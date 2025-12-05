@@ -382,7 +382,7 @@ class PIDFeeController:
             ):
                 self.plugin.log(
                     f"Warning: Could not unmanage {peer_id} from clboss, "
-                    "fee may be reverted", level='warning'
+                    "fee may be reverted", level='warn'
                 )
             
             # Step 2: Set the fee

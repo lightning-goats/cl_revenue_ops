@@ -135,7 +135,7 @@ class FlowAnalyzer:
             # Other errors might be temporary
             return True
         except Exception as e:
-            self.plugin.log(f"Error checking bookkeeper: {e}", level='warning')
+            self.plugin.log(f"Error checking bookkeeper: {e}", level='warn')
             self._bookkeeper_available = False
             return False
     
@@ -465,7 +465,7 @@ class FlowAnalyzer:
                 pass
                 
         except RpcError as e:
-            self.plugin.log(f"Error querying bookkeeper: {e}", level='warning')
+            self.plugin.log(f"Error querying bookkeeper: {e}", level='warn')
             # Fall back to listforwards
             return self._get_flow_from_listforwards(channel_id)
         

@@ -276,7 +276,7 @@ class ChannelProfitabilityAnalyzer:
         except Exception as e:
             self.plugin.log(
                 f"Error analyzing channel {channel_id}: {e}", 
-                level='warning'
+                level='warn'
             )
             return None
     
@@ -889,7 +889,7 @@ class ChannelProfitabilityAnalyzer:
         except Exception as e:
             self.plugin.log(
                 f"Error getting revenue for {channel_id}: {e}", 
-                level='warning'
+                level='warn'
             )
         
         return ChannelRevenue(

@@ -99,7 +99,7 @@ class ClbossManager:
             self._clboss_available = True
             return True
         except Exception as e:
-            self.plugin.log(f"Error checking clboss availability: {e}", level='warning')
+            self.plugin.log(f"Error checking clboss availability: {e}", level='warn')
             self._clboss_available = False
             return False
     
@@ -202,7 +202,7 @@ class ClbossManager:
                 else:
                     result["success"] = False
                     result["message"] = f"clboss-unmanage failed: {error_str}"
-                    self.plugin.log(f"Failed to unmanage {peer_id}: {error_str}", level='warning')
+                    self.plugin.log(f"Failed to unmanage {peer_id}: {error_str}", level='warn')
                     
         except Exception as e:
             result["success"] = False
@@ -361,6 +361,6 @@ class ClbossManager:
         # Failed to unmanage - log and return False
         self.plugin.log(
             f"Could not unmanage {peer_id} for {tag}: {result['message']}", 
-            level='warning'
+            level='warn'
         )
         return False

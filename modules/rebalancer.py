@@ -828,7 +828,7 @@ class EVRebalancer:
                     error_message=error
                 )
                 result["message"] = f"Rebalance failed: {error}"
-                self.plugin.log(f"Rebalance failed: {error}", level='warning')
+                self.plugin.log(f"Rebalance failed: {error}", level='warn')
                 
         except Exception as e:
             result["message"] = f"Error: {str(e)}"
@@ -986,7 +986,7 @@ class EVRebalancer:
             self.plugin.log(
                 f"Warning: {to_channel} is a SINK channel. It fills itself for free. "
                 f"Consider NOT rebalancing into it.",
-                level='warning'
+                level='warn'
             )
         
         # Calculate EV even for manual
@@ -1032,7 +1032,7 @@ class EVRebalancer:
         if spread_ppm <= 0:
             self.plugin.log(
                 f"Warning: Manual rebalance has negative EV (spread={spread_ppm} PPM)",
-                level='warning'
+                level='warn'
             )
         
         return self.execute_rebalance(candidate)
