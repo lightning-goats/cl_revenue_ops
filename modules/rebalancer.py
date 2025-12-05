@@ -228,7 +228,7 @@ class EVRebalancer:
         # Sort by priority: SOURCE channels first (they're money printers!), then by profit
         # SOURCE channels get a priority boost since keeping them full is critical
         def sort_key(c):
-            dest_state = self.database.get_channel_state(c.dest_channel_id)
+            dest_state = self.database.get_channel_state(c.to_channel)
             flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
             # SOURCE = 2 (highest priority), BALANCED = 1, SINK should never appear here
             priority = 2 if flow_state == "source" else 1
