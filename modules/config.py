@@ -63,6 +63,9 @@ class Config:
     # Rebalancer plugin selection
     rebalancer_plugin: str = 'circular'  # 'circular' or 'sling'
     
+    # Profitability tracking
+    estimated_open_cost_sats: int = 5000  # Estimated on-chain fee for channel open
+    
     # Safety flags
     dry_run: bool = False          # If True, log but don't execute
 

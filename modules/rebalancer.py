@@ -49,13 +49,16 @@ loops that plague naive automated systems.
 
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
 
 from pyln.client import Plugin, RpcError
 
 from .config import Config
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
+
+if TYPE_CHECKING:
+    from .profitability_analyzer import ChannelProfitabilityAnalyzer
 
 
 @dataclass
@@ -147,6 +150,13 @@ class EVRebalancer:
         
         # Track pending rebalances to avoid duplicates
         self._pending: Dict[str, int] = {}  # channel_id -> timestamp
+        
+        # Optional profitability analyzer - set via setter to avoid circular imports
+        self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
+    
+    def set_profitability_analyzer(self, analyzer: 'ChannelProfitabilityAnalyzer') -> None:
+        """Set the profitability analyzer instance."""
+        self._profitability_analyzer = analyzer
     
     def find_rebalance_candidates(self) -> List[RebalanceCandidate]:
         """
@@ -279,6 +289,41 @@ class EVRebalancer:
             )
             return None
         
+        # Check channel profitability if analyzer is available
+        # Skip or deprioritize underwater/zombie channels
+        channel_profitability = None
+        if self._profitability_analyzer:
+            try:
+                channel_profitability = self._profitability_analyzer.analyze_channel(dest_channel)
+                if channel_profitability:
+                    profitability_class = channel_profitability.classification.value
+                    
+                    # ZOMBIE channels: No routing activity - don't invest more
+                    if profitability_class == "zombie":
+                        self.plugin.log(
+                            f"Skipping {dest_channel}: ZOMBIE channel has no routing activity. "
+                            f"Don't invest more until it shows life."
+                        )
+                        return None
+                    
+                    # UNDERWATER channels: Negative ROI - be cautious
+                    if profitability_class == "underwater":
+                        # Only skip if deeply underwater (ROI < -50%)
+                        if channel_profitability.roi_percent < -50:
+                            self.plugin.log(
+                                f"Skipping {dest_channel}: deeply UNDERWATER channel "
+                                f"(ROI={channel_profitability.roi_percent:.1f}%). "
+                                f"Fix economics before rebalancing."
+                            )
+                            return None
+                        else:
+                            self.plugin.log(
+                                f"Channel {dest_channel} is UNDERWATER (ROI={channel_profitability.roi_percent:.1f}%) "
+                                f"but proceeding with caution."
+                            )
+            except Exception as e:
+                self.plugin.log(f"Error checking profitability for {dest_channel}: {e}")
+        
         # Determine how much to rebalance
         capacity = dest_info.get("capacity", 0)
         spendable = dest_info.get("spendable_sats", 0)
@@ -386,44 +431,192 @@ class EVRebalancer:
             dest_flow_state=dest_flow_state
         )
     
-    def _estimate_inbound_fee(self, peer_id: str) -> int:
+    def _estimate_inbound_fee(self, peer_id: str, amount_msat: int = 100000000) -> int:
         """
         Estimate the fee we'll pay to route to ourselves via a peer.
         
-        This is a key part of the EV calculation. We need to estimate
-        the routing cost based on:
-        1. The peer's fees to us (known)
-        2. Network fees to reach the peer (estimated)
+        Uses multiple methods in priority order:
+        1. getroute probe - most accurate, shows actual network fees
+        2. Historical rebalance data - what we've actually paid before
+        3. Peer's channel fees to us - known from gossip
+        4. Fallback default - conservative estimate
         
         Args:
             peer_id: The peer we're routing through
+            amount_msat: Amount to estimate fees for (default 100k sats)
             
         Returns:
             Estimated inbound fee in PPM
         """
-        # Try to get peer's channel to us
+        # Method 1: Use getroute to probe actual network fees
+        route_fee = self._get_route_fee_estimate(peer_id, amount_msat)
+        if route_fee is not None:
+            return route_fee
+        
+        # Method 2: Check historical rebalance costs from database
+        historical_fee = self._get_historical_inbound_fee(peer_id)
+        if historical_fee is not None:
+            return historical_fee
+        
+        # Method 3: Get peer's direct channel fee to us from gossip
+        peer_fee = self._get_peer_fee_to_us(peer_id)
+        if peer_fee is not None:
+            # Add network routing buffer
+            return peer_fee + self.config.inbound_fee_estimate_ppm
+        
+        # Method 4: Fallback default
+        self.plugin.log(
+            f"Using default inbound fee estimate for peer {peer_id[:12]}...",
+            level='debug'
+        )
+        return 1000  # Conservative default
+    
+    def _get_route_fee_estimate(self, peer_id: str, amount_msat: int) -> Optional[int]:
+        """
+        Use getroute to probe actual network fees to reach a peer.
+        
+        This gives us the real routing cost through the network.
+        We route TO the peer (not ourselves) since that's where we need
+        to push liquidity from.
+        
+        Args:
+            peer_id: Target peer node ID
+            amount_msat: Amount to route
+            
+        Returns:
+            Fee in PPM, or None if route not found
+        """
+        try:
+            # Get route to the peer
+            # Use a reasonable risk factor and max hops
+            route = self.plugin.rpc.getroute(
+                id=peer_id,
+                amount_msat=amount_msat,
+                riskfactor=10,
+                maxhops=6
+            )
+            
+            route_hops = route.get("route", [])
+            if not route_hops:
+                return None
+            
+            # Calculate total fees from route
+            total_fee_msat = 0
+            for hop in route_hops:
+                # Each hop has the amount at that point
+                # The difference from our send amount is the cumulative fee
+                pass
+            
+            # Simpler: first hop amount - final amount = total fee
+            if len(route_hops) >= 1:
+                first_hop_msat = route_hops[0].get("amount_msat", amount_msat)
+                if isinstance(first_hop_msat, str):
+                    first_hop_msat = int(first_hop_msat.replace("msat", ""))
+                
+                total_fee_msat = first_hop_msat - amount_msat
+                
+                # Convert to PPM
+                if amount_msat > 0:
+                    fee_ppm = int((total_fee_msat / amount_msat) * 1_000_000)
+                    
+                    self.plugin.log(
+                        f"Route probe to {peer_id[:12]}...: {fee_ppm} PPM "
+                        f"({total_fee_msat // 1000} sats for {amount_msat // 1000} sats, "
+                        f"{len(route_hops)} hops)",
+                        level='debug'
+                    )
+                    return fee_ppm
+                    
+        except Exception as e:
+            self.plugin.log(
+                f"getroute probe failed for {peer_id[:12]}...: {e}",
+                level='debug'
+            )
+        
+        return None
+    
+    def _get_historical_inbound_fee(self, peer_id: str) -> Optional[int]:
+        """
+        Get average fee from historical successful rebalances to this peer.
+        
+        Args:
+            peer_id: Peer node ID
+            
+        Returns:
+            Average historical fee in PPM, or None if no history
+        """
+        try:
+            # Query database for past rebalances to channels with this peer
+            history = self.database.get_rebalance_history_by_peer(peer_id)
+            
+            if not history:
+                return None
+            
+            # Calculate average PPM from successful rebalances
+            total_ppm = 0
+            count = 0
+            
+            for record in history:
+                if record.get("status") == "success":
+                    fee_paid = record.get("fee_paid_msat", 0)
+                    amount = record.get("amount_msat", 0)
+                    
+                    if amount > 0:
+                        ppm = int((fee_paid / amount) * 1_000_000)
+                        total_ppm += ppm
+                        count += 1
+            
+            if count > 0:
+                avg_ppm = total_ppm // count
+                self.plugin.log(
+                    f"Historical inbound fee for {peer_id[:12]}...: {avg_ppm} PPM "
+                    f"(from {count} rebalances)",
+                    level='debug'
+                )
+                return avg_ppm
+                
+        except Exception as e:
+            self.plugin.log(
+                f"Error getting historical fees for {peer_id[:12]}...: {e}",
+                level='debug'
+            )
+        
+        return None
+    
+    def _get_peer_fee_to_us(self, peer_id: str) -> Optional[int]:
+        """
+        Get the peer's channel fee to route to us from gossip data.
+        
+        Args:
+            peer_id: Peer node ID
+            
+        Returns:
+            Peer's fee in PPM, or None if not found
+        """
         try:
             # Get our node ID
             info = self.plugin.rpc.getinfo()
             our_node_id = info.get("id", "")
             
-            # Try to find peer's channel info
-            # This requires looking at gossip data
+            # Look for channels from peer to us in gossip
             channels = self.plugin.rpc.listchannels(source=peer_id)
             
             for channel in channels.get("channels", []):
                 if channel.get("destination") == our_node_id:
-                    # Get the peer's fee to route to us
                     ppm = channel.get("fee_per_millionth", 0)
+                    self.plugin.log(
+                        f"Peer {peer_id[:12]}... fee to us: {ppm} PPM",
+                        level='debug'
+                    )
+                    return ppm
                     
-                    # Add buffer for network routing (configurable via inbound_fee_estimate_ppm)
-                    return ppm + self.config.inbound_fee_estimate_ppm
-            
         except Exception as e:
-            self.plugin.log(f"Could not estimate inbound fee: {e}", level='debug')
+            self.plugin.log(
+                f"Error getting peer fee for {peer_id[:12]}...: {e}",
+                level='debug'
+            )
         
-        # Default estimate if we can't determine exact fee
-        return 1000  # 1000 PPM is a reasonable network average
+        return None
     
     def _select_source_channel(self, sources: List[Tuple[str, Dict[str, Any], float]],
                                amount_needed: int) -> Optional[Tuple[str, Dict[str, Any]]]:

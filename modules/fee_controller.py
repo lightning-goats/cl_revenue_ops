@@ -28,13 +28,16 @@ the oscillation problems of simple threshold-based approaches.
 
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
 
 from pyln.client import Plugin, RpcError
 
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
+
+if TYPE_CHECKING:
+    from .profitability_analyzer import ChannelProfitabilityAnalyzer
 
 
 @dataclass
@@ -97,10 +100,12 @@ class PIDFeeController:
     2. Liquidity-aware: Considers channel balance when setting fees
     3. Economic floor: Never charges less than channel costs
     4. clboss override: Unmanages from clboss before setting fees
+    5. Profitability-aware: Adjusts fees based on channel ROI
     """
     
     def __init__(self, plugin: Plugin, config: Config, database: Database, 
-                 clboss_manager: ClbossManager):
+                 clboss_manager: ClbossManager,
+                 profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None):
         """
         Initialize the fee controller.
         
@@ -109,11 +114,13 @@ class PIDFeeController:
             config: Configuration object
             database: Database instance
             clboss_manager: ClbossManager for handling overrides
+            profitability_analyzer: Optional profitability analyzer for ROI-based adjustments
         """
         self.plugin = plugin
         self.config = config
         self.database = database
         self.clboss = clboss_manager
+        self.profitability = profitability_analyzer
         
         # In-memory cache of PID states (also persisted to DB)
         self._pid_states: Dict[str, PIDState] = {}
@@ -262,9 +269,19 @@ class PIDFeeController:
         elif flow_state == "sink":
             flow_state_multiplier = 0.80  # 20% lower fees for sinks
         
+        # Apply profitability multiplier
+        # Profitable channels can afford competitive fees, underwater channels need recovery
+        profitability_multiplier = 1.0
+        profitability_class = "unknown"
+        if self.profitability:
+            profitability_multiplier = self.profitability.get_fee_multiplier(channel_id)
+            prof_data = self.profitability.get_profitability(channel_id)
+            if prof_data:
+                profitability_class = prof_data.classification.value
+        
         # Calculate new fee
         base_fee = current_fee_ppm + fee_adjustment
-        new_fee_ppm = int(base_fee * liquidity_multiplier * flow_state_multiplier)
+        new_fee_ppm = int(base_fee * liquidity_multiplier * flow_state_multiplier * profitability_multiplier)
         
         # Apply floor and ceiling
         floor_ppm = self._calculate_floor(capacity)
@@ -285,9 +302,11 @@ class PIDFeeController:
             self._save_pid_state(channel_id, pid_state)
             return None
         
-        # Build reason string (flow_state already defined above for multiplier)
+        # Build reason string
         reason = (f"PID adjustment: flow={daily_volume}/day (target={target_flow}), "
-                 f"state={flow_state} (x{flow_state_multiplier}), liquidity={bucket} ({outbound_ratio:.0%})")
+                 f"state={flow_state} (x{flow_state_multiplier}), "
+                 f"liquidity={bucket} ({outbound_ratio:.0%}), "
+                 f"profit={profitability_class} (x{profitability_multiplier})")
         
         # Apply the fee change
         result = self.set_channel_fee(channel_id, new_fee_ppm, reason=reason)

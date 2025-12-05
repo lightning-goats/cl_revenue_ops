@@ -25,25 +25,38 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - Sets strict budget caps to ensure profitability
 - Supports both circular and sling rebalancer plugins
 
+### Module 4: Channel Profitability Analyzer
+- Tracks costs per channel (opening costs + rebalancing costs)
+- Tracks revenue per channel (routing fees earned)
+- Calculates ROI and net profit for each channel
+- Classifies channels as **PROFITABLE**, **BREAK_EVEN**, **UNDERWATER**, or **ZOMBIE**
+- Integrates with fee controller and rebalancer for smarter decisions
+
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    cl-revenue-ops Plugin                      │
-├──────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
-│  │  Flow Analyzer  │  │  PID Fee        │  │  EV          │ │
-│  │  (Sink/Source)  │─▶│  Controller     │─▶│  Rebalancer  │ │
-│  └────────┬────────┘  └────────┬────────┘  └──────┬───────┘ │
-│           │                    │                   │         │
-│           ▼                    ▼                   ▼         │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │                   Clboss Manager                        │ │
-│  │            (Manager-Override Pattern)                   │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│           │                    │                   │         │
-└───────────┼────────────────────┼───────────────────┼─────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│                      cl-revenue-ops Plugin                            │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────────┐  │
+│  │  Flow Analyzer  │  │  Profitability  │  │                      │  │
+│  │  (Sink/Source)  │  │  Analyzer       │  │                      │  │
+│  └────────┬────────┘  └────────┬────────┘  │                      │  │
+│           │                    │           │                      │  │
+│           ▼                    ▼           │                      │  │
+│  ┌─────────────────────────────────────┐   │  ┌──────────────┐   │  │
+│  │         PID Fee Controller          │   │  │  EV          │   │  │
+│  │  (uses flow state + profitability)  │◀──┼──│  Rebalancer  │   │  │
+│  └────────────────┬────────────────────┘   │  └──────┬───────┘   │  │
+│                   │                        │         │           │  │
+│                   ▼                        ▼         ▼           │  │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │                   Clboss Manager                            │    │
+│  │            (Manager-Override Pattern)                       │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│           │                    │                   │                │
+└───────────┼────────────────────┼───────────────────┼────────────────┘
             ▼                    ▼                   ▼
      ┌──────────┐         ┌──────────┐        ┌──────────┐
      │ clboss   │         │ setchan  │        │ circular │
@@ -154,6 +167,23 @@ Check clboss integration status.
 lightning-cli revenue-clboss-status
 ```
 
+### `revenue-profitability [channel_id]`
+Get channel profitability analysis.
+
+```bash
+# Get summary of all channels grouped by profitability class
+lightning-cli revenue-profitability
+
+# Analyze specific channel
+lightning-cli revenue-profitability 123x456x0
+```
+
+Returns:
+- **profitable**: Positive ROI, earning more than costs
+- **break_even**: ROI near zero
+- **underwater**: Negative ROI, losing money
+- **zombie**: No routing activity at all
+
 ### `revenue-remanage peer_id [tag]`
 Re-enable clboss management for a peer.
 
@@ -234,6 +264,37 @@ This separation of concerns means:
 ### Anti-Thrashing Protection
 
 After a successful rebalance, the plugin keeps the peer unmanaged from clboss's rebalancing logic. This prevents clboss from immediately "fixing" the channel balance and wasting the fees we just paid.
+
+### Channel Profitability Analysis
+
+The profitability analyzer tracks the economic performance of each channel:
+
+**Cost Tracking:**
+- Opening costs from **bookkeeper plugin** (actual on-chain fees paid)
+- Falls back to database cache, then config estimate if bookkeeper unavailable
+- Accumulated rebalancing costs (fees paid to move liquidity in)
+
+**Revenue Tracking:**
+- Routing fees earned from forwards through the channel
+
+**Classification Logic:**
+- **PROFITABLE**: ROI > 0% and net profit > 0
+- **BREAK_EVEN**: ROI between -5% and 5%
+- **UNDERWATER**: Negative ROI (costs exceed revenue)
+- **ZOMBIE**: No routing activity detected
+
+**Integration with Other Modules:**
+
+1. **Fee Controller**: Applies profitability multipliers
+   - Profitable channels: 1.0x (standard fees)
+   - Break-even channels: 1.1x (slightly higher to improve margins)
+   - Underwater channels: 1.2x (higher fees to recover costs)
+   - Zombie channels: 1.15x (higher to make any activity worthwhile)
+
+2. **Rebalancer**: Filters candidates by profitability
+   - Skips ZOMBIE channels (no point investing in dead channels)
+   - Skips deeply UNDERWATER channels (ROI < -50%)
+   - Proceeds with caution on mildly underwater channels
 
 ## Monitoring
 

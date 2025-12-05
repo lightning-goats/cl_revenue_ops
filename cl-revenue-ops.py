@@ -47,6 +47,7 @@ from modules.rebalancer import EVRebalancer
 from modules.clboss_manager import ClbossManager
 from modules.config import Config
 from modules.database import Database
+from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 
 # Initialize the plugin
 plugin = Plugin()
@@ -58,6 +59,7 @@ rebalancer: Optional[EVRebalancer] = None
 clboss_manager: Optional[ClbossManager] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
+profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
 
 
 # =============================================================================
@@ -170,7 +172,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config
+    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer
     
     plugin.log("Initializing cl-revenue-ops plugin...")
     
@@ -204,10 +206,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize clboss manager (handles unmanage commands)
     clboss_manager = ClbossManager(plugin, config)
     
-    # Initialize analysis modules
+    # Initialize profitability analyzer
+    profitability_analyzer = ChannelProfitabilityAnalyzer(plugin, config, database)
+    
+    # Initialize analysis modules with profitability analyzer
     flow_analyzer = FlowAnalyzer(plugin, config, database)
-    fee_controller = PIDFeeController(plugin, config, database, clboss_manager)
+    fee_controller = PIDFeeController(plugin, config, database, clboss_manager, profitability_analyzer)
     rebalancer = EVRebalancer(plugin, config, database, clboss_manager)
+    rebalancer.set_profitability_analyzer(profitability_analyzer)
     
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
@@ -436,6 +442,89 @@ def revenue_clboss_status(plugin: Plugin) -> Dict[str, Any]:
         return {"error": "Plugin not fully initialized"}
     
     return clboss_manager.get_unmanaged_status()
+
+
+@plugin.method("revenue-profitability")
+def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Get channel profitability analysis.
+    
+    Shows each channel's:
+    - Total costs (opening + rebalancing)
+    - Total revenue (routing fees)
+    - Net profit/loss
+    - ROI percentage
+    - Profitability classification (profitable, break_even, underwater, zombie)
+    
+    Usage: lightning-cli revenue-profitability [channel_id]
+    """
+    if profitability_analyzer is None:
+        return {"error": "Plugin not fully initialized"}
+    
+    try:
+        if channel_id:
+            # Analyze single channel
+            result = profitability_analyzer.analyze_channel(channel_id)
+            if result:
+                return {
+                    "channel_id": channel_id,
+                    "profitability": {
+                        "total_costs_sats": result.costs.total_cost_sats,
+                        "total_revenue_sats": result.revenue.fees_earned_sats,
+                        "net_profit_sats": result.net_profit_sats,
+                        "roi_percentage": round(result.roi_percent, 2),
+                        "profitability_class": result.classification.value,
+                        "days_active": result.days_open,
+                        "volume_routed_sats": result.revenue.volume_routed_sats,
+                        "forward_count": result.revenue.forward_count,
+                        "fee_multiplier": profitability_analyzer.get_fee_multiplier(channel_id)
+                    }
+                }
+            else:
+                return {"channel_id": channel_id, "error": "No data available"}
+        else:
+            # Analyze all channels
+            all_results = profitability_analyzer.analyze_all_channels()
+            
+            # Group by profitability class
+            summary = {
+                "profitable": [],
+                "break_even": [],
+                "underwater": [],
+                "zombie": []
+            }
+            total_profit = 0
+            total_revenue = 0
+            total_costs = 0
+            
+            for ch_id, result in all_results.items():
+                channel_summary = {
+                    "channel_id": ch_id,
+                    "net_profit_sats": result.net_profit_sats,
+                    "roi_percentage": round(result.roi_percent, 2),
+                    "days_active": result.days_open
+                }
+                summary[result.classification.value].append(channel_summary)
+                total_profit += result.net_profit_sats
+                total_revenue += result.revenue.fees_earned_sats
+                total_costs += result.costs.total_cost_sats
+            
+            return {
+                "summary": {
+                    "total_channels": len(all_results),
+                    "profitable_count": len(summary["profitable"]),
+                    "break_even_count": len(summary["break_even"]),
+                    "underwater_count": len(summary["underwater"]),
+                    "zombie_count": len(summary["zombie"]),
+                    "total_profit_sats": total_profit,
+                    "total_revenue_sats": total_revenue,
+                    "total_costs_sats": total_costs,
+                    "overall_roi_pct": round((total_profit / total_costs * 100) if total_costs > 0 else 0, 2)
+                },
+                "channels_by_class": summary
+            }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 @plugin.method("revenue-remanage")

@@ -151,11 +151,35 @@ class Database:
             )
         """)
         
+        # Channel open costs tracking (for profitability analysis)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_costs (
+                channel_id TEXT PRIMARY KEY,
+                peer_id TEXT NOT NULL,
+                open_cost_sats INTEGER NOT NULL DEFAULT 0,
+                capacity_sats INTEGER NOT NULL,
+                opened_at INTEGER NOT NULL
+            )
+        """)
+        
+        # Rebalance costs tracking (cumulative per channel)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rebalance_costs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                cost_sats INTEGER NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL
+            )
+        """)
+        
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_time ON forwards(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_channels ON forwards(in_channel, out_channel)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_channel ON rebalance_costs(channel_id)")
         
         self.plugin.log("Database initialized successfully")
     
@@ -445,6 +469,102 @@ class Database:
         conn = self._get_connection()
         rows = conn.execute("SELECT * FROM clboss_unmanaged").fetchall()
         return [dict(row) for row in rows]
+    
+    # =========================================================================
+    # Profitability Tracking Methods
+    # =========================================================================
+    
+    def record_channel_open_cost(self, channel_id: str, peer_id: str,
+                                  open_cost_sats: int, capacity_sats: int,
+                                  timestamp: Optional[int] = None):
+        """Record the cost to open a channel."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT OR REPLACE INTO channel_costs 
+            (channel_id, peer_id, open_cost_sats, capacity_sats, opened_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (channel_id, peer_id, open_cost_sats, capacity_sats, 
+              timestamp or int(time.time())))
+        conn.commit()
+    
+    def get_channel_open_cost(self, channel_id: str) -> Optional[int]:
+        """Get the recorded open cost for a channel."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT open_cost_sats FROM channel_costs WHERE channel_id = ?",
+            (channel_id,)
+        ).fetchone()
+        return row["open_cost_sats"] if row else None
+    
+    def record_rebalance_cost(self, channel_id: str, peer_id: str,
+                              cost_sats: int, amount_sats: int,
+                              timestamp: Optional[int] = None):
+        """Record a rebalance cost for a channel."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT INTO rebalance_costs 
+            (channel_id, peer_id, cost_sats, amount_sats, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        """, (channel_id, peer_id, cost_sats, amount_sats,
+              timestamp or int(time.time())))
+        conn.commit()
+    
+    def get_channel_rebalance_costs(self, channel_id: str) -> int:
+        """Get total rebalance costs for a channel."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(cost_sats), 0) as total FROM rebalance_costs WHERE channel_id = ?",
+            (channel_id,)
+        ).fetchone()
+        return row["total"] if row else 0
+    
+    def get_channel_cost_history(self, channel_id: str) -> List[Dict[str, Any]]:
+        """Get detailed cost history for a channel."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM rebalance_costs 
+            WHERE channel_id = ? 
+            ORDER BY timestamp DESC
+        """, (channel_id,)).fetchall()
+        return [dict(row) for row in rows]
+    
+    def get_all_channel_costs(self) -> Dict[str, Dict[str, int]]:
+        """Get summary of costs for all channels."""
+        conn = self._get_connection()
+        
+        result = {}
+        
+        # Get open costs
+        open_rows = conn.execute("SELECT * FROM channel_costs").fetchall()
+        for row in open_rows:
+            channel_id = row["channel_id"]
+            result[channel_id] = {
+                "open_cost_sats": row["open_cost_sats"],
+                "rebalance_cost_sats": 0,
+                "total_cost_sats": row["open_cost_sats"]
+            }
+        
+        # Get rebalance costs
+        rebalance_rows = conn.execute("""
+            SELECT channel_id, SUM(cost_sats) as total 
+            FROM rebalance_costs 
+            GROUP BY channel_id
+        """).fetchall()
+        
+        for row in rebalance_rows:
+            channel_id = row["channel_id"]
+            if channel_id not in result:
+                result[channel_id] = {
+                    "open_cost_sats": 0,
+                    "rebalance_cost_sats": 0,
+                    "total_cost_sats": 0
+                }
+            result[channel_id]["rebalance_cost_sats"] = row["total"]
+            result[channel_id]["total_cost_sats"] = (
+                result[channel_id]["open_cost_sats"] + row["total"]
+            )
+        
+        return result
     
     # =========================================================================
     # Cleanup Methods
