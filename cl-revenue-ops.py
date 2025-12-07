@@ -61,6 +61,10 @@ database: Optional[Database] = None
 config: Optional[Config] = None
 profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
 
+# SCID to Peer ID cache for reputation tracking
+# Maps short_channel_id -> peer_id for quick lookups
+_scid_to_peer_cache: Dict[str, str] = {}
+
 
 # =============================================================================
 # PLUGIN OPTIONS
@@ -168,6 +172,18 @@ plugin.add_option(
     description='If true, log actions but do not execute (default: false)'
 )
 
+plugin.add_option(
+    name='revenue-ops-htlc-congestion-threshold',
+    default='0.8',
+    description='HTLC slot utilization threshold (0.0-1.0) above which channel is considered congested (default: 0.8)'
+)
+
+plugin.add_option(
+    name='revenue-ops-enable-reputation',
+    default='true',
+    description='If true, weight volume by peer reputation (success rate) in fee decisions (default: true)'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -206,7 +222,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalancer_plugin=options['revenue-ops-rebalancer'],
         daily_budget_sats=int(options['revenue-ops-daily-budget-sats']),
         min_wallet_reserve=int(options['revenue-ops-min-wallet-reserve']),
-        dry_run=options['revenue-ops-dry-run'].lower() == 'true'
+        dry_run=options['revenue-ops-dry-run'].lower() == 'true',
+        htlc_congestion_threshold=float(options['revenue-ops-htlc-congestion-threshold']),
+        enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true'
     )
     
     plugin.log(f"Configuration loaded: target_flow={config.target_flow}, "
@@ -579,21 +597,71 @@ def on_htlc_accepted(onion: Dict, htlc: Dict, plugin: Plugin, **kwargs) -> Dict[
     return {"result": "continue"}
 
 
+def _resolve_scid_to_peer(scid: str) -> Optional[str]:
+    """
+    Resolve a short_channel_id to its peer_id.
+    
+    Uses a cache to avoid repeated RPC calls. Cache is refreshed if the
+    SCID is not found (channel might be new).
+    
+    Args:
+        scid: Short channel ID (e.g., "123x456x0")
+        
+    Returns:
+        peer_id (node pubkey) or None if not found
+    """
+    global _scid_to_peer_cache
+    
+    # Check cache first
+    if scid in _scid_to_peer_cache:
+        return _scid_to_peer_cache[scid]
+    
+    # Cache miss - refresh cache from listpeerchannels
+    try:
+        result = plugin.rpc.listpeerchannels()
+        for channel in result.get("channels", []):
+            channel_scid = channel.get("short_channel_id") or channel.get("channel_id")
+            peer_id = channel.get("peer_id")
+            if channel_scid and peer_id:
+                _scid_to_peer_cache[channel_scid] = peer_id
+        
+        # Try again after refresh
+        return _scid_to_peer_cache.get(scid)
+    except RpcError as e:
+        plugin.log(f"Error resolving SCID {scid} to peer: {e}", level='warn')
+        return None
+
+
 @plugin.subscribe("forward_event")
 def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     """
     Notification when a forward completes (success or failure).
     
-    We can use this for real-time flow tracking to complement our periodic
-    bookkeeper analysis.
+    We use this for:
+    1. Real-time flow tracking (settled forwards)
+    2. Peer reputation tracking (success/failure rates)
+    
+    Reputation tracking helps identify unreliable peers for traffic intelligence.
     """
     if database is None:
         return
     
     status = forward_event.get("status")
+    in_channel = forward_event.get("in_channel")
+    
+    # Track peer reputation for all forward outcomes
+    if in_channel:
+        peer_id = _resolve_scid_to_peer(in_channel)
+        if peer_id:
+            if status == "settled":
+                # Success - increment success count
+                database.update_peer_reputation(peer_id, is_success=True)
+            elif status in ("failed", "local_failed"):
+                # Failure - increment failure count
+                database.update_peer_reputation(peer_id, is_success=False)
+    
+    # Record successful forwards for flow metrics
     if status == "settled":
-        # Record successful forward for real-time metrics
-        in_channel = forward_event.get("in_channel")
         out_channel = forward_event.get("out_channel")
         in_msat = forward_event.get("in_msat", 0)
         out_msat = forward_event.get("out_msat", 0)

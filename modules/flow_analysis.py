@@ -35,11 +35,13 @@ class ChannelState(Enum):
     SINK: Net inflow - channel is filling
     BALANCED: Roughly equal flow - ideal state
     UNKNOWN: Not enough data to classify
+    CONGESTED: HTLC slots near exhaustion (>80% used)
     """
     SOURCE = "source"
     SINK = "sink"
     BALANCED = "balanced"
     UNKNOWN = "unknown"
+    CONGESTED = "congested"
 
 
 @dataclass
@@ -54,9 +56,14 @@ class FlowMetrics:
         sats_out: Total sats routed out of this channel (to peer)
         capacity: Channel capacity in sats
         flow_ratio: (sats_out - sats_in) / capacity
-        state: Classified state (SOURCE/SINK/BALANCED)
+        state: Classified state (SOURCE/SINK/BALANCED/CONGESTED)
         daily_volume: Average daily routing volume
         analysis_window_days: Number of days analyzed
+        htlc_min: Minimum HTLC amount (msat)
+        htlc_max: Maximum HTLC amount (msat)
+        active_htlcs: Number of currently active HTLCs
+        max_htlcs: Maximum allowed HTLCs on the channel
+        is_congested: True if HTLC slots are >80% utilized
     """
     channel_id: str
     peer_id: str
@@ -67,6 +74,11 @@ class FlowMetrics:
     state: ChannelState
     daily_volume: int
     analysis_window_days: int
+    htlc_min: int = 0
+    htlc_max: int = 0
+    active_htlcs: int = 0
+    max_htlcs: int = 483  # Default per BOLT spec
+    is_congested: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -79,7 +91,12 @@ class FlowMetrics:
             "flow_ratio": round(self.flow_ratio, 4),
             "state": self.state.value,
             "daily_volume": self.daily_volume,
-            "analysis_window_days": self.analysis_window_days
+            "analysis_window_days": self.analysis_window_days,
+            "htlc_min": self.htlc_min,
+            "htlc_max": self.htlc_max,
+            "active_htlcs": self.active_htlcs,
+            "max_htlcs": self.max_htlcs,
+            "is_congested": self.is_congested
         }
 
 
@@ -197,6 +214,12 @@ class FlowAnalyzer:
             sats_in = channel_flow.get("in", 0)
             sats_out = channel_flow.get("out", 0)
             
+            # Extract HTLC information for congestion detection
+            htlc_min = channel.get("htlc_min_msat", 0)
+            htlc_max = channel.get("htlc_max_msat", 0)
+            active_htlcs = channel.get("active_htlcs", 0)
+            max_htlcs = channel.get("max_htlcs", 483)
+            
             # Calculate metrics (with balance fallback for zero-flow channels)
             metrics = self._calculate_metrics(
                 channel_id=channel_id,
@@ -204,7 +227,11 @@ class FlowAnalyzer:
                 sats_in=sats_in,
                 sats_out=sats_out,
                 capacity=capacity,
-                our_balance=our_balance
+                our_balance=our_balance,
+                htlc_min=htlc_min,
+                htlc_max=htlc_max,
+                active_htlcs=active_htlcs,
+                max_htlcs=max_htlcs
             )
             
             results[channel_id] = metrics
@@ -260,18 +287,30 @@ class FlowAnalyzer:
         
         channel_flow = flow_data.get(channel_id, {"in": 0, "out": 0})
         
+        # Extract HTLC information for congestion detection
+        htlc_min = channel.get("htlc_min_msat", 0)
+        htlc_max = channel.get("htlc_max_msat", 0)
+        active_htlcs = channel.get("active_htlcs", 0)
+        max_htlcs = channel.get("max_htlcs", 483)
+        
         return self._calculate_metrics(
             channel_id=channel_id,
             peer_id=peer_id,
             sats_in=channel_flow.get("in", 0),
             sats_out=channel_flow.get("out", 0),
             capacity=capacity,
-            our_balance=our_balance
+            our_balance=our_balance,
+            htlc_min=htlc_min,
+            htlc_max=htlc_max,
+            active_htlcs=active_htlcs,
+            max_htlcs=max_htlcs
         )
     
     def _calculate_metrics(self, channel_id: str, peer_id: str,
                           sats_in: int, sats_out: int, capacity: int,
-                          our_balance: int = 0) -> FlowMetrics:
+                          our_balance: int = 0,
+                          htlc_min: int = 0, htlc_max: int = 0,
+                          active_htlcs: int = 0, max_htlcs: int = 483) -> FlowMetrics:
         """
         Calculate flow metrics and classify a channel.
         
@@ -290,6 +329,12 @@ class FlowAnalyzer:
         - High outbound (> 70%): Channel has been filling → likely SINK
         - Middle range: BALANCED
         
+        HTLC CONGESTION CHECK:
+        If active_htlcs / max_htlcs exceeds the configured htlc_congestion_threshold
+        (default 80% slot utilization), the channel is marked as CONGESTED. This
+        overrides the flow-based classification because a congested channel cannot
+        route new payments regardless of its liquidity state.
+        
         This allows the PID to make reasonable fee decisions even for new
         channels or when bookkeeper data is unavailable.
         
@@ -300,6 +345,10 @@ class FlowAnalyzer:
             sats_out: Total sats routed out
             capacity: Channel capacity
             our_balance: Our current balance (outbound liquidity) for fallback
+            htlc_min: Minimum HTLC amount (msat)
+            htlc_max: Maximum HTLC amount (msat)
+            active_htlcs: Number of currently active HTLCs
+            max_htlcs: Maximum allowed HTLCs on the channel
             
         Returns:
             FlowMetrics with classification
@@ -312,8 +361,19 @@ class FlowAnalyzer:
         else:
             flow_ratio = 0.0
         
-        # Classify based on flow data OR balance fallback
-        if has_flow_data:
+        # Check HTLC slot congestion FIRST
+        # If > threshold of HTLC slots are used, channel is congested and cannot route
+        htlc_utilization = active_htlcs / max_htlcs if max_htlcs > 0 else 0.0
+        is_congested = htlc_utilization > self.config.htlc_congestion_threshold
+        
+        if is_congested:
+            # Channel is slot-congested - override flow state
+            state = ChannelState.CONGESTED
+            self.plugin.log(
+                f"Channel {channel_id} is CONGESTED: {active_htlcs}/{max_htlcs} "
+                f"HTLC slots used ({htlc_utilization:.1%})"
+            )
+        elif has_flow_data:
             # Use actual flow data for classification
             if flow_ratio > self.config.source_threshold:
                 state = ChannelState.SOURCE
@@ -354,11 +414,24 @@ class FlowAnalyzer:
             flow_ratio=flow_ratio,
             state=state,
             daily_volume=daily_volume,
-            analysis_window_days=self.config.flow_window_days
+            analysis_window_days=self.config.flow_window_days,
+            htlc_min=htlc_min,
+            htlc_max=htlc_max,
+            active_htlcs=active_htlcs,
+            max_htlcs=max_htlcs,
+            is_congested=is_congested
         )
     
     def _get_channels(self) -> List[Dict[str, Any]]:
-        """Get list of all channels from lightningd."""
+        """
+        Get list of all channels from lightningd with HTLC information.
+        
+        Extracts HTLC slot limits and current usage for congestion detection:
+        - htlc_minimum_msat: Minimum HTLC amount
+        - htlc_maximum_msat: Maximum HTLC amount
+        - max_accepted_htlcs: Maximum number of HTLCs allowed
+        - htlcs: List of currently active HTLCs
+        """
         try:
             result = self.plugin.rpc.listpeerchannels()
             channels = []
@@ -366,6 +439,19 @@ class FlowAnalyzer:
             # listpeerchannels returns channels grouped by peer
             for channel_info in result.get("channels", []):
                 if channel_info.get("state") == "CHANNELD_NORMAL":
+                    # Extract HTLC limits and current usage
+                    # htlc_minimum_msat and htlc_maximum_msat are our advertised limits
+                    channel_info["htlc_min_msat"] = channel_info.get("htlc_minimum_msat", 0)
+                    channel_info["htlc_max_msat"] = channel_info.get("htlc_maximum_msat", 0)
+                    
+                    # max_accepted_htlcs is the limit on concurrent HTLCs
+                    # Default is 483 per BOLT #2
+                    channel_info["max_htlcs"] = channel_info.get("max_accepted_htlcs", 483)
+                    
+                    # Count active HTLCs from the htlcs array
+                    htlcs = channel_info.get("htlcs", [])
+                    channel_info["active_htlcs"] = len(htlcs) if htlcs else 0
+                    
                     channels.append(channel_info)
             
             return channels

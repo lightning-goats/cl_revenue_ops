@@ -1,8 +1,8 @@
-# cl-revenue-ops Roadmap:
+# cl-revenue-ops Roadmap: Enterprise Grade
 
 This document outlines the development path to move `cl-revenue-ops` from a "Power User" tool to an "Enterprise Grade" routing engine suitable for managing high-liquidity nodes.
 
-## Phase 1: Capital Safety & Controls (In Progress)
+## Phase 1: Capital Safety & Controls (Completed)
 *Objective: Prevent the algorithm from over-spending on fees or exhausting operating capital during high-volatility periods.*
 
 - [x] **Global Daily Budgeting**: Implement a hard cap on total rebalancing fees paid per 24-hour rolling window.
@@ -19,18 +19,22 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - Rebalancing costs vs. Expected Profit
 - [ ] **Decision Logging**: Create a structured event log (JSON lines) separate from the debug log for auditing algorithmic choices.
 
-## Phase 3: Traffic Intelligence
+## Phase 3: Traffic Intelligence (Core Completed)
 *Objective: Optimize for quality liquidity and filter out noise/spam.*
 
-- [ ] **HTLC Slot Awareness**: 
+- [x] **HTLC Slot Awareness**: 
     - Monitor `htlc_max_concurrent` usage.
-    - Mark channels with >80% slot usage as `CONGESTED`.
+    - Mark channels with >80% (configurable) slot usage as `CONGESTED`.
     - Prevent rebalancing into congested channels (liquidity cannot be used).
-    - Apply fee premiums to congested channels.
-- [ ] **Reputation-Weighted Analysis**:
-    - Track HTLC failure rates per peer.
+- [x] **Reputation Tracking**:
+    - Track HTLC failure rates per peer in database.
+    - Resolve forward events to Peer IDs.
+- [x] **Reputation-Weighted Fees**:
     - Discount volume from peers with high failure rates (spam/probing) in the Hill Climbing algorithm.
     - Optimize fees based on *settled* revenue potential, not just attempted volume.
+- [ ] **Reputation Logic Refinements**:
+    - **Time-Windowing/Decay**: Implement a decay factor (e.g., multiply counts by 0.9 daily) so recent behavior outweighs ancient history.
+    - **Laplace Smoothing**: Apply statistical smoothing (e.g., `(success+1)/(total+2)`) to prevent extreme score swings on peers with low sample sizes.
 
 ## Phase 4: Stability & Scaling
 *Objective: Reduce network noise and handle high throughput.*

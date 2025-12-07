@@ -330,6 +330,29 @@ class EVRebalancer:
             )
             return None
         
+        # HTLC SLOT CONGESTION CHECK
+        # Don't pay fees to move liquidity into a channel that cannot route new
+        # payments due to HTLC slot exhaustion. Check both state and live data.
+        if dest_flow_state == "congested":
+            # Get HTLC counts from dest_info if available for logging
+            active_htlcs = dest_info.get("active_htlcs", "?")
+            max_htlcs = dest_info.get("max_htlcs", "?")
+            self.plugin.log(
+                f"Skipping rebalance: Channel {dest_channel} is slot-congested "
+                f"({active_htlcs}/{max_htlcs}). Cannot route new payments."
+            )
+            return None
+        
+        # Also check live HTLC data from dest_info (in case state is stale)
+        active_htlcs = dest_info.get("active_htlcs", 0)
+        max_htlcs = dest_info.get("max_htlcs", 483)
+        if max_htlcs > 0 and active_htlcs / max_htlcs > self.config.htlc_congestion_threshold:
+            self.plugin.log(
+                f"Skipping rebalance: Channel {dest_channel} is slot-congested "
+                f"({active_htlcs}/{max_htlcs}). Cannot route new payments."
+            )
+            return None
+        
         # Check channel profitability if analyzer is available
         # Skip or deprioritize underwater/zombie channels
         channel_profitability = None
@@ -1440,10 +1463,10 @@ class EVRebalancer:
     
     def _get_channels_with_balances(self) -> Dict[str, Dict[str, Any]]:
         """
-        Get all channels with their current balances.
+        Get all channels with their current balances and HTLC information.
         
         Returns:
-            Dict mapping channel_id to channel info including balances
+            Dict mapping channel_id to channel info including balances and HTLC data
         """
         channels = {}
         
@@ -1475,6 +1498,13 @@ class EVRebalancer:
                 fee_base = local_updates.get("fee_base_msat") or channel.get("fee_base_msat", 0)
                 fee_ppm = local_updates.get("fee_proportional_millionths") or channel.get("fee_proportional_millionths", 0)
                 
+                # Extract HTLC limits and current usage for congestion detection
+                htlc_min = channel.get("htlc_minimum_msat", 0)
+                htlc_max = channel.get("htlc_maximum_msat", 0)
+                max_htlcs = channel.get("max_accepted_htlcs", 483)  # Default per BOLT #2
+                htlcs = channel.get("htlcs", [])
+                active_htlcs = len(htlcs) if htlcs else 0
+                
                 channels[channel_id] = {
                     "channel_id": channel_id,
                     "peer_id": channel.get("peer_id", ""),
@@ -1482,7 +1512,11 @@ class EVRebalancer:
                     "spendable_sats": spendable_msat // 1000,
                     "receivable_sats": receivable_msat // 1000,
                     "fee_base_msat": fee_base,
-                    "fee_ppm": fee_ppm
+                    "fee_ppm": fee_ppm,
+                    "htlc_min_msat": htlc_min,
+                    "htlc_max_msat": htlc_max,
+                    "max_htlcs": max_htlcs,
+                    "active_htlcs": active_htlcs
                 }
                 
         except RpcError as e:

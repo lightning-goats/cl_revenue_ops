@@ -201,6 +201,17 @@ class Database:
             )
         """)
         
+        # Peer reputation tracking for routing success rates
+        # Used to evaluate peer reliability for traffic intelligence
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_reputation (
+                peer_id TEXT PRIMARY KEY,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_update INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
@@ -623,6 +634,60 @@ class Database:
         # Convert msat to sats
         return (row['total_out_msat'] // 1000) if row else 0
     
+    def get_weighted_volume_since(self, channel_id: str, timestamp: int) -> int:
+        """
+        Get reputation-weighted outbound volume for a channel since a timestamp.
+        
+        This method weights each forward by the reputation score of the incoming
+        peer. Peers with high failure rates have their volume discounted, preventing
+        spammy peers from influencing fee decisions.
+        
+        Effective Volume = Raw Volume * Peer_Success_Rate
+        
+        The calculation:
+        1. Select forwards where out_channel = channel_id and time > timestamp
+        2. Join forwards.in_channel with channel_states.channel_id to find peer_id
+        3. Join peer_id with peer_reputation to get success/failure counts
+        4. Calculate score = success_count / (success_count + failure_count)
+        5. Edge case: If total == 0 or peer not found, score = 1.0 (innocent until proven guilty)
+        6. Return SUM(forwards.out_msat * score) in satoshis
+        
+        Args:
+            channel_id: Channel to get weighted volume for
+            timestamp: Unix timestamp to start counting from
+            
+        Returns:
+            Total reputation-weighted outbound volume in satoshis
+        """
+        conn = self._get_connection()
+        
+        # Advanced SQL JOIN query with division-by-zero protection
+        # We use COALESCE and CASE to handle:
+        # - Peers not in peer_reputation table (score = 1.0)
+        # - Peers with zero total counts (score = 1.0)
+        # - Channels not in channel_states table (score = 1.0)
+        row = conn.execute("""
+            SELECT COALESCE(
+                SUM(
+                    f.out_msat * 
+                    CASE 
+                        WHEN pr.success_count IS NULL THEN 1.0
+                        WHEN (pr.success_count + pr.failure_count) = 0 THEN 1.0
+                        ELSE CAST(pr.success_count AS REAL) / 
+                             CAST(pr.success_count + pr.failure_count AS REAL)
+                    END
+                ),
+                0
+            ) as weighted_out_msat
+            FROM forwards f
+            LEFT JOIN channel_states cs ON f.in_channel = cs.channel_id
+            LEFT JOIN peer_reputation pr ON cs.peer_id = pr.peer_id
+            WHERE f.out_channel = ? AND f.timestamp > ?
+        """, (channel_id, timestamp)).fetchone()
+        
+        # Convert msat to sats
+        return int(row['weighted_out_msat'] // 1000) if row else 0
+    
     def get_daily_volume(self, days: int = 7) -> int:
         """Get total routing volume over the past N days."""
         conn = self._get_connection()
@@ -853,6 +918,106 @@ class Database:
         conn = self._get_connection()
         rows = conn.execute("SELECT * FROM channel_failures").fetchall()
         return {row["channel_id"]: (row["failure_count"], row["last_failure_time"]) for row in rows}
+    
+    # =========================================================================
+    # Peer Reputation Methods
+    # =========================================================================
+    
+    def update_peer_reputation(self, peer_id: str, is_success: bool):
+        """
+        Update peer reputation based on forward success or failure.
+        
+        Tracks success/failure counts for each peer to calculate routing
+        success rates. This data is used for traffic intelligence to
+        identify unreliable peers.
+        
+        Args:
+            peer_id: The peer's node ID
+            is_success: True if forward settled, False if failed
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        
+        if is_success:
+            conn.execute("""
+                INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
+                VALUES (?, 1, 0, ?)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    success_count = success_count + 1,
+                    last_update = excluded.last_update
+            """, (peer_id, now))
+        else:
+            conn.execute("""
+                INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
+                VALUES (?, 0, 1, ?)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    failure_count = failure_count + 1,
+                    last_update = excluded.last_update
+            """, (peer_id, now))
+    
+    def get_peer_reputation(self, peer_id: str) -> Dict[str, Any]:
+        """
+        Get reputation statistics for a peer.
+        
+        Args:
+            peer_id: The peer's node ID
+            
+        Returns:
+            Dict with 'successes', 'failures', and 'score' (success rate 0.0-1.0)
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT success_count, failure_count, last_update FROM peer_reputation WHERE peer_id = ?",
+            (peer_id,)
+        ).fetchone()
+        
+        if row:
+            successes = row["success_count"]
+            failures = row["failure_count"]
+            total = successes + failures
+            score = successes / total if total > 0 else 1.0  # Default to 1.0 if no data
+            return {
+                'successes': successes,
+                'failures': failures,
+                'score': score,
+                'last_update': row["last_update"]
+            }
+        
+        # No data yet - return default (assume reliable until proven otherwise)
+        return {
+            'successes': 0,
+            'failures': 0,
+            'score': 1.0,
+            'last_update': 0
+        }
+    
+    def get_all_peer_reputations(self) -> List[Dict[str, Any]]:
+        """
+        Get reputation statistics for all peers.
+        
+        Returns:
+            List of dicts with peer_id, successes, failures, and score
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT peer_id, success_count, failure_count, last_update FROM peer_reputation ORDER BY success_count + failure_count DESC"
+        ).fetchall()
+        
+        results = []
+        for row in rows:
+            successes = row["success_count"]
+            failures = row["failure_count"]
+            total = successes + failures
+            score = successes / total if total > 0 else 1.0
+            results.append({
+                'peer_id': row["peer_id"],
+                'successes': successes,
+                'failures': failures,
+                'score': score,
+                'last_update': row["last_update"]
+            })
+        
+        return results
     
     # =========================================================================
     # Cleanup Methods

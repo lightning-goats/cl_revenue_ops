@@ -246,7 +246,14 @@ class HillClimbingFeeController:
         
         # RATE-BASED FEEDBACK: Get volume SINCE LAST FEE CHANGE (not 7-day average)
         # This eliminates the lag from averaging that made the controller blind
-        volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
+        #
+        # REPUTATION-WEIGHTED VOLUME: If enabled, discount volume by peer success rate
+        # This prevents spammy peers with high failure rates from influencing fees
+        # Effective Volume = Raw Volume * Peer_Success_Rate
+        if self.config.enable_reputation:
+            volume_since_sats = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
+        else:
+            volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
         
         # Calculate time elapsed since last update
         if hc_state.last_update > 0:
