@@ -219,6 +219,27 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_channels ON forwards(in_channel, out_channel)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_channel ON rebalance_costs(channel_id)")
         
+        # Schema migration: Add deadband hysteresis columns to fee_strategy_state
+        # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
+        try:
+            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN is_sleeping INTEGER DEFAULT 0")
+            self.plugin.log("Added is_sleeping column to fee_strategy_state")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        try:
+            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN sleep_until INTEGER DEFAULT 0")
+            self.plugin.log("Added sleep_until column to fee_strategy_state")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        # Schema migration: Add stable_cycles counter for hysteresis
+        try:
+            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN stable_cycles INTEGER DEFAULT 0")
+            self.plugin.log("Added stable_cycles column to fee_strategy_state")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
         self.plugin.log("Database initialized successfully")
     
     # =========================================================================
@@ -322,7 +343,8 @@ class Database:
             channel_id: Channel to get state for
             
         Returns:
-            Dict with last_revenue_rate, last_fee_ppm, trend_direction, step_ppm, etc.
+            Dict with last_revenue_rate, last_fee_ppm, trend_direction, step_ppm,
+            is_sleeping, sleep_until, stable_cycles, etc.
         """
         conn = self._get_connection()
         row = conn.execute(
@@ -339,6 +361,13 @@ class Database:
             # Ensure step_ppm is present (may be missing from old schema)
             if 'step_ppm' not in result:
                 result['step_ppm'] = 50  # Default step size
+            # Ensure hysteresis fields are present (may be missing from old schema)
+            if 'is_sleeping' not in result:
+                result['is_sleeping'] = 0
+            if 'sleep_until' not in result:
+                result['sleep_until'] = 0
+            if 'stable_cycles' not in result:
+                result['stable_cycles'] = 0
             return result
         
         # Return default state if not found
@@ -349,13 +378,19 @@ class Database:
             'trend_direction': 1,  # Default: try increasing fee
             'step_ppm': 50,  # Default step size for dampening
             'consecutive_same_direction': 0,
-            'last_update': 0
+            'last_update': 0,
+            'is_sleeping': 0,  # Deadband hysteresis: 0 = awake, 1 = sleeping
+            'sleep_until': 0,  # Unix timestamp when to wake up
+            'stable_cycles': 0  # Number of consecutive stable cycles
         }
     
     def update_fee_strategy_state(self, channel_id: str, last_revenue_rate: float,
                                    last_fee_ppm: int, trend_direction: int,
                                    step_ppm: int = 50,
-                                   consecutive_same_direction: int = 0):
+                                   consecutive_same_direction: int = 0,
+                                   is_sleeping: int = 0,
+                                   sleep_until: int = 0,
+                                   stable_cycles: int = 0):
         """
         Update Hill Climbing fee strategy state for a channel.
         
@@ -369,6 +404,9 @@ class Database:
             trend_direction: Direction we were moving (1 = up, -1 = down)
             step_ppm: Current step size (for wiggle dampening)
             consecutive_same_direction: How many times we've moved same way
+            is_sleeping: Deadband hysteresis sleep state (0 = awake, 1 = sleeping)
+            sleep_until: Unix timestamp when to wake up from sleep mode
+            stable_cycles: Number of consecutive stable cycles (for hysteresis)
         """
         conn = self._get_connection()
         now = int(time.time())
@@ -376,10 +414,12 @@ class Database:
         conn.execute("""
             INSERT OR REPLACE INTO fee_strategy_state 
             (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
-             step_ppm, consecutive_same_direction, last_update)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+             step_ppm, consecutive_same_direction, last_update,
+             is_sleeping, sleep_until, stable_cycles)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
-              step_ppm, consecutive_same_direction, now))
+              step_ppm, consecutive_same_direction, now,
+              is_sleeping, sleep_until, stable_cycles))
     
     def get_all_fee_strategy_states(self) -> List[Dict[str, Any]]:
         """Get fee strategy state for all channels."""

@@ -7,28 +7,45 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 
 - [x] **Global Daily Budgeting**: Implement a hard cap on total rebalancing fees paid per 24-hour rolling window.
 - [x] **Wallet Reserve Protection**: Suspend all operations if on-chain or off-chain liquid funds drop below a safe reserve threshold.
+- [ ] **Kelly Criterion Sizing**: (Optional) Dynamically scale rebalance budget based on the statistical certainty of the channel's revenue stream.
 
-## Phase 2: Observability (Completed)
+## Phase 2: Observability (High Priority)
 *Objective: "You cannot manage what you cannot measure." Provide real-time visualization of algorithmic decisions.*
 
-- [x] **Prometheus Metrics Exporter**: Expose a local HTTP endpoint to output time-series data for fees, revenue, ROI, and rebalancing.
+- [x] **Prometheus Metrics Exporter**: Expose a local HTTP endpoint (or `.prom` file writer) to output time-series data:
+    - Current Fee PPM per channel
+    - Calculated Revenue Rate (sats/hr)
+    - Marginal ROI
+    - Rebalancing costs vs. Expected Profit
+- [ ] **Decision Logging**: Create a structured event log (JSON lines) separate from the debug log for auditing algorithmic choices / backtesting.
 
-## Phase 3: Traffic Intelligence (Completed)
+## Phase 3: Traffic Intelligence (Core Completed)
 *Objective: Optimize for quality liquidity and filter out noise/spam.*
 
-- [x] **HTLC Slot Awareness**: Mark channels with >80% slot usage as `CONGESTED` and skip rebalancing.
-- [x] **Reputation Tracking**: Track HTLC failure rates per peer in database.
-- [x] **Reputation-Weighted Fees**: Discount volume from peers with high failure rates (spam/probing) in the Hill Climbing algorithm.
+- [x] **HTLC Slot Awareness**: 
+    - Monitor `htlc_max_concurrent` usage.
+    - Mark channels with >80% (configurable) slot usage as `CONGESTED`.
+    - Prevent rebalancing into congested channels (liquidity cannot be used).
+- [x] **Reputation Tracking**:
+    - Track HTLC failure rates per peer in database.
+    - Resolve forward events to Peer IDs.
+- [x] **Reputation-Weighted Fees**:
+    - Discount volume from peers with high failure rates (spam/probing) in the Hill Climbing algorithm.
+    - Optimize fees based on *settled* revenue potential, not just attempted volume.
+- [ ] **Reputation Logic Refinements**:
+    - **Time-Windowing/Decay**: Implement a decay factor (e.g., multiply counts by 0.9 daily) so recent behavior outweighs ancient history.
+    - **Laplace Smoothing**: Apply statistical smoothing (e.g., `(success+1)/(total+2)`) to prevent extreme score swings on peers with low sample sizes.
 
-## Phase 4: Stability & Scaling (Next)
+## Phase 4: Stability & Scaling (In Progress)
 *Objective: Reduce network noise and handle high throughput.*
 
-- [ ] **Deadband Hysteresis**:
+- [x] **Deadband Hysteresis**:
     - Detect "Market Calm" (low revenue variance).
     - Enter "Sleep Mode" for stable channels to reduce gossip noise (`channel_update` spam).
+    - Wake up immediately on revenue spikes.
 - [ ] **Async Job Queue**:
     - Refactor `rebalancer.py` to decouple decision-making from execution.
     - Allow concurrent rebalancing attempts (if supported by the underlying rebalancer plugin).
 
 ---
-*Roadmap updated: December 07, 2025*
+*Roadmap updated: December 08, 2025*

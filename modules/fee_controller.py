@@ -63,6 +63,9 @@ class HillClimbState:
         step_ppm: Current step size in PPM (subject to wiggle dampening)
         last_update: Timestamp of last update
         consecutive_same_direction: How many times we've moved in same direction
+        is_sleeping: Deadband hysteresis - True if channel is in sleep mode
+        sleep_until: Unix timestamp when to wake up from sleep mode
+        stable_cycles: Number of consecutive stable cycles (for entering sleep)
     """
     last_revenue_rate: float = 0.0  # Revenue rate in sats/hour
     last_fee_ppm: int = 0
@@ -70,6 +73,9 @@ class HillClimbState:
     step_ppm: int = 50  # Current step size (decays on reversal)
     last_update: int = 0
     consecutive_same_direction: int = 0
+    is_sleeping: bool = False  # Deadband hysteresis sleep state
+    sleep_until: int = 0  # Unix timestamp when to wake up
+    stable_cycles: int = 0  # Consecutive stable cycles counter
 
 
 @dataclass
@@ -132,6 +138,13 @@ class HillClimbingFeeController:
     DAMPENING_FACTOR = 0.8  # Step size decay factor on direction reversal (wiggle dampening)
     MIN_OBSERVATION_HOURS = 1.0  # Minimum hours between fee changes for valid signal
     VOLATILITY_THRESHOLD = 0.50  # 50% change in revenue rate triggers volatility reset
+    
+    # Deadband Hysteresis parameters (Phase 4: Stability & Scaling)
+    # These reduce gossip noise by suppressing fee updates when the market is stable
+    STABILITY_THRESHOLD = 0.01   # 1% change - consider market stable if below this
+    WAKE_UP_THRESHOLD = 0.20     # 20% revenue spike triggers immediate wake-up
+    SLEEP_CYCLES = 4             # Sleep for 4x the fee interval
+    STABLE_CYCLES_REQUIRED = 3   # Number of flat cycles before entering sleep mode
     
     def __init__(self, plugin: Plugin, config: Config, database: Database, 
                  clboss_manager: ClbossManager,
@@ -248,6 +261,69 @@ class HillClimbingFeeController:
         
         now = int(time.time())
         
+        # =====================================================================
+        # DEADBAND HYSTERESIS: Sleep Status Check (Phase 4: Stability & Scaling)
+        # Reduces gossip noise by suppressing fee updates when the market is stable
+        # =====================================================================
+        if hc_state.is_sleeping:
+            # Check if it's time to wake up (sleep timer expired)
+            if now > hc_state.sleep_until:
+                # Timer expired - wake up
+                hc_state.is_sleeping = False
+                hc_state.sleep_until = 0
+                hc_state.stable_cycles = 0
+                self._save_hill_climb_state(channel_id, hc_state)
+                self.plugin.log(
+                    f"HYSTERESIS: Channel {channel_id[:12]}... waking up (sleep timer expired)",
+                    level='info'
+                )
+            else:
+                # Still within sleep period - check for revenue spike that should wake us
+                # Calculate current revenue rate to detect significant changes
+                if self.config.enable_reputation:
+                    volume_since_sats = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
+                else:
+                    volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
+                
+                hours_elapsed = (now - hc_state.last_update) / 3600.0 if hc_state.last_update > 0 else 1.0
+                hours_elapsed = max(hours_elapsed, 0.1)  # Prevent division by zero
+                
+                revenue_sats = (volume_since_sats * current_fee_ppm) // 1_000_000
+                current_revenue_rate = revenue_sats / hours_elapsed
+                
+                # Calculate percent change from last known rate
+                last_rate = max(1.0, hc_state.last_revenue_rate)  # Avoid division by zero
+                delta = abs(current_revenue_rate - hc_state.last_revenue_rate)
+                percent_change = delta / last_rate
+                
+                if percent_change > self.WAKE_UP_THRESHOLD:
+                    # Significant revenue spike detected - wake up immediately!
+                    hc_state.is_sleeping = False
+                    hc_state.sleep_until = 0
+                    hc_state.stable_cycles = 0
+                    self._save_hill_climb_state(channel_id, hc_state)
+                    self.plugin.log(
+                        f"HYSTERESIS: Channel {channel_id[:12]}... waking up due to revenue spike "
+                        f"({percent_change:.0%} change, threshold={self.WAKE_UP_THRESHOLD:.0%})",
+                        level='info'
+                    )
+                else:
+                    # No significant change - stay asleep, skip this adjustment cycle
+                    self.plugin.log(
+                        f"HYSTERESIS: Channel {channel_id[:12]}... sleeping "
+                        f"(wake in {(hc_state.sleep_until - now) // 60} min)",
+                        level='debug'
+                    )
+                    # Export sleep state metric (Observability)
+                    if self.metrics:
+                        self.metrics.set_gauge(
+                            MetricNames.CHANNEL_IS_SLEEPING,
+                            1,
+                            {"channel_id": channel_id, "peer_id": peer_id},
+                            METRIC_HELP.get(MetricNames.CHANNEL_IS_SLEEPING, "")
+                        )
+                    return None
+        
         # RATE-BASED FEEDBACK: Get volume SINCE LAST FEE CHANGE (not 7-day average)
         # This eliminates the lag from averaging that made the controller blind
         #
@@ -334,23 +410,67 @@ class HillClimbingFeeController:
         # curve has likely shifted significantly. A small dampened step (e.g., 10ppm)
         # won't adapt fast enough - we need to explore aggressively again.
         volatility_reset = False
+        rate_change_ratio = 0.0  # Track for hysteresis check
         if hc_state.last_update > 0 and hc_state.last_revenue_rate > 0:
             # Calculate percentage change in revenue rate (division-by-zero safe)
             delta = abs(current_revenue_rate - hc_state.last_revenue_rate)
-            change_ratio = delta / max(1.0, hc_state.last_revenue_rate)
+            rate_change_ratio = delta / max(1.0, hc_state.last_revenue_rate)
             
-            if change_ratio > self.VOLATILITY_THRESHOLD:
+            if rate_change_ratio > self.VOLATILITY_THRESHOLD:
                 # Large shift detected - reset step to default for aggressive exploration
                 old_step = step_ppm
                 step_ppm = self.STEP_PPM
                 volatility_reset = True
+                # Also reset stable cycles counter - market is volatile
+                hc_state.stable_cycles = 0
                 self.plugin.log(
                     f"VOLATILITY RESET {channel_id[:12]}...: revenue rate changed by "
-                    f"{change_ratio:.0%} (from {hc_state.last_revenue_rate:.2f} to "
+                    f"{rate_change_ratio:.0%} (from {hc_state.last_revenue_rate:.2f} to "
                     f"{current_revenue_rate:.2f} sats/hr). Resetting step from "
                     f"{old_step}ppm to {step_ppm}ppm for aggressive exploration.",
                     level='info'
                 )
+        
+        # =====================================================================
+        # DEADBAND HYSTERESIS: Enter Sleep Mode Check (Phase 4: Stability & Scaling)
+        # If the market is stable (low rate change), increment stable_cycles.
+        # After STABLE_CYCLES_REQUIRED consecutive stable cycles, enter sleep mode.
+        # =====================================================================
+        if hc_state.last_update > 0 and rate_change_ratio < self.STABILITY_THRESHOLD:
+            # Market is stable - increment stable cycles counter
+            hc_state.stable_cycles += 1
+            
+            if hc_state.stable_cycles >= self.STABLE_CYCLES_REQUIRED:
+                # Enough stable cycles - enter sleep mode
+                sleep_duration_seconds = self.config.fee_interval * self.SLEEP_CYCLES
+                hc_state.is_sleeping = True
+                hc_state.sleep_until = now + sleep_duration_seconds
+                
+                # Update state for tracking before sleeping
+                hc_state.last_revenue_rate = current_revenue_rate
+                hc_state.last_fee_ppm = current_fee_ppm
+                hc_state.last_update = now
+                self._save_hill_climb_state(channel_id, hc_state)
+                
+                self.plugin.log(
+                    f"HYSTERESIS: Market Calm - Channel {channel_id[:12]}... entering sleep mode "
+                    f"({hc_state.stable_cycles} stable cycles, rate_change={rate_change_ratio:.1%}). "
+                    f"Sleeping for {sleep_duration_seconds // 60} minutes.",
+                    level='info'
+                )
+                # Export sleep state metric (Observability)
+                if self.metrics:
+                    self.metrics.set_gauge(
+                        MetricNames.CHANNEL_IS_SLEEPING,
+                        1,
+                        {"channel_id": channel_id, "peer_id": peer_id},
+                        METRIC_HELP.get(MetricNames.CHANNEL_IS_SLEEPING, "")
+                    )
+                return None  # Do not update fee this cycle
+        else:
+            # Market is not stable - reset stable cycles counter
+            if rate_change_ratio >= self.STABILITY_THRESHOLD:
+                hc_state.stable_cycles = 0
         
         # Determine new direction based on revenue rate change
         if hc_state.last_update == 0:
@@ -448,6 +568,14 @@ class HillClimbingFeeController:
                     current_revenue_rate,
                     labels,
                     METRIC_HELP.get(MetricNames.CHANNEL_REVENUE_RATE_SATS_HR, "")
+                )
+                
+                # Gauge: Sleep state (0 = awake, actively adjusting)
+                self.metrics.set_gauge(
+                    MetricNames.CHANNEL_IS_SLEEPING,
+                    0,
+                    labels,
+                    METRIC_HELP.get(MetricNames.CHANNEL_IS_SLEEPING, "")
                 )
             
             return FeeAdjustment(
@@ -660,7 +788,8 @@ class HillClimbingFeeController:
         Get Hill Climbing state for a channel.
         
         Checks in-memory cache first, then database.
-        Updated to use rate-based feedback (last_revenue_rate) and step_ppm.
+        Updated to use rate-based feedback (last_revenue_rate), step_ppm,
+        and deadband hysteresis fields (is_sleeping, sleep_until, stable_cycles).
         """
         if channel_id in self._hill_climb_states:
             return self._hill_climb_states[channel_id]
@@ -674,14 +803,17 @@ class HillClimbingFeeController:
             trend_direction=db_state.get("trend_direction", 1),
             step_ppm=db_state.get("step_ppm", self.STEP_PPM),
             last_update=db_state.get("last_update", 0),
-            consecutive_same_direction=db_state.get("consecutive_same_direction", 0)
+            consecutive_same_direction=db_state.get("consecutive_same_direction", 0),
+            is_sleeping=bool(db_state.get("is_sleeping", 0)),
+            sleep_until=db_state.get("sleep_until", 0),
+            stable_cycles=db_state.get("stable_cycles", 0)
         )
         
         self._hill_climb_states[channel_id] = hc_state
         return hc_state
     
     def _save_hill_climb_state(self, channel_id: str, state: HillClimbState):
-        """Save Hill Climbing state to cache and database."""
+        """Save Hill Climbing state to cache and database (including hysteresis fields)."""
         self._hill_climb_states[channel_id] = state
         self.database.update_fee_strategy_state(
             channel_id=channel_id,
@@ -689,7 +821,10 @@ class HillClimbingFeeController:
             last_fee_ppm=state.last_fee_ppm,
             trend_direction=state.trend_direction,
             step_ppm=state.step_ppm,
-            consecutive_same_direction=state.consecutive_same_direction
+            consecutive_same_direction=state.consecutive_same_direction,
+            is_sleeping=1 if state.is_sleeping else 0,
+            sleep_until=state.sleep_until,
+            stable_cycles=state.stable_cycles
         )
     
     def _get_channels_info(self) -> Dict[str, Dict[str, Any]]:

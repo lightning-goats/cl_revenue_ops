@@ -386,6 +386,9 @@ class MetricNames:
     PEER_SUCCESS_COUNT = "cl_revenue_peer_success_count"
     PEER_FAILURE_COUNT = "cl_revenue_peer_failure_count"
     
+    # Deadband Hysteresis metrics (Gauges)
+    CHANNEL_IS_SLEEPING = "cl_revenue_channel_is_sleeping"
+    
     # System health metrics (Gauges)
     SYSTEM_LAST_RUN_TIMESTAMP = "cl_revenue_system_last_run_timestamp_seconds"
 
@@ -402,5 +405,6 @@ METRIC_HELP = {
     MetricNames.PEER_REPUTATION_SCORE: "Peer reputation score (success rate 0.0 to 1.0)",
     MetricNames.PEER_SUCCESS_COUNT: "Total successful forwards from peer",
     MetricNames.PEER_FAILURE_COUNT: "Total failed forwards from peer",
+    MetricNames.CHANNEL_IS_SLEEPING: "1 if channel is in Deadband Hysteresis (sleep mode), 0 otherwise",
     MetricNames.SYSTEM_LAST_RUN_TIMESTAMP: "Unix timestamp of last successful task run (for health monitoring)",
 }
