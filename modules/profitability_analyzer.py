@@ -847,7 +847,6 @@ class ChannelProfitabilityAnalyzer:
         channels to appear as massive losses.
         
         Detection criteria:
-        - open_cost >= capacity_sats (impossible - fee can't exceed channel size)
         - open_cost >= 90% of capacity (almost certainly the funding amount)
         
         Args:
@@ -860,20 +859,17 @@ class ChannelProfitabilityAnalyzer:
         Returns:
             Corrected open_cost value (either validated original, re-queried, or fallback)
         """
-        # Only flag as invalid if open_cost is >= 90% of capacity
-        # This is a clear indicator that the funding amount was recorded as fee
-        # Normal on-chain fees are typically 0.1-5% of channel size at most
-        is_invalid = open_cost >= (capacity_sats * 0.90)
+        # Flag as invalid if open_cost is >= 90% of capacity
+        threshold = capacity_sats * 0.90
         
-        if not is_invalid:
+        if open_cost < threshold:
             return open_cost  # Value looks reasonable
         
         # DETECTED INVALID OPEN COST - trigger self-healing
         self.plugin.log(
-            f"SANITY CHECK: Detected invalid open_cost for {channel_id}: "
-            f"{open_cost} sats (capacity: {capacity_sats} sats). "
-            f"Capital likely counted as expense. Triggering recalculation.",
-            level='warn'
+            f"Sanity check for {channel_id}: Value {open_cost} is >= 90% of "
+            f"Capacity {capacity_sats} - flagging as invalid. Triggering recalculation.",
+            level='debug'
         )
         
         # Step 1: Force re-query from bookkeeper
@@ -882,11 +878,11 @@ class ChannelProfitabilityAnalyzer:
             corrected_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
         
         # Step 2: Validate the re-queried value - reject if still >= 90% of capacity
-        if corrected_cost is not None and corrected_cost >= (capacity_sats * 0.90):
+        if corrected_cost is not None and corrected_cost >= threshold:
             self.plugin.log(
-                f"Re-query still returned invalid value ({corrected_cost} sats). "
-                f"Discarding and using fallback.",
-                level='warn'
+                f"Re-query for {channel_id} still returned invalid value "
+                f"({corrected_cost} sats >= 90% of {capacity_sats}). Using fallback.",
+                level='debug'
             )
             corrected_cost = None
         
@@ -894,14 +890,15 @@ class ChannelProfitabilityAnalyzer:
         if corrected_cost is None:
             corrected_cost = self.config.estimated_open_cost_sats
             self.plugin.log(
-                f"Using fallback estimated_open_cost_sats: {corrected_cost} sats",
+                f"Fallback triggered for {channel_id}: using estimated_open_cost_sats "
+                f"({corrected_cost} sats)",
                 level='info'
             )
         else:
             self.plugin.log(
                 f"Corrected open_cost for {channel_id}: {corrected_cost} sats "
                 f"(was: {open_cost} sats)",
-                level='info'
+                level='debug'
             )
         
         # Step 4: Update database with corrected value (self-healing)
@@ -924,7 +921,8 @@ class ChannelProfitabilityAnalyzer:
         the account is named by the funding txid (bytes reversed).
         
         HARDENED: Now validates that found fee is actually a fee and not
-        the funding output amount (principal capital).
+        the funding output amount (principal capital). Events with amounts
+        >= 90% of capacity are skipped as they are likely the funding principal.
         
         Args:
             funding_txid: The funding transaction ID
@@ -946,6 +944,9 @@ class ChannelProfitabilityAnalyzer:
             
             events = result.get("events", [])
             
+            # Calculate threshold for detecting funding principal vs mining fee
+            threshold = capacity_sats * 0.90 if capacity_sats > 0 else 0
+            
             # Look for onchain_fee events with debit (fee paid)
             # The fee is the debit_msat on the channel's onchain_fee event
             for event in events:
@@ -959,9 +960,14 @@ class ChannelProfitabilityAnalyzer:
                     if credit_msat > 0:
                         fee_sats = credit_msat // 1000
                         
-                        # HARDENING: Validate this is actually a fee, not the funding amount
-                        if not self._is_valid_fee_amount(fee_sats, capacity_sats, funding_txid):
-                            continue  # Skip this event, look for others
+                        # CRUCIAL: Skip if fee_sats >= 90% of capacity (likely funding principal)
+                        if threshold > 0 and fee_sats >= threshold:
+                            self.plugin.log(
+                                f"Ignored event with amount {fee_sats} sats (likely funding principal, "
+                                f">= 90% of capacity {capacity_sats})",
+                                level='debug'
+                            )
+                            continue  # Skip this event, look for the actual fee
                         
                         self.plugin.log(
                             f"Found actual open cost for {funding_txid}: {fee_sats} sats",
@@ -985,9 +991,14 @@ class ChannelProfitabilityAnalyzer:
                     if debit_msat > 0:
                         fee_sats = debit_msat // 1000
                         
-                        # HARDENING: Validate this is actually a fee, not the funding amount
-                        if not self._is_valid_fee_amount(fee_sats, capacity_sats, funding_txid):
-                            continue  # Skip this event, look for others
+                        # CRUCIAL: Skip if fee_sats >= 90% of capacity (likely funding principal)
+                        if threshold > 0 and fee_sats >= threshold:
+                            self.plugin.log(
+                                f"Ignored wallet event with amount {fee_sats} sats (likely funding principal, "
+                                f">= 90% of capacity {capacity_sats})",
+                                level='debug'
+                            )
+                            continue  # Skip this event, look for the actual fee
                         
                         self.plugin.log(
                             f"Found wallet open cost for {funding_txid}: {fee_sats} sats",
@@ -1011,6 +1022,9 @@ class ChannelProfitabilityAnalyzer:
         This catches the bug where bookkeeper returns the channel capacity
         (funding output) instead of the actual on-chain mining fee.
         
+        NOTE: This method is kept for backward compatibility but the primary
+        validation is now done inline in _get_open_cost_from_bookkeeper.
+        
         Args:
             fee_sats: The fee amount to validate
             capacity_sats: Channel capacity in sats
@@ -1026,9 +1040,8 @@ class ChannelProfitabilityAnalyzer:
         # Reject if fee >= 90% of capacity - this is clearly the funding amount
         if fee_sats >= capacity_sats * 0.90:
             self.plugin.log(
-                f"Rejecting invalid fee ({fee_sats} sats) for {funding_txid}: "
-                f"equals/exceeds 90% of capacity ({capacity_sats} sats). "
-                f"This is likely the funding output, not the mining fee.",
+                f"Rejecting fee {fee_sats} sats for {funding_txid}: "
+                f"value is >= 90% of capacity ({capacity_sats} sats)",
                 level='debug'
             )
             return False
