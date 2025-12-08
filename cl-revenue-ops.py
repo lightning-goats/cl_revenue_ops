@@ -771,6 +771,28 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
             elif status in ("failed", "local_failed"):
                 # Failure - increment failure count
                 database.update_peer_reputation(peer_id, is_success=False)
+            
+            # Real-time metrics update (Phase 2: Observability)
+            # Update Prometheus metrics immediately after DB update
+            if metrics_exporter:
+                rep = database.get_peer_reputation(peer_id)
+                labels = {"peer_id": peer_id}
+                
+                metrics_exporter.set_gauge(
+                    MetricNames.PEER_REPUTATION_SCORE,
+                    rep.get('score', 1.0),
+                    labels
+                )
+                metrics_exporter.set_gauge(
+                    MetricNames.PEER_SUCCESS_COUNT,
+                    rep.get('successes', 0),
+                    labels
+                )
+                metrics_exporter.set_gauge(
+                    MetricNames.PEER_FAILURE_COUNT,
+                    rep.get('failures', 0),
+                    labels
+                )
     
     # Record successful forwards for flow metrics
     if status == "settled":
