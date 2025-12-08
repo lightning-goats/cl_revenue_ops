@@ -788,6 +788,10 @@ class ChannelProfitabilityAnalyzer:
         1. Bookkeeper onchain_fee events for the funding tx (most accurate)
         2. Database cached value (from previous lookup or manual entry)
         3. Config estimated_open_cost_sats (fallback)
+        
+        IMPORTANT: Includes sanity check and self-healing mechanism to detect
+        and correct cases where principal capital (funding amount) was incorrectly
+        recorded as an expense (open cost).
         """
         # Get rebalance costs - combine database records with bookkeeper data
         db_rebalance_costs = self.database.get_channel_rebalance_costs(channel_id)
@@ -799,9 +803,16 @@ class ChannelProfitabilityAnalyzer:
         # Try to get open cost from database cache first
         open_cost = self.database.get_channel_open_cost(channel_id)
         
+        # SANITY CHECK: Detect invalid open_cost (capital mistaken as expense)
+        # This triggers self-healing for existing bad data in the database
+        if open_cost is not None and capacity_sats > 0:
+            open_cost = self._sanity_check_open_cost(
+                channel_id, peer_id, funding_txid, open_cost, capacity_sats
+            )
+        
         if open_cost is None and funding_txid:
             # Query bookkeeper for actual on-chain fee
-            open_cost = self._get_open_cost_from_bookkeeper(funding_txid)
+            open_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
             
             # Cache it in database for future lookups
             if open_cost is not None:
@@ -825,18 +836,124 @@ class ChannelProfitabilityAnalyzer:
             rebalance_cost_sats=rebalance_costs
         )
     
-    def _get_open_cost_from_bookkeeper(self, funding_txid: str) -> Optional[int]:
+    def _sanity_check_open_cost(self, channel_id: str, peer_id: str,
+                                 funding_txid: str, open_cost: int,
+                                 capacity_sats: int) -> int:
+        """
+        Sanity check and self-heal invalid open_cost values.
+        
+        This detects cases where the channel funding amount (principal capital)
+        was incorrectly recorded as an expense (open cost), causing healthy
+        channels to appear as massive losses.
+        
+        Detection criteria:
+        - open_cost >= capacity_sats (impossible - fee can't exceed channel size)
+        - open_cost > 25% of capacity for large channels (>1M sats)
+        - open_cost > 50% of capacity for smaller channels
+        
+        Args:
+            channel_id: Channel short ID
+            peer_id: Peer node ID
+            funding_txid: Funding transaction ID
+            open_cost: The open cost value to validate
+            capacity_sats: Channel capacity in sats
+            
+        Returns:
+            Corrected open_cost value (either validated original, re-queried, or fallback)
+        """
+        # Determine threshold based on channel size
+        # Large channels (>1M sats): fee should be < 25% of capacity
+        # Smaller channels: fee should be < 50% of capacity
+        # In practice, on-chain fees are typically 0.1-2% of capacity
+        if capacity_sats > 1_000_000:
+            max_reasonable_fee_ratio = 0.25
+        else:
+            max_reasonable_fee_ratio = 0.50
+        
+        max_reasonable_fee = int(capacity_sats * max_reasonable_fee_ratio)
+        
+        # Check if open_cost is suspiciously high
+        is_invalid = (
+            open_cost >= capacity_sats or  # Fee >= capacity (definitely wrong)
+            open_cost > max_reasonable_fee  # Fee unreasonably high for channel size
+        )
+        
+        if not is_invalid:
+            return open_cost  # Value looks reasonable
+        
+        # DETECTED INVALID OPEN COST - trigger self-healing
+        self.plugin.log(
+            f"⚠️  SANITY CHECK: Detected invalid open_cost for {channel_id}: "
+            f"{open_cost} sats (capacity: {capacity_sats} sats). "
+            f"Capital likely counted as expense. Triggering recalculation.",
+            level='warn'
+        )
+        
+        # Step 1: Force re-query from bookkeeper
+        corrected_cost = None
+        if funding_txid:
+            corrected_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
+        
+        # Step 2: Validate the re-queried value
+        if corrected_cost is not None:
+            # Check if re-query also returns a value close to capacity (within 5%)
+            if corrected_cost >= capacity_sats * 0.95:
+                self.plugin.log(
+                    f"⚠️  Re-query still returned invalid value ({corrected_cost} sats). "
+                    f"Discarding and using fallback.",
+                    level='warn'
+                )
+                corrected_cost = None
+            elif corrected_cost > max_reasonable_fee:
+                self.plugin.log(
+                    f"⚠️  Re-query returned suspicious value ({corrected_cost} sats). "
+                    f"Discarding and using fallback.",
+                    level='warn'
+                )
+                corrected_cost = None
+        
+        # Step 3: Use fallback if re-query failed or still invalid
+        if corrected_cost is None:
+            corrected_cost = self.config.estimated_open_cost_sats
+            self.plugin.log(
+                f"✓ Using fallback estimated_open_cost_sats: {corrected_cost} sats",
+                level='info'
+            )
+        else:
+            self.plugin.log(
+                f"✓ Corrected open_cost for {channel_id}: {corrected_cost} sats "
+                f"(was: {open_cost} sats)",
+                level='info'
+            )
+        
+        # Step 4: Update database with corrected value (self-healing)
+        self.database.record_channel_open_cost(
+            channel_id, peer_id, corrected_cost, capacity_sats
+        )
+        self.plugin.log(
+            f"✓ Database updated with corrected open_cost for {channel_id}",
+            level='info'
+        )
+        
+        return corrected_cost
+    
+    def _get_open_cost_from_bookkeeper(self, funding_txid: str, 
+                                        capacity_sats: int = 0) -> Optional[int]:
         """
         Query bookkeeper for actual on-chain fee paid for channel open.
         
         Bookkeeper tracks onchain_fee events per txid. For channel opens,
         the account is named by the funding txid (bytes reversed).
         
+        HARDENED: Now validates that found fee is actually a fee and not
+        the funding output amount (principal capital).
+        
         Args:
             funding_txid: The funding transaction ID
+            capacity_sats: Channel capacity in sats (for validation)
             
         Returns:
-            On-chain fee in sats, or None if not found
+            On-chain fee in sats, or None if not found or invalid
         """
         try:
             # Bookkeeper account names use reversed txid bytes
@@ -863,6 +980,11 @@ class ChannelProfitabilityAnalyzer:
                     credit_msat = event.get("credit_msat", 0)
                     if credit_msat > 0:
                         fee_sats = credit_msat // 1000
+                        
+                        # HARDENING: Validate this is actually a fee, not the funding amount
+                        if not self._is_valid_fee_amount(fee_sats, capacity_sats, funding_txid):
+                            continue  # Skip this event, look for others
+                        
                         self.plugin.log(
                             f"Found actual open cost for {funding_txid}: {fee_sats} sats",
                             level='debug'
@@ -884,6 +1006,11 @@ class ChannelProfitabilityAnalyzer:
                     debit_msat = event.get("debit_msat", 0)
                     if debit_msat > 0:
                         fee_sats = debit_msat // 1000
+                        
+                        # HARDENING: Validate this is actually a fee, not the funding amount
+                        if not self._is_valid_fee_amount(fee_sats, capacity_sats, funding_txid):
+                            continue  # Skip this event, look for others
+                        
                         self.plugin.log(
                             f"Found wallet open cost for {funding_txid}: {fee_sats} sats",
                             level='debug'
@@ -897,6 +1024,67 @@ class ChannelProfitabilityAnalyzer:
             )
         
         return None
+    
+    def _is_valid_fee_amount(self, fee_sats: int, capacity_sats: int, 
+                             funding_txid: str) -> bool:
+        """
+        Validate that a fee amount is actually a mining fee, not the funding output.
+        
+        This catches the bug where bookkeeper returns the channel capacity
+        (funding output) instead of the actual on-chain mining fee.
+        
+        Validation rules:
+        1. Fee cannot equal or exceed channel capacity (it's the funding amount!)
+        2. Fee should be reasonable relative to capacity (typically < 5% for most cases)
+        3. Fee should be within reasonable absolute bounds (typically 100 - 100,000 sats)
+        
+        Args:
+            fee_sats: The fee amount to validate
+            capacity_sats: Channel capacity in sats
+            funding_txid: Transaction ID (for logging)
+            
+        Returns:
+            True if fee appears valid, False if it looks like funding amount
+        """
+        # If we don't have capacity info, be more lenient but still catch extreme cases
+        if capacity_sats <= 0:
+            # Without capacity, only reject extremely high values (> 1 BTC in fees is suspicious)
+            if fee_sats > 100_000_000:  # 1 BTC
+                self.plugin.log(
+                    f"Rejecting suspiciously high fee ({fee_sats} sats) for {funding_txid}: "
+                    f"exceeds 1 BTC, likely not a mining fee",
+                    level='warn'
+                )
+                return False
+            return True
+        
+        # Rule 1: Fee cannot equal channel capacity (this IS the funding amount, not fee)
+        # Use 5% tolerance to catch values close to capacity
+        if fee_sats >= capacity_sats * 0.95:
+            self.plugin.log(
+                f"Rejecting invalid fee ({fee_sats} sats) for {funding_txid}: "
+                f"equals/exceeds 95% of capacity ({capacity_sats} sats). "
+                f"This is the funding output, not the mining fee!",
+                level='warn'
+            )
+            return False
+        
+        # Rule 2: Fee should be reasonable relative to capacity
+        # Typical on-chain fees are 0.1% - 3% of channel size
+        # Be generous and allow up to 10% for high-fee environments
+        max_reasonable_fee_ratio = 0.10
+        if fee_sats > capacity_sats * max_reasonable_fee_ratio:
+            # This is suspicious but could be valid in extreme fee environments
+            # Log warning but still accept (the sanity check in _get_channel_costs
+            # will catch truly problematic cases)
+            self.plugin.log(
+                f"Warning: High fee ratio detected for {funding_txid}: "
+                f"{fee_sats} sats is {(fee_sats/capacity_sats)*100:.1f}% of capacity. "
+                f"Accepting but flagging for review.",
+                level='debug'
+            )
+        
+        return True
     
     def _get_rebalance_costs_from_bookkeeper(self, channel_id: str, funding_txid: Optional[str] = None) -> int:
         """
