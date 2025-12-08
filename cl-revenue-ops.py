@@ -187,6 +187,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-reputation-decay',
+    default='0.98',
+    description='Reputation decay factor applied per flow-interval (default: 0.98). 0.98^24 ≈ 0.61 daily decay.'
+)
+
+plugin.add_option(
     name='revenue-ops-enable-prometheus',
     default='false',
     description='If true, start Prometheus metrics exporter HTTP server (default: false)'
@@ -240,6 +246,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
         htlc_congestion_threshold=float(options['revenue-ops-htlc-congestion-threshold']),
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
+        reputation_decay=float(options['revenue-ops-reputation-decay']),
         enable_prometheus=options['revenue-ops-enable-prometheus'].lower() == 'true',
         prometheus_port=int(options['revenue-ops-prometheus-port'])
     )
@@ -372,6 +379,9 @@ def run_flow_analysis():
     
     Query bookkeeper to calculate the "Net Flow" of every channel over 
     the last N days. Calculate FlowRatio and mark channels as Source/Sink/Balanced.
+    
+    Also applies reputation decay to ensure recent peer behavior matters more
+    than ancient history.
     """
     if flow_analyzer is None:
         plugin.log("Flow analyzer not initialized", level='error')
@@ -386,6 +396,12 @@ def run_flow_analysis():
         sinks = sum(1 for r in results.values() if r.state == ChannelState.SINK)
         balanced = sum(1 for r in results.values() if r.state == ChannelState.BALANCED)
         plugin.log(f"Channel states: {sources} sources, {sinks} sinks, {balanced} balanced")
+        
+        # Apply reputation decay (Phase 3: Time-windowing)
+        # This ensures recent peer behavior matters more than ancient history
+        if database and config and config.enable_reputation:
+            database.decay_reputation(config.reputation_decay)
+            plugin.log(f"Applied reputation decay (factor={config.reputation_decay})")
         
     except Exception as e:
         plugin.log(f"Flow analysis failed: {e}", level='error')

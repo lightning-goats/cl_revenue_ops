@@ -75,6 +75,8 @@ class Config:
     
     # Reputation-weighted volume
     enable_reputation: bool = True  # If True, weight volume by peer success rate
+    reputation_decay: float = 0.98  # Decay factor per flow_interval (default hourly)
+                                     # 0.98^24 ≈ 0.61, meaning old data loses ~40% weight daily
     
     # Prometheus Metrics (Phase 2: Observability)
     enable_prometheus: bool = False  # If True, start Prometheus metrics exporter (disabled by default)

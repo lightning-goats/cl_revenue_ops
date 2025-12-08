@@ -701,20 +701,23 @@ class Database:
         """
         conn = self._get_connection()
         
-        # Advanced SQL JOIN query with division-by-zero protection
-        # We use COALESCE and CASE to handle:
-        # - Peers not in peer_reputation table (score = 1.0)
-        # - Peers with zero total counts (score = 1.0)
-        # - Channels not in channel_states table (score = 1.0)
+        # Advanced SQL JOIN query using Laplace Smoothing (add-one smoothing)
+        # Formula: Score = (success_count + 1) / (total_count + 2)
+        # 
+        # Laplace smoothing effects:
+        # - 0/0 -> (0+1)/(0+2) = 0.5 (Neutral start for new peers)
+        # - 0/1 -> (0+1)/(1+2) = 0.33 (Not harshly punished)
+        # - 100/100 -> (100+1)/(100+2) = 0.99 (Not perfect 1.0)
+        #
+        # For peers not in peer_reputation table, we use 0.5 (neutral)
         row = conn.execute("""
             SELECT COALESCE(
                 SUM(
                     f.out_msat * 
                     CASE 
-                        WHEN pr.success_count IS NULL THEN 1.0
-                        WHEN (pr.success_count + pr.failure_count) = 0 THEN 1.0
-                        ELSE CAST(pr.success_count AS REAL) / 
-                             CAST(pr.success_count + pr.failure_count AS REAL)
+                        WHEN pr.success_count IS NULL THEN 0.5
+                        ELSE CAST(pr.success_count + 1 AS REAL) / 
+                             CAST(pr.success_count + pr.failure_count + 2 AS REAL)
                     END
                 ),
                 0
@@ -999,11 +1002,19 @@ class Database:
         """
         Get reputation statistics for a peer.
         
+        Uses Laplace Smoothing (add-one smoothing) for the score calculation:
+        Score = (success_count + 1) / (total_count + 2)
+        
+        This provides better handling of edge cases:
+        - 0/0 -> 0.5 (Neutral start for new peers)
+        - 0/1 -> 0.33 (Not harshly punished for single failure)
+        - 100/100 -> 0.99 (Never reaches perfect 1.0)
+        
         Args:
             peer_id: The peer's node ID
             
         Returns:
-            Dict with 'successes', 'failures', and 'score' (success rate 0.0-1.0)
+            Dict with 'successes', 'failures', and 'score' (Laplace-smoothed rate 0.0-1.0)
         """
         conn = self._get_connection()
         row = conn.execute(
@@ -1014,8 +1025,8 @@ class Database:
         if row:
             successes = row["success_count"]
             failures = row["failure_count"]
-            total = successes + failures
-            score = successes / total if total > 0 else 1.0  # Default to 1.0 if no data
+            # Laplace smoothing: (successes + 1) / (total + 2)
+            score = (successes + 1) / (successes + failures + 2)
             return {
                 'successes': successes,
                 'failures': failures,
@@ -1023,11 +1034,11 @@ class Database:
                 'last_update': row["last_update"]
             }
         
-        # No data yet - return default (assume reliable until proven otherwise)
+        # No data yet - return default with Laplace smoothing: (0+1)/(0+2) = 0.5
         return {
             'successes': 0,
             'failures': 0,
-            'score': 1.0,
+            'score': 0.5,
             'last_update': 0
         }
     
@@ -1035,8 +1046,11 @@ class Database:
         """
         Get reputation statistics for all peers.
         
+        Uses Laplace Smoothing (add-one smoothing) for score calculation:
+        Score = (success_count + 1) / (total_count + 2)
+        
         Returns:
-            List of dicts with peer_id, successes, failures, and score
+            List of dicts with peer_id, successes, failures, and score (Laplace-smoothed)
         """
         conn = self._get_connection()
         rows = conn.execute(
@@ -1047,8 +1061,8 @@ class Database:
         for row in rows:
             successes = row["success_count"]
             failures = row["failure_count"]
-            total = successes + failures
-            score = successes / total if total > 0 else 1.0
+            # Laplace smoothing: (successes + 1) / (total + 2)
+            score = (successes + 1) / (successes + failures + 2)
             results.append({
                 'peer_id': row["peer_id"],
                 'successes': successes,
@@ -1058,6 +1072,44 @@ class Database:
             })
         
         return results
+    
+    def decay_reputation(self, decay_factor: float):
+        """
+        Apply time-based decay to all peer reputation counts.
+        
+        This implements reputation decay (time-windowing) so that recent behavior
+        matters more than ancient history. Should be called periodically (e.g., hourly).
+        
+        The decay formula multiplies all counts by the decay_factor:
+        - success_count = CAST(success_count * decay_factor AS INTEGER)
+        - failure_count = CAST(failure_count * decay_factor AS INTEGER)
+        
+        With decay_factor = 0.98 applied hourly:
+        - Daily decay: 0.98^24 ≈ 0.61 (old data loses ~40% weight daily)
+        - Weekly decay: 0.98^168 ≈ 0.03 (data from a week ago is nearly gone)
+        
+        This allows peers to recover from past failures relatively quickly while
+        still maintaining meaningful reputation data.
+        
+        Args:
+            decay_factor: Multiplier to apply to counts (e.g., 0.98)
+        """
+        conn = self._get_connection()
+        
+        # Apply decay to both success and failure counts
+        # Using CAST to INTEGER naturally floors the result
+        conn.execute("""
+            UPDATE peer_reputation 
+            SET success_count = CAST(success_count * ? AS INTEGER),
+                failure_count = CAST(failure_count * ? AS INTEGER)
+        """, (decay_factor, decay_factor))
+        
+        # Optionally clean up peers that have decayed to (0, 0)
+        # This prevents the table from growing indefinitely with stale entries
+        conn.execute("""
+            DELETE FROM peer_reputation 
+            WHERE success_count = 0 AND failure_count = 0
+        """)
     
     # =========================================================================
     # Cleanup Methods
