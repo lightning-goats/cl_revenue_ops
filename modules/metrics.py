@@ -247,35 +247,49 @@ class PrometheusExporter:
             
             def do_GET(self):
                 """Handle GET requests."""
-                if self.path in ('/', '/metrics'):
-                    try:
-                        content = exporter.format_prometheus()
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                        self.send_header('Content-Length', str(len(content)))
-                        self.end_headers()
-                        self.wfile.write(content.encode('utf-8'))
-                    except Exception as e:
-                        self.send_response(500)
+                try:
+                    if self.path in ('/', '/metrics'):
+                        try:
+                            content = exporter.format_prometheus()
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                            self.send_header('Content-Length', str(len(content)))
+                            self.end_headers()
+                            self.wfile.write(content.encode('utf-8'))
+                        except (BrokenPipeError, ConnectionResetError):
+                            # Client disconnected before we finished - this is normal
+                            pass
+                        except Exception as e:
+                            try:
+                                self.send_response(500)
+                                self.send_header('Content-Type', 'text/plain')
+                                self.end_headers()
+                                error_msg = f"Error generating metrics: {e}"
+                                self.wfile.write(error_msg.encode('utf-8'))
+                            except (BrokenPipeError, ConnectionResetError):
+                                pass
+                    else:
+                        self.send_response(404)
                         self.send_header('Content-Type', 'text/plain')
                         self.end_headers()
-                        error_msg = f"Error generating metrics: {e}"
-                        self.wfile.write(error_msg.encode('utf-8'))
-                else:
-                    self.send_response(404)
-                    self.send_header('Content-Type', 'text/plain')
-                    self.end_headers()
-                    self.wfile.write(b'Not Found. Try /metrics')
+                        self.wfile.write(b'Not Found. Try /metrics')
+                except (BrokenPipeError, ConnectionResetError):
+                    # Client disconnected - silently ignore
+                    pass
             
             def do_HEAD(self):
                 """Handle HEAD requests."""
-                if self.path in ('/', '/metrics'):
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                    self.end_headers()
-                else:
-                    self.send_response(404)
-                    self.end_headers()
+                try:
+                    if self.path in ('/', '/metrics'):
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                        self.end_headers()
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                except (BrokenPipeError, ConnectionResetError):
+                    # Client disconnected - silently ignore
+                    pass
         
         return MetricsHandler
     
