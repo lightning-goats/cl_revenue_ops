@@ -152,12 +152,6 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-rebalancer',
-    default='circular',
-    description='Which rebalancer plugin to use: circular or sling (default: circular)'
-)
-
-plugin.add_option(
     name='revenue-ops-daily-budget-sats',
     default='5000',
     description='Max rebalancing fees to spend in 24 hours (default: 5000)'

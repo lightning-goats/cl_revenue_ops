@@ -990,8 +990,8 @@ class EVRebalancer:
         """
         Execute a rebalance for the given candidate.
         
-        For sling: Starts an async background job
-        For circular: Executes synchronously (legacy behavior)
+        Uses the async JobManager to spawn sling background jobs.
+        This plugin acts as the "Strategist" while sling workers handle execution.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         self._pending[candidate.to_channel] = int(time.time())
@@ -1021,116 +1021,34 @@ class EVRebalancer:
                 )
                 return {"success": True, "message": "Dry run", "rebalance_id": rebalance_id}
 
-            # Route to appropriate rebalancer
-            if self.config.rebalancer_plugin == 'sling':
-                # Async execution via JobManager
-                res = self.job_manager.start_job(candidate, rebalance_id)
-                
-                if res.get("success"):
-                    # Update DB status to pending_async
-                    self.database.update_rebalance_result(rebalance_id, 'pending_async')
-                    result.update({
-                        "success": True, 
-                        "message": "Async job started",
-                        "rebalance_id": rebalance_id
-                    })
-                    self.plugin.log(
-                        f"Rebalance job queued: {candidate.to_channel} "
-                        f"(job #{self.job_manager.active_job_count})"
-                    )
-                else:
-                    error = res.get("error", "Failed to start job")
-                    self.database.update_rebalance_result(
-                        rebalance_id, 'failed', error_message=error
-                    )
-                    result["message"] = f"Failed: {error}"
-                    self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
-                    
-            elif self.config.rebalancer_plugin == 'circular':
-                # Synchronous execution (legacy)
-                res = self._execute_circular(candidate)
-                
-                if res.get("success"):
-                    fee = res.get("fee_sats", 0)
-                    self.database.update_rebalance_result(
-                        rebalance_id, 'success', fee, candidate.expected_profit_sats - fee
-                    )
-                    self.database.reset_failure_count(candidate.to_channel)
-                    if self.metrics:
-                        self.metrics.inc_counter(
-                            MetricNames.REBALANCE_COST_TOTAL_SATS, 
-                            fee, 
-                            {"channel_id": candidate.to_channel}
-                        )
-                    result.update({
-                        "success": True, 
-                        "actual_fee_sats": fee, 
-                        "message": "Success",
-                        "rebalance_id": rebalance_id
-                    })
-                    self.plugin.log(
-                        f"Rebalance SUCCESS: {candidate.to_channel} filled. Fee: {fee} sats."
-                    )
-                else:
-                    error = res.get("error", "Unknown error")
-                    self.database.update_rebalance_result(
-                        rebalance_id, 'failed', error_message=error
-                    )
-                    self.database.increment_failure_count(candidate.to_channel)
-                    result["message"] = f"Failed: {error}"
-                    self.plugin.log(f"Rebalance FAILED: {error}", level='warn')
+            # Async execution via JobManager (sling background jobs)
+            res = self.job_manager.start_job(candidate, rebalance_id)
+            
+            if res.get("success"):
+                # Update DB status to pending_async
+                self.database.update_rebalance_result(rebalance_id, 'pending_async')
+                result.update({
+                    "success": True, 
+                    "message": "Async job started",
+                    "rebalance_id": rebalance_id
+                })
+                self.plugin.log(
+                    f"Rebalance job queued: {candidate.to_channel} "
+                    f"(job #{self.job_manager.active_job_count})"
+                )
             else:
-                error = f"Unknown rebalancer: {self.config.rebalancer_plugin}"
-                self.database.update_rebalance_result(rebalance_id, 'failed', error_message=error)
-                result["message"] = error
+                error = res.get("error", "Failed to start job")
+                self.database.update_rebalance_result(
+                    rebalance_id, 'failed', error_message=error
+                )
+                result["message"] = f"Failed: {error}"
+                self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
 
         except Exception as e:
             result["message"] = str(e)
             self.plugin.log(f"Execution error: {e}", level='error')
         
         return result
-
-    def _execute_circular(self, candidate: RebalanceCandidate) -> Dict[str, Any]:
-        """
-        Execute circular rebalance (synchronous).
-        Signature: circular outscid inscid amount maxppm attempts maxhops
-        """
-        result = {"success": False}
-        max_attempts = 3
-        max_hops = 10
-        
-        # Normalize SCIDs to colon format
-        out_scid = candidate.from_channel.replace('x', ':')
-        in_scid = candidate.to_channel.replace('x', ':')
-        
-        self.plugin.log(
-            f"Executing circular: {out_scid} -> {in_scid}, max_ppm={candidate.max_fee_ppm}"
-        )
-        
-        for attempt in range(max_attempts):
-            try:
-                response = self.plugin.rpc.circular(
-                    out_scid, 
-                    in_scid, 
-                    candidate.amount_msat, 
-                    candidate.max_fee_ppm, 
-                    1,          # attempts per call
-                    max_hops
-                )
-                
-                if response.get("status") == "success":
-                    fee_msat = response.get("fee", 0)
-                    return {"success": True, "fee_sats": fee_msat // 1000, "fee_msat": fee_msat}
-                
-                self.plugin.log(
-                    f"Circular attempt {attempt+1} failed: {response.get('message')}", 
-                    level='debug'
-                )
-                time.sleep(1)
-            except Exception as e:
-                self.plugin.log(f"Circular RPC error: {e}", level='debug')
-        
-        return {"error": "Circular rebalance failed after retries"}
 
     def manual_rebalance(self, from_channel: str, to_channel: str, 
                          amount_sats: int, max_fee_sats: int = None) -> Dict[str, Any]:

@@ -37,7 +37,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - **Global Capital Controls**: Prevents over-spending with two safety checks:
   - **Daily Budget**: Limits total rebalancing fees to a configurable amount per 24 hours
   - **Wallet Reserve**: Aborts rebalancing if total spendable funds fall below minimum threshold
-- Supports both circular and sling rebalancer plugins
+- Uses sling for async background job execution
 
 ### Module 4: Channel Profitability Analyzer
 - Tracks costs per channel (opening costs + rebalancing costs)
@@ -100,8 +100,8 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 └─────────────┼─────────────────────────────┼────────────────────────────┘
               ▼                             ▼
        ┌──────────────┐              ┌──────────────┐
-       │   setchan    │              │   circular   │
-       │   -nelfee    │              │    /sling    │
+       │   setchan    │              │    sling     │
+       │   -nelfee    │              │  (async)     │
        └──────────────┘              └──────────────┘
               │
               ▼
@@ -118,7 +118,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 1. Core Lightning node running
 2. Python 3.8+
 3. bookkeeper plugin enabled (recommended) or just listforwards
-4. A rebalancer plugin installed (circular or sling)
+4. **cln-sling plugin** installed (required for rebalancing)
 5. clboss (optional, for full integration)
 
 ### Install Steps
@@ -158,7 +158,6 @@ All options can be set via `lightning-cli` at startup or in your config file:
 | `revenue-ops-rebalance-min-profit` | `10` | Min profit to trigger rebalance (sats) |
 | `revenue-ops-flow-window-days` | `7` | Days to analyze for flow |
 | `revenue-ops-clboss-enabled` | `true` | Enable clboss integration |
-| `revenue-ops-rebalancer` | `circular` | Rebalancer plugin (circular/sling) |
 | `revenue-ops-daily-budget-sats` | `5000` | Max rebalancing fees per 24 hours (sats) |
 | `revenue-ops-min-wallet-reserve` | `1000000` | Min total funds to keep in reserve (sats) |
 | `revenue-ops-metrics-port` | `9800` | Prometheus metrics HTTP port |
