@@ -653,108 +653,133 @@ class EVRebalancer:
         2. Filters out channels with active jobs
         3. Respects max concurrent job limit
         4. Returns prioritized list of candidates
+        
+        Performance optimizations:
+        - Hoists listpeers RPC call to avoid N+1 queries
+        - Uses ephemeral fee cache for listchannels calls
         """
         candidates = []
         
-        # First, monitor existing jobs and clean up finished ones
-        if self.job_manager.active_job_count > 0:
-            monitor_result = self.job_manager.monitor_jobs()
-            self.plugin.log(
-                f"Job monitor: {monitor_result['checked']} checked, "
-                f"{monitor_result['completed']} completed, "
-                f"{monitor_result['failed']} failed, "
-                f"{monitor_result['timed_out']} timed out, "
-                f"{monitor_result['still_running']} running"
-            )
+        # Initialize ephemeral fee cache for this run (cleared at end)
+        self._fee_cache: Dict[str, Optional[int]] = {}
         
-        # Check if we have slots available
-        available_slots = self.job_manager.slots_available()
-        if available_slots <= 0:
-            self.plugin.log(
-                f"No rebalance slots available ({self.job_manager.active_job_count}/"
-                f"{self.job_manager.max_concurrent_jobs} jobs active)"
-            )
-            return candidates
-        
-        # Check capital controls
-        if not self._check_capital_controls():
-            return candidates
-        
-        channels = self._get_channels_with_balances()
-        if not channels:
-            return candidates
-        
-        # Get set of channels with active jobs
-        active_channels = set(self.job_manager.active_channels)
-        
-        depleted_channels = []
-        source_channels = []
-        
-        for channel_id, info in channels.items():
-            capacity = info.get("capacity", 0)
-            spendable = info.get("spendable_sats", 0)
-            if capacity == 0: 
-                continue
+        try:
+            # First, monitor existing jobs and clean up finished ones
+            if self.job_manager.active_job_count > 0:
+                monitor_result = self.job_manager.monitor_jobs()
+                self.plugin.log(
+                    f"Job monitor: {monitor_result['checked']} checked, "
+                    f"{monitor_result['completed']} completed, "
+                    f"{monitor_result['failed']} failed, "
+                    f"{monitor_result['timed_out']} timed out, "
+                    f"{monitor_result['still_running']} running"
+                )
             
-            outbound_ratio = spendable / capacity
+            # Check if we have slots available
+            available_slots = self.job_manager.slots_available()
+            if available_slots <= 0:
+                self.plugin.log(
+                    f"No rebalance slots available ({self.job_manager.active_job_count}/"
+                    f"{self.job_manager.max_concurrent_jobs} jobs active)"
+                )
+                return candidates
             
-            # Skip channels with active jobs
-            normalized = channel_id.replace(':', 'x')
-            if normalized in active_channels:
-                continue
+            # Check capital controls
+            if not self._check_capital_controls():
+                return candidates
             
-            if outbound_ratio < self.config.low_liquidity_threshold:
-                depleted_channels.append((channel_id, info, outbound_ratio))
-            elif outbound_ratio > self.config.high_liquidity_threshold:
-                source_channels.append((channel_id, info, outbound_ratio))
-        
-        if not depleted_channels or not source_channels:
-            return candidates
+            channels = self._get_channels_with_balances()
+            if not channels:
+                return candidates
             
-        self.plugin.log(
-            f"Found {len(depleted_channels)} depleted and {len(source_channels)} source channels "
-            f"(excluding {len(active_channels)} with active jobs)"
-        )
-        
-        for dest_id, dest_info, dest_ratio in depleted_channels:
-            if self._is_pending_with_backoff(dest_id): 
-                continue
+            # Hoist peer connection status call - do it once instead of per-candidate
+            peer_status = self._get_peer_connection_status()
             
-            last_rebalance = self.database.get_last_rebalance_time(dest_id)
-            if last_rebalance:
-                cooldown = self.config.rebalance_cooldown_hours * 3600
-                if int(time.time()) - last_rebalance < cooldown: 
+            # Get set of channels with active jobs
+            active_channels = set(self.job_manager.active_channels)
+            
+            depleted_channels = []
+            source_channels = []
+            
+            for channel_id, info in channels.items():
+                capacity = info.get("capacity", 0)
+                spendable = info.get("spendable_sats", 0)
+                if capacity == 0: 
                     continue
-            
-            candidate = self._analyze_rebalance_ev(dest_id, dest_info, dest_ratio, source_channels)
-            if candidate:
-                candidates.append(candidate)
                 
-                # Stop if we have enough candidates to fill available slots
-                if len(candidates) >= available_slots:
-                    break
+                outbound_ratio = spendable / capacity
+                
+                # Skip channels with active jobs
+                normalized = channel_id.replace(':', 'x')
+                if normalized in active_channels:
+                    continue
+                
+                if outbound_ratio < self.config.low_liquidity_threshold:
+                    depleted_channels.append((channel_id, info, outbound_ratio))
+                elif outbound_ratio > self.config.high_liquidity_threshold:
+                    source_channels.append((channel_id, info, outbound_ratio))
+            
+            if not depleted_channels or not source_channels:
+                return candidates
+                
+            self.plugin.log(
+                f"Found {len(depleted_channels)} depleted and {len(source_channels)} source channels "
+                f"(excluding {len(active_channels)} with active jobs)"
+            )
+            
+            for dest_id, dest_info, dest_ratio in depleted_channels:
+                if self._is_pending_with_backoff(dest_id): 
+                    continue
+                
+                last_rebalance = self.database.get_last_rebalance_time(dest_id)
+                if last_rebalance:
+                    cooldown = self.config.rebalance_cooldown_hours * 3600
+                    if int(time.time()) - last_rebalance < cooldown: 
+                        continue
+                
+                candidate = self._analyze_rebalance_ev(
+                    dest_id, dest_info, dest_ratio, source_channels, peer_status
+                )
+                if candidate:
+                    candidates.append(candidate)
+                    
+                    # Stop if we have enough candidates to fill available slots
+                    if len(candidates) >= available_slots:
+                        break
+            
+            # Sort by priority
+            def sort_key(c):
+                dest_state = self.database.get_channel_state(c.to_channel)
+                flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
+                priority = 2 if flow_state == "source" else 1
+                return (priority, c.expected_profit_sats)
+            
+            candidates.sort(key=sort_key, reverse=True)
+            
+            # Limit to available slots
+            return candidates[:available_slots]
         
-        # Sort by priority
-        def sort_key(c):
-            dest_state = self.database.get_channel_state(c.to_channel)
-            flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
-            priority = 2 if flow_state == "source" else 1
-            return (priority, c.expected_profit_sats)
-        
-        candidates.sort(key=sort_key, reverse=True)
-        
-        # Limit to available slots
-        return candidates[:available_slots]
+        finally:
+            # Clear ephemeral fee cache at end of run
+            self._fee_cache = {}
 
     def _analyze_rebalance_ev(self, dest_channel: str, dest_info: Dict[str, Any],
                               dest_ratio: float,
-                              sources: List[Tuple[str, Dict[str, Any], float]]) -> Optional[RebalanceCandidate]:
+                              sources: List[Tuple[str, Dict[str, Any], float]],
+                              peer_status: Optional[Dict] = None) -> Optional[RebalanceCandidate]:
         """
         Analyze expected value of rebalancing a channel with multi-source support.
         
         This method now identifies ALL profitable source channels and includes them
         in the candidate. EV calculations are based on the primary (best) source,
         but additional sources serve as fallbacks for Sling's pathfinding.
+        
+        Args:
+            dest_channel: Destination channel SCID
+            dest_info: Channel info dict
+            dest_ratio: Current outbound liquidity ratio
+            sources: List of potential source channels
+            peer_status: Pre-fetched peer connection status (optimization)
         """
         dest_state = self.database.get_channel_state(dest_channel)
         dest_flow_state = dest_state.get("state", "unknown") if dest_state else "unknown"
@@ -798,7 +823,8 @@ class EVRebalancer:
         
         # Get ALL profitable source candidates (sorted by score, best first)
         source_candidates = self._select_source_candidates(
-            sources, rebalance_amount, dest_channel, outbound_fee_ppm, inbound_fee_ppm
+            sources, rebalance_amount, dest_channel, outbound_fee_ppm, inbound_fee_ppm,
+            peer_status=peer_status
         )
         
         if not source_candidates: 
@@ -911,6 +937,17 @@ class EVRebalancer:
         return 1000
 
     def _get_last_hop_fee(self, peer_id: str) -> Optional[int]:
+        """
+        Get the fee for the last hop from a peer to us.
+        
+        Uses memoization via self._fee_cache to avoid repeated listchannels
+        RPC calls within a single find_rebalance_candidates run.
+        """
+        # Check cache first (memoization for this run)
+        if hasattr(self, '_fee_cache') and peer_id in self._fee_cache:
+            return self._fee_cache[peer_id]
+        
+        result = None
         try:
             our_id = self._get_our_node_id()
             if not our_id: 
@@ -918,10 +955,16 @@ class EVRebalancer:
             channels = self.plugin.rpc.listchannels(source=peer_id)
             for ch in channels.get("channels", []):
                 if ch.get("destination") == our_id:
-                    return ch.get("fee_per_millionth", 0) + (ch.get("base_fee_millisatoshi", 0) // 1000)
+                    result = ch.get("fee_per_millionth", 0) + (ch.get("base_fee_millisatoshi", 0) // 1000)
+                    break
         except Exception: 
             pass
-        return None
+        
+        # Cache the result (even if None, to avoid re-querying)
+        if hasattr(self, '_fee_cache'):
+            self._fee_cache[peer_id] = result
+        
+        return result
 
     def _get_route_fee_estimate(self, peer_id: str, amount_msat: int) -> Optional[int]:
         try:
@@ -957,7 +1000,8 @@ class EVRebalancer:
         amount_needed: int, 
         dest_channel: str,
         dest_outbound_fee_ppm: int,
-        dest_inbound_fee_ppm: int
+        dest_inbound_fee_ppm: int,
+        peer_status: Optional[Dict] = None
     ) -> List[Tuple[str, Dict[str, Any], int, float]]:
         """
         Select all profitable source channels for a rebalance.
@@ -972,13 +1016,15 @@ class EVRebalancer:
             dest_channel: Destination channel SCID
             dest_outbound_fee_ppm: Outbound fee of destination channel
             dest_inbound_fee_ppm: Estimated inbound fee to destination
+            peer_status: Pre-fetched peer connection status (optimization)
             
         Returns:
             List of (channel_id, info, score, weighted_opp_cost) tuples,
             sorted by score (highest first). Empty list if no profitable sources.
         """
         candidates = []
-        peers = self._get_peer_connection_status()
+        # Use provided peer_status or fetch if not provided (fallback for direct calls)
+        peers = peer_status if peer_status is not None else self._get_peer_connection_status()
         
         # Exclude sources with active jobs
         active_channels = set(self.job_manager.active_channels)
