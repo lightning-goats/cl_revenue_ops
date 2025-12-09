@@ -47,18 +47,18 @@ class JobStatus(Enum):
 
 @dataclass
 class RebalanceCandidate:
-    """A candidate for rebalancing."""
-    from_channel: str
+    """A candidate for rebalancing with multi-source support."""
+    source_candidates: List[str]  # List of source SCIDs, sorted by score (best first)
     to_channel: str
-    from_peer_id: str
+    primary_source_peer_id: str  # Peer ID of the best (first) source candidate
     to_peer_id: str
     amount_sats: int
     amount_msat: int
     outbound_fee_ppm: int
     inbound_fee_ppm: int
-    source_fee_ppm: int
-    weighted_opp_cost_ppm: int
-    spread_ppm: int
+    source_fee_ppm: int  # Fee PPM of the primary (best) source
+    weighted_opp_cost_ppm: int  # Weighted opportunity cost of the primary source
+    spread_ppm: int  # Spread based on primary source
     max_budget_sats: int
     max_budget_msat: int
     max_fee_ppm: int
@@ -66,13 +66,25 @@ class RebalanceCandidate:
     liquidity_ratio: float
     dest_flow_state: str
     dest_turnover_rate: float
-    source_turnover_rate: float
+    source_turnover_rate: float  # Turnover rate of the primary source
+    
+    # Backwards compatibility property
+    @property
+    def from_channel(self) -> str:
+        """Returns the primary (best) source channel for backwards compatibility."""
+        return self.source_candidates[0] if self.source_candidates else ""
+    
+    @property
+    def from_peer_id(self) -> str:
+        """Returns the primary source peer ID for backwards compatibility."""
+        return self.primary_source_peer_id
     
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "from_channel": self.from_channel,
+            "source_candidates": self.source_candidates,
+            "from_channel": self.from_channel,  # Primary source for backwards compat
             "to_channel": self.to_channel,
-            "from_peer_id": self.from_peer_id,
+            "from_peer_id": self.primary_source_peer_id,
             "to_peer_id": self.to_peer_id,
             "amount_sats": self.amount_sats,
             "amount_msat": self.amount_msat,
@@ -88,7 +100,8 @@ class RebalanceCandidate:
             "liquidity_ratio": round(self.liquidity_ratio, 4),
             "dest_flow_state": self.dest_flow_state,
             "dest_turnover_rate": round(self.dest_turnover_rate, 4),
-            "source_turnover_rate": round(self.source_turnover_rate, 4)
+            "source_turnover_rate": round(self.source_turnover_rate, 4),
+            "num_source_candidates": len(self.source_candidates)
         }
 
 
@@ -97,7 +110,7 @@ class ActiveJob:
     """Tracks an active sling background job."""
     scid: str                      # Target channel SCID (colon format for sling)
     scid_normalized: str           # Original SCID format (for our tracking)
-    from_scid: str                 # Source channel SCID
+    source_candidates: List[str]   # List of source channel SCIDs (colon format)
     start_time: int                # Unix timestamp when job started
     candidate: RebalanceCandidate  # Original candidate data
     rebalance_id: int              # Database record ID
@@ -105,6 +118,12 @@ class ActiveJob:
     initial_local_sats: int        # Local balance when job started
     max_fee_ppm: int               # Max fee rate for this job
     status: JobStatus = JobStatus.PENDING
+    
+    # Backwards compatibility property
+    @property
+    def from_scid(self) -> str:
+        """Returns the primary (best) source SCID for backwards compatibility."""
+        return self.source_candidates[0] if self.source_candidates else ""
 
 
 class JobManager:
@@ -190,10 +209,12 @@ class JobManager:
     
     def start_job(self, candidate: RebalanceCandidate, rebalance_id: int) -> Dict[str, Any]:
         """
-        Start a new sling-job for the given candidate.
+        Start a new sling-job for the given candidate with multi-source support.
         
         sling-job creates a persistent background worker that will keep
         attempting to rebalance until stopped or target is reached.
+        Passes ALL profitable source candidates to Sling so it can handle
+        pathfinding failover automatically.
         
         Args:
             candidate: The rebalance candidate with all parameters
@@ -214,7 +235,9 @@ class JobManager:
         
         # Convert SCIDs to sling format (colon-separated)
         to_scid = self._to_sling_scid(candidate.to_channel)
-        from_scid = self._to_sling_scid(candidate.from_channel)
+        
+        # Convert all source candidates to sling format
+        source_scids_sling = [self._to_sling_scid(scid) for scid in candidate.source_candidates]
         
         # Get initial balance for progress tracking
         initial_balance = self._get_channel_local_balance(candidate.to_channel)
@@ -223,17 +246,19 @@ class JobManager:
         chunk_size = min(candidate.amount_sats, self.chunk_size_sats)
         
         try:
-            # Build candidates JSON array
-            candidates_json = json.dumps([from_scid])
+            # Build candidates JSON array with ALL source candidates
+            # Sling will try them in order, providing pathfinding failover
+            candidates_json = json.dumps(source_scids_sling)
             
+            primary_source = source_scids_sling[0] if source_scids_sling else "none"
             self.plugin.log(
-                f"Starting sling-job: {to_scid} <- {from_scid}, "
-                f"amount={chunk_size}, maxppm={candidate.max_fee_ppm}, "
+                f"Starting sling-job: {to_scid} <- [{len(source_scids_sling)} candidates], "
+                f"primary={primary_source}, amount={chunk_size}, maxppm={candidate.max_fee_ppm}, "
                 f"target_total={candidate.amount_sats}"
             )
             
             # Start sling-job with keyword arguments
-            # sling-job -k scid=X direction=pull amount=Y maxppm=Z candidates='["A"]'
+            # sling-job -k scid=X direction=pull amount=Y maxppm=Z candidates='["A","B","C"]'
             self.plugin.rpc.call("sling-job", {
                 "scid": to_scid,
                 "direction": "pull",
@@ -251,11 +276,11 @@ class JobManager:
                 if "already running" not in str(e).lower():
                     self.plugin.log(f"sling-go warning: {e}", level='debug')
             
-            # Track the job
+            # Track the job with all source candidates
             job = ActiveJob(
                 scid=to_scid,
                 scid_normalized=normalized_scid,
-                from_scid=from_scid,
+                source_candidates=source_scids_sling,
                 start_time=int(time.time()),
                 candidate=candidate,
                 rebalance_id=rebalance_id,
@@ -266,9 +291,15 @@ class JobManager:
             )
             self._active_jobs[normalized_scid] = job
             
-            self.plugin.log(f"Sling job started for {to_scid}, tracking as {normalized_scid}")
+            self.plugin.log(
+                f"Sling job started for {to_scid}, tracking as {normalized_scid} "
+                f"with {len(source_scids_sling)} source candidates"
+            )
             
-            return {"success": True, "message": f"Job started for {to_scid}"}
+            return {
+                "success": True, 
+                "message": f"Job started for {to_scid} with {len(source_scids_sling)} source candidates"
+            }
             
         except RpcError as e:
             error_msg = str(e)
@@ -556,7 +587,9 @@ class JobManager:
         
         return {
             "scid": job.scid,
-            "from_scid": job.from_scid,
+            "source_candidates": job.source_candidates,
+            "from_scid": job.from_scid,  # Primary source for backwards compat
+            "num_sources": len(job.source_candidates),
             "status": job.status.value,
             "elapsed_seconds": elapsed,
             "target_amount_sats": job.target_amount_sats,
@@ -716,7 +749,13 @@ class EVRebalancer:
     def _analyze_rebalance_ev(self, dest_channel: str, dest_info: Dict[str, Any],
                               dest_ratio: float,
                               sources: List[Tuple[str, Dict[str, Any], float]]) -> Optional[RebalanceCandidate]:
-        """Analyze expected value of rebalancing a channel."""
+        """
+        Analyze expected value of rebalancing a channel with multi-source support.
+        
+        This method now identifies ALL profitable source channels and includes them
+        in the candidate. EV calculations are based on the primary (best) source,
+        but additional sources serve as fallbacks for Sling's pathfinding.
+        """
         dest_state = self.database.get_channel_state(dest_channel)
         dest_flow_state = dest_state.get("state", "unknown") if dest_state else "unknown"
         
@@ -757,19 +796,30 @@ class EVRebalancer:
         outbound_fee_ppm = dest_info.get("fee_ppm", 0)
         inbound_fee_ppm = self._estimate_inbound_fee(dest_info.get("peer_id", ""))
         
-        best_source = self._select_source_channel(sources, rebalance_amount, dest_channel)
-        if not best_source: 
+        # Get ALL profitable source candidates (sorted by score, best first)
+        source_candidates = self._select_source_candidates(
+            sources, rebalance_amount, dest_channel, outbound_fee_ppm, inbound_fee_ppm
+        )
+        
+        if not source_candidates: 
             return None
-        source_id, source_info = best_source
         
-        source_fee_ppm = source_info.get("fee_ppm", 0)
-        source_capacity = source_info.get("capacity", 1)
-        source_turnover_rate = self._calculate_turnover_rate(source_id, source_capacity)
+        # Extract just the SCIDs for the candidate list
+        source_scids = [cid for cid, _, _, _ in source_candidates]
         
-        turnover_weight = min(1.0, source_turnover_rate * 7)
-        weighted_opp_cost = int(source_fee_ppm * turnover_weight)
+        # Use the PRIMARY (best) source for EV calculations
+        primary_source_id, primary_source_info, primary_score, primary_opp_cost = source_candidates[0]
+        
+        source_fee_ppm = primary_source_info.get("fee_ppm", 0)
+        source_capacity = primary_source_info.get("capacity", 1)
+        source_turnover_rate = self._calculate_turnover_rate(primary_source_id, source_capacity)
+        
+        # Use the primary source's opportunity cost for spread calculation
+        weighted_opp_cost = primary_opp_cost
         spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
         
+        # This should always be positive since _select_source_candidates filters for it,
+        # but check anyway for safety
         if spread_ppm <= 0: 
             return None
         
@@ -804,6 +854,7 @@ class EVRebalancer:
         expected_utilization = max(min(dest_turnover_rate * cooldown_days, 1.0), 0.05)
         
         expected_income = (rebalance_amount * expected_utilization * outbound_fee_ppm) // 1_000_000
+        turnover_weight = min(1.0, source_turnover_rate * 7)
         expected_source_loss = (rebalance_amount * expected_utilization * source_fee_ppm * turnover_weight) // 1_000_000
         expected_profit = expected_income - max_budget_sats - expected_source_loss
         
@@ -811,15 +862,24 @@ class EVRebalancer:
             return None
         
         return RebalanceCandidate(
-            from_channel=source_id, to_channel=dest_channel,
-            from_peer_id=source_info.get("peer_id", ""), to_peer_id=dest_info.get("peer_id", ""),
-            amount_sats=rebalance_amount, amount_msat=amount_msat,
-            outbound_fee_ppm=outbound_fee_ppm, inbound_fee_ppm=inbound_fee_ppm,
-            source_fee_ppm=source_fee_ppm, weighted_opp_cost_ppm=weighted_opp_cost,
-            spread_ppm=spread_ppm, max_budget_sats=max_budget_sats,
-            max_budget_msat=max_budget_msat, max_fee_ppm=max_fee_ppm,
-            expected_profit_sats=expected_profit, liquidity_ratio=dest_ratio,
-            dest_flow_state=dest_flow_state, dest_turnover_rate=dest_turnover_rate,
+            source_candidates=source_scids,
+            to_channel=dest_channel,
+            primary_source_peer_id=primary_source_info.get("peer_id", ""),
+            to_peer_id=dest_info.get("peer_id", ""),
+            amount_sats=rebalance_amount,
+            amount_msat=amount_msat,
+            outbound_fee_ppm=outbound_fee_ppm,
+            inbound_fee_ppm=inbound_fee_ppm,
+            source_fee_ppm=source_fee_ppm,
+            weighted_opp_cost_ppm=weighted_opp_cost,
+            spread_ppm=spread_ppm,
+            max_budget_sats=max_budget_sats,
+            max_budget_msat=max_budget_msat,
+            max_fee_ppm=max_fee_ppm,
+            expected_profit_sats=expected_profit,
+            liquidity_ratio=dest_ratio,
+            dest_flow_state=dest_flow_state,
+            dest_turnover_rate=dest_turnover_rate,
             source_turnover_rate=source_turnover_rate
         )
 
@@ -891,11 +951,36 @@ class EVRebalancer:
             pass
         return None
 
-    def _select_source_channel(self, sources, amount_needed, dest_channel=None):
-        best_source, best_score = None, -float('inf')
+    def _select_source_candidates(
+        self, 
+        sources: List[Tuple[str, Dict[str, Any], float]], 
+        amount_needed: int, 
+        dest_channel: str,
+        dest_outbound_fee_ppm: int,
+        dest_inbound_fee_ppm: int
+    ) -> List[Tuple[str, Dict[str, Any], int, float]]:
+        """
+        Select all profitable source channels for a rebalance.
+        
+        Instead of returning a single "best" source, this returns ALL sources
+        that have a positive spread (EV > 0), sorted by score (highest first).
+        This allows Sling to handle pathfinding failover automatically.
+        
+        Args:
+            sources: List of (channel_id, info, outbound_ratio) tuples
+            amount_needed: Amount to rebalance in sats
+            dest_channel: Destination channel SCID
+            dest_outbound_fee_ppm: Outbound fee of destination channel
+            dest_inbound_fee_ppm: Estimated inbound fee to destination
+            
+        Returns:
+            List of (channel_id, info, score, weighted_opp_cost) tuples,
+            sorted by score (highest first). Empty list if no profitable sources.
+        """
+        candidates = []
         peers = self._get_peer_connection_status()
         
-        # Also exclude sources with active jobs
+        # Exclude sources with active jobs
         active_channels = set(self.job_manager.active_channels)
         
         for cid, info, ratio in sources:
@@ -904,25 +989,52 @@ class EVRebalancer:
             if normalized in active_channels:
                 continue
                 
+            # Skip if insufficient balance
             if info.get("spendable_sats", 0) < amount_needed: 
                 continue
+            
+            # Skip disconnected peers
             pid = info.get("peer_id", "")
             if pid and pid in peers and not peers[pid].get("connected"): 
                 continue
             
-            fee_ppm = info.get("fee_ppm", 1000)
-            score = (ratio * 50) - (fee_ppm / 10)
+            # Calculate opportunity cost for this source
+            source_fee_ppm = info.get("fee_ppm", 1000)
+            source_capacity = info.get("capacity", 1)
+            source_turnover_rate = self._calculate_turnover_rate(cid, source_capacity)
             
+            # Weight opportunity cost by how actively the source is used
+            turnover_weight = min(1.0, source_turnover_rate * 7)
+            weighted_opp_cost = int(source_fee_ppm * turnover_weight)
+            
+            # Calculate spread: what we earn minus what it costs
+            spread_ppm = dest_outbound_fee_ppm - dest_inbound_fee_ppm - weighted_opp_cost
+            
+            # Only include profitable sources (positive spread)
+            if spread_ppm <= 0:
+                continue
+            
+            # Check minimum profit threshold
+            expected_profit_estimate = (spread_ppm * amount_needed) // 1_000_000
+            if expected_profit_estimate < self.config.rebalance_min_profit:
+                continue
+            
+            # Calculate score for sorting (higher is better)
+            score = (ratio * 50) - (source_fee_ppm / 10)
+            
+            # Bonus for sink/balanced channels (they have excess outbound we want to use)
             state = self.database.get_channel_state(cid)
             if state and state.get("state") == "sink": 
                 score += 100
             elif state and state.get("state") == "balanced": 
                 score += 20
             
-            if score > best_score:
-                best_score = score
-                best_source = (cid, info)
-        return best_source
+            candidates.append((cid, info, score, weighted_opp_cost))
+        
+        # Sort by score (highest first) so Sling tries most profitable sources first
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        
+        return candidates
 
     def _get_peer_connection_status(self) -> Dict:
         status = {}
@@ -998,10 +1110,13 @@ class EVRebalancer:
         
         try:
             # Ensure channels are unmanaged from clboss
-            self.clboss.ensure_unmanaged_for_channel(
-                candidate.from_channel, candidate.from_peer_id, 
-                ClbossTags.FEE_AND_BALANCE, self.database
-            )
+            # Unmanage ALL source candidates since Sling may use any of them
+            for source_scid in candidate.source_candidates:
+                # We only have peer_id for primary source, but clboss can work with just SCID
+                self.clboss.ensure_unmanaged_for_channel(
+                    source_scid, candidate.primary_source_peer_id, 
+                    ClbossTags.FEE_AND_BALANCE, self.database
+                )
             self.clboss.ensure_unmanaged_for_channel(
                 candidate.to_channel, candidate.to_peer_id, 
                 ClbossTags.FEE_AND_BALANCE, self.database
