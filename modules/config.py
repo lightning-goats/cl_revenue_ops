@@ -60,6 +60,9 @@ class Config:
     clboss_enabled: bool = True    # Whether to use clboss-unmanage
     clboss_unmanage_duration_hours: int = 24  # Keep unmanaged after rebalance
     
+    # Rebalancer plugin selection
+    rebalancer_plugin: str = 'sling'  # Only sling is supported
+    
     # Profitability tracking
     estimated_open_cost_sats: int = 5000  # Estimated on-chain fee for channel open
     
