@@ -53,6 +53,9 @@ class Database:
                 isolation_level=None  # Autocommit mode
             )
             self._conn.row_factory = sqlite3.Row
+            
+            # Enable Write-Ahead Logging for better multi-thread concurrency
+            self._conn.execute("PRAGMA journal_mode=WAL;")
         return self._conn
     
     def initialize(self):
@@ -218,6 +221,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_time ON forwards(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_channels ON forwards(in_channel, out_channel)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_channel ON rebalance_costs(channel_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_states_peer ON channel_states(peer_id)")
         
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except

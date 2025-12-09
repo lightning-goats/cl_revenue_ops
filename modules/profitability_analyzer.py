@@ -224,6 +224,9 @@ class ChannelProfitabilityAnalyzer:
         """
         Analyze profitability for all channels.
         
+        This method is optimized to batch fetch revenue data with a single
+        RPC call to listforwards, avoiding N+1 query overhead.
+        
         Returns:
             Dict mapping channel_id to ChannelProfitability
         """
@@ -233,8 +236,15 @@ class ChannelProfitabilityAnalyzer:
             # Get all channels
             channels = self._get_all_channels()
             
+            # Batch fetch all revenue data with a single RPC call
+            all_revenue_data = self._get_all_revenue_data()
+            
             for channel_id, channel_info in channels.items():
-                profitability = self.analyze_channel(channel_id, channel_info)
+                # Pass precalculated revenue to avoid per-channel RPC calls
+                precalculated_revenue = all_revenue_data.get(channel_id)
+                profitability = self.analyze_channel(
+                    channel_id, channel_info, precalculated_revenue=precalculated_revenue
+                )
                 if profitability:
                     results[channel_id] = profitability
             
@@ -259,13 +269,16 @@ class ChannelProfitabilityAnalyzer:
         return results
     
     def analyze_channel(self, channel_id: str, 
-                       channel_info: Optional[Dict] = None) -> Optional[ChannelProfitability]:
+                       channel_info: Optional[Dict] = None,
+                       precalculated_revenue: Optional[ChannelRevenue] = None) -> Optional[ChannelProfitability]:
         """
         Analyze profitability for a single channel.
         
         Args:
             channel_id: Channel to analyze
             channel_info: Optional channel info (fetched if not provided)
+            precalculated_revenue: Optional pre-fetched revenue data to avoid
+                                   per-channel RPC calls when batch processing
             
         Returns:
             ChannelProfitability object or None if analysis fails
@@ -286,7 +299,11 @@ class ChannelProfitabilityAnalyzer:
             costs = self._get_channel_costs(channel_id, peer_id, funding_txid, capacity)
             
             # Get revenue from routing history
-            revenue = self._get_channel_revenue(channel_id)
+            # Use precalculated data if provided, otherwise fall back to single RPC call
+            if precalculated_revenue is not None:
+                revenue = precalculated_revenue
+            else:
+                revenue = self._get_channel_revenue(channel_id)
             
             # Calculate metrics
             net_profit = revenue.fees_earned_sats - costs.total_cost_sats
@@ -1216,8 +1233,78 @@ class ChannelProfitabilityAnalyzer:
         except (ValueError, AttributeError):
             return txid
     
+    def _get_all_revenue_data(self) -> Dict[str, ChannelRevenue]:
+        """
+        Batch fetch revenue data for all channels with a single RPC call.
+        
+        This method calls listforwards(status="settled") once and aggregates
+        fees_earned and volume_routed by out_channel (SCID).
+        
+        This is a performance optimization that reduces RPC calls from N
+        (number of channels) to 1 when analyzing all channels.
+        
+        Returns:
+            Dict mapping channel_id (out_channel SCID) to ChannelRevenue
+        """
+        revenue_map: Dict[str, Dict[str, int]] = {}
+        
+        try:
+            # Single RPC call to fetch ALL settled forwards
+            result = self.plugin.rpc.listforwards(status="settled")
+            
+            for forward in result.get("forwards", []):
+                out_channel = forward.get("out_channel")
+                if not out_channel:
+                    continue
+                
+                # Initialize channel entry if not exists
+                if out_channel not in revenue_map:
+                    revenue_map[out_channel] = {
+                        "fees_earned": 0,
+                        "volume_routed": 0,
+                        "forward_count": 0
+                    }
+                
+                # Aggregate fee
+                fee_msat = forward.get("fee_msat", 0)
+                if isinstance(fee_msat, str):
+                    fee_msat = int(fee_msat.replace("msat", ""))
+                revenue_map[out_channel]["fees_earned"] += fee_msat // 1000
+                
+                # Aggregate volume
+                out_msat = forward.get("out_msat", 0)
+                if isinstance(out_msat, str):
+                    out_msat = int(out_msat.replace("msat", ""))
+                revenue_map[out_channel]["volume_routed"] += out_msat // 1000
+                
+                revenue_map[out_channel]["forward_count"] += 1
+                
+        except Exception as e:
+            self.plugin.log(
+                f"Error batch fetching revenue data: {e}", 
+                level='warn'
+            )
+        
+        # Convert to ChannelRevenue objects
+        result_map: Dict[str, ChannelRevenue] = {}
+        for channel_id, data in revenue_map.items():
+            result_map[channel_id] = ChannelRevenue(
+                channel_id=channel_id,
+                fees_earned_sats=data["fees_earned"],
+                volume_routed_sats=data["volume_routed"],
+                forward_count=data["forward_count"]
+            )
+        
+        return result_map
+    
     def _get_channel_revenue(self, channel_id: str) -> ChannelRevenue:
-        """Get revenue for a channel from routing history."""
+        """
+        Get revenue for a single channel from routing history.
+        
+        Note: For batch operations, use _get_all_revenue_data() instead to
+        avoid N+1 query overhead. This method is retained for single-channel
+        lookups where batch fetching would be wasteful.
+        """
         # Query listforwards for this channel's earnings
         fees_earned = 0
         volume_routed = 0
