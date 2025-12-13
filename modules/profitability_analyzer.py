@@ -1112,6 +1112,7 @@ class ChannelProfitabilityAnalyzer:
         needing heuristic rejection.
         
         Validation rules (returns False if ANY match):
+        - fee_sats > 50,000 (Hard Cap - no mining fee should ever be this high)
         - fee_sats >= 90% of capacity (Principal Check - funding amount)
         - fee_sats > capacity (clearly invalid - fee can't exceed capacity)
         
@@ -1123,6 +1124,16 @@ class ChannelProfitabilityAnalyzer:
         Returns:
             True if fee appears valid, False if it looks like funding amount
         """
+        # Hard Cap: Reject any fee above 50,000 sats
+        # No legitimate channel opening fee should ever be this high.
+        # This catches data artifacts like change outputs or batch fee totals.
+        if fee_sats > 50000:
+            self.plugin.log(
+                f"Rejected absurd fee: {fee_sats} > 50,000 hard cap for {funding_txid}",
+                level='debug'
+            )
+            return False
+        
         # If we don't have capacity info, accept any reasonable value
         if capacity_sats <= 0:
             return True
