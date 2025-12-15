@@ -235,6 +235,23 @@ Returns:
 - **underwater**: Negative ROI, losing money
 - **zombie**: No routing activity at all
 
+### `revenue-history`
+Get lifetime financial history including closed channels.
+
+```bash
+lightning-cli revenue-history
+```
+
+Returns aggregate financial performance since the plugin was installed, including data from channels that have since been closed. This provides a true "Lifetime P&L" view:
+
+- **lifetime_revenue_sats**: Total routing fees earned (all time)
+- **lifetime_opening_costs_sats**: Total channel opening fees paid
+- **lifetime_rebalance_costs_sats**: Total rebalancing fees paid
+- **lifetime_total_costs_sats**: Opening + Rebalance costs
+- **lifetime_net_profit_sats**: Revenue minus total costs
+- **lifetime_roi_percent**: Return on investment percentage
+- **lifetime_forward_count**: Total number of forwards processed
+
 ### `revenue-remanage peer_id [tag]`
 Re-enable clboss management for a peer.
 
