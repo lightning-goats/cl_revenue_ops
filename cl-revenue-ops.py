@@ -716,6 +716,33 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
         return {"status": "error", "error": str(e)}
 
 
+@plugin.method("revenue-history")
+def revenue_history(plugin: Plugin) -> Dict[str, Any]:
+    """
+    Get lifetime financial history including closed channels.
+    
+    Reports aggregate financial performance since the plugin was installed,
+    including data from channels that have since been closed. This provides
+    a true "Lifetime P&L" view.
+    
+    Returns:
+        - Lifetime Revenue (total routing fees earned)
+        - Lifetime Costs (opening fees + rebalancing fees)
+        - Lifetime Net Profit (revenue - costs)
+        - Lifetime ROI percentage
+        - Total number of forwards processed
+    
+    Usage: lightning-cli revenue-history
+    """
+    if profitability_analyzer is None:
+        return {"error": "Plugin not initialized"}
+    
+    try:
+        return profitability_analyzer.get_lifetime_report()
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 @plugin.method("revenue-remanage")
 def revenue_remanage(plugin: Plugin, peer_id: str, tag: Optional[str] = None) -> Dict[str, Any]:
     """

@@ -656,6 +656,57 @@ class ChannelProfitabilityAnalyzer:
             "cache_age_seconds": int(time.time()) - self._cache_timestamp
         }
     
+    def get_lifetime_report(self) -> Dict[str, Any]:
+        """
+        Get lifetime financial history report including closed channels.
+        
+        Unlike get_summary() which only considers active channels,
+        this method queries the database directly for ALL historical
+        data to provide a true "Lifetime P&L" view.
+        
+        Returns:
+            Dictionary with lifetime financial metrics:
+                - lifetime_revenue_sats: Total routing fees earned
+                - lifetime_opening_costs_sats: Total channel opening fees
+                - lifetime_rebalance_costs_sats: Total rebalancing fees paid
+                - lifetime_total_costs_sats: Opening + Rebalance costs
+                - lifetime_net_profit_sats: Revenue - Total Costs
+                - lifetime_roi_percent: ROI percentage
+                - lifetime_forward_count: Total number of forwards
+        """
+        # Get aggregate stats from database (includes closed channels)
+        stats = self.database.get_lifetime_stats()
+        
+        # Convert revenue from msat to sats
+        lifetime_revenue_sats = stats["total_revenue_msat"] // 1000
+        
+        # Get costs
+        lifetime_opening_costs_sats = stats["total_opening_cost_sats"]
+        lifetime_rebalance_costs_sats = stats["total_rebalance_cost_sats"]
+        
+        # Calculate totals
+        lifetime_total_costs_sats = lifetime_opening_costs_sats + lifetime_rebalance_costs_sats
+        lifetime_net_profit_sats = lifetime_revenue_sats - lifetime_total_costs_sats
+        
+        # Calculate ROI (avoid division by zero)
+        if lifetime_total_costs_sats > 0:
+            lifetime_roi_percent = round(
+                (lifetime_net_profit_sats / lifetime_total_costs_sats) * 100, 2
+            )
+        else:
+            # No costs incurred - infinite ROI if any revenue, 0 otherwise
+            lifetime_roi_percent = 100.0 if lifetime_revenue_sats > 0 else 0.0
+        
+        return {
+            "lifetime_revenue_sats": lifetime_revenue_sats,
+            "lifetime_opening_costs_sats": lifetime_opening_costs_sats,
+            "lifetime_rebalance_costs_sats": lifetime_rebalance_costs_sats,
+            "lifetime_total_costs_sats": lifetime_total_costs_sats,
+            "lifetime_net_profit_sats": lifetime_net_profit_sats,
+            "lifetime_roi_percent": lifetime_roi_percent,
+            "lifetime_forward_count": stats["total_forwards"]
+        }
+    
     # =========================================================================
     # Private Helper Methods
     # =========================================================================

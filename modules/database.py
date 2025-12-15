@@ -891,6 +891,53 @@ class Database:
         
         return result
     
+    def get_lifetime_stats(self) -> Dict[str, int]:
+        """
+        Get lifetime aggregate financial statistics.
+        
+        Returns aggregate data from ALL channels, including closed ones,
+        to provide a true "Lifetime P&L" view.
+        
+        Returns:
+            Dictionary with:
+                - total_revenue_msat: Sum of all routing fees earned
+                - total_rebalance_cost_sats: Sum of all rebalancing fees paid
+                - total_opening_cost_sats: Sum of all channel opening costs
+                - total_forwards: Count of all completed forwards
+        """
+        conn = self._get_connection()
+        
+        # Total revenue from forwards table (in msat)
+        revenue_row = conn.execute(
+            "SELECT COALESCE(SUM(fee_msat), 0) as total FROM forwards"
+        ).fetchone()
+        total_revenue_msat = revenue_row["total"] if revenue_row else 0
+        
+        # Total rebalance costs from rebalance_costs table (aggregated source of truth)
+        rebalance_row = conn.execute(
+            "SELECT COALESCE(SUM(cost_sats), 0) as total FROM rebalance_costs"
+        ).fetchone()
+        total_rebalance_cost_sats = rebalance_row["total"] if rebalance_row else 0
+        
+        # Total opening costs from channel_costs table
+        opening_row = conn.execute(
+            "SELECT COALESCE(SUM(open_cost_sats), 0) as total FROM channel_costs"
+        ).fetchone()
+        total_opening_cost_sats = opening_row["total"] if opening_row else 0
+        
+        # Total forward count
+        count_row = conn.execute(
+            "SELECT COUNT(*) as total FROM forwards"
+        ).fetchone()
+        total_forwards = count_row["total"] if count_row else 0
+        
+        return {
+            "total_revenue_msat": total_revenue_msat,
+            "total_rebalance_cost_sats": total_rebalance_cost_sats,
+            "total_opening_cost_sats": total_opening_cost_sats,
+            "total_forwards": total_forwards
+        }
+    
     # =========================================================================
     # Channel Failure Tracking Methods (Persistent Backoff)
     # =========================================================================
