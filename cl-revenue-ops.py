@@ -21,7 +21,7 @@ This allows us to:
 Dependencies:
 - pyln-client: Core Lightning plugin framework
 - bookkeeper plugin (built-in): Historical routing data
-- External rebalancer (circular/sling): Executes rebalance payments
+- External rebalancer (sling): Executes rebalance payments
 
 Author: Lightning Goats Team
 License: MIT

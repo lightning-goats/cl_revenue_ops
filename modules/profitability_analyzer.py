@@ -1212,13 +1212,13 @@ class ChannelProfitabilityAnalyzer:
     
     def _get_rebalance_costs_from_bookkeeper(self, channel_id: str, funding_txid: Optional[str] = None) -> int:
         """
-        Query bookkeeper for rebalance costs (circular payment fees).
+        Query bookkeeper for rebalance costs (self-payment rebalance fees).
         
-        Circular rebalances show up in bookkeeper as:
+        Rebalance self-payments show up in bookkeeper as:
         - 'invoice' events on the destination channel (we paid ourselves)
         - The fees_msat field shows what we paid in routing fees
         
-        We look for invoice events where we paid to ourselves (circular)
+        We look for invoice events where we paid to ourselves
         by checking if there's a matching credit on another of our channels.
         
         Args:
@@ -1257,7 +1257,7 @@ class ChannelProfitabilityAnalyzer:
                     # Debit on invoice = we paid out (could be rebalance)
                     fees_msat = event.get("fees_msat", 0)
                     if fees_msat and fees_msat > 0:
-                        # This is a fee we paid - likely a circular rebalance
+                        # This is a fee we paid - likely a rebalance self-payment
                         total_fees_sats += fees_msat // 1000
             
             if total_fees_sats > 0:

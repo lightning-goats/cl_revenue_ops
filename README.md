@@ -323,29 +323,29 @@ Every 15 minutes (configurable), the plugin:
    - Spread = OutboundFee - InboundFee - WeightedOpportunityCost
 6. Only executes if spread is positive and profit > minimum
 7. **Adaptive failure backoff**: Exponential cooldown for failing channels
-8. Calls circular via RPC with strict `maxppm` constraint
+8. Starts a `sling` job with a strict `maxppm` constraint
 
-### Circular Integration (Strategist & Driver Pattern)
+### Sling Integration (Strategist & Driver Pattern)
 
-This plugin acts as the **Strategist** while circular is the **Driver**:
+This plugin acts as the **Strategist** while `sling` is the **Driver**:
 
 ```python
 # We calculate the EV constraint
 max_ppm = int((max_fee_msat / amount_msat) * 1_000_000)
 
-# We tell circular what to do via RPC
-result = plugin.rpc.circular(
-    outgoing_scid,    # Channel to drain
-    incoming_scid,    # Channel to fill
-    amount_msat,      # How much to move
-    max_ppm,          # THE KEY CONSTRAINT - circular won't exceed this
-    retry_count       # Number of retries
-)
+# We tell sling what to do via RPC
+plugin.rpc.call("sling-job", {
+   "scid": incoming_scid,   # Channel to fill
+   "direction": "pull",
+   "amount": amount_msat,
+   "maxppm": max_ppm,
+   "candidates": [outgoing_scid],
+})
 ```
 
 This separation of concerns means:
 - **revenue-ops** handles the economics (when to rebalance, how much to pay)
-- **circular** handles the mechanics (pathfinding, HTLC management)
+- **sling** handles the mechanics (pathfinding, HTLC management)
 
 ### Anti-Thrashing Protection
 

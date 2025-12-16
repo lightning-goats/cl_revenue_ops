@@ -517,6 +517,9 @@ class JobManager:
     def _handle_job_failure(self, job: ActiveJob, stats: Dict[str, Any]) -> None:
         """Handle a failed job."""
         error_msg = stats.get("last_error", "Unknown error from sling")
+        # sling is the only supported backend; hide legacy wording if it appears
+        if isinstance(error_msg, str) and "method: circular" in error_msg:
+            error_msg = error_msg.replace("method: circular", "method: sling")
         
         self.plugin.log(
             f"Rebalance FAILED: {job.scid} - {error_msg}",

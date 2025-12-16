@@ -2,29 +2,35 @@
 
 This document outlines the development path to move `cl-revenue-ops` from a "Power User" tool to an "Enterprise Grade" routing engine suitable for managing high-liquidity nodes.
 
-## Phase 1: Capital Safety & Controls (Completed)
+## Phase 1: Capital Safety & Controls
 *Objective: Prevent the algorithm from over-spending on fees or exhausting operating capital during high-volatility periods.*
 
 - [x] **Global Daily Budgeting**: Implement a hard cap on total rebalancing fees paid per 24-hour rolling window.
 - [x] **Wallet Reserve Protection**: Suspend all operations if on-chain or off-chain liquid funds drop below a safe reserve threshold.
 - [x] **Kelly Criterion Sizing**: Dynamically scale rebalance budget based on the statistical certainty of the peer's reliability (Win Probability) and Profitability (Odds).
+- [ ] Align wallet reserve definition
 
-## Phase 2: Observability (Completed)
+## Phase 2: Observability
 *Objective: "You cannot manage what you cannot measure." Provide real-time visualization and auditing of algorithmic decisions.*
 
 - [x] **Prometheus Metrics Exporter**: Expose a local HTTP endpoint (or `.prom` file writer) to output time-series data.
 - [x] **Real-Time Metrics**: Updated event hooks to push metrics instantly, removing dashboard lag.
 - [x] **Lifetime History**: Added `revenue-history` to track total P&L including closed channels.
+- [ ] Fix revenue-history pruning issue
+- [ ] Record rebalance_costs on success
+- [ ] Reconcile README option names
 
-## Phase 3: Traffic Intelligence (Completed)
+## Phase 3: Traffic Intelligence
 *Objective: Optimize for quality liquidity and filter out noise/spam.*
 
 - [x] **HTLC Slot Awareness**: Monitor usage and mark congested channels (>80% utilization).
 - [x] **Reputation Tracking**: Track HTLC failure rates per peer in database.
 - [x] **Reputation-Weighted Fees**: Discount volume from spammy peers in the Hill Climbing algorithm.
 - [x] **Reputation Logic Refinements**: Implemented Laplace Smoothing and Time Decay.
+- [ ] Apply congested-state protections
+- [ ] Align reputation default weighting docs
 
-## Phase 4: Stability & Scaling (Completed)
+## Phase 4: Stability & Scaling
 *Objective: Reduce network noise and handle high throughput.*
 
 - [x] **Deadband Hysteresis**:
@@ -36,6 +42,10 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - Allow concurrent rebalancing attempts via `sling` background jobs.
     - Implemented Multi-Source selection for robust pathfinding.
 - [x] **Precision Accounting**: Implemented Summation Logic for Bookkeeper to correctly handle Batch Transactions.
+- [ ] Clarify bookkeeper vs listforwards usage
+- [ ] **Documentation Alignment**: Purge references to legacy `circular` wording; documentation and error logs must reflect the `sling` backend.
+- [ ] **Database Maintenance**: Implement `VACUUM` strategy to recover disk space after pruning.
+- [ ] **Startup Dependency Checks**: Verify `sling` and `bookkeeper` are loaded on startup to prevent runtime RPC errors.
 
 ## Phase 5: Network Resilience & Optimization (Planned v1.1)
 *Objective: Prevent liquidity from getting trapped in unstable channels and improve execution speed by learning from past failures.*
