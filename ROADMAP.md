@@ -16,7 +16,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Prometheus Metrics Exporter**: Expose a local HTTP endpoint (or `.prom` file writer) to output time-series data.
 - [x] **Real-Time Metrics**: Updated event hooks to push metrics instantly, removing dashboard lag.
 - [x] **Lifetime History**: Added `revenue-history` to track total P&L including closed channels.
-- [ ] Fix revenue-history pruning issue
+- [x] Fix revenue-history pruning issue
 - [ ] Record rebalance_costs on success
 - [ ] Reconcile README option names
 

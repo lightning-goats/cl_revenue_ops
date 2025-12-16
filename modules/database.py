@@ -215,6 +215,22 @@ class Database:
             )
         """)
         
+        # Lifetime aggregates - stores cumulative totals before pruning
+        # This ensures revenue-history remains accurate even after old forwards are deleted
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lifetime_aggregates (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                pruned_revenue_msat INTEGER NOT NULL DEFAULT 0,
+                pruned_forward_count INTEGER NOT NULL DEFAULT 0,
+                last_prune_timestamp INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # Ensure exactly one row exists
+        conn.execute("""
+            INSERT OR IGNORE INTO lifetime_aggregates (id, pruned_revenue_msat, pruned_forward_count, last_prune_timestamp)
+            VALUES (1, 0, 0, 0)
+        """)
+        
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
@@ -898,20 +914,34 @@ class Database:
         Returns aggregate data from ALL channels, including closed ones,
         to provide a true "Lifetime P&L" view.
         
+        This combines:
+        - Current data in the forwards table (recent, not yet pruned)
+        - Historical aggregates from lifetime_aggregates (data from pruned rows)
+        
         Returns:
             Dictionary with:
-                - total_revenue_msat: Sum of all routing fees earned
+                - total_revenue_msat: Sum of all routing fees earned (including pruned)
                 - total_rebalance_cost_sats: Sum of all rebalancing fees paid
                 - total_opening_cost_sats: Sum of all channel opening costs
-                - total_forwards: Count of all completed forwards
+                - total_forwards: Count of all completed forwards (including pruned)
         """
         conn = self._get_connection()
         
-        # Total revenue from forwards table (in msat)
+        # Get pruned historical aggregates from lifetime_aggregates table
+        lifetime_row = conn.execute(
+            "SELECT pruned_revenue_msat, pruned_forward_count FROM lifetime_aggregates WHERE id = 1"
+        ).fetchone()
+        pruned_revenue_msat = lifetime_row["pruned_revenue_msat"] if lifetime_row else 0
+        pruned_forward_count = lifetime_row["pruned_forward_count"] if lifetime_row else 0
+        
+        # Current revenue from forwards table (in msat) - not yet pruned
         revenue_row = conn.execute(
             "SELECT COALESCE(SUM(fee_msat), 0) as total FROM forwards"
         ).fetchone()
-        total_revenue_msat = revenue_row["total"] if revenue_row else 0
+        current_revenue_msat = revenue_row["total"] if revenue_row else 0
+        
+        # Combine pruned + current for true lifetime total
+        total_revenue_msat = pruned_revenue_msat + current_revenue_msat
         
         # Total rebalance costs from rebalance_costs table (aggregated source of truth)
         rebalance_row = conn.execute(
@@ -925,11 +955,14 @@ class Database:
         ).fetchone()
         total_opening_cost_sats = opening_row["total"] if opening_row else 0
         
-        # Total forward count
+        # Current forward count from forwards table
         count_row = conn.execute(
             "SELECT COUNT(*) as total FROM forwards"
         ).fetchone()
-        total_forwards = count_row["total"] if count_row else 0
+        current_forwards = count_row["total"] if count_row else 0
+        
+        # Combine pruned + current for true lifetime total
+        total_forwards = pruned_forward_count + current_forwards
         
         return {
             "total_revenue_msat": total_revenue_msat,
@@ -1177,26 +1210,60 @@ class Database:
         data for the flow_window_days (default 7 days), so we default to keeping
         8 days (7 + 1 buffer) instead of the previous 30 days.
         
-        The caller (cl-revenue-ops.py) should pass max(8, config.flow_window_days + 1)
-        to ensure we keep enough data for flow analysis while preventing bloat.
+        LIFETIME PRESERVATION:
+        Before deleting old forwards, we aggregate their revenue and count into
+        the lifetime_aggregates table. This ensures revenue-history remains
+        accurate even after pruning.
         
         Args:
             days_to_keep: Number of days of data to retain (default 8)
         """
         conn = self._get_connection()
-        cutoff = int(time.time()) - (days_to_keep * 86400)
-        
-        # Count rows before deletion for logging
-        flow_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM flow_history WHERE timestamp < ?", (cutoff,)
-        ).fetchone()["cnt"]
-        forwards_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM forwards WHERE timestamp < ?", (cutoff,)
-        ).fetchone()["cnt"]
-        
-        conn.execute("DELETE FROM flow_history WHERE timestamp < ?", (cutoff,))
-        conn.execute("DELETE FROM forwards WHERE timestamp < ?", (cutoff,))
-        
+        now = int(time.time())
+        cutoff = now - (days_to_keep * 86400)
+
+        flow_count = 0
+        forwards_count = 0
+        pruned_revenue = 0
+        pruned_count = 0
+
+        # Atomic aggregation + deletion to avoid double-counting if interrupted.
+        # If we update lifetime_aggregates but fail before deleting forwards, we'd
+        # count the same forwards again later. Using a transaction prevents this.
+        with conn:
+            # Count rows before deletion for logging
+            flow_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM flow_history WHERE timestamp < ?", (cutoff,)
+            ).fetchone()["cnt"]
+            forwards_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM forwards WHERE timestamp < ?", (cutoff,)
+            ).fetchone()["cnt"]
+
+            # LIFETIME PRESERVATION: Aggregate revenue from forwards about to be pruned
+            if forwards_count > 0:
+                prune_stats = conn.execute(
+                    "SELECT COALESCE(SUM(fee_msat), 0) as revenue, COUNT(*) as count FROM forwards WHERE timestamp < ?",
+                    (cutoff,)
+                ).fetchone()
+                pruned_revenue = prune_stats["revenue"] if prune_stats else 0
+                pruned_count = prune_stats["count"] if prune_stats else 0
+
+                conn.execute("""
+                    UPDATE lifetime_aggregates
+                    SET pruned_revenue_msat = pruned_revenue_msat + ?,
+                        pruned_forward_count = pruned_forward_count + ?,
+                        last_prune_timestamp = ?
+                    WHERE id = 1
+                """, (pruned_revenue, pruned_count, now))
+
+            conn.execute("DELETE FROM flow_history WHERE timestamp < ?", (cutoff,))
+            conn.execute("DELETE FROM forwards WHERE timestamp < ?", (cutoff,))
+
+        if forwards_count > 0:
+            self.plugin.log(
+                f"Preserved {pruned_revenue // 1000} sats revenue from {pruned_count} forwards before pruning"
+            )
+
         if flow_count > 0 or forwards_count > 0:
             self.plugin.log(
                 f"Cleaned up data older than {days_to_keep} days: "
