@@ -503,6 +503,18 @@ class JobManager:
         )
         self.database.reset_failure_count(job.scid_normalized)
         
+        # Record cost in rebalance_costs for lifetime accounting (revenue-history)
+        # Uses rebalance_id as part of idempotency: each job has a unique rebalance_id,
+        # and _handle_job_success is only called once per job lifecycle.
+        if fee_sats > 0:
+            self.database.record_rebalance_cost(
+                channel_id=job.scid_normalized,
+                peer_id=job.candidate.to_peer_id,
+                cost_sats=fee_sats,
+                amount_sats=amount_transferred,
+                timestamp=int(time.time())
+            )
+        
         # Update metrics
         if self.metrics:
             self.metrics.inc_counter(
@@ -1288,7 +1300,7 @@ class EVRebalancer:
             total_reserve = onchain_sats + channel_spendable_sats
             if total_reserve < self.config.min_wallet_reserve:
                 self.plugin.log(
-                    f"CAPITAL CONTROL: Wallet reserve {total_reserve} < "
+                    f"CAPITAL CONTROL: Wallet reserve (confirmed on-chain + channel spendable) {total_reserve} < "
                     f"{self.config.min_wallet_reserve}", 
                     level='warning'
                 )

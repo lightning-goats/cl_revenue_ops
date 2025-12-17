@@ -36,7 +36,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - **HTLC Slot Awareness**: Prevents rebalancing into congested channels (>80% slot usage)
 - **Global Capital Controls**: Prevents over-spending with two safety checks:
   - **Daily Budget**: Limits total rebalancing fees to a configurable amount per 24 hours
-  - **Wallet Reserve**: Aborts rebalancing if total spendable funds fall below minimum threshold
+   - **Wallet Reserve**: Aborts rebalancing if (confirmed on-chain + channel spendable) falls below the minimum threshold
 - Uses sling for async background job execution
 
 ### Module 4: Channel Profitability Analyzer

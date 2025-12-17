@@ -8,7 +8,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Global Daily Budgeting**: Implement a hard cap on total rebalancing fees paid per 24-hour rolling window.
 - [x] **Wallet Reserve Protection**: Suspend all operations if on-chain or off-chain liquid funds drop below a safe reserve threshold.
 - [x] **Kelly Criterion Sizing**: Dynamically scale rebalance budget based on the statistical certainty of the peer's reliability (Win Probability) and Profitability (Odds).
-- [ ] Align wallet reserve definition
+- [x] Align wallet reserve definition
 
 ## Phase 2: Observability
 *Objective: "You cannot manage what you cannot measure." Provide real-time visualization and auditing of algorithmic decisions.*
@@ -17,7 +17,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Real-Time Metrics**: Updated event hooks to push metrics instantly, removing dashboard lag.
 - [x] **Lifetime History**: Added `revenue-history` to track total P&L including closed channels.
 - [x] Fix revenue-history pruning issue
-- [ ] Record rebalance_costs on success
+- [x] Record rebalance_costs on success
 - [ ] Reconcile README option names
 
 ## Phase 3: Traffic Intelligence

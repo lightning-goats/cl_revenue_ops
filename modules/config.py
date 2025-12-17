@@ -68,7 +68,7 @@ class Config:
     
     # Global Capital Controls
     daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period
-    min_wallet_reserve: int = 1_000_000    # Min sats (on-chain + receivable) before ABORT
+    min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
     
     # HTLC Congestion threshold
     htlc_congestion_threshold: float = 0.8  # Mark channel as CONGESTED if >80% HTLC slots used
