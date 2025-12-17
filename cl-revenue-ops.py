@@ -275,7 +275,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Verify external plugins are available before initializing dependent modules
     # =========================================================================
     try:
-        plugins_result = plugin.rpc.listplugins()
+        # Try modern 'plugin list' command first, fallback to 'listplugins' for older nodes
+        try:
+            # Modern CLN (v23.08+)
+            plugins_result = plugin.rpc.plugin("list")
+        except RpcError:
+            # Fallback for older CLN versions
+            plugins_result = plugin.rpc.listplugins()
+            
         active_plugins = [p.get("name", "").lower() for p in plugins_result.get("plugins", [])]
         
         # Check for sling plugin
