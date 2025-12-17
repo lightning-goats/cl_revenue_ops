@@ -62,11 +62,18 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [ ] **Database Rollups**: Summarize old forwarding data into daily stats before pruning to maintain long-term history without bloat.
 
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
-*Objective: Automate the expansion of profitable capacity and defend against Layer 1 volatility.*
+*Objective: This phase shifts the plugin from "Maintenance" to "Growth & Pruning," automating the capital allocation decisions that usually require manual operator intervention.*
 
-- [ ] **Mempool-Aware Fee Floors**: Dynamically adjust `min_fee_ppm` based on current L1 feerates to ensure routing fees cover the increased risk/insurance cost of force-closures during congestion.
-- [ ] **Smart Splicing**: Detect high-ROI channels that are capacity-constrained and trigger `splice` to increase size.
-- [ ] **Automated Liquidity Ads**: Monetize excess "Sink" liquidity.
+- [ ] **Dynamic Chain Cost Defense (Mempool Awareness)**: Automatically adjust the fee floor based on current L1 congestion to cover the "Risk Premium" of on-chain enforcement.
+    - **Logic**: `min_safe_fee_ppm = (current_sats_per_vbyte * 150) / average_htlc_size * 1_000_000`.
+    - **Action**: If mempool clogged, `dynamic_floor = max(config.min_fee_ppm, calculated_risk_premium)`.
+
+- [ ] **Capacity Augmentation (Smart Splicing)**: Detect high-performing channels that are capacity-constrained and recommend (or execute) a splice-in.
+    - **Logic**: Identify "Winners" (ROI > 20% & Flow Ratio > 0.8 or < -0.8). Check turnover > 0.5.
+    - **Action**: Generate `revenue-capacity-report` with splice recommendations.
+
+- [ ] **Automated Liquidity Ads (Leasing)**: Monetize excess inbound capacity on "Sink" channels by selling it via Liquidity Ads.
+    - **Logic**: If `total_sink_capacity > 50M`, enable liquidity ads via `funder-update`.
 
 ---
-*Roadmap updated: December 16, 2025*
+*Roadmap updated: December 17, 2025*
