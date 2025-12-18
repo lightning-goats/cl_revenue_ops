@@ -318,22 +318,33 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     database = Database(config.db_path, plugin)
     database.initialize()
     
+    
     # Snapshot currently connected peers for baseline state on restart
     # This establishes a known state for uptime tracking after plugin restarts
     try:
         peers = plugin.rpc.listpeers()
+        total_peers = len(peers.get("peers", []))
+        connected_peers = 0
         snapshot_count = 0
+        
+        plugin.log(f"Checking {total_peers} peers for connection snapshot...")
+        
         for peer in peers.get("peers", []):
             if peer.get("connected", False):
+                connected_peers += 1
                 peer_id = peer["id"]
                 # Only insert snapshot if no recent history exists (within 1 hour)
-                if not database.has_recent_connection_history(peer_id, 3600):
+                has_recent = database.has_recent_connection_history(peer_id, 3600)
+                plugin.log(f"Peer {peer_id[:12]}... is connected, has_recent_history={has_recent}", level='debug')
+                if not has_recent:
                     database.record_connection_event(peer_id, "snapshot")
                     snapshot_count += 1
-        if snapshot_count > 0:
-            plugin.log(f"Connection baseline: snapshotted {snapshot_count} connected peers")
+        
+        plugin.log(f"Connection baseline: {connected_peers} connected peers, snapshotted {snapshot_count} new peers")
     except Exception as e:
         plugin.log(f"Error snapshotting peer connections: {e}", level='warn')
+        import traceback
+        plugin.log(f"Traceback: {traceback.format_exc()}", level='warn')
     
     # Initialize Prometheus metrics exporter (Phase 2: Observability)
     if config.enable_prometheus:
