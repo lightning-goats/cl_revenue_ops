@@ -251,6 +251,20 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_states_peer ON channel_states(peer_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connection_history_peer_time ON peer_connection_history(peer_id, timestamp)")
         
+        # Daily aggregated forwarding stats (Granular History)
+        # Replacing the single 'lifetime_aggregates' counter with daily resolution
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_forwarding_stats (
+                channel_id TEXT NOT NULL,
+                date INTEGER NOT NULL,  -- Unix timestamp of midnight (UTC)
+                total_in_msat INTEGER NOT NULL DEFAULT 0,
+                total_out_msat INTEGER NOT NULL DEFAULT 0,
+                total_fee_msat INTEGER NOT NULL DEFAULT 0,
+                forward_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (channel_id, date)
+            )
+        """)
+        
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
         try:
@@ -952,8 +966,14 @@ class Database:
         ).fetchone()
         current_revenue_msat = revenue_row["total"] if revenue_row else 0
         
-        # Combine pruned + current for true lifetime total
-        total_revenue_msat = pruned_revenue_msat + current_revenue_msat
+        # Rolled-up revenue from daily_forwarding_stats
+        rollup_revenue_row = conn.execute(
+            "SELECT COALESCE(SUM(total_fee_msat), 0) as total FROM daily_forwarding_stats"
+        ).fetchone()
+        rollup_revenue_msat = rollup_revenue_row["total"] if rollup_revenue_row else 0
+        
+        # Combine pruned (legacy) + rolled-up + current
+        total_revenue_msat = pruned_revenue_msat + rollup_revenue_msat + current_revenue_msat
         
         # Total rebalance costs from rebalance_costs table (aggregated source of truth)
         rebalance_row = conn.execute(
@@ -973,8 +993,14 @@ class Database:
         ).fetchone()
         current_forwards = count_row["total"] if count_row else 0
         
-        # Combine pruned + current for true lifetime total
-        total_forwards = pruned_forward_count + current_forwards
+        # Rolled-up forward count
+        rollup_count_row = conn.execute(
+            "SELECT COALESCE(SUM(forward_count), 0) as total FROM daily_forwarding_stats"
+        ).fetchone()
+        rollup_forwards = rollup_count_row["total"] if rollup_count_row else 0
+        
+        # Combine pruned (legacy) + rolled-up + current
+        total_forwards = pruned_forward_count + rollup_forwards + current_forwards
         
         return {
             "total_revenue_msat": total_revenue_msat,
@@ -1252,21 +1278,41 @@ class Database:
             ).fetchone()["cnt"]
 
             # LIFETIME PRESERVATION: Aggregate revenue from forwards about to be pruned
+            # and store in daily_forwarding_stats for granular history.
             if forwards_count > 0:
-                prune_stats = conn.execute(
-                    "SELECT COALESCE(SUM(fee_msat), 0) as revenue, COUNT(*) as count FROM forwards WHERE timestamp < ?",
-                    (cutoff,)
-                ).fetchone()
-                pruned_revenue = prune_stats["revenue"] if prune_stats else 0
-                pruned_count = prune_stats["count"] if prune_stats else 0
-
-                conn.execute("""
-                    UPDATE lifetime_aggregates
-                    SET pruned_revenue_msat = pruned_revenue_msat + ?,
-                        pruned_forward_count = pruned_forward_count + ?,
-                        last_prune_timestamp = ?
-                    WHERE id = 1
-                """, (pruned_revenue, pruned_count, now))
+                # Group by channel and day (86400s)
+                # SQLite integer division floor handles the day bucket
+                rows = conn.execute("""
+                    SELECT 
+                        out_channel,
+                        (timestamp / 86400) * 86400 as day_ts,
+                        COALESCE(SUM(in_msat), 0) as sum_in,
+                        COALESCE(SUM(out_msat), 0) as sum_out,
+                        COALESCE(SUM(fee_msat), 0) as sum_fee,
+                        COUNT(*) as count
+                    FROM forwards 
+                    WHERE timestamp < ?
+                    GROUP BY out_channel, day_ts
+                """, (cutoff,)).fetchall()
+                
+                for r in rows:
+                    pruned_revenue += r['sum_fee']
+                    pruned_count += r['count']
+                    
+                    # Upsert into daily stats
+                    conn.execute("""
+                        INSERT INTO daily_forwarding_stats 
+                        (channel_id, date, total_in_msat, total_out_msat, total_fee_msat, forward_count)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(channel_id, date) DO UPDATE SET
+                            total_in_msat = total_in_msat + excluded.total_in_msat,
+                            total_out_msat = total_out_msat + excluded.total_out_msat,
+                            total_fee_msat = total_fee_msat + excluded.total_fee_msat,
+                            forward_count = forward_count + excluded.forward_count
+                    """, (r['out_channel'], r['day_ts'], r['sum_in'], r['sum_out'], r['sum_fee'], r['count']))
+                
+                # We NO LONGER update lifetime_aggregates for new data, 
+                # but we leave the table alone as it contains legacy history.
 
             conn.execute("DELETE FROM flow_history WHERE timestamp < ?", (cutoff,))
             conn.execute("DELETE FROM forwards WHERE timestamp < ?", (cutoff,))

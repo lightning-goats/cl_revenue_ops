@@ -342,13 +342,30 @@ class HillClimbingFeeController:
                         )
                     return None
         
+        # PROFITABILITY SHIELD: Protect high-value peers from reputation penalties
+        # If a channel is highly profitable (ROI > 10%), we ignore its "reputation" score.
+        # This ensures we don't price-out "messy but rich" peers (high volume but occasional failures).
+        is_shielded = False
+        if self.profitability:
+            from .profitability_analyzer import ProfitabilityClass
+            prof_data = self.profitability.get_profitability(channel_id)
+            if prof_data and prof_data.classification == ProfitabilityClass.PROFITABLE:
+                is_shielded = True
+                self.plugin.log(
+                    f"PROFITABILITY SHIELD: Shielding profitable peer {peer_id[:12]}... "
+                    f"(ROI={prof_data.roi_percent:.1f}%) - Reputation penalty ignored.",
+                    level='info'
+                )
+
         # RATE-BASED FEEDBACK: Get volume SINCE LAST FEE CHANGE (not 7-day average)
         # This eliminates the lag from averaging that made the controller blind
         #
         # REPUTATION-WEIGHTED VOLUME: If enabled, discount volume by peer success rate
         # This prevents spammy peers with high failure rates from influencing fees
         # Effective Volume = Raw Volume * Peer_Success_Rate
-        if self.config.enable_reputation:
+        #
+        # EXCEPTION: If channel is SHIELDED, we always use raw volume.
+        if self.config.enable_reputation and not is_shielded:
             volume_since_sats = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
         else:
             volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
@@ -357,6 +374,9 @@ class HillClimbingFeeController:
         # Peers with high disconnect rates have dampened revenue signals so we
         # don't optimize fees based on unreliable traffic patterns.
         # Formula: effective_volume = volume * (uptime_pct / 100)
+        # 
+        # NOTE: Shielded channels are NOT protected from Flap Protection.
+        # Unstable connections are bad regardless of profitability.
         uptime_pct = self.database.get_peer_uptime_percent(peer_id, 86400)  # 24h window
         uptime_factor = uptime_pct / 100.0  # Convert 0-100 to 0-1
         if uptime_factor < 1.0:

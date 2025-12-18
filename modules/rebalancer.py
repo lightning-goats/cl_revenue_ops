@@ -162,6 +162,10 @@ class JobManager:
         
         # Chunk size for sling rebalances (sats per attempt)
         self.chunk_size_sats = getattr(config, 'sling_chunk_size_sats', 500000)
+
+        # Source reliability tracking
+        self.source_failure_counts: Dict[str, float] = {}
+        self.last_decay_time = time.time()
     
     @property
     def active_job_count(self) -> int:
@@ -368,11 +372,19 @@ class JobManager:
             "still_running": 0
         }
         
+        # Get current time
+        now = int(time.time())
+        
+        # Periodic decay of failure counts (every hour)
+        if now - self.last_decay_time > 3600:
+            for scid in list(self.source_failure_counts.keys()):
+                self.source_failure_counts[scid] *= 0.5
+                if self.source_failure_counts[scid] < 0.1:
+                    del self.source_failure_counts[scid]
+            self.last_decay_time = now
+            
         if not self._active_jobs:
             return summary
-        
-        # Get current time for timeout checks
-        now = int(time.time())
         
         # Get sling stats for all jobs
         sling_stats = self._get_sling_stats()
@@ -515,6 +527,13 @@ class JobManager:
                 timestamp=int(time.time())
             )
         
+        # RELIABILITY: Reset failure count for the source channel since it delivered
+        if job.candidate and job.candidate.source_candidates:
+            primary_source = job.candidate.source_candidates[0]
+            if primary_source in self.source_failure_counts:
+                # Significant reduction (rewarding success)
+                self.source_failure_counts[primary_source] = 0.0
+        
         # Update metrics
         if self.metrics:
             self.metrics.inc_counter(
@@ -546,6 +565,12 @@ class JobManager:
         )
         self.database.increment_failure_count(job.scid_normalized)
         
+        # Track source failure for reliability scoring
+        if job.candidate and job.candidate.source_candidates:
+            # Penalize the primary source
+            primary_source = job.candidate.source_candidates[0]
+            self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
+
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
     
@@ -624,6 +649,10 @@ class JobManager:
             for scid in self._active_jobs.keys()
             if self.get_job_status(scid)
         ]
+
+    def get_source_failure_count(self, channel_id: str) -> float:
+        """Get the recent failure count for a source channel."""
+        return self.source_failure_counts.get(channel_id, 0.0)
 
 
 class EVRebalancer:
@@ -1099,6 +1128,21 @@ class EVRebalancer:
                         level='info'
                     )
                     continue
+
+            # SOURCE PROTECTION (Anti-Cannibalization)
+            # Prevent draining our best source channels unless they are overflowing.
+            # A "Source" is meant to sell INBOUND liquidity. Rebalancing OUT destroys that value.
+            #
+            # RELAXED MODE: Only allow if local balance > 80% (outbound_ratio > 0.8)
+            state = self.database.get_channel_state(cid)
+            if state and state.get("state") == "source":
+                if ratio < 0.80:
+                    self.plugin.log(
+                        f"Skipping source candidate {cid}: Protected Source "
+                        f"(ratio={ratio:.2f} < 0.80)",
+                        level='debug'
+                    )
+                    continue
             
             # Calculate opportunity cost for this source
             source_fee_ppm = info.get("fee_ppm", 1000)
@@ -1130,6 +1174,16 @@ class EVRebalancer:
                 score += 100
             elif state and state.get("state") == "balanced": 
                 score += 20
+            
+            # RELIABILITY PENALTY: Penalize sources with recent failures
+            fails = self.job_manager.get_source_failure_count(cid)
+            if fails > 0:
+                penalty = fails * 50
+                score -= penalty
+                self.plugin.log(
+                    f"Applying reliability penalty to {cid}: -{penalty:.1f} (fails: {fails:.1f})",
+                    level='debug'
+                )
             
             candidates.append((cid, info, score, weighted_opp_cost))
         
