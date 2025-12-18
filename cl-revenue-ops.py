@@ -464,10 +464,42 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log(f"Rebalance check sleeping for {sleep_time}s")
             time.sleep(sleep_time)
     
+    def snapshot_peers_delayed():
+        """
+        One-time delayed snapshot of connected peers.
+        
+        Sleeps to allow lightningd to establish connections, then records
+        a snapshot for all currently connected peers. Exits after completion.
+        """
+        delay_seconds = 60
+        plugin.log(f"Startup snapshot: waiting {delay_seconds}s for network connections...")
+        time.sleep(delay_seconds)
+        
+        try:
+            peers = plugin.rpc.listpeers()
+            connected_count = 0
+            snapshot_count = 0
+            
+            for peer in peers.get("peers", []):
+                if peer.get("connected", False):
+                    connected_count += 1
+                    peer_id = peer["id"]
+                    # Only snapshot if no recent history exists
+                    if not database.has_recent_connection_history(peer_id, 3600):
+                        database.record_connection_event(peer_id, "snapshot")
+                        snapshot_count += 1
+            
+            plugin.log(f"Startup snapshot: Recorded {snapshot_count} of {connected_count} connected peers")
+        except Exception as e:
+            plugin.log(f"Error in delayed snapshot: {e}", level='warn')
+            import traceback
+            plugin.log(f"Traceback: {traceback.format_exc()}", level='warn')
+    
     # Start background threads (daemon=True so they don't block shutdown)
     threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()
     threading.Thread(target=fee_adjustment_loop, daemon=True, name="fee-adjustment").start()
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
+    threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     
     plugin.log("cl-revenue-ops plugin initialized successfully!")
     return None
@@ -967,9 +999,9 @@ def on_peer_connect(plugin: Plugin, **kwargs):
     peer_id = kwargs.get("id")
     if peer_id:
         database.record_connection_event(peer_id, "connected")
-        plugin.log(f"Peer connected: {peer_id[:12]}...", level='debug')
+        plugin.log(f"Peer connected: {peer_id[:12]}...", level='info')
     else:
-        plugin.log(f"Received connect event without id: {kwargs.keys()}", level='debug')
+        plugin.log(f"Received connect event without id: {kwargs.keys()}", level='info')
 
 
 @plugin.subscribe("disconnect")
@@ -985,9 +1017,9 @@ def on_peer_disconnect(plugin: Plugin, **kwargs):
     peer_id = kwargs.get("id")
     if peer_id:
         database.record_connection_event(peer_id, "disconnected")
-        plugin.log(f"Peer disconnected: {peer_id[:12]}...", level='debug')
+        plugin.log(f"Peer disconnected: {peer_id[:12]}...", level='info')
     else:
-        plugin.log(f"Received disconnect event without id: {kwargs.keys()}", level='debug')
+        plugin.log(f"Received disconnect event without id: {kwargs.keys()}", level='info')
 
 
 # =============================================================================
