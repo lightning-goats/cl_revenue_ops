@@ -1270,6 +1270,7 @@ class Database:
 
             conn.execute("DELETE FROM flow_history WHERE timestamp < ?", (cutoff,))
             conn.execute("DELETE FROM forwards WHERE timestamp < ?", (cutoff,))
+            conn.execute("DELETE FROM peer_connection_history WHERE timestamp < ?", (cutoff,))
 
         # VACUUM to reclaim disk space after pruning
         # SQLite DELETE only marks pages as free; VACUUM actually shrinks the file.
