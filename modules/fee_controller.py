@@ -752,7 +752,12 @@ class HillClimbingFeeController:
         The floor ensures we never charge less than the channel costs us.
         Uses live mempool fee rates when available for accurate cost estimation.
         
-        floor_ppm = (open_cost + close_cost) / estimated_lifetime_volume * 1M
+        ALGORITHM:
+        1. Base Floor: Amortized open/close costs over lifetime volume.
+        2. Risk Premium: Additional fee needed to cover on-chain enforcement diff
+           during high congestion for typical HTLC sizes.
+           
+        floor_ppm = max(base_floor, risk_premium)
         
         Args:
             capacity_sats: Channel capacity
@@ -765,8 +770,10 @@ class HillClimbingFeeController:
         # Use provided chain_costs (hoisted from adjust_all_fees for efficiency)
         # Falls back to static defaults if chain_costs is None (RPC failed)
         dynamic_costs = chain_costs
+        floor_ppm = ChainCostDefaults.calculate_floor_ppm(capacity_sats)
         
         if dynamic_costs:
+            # 1. Calculate Base Floor (Cost Recovery)
             open_cost = dynamic_costs.get("open_cost_sats", ChainCostDefaults.CHANNEL_OPEN_COST_SATS)
             close_cost = dynamic_costs.get("close_cost_sats", ChainCostDefaults.CHANNEL_CLOSE_COST_SATS)
             
@@ -774,11 +781,44 @@ class HillClimbingFeeController:
             estimated_lifetime_volume = ChainCostDefaults.DAILY_VOLUME_SATS * ChainCostDefaults.CHANNEL_LIFETIME_DAYS
             
             if estimated_lifetime_volume > 0:
-                floor_ppm = (total_chain_cost / estimated_lifetime_volume) * 1_000_000
-                return max(1, int(floor_ppm))
+                base_floor = (total_chain_cost / estimated_lifetime_volume) * 1_000_000
+                floor_ppm = max(floor_ppm, int(base_floor))
+                
+            # 2. Calculate Risk Premium (Congestion Defense)
+            # When mempool is congested, force-closing becomes expensive.
+            # We must charge enough to justify the risk of smaller HTLCs getting stuck/trimmed.
+            sat_per_vbyte = dynamic_costs.get("sat_per_vbyte", 0.0)
+            
+            if sat_per_vbyte > 0:
+                # Conservative estimate for a commitment tx weight (approx 150 vbytes)
+                COMMITMENT_TX_VBYTES = 150
+                # Reference HTLC size to evaluate risk against (50k sats = ~$50)
+                # Smaller values mean we charge HIGHER fees to discourage dust
+                AVG_HTLC_SIZE_SATS = 50_000
+                
+                # RISK PROBABILITY: The chance that any specific HTLC will force-close the channel.
+                # We don't charge the full on-chain cost for every packet (that would be ~180,000 PPM).
+                # We charge the Expectation of cost: Cost * Probability.
+                # Assumes ~1 in 1000 HLTCs causes a force-close scenario.
+                RISK_PROBABILITY = 0.001
+                
+                # Formula: (Cost to enforce * Probability) / Value protected * 1M
+                # (sat_vbyte * 150 * 0.001) / 250k * 1M
+                risk_premium_ppm = int((sat_per_vbyte * COMMITMENT_TX_VBYTES * RISK_PROBABILITY * 1_000_000) / AVG_HTLC_SIZE_SATS)
+                
+                # Apply Risk Premium if it exceeds the base floor
+                if risk_premium_ppm > floor_ppm:
+                    # Log warning only if congestion is significant (e.g. > 100 sat/vB)
+                    if sat_per_vbyte > 100:
+                        self.plugin.log(
+                            f"CONGESTION DEFENSE: High fees ({sat_per_vbyte:.1f} sat/vB). "
+                            f"Raising floor from {floor_ppm} to {risk_premium_ppm} PPM "
+                            f"(Risk Premium).",
+                            level='info'
+                        )
+                    floor_ppm = risk_premium_ppm
         
-        # Fallback to static defaults
-        return ChainCostDefaults.calculate_floor_ppm(capacity_sats)
+        return max(1, int(floor_ppm))
     
     def _get_dynamic_chain_costs(self) -> Optional[Dict[str, int]]:
         """
