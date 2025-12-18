@@ -294,9 +294,11 @@ class ChannelProfitabilityAnalyzer:
             peer_id = channel_info.get("peer_id", "")
             capacity = channel_info.get("capacity", 0)
             funding_txid = channel_info.get("funding_txid", "")
+            opener = channel_info.get("opener", "local")
             
             # Get costs from database
-            costs = self._get_channel_costs(channel_id, peer_id, funding_txid, capacity)
+            # Pass opener to correctly handle remote vs local channel costs
+            costs = self._get_channel_costs(channel_id, peer_id, funding_txid, capacity, opener)
             
             # Get revenue from routing history
             # Use precalculated data if provided, otherwise fall back to single RPC call
@@ -312,7 +314,8 @@ class ChannelProfitabilityAnalyzer:
             if costs.total_cost_sats > 0:
                 roi = net_profit / costs.total_cost_sats
             else:
-                # No costs recorded - consider profitable if earning
+                # No costs recorded (e.g. remote open, no rebalancing)
+                # Infinite ROI if earning, 0 otherwise
                 roi = 1.0 if revenue.fees_earned_sats > 0 else 0.0
             
             # Cost/fee per sat routed
@@ -754,7 +757,8 @@ class ChannelProfitabilityAnalyzer:
                     "peer_id": channel.get("peer_id", ""),
                     "capacity": capacity,
                     "funding_txid": funding_txid,
-                    "open_timestamp": open_timestamp
+                    "open_timestamp": open_timestamp,
+                    "opener": channel.get("opener", "local")  # Extract opener (local/remote)
                 }
                 
         except Exception as e:
@@ -848,22 +852,23 @@ class ChannelProfitabilityAnalyzer:
         return None
     
     def _get_channel_costs(self, channel_id: str, peer_id: str, 
-                          funding_txid: str, capacity_sats: int = 0) -> ChannelCosts:
+                          funding_txid: str, capacity_sats: int = 0,
+                          opener: str = "local") -> ChannelCosts:
         """
         Get costs for a channel from bookkeeper and database.
         
         Cost sources (in priority order):
-        1. Bookkeeper onchain_fee events for the funding tx (most accurate)
-        2. Database cached value (from previous lookup or manual entry)
-        3. Config estimated_open_cost_sats (fallback)
+        1. If opener == 'remote': Cost is 0 (we didn't pay to open it).
+        2. Bookkeeper onchain_fee events for the funding tx (most accurate).
+        3. Database cached value.
+        4. Config estimated_open_cost_sats (fallback).
         
-        IMPORTANT: Includes sanity check and self-healing mechanism to detect
-        and correct cases where principal capital (funding amount) was incorrectly
-        recorded as an expense (open cost).
-        
-        RETROACTIVE FIX: If a channel is stored with the fallback value
-        (estimated_open_cost_sats), we re-query bookkeeper with the corrected
-        summation logic to attempt self-healing of legacy bad data.
+        Args:
+            channel_id: Short channel ID
+            peer_id: Peer node ID
+            funding_txid: Funding transaction ID
+            capacity_sats: Channel capacity
+            opener: Who opened the channel ('local' or 'remote')
         """
         # Get rebalance costs - combine database records with bookkeeper data
         db_rebalance_costs = self.database.get_channel_rebalance_costs(channel_id)
@@ -872,59 +877,73 @@ class ChannelProfitabilityAnalyzer:
         # Use the higher value (bookkeeper may have more complete history)
         rebalance_costs = max(db_rebalance_costs, bkpr_rebalance_costs)
         
-        # Try to get open cost from database cache first
+        # Determine open cost
+        open_cost = None
         db_open_cost = self.database.get_channel_open_cost(channel_id)
-        open_cost = db_open_cost
-        
-        # RETROACTIVE FIX: Re-query channels stored with fallback value
-        # Many channels were stored with estimated_open_cost_sats (e.g., 5000 sats)
-        # because the old logic failed. Now that we use proper summation, re-try.
-        if db_open_cost is not None and db_open_cost == self.config.estimated_open_cost_sats:
-            if funding_txid:
+
+        if opener == 'remote':
+            # Remote opener pays the fees -> Cost to us is 0
+            open_cost = 0
+            
+            # SELF-HEALING: If we previously recorded a cost for a remote channel (e.g. fallback), fix it.
+            if db_open_cost is not None and db_open_cost > 0:
                 self.plugin.log(
-                    f"Stored cost for {channel_id} is fallback value "
-                    f"({db_open_cost} sats). Attempting re-query with summation logic...",
+                    f"Self-healing: Fixed open cost for remote channel {channel_id} "
+                    f"(was {db_open_cost}, now 0)",
+                    level='info'
+                )
+                self.database.record_channel_open_cost(
+                    channel_id, peer_id, 0, capacity_sats
+                )
+        else:
+            # Local opener -> We paid fees. Proceed with lookup logic.
+            
+            # Use cached value if available
+            open_cost = db_open_cost
+            
+            # RETROACTIVE FIX: Re-query channels stored with fallback value
+            if db_open_cost is not None and db_open_cost == self.config.estimated_open_cost_sats:
+                if funding_txid:
+                    self.plugin.log(
+                        f"Stored cost for {channel_id} is fallback value "
+                        f"({db_open_cost} sats). Attempting re-query with summation logic...",
+                        level='debug'
+                    )
+                    requeried_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
+                    
+                    if requeried_cost is not None:
+                        self.plugin.log(
+                            f"Retroactive fix for {channel_id}: updated open_cost from "
+                            f"{db_open_cost} sats (fallback) to {requeried_cost} sats (actual)",
+                            level='info'
+                        )
+                        self.database.record_channel_open_cost(
+                            channel_id, peer_id, requeried_cost, capacity_sats
+                        )
+                        open_cost = requeried_cost
+            
+            # SANITY CHECK: Detect invalid open_cost (capital mistaken as expense)
+            if open_cost is not None and capacity_sats > 0:
+                open_cost = self._sanity_check_open_cost(
+                    channel_id, peer_id, funding_txid, open_cost, capacity_sats
+                )
+            
+            # Query bookkeeper if not found
+            if open_cost is None and funding_txid:
+                open_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
+                if open_cost is not None:
+                    self.database.record_channel_open_cost(
+                        channel_id, peer_id, open_cost, capacity_sats
+                    )
+            
+            # Final fallback
+            if open_cost is None:
+                open_cost = self.config.estimated_open_cost_sats
+                self.plugin.log(
+                    f"Using estimated open cost ({open_cost} sats) for {channel_id} - "
+                    f"bookkeeper data not available",
                     level='debug'
                 )
-                requeried_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
-                
-                if requeried_cost is not None:
-                    self.plugin.log(
-                        f"Retroactive fix for {channel_id}: updated open_cost from "
-                        f"{db_open_cost} sats (fallback) to {requeried_cost} sats (actual)",
-                        level='info'
-                    )
-                    # Update database with corrected value
-                    self.database.record_channel_open_cost(
-                        channel_id, peer_id, requeried_cost, capacity_sats
-                    )
-                    open_cost = requeried_cost
-        
-        # SANITY CHECK: Detect invalid open_cost (capital mistaken as expense)
-        # This triggers self-healing for existing bad data in the database
-        if open_cost is not None and capacity_sats > 0:
-            open_cost = self._sanity_check_open_cost(
-                channel_id, peer_id, funding_txid, open_cost, capacity_sats
-            )
-        
-        if open_cost is None and funding_txid:
-            # Query bookkeeper for actual on-chain fee
-            open_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
-            
-            # Cache it in database for future lookups
-            if open_cost is not None:
-                self.database.record_channel_open_cost(
-                    channel_id, peer_id, open_cost, capacity_sats
-                )
-        
-        if open_cost is None:
-            # Final fallback: use estimated cost from config
-            open_cost = self.config.estimated_open_cost_sats
-            self.plugin.log(
-                f"Using estimated open cost ({open_cost} sats) for {channel_id} - "
-                f"bookkeeper data not available",
-                level='debug'
-            )
         
         return ChannelCosts(
             channel_id=channel_id,
