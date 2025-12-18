@@ -215,6 +215,17 @@ class Database:
             )
         """)
         
+        # Peer connection history for uptime/stability tracking
+        # Logs connect/disconnect events to calculate historical uptime
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_connection_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            )
+        """)
+        
         # Lifetime aggregates - stores cumulative totals before pruning
         # This ensures revenue-history remains accurate even after old forwards are deleted
         conn.execute("""
@@ -238,6 +249,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_channels ON forwards(in_channel, out_channel)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_channel ON rebalance_costs(channel_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_states_peer ON channel_states(peer_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_connection_history_peer_time ON peer_connection_history(peer_id, timestamp)")
         
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
@@ -1279,6 +1291,113 @@ class Database:
                 f"Cleaned up data older than {days_to_keep} days: "
                 f"{flow_count} flow_history rows, {forwards_count} forwards rows"
             )
+    
+    # =========================================================================
+    # Peer Connection History Methods
+    # =========================================================================
+    
+    def record_connection_event(self, peer_id: str, event_type: str):
+        """
+        Record a peer connection event.
+        
+        Args:
+            peer_id: The peer's node ID
+            event_type: One of 'connected', 'disconnected', or 'snapshot'
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        
+        conn.execute("""
+            INSERT INTO peer_connection_history (peer_id, event_type, timestamp)
+            VALUES (?, ?, ?)
+        """, (peer_id, event_type, now))
+    
+    def has_recent_connection_history(self, peer_id: str, seconds: int) -> bool:
+        """
+        Check if a peer has any connection history within the given time window.
+        
+        Used to avoid duplicate 'snapshot' events on restart if history already exists.
+        
+        Args:
+            peer_id: The peer's node ID
+            seconds: Time window in seconds to check
+            
+        Returns:
+            True if any events exist within the window
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        cutoff = now - seconds
+        
+        row = conn.execute("""
+            SELECT 1 FROM peer_connection_history 
+            WHERE peer_id = ? AND timestamp >= ?
+            LIMIT 1
+        """, (peer_id, cutoff)).fetchone()
+        
+        return row is not None
+    
+    def get_peer_uptime_percent(self, peer_id: str, duration_seconds: int) -> float:
+        """
+        Calculate the uptime percentage for a peer over a time window.
+        
+        Walks through connection events and sums time spent connected.
+        Handles open-ended intervals (e.g., currently connected).
+        
+        Args:
+            peer_id: The peer's node ID
+            duration_seconds: Time window to analyze (seconds before now)
+            
+        Returns:
+            Uptime percentage (0.0 to 100.0)
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        window_start = now - duration_seconds
+        
+        # 1. Determine state at window start
+        # Look for the most recent event BEFORE the window to know initial state
+        prior_event = conn.execute("""
+            SELECT event_type FROM peer_connection_history
+            WHERE peer_id = ? AND timestamp < ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (peer_id, window_start)).fetchone()
+        
+        # Start state: connected if prior event was 'connected' or 'snapshot'
+        is_connected = prior_event is not None and prior_event['event_type'] in ('connected', 'snapshot')
+        last_interval_start = window_start
+        
+        # 2. Get all events in the window
+        rows = conn.execute("""
+            SELECT event_type, timestamp FROM peer_connection_history
+            WHERE peer_id = ? AND timestamp >= ?
+            ORDER BY timestamp ASC
+        """, (peer_id, window_start)).fetchall()
+        
+        total_connected_time = 0
+        
+        for row in rows:
+            event_type = row['event_type']
+            timestamp = row['timestamp']
+            
+            if is_connected:
+                # We were connected until this event
+                total_connected_time += timestamp - last_interval_start
+            
+            # Update state for next interval
+            is_connected = event_type in ('connected', 'snapshot')
+            last_interval_start = timestamp
+        
+        # 3. Handle interval from last event until now
+        if is_connected:
+            total_connected_time += now - last_interval_start
+        
+        if duration_seconds <= 0:
+            return 0.0
+        
+        uptime_pct = (total_connected_time / duration_seconds) * 100.0
+        return min(100.0, max(0.0, uptime_pct))
     
     def close(self):
         """Close the database connection."""

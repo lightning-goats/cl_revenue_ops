@@ -318,6 +318,23 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     database = Database(config.db_path, plugin)
     database.initialize()
     
+    # Snapshot currently connected peers for baseline state on restart
+    # This establishes a known state for uptime tracking after plugin restarts
+    try:
+        peers = plugin.rpc.listpeers()
+        snapshot_count = 0
+        for peer in peers.get("peers", []):
+            if peer.get("connected", False):
+                peer_id = peer["id"]
+                # Only insert snapshot if no recent history exists (within 1 hour)
+                if not database.has_recent_connection_history(peer_id, 3600):
+                    database.record_connection_event(peer_id, "snapshot")
+                    snapshot_count += 1
+        if snapshot_count > 0:
+            plugin.log(f"Connection baseline: snapshotted {snapshot_count} connected peers")
+    except Exception as e:
+        plugin.log(f"Error snapshotting peer connections: {e}", level='warn')
+    
     # Initialize Prometheus metrics exporter (Phase 2: Observability)
     if config.enable_prometheus:
         metrics_exporter = PrometheusExporter(port=config.prometheus_port, plugin=plugin)
@@ -924,6 +941,38 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
         fee_msat = forward_event.get("fee_msat", 0)
         
         database.record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat)
+
+
+@plugin.subscribe("connect")
+def on_peer_connect(connect_event: Dict, plugin: Plugin, **kwargs):
+    """
+    Notification when a peer connects.
+    
+    Records the connection event for uptime tracking.
+    """
+    if database is None:
+        return
+    
+    peer_id = connect_event.get("id")
+    if peer_id:
+        database.record_connection_event(peer_id, "connected")
+        plugin.log(f"Peer connected: {peer_id[:12]}...", level='debug')
+
+
+@plugin.subscribe("disconnect")
+def on_peer_disconnect(disconnect_event: Dict, plugin: Plugin, **kwargs):
+    """
+    Notification when a peer disconnects.
+    
+    Records the disconnection event for uptime tracking.
+    """
+    if database is None:
+        return
+    
+    peer_id = disconnect_event.get("id")
+    if peer_id:
+        database.record_connection_event(peer_id, "disconnected")
+        plugin.log(f"Peer disconnected: {peer_id[:12]}...", level='debug')
 
 
 # =============================================================================
