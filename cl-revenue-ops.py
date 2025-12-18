@@ -944,7 +944,7 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
 
 
 @plugin.subscribe("connect")
-def on_peer_connect(plugin: Plugin, id: str, **kwargs):
+def on_peer_connect(plugin: Plugin, **kwargs):
     """
     Notification when a peer connects.
     
@@ -953,12 +953,16 @@ def on_peer_connect(plugin: Plugin, id: str, **kwargs):
     if database is None:
         return
     
-    database.record_connection_event(id, "connected")
-    plugin.log(f"Peer connected: {id[:12]}...", level='debug')
+    peer_id = kwargs.get("id")
+    if peer_id:
+        database.record_connection_event(peer_id, "connected")
+        plugin.log(f"Peer connected: {peer_id[:12]}...", level='debug')
+    else:
+        plugin.log(f"Received connect event without id: {kwargs.keys()}", level='debug')
 
 
 @plugin.subscribe("disconnect")
-def on_peer_disconnect(plugin: Plugin, id: str, **kwargs):
+def on_peer_disconnect(plugin: Plugin, **kwargs):
     """
     Notification when a peer disconnects.
     
@@ -967,8 +971,12 @@ def on_peer_disconnect(plugin: Plugin, id: str, **kwargs):
     if database is None:
         return
     
-    database.record_connection_event(id, "disconnected")
-    plugin.log(f"Peer disconnected: {id[:12]}...", level='debug')
+    peer_id = kwargs.get("id")
+    if peer_id:
+        database.record_connection_event(peer_id, "disconnected")
+        plugin.log(f"Peer disconnected: {peer_id[:12]}...", level='debug')
+    else:
+        plugin.log(f"Received disconnect event without id: {kwargs.keys()}", level='debug')
 
 
 # =============================================================================
