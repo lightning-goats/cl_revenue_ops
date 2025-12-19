@@ -476,7 +476,7 @@ class HillClimbingFeeController:
                 marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
         
         # Calculate floor and ceiling
-        floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs)
+        floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id)
         floor_ppm = max(floor_ppm, self.config.min_fee_ppm)
         # Apply flow state to floor (sinks can go lower)
         floor_ppm = int(floor_ppm * flow_state_multiplier)
@@ -796,7 +796,8 @@ class HillClimbingFeeController:
         return result
     
     def _calculate_floor(self, capacity_sats: int, 
-                         chain_costs: Optional[Dict[str, int]] = None) -> int:
+                         chain_costs: Optional[Dict[str, int]] = None,
+                         peer_id: Optional[str] = None) -> int:
         """
         Calculate the economic floor fee for a channel.
         
@@ -808,13 +809,15 @@ class HillClimbingFeeController:
            (Phase 7: REPLACEMENT COST PRICING logic)
         2. Risk Premium: Additional fee needed to cover on-chain enforcement diff
            during high congestion for typical HTLC sizes.
+        3. HTLC Hold Risk Premium: Markup for peers with high "Stall Risk"
+           (peers that tie up capital for long durations).
            
-        floor_ppm = max(base_floor, risk_premium)
+        floor_ppm = max(base_floor, risk_premium) * stall_multiplier
         
         Args:
             capacity_sats: Channel capacity
             chain_costs: Pre-fetched chain costs from feerates RPC (optimization).
-                        If None, falls back to static defaults.
+            peer_id: Optional peer ID to check for HTLC hold latency.
             
         Returns:
             Minimum fee in PPM
@@ -846,8 +849,22 @@ class HillClimbingFeeController:
                     )
                 
                 floor_ppm = max(floor_ppm, int(base_floor))
+        
+        # 3. HTLC Hold Risk Premium (Stall Defense)
+        if peer_id:
+            latency = self.database.get_peer_latency_stats(peer_id, window_seconds=86400)
+            avg_res = latency.get('avg', 0)
+            std_res = latency.get('std', 0)
+            
+            if avg_res > 10.0 or std_res > 5.0:
+                self.plugin.log(
+                    f"HTLC HOLD DEFENSE: Peer {peer_id[:16]}... has high Stall Risk "
+                    f"(avg={avg_res:.1f}s, std={std_res:.1f}s). Applying 20% markup to floor.",
+                    level='info'
+                )
+                floor_ppm = int(floor_ppm * 1.2)
                 
-            # 2. Calculate Risk Premium (Congestion Defense)
+        # 2. Calculate Risk Premium (Congestion Defense)
             # When mempool is congested, force-closing becomes expensive.
             # We must charge enough to justify the risk of smaller HTLCs getting stuck/trimmed.
             sat_per_vbyte = dynamic_costs.get("sat_per_vbyte", 0.0)

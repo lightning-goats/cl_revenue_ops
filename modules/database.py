@@ -12,6 +12,7 @@ import sqlite3
 import os
 import time
 import json
+import math
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
@@ -803,6 +804,44 @@ class Database:
         """, (since,)).fetchone()
         
         return row['total_volume_msat'] // 1000 if row else 0
+    
+    def get_peer_latency_stats(self, peer_id: str, window_seconds: int = 86400) -> Dict[str, float]:
+        """
+        Calculate latency (resolution_time) statistics for a peer.
+        
+        Args:
+            peer_id: The peer to analyze
+            window_seconds: Lookback window in seconds (default 24h)
+            
+        Returns:
+            Dict with 'avg' and 'std' of resolution_time
+        """
+        conn = self._get_connection()
+        since = int(time.time()) - window_seconds
+        
+        # Join forwards with channel_states to filter by peer_id
+        # We look at out_channel because that's where the capital was tied up
+        rows = conn.execute("""
+            SELECT f.resolution_time
+            FROM forwards f
+            JOIN channel_states cs ON f.out_channel = cs.channel_id
+            WHERE cs.peer_id = ? AND f.timestamp >= ?
+        """, (peer_id, since)).fetchall()
+        
+        if not rows:
+            return {'avg': 0.0, 'std': 0.0}
+            
+        times = [row['resolution_time'] for row in rows]
+        n = len(times)
+        avg = sum(times) / n
+        
+        if n < 2:
+            return {'avg': avg, 'std': 0.0}
+            
+        variance = sum((x - avg) ** 2 for x in times) / (n - 1)
+        std = math.sqrt(variance)
+        
+        return {'avg': avg, 'std': std}
     
     # =========================================================================
     # Clboss Unmanage Tracking

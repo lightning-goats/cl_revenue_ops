@@ -28,7 +28,7 @@ Reason: The current logic prevents the Hill Climber from fine-tuning fees at the
 
 ## Phase 5: Network Resilience & Optimization (In Progress)
 
-### 2. The "HTLC Hold" Risk Premium (Capital Efficiency)
+### 2. The "HTLC Hold" Risk Premium (Capital Efficiency) ✅ COMPLETED
 **Objective:** Price-in the capital lockup time by charging a premium to high-latency or high-variance ("Stalling") peers.
 
 **Context Files:**
