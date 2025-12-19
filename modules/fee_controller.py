@@ -585,7 +585,12 @@ class HillClimbingFeeController:
         
         # Check if fee changed meaningfully
         fee_change = abs(new_fee_ppm - current_fee_ppm)
-        min_change = max(5, current_fee_ppm * 0.03)  # 3% or 5 ppm minimum
+
+        #allow any integer change if the fee is low
+        if current_fee_ppm < 100:
+            min_change = 1  # Allow fine-tuning at the bottom
+        else:
+            min_change = max(5, current_fee_ppm * 0.03)
         
         # Always update state for tracking (with rate-based values)
         hc_state.last_revenue_rate = current_revenue_rate

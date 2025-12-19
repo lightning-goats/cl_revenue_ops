@@ -54,19 +54,23 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Flap Protection**: 
     - **Rebalancer**: Skip targets with high disconnect rates.
     - **Fee Controller**: Discount volume from flapping peers.
-- [ ] **The "Profitability Shield" (Smart Reputation)**:
+- [x] **The "Profitability Shield" (Smart Reputation)**:
     - **Volume Unmasking:** If a channel is `PROFITABLE`, ignore the Reputation Score and count 100% of the volume for Fee Control (fixes the "Invisible Whale" problem where we undercharge messy-but-rich peers).
     - **Smart Penalty:** Only apply fee penalties (pricing out) to peers that are both **Spammy AND Underwater**. Grant "Immunity" to profitable spammers.
-- [ ] **Source Protection (Anti-Cannibalization)**: Explicitly prevent the Rebalancer from draining channels marked as **High-Velocity Sources**, even if they have excess liquidity.
-- [ ] **Source Reliability Scoring**: Penalize source channels in the rebalancer selection logic if they have a history of routing failures.
-- [ ] **Database Rollups**: Summarize old forwarding data into daily stats before pruning to maintain long-term history without bloat.
+- [x] **Source Protection (Anti-Cannibalization)**: Explicitly prevent the Rebalancer from draining channels marked as **High-Velocity Sources**, even if they have excess liquidity.
+- [x] **Source Reliability Scoring**: Penalize source channels in the rebalancer selection logic if they have a history of routing failures.
+- [x] **Database Rollups**: Summarize old forwarding data into daily stats before pruning to maintain long-term history without bloat.
 
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 *Objective: This phase shifts the plugin from "Maintenance" to "Growth & Pruning," automating the capital allocation decisions that usually require manual operator intervention.*
 
-- [ ] **Dynamic Chain Cost Defense (Mempool Awareness)**: Automatically adjust the fee floor based on current L1 congestion to cover the "Risk Premium" of on-chain enforcement.
+- [x] **Dynamic Chain Cost Defense (Mempool Awareness)**: Automatically adjust the fee floor based on current L1 congestion to cover the "Risk Premium" of on-chain enforcement.
     - **Logic**: `min_safe_fee_ppm = (current_sats_per_vbyte * 150) / average_htlc_size * 1_000_000`.
     - **Action**: If mempool clogged, `dynamic_floor = max(config.min_fee_ppm, calculated_risk_premium)`.
+
+- [ ] **The "HTLC Hold" Risk Premium (Capital Efficiency)**: Price-in the capital lockup time by charging a premium to high-latency peers.
+    - **Logic**: Track `avg_resolution_time` per peer. If ` > 10s`, apply +20% fee markup.
+    - **Action**: Update `forwards` tracking to include duration and modify `_calculate_floor`.
 
 - [ ] **Capacity Augmentation (Smart Splicing)**: Detect high-performing channels that are capacity-constrained and recommend (or execute) a splice-in.
     - **Logic**: Identify "Winners" (ROI > 20% & Flow Ratio > 0.8 or < -0.8). Check turnover > 0.5.
@@ -76,4 +80,4 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - **Logic**: If `total_sink_capacity > 50M`, enable liquidity ads via `funder-update`.
 
 ---
-*Roadmap updated: December 17, 2025*
+*Roadmap updated: December 19, 2025*
