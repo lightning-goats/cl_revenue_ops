@@ -762,7 +762,18 @@ class EVRebalancer:
                 if normalized in active_channels:
                     continue
                 
-                if outbound_ratio < self.config.low_liquidity_threshold:
+                # STAGNANT INVENTORY DETECTION
+                # Check if a channel is "Stagnant" (Balanced but not moving for ~1 week)
+                # Threshold: turnover < 0.0015 per day (~1% per week)
+                turnover = self._calculate_turnover_rate(channel_id, capacity)
+                is_stagnant = (0.4 <= outbound_ratio <= 0.6) and (turnover < 0.0015)
+
+                if is_stagnant:
+                    # Treat stagnant balanced channels as source candidates to redeploy capital
+                    source_channels.append((channel_id, info, outbound_ratio))
+                    self.plugin.log(f"STAGNANT AWAKENING: {channel_id[:12]}... is idle (turnover {turnover:.4f}). Adding to source pool.", level='debug')
+                
+                elif outbound_ratio < self.config.low_liquidity_threshold:
                     depleted_channels.append((channel_id, info, outbound_ratio))
                 elif outbound_ratio > self.config.high_liquidity_threshold:
                     source_channels.append((channel_id, info, outbound_ratio))
@@ -1182,9 +1193,16 @@ class EVRebalancer:
             
             # Bonus for sink/balanced channels (they have excess outbound we want to use)
             state = self.database.get_channel_state(cid)
-            if state and state.get("state") == "sink": 
+            flow_state = state.get("state", "balanced") if state else "balanced"
+            
+            if flow_state == "sink": 
                 score += 100
-            elif state and state.get("state") == "balanced": 
+            elif flow_state == "balanced":
+                # Apply Stagnant Inventory Bonus
+                if source_turnover_rate < 0.0015:
+                    score += 10 # Awakening Bonus
+                    self.plugin.log(f"STAGNANT BONUS: Applying +10 priority to stagnant channel {cid[:12]}...", level='info')
+                
                 score += 20
             
             # RELIABILITY PENALTY: Penalize sources with recent failures

@@ -75,7 +75,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 
 - [x] **Replacement Cost Pricing**: Base fee floor on *current* on-chain replacement cost, not historical cost.
 - [x] **"Fire Sale" Mode**: Automatically dump inventory for Zombie or Underwater channels at 0-1 PPM fees to avoid manual closure costs.
-- [ ] **"Stagnant Inventory" Awakening**: Treat balanced but low-volume channels as Sources to redeploy idle capital to high-demand areas.
+- [x] **"Stagnant Inventory" Awakening**: Treat balanced but low-volume channels as Sources to redeploy idle capital to high-demand areas.
 
 ---
 *Roadmap updated: December 19, 2025*

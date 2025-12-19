@@ -143,7 +143,7 @@ Implement "Fire Sale" mode for Zombie channels.
     - This encourages the network to drain the channel for us, saving the closing fee.
 ```
 
-### 7. "Stagnant Inventory" Awakening (Rebalancer)
+### 7. "Stagnant Inventory" Awakening (Rebalancer) ✅ COMPLETED
 **Objective:** Treat balanced but low-volume channels as "Sources" to redeploy that idle capital.
 
 **Context Files:**
