@@ -70,6 +70,10 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - **Critical State Overrides**: Forced immediate broadcast for Congestion and Fire Sale transitions.
 - [x] **The "Alpha Sequence" Fee Logic**: Refactored decision flow to prioritize emergency states over discovery.
 - [x] **Low Fee Trap Fix**: Enabled fine-tuning (1 PPM steps) for inexpensive, high-volume channels.
+- [x] **Strict Idempotency Guard**: Eliminate redundant `1 -> 1 PPM` RPC calls and log noise.
+- [ ] **Database Thread Safety**: Implement `threading.local()` to prevent corruption during concurrent access.
+- [ ] **Rebalance Price-Truth Alignment**: Ensure EV calculations reflect on-chain prices rather than internal targets.
+- [ ] **Fire Sale Momentum Guard**: Protect improving but technically "underwater" channels from premature liquidation.
 
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 *Objective: This phase shifts the plugin from "Maintenance" to "Growth & Pruning," automating the capital allocation decisions that usually require manual operator intervention.*
@@ -78,12 +82,25 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **The "HTLC Hold" Risk Premium (Capital Efficiency)**: Price-in capital lockup. Track `avg_resolution_time` and standard deviation ("Stall Risk"). If `avg > 10s` or `std > 5s`, apply +20% fee markup.
 - [x] **Capacity Augmentation (Smart Splicing)**: This is the "Growth" lever. Use Phase 7 data (Fire Sale/Stagnant) to recommend: "Close A (Loser), Splice into B (Source Winner)."
 
-## Phase 7: Alpha Maximization (Yield Optimization)
-*Objective: Optimize for capital efficiency and yield by fixing accounting gaps and automating inventory liquidation.*
-
 - [x] **Replacement Cost Pricing**: Base fee floor on *current* on-chain replacement cost, not historical cost.
 - [x] **"Fire Sale" Mode**: Automatically dump inventory for Zombie or Underwater channels at 0-1 PPM fees to avoid manual closure costs.
 - [x] **"Stagnant Inventory" Awakening**: Treat balanced but low-volume channels as Sources to redeploy idle capital to high-demand areas.
+
+## Phase 8: "The 1% Node" Strategy Path
+*Objective: Institutional-grade Liquidity Management focusing on Scarcity, Irreplaceability, Volatility, and Market Presence.*
+
+- [ ] **Mempool Acceleration (Vegas Reflex)**: 
+    - Detect L1 fee "shocks" and force an immediate re-price of inventory.
+    - **Safety Guard**: 2-cycle Confirmation Window to filter out exchange-batch noise.
+- [ ] **HTLC Slot Scarcity Pricing**:
+    - Transition from binary congestion gates to exponential pricing curves.
+    - **Safety Guard**: EMA-based utilization to prevent price flapping.
+- [ ] **Flow Asymmetry (Rare Liquidity Premium)**:
+    - Charge a premium for "One-Way Street" channels with high outflow.
+    - **Safety Guard**: Velocity Gate - only apply to high-volume channels (>50k sats/day).
+- [ ] **Peer-Level Atomic Fee Syncing**:
+    - Unified liquidity pool pricing per peer node to prevent "Gossip Cannibalization."
+    - **Safety Guard**: Exception Hierarchy - emergency states (Fire Sale/Congestion) take precedence over syncing.
 
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*

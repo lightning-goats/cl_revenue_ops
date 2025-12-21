@@ -1,151 +1,25 @@
-# cl-revenue-ops: Outstanding Roadmap & Implementation Prompts
+# cl-revenue-ops: "The 1% Node" Strategy Path (Safety-Hardened)
 
-This document details the implementation steps for the remaining items in the roadmap, including newly identified "Alpha Leaks."
+This document details the implementation steps for the remaining items in the roadmap, focusing on capital efficiency, gossip reduction, and advanced market dynamics with strong safety guards.
 
-## 🚨 Priority Fixes (Immediate)
+## 🚨 Final Polish (Immediate)
 
-### 1. Fix "Low Fee Trap" Logic Bug ✅ COMPLETED
-**Objective:** Allow small fee increments (e.g., 10 -> 11 PPM) for low-fee channels, which are currently blocked by the "3% minimum change" spam guard.
+### 1-10. Existing Roadmap Items ✅ COMPLETED
 
-**Context Files:**
-- `modules/fee_controller.py`
+### 11. Strict Idempotency Guard ✅ COMPLETED
+**Objective:** Eliminate redundant `1 -> 1 PPM` RPC calls and log noise.
 
-**AI Prompt:**
-```text
-Modify `modules/fee_controller.py` in the `_adjust_channel_fee` method.
+### 11.5. Database Thread Safety (Crash Prevention)
+**AI Prompt:** 
+Modify `modules/database.py`. Remove the shared `self._conn`. Update `_get_connection` to create a new connection if one doesn't exist for the current thread (using `threading.local()`). This prevents database corruption when multiple loops (Fee/Flow/Rebalance) write simultaneously.
 
-Current logic:
-`min_change = max(5, current_fee_ppm * 0.03)`
+### 11.6. Rebalance Price-Truth Alignment
+**AI Prompt:** 
+Modify `modules/rebalancer.py`. In `_analyze_rebalance_ev`, ensure that the `outbound_fee_ppm` used for profit calculation is the `last_broadcast_fee_ppm` from the database, not the internal target fee. We must only rebalance based on prices the network is actually paying.
 
-Required Change:
-If `current_fee_ppm < 100`, set `min_change = 1`.
-Else, keep existing logic.
-
-Reason: The current logic prevents the Hill Climber from fine-tuning fees at the bottom range (e.g. stepping from 10 to 12 ppm), causing revenue loss on high-volume cheap channels.
-```
-
----
-
-## Phase 5: Network Resilience & Optimization (In Progress)
-
-### 2. The "HTLC Hold" Risk Premium (Capital Efficiency) ✅ COMPLETED
-**Objective:** Price-in the capital lockup time by charging a premium to high-latency or high-variance ("Stalling") peers.
-
-**Context Files:**
-- `cl-revenue-ops.py` (Subscriber update)
-- `modules/database.py` (Schema & query update)
-- `modules/fee_controller.py` (Floor calculation update)
-
-**AI Prompt:**
-```text
-Implement "HTLC Hold" Risk Premium to penalize peers that lock up capital.
-
-1.  **Database Upgrade (`modules/database.py`)**:
-    - Modify the `forwards` table to add a `resolution_time` column (REAL).
-    - Update `record_forward()` to store this value.
-    - Add `get_peer_latency_stats(peer_id, window_seconds)`: Return BOTH `mean` and `std_dev` of resolution times.
-    - *Rationale:* Consistent slowness is bad, but high variance ("Stalling") is worse.
-
-2.  **Notification Logic (`cl-revenue-ops.py`)**:
-    - In `on_forward_event()`, calculate `resolution_time = resolved_time - received_time`.
-    - Pass this duration to `database.record_forward()`.
-
-3.  **Fee Logic (`modules/fee_controller.py`)**:
-    - In `_calculate_floor()`, fetch latency stats (mean + std_dev) for the last 24h.
-    - **Stall Risk Check:** If `mean > 10s` OR `std_dev > 5s`:
-        - Apply a +20% markup to the `floor_ppm`.
-        - Log: "HTLC HOLD DEFENSE: Peer {peer_id} has high Stall Risk (avg={mean}s, std={std_dev}s). Applying 20% markup."
-```
-
----
-
-## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
-
-### 3. Capacity Augmentation (Smart Splicing) ✅ COMPLETED
-**Objective:** Identify "Growth" levers by redeploying capital from dead channels to sold-out winners.
-
-**Context Files:**
-- `modules/capacity_planner.py` (New Module)
-- `modules/flow_analysis.py`
-- `modules/profitability_analyzer.py`
-
-**AI Prompt:**
-```text
-Create `modules/capacity_planner.py` to identify capital redeployment opportunities.
-
-1.  **Identify Winners (Targets for Splice-In)**:
-    - `marginal_roi > 20%`.
-    - `flow_ratio > 0.8` (Source) AND `turnover > 0.5` (Sold out).
-
-2.  **Identify Losers (Sources for Splice-Out/Close)**:
-    - Channels in `FIRE SALE` mode (Zombie/Deeply Underwater).
-    - Balanced channels with `turnover < 0.0015` (Stagnant).
-
-3.  **Action**:
-    - Generate `revenue-capacity-report`.
-    - Recommendation Logic: "STRATEGIC REDEPLOYMENT: Close channel {loser_scid} (Fire Sale/Stagnant) and Splice the funds into {winner_scid} (High ROI Source)."
-    - This creates a self-optimizing loop where capital flows toward yield.
-```
-
----
-
-## Phase 7: Alpha Maximization (Yield Optimization)
-*These are newly identified inefficiencies ("Alpha Leaks") that require logic updates to maximize ROI.*
-
-### 4. Replacement Cost Pricing (Accounting Fix) ✅ COMPLETED
-**Objective:** Price liquidity based on the current cost to replace it, not the historical cost paid to open the channel.
-
-**Context Files:**
-- `modules/fee_controller.py`
-
-**AI Prompt:**
-```text
-Update the fee floor calculation to use Replacement Cost instead of Historical Cost.
-
-1.  **Location:** `modules/fee_controller.py`, method `_calculate_floor`.
-2.  **Current Logic:** Uses `ChainCostDefaults.CHANNEL_OPEN_COST_SATS` (static) or DB history.
-3.  **New Logic:**
-    - Always use the `dynamic_costs` (from `feerates` RPC) for the `open_cost` component.
-    - `total_chain_cost = dynamic_costs['open_cost_sats'] + dynamic_costs['close_cost_sats']`.
-    - *Rationale:* In a rising fee market, we must charge enough to replace the channel at *today's* prices, not 2023 prices.
-```
-
-### 5. "Fire Sale" Mode (Capital Preservation) ✅ COMPLETED
-**Objective:** Drain dead channels via routing (cheap) rather than closing them on-chain (expensive).
-
-**Context Files:**
-- `modules/fee_controller.py`
-
-**AI Prompt:**
-```text
-Implement "Fire Sale" mode for Zombie channels.
-
-1.  **Location:** `modules/fee_controller.py`, `_adjust_channel_fee`.
-2.  **Logic:**
-    - Check `profitability_analyzer` for the channel class.
-    - If class is `ZOMBIE` or `UNDERWATER` (and days_active > 90):
-        - Override calculated fee: Set `new_fee_ppm = 0` (or 1).
-        - Log: "FIRE SALE: Dumping inventory for {channel_id} to avoid on-chain closure costs."
-    - This encourages the network to drain the channel for us, saving the closing fee.
-```
-
-### 6. "Stagnant Inventory" Awakening (Rebalancer) ✅ COMPLETED
-**Objective:** Treat balanced but low-volume channels as "Sources" to redeploy that idle capital.
-
-**Context Files:**
-- `modules/rebalancer.py`
-
-**AI Prompt:**
-```text
-Update rebalancer logic to target stagnant balanced channels.
-
-1.  **Location:** `modules/rebalancer.py`, `_select_source_candidates`.
-2.  **Logic:**
-    - Retrieve `daily_volume` (or turnover rate) for the channel.
-    - If `state == 'balanced'` (ratio ~0.5) AND `turnover_rate < 0.01` (1% per week):
-        - Treat this channel as a valid **SOURCE**.
-        - Apply a specific score bonus (e.g., `+10`) to prioritize moving this idle capital to a high-demand Sink.
-    - *Rationale:* A balanced channel with no volume is dead inventory. We should move it.
+### 11.7. Fire Sale Momentum Guard
+**AI Prompt:** 
+Modify `_adjust_channel_fee` in `modules/fee_controller.py`. Even if a channel is Underwater/Zombie, if its `marginal_roi` is positive and increasing, skip the `FIRE_SALE` override and allow the Hill Climber to keep seeking a higher, sustainable price.
 
 ---
 
@@ -154,39 +28,96 @@ Update rebalancer logic to target stagnant balanced channels.
 ### 7. Delta-Based Gossip Updates (Gossip Hysteresis) ✅ COMPLETED
 **Objective:** Reduce network noise and remain an enterprise-grade stable peer by only broadcasting fee updates when they are economically significant (>5% change).
 
+---
+
+## Phase 6.0: Yield Management & Protocol-Level Alpha
+
+### 12. Mempool Acceleration (Vegas Reflex)
+**Objective:** Detect L1 fee "shocks" (e.g. a sudden NFT mint or exchange run) and force an immediate re-price of inventory.
+**Safety Guard:** **Confirmation Window.** To prevent overreacting to 10-minute fee "spikes" from a single exchange batch, the reflex only triggers if the spike persists for 2 consecutive check cycles (60 mins).
+
 **Context Files:**
 - `modules/fee_controller.py`
 - `modules/database.py`
 
-**Logic Flow**:
-1. **Target vs. Broadcast**: We now track two fees. The `target_fee` is where the Hill Climber currently sits. The `broadcast_fee` is what we last told the network via RPC.
-2. **The 5% Gate**: If `abs(target_fee - broadcast_fee) / broadcast_fee < 0.05`, we skip the `setchannel` RPC call.
-3. **The Observation Pause**: If we skip the RPC, we **do not** update the `last_update` timestamp in the database. This effectively "freezes" the Hill Climber's timer. It won't try to calculate a new revenue rate or move again until the Delta accumulates enough to trigger a real broadcast.
+**AI Prompt:**
+```text
+Implement "Vegas Reflex" with Confirmation logic in `modules/fee_controller.py`.
+
+1. **Database Update**: Store `last_sat_per_vbyte` and `spike_confirm_count` in `fee_strategy_state`.
+2. **Logic**:
+   - Every cycle, if `current_sat_per_vbyte > (previous * 2.0)`, increment `spike_confirm_count`.
+   - If `spike_confirm_count >= 2`:
+     - Set `market_shock = True`.
+     - Double the Hill Climber's `step_ppm`.
+     - Bypass Gossip Hysteresis (Significant_change = True).
+   - If the fee drops back down, reset the count to 0.
+3. **Benefit**: Protects your "Hard Asset" (sats) during real L1 fee runs while ignoring mempool noise.
+```
+
+### 13. HTLC Slot Scarcity Pricing (Yield Management)
+**Objective:** Transition from a binary "Congestion Guard" to exponential slot pricing.
+**Safety Guard:** **Utilization EMA.** To prevent "Price Flapping" where a single large payment clearing causes a fee crash, calculate the premium based on an Exponential Moving Average (EMA) of slot usage.
+
+**Context Files:**
+- `modules/fee_controller.py`
 
 **AI Prompt:**
 ```text
-Implement Delta-Based Gossip Updates with Hill Climber synchronization.
+Implement "Dampened Slot Scarcity Pricing" in `modules/fee_controller.py`.
 
-1.  **Database Update (`modules/database.py`)**:
-    - Add `last_broadcast_fee_ppm` (INTEGER) to the `fee_strategy_state` table.
-    - Ensure `get_fee_strategy_state` and `update_fee_strategy_state` handle this new field.
-
-2.  **Controller Logic (`modules/fee_controller.py`)**:
-    - Modify `_adjust_channel_fee` to calculate `delta = abs(new_fee_ppm - hc_state.last_broadcast_fee_ppm)`.
-    - Set a `significant_change = delta > (hc_state.last_broadcast_fee_ppm * 0.05)`.
-    - **Override**: Always set `significant_change = True` if the channel is entering/exiting "CONGESTED" or "FIRE SALE" states.
-
-3.  **The Broadcast Gate**:
-    - If `significant_change` is FALSE:
-        - DO NOT call `set_channel_fee` (skip RPC).
-        - Update `hc_state.last_fee_ppm = new_fee_ppm` (save internal target).
-        - IMPORTANT: Do NOT update `hc_state.last_update`. This pauses the observation window.
-        - Log: "HYSTERESIS: Target fee {new_fee} is <5% delta from broadcast {last_broadcast}. Skipping gossip; pausing observation."
-    - If `significant_change` is TRUE:
-        - Call `set_channel_fee` (execute RPC).
-        - Update `hc_state.last_broadcast_fee_ppm = new_fee_ppm`.
-        - Update `hc_state.last_update = now`. This starts the 30-minute clock for the next "Observe" phase.
-
-4.  **Result**: This allows the node to wiggle its fee internally to find a floor, but it only "announces" the move once it has shifted significantly, ensuring high-quality, non-spammy gossip.
+1. **Logic**:
+   - In `_adjust_channel_fee`, track an `EMA_slot_utilization` (Alpha=0.2).
+   - `multiplier = 1.0 + (EMA_slot_utilization ** 4)`.
+   - Apply this multiplier to the `new_fee_ppm`.
+2. **Rebalancer Immunity**: 
+   - If the channel is a target of an active `sling` job, set `multiplier = 1.0`. We don't want to price out our own rebalance.
+3. **Benefit**: Prices in the "Risk of Blockage" using smooth transitions, avoiding rapid fee oscillations.
 ```
+
+### 14. Flow Asymmetry (Rare Liquidity Premium)
+**Objective:** Charge a premium for "One-Way Street" channels (high outflow, zero organic refill).
+**Safety Guard:** **Velocity Gate.** To avoid pricing out the very traffic that could fix the asymmetry (organic inbound), only apply the premium if the channel is High Volume (>50k sats/day).
+
+**Context Files:**
+- `modules/fee_controller.py`
+- `modules/flow_analysis.py`
+
+**AI Prompt:**
+```text
+Implement "Velocity-Gated Asymmetry Premiums" in `modules/fee_controller.py`.
+
+1. **Logic**:
+   - Check `EMA_In` and `EMA_Out` from `flow_analysis`.
+   - `inbound_ratio = EMA_In / (EMA_In + EMA_Out)`.
+   - **Apply Premium ONLY IF**: `(inbound_ratio < 0.1)` AND `(total_daily_volume > 50,000 sats)`.
+   - If both true, apply 1.5x to the calculated floor.
+2. **Benefit**: Ensures you only charge a premium for "Irreplaceable Outbound" that is being drained rapidly. Quiet channels are left alone to attract organic "free" refills.
 ```
+
+### 15. Peer-Level Atomic Fee Syncing
+**Objective:** Unified liquidity pool pricing per peer node.
+**Safety Guard:** **Exception Hierarchy.** Do not force synchronization if individual channels are in emergency states (FIRE_SALE, CONGESTION, etc.).
+
+**Context Files:**
+- `modules/fee_controller.py`
+
+**AI Prompt:**
+```text
+Refactor `adjust_all_fees` in `modules/fee_controller.py` for "State-Aware Syncing."
+
+1. **Logic**:
+   - Group channels by `peer_id`.
+   - **Sync Filter**: For each peer group, only include channels in the `BALANCED / Hill Climbing` state.
+   - **Exclude**: Any channel currently in `FIRE_SALE`, `CONGESTION`, or `MANUAL` mode must be priced individually.
+   - For the "Normal" channels in the group, sync their `new_fee_ppm` to match the largest capacity channel in that group.
+2. **Benefit**: Presents a unified, professional policy front to the network while still allowing emergency logic to handle individual channel crises.
+```
+
+### Final Strategic Audit
+*   **Item 12 (Mempool):** Prevents the "Liquidity Trap."
+*   **Item 13 (Slots):** Prevents "Slot Exhaustion."
+*   **Item 14 (Asymmetry):** Funds the "Manual Rebalance" overhead.
+*   **Item 15 (Syncing):** Prevents "Policy Cherry-Picking."
+
+**Implementation Recommendation:** Start with **Item 12 (Vegas Reflex)**. It is the strongest defensive move to preserve the real value of your node's capital during Bitcoin's high-volatility periods.
