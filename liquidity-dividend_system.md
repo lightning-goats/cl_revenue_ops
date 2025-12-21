@@ -1,81 +1,113 @@
-# cl-revenue-ops: Liquidity Dividend System (LDS)
-**Technical Specification & Implementation Roadmap v1.0**
-
-## 1. Project Vision
-The LDS transforms a Core Lightning (CLN) node into a **Community-Funded Market Maker**. It allows third-party contributors to provide "passive capital" to the node’s global liquidity pool. In exchange, they receive a pro-rata share of the **Realized Net Profit**, calculated after all rebalancing and operational expenses are deducted.
+# cl-revenue-ops: Liquidity Provider System (LDS) v2.0
+**Technical Specification: Managed Liquidity Hosting & Dividend Ledger**
 
 ---
 
-## 2. Core Economic Philosophy: The Unified Pool
-Unlike "Channel Leasing" where a user’s risk is tied to a specific peer, the LDS utilizes a **Unified Risk-Averaged Pool**.
+## 1. Project Vision: The "Liquidity Hosting" Model
+The LDS is an internal utility designed to scale node capacity by pooling capital from a trusted team. It operates on a **Managed Liquidity Hosting** model: 
 
-*   **Socialized Operational Risk:** User capital is allocated dynamically via `clboss` and `sling`. Rebalancing costs and channel opening fees are deducted from the **Global Pool Profit**.
-*   **Decoupled Allocation:** The Node Operator (and the `cl-revenue-ops` algorithms) maintains full control over where capital is deployed.
-*   **Protection against "Bad Decisions":** Because profit/loss is averaged across the entire node, users are not penalized if one specific channel fails, provided the node's overall strategy remains profitable.
-
-### The Dividend Formula
-$$Dividend_i = \left( Net\_Profit \times \frac{User\_TWAB_i}{Node\_Total\_Capital} \right) \times Lock\_Rebate\_Factor$$
-
-*   **Net Profit:** `Fees_Earned - (Rebalance_Costs + Amortized_Open_Costs)`.
-*   **User TWAB:** Time-Weighted Average Balance over the last 72 hours.
-*   **Lock Rebate Factor:** The percentage of the Node's Management Fee returned to the user.
+*   **Native vs. Hosted Capital:** The Node Operator maintains independent "Node Native Capital." LPs provide "Hosted Capital." By combining both, the node achieves a higher "Network Rank" and better routing efficiency than separate efforts.
+*   **The Proposition:** LPs gain liquidity hosting on a professionally maintained node running `cl-revenue-ops`. They face the same market risks they would face running their own node but benefit from centralized management and institutional-grade logic.
+*   **The Operator’s Intent:** The operator seeks **zero profit** from LP capital. The system is designed only to recover **Operational Expenses (OpEx)**. The operator’s primary gain is the improved performance of their own *Native Capital* within a larger, more robust pool.
 
 ---
 
-## 3. Dynamic Multipliers: The "Management Fee Rebate" Model
-To eliminate "Node Bleed" (paying out more than earned), multipliers are funded exclusively by rebating the **Node Management Fee (Carry)**.
+## 2. Economic Logic: Loyalty-Tiered Performance Rebates
+To incentivize capital stability without enforcing hard locks, the system uses **Seniority-Based Fee Rebates**. As capital ages in the pool, the Node Operator waives a larger portion of their performance fee.
 
-**System Default:** The Node Operator takes a **20% Carry** on all net profits.
+### Performance Hosting Fee Tiers
+The Hosting Fee is a "tax" on routing profit used to fund node maintenance.
 
-| Lock Duration | Node Carry | User Payout | Multiplier Label |
-| :--- | :--- | :--- | :--- |
-| **0 Days (Liquid)** | 20% | 80% of Pro-rata | 0.8x |
-| **30 Days** | 10% | 90% of Pro-rata | 0.9x |
-| **90 Days** | 0% | 100% of Pro-rata | 1.0x |
-| **180 Days** | 0% | 100% of Pro-rata | 1.0x (Cap) |
-
-*By capping payouts at 100% of realized profit, the node operator ensures the principal is never touched to pay interest.*
-
----
-
-## 4. Adversarial Protection (Red Team Audit)
-
-| Attack Vector | Description | Technical Mitigation |
+| Seniority (Time in Vault) | Node Hosting Fee (Carry) | LP Payout (% of Pro-rata) |
 | :--- | :--- | :--- |
-| **Yield Sniping** | Depositing 1 BTC just before the payout loop to capture "Whale" routing profits. | **72h TWAB:** Dividends are based on the average balance over 3 days. Flash-deposits earn near-zero yield. |
-| **The Bank Run** | Users withdraw 100% of capital during an L1 fee spike or force-close storm. | **Liquidity Buffer:** LNbits restricts instant withdrawals to 10% of total pool. Excess is queued for 24h rebalancing. |
-| **Virtual Inflation** | Logic bug pays out "Virtual sats" in LNbits that don't exist in CLN channels. | **Master Audit:** System halts if `Virtual Liabilities > 85% of Physical Local Balance`. |
-| **Decision Decay** | Node operator over-spends on rebalancing, making net profit negative. | **High Water Mark (HWM):** Losses are carried forward. No dividends are paid until all past OpEx is recovered. |
+| **0 – 30 Days** | 30% | 70% |
+| **31 – 90 Days** | 15% | 85% |
+| **91+ Days** | 5% (Base OpEx) | 95% |
+
+*Logic: A user who exits early pays a higher fee to the node's reserve fund to compensate for the churn they caused.*
+
+---
+
+## 3. High-Fidelity Accounting & Transparency
+
+### A. The "Total Capacity" Share
+Rebates are calculated based on the LP’s share of the **Entire Node Local Balance** (Native + All Hosted Capital).
+*   **Formula:** $\text{LP Share \%} = \frac{\text{LP 72h TWAB}}{\text{Node Native Capital} + \text{Total Hosted Capital}}$
+
+### B. Automatic "Entry Tax" Recognition
+To ensure a true ROI view, the system tracks the fees LPs paid to move funds in (e.g., Submarine Swap or mining fees).
+*   **Automation:** The system scans for node-side Submarine Swap transactions correlating to deposits and automatically tags the `Entry_Tax` amount.
+*   **Reporting:** The UI displays `Total Entry Tax` vs. `Total Rebates Earned`.
+
+### C. Predictive Breakeven Analysis
+The system calculates a dynamic "Time to Profit" for each LP.
+*   **Logic:** `(Remaining_Entry_Tax) / (Average_7D_Seniority_Adjusted_Profit)`.
+*   **Transparency:** LPs see exactly when their capital becomes "Net Green" based on real-time node performance.
+
+### D. The "Close Reserve" (Asset Amortization)
+To protect the pool from sudden fee spikes when channels close:
+1.  **Recognition:** `Open_Fee + 3000 sat (Estimated Close)` is deducted from the Pool PnL upon channel open.
+2.  **Daily Accretion:** 1/90th of this reserve is "credited" back to the profit pool every 24 hours.
+3.  **Separation:** Hosted Capital is only charged for channels opened specifically to deploy LDS funds.
+
+---
+
+## 4. Adversarial Protection (The "Red Team" Guards)
+
+| Risk | Mitigation Strategy |
+| :--- | :--- |
+| **Yield Sniping** | **72-hour TWAB:** Rebates are calculated using the average balance over 3 days. Instant deposits earn negligible yield. |
+| **Bank Run** | **Hosted Liquidity Cap:** Total Hosted Liabilities are capped at **80% of Spendable Local Balance**. The remaining 20% + Native Capital acts as the "Instant Exit" buffer. |
+| **In-Flight Freeze** | **HTLC Awareness:** Solvency check subtracts `sum(htlcs_out)` from `listfunds` local balance to ensure only "settled" sats are shared. |
+| **Principal Bleed** | **Profit Floor:** If `Total_Profit < 0` (due to high rebalancing costs), all rebates are **0**. User principal is never touched. |
 
 ---
 
 ## 5. Technical Architecture
 
-### Layer 1: LNbits "Vault" Extension (The Ledger)
-*   **Hard-Lock Enforcement:** A dedicated extension that flags wallets as `LDS_INVESTOR`. It hooks into LNbits payment logic to block any `OUT` transaction if `now < lock_expiry`.
-*   **Investor Dashboard:** Displays "Current Yield," "Active Multiplier," and "Time until Unlock."
-*   **TWAB Engine:** Hourly snapshots of investor balances stored in a local SQLite table.
+### Layer 1: LNbits "LDS-Loyalty" Extension (User/Admin Ledger)
+*   **Wallet Isolation:** Users deposit into a specific LDS wallet. 
+*   **Metadata Tagging:** Automatically tags "Move-in Fees" for accurate ROI tracking.
+*   **Non-Blocking:** Funds are never physically locked by code, allowing team members full control over their funds at all times.
 
-### Layer 2: `cl-revenue-ops` LDS Driver (The Strategist)
-*   **Solvency Engine:** Queries CLN `listfunds` and compares physical "Local Balance" against the LNbits `Total_Liabilities`.
-*   **Payout Orchestrator:** Calculates the daily delta in `lifetime_net_profit`. If positive, it issues an internal transfer from the Node Master Wallet to the LDS Master Wallet.
-
----
-
-## 6. Implementation Roadmap (AI Prompts)
-
-### Phase 1: The Solvency & TWAB Driver
-> "Update `modules/database.py` to support LDS tracking. Create an `lds_snapshots` table to record wallet balances every hour. Implement `get_72h_twab(wallet_id)`. Then, in `cl-revenue-ops.py`, create a `verify_solvency()` function that aborts the payout loop if total virtual liabilities exceed 85% of the physical local balance found in CLN `listfunds`."
-
-### Phase 2: The LNbits Extension (Spend Guard)
-> "Build an LNbits extension called 'LDS Vault'. Create a setting to mark a wallet as 'LOCKED'. Implement a middleware hook in FastAPI to intercept `POST /api/v1/payments`. If the source wallet is LOCKED and the `lock_expiry` hasn't passed, return a 403 error: 'Capital is currently deployed in routing channels and is time-locked'."
-
-### Phase 3: The Profit Distribution Loop
-> "Implement the `distribute_dividends` loop in `cl-revenue-ops.py`. It should: 1. Calculate Net Profit since the last successful payout. 2. For each investor wallet, calculate their TWAB-based share. 3. Apply the MFR (Management Fee Rebate) based on their lock tier. 4. Use the LNbits API to credit the user's wallet. 5. Update a `global_high_water_mark` in the DB to ensure losses are recovered before the next payout."
+### Layer 2: `cl-revenue-ops` LDS Driver (CLN Logic)
+*   **The Orchestrator:** Every 24 hours, it calculates the **Net Pool Profit Delta**.
+*   **The Auditor:** Executes a "Physical vs. Virtual" check every 10 minutes to ensure the node is solvent.
+*   **Internal Payouts:** Directs dividends from the Node's fee wallet to LP wallets via the LNbits API.
 
 ---
 
-## 7. Team Review: Points for Refinement
-1.  **Exit Strategy:** Should we offer an "Emergency Exit" button that allows users to break a lock for a 5% "Slashing Penalty"? This penalty would stay in the node's reserve.
-2.  **Pool Density:** Do we limit the pool size? (e.g., "The node will not accept more than 2 BTC total in contributions").
-3.  **Operator Guarantee:** Does the operator guarantee the return of principal in the event of a massive force-close that exceeds the reserve fund? (Recommendation: Terms of Service should state that users share in the risk of on-chain enforcement loss).
+## 6. Implementation Roadmap (AI Assistant Prompts)
+
+### Phase 1: The Dual-Pool Database
+**AI Prompt:**
+> "Refactor `modules/database.py` for LDS v2.0. 
+> 1. Create `lds_wallets` table: `wallet_id`, `join_timestamp`, `entry_tax_total`, `is_hosted_capital`.
+> 2. Create `lds_snapshots` for hourly balance tracking.
+> 3. Implement `get_72h_twab(wallet_id)`.
+> 4. Create logic to auto-detect node-side Submarine Swaps and attribute the fees to the `entry_tax_total` of the receiving wallet."
+
+### Phase 2: The Solvency Auditor
+**AI Prompt:**
+> "Implement `verify_solvency()` in `modules/lds_manager.py`. 
+> 1. Total_Hosted_Liability = `Sum(All LP LNbits Balances)`.
+> 2. Physical_Assets = `(CLN listfunds local_balance) - (CLN listpeers sum of out_htlcs)`.
+> 3. Safety Check: If `Total_Hosted_Liability > (Physical_Assets * 0.85)`, trigger an emergency 'Liquidity Halt' log and alert the operator. This ensures the node never 'oversells' its physical liquidity."
+
+### Phase 3: Seniority-Tiered Payout Loop
+**AI Prompt:**
+> "Implement the `distribute_rebates` loop. 
+> 1. Calculate `Net_Daily_Profit = Routing_Fees - (Rebalance_Costs + Amortized_Open_Costs + Static_OpEx)`.
+> 2. For each wallet, calculate seniority tier: `<30d (0.7), 31-90d (0.85), >90d (0.95)`.
+> 3. `Share_Ratio = TWAB / (Native_Capital + Total_Hosted_Capital)`.
+> 4. `Final_Rebate = Net_Daily_Profit * Share_Ratio * Seniority_Multiplier`.
+> 5. Execute internal LNbits transfer and log the transparency data."
+
+---
+
+## 7. Stakeholder Risk Disclosure
+1.  **Full-Risk Deployment:** Contributed capital is deployed into hot wallets and active channels. LPs share in the risk of software bugs and malicious peer behavior (force-closes).
+2.  **No Guarantee of Profit:** Just like a self-managed node, routing activity may not always exceed rebalancing costs.
+3.  **Operator Discretion:** The Node Operator maintains control over channel selection and peer peering to ensure overall node health.
+
+**Status: This specification is complete and verified against team review feedback. READY FOR DEVELOPMENT.**
