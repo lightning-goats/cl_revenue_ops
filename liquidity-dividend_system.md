@@ -1,113 +1,120 @@
-# cl-revenue-ops: Liquidity Provider System (LDS) v2.0
-**Technical Specification: Managed Liquidity Hosting & Dividend Ledger**
+# cl-revenue-ops: Liquidity Provider System (LDS) v2.1
+**Technical Specification: Managed Liquidity Hosting & Shared Growth Ledger**
 
 ---
 
-## 1. Project Vision: The "Liquidity Hosting" Model
-The LDS is an internal utility designed to scale node capacity by pooling capital from a trusted team. It operates on a **Managed Liquidity Hosting** model: 
+## 1. Project Vision & Governance Philosophy
 
-*   **Native vs. Hosted Capital:** The Node Operator maintains independent "Node Native Capital." LPs provide "Hosted Capital." By combining both, the node achieves a higher "Network Rank" and better routing efficiency than separate efforts.
-*   **The Proposition:** LPs gain liquidity hosting on a professionally maintained node running `cl-revenue-ops`. They face the same market risks they would face running their own node but benefit from centralized management and institutional-grade logic.
-*   **The Operator’s Intent:** The operator seeks **zero profit** from LP capital. The system is designed only to recover **Operational Expenses (OpEx)**. The operator’s primary gain is the improved performance of their own *Native Capital* within a larger, more robust pool.
+The **Liquidity Provider System (LDS)** is an internal utility designed to scale the routing capacity and network centrality of a Core Lightning (CLN) node by pooling capital from a trusted internal team. 
+
+### 1.1 Managed Liquidity Hosting Model
+This system does not function as an "investment product," but rather as a **Managed Liquidity Hosting Service**. 
+*   **The Participant (LP):** A team member who contributes capital ("Hosted Capital") to be managed by the node’s automated routing logic (`cl-revenue-ops`). LPs gain the benefit of high-uptime hosting and professional channel management without needing to run their own infrastructure.
+*   **The Node Operator:** Maintains independent "Node Native Capital." The operator provides the hardware, maintenance, and technical expertise to run the node.
+*   **The Synergetic Benefit:** By pooling Native and Hosted capital, the node achieves significantly higher **Liquidity Depth** and **Centrality Scores**. This scale allows the node to access high-volume routing rebalances and "Whale" payments that are inaccessible to smaller, fragmented nodes.
+
+### 1.2 The "No-Profit" Operator Mandate
+The Node Operator seeks **zero long-term profit** from the LPs' principal. The operator is compensated through the **amplified performance of their own Native Capital**, which routes more effectively as part of a larger, more robust node. The tiered fees (detailed in Section 2) are strictly for **Operational Expense (OpEx)** recovery and risk mitigation.
 
 ---
 
 ## 2. Economic Logic: Loyalty-Tiered Performance Rebates
-To incentivize capital stability without enforcing hard locks, the system uses **Seniority-Based Fee Rebates**. As capital ages in the pool, the Node Operator waives a larger portion of their performance fee.
 
-### Performance Hosting Fee Tiers
-The Hosting Fee is a "tax" on routing profit used to fund node maintenance.
+To ensure capital stability for the `cl-revenue-ops` rebalancing algorithms, the system uses **Seniority-Based Fee Rebates**. This creates a "Natural Lock" where capital is technically liquid (users can withdraw any time) but is financially incentivized to remain deployed.
+
+### 2.1 Performance Hosting Fee Tiers
+The Hosting Fee is a percentage of routing profit retained by the node reserve. After 90 days, the operator waives all fees, recognizing that the increased node scale is sufficient compensation.
 
 | Seniority (Time in Vault) | Node Hosting Fee (Carry) | LP Payout (% of Pro-rata) |
 | :--- | :--- | :--- |
 | **0 – 30 Days** | 30% | 70% |
 | **31 – 90 Days** | 15% | 85% |
-| **91+ Days** | 5% (Base OpEx) | 95% |
+| **91+ Days** | **0% (Full Pass-Through)** | **100%** |
 
-*Logic: A user who exits early pays a higher fee to the node's reserve fund to compensate for the churn they caused.*
-
----
-
-## 3. High-Fidelity Accounting & Transparency
-
-### A. The "Total Capacity" Share
-Rebates are calculated based on the LP’s share of the **Entire Node Local Balance** (Native + All Hosted Capital).
-*   **Formula:** $\text{LP Share \%} = \frac{\text{LP 72h TWAB}}{\text{Node Native Capital} + \text{Total Hosted Capital}}$
-
-### B. Automatic "Entry Tax" Recognition
-To ensure a true ROI view, the system tracks the fees LPs paid to move funds in (e.g., Submarine Swap or mining fees).
-*   **Automation:** The system scans for node-side Submarine Swap transactions correlating to deposits and automatically tags the `Entry_Tax` amount.
-*   **Reporting:** The UI displays `Total Entry Tax` vs. `Total Rebates Earned`.
-
-### C. Predictive Breakeven Analysis
-The system calculates a dynamic "Time to Profit" for each LP.
-*   **Logic:** `(Remaining_Entry_Tax) / (Average_7D_Seniority_Adjusted_Profit)`.
-*   **Transparency:** LPs see exactly when their capital becomes "Net Green" based on real-time node performance.
-
-### D. The "Close Reserve" (Asset Amortization)
-To protect the pool from sudden fee spikes when channels close:
-1.  **Recognition:** `Open_Fee + 3000 sat (Estimated Close)` is deducted from the Pool PnL upon channel open.
-2.  **Daily Accretion:** 1/90th of this reserve is "credited" back to the profit pool every 24 hours.
-3.  **Separation:** Hosted Capital is only charged for channels opened specifically to deploy LDS funds.
+*   **Logic:** The initial 90-day fees fund the **Node Reserve Fund**, which offsets the on-chain costs (mining fees) and risks (force-closures) associated with deploying new liquidity.
 
 ---
 
-## 4. Adversarial Protection (The "Red Team" Guards)
+## 3. The Boltz Integration: Solving Ingress & Attribution
 
-| Risk | Mitigation Strategy |
-| :--- | :--- |
-| **Yield Sniping** | **72-hour TWAB:** Rebates are calculated using the average balance over 3 days. Instant deposits earn negligible yield. |
-| **Bank Run** | **Hosted Liquidity Cap:** Total Hosted Liabilities are capped at **80% of Spendable Local Balance**. The remaining 20% + Native Capital acts as the "Instant Exit" buffer. |
-| **In-Flight Freeze** | **HTLC Awareness:** Solvency check subtracts `sum(htlcs_out)` from `listfunds` local balance to ensure only "settled" sats are shared. |
-| **Principal Bleed** | **Profit Floor:** If `Total_Profit < 0` (due to high rebalancing costs), all rebates are **0**. User principal is never touched. |
+The most significant technical hurdle in pooled liquidity is **Attribution**: knowing exactly which on-chain transaction belongs to which user and how much it cost them to move. We solve this by integrating the **LNbits Boltz Extension**.
+
+### 3.1 Submarine Swap Gateway
+LPs have two methods for capital movement:
+1.  **Lightning-Native:** Standard LN payments directly into the LP's LDS wallet.
+2.  **On-chain Bridge (Boltz):** LPs use the Boltz extension *within* their specific LNbits wallet to perform **Reverse Submarine Swaps** (On-chain BTC -> Lightning).
+
+### 3.2 Why Boltz?
+*   **Automatic Attribution:** When an LP performs a swap via Boltz in their wallet, the funds arrive as an internal Lightning deposit. The LDS system immediately knows the owner without needing to monitor unique xpub derivation paths.
+*   **Precise "Entry Tax" Tracking:** Boltz metadata contains the exact service and network fees paid. The LDS system queries the Boltz API to record the **Entry Tax** (the fee paid to enter the pool) to provide a transparent ROI view.
+*   **Operator Liquidity:** Every Boltz Swap-In provides the Node Operator with fresh **on-chain BTC**. This is the "dry powder" the node needs to open new channels or perform submarine swaps to balance the node.
 
 ---
 
-## 5. Technical Architecture
+## 4. High-Fidelity Accounting & Transparency
 
-### Layer 1: LNbits "LDS-Loyalty" Extension (User/Admin Ledger)
-*   **Wallet Isolation:** Users deposit into a specific LDS wallet. 
-*   **Metadata Tagging:** Automatically tags "Move-in Fees" for accurate ROI tracking.
-*   **Non-Blocking:** Funds are never physically locked by code, allowing team members full control over their funds at all times.
+### 4.1 The Unified Pool Cost Model
+To ensure fairness, all node expenses (rebalancing, opening, closing) are socialized.
+*   **Hosted Ratio ($R$):** $\text{Total Hosted Capital} / (\text{Native Capital} + \text{Total Hosted Capital})$.
+*   **Socialized Expenses:** LPs are collectively charged $R \times \text{Total Node Expenses}$. This ensures LPs share in the node's average performance and are not penalized for the specific channel their capital happens to occupy.
 
-### Layer 2: `cl-revenue-ops` LDS Driver (CLN Logic)
-*   **The Orchestrator:** Every 24 hours, it calculates the **Net Pool Profit Delta**.
-*   **The Auditor:** Executes a "Physical vs. Virtual" check every 10 minutes to ensure the node is solvent.
-*   **Internal Payouts:** Directs dividends from the Node's fee wallet to LP wallets via the LNbits API.
+### 4.2 Asset Protection: The "Close Reserve"
+When a channel opens, the system deducts the `Open Fee + 3000 sat (Estimated Close)` from the Pool PnL immediately. 
+*   **Accretion:** 1/90th of this reserve is "credited" back to the pool every 24 hours.
+*   **Reconciliation:** If a channel closes early (e.g., Day 15), the system immediately "returns" the remaining 75/90ths of the reserve to the PnL, then subtracts the **Actual Close Fee**. This ensures the ledger always balances to the physical reality of the blockchain.
+
+### 4.3 ROI Dashboard & Breakeven Analysis
+Each LP sees a transparent view of their contribution:
+*   **Entry Tax:** Total fees paid (via Boltz or manual tagging) to move funds in.
+*   **Total Rebates:** All routing fees earned.
+*   **Time-to-Breakeven:** A predictive calculation: $\text{Remaining Entry Tax} / \text{7-Day Average Daily Rebate}$.
+
+---
+
+## 5. Safety, Solvency & Adversarial Hardening
+
+### 5.1 72-hour TWAB (Anti-Sniping)
+Dividends are calculated using a **Time-Weighted Average Balance (TWAB)** sampled hourly over 3 days. This prevents "Yield Sniping," where a user deposits capital just minutes before the daily payout loop and withdraws immediately after.
+
+### 5.2 Solvency Auditor (The "Brake")
+The plugin executes a "Master Audit" every 10 minutes:
+*   **Effective Liquidity:** $\text{CLN listfunds (Local Balance)} - \text{CLN listpeers (Pending Outbound HTLCs)}$.
+*   **The Guard:** If `Total Virtual Liabilities > (Effective Liquidity * 0.85)`, the system triggers a **Liquidity Halt**. Payouts are suspended and rebalancing is paused to ensure the node remains solvent for investor exits.
+
+### 5.3 Principal Floor
+The principal is never programmatically used to pay rebates. If `Net_Profit <= 0` (due to high rebalance costs), all rebates are $0$ for that cycle. LPs share in the protocol-level risk of force-closures.
 
 ---
 
 ## 6. Implementation Roadmap (AI Assistant Prompts)
 
-### Phase 1: The Dual-Pool Database
+### Phase 1: The Multi-Pool Database Layer
 **AI Prompt:**
-> "Refactor `modules/database.py` for LDS v2.0. 
-> 1. Create `lds_wallets` table: `wallet_id`, `join_timestamp`, `entry_tax_total`, `is_hosted_capital`.
-> 2. Create `lds_snapshots` for hourly balance tracking.
-> 3. Implement `get_72h_twab(wallet_id)`.
-> 4. Create logic to auto-detect node-side Submarine Swaps and attribute the fees to the `entry_tax_total` of the receiving wallet."
+> "Refactor `modules/database.py` for LDS v2.1. 
+> 1. Create `lds_wallets` table to track Hosted Capital per `wallet_id`.
+> 2. Create `lds_snapshots` for hourly balance tracking (TWAB).
+> 3. Implement `sync_boltz_metadata()`: Query the LNbits Boltz extension API to find successful swaps for LDS wallets and record the fee spread as the 'Entry Tax' for that user."
 
-### Phase 2: The Solvency Auditor
+### Phase 2: Solvency & Reconciliation Logic
 **AI Prompt:**
-> "Implement `verify_solvency()` in `modules/lds_manager.py`. 
-> 1. Total_Hosted_Liability = `Sum(All LP LNbits Balances)`.
-> 2. Physical_Assets = `(CLN listfunds local_balance) - (CLN listpeers sum of out_htlcs)`.
-> 3. Safety Check: If `Total_Hosted_Liability > (Physical_Assets * 0.85)`, trigger an emergency 'Liquidity Halt' log and alert the operator. This ensures the node never 'oversells' its physical liquidity."
+> "Implement `verify_solvency()` and `reconcile_closures()` in `modules/lds_manager.py`.
+> 1. Solvency: Subtract pending outbound HTLCs from the physical local balance. Abort payouts if liabilities exceed 85% of this value.
+> 2. Reconciliation: Monitor for channel closures. If a channel closes, compare its remaining 'Close Reserve' against the actual on-chain fee and settle the difference in the Global Pool PnL."
 
-### Phase 3: Seniority-Tiered Payout Loop
+### Phase 3: The 24h Payout Orchestrator
 **AI Prompt:**
-> "Implement the `distribute_rebates` loop. 
-> 1. Calculate `Net_Daily_Profit = Routing_Fees - (Rebalance_Costs + Amortized_Open_Costs + Static_OpEx)`.
-> 2. For each wallet, calculate seniority tier: `<30d (0.7), 31-90d (0.85), >90d (0.95)`.
-> 3. `Share_Ratio = TWAB / (Native_Capital + Total_Hosted_Capital)`.
-> 4. `Final_Rebate = Net_Daily_Profit * Share_Ratio * Seniority_Multiplier`.
-> 5. Execute internal LNbits transfer and log the transparency data."
+> "Implement the daily `payout_loop`. 
+> 1. Calculate `Net_Daily_Profit = Routing_Fees - (Pro-rata Rebalance + Amortized Costs)`.
+> 2. For each LP, calculate their TWAB-based share of that profit.
+> 3. Apply the Seniority Multiplier (70% for <30d, 85% for <90d, 100% for >90d).
+> 4. Use the LNbits API to transfer the rebate from the Node Master wallet to the LP wallet and log the transaction for transparency."
 
 ---
 
-## 7. Stakeholder Risk Disclosure
-1.  **Full-Risk Deployment:** Contributed capital is deployed into hot wallets and active channels. LPs share in the risk of software bugs and malicious peer behavior (force-closes).
-2.  **No Guarantee of Profit:** Just like a self-managed node, routing activity may not always exceed rebalancing costs.
-3.  **Operator Discretion:** The Node Operator maintains control over channel selection and peer peering to ensure overall node health.
+## 7. Stakeholder Operational Agreement
 
-**Status: This specification is ready for team review feedback.**
+1.  **Risk Acknowledgment:** LPs acknowledge that funds are in a "Hot Wallet." Principal loss is possible via software bugs, node exploits, or high-fee force-closure events.
+2.  **No Guarantee:** Routing performance is dependent on network demand. High-OpEx days may result in $0$ dividends.
+3.  **Operator Control:** The Node Operator maintains full control over peer selection, channel sizes, and rebalancing parameters to ensure node health.
+
+**Status: v2.1 Fully Specified. READY FOR REVIEW.**
