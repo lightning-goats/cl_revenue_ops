@@ -684,8 +684,8 @@ class Database:
         """, (channel_id, since)).fetchone()
         
         return {
-            "attempt_count": row['attempt_count'] if row else 0,
-            "last_success_time": row['last_success'] if row and row['last_success'] > 0 else None
+            "attempt_count": int(row['attempt_count']) if row else 0,
+            "last_success_time": int(row['last_success']) if row and row['last_success'] and row['last_success'] > 0 else None
         }
     
     def get_total_rebalance_fees(self, since_timestamp: int) -> int:
