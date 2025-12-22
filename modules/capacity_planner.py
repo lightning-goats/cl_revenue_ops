@@ -140,6 +140,10 @@ class CapacityPlanner:
         for scid, prof in all_profitability.items():
             flow_metrics = all_flow.get(scid)
             
+            # Fetch diagnostic stats from DB
+            diag_stats = self.profitability.database.get_diagnostic_rebalance_stats(scid, days=14)
+            attempt_count = diag_stats["attempt_count"]
+            
             # SCID formatting check - ensure 'x' separator
             scid_display = scid.replace(':', 'x')
             
@@ -164,15 +168,30 @@ class CapacityPlanner:
                         is_stagnant = True
             
             if is_fire_sale or is_stagnant:
-                losers.append({
-                    "scid": scid_display,
-                    "peer_id": prof.peer_id,
-                    "reason": "FIRE SALE" if is_fire_sale else "STAGNANT",
-                    "roi": round(prof.roi_percent, 2),
-                    "marginal_roi": round(prof.marginal_roi_percent, 2),
-                    "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
-                    "capacity": prof.capacity_sats
-                })
+                # PROTECTION: A channel cannot be recommended for "Close" or "Splice-out"
+                # until the diagnostic_rebalance has been attempted at least twice in the last 14 days.
+                if attempt_count < 2:
+                    losers.append({
+                        "scid": scid_display,
+                        "peer_id": prof.peer_id,
+                        "reason": "STAGNANT (NEEDS DEFIBRILLATOR)",
+                        "roi": round(prof.roi_percent, 2),
+                        "marginal_roi": round(prof.marginal_roi_percent, 2),
+                        "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
+                        "capacity": prof.capacity_sats,
+                        "action": "DEFIBRILLATE"
+                    })
+                else:
+                    losers.append({
+                        "scid": scid_display,
+                        "peer_id": prof.peer_id,
+                        "reason": "FIRE SALE" if is_fire_sale else "STAGNANT",
+                        "roi": round(prof.roi_percent, 2),
+                        "marginal_roi": round(prof.marginal_roi_percent, 2),
+                        "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
+                        "capacity": prof.capacity_sats,
+                        "action": "CLOSE"
+                    })
                 
         return losers
 
@@ -212,7 +231,12 @@ class CapacityPlanner:
             # Try to pair with a loser
             loser = sorted_losers.pop(0)
             
-            if winner.get('peer_supports_splice', False):
+            if loser.get("action") == "DEFIBRILLATE":
+                recommendations.append(
+                    f"STAGNANT ALERT: {loser['scid']} is stagnant. "
+                    f"Diagnostic rebalance required before extraction ({loser['roi']:.1f}% ROI)."
+                )
+            elif winner.get('peer_supports_splice', False):
                 recommendations.append(
                     f"STRATEGIC REDEPLOYMENT: Close channel {loser['scid']} ({loser['reason']}) "
                     f"and Splice the funds into {winner['scid']} (ROI: {winner['roi']:.1f}%)."

@@ -273,6 +273,12 @@ class HillClimbingFeeController:
         # Load Hill Climbing state
         hc_state = self._get_hill_climb_state(channel_id)
         
+        # =====================================================================
+        # ZERO-FEE PROBE: Defibrillator Override (Phase 8.1)
+        # =====================================================================
+        probe_flag = self.database.get_channel_probe(channel_id)
+        is_under_probe = (probe_flag is not None)
+        
         now = int(time.time())
         
         # Decision for target fee (The Alpha Sequence)
@@ -481,7 +487,38 @@ class HillClimbingFeeController:
             previous_rate = hc_state.last_revenue_rate
             target_found = True
             
-        # Priority 3: Hill Climbing (Discovery)
+        # Priority 3: Zero-Fee Probe Logic (Jumpstarting)
+        if not target_found and is_under_probe:
+            # Calculate current revenue rate (reuse logic from rate calculation below)
+            if self.config.enable_reputation and not is_shielded:
+                v_since = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
+            else:
+                v_since = self.database.get_volume_since(channel_id, hc_state.last_update)
+            
+            h_elapsed = (now - hc_state.last_update) / 3600.0 if hc_state.last_update > 0 else 1.0
+            rev_sats = (v_since * current_fee_ppm) // 1_000_000
+            curr_rev_rate = rev_sats / h_elapsed if h_elapsed > 0 else 0.0
+            
+            if curr_rev_rate > 0.0:
+                # WAKE UP: Success!
+                self.database.clear_channel_probe(channel_id)
+                self.plugin.log(
+                    f"DEFIBRILLATOR SUCCESS: Channel {channel_id} routed under 0-fee probe. Resuming Hill Climber.",
+                    level='info'
+                )
+                is_under_probe = False  # Continue to standard Hill Climbing this cycle
+            else:
+                # Still probing
+                new_fee_ppm = 0  # Force 0 PPM
+                decision_reason = "ZERO_FEE_PROBE"
+                new_direction = hc_state.trend_direction
+                step_ppm = hc_state.step_ppm
+                volatility_reset = False
+                rate_change = 0.0
+                previous_rate = hc_state.last_revenue_rate
+                target_found = True
+
+        # Priority 4: Hill Climbing (Discovery)
         if not target_found:
             # HILL CLIMBING DECISION (Rate-Based)
             rate_change = current_revenue_rate - hc_state.last_revenue_rate

@@ -148,6 +148,7 @@ class Database:
                 expected_profit_sats INTEGER NOT NULL,
                 actual_profit_sats INTEGER,
                 status TEXT NOT NULL,  -- 'pending', 'success', 'failed'
+                rebalance_type TEXT NOT NULL DEFAULT 'normal',  -- 'normal', 'diagnostic'
                 error_message TEXT,
                 timestamp INTEGER NOT NULL
             )
@@ -242,10 +243,19 @@ class Database:
                 last_prune_timestamp INTEGER NOT NULL DEFAULT 0
             )
         """)
-        # Ensure exactly one row exists
+        # ensure exactly one row exists
         conn.execute("""
             INSERT OR IGNORE INTO lifetime_aggregates (id, pruned_revenue_msat, pruned_forward_count, last_prune_timestamp)
             VALUES (1, 0, 0, 0)
+        """)
+
+        # Channel Probes table for Zero-Fee Probe Defibrillator
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_probes (
+                channel_id TEXT PRIMARY KEY,
+                probe_type TEXT NOT NULL,  -- 'zero_fee'
+                started_at INTEGER NOT NULL
+            )
         """)
         
         # Create indexes for common queries
@@ -299,13 +309,19 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
         
-        # Schema migration: Add last_broadcast_fee_ppm and last_state for gossip hysteresis
         try:
             conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_broadcast_fee_ppm INTEGER DEFAULT 0")
             conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_state TEXT DEFAULT 'balanced'")
             self.plugin.log("Added last_broadcast_fee_ppm and last_state columns to fee_strategy_state")
         except sqlite3.OperationalError:
             pass  # Columns already exist
+        
+        # Schema migration: Add rebalance_type to rebalance_history
+        try:
+            conn.execute("ALTER TABLE rebalance_history ADD COLUMN rebalance_type TEXT DEFAULT 'normal'")
+            self.plugin.log("Added rebalance_type column to rebalance_history")
+        except sqlite3.OperationalError:
+            pass
         
         self.plugin.log("Database initialized successfully")
     
@@ -359,6 +375,33 @@ class Database:
             (state,)
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Channel Probe Methods
+    # =========================================================================
+
+    def set_channel_probe(self, channel_id: str, probe_type: str = 'zero_fee'):
+        """Sets the probe flag for a channel."""
+        conn = self._get_connection()
+        now = int(time.time())
+        conn.execute("""
+            INSERT OR REPLACE INTO channel_probes (channel_id, probe_type, started_at)
+            VALUES (?, ?, ?)
+        """, (channel_id, probe_type, now))
+
+    def get_channel_probe(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Gets the probe flag for a channel."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM channel_probes WHERE channel_id = ?",
+            (channel_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def clear_channel_probe(self, channel_id: str):
+        """Clears the probe flag for a channel."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
     
     # =========================================================================
     # PID State Methods (LEGACY - kept for backward compatibility)
@@ -557,7 +600,7 @@ class Database:
     
     def record_rebalance(self, from_channel: str, to_channel: str, amount_sats: int,
                          max_fee_sats: int, expected_profit_sats: int,
-                         status: str = 'pending') -> int:
+                         status: str = 'pending', **kwargs) -> int:
         """Record a rebalance attempt and return its ID."""
         conn = self._get_connection()
         now = int(time.time())
@@ -565,10 +608,10 @@ class Database:
         cursor = conn.execute("""
             INSERT INTO rebalance_history 
             (from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats,
-             status, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+             status, rebalance_type, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats,
-              status, now))
+              status, kwargs.get('rebalance_type', 'normal'), now))
         
         return cursor.lastrowid
     
@@ -617,6 +660,33 @@ class Database:
         if row and row['last_time']:
             return row['last_time']
         return None
+    
+    def get_diagnostic_rebalance_stats(self, channel_id: str, days: int = 14) -> Dict[str, Any]:
+        """
+        Get stats for diagnostic rebalance attempts for a channel.
+        
+        Args:
+            channel_id: The destination channel SCID
+            days: Lookback window in days
+            
+        Returns:
+            Dict with count and last_success_time
+        """
+        conn = self._get_connection()
+        since = int(time.time()) - (days * 86400)
+        
+        row = conn.execute("""
+            SELECT 
+                COUNT(*) as attempt_count,
+                MAX(CASE WHEN status = 'success' THEN timestamp ELSE 0 END) as last_success
+            FROM rebalance_history 
+            WHERE to_channel = ? AND rebalance_type = 'diagnostic' AND timestamp >= ?
+        """, (channel_id, since)).fetchone()
+        
+        return {
+            "attempt_count": row['attempt_count'] if row else 0,
+            "last_success_time": row['last_success'] if row and row['last_success'] > 0 else None
+        }
     
     def get_total_rebalance_fees(self, since_timestamp: int) -> int:
         """

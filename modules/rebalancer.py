@@ -1278,7 +1278,7 @@ class EVRebalancer:
         
         return channels
 
-    def execute_rebalance(self, candidate: RebalanceCandidate) -> Dict[str, Any]:
+    def execute_rebalance(self, candidate: RebalanceCandidate, **kwargs) -> Dict[str, Any]:
         """
         Execute a rebalance for the given candidate.
         
@@ -1317,7 +1317,8 @@ class EVRebalancer:
                 db_amount,
                 db_max_fee, 
                 db_profit, 
-                'pending'
+                'pending',
+                rebalance_type=kwargs.get('rebalance_type', 'normal')
             )
             
             if self.config.dry_run:
@@ -1356,6 +1357,24 @@ class EVRebalancer:
             self.plugin.log(f"Execution error: {e}", level='error')
         
         return result
+
+    def diagnostic_rebalance(self, channel_id: str) -> Dict[str, Any]:
+        """
+        Trigger a "Zero-Fee Probe" (Passive Defibrillator).
+        
+        Instead of an active rebalance, this sets the channel fee to 0 PPM
+        using an override flag. If the channel routes, the flag is removed.
+        """
+        self.plugin.log(f"Defibrillator: Triggering Zero-Fee Probe for channel {channel_id}")
+        
+        # 1. Set the probe flag in the database
+        self.database.set_channel_probe(channel_id, probe_type='zero_fee')
+        
+        # 2. Inform the Fee Controller to pick it up in the next cycle
+        return {
+            "success": True, 
+            "message": f"Zero-Fee Probe active for {channel_id}. Fee will be set to 0 PPM and monitored."
+        }
 
     def manual_rebalance(self, from_channel: str, to_channel: str, 
                          amount_sats: int, max_fee_sats: int = None) -> Dict[str, Any]:

@@ -33,7 +33,8 @@ class ProfitabilityClass(Enum):
     PROFITABLE = "profitable"      # ROI > 10%
     BREAK_EVEN = "break_even"      # ROI between -10% and 10%
     UNDERWATER = "underwater"      # ROI < -10%
-    ZOMBIE = "zombie"              # Underwater + low volume for 30+ days
+    STAGNANT_CANDIDATE = "stagnant_candidate"  # 0 forwards in last 7 days
+    ZOMBIE = "zombie"              # Underwater + failed diagnostic recovery
 
 
 @dataclass
@@ -359,7 +360,8 @@ class ChannelProfitabilityAnalyzer:
             
             # Classify
             classification = self._classify_channel(
-                roi, net_profit, last_routed, days_open
+                roi, net_profit, last_routed, days_open,
+                channel_id=channel_id
             )
             
             profitability = ChannelProfitability(
@@ -1454,25 +1456,40 @@ class ChannelProfitabilityAnalyzer:
             return None
     
     def _classify_channel(self, roi: float, net_profit: int,
-                         last_routed: Optional[int], days_open: int) -> ProfitabilityClass:
+                         last_routed: Optional[int], days_open: int,
+                         channel_id: Optional[str] = None) -> ProfitabilityClass:
         """Classify a channel based on profitability metrics."""
         
-        # Check for zombie first
+        # Check for inactivity
         if last_routed:
             days_inactive = (int(time.time()) - last_routed) // 86400
         else:
             days_inactive = days_open  # Never routed
         
-        is_zombie = (
-            roi < self.UNDERWATER_ROI_THRESHOLD and
-            days_inactive >= self.ZOMBIE_DAYS_INACTIVE and
-            net_profit < -self.ZOMBIE_MIN_LOSS_SATS
-        )
+        # 1. Check for ZOMBIE (refinement with Defibrillator logic)
+        # Requirement: Underwater AND inactive AND (at least 2 diagnostic attempts in 14 days)
+        # If there are no diagnostic attempts, it's just UNDERWATER or STAGNANT_CANDIDATE
+        if channel_id and roi < self.UNDERWATER_ROI_THRESHOLD:
+            diag_stats = self.database.get_diagnostic_rebalance_stats(channel_id, days=14)
+            
+            # If 2+ attempts made and it's still not routing after the last success (or last attempt)
+            if diag_stats["attempt_count"] >= 2:
+                # If it succeeded but still didn't route in 48h, it's a zombie
+                if diag_stats["last_success_time"]:
+                    hours_since_diag_success = (int(time.time()) - diag_stats["last_success_time"]) // 3600
+                    if hours_since_diag_success > 48 and (not last_routed or last_routed < diag_stats["last_success_time"]):
+                        return ProfitabilityClass.ZOMBIE
+                else:
+                    # No success in 2+ attempts
+                    return ProfitabilityClass.ZOMBIE
+                    
+        # 2. Check for STAGNANT_CANDIDATE (0 forwards in last 7 days + unprofitable)
+        # Bug C Fix: Ensure low-volume profitable channels are BREAK_EVEN/BALANCED, not STAGNANT.
+        # STAGNANT_CANDIDATE only if ROI < -10% and inactive for 7+ days.
+        if days_inactive >= 7 and roi < -0.10:
+            return ProfitabilityClass.STAGNANT_CANDIDATE
         
-        if is_zombie:
-            return ProfitabilityClass.ZOMBIE
-        
-        # Classify by ROI
+        # 3. Standard ROI Classifications
         if roi > self.PROFITABLE_ROI_THRESHOLD:
             return ProfitabilityClass.PROFITABLE
         elif roi < self.UNDERWATER_ROI_THRESHOLD:

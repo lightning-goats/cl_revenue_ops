@@ -129,11 +129,39 @@ Refactor `adjust_all_fees` in `modules/fee_controller.py` for "State-Aware Synci
 **AI Prompt:**
 Implement a `revenue-config` RPC method. It should allow updating any attribute in the `Config` class. The method must perform type-validation (don't allow strings into integer fields) and persist the changes into the `config_store` table in the SQLite database. On startup, the plugin must load these overrides from the database.
 
+### 17. The "Channel Defibrillator" (Zero-Fee Probe) ✅ COMPLETED
+**Objective:** Prevent premature channel closures. Before the Lifecycle Manager assumes a channel is a "Zombie," the system must attempt a "Zero-Fee Probe" to jumpstart flow and verify reachability without active rebalance costs.
+
+**Context Files:**
+- `modules/rebalancer.py`
+- `modules/profitability_analyzer.py`
+- `modules/capacity_planner.py`
+
+**AI Prompt:**
+```text
+Implement the "Channel Defibrillator" logic to verify stagnant channels before closure.
+
+1. **Identification**:
+   - In `profitability_analyzer.py`, flag channels with 0 forwards in the last 7 days as "STAGNANT_CANDIDATE."
+
+2. **The Defibrillator Trigger**:
+   - In `rebalancer.py`, create a `diagnostic_rebalance(channel_id)` method.
+   - For stagnant candidates, trigger a small, low-fee rebalance (e.g., 50,000 sats). 
+   - We are willing to accept a 0% profit or even a tiny loss for this move, as it is a "diagnostic cost" to save a larger CapEx investment (the channel).
+
+3. **Lifecycle Integration**:
+   - Update `capacity_planner.py` (The Pruner).
+   - A channel cannot be recommended for "Close" or "Splice-out" until the `diagnostic_rebalance` has been attempted at least twice in the last 14 days.
+   - If the diagnostic rebalance succeeds but the channel STILL doesn't route within 48 hours, *then* it is confirmed as a ZOMBIE.
+
+4. **Benefit**: This ensures we don't close channels that just needed a "nudge" to move their liquidity into a more active demand zone, or channels that were temporarily path-blocked.
+```
+
 ---
 
 ## Phase 8.0: Liquidity Dividend System (LDS)
 
-### 17. The Solvency & TWAB Driver
+### 18. The Solvency & TWAB Driver
 **Objective:** Track investor capital and ensure system solvency.
 
 **Context Files:**
@@ -149,7 +177,7 @@ Update `modules/database.py` to support LDS tracking.
 3. In `cl-revenue-ops.py`, create a `verify_solvency()` function that aborts the payout loop if total virtual liabilities exceed 85% of the physical local balance found in CLN `listfunds`.
 ```
 
-### 18. The LNbits Extension (Spend Guard)
+### 19. The LNbits Extension (Spend Guard)
 **Objective:** Enforce lock-up periods for investor capital.
 
 **AI Prompt:**
@@ -161,7 +189,7 @@ Build an LNbits extension called 'LDS Vault'.
 3. If the source wallet is LOCKED and the `lock_expiry` hasn't passed, return a 403 error: 'Capital is currently deployed in routing channels and is time-locked'.
 ```
 
-### 19. The Profit Distribution Loop
+### 20. The Profit Distribution Loop
 **Objective:** Distribute net profits to investors.
 
 **AI Prompt:**
