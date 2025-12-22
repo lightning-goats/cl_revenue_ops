@@ -1313,13 +1313,13 @@ class EVRebalancer:
             
             # Record rebalance attempt in database using SAFE primitives
             rebalance_id = self.database.record_rebalance(
-                db_from_channel, 
-                db_to_channel, 
-                db_amount,
-                db_max_fee, 
-                db_profit, 
-                'pending',
-                rebalance_type=rebalance_type  # Use the explicitly passed argument
+                db_from_channel,         # Positional Arg 1: from_channel
+                db_to_channel,           # Positional Arg 2: to_channel (THE FIX IS HERE, it is a clean string)
+                db_amount,               # Positional Arg 3: amount_sats
+                db_max_fee,              # Positional Arg 4: max_fee_sats
+                db_profit,               # Positional Arg 5: expected_profit_sats
+                'pending',               # Positional Arg 6: status
+                rebalance_type=rebalance_type # Named Arg (kwargs) 7: rebalance_type
             )
             
             if self.config.dry_run:
