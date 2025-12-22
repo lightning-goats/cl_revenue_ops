@@ -605,13 +605,24 @@ class Database:
         conn = self._get_connection()
         now = int(time.time())
         
+        params = {
+            'from_channel': from_channel,
+            'to_channel': to_channel,
+            'amount_sats': amount_sats,
+            'max_fee_sats': max_fee_sats,
+            'expected_profit_sats': expected_profit_sats,
+            'status': status,
+            'rebalance_type': kwargs.get('rebalance_type', 'normal'),
+            'timestamp': now
+        }
+
         cursor = conn.execute("""
             INSERT INTO rebalance_history 
             (from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats,
              status, rebalance_type, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats,
-              status, kwargs.get('rebalance_type', 'normal'), now))
+            VALUES (:from_channel, :to_channel, :amount_sats, :max_fee_sats, :expected_profit_sats, 
+                    :status, :rebalance_type, :timestamp)
+        """, params)
         
         return cursor.lastrowid
     

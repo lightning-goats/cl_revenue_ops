@@ -1302,8 +1302,7 @@ class EVRebalancer:
                 ClbossTags.FEE_AND_BALANCE, self.database
             )
             
-            # HOTFIX: Explicitly cast to string/int to prevent SQLite binding errors
-            # The 'from_channel' is a property that returns a string, but we cast to be sure.
+            # --- CRITICAL BUG FIX: Ensure all values are simple types for SQLite ---
             db_from_channel = str(candidate.from_channel)
             db_to_channel = str(candidate.to_channel)
             db_amount = int(candidate.amount_sats)
@@ -1362,8 +1361,8 @@ class EVRebalancer:
         """
         Trigger a "Zero-Fee Probe" (Passive Defibrillator).
         
-        Instead of an active rebalance, this sets the channel fee to 0 PPM
-        using an override flag. If the channel routes, the flag is removed.
+        This sets the channel fee to 0 PPM using a probe flag in the database. 
+        The fee_controller will pick it up and enforce the price change.
         """
         self.plugin.log(f"Defibrillator: Triggering Zero-Fee Probe for channel {channel_id}")
         
@@ -1373,11 +1372,11 @@ class EVRebalancer:
         # 2. Inform the Fee Controller to pick it up in the next cycle
         return {
             "success": True, 
-            "message": f"Zero-Fee Probe active for {channel_id}. Fee will be set to 0 PPM and monitored."
+            "message": f"Zero-Fee Probe active for {channel_id}. Fee will be set to 0 PPM and monitored by Fee Controller."
         }
 
     def manual_rebalance(self, from_channel: str, to_channel: str, 
-                         amount_sats: int, max_fee_sats: int = None) -> Dict[str, Any]:
+                         amount_sats: int, max_fee_sats: Optional[int] = None) -> Dict[str, Any]:
         """Execute a manual rebalance between two channels."""
         channels = self._get_channels_with_balances()
         if from_channel not in channels or to_channel not in channels:
@@ -1391,6 +1390,7 @@ class EVRebalancer:
         est_in = self._estimate_inbound_fee(t_info.get("peer_id"))
         
         if max_fee_sats is None:
+            # Calculate a budget for a manual push based on estimated spread
             max_fee_sats = int(amount_sats * (fee_ppm - est_in - src_ppm) / 1e6)
             if max_fee_sats < 0: 
                 max_fee_sats = 100
@@ -1418,7 +1418,7 @@ class EVRebalancer:
             dest_turnover_rate=0.0,
             source_turnover_rate=0.0
         )
-        return self.execute_rebalance(cand)
+        return self.execute_rebalance(cand, rebalance_type='manual')
 
     def _check_capital_controls(self) -> bool:
         """Check if capital controls allow rebalancing."""

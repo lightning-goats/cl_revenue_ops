@@ -159,9 +159,21 @@ Implement the "Channel Defibrillator" logic to verify stagnant channels before c
 
 ---
 
+### 18. Proactive HTLC Slot Pricing (Congestion Defense 2.0)
+**Objective:** Proactively price the scarcity of HTLC slots, starting from a 50% utilization, to prevent low-margin traffic from crowding out high-margin payments.
+
+**AI Prompt:**
+1. In `modules/fee_controller.py`, modify `_adjust_channel_fee`.
+2. Retrieve the channel's current `htlc_utilization` (active/max slots).
+3. If `utilization > 0.5`:
+    - Apply a quadratic multiplier to the calculated `new_fee_ppm`. The multiplier should scale the fee up to 1.5x as utilization approaches the hard 0.8 congestion limit.
+4. **Benefit:** This turns the channel's capacity into a yield-optimized resource, charging a premium for the increasing risk/scarcity of an available HTLC slot.
+
+---
+
 ## Phase 8.0: Liquidity Dividend System (LDS)
 
-### 18. The Solvency & TWAB Driver
+### 19. The Solvency & TWAB Driver
 **Objective:** Track investor capital and ensure system solvency.
 
 **Context Files:**
@@ -177,7 +189,7 @@ Update `modules/database.py` to support LDS tracking.
 3. In `cl-revenue-ops.py`, create a `verify_solvency()` function that aborts the payout loop if total virtual liabilities exceed 85% of the physical local balance found in CLN `listfunds`.
 ```
 
-### 19. The LNbits Extension (Spend Guard)
+### 20. The LNbits Extension (Spend Guard)
 **Objective:** Enforce lock-up periods for investor capital.
 
 **AI Prompt:**
@@ -189,7 +201,7 @@ Build an LNbits extension called 'LDS Vault'.
 3. If the source wallet is LOCKED and the `lock_expiry` hasn't passed, return a 403 error: 'Capital is currently deployed in routing channels and is time-locked'.
 ```
 
-### 20. The Profit Distribution Loop
+### 21. The Profit Distribution Loop
 **Objective:** Distribute net profits to investors.
 
 **AI Prompt:**
