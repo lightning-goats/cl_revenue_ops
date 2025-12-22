@@ -101,6 +101,9 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [ ] **Peer-Level Atomic Fee Syncing**:
     - Unified liquidity pool pricing per peer node to prevent "Gossip Cannibalization."
     - **Safety Guard**: Exception Hierarchy - emergency states (Fire Sale/Congestion) take precedence over syncing.
+- [ ] **Dynamic Runtime Configuration**:
+    - Allow the operator to tune the algorithm via CLI without plugin restarts.
+    - Persist overrides in SQLite and load on startup.
 
 ## Phase 8: Liquidity Dividend System (LDS)
 *Objective: Transform the node into a Community-Funded Market Maker using LNbits and a unified risk-averaged pool.*

@@ -124,9 +124,16 @@ Refactor `adjust_all_fees` in `modules/fee_controller.py` for "State-Aware Synci
 
 ---
 
+### 16. Dynamic Runtime Configuration
+**Objective:** Allow the operator to tune the algorithm via CLI without plugin restarts.
+**AI Prompt:**
+Implement a `revenue-config` RPC method. It should allow updating any attribute in the `Config` class. The method must perform type-validation (don't allow strings into integer fields) and persist the changes into the `config_store` table in the SQLite database. On startup, the plugin must load these overrides from the database.
+
+---
+
 ## Phase 8.0: Liquidity Dividend System (LDS)
 
-### 16. The Solvency & TWAB Driver
+### 17. The Solvency & TWAB Driver
 **Objective:** Track investor capital and ensure system solvency.
 
 **Context Files:**
@@ -142,7 +149,7 @@ Update `modules/database.py` to support LDS tracking.
 3. In `cl-revenue-ops.py`, create a `verify_solvency()` function that aborts the payout loop if total virtual liabilities exceed 85% of the physical local balance found in CLN `listfunds`.
 ```
 
-### 17. The LNbits Extension (Spend Guard)
+### 18. The LNbits Extension (Spend Guard)
 **Objective:** Enforce lock-up periods for investor capital.
 
 **AI Prompt:**
@@ -154,7 +161,7 @@ Build an LNbits extension called 'LDS Vault'.
 3. If the source wallet is LOCKED and the `lock_expiry` hasn't passed, return a 403 error: 'Capital is currently deployed in routing channels and is time-locked'.
 ```
 
-### 18. The Profit Distribution Loop
+### 19. The Profit Distribution Loop
 **Objective:** Distribute net profits to investors.
 
 **AI Prompt:**
