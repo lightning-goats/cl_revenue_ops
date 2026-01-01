@@ -71,9 +71,10 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **The "Alpha Sequence" Fee Logic**: Refactored decision flow to prioritize emergency states over discovery.
 - [x] **Low Fee Trap Fix**: Enabled fine-tuning (1 PPM steps) for inexpensive, high-volume channels.
 - [x] **Strict Idempotency Guard**: Eliminate redundant `1 -> 1 PPM` RPC calls and log noise.
-- [ ] **Database Thread Safety**: Implement `threading.local()` to prevent corruption during concurrent access.
-- [ ] **Rebalance Price-Truth Alignment**: Ensure EV calculations reflect on-chain prices rather than internal targets.
-- [ ] **Fire Sale Momentum Guard**: Protect improving but technically "underwater" channels from premature liquidation.
+- [x] **Database Thread Safety**: Implement `threading.local()` to prevent corruption during concurrent access.
+- [x] **Rebalance Price-Truth Alignment**: Ensure EV calculations reflect on-chain prices rather than internal targets.
+- [x] **Fire Sale Momentum Guard**: Protect improving but technically "underwater" channels from premature liquidation.
+- [x] **Zero-Fee Probe Priority Fix**: Ensure Defibrillator (0 PPM) takes precedence over Fire Sale (1 PPM) in Alpha Sequence.
 
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 *Objective: This phase shifts the plugin from "Maintenance" to "Growth & Pruning," automating the capital allocation decisions that usually require manual operator intervention.*
@@ -120,4 +121,4 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*
-*Roadmap updated: December 21, 2025*
+*Roadmap updated: January 1, 2026*

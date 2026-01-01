@@ -6,6 +6,10 @@ Handles SQLite persistence for:
 - PID controller state (integral terms)
 - Fee change history
 - Rebalance history
+
+Thread Safety:
+- Uses threading.local() to provide each thread with its own SQLite connection
+- Prevents race conditions during concurrent writes (e.g., Rebalancer + Fee Controller)
 """
 
 import sqlite3
@@ -13,6 +17,7 @@ import os
 import time
 import json
 import math
+import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
@@ -28,11 +33,15 @@ class Database:
     - PID controller state
     - Fee change audit log
     - Rebalance history
+    
+    Thread Safety:
+    - Each thread gets its own isolated SQLite connection via threading.local()
+    - WAL mode enabled for better concurrent read/write performance
     """
     
     def __init__(self, db_path: str, plugin):
         """
-        Initialize the database connection.
+        Initialize the database manager.
         
         Args:
             db_path: Path to SQLite database file
@@ -40,24 +49,40 @@ class Database:
         """
         self.db_path = os.path.expanduser(db_path)
         self.plugin = plugin
-        self._conn: Optional[sqlite3.Connection] = None
+        # Thread-local storage for connections (Phase 5.5: Database Thread Safety)
+        self._local = threading.local()
         
     def _get_connection(self) -> sqlite3.Connection:
-        """Get or create database connection."""
-        if self._conn is None:
+        """
+        Get or create a thread-local database connection.
+        
+        Each thread gets its own isolated connection to prevent race conditions
+        during concurrent database operations (e.g., when Rebalancer and Fee
+        Controller run simultaneously on different timer threads).
+        
+        Returns:
+            sqlite3.Connection: Thread-local database connection
+        """
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
             # Ensure directory exists
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             
-            self._conn = sqlite3.connect(
+            # Create new connection for this thread
+            self._local.conn = sqlite3.connect(
                 self.db_path,
-                check_same_thread=False,
                 isolation_level=None  # Autocommit mode
             )
-            self._conn.row_factory = sqlite3.Row
+            self._local.conn.row_factory = sqlite3.Row
             
             # Enable Write-Ahead Logging for better multi-thread concurrency
-            self._conn.execute("PRAGMA journal_mode=WAL;")
-        return self._conn
+            # WAL allows readers and writers to operate concurrently
+            self._local.conn.execute("PRAGMA journal_mode=WAL;")
+            
+            self.plugin.log(
+                f"Database: Created new thread-local connection (thread={threading.current_thread().name})",
+                level='debug'
+            )
+        return self._local.conn
     
     def initialize(self):
         """Create database tables if they don't exist."""
@@ -1615,7 +1640,7 @@ class Database:
         return min(100.0, max(0.0, uptime_pct))
     
     def close(self):
-        """Close the database connection."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        """Close the thread-local database connection (if any)."""
+        if hasattr(self._local, 'conn') and self._local.conn is not None:
+            self._local.conn.close()
+            self._local.conn = None

@@ -9,17 +9,17 @@ This document details the implementation steps for the remaining items in the ro
 ### 11. Strict Idempotency Guard ✅ COMPLETED
 **Objective:** Eliminate redundant `1 -> 1 PPM` RPC calls and log noise.
 
-### 11.5. Database Thread Safety (Crash Prevention)
-**AI Prompt:** 
-Modify `modules/database.py`. Remove the shared `self._conn`. Update `_get_connection` to create a new connection if one doesn't exist for the current thread (using `threading.local()`). This prevents database corruption when multiple loops (Fee/Flow/Rebalance) write simultaneously.
+### 11.5. Database Thread Safety (Crash Prevention) ✅ COMPLETED
+**Status:** Implemented `threading.local()` pattern in `database.py` to provide isolated connections per thread.
 
-### 11.6. Rebalance Price-Truth Alignment
-**AI Prompt:** 
-Modify `modules/rebalancer.py`. In `_analyze_rebalance_ev`, ensure that the `outbound_fee_ppm` used for profit calculation is the `last_broadcast_fee_ppm` from the database, not the internal target fee. We must only rebalance based on prices the network is actually paying.
+### 11.6. Rebalance Price-Truth Alignment ✅ COMPLETED
+**Status:** Modified `rebalancer.py` to fetch `last_broadcast_fee_ppm` from `fee_strategy_state` for EV calculations, with fallback to `listpeerchannels` fee if unavailable.
 
-### 11.7. Fire Sale Momentum Guard
-**AI Prompt:** 
-Modify `_adjust_channel_fee` in `modules/fee_controller.py`. Even if a channel is Underwater/Zombie, if its `marginal_roi` is positive and increasing, skip the `FIRE_SALE` override and allow the Hill Climber to keep seeking a higher, sustainable price.
+### 11.7. Fire Sale Momentum Guard ✅ COMPLETED
+**Status:** Added guard in `fee_controller.py` that protects channels with `marginal_roi > 5%` and `days_open < 180` from Fire Sale liquidation.
+
+### 11.8. Zero-Fee Probe Priority Fix ✅ COMPLETED
+**Status:** Added priority override in `fee_controller.py` to disable Fire Sale when Zero-Fee Probe is active, ensuring the Defibrillator (0 PPM) takes precedence over liquidation pricing (1 PPM).
 
 ---
 

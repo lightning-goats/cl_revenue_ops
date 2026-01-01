@@ -896,7 +896,18 @@ class EVRebalancer:
                              min(self.config.rebalance_max_amount, amount_needed))
         amount_msat = rebalance_amount * 1000
         
-        outbound_fee_ppm = dest_info.get("fee_ppm", 0)
+        # BROADCAST FEE ALIGNMENT (Phase 5.5): Use confirmed broadcast fee for EV
+        # This prevents "Self-Arbitrage" where we pay for a rebalance expecting to
+        # earn at the internal target fee, but Hysteresis blocked the update so we're
+        # actually still selling liquidity at a lower broadcast fee.
+        fee_state = self.database.get_fee_strategy_state(dest_channel)
+        broadcast_fee_ppm = fee_state.get("last_broadcast_fee_ppm", 0)
+        
+        # Fallback to listpeerchannels fee if no broadcast fee recorded
+        if broadcast_fee_ppm <= 0:
+            broadcast_fee_ppm = dest_info.get("fee_ppm", 0)
+        
+        outbound_fee_ppm = broadcast_fee_ppm
         inbound_fee_ppm = self._estimate_inbound_fee(dest_info.get("peer_id", ""))
         
         # Get ALL profitable source candidates (sorted by score, best first)

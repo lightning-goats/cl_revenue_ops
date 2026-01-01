@@ -292,6 +292,19 @@ class HillClimbingFeeController:
                 elif prof_data.classification == ProfitabilityClass.UNDERWATER:
                     if prof_data.roi_percent < -50.0:
                         is_fire_sale = True
+            
+            # MOMENTUM GUARD: Protect recovering channels from Fire Sale (Phase 5.5)
+            # Channels with positive operational ROI are paying back their debt -
+            # don't kill them just because they had high opening costs.
+            if is_fire_sale and prof_data:
+                marginal_roi = prof_data.marginal_roi
+                if marginal_roi > 0.05 and prof_data.days_open < 180:
+                    self.plugin.log(
+                        f"MOMENTUM GUARD: Channel {channel_id[:12]}... is recovering "
+                        f"(Marginal ROI {marginal_roi:.1%}). Suspending Fire Sale to allow price discovery.",
+                        level='info'
+                    )
+                    is_fire_sale = False
         
         # =====================================================================
         # DEADBAND HYSTERESIS: Sleep Status Check (Phase 4: Stability & Scaling)
@@ -460,6 +473,12 @@ class HillClimbingFeeController:
         floor_ppm = max(floor_ppm, 1)  # Never go below 1 ppm
         
         ceiling_ppm = self.config.max_fee_ppm
+        
+        # PRIORITY OVERRIDE: Zero-Fee Probe takes precedence over Fire Sale
+        # We must allow the diagnostic probe (0 PPM) to run to verify liveness
+        # before resigning ourselves to liquidation pricing (1 PPM).
+        if is_under_probe:
+            is_fire_sale = False
         
         # Target Decision Block (The Alpha Sequence)
         new_fee_ppm = 0
