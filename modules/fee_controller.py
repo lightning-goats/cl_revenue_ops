@@ -474,9 +474,16 @@ class HillClimbingFeeController:
         
         ceiling_ppm = self.config.max_fee_ppm
         
-        # PRIORITY OVERRIDE: Zero-Fee Probe takes precedence over Fire Sale
-        # We must allow the diagnostic probe (0 PPM) to run to verify liveness
-        # before resigning ourselves to liquidation pricing (1 PPM).
+        # =====================================================================
+        # PRIORITY OVERRIDE: Zero-Fee Probe > Fire Sale
+        # =====================================================================
+        # The Alpha Sequence priority is: Congestion > Zero-Fee > Fire Sale > Hill Climbing
+        # 
+        # However, Fire Sale appears earlier in the if/elif chain for code clarity.
+        # This guard ensures the correct priority by disabling Fire Sale when a
+        # Zero-Fee Probe is active. We MUST allow the diagnostic probe (0 PPM) to
+        # verify channel liveness before resigning ourselves to liquidation (1 PPM).
+        # =====================================================================
         if is_under_probe:
             is_fire_sale = False
         

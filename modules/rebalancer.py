@@ -1314,6 +1314,10 @@ class EVRebalancer:
             )
             
             # --- CRITICAL BUG FIX: Ensure all values are simple types for SQLite ---
+            # Assertion guards: Fail-fast on empty/None channel IDs (HO-01)
+            assert candidate.from_channel, "from_channel cannot be empty"
+            assert candidate.to_channel, "to_channel cannot be empty"
+            
             db_from_channel = str(candidate.from_channel)
             db_to_channel = str(candidate.to_channel)
             db_amount = int(candidate.amount_sats)

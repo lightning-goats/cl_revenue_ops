@@ -75,6 +75,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Rebalance Price-Truth Alignment**: Ensure EV calculations reflect on-chain prices rather than internal targets.
 - [x] **Fire Sale Momentum Guard**: Protect improving but technically "underwater" channels from premature liquidation.
 - [x] **Zero-Fee Probe Priority Fix**: Ensure Defibrillator (0 PPM) takes precedence over Fire Sale (1 PPM) in Alpha Sequence.
+- [x] **Zero Tolerance Security Audit**: Full adversarial code audit completed. Production deployment APPROVED. All recommendations (LC-01, HO-01) implemented.
 
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 *Objective: This phase shifts the plugin from "Maintenance" to "Growth & Pruning," automating the capital allocation decisions that usually require manual operator intervention.*
@@ -88,24 +89,42 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **"Stagnant Inventory" Awakening**: Treat balanced but low-volume channels as Sources to redeploy idle capital to high-demand areas.
 - [x] **The Channel Defibrillator (Zero-Fee Probe)**: Automatically jumpstart stagnant channels by overriding fees to 0 PPM before confirming them as "Zombies" for closure.
 
-## Phase 7: "The 1% Node" Strategy Path
-*Objective: Institutional-grade Liquidity Management focusing on Scarcity, Irreplaceability, Volatility, and Market Presence.*
+## Phase 7: "The 1% Node" Defense
+*Status: HARDENED (Post-Red Team Review)*
+*Target Version: v1.3.0*
+*Security Level: High (Financial Risk Mitigation)*
 
-- [ ] **Mempool Acceleration (Vegas Reflex)**: 
+### v1.3.0: Core Architecture & Safety (Immediate)
+
+- [ ] **Dynamic Runtime Config (Hardened)**:
+    - Allow the operator to tune the algorithm via CLI without plugin restarts.
+    - Persist overrides in SQLite and load on startup.
+    - *Mitigation:* Implements `ConfigSnapshot` pattern to prevent "Torn Reads" (Critical-02).
+    - *Mitigation:* Transactional DB writes to prevent "Ghost States."
+
+- [ ] **Mempool Acceleration (Vegas Reflex)**:
     - Detect L1 fee "shocks" and force an immediate re-price of inventory.
-    - **Safety Guard**: 2-cycle Confirmation Window to filter out exchange-batch noise.
+    - *Mitigation:* Replaces binary latch with **Exponential Decay State** to prevent Latch Bomb DoS (Critical-01).
+    - *Mitigation:* Adds **Probabilistic Early Trigger** to prevent confirmation window front-running (High-03).
+
 - [ ] **HTLC Slot Scarcity Pricing**:
     - Transition from binary congestion gates to exponential pricing curves.
-    - **Safety Guard**: EMA-based utilization to prevent price flapping.
+    - *Mitigation:* Uses **Value-Weighted Utilization** (`max(slot_util, value_util)`) to neutralize Dust Flood attacks (High-01).
+    - *Mitigation:* Asymmetric EMA (Fast Up, Slow Down).
+    - *Mitigation:* Rebalancer forecasts post-rebalance utilization to prevent "Trap & Trap" deadlock.
+
+### v1.4.0: Optimization & Yield (Deferred)
+*Reason: These features introduce complex game-theoretic risks that require stable baseline data from v1.3.*
+
 - [ ] **Flow Asymmetry (Rare Liquidity Premium)**:
     - Charge a premium for "One-Way Street" channels with high outflow.
     - **Safety Guard**: Velocity Gate - only apply to high-volume channels (>50k sats/day).
+    - *Deferred:* Requires traffic pattern analysis to distinguish "One-Way Streets" from "Self-Loops."
+
 - [ ] **Peer-Level Atomic Fee Syncing**:
     - Unified liquidity pool pricing per peer node to prevent "Gossip Cannibalization."
     - **Safety Guard**: Exception Hierarchy - emergency states (Fire Sale/Congestion) take precedence over syncing.
-- [ ] **Dynamic Runtime Configuration**:
-    - Allow the operator to tune the algorithm via CLI without plugin restarts.
-    - Persist overrides in SQLite and load on startup.
+    - *Deferred:* High-02 Arbitrage Risk. Requires "Baseline/Floor" architecture rather than "Leader Override."
 
 ## Phase 8: Liquidity Dividend System (LDS)
 *Objective: Transform the node into a Community-Funded Market Maker using LNbits and a unified risk-averaged pool.*
