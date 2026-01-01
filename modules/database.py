@@ -746,6 +746,29 @@ class Database:
         
         return row['total_fees'] if row else 0
     
+    def get_total_routing_revenue(self, since_timestamp: int) -> int:
+        """
+        Get total routing revenue (fees earned) since a given timestamp.
+        
+        Used for Revenue-Proportional Budget calculation.
+        Sums fee_msat from the forwards table since the timestamp.
+        
+        Args:
+            since_timestamp: Unix timestamp to start summing from
+            
+        Returns:
+            Total routing fees earned in sats (0 if none)
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(fee_msat), 0) as total_fees_msat
+            FROM forwards
+            WHERE timestamp >= ?
+        """, (since_timestamp,)).fetchone()
+        
+        # Convert msat to sats
+        return (row['total_fees_msat'] // 1000) if row else 0
+    
     def get_rebalance_history_by_peer(self, peer_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Get rebalance history for channels belonging to a specific peer.

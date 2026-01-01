@@ -1374,25 +1374,116 @@ class EVRebalancer:
 
     def diagnostic_rebalance(self, channel_id: str) -> Dict[str, Any]:
         """
-        Trigger a "Zero-Fee Probe" (Passive Defibrillator).
+        Trigger a "Channel Defibrillator" sequence:
+        1. Set Fee to 0 (Passive Lure).
+        2. Execute small active rebalance (Active Shock).
         
-        This sets the channel fee to 0 PPM using a probe flag in the database. 
-        The fee_controller will pick it up and enforce the price change.
+        This is a diagnostic operation to verify channel liveness before
+        confirming a channel as a "Zombie" for closure. The small rebalance
+        (50k sats) forces liquidity into the channel immediately rather than
+        waiting for organic routing traffic.
         """
         self.plugin.log(f"Defibrillator: Triggering Zero-Fee Probe for channel {channel_id}")
         
-        # 1. Set the probe flag in the database
+        # 1. Set the probe flag in the database (Fee Controller will see this and set 0 PPM)
         self.database.set_channel_probe(channel_id, probe_type='zero_fee')
         
-        # 2. Inform the Fee Controller to pick it up in the next cycle
-        return {
-            "success": True, 
-            "message": f"Zero-Fee Probe active for {channel_id}. Fee will be set to 0 PPM and monitored by Fee Controller."
-        }
+        # 2. THE ACTIVE SHOCK: Attempt a small rebalance immediately
+        try:
+            # Find a healthy source channel
+            channels = self._get_channels_with_balances()
+            if channel_id not in channels:
+                return {"success": False, "message": "Channel not found locally"}
+
+            dest_info = channels[channel_id]
+            
+            # Find best source (highest spendable sats, excluding target)
+            valid_sources = [
+                (cid, info) for cid, info in channels.items() 
+                if cid != channel_id and info.get('spendable_sats', 0) > 100_000
+            ]
+            
+            if not valid_sources:
+                return {
+                    "success": True, 
+                    "message": "Zero-Fee flag set, but no sources available for active shock."
+                }
+            
+            # Sort by spendable capacity desc, pick the best
+            best_source_id, best_source_info = sorted(
+                valid_sources, 
+                key=lambda x: x[1].get('spendable_sats', 0), 
+                reverse=True
+            )[0]
+            
+            # Construct a diagnostic candidate (50k sats - small enough to be OpEx)
+            shock_amount = 50_000
+            
+            # Estimate inbound fee (we accept a loss here, it's a diagnostic cost)
+            # Note: outbound_fee is 0 because we set the probe flag above
+            inbound_fee = self._estimate_inbound_fee(dest_info.get('peer_id'))
+            
+            candidate = RebalanceCandidate(
+                source_candidates=[best_source_id],
+                to_channel=channel_id,
+                primary_source_peer_id=best_source_info.get('peer_id', ''),
+                to_peer_id=dest_info.get('peer_id', ''),
+                amount_sats=shock_amount,
+                amount_msat=shock_amount * 1000,
+                outbound_fee_ppm=0,
+                inbound_fee_ppm=inbound_fee,
+                source_fee_ppm=best_source_info.get('fee_ppm', 0),
+                weighted_opp_cost_ppm=0,
+                spread_ppm=0,  # Likely negative, we don't care for diagnostic
+                max_budget_sats=100,  # Cap the diagnostic cost at 100 sats
+                max_budget_msat=100_000,
+                max_fee_ppm=2000,  # Allow up to 2000ppm for the shock packet
+                expected_profit_sats=-50,  # Expect a small loss (diagnostic cost)
+                liquidity_ratio=0.5,
+                dest_flow_state="diagnostic",
+                dest_turnover_rate=0.0,
+                source_turnover_rate=0.0
+            )
+            
+            # Capital Controls Check - diagnostic rebalances count against daily budget
+            if not self._check_capital_controls():
+                self.plugin.log("Defibrillator Active Shock blocked by capital controls", level='warning')
+                return {
+                    "success": True,
+                    "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
+                }
+            
+            # Execute Active Shock
+            result = self.execute_rebalance(candidate, rebalance_type='diagnostic')
+            
+            return {
+                "success": True, 
+                "message": f"Defibrillator active: Zero-Fee flag set + Shock job queued ({result.get('message', 'pending')})"
+            }
+
+        except Exception as e:
+            self.plugin.log(f"Defibrillator shock failed: {e}", level='error')
+            return {
+                "success": True, 
+                "message": f"Zero-Fee flag set, but active shock failed: {e}"
+            }
 
     def manual_rebalance(self, from_channel: str, to_channel: str, 
                          amount_sats: int, max_fee_sats: Optional[int] = None) -> Dict[str, Any]:
-        """Execute a manual rebalance between two channels."""
+        """Execute a manual rebalance between two channels.
+        
+        Note: Manual rebalances bypass capital controls by design (user override),
+        but fees ARE recorded and count toward the daily budget for automated rebalances.
+        """
+        # Warn if capital controls would block this (but don't enforce for manual)
+        capital_ok = self._check_capital_controls()
+        if not capital_ok:
+            self.plugin.log(
+                "WARNING: Manual rebalance executing despite capital controls. "
+                "Budget may be exhausted or reserve low.", 
+                level='warning'
+            )
+        
         channels = self._get_channels_with_balances()
         if from_channel not in channels or to_channel not in channels:
             return {"error": "Channels not found"}
@@ -1433,7 +1524,13 @@ class EVRebalancer:
             dest_turnover_rate=0.0,
             source_turnover_rate=0.0
         )
-        return self.execute_rebalance(cand, rebalance_type='manual')
+        result = self.execute_rebalance(cand, rebalance_type='manual')
+        
+        # Include capital controls warning in result
+        if not capital_ok:
+            result['capital_controls_warning'] = "Budget exhausted or reserve low (manual override)"
+        
+        return result
 
     def _check_capital_controls(self) -> bool:
         """Check if capital controls allow rebalancing."""
@@ -1466,12 +1563,29 @@ class EVRebalancer:
                     level='warning'
                 )
                 return False
+            
+            # Calculate effective daily budget
+            # If proportional budget enabled: max(fixed_floor, revenue_24h * percentage)
+            effective_budget = self.config.daily_budget_sats
+            
+            if self.config.enable_proportional_budget:
+                now = int(time.time())
+                revenue_24h = self.database.get_total_routing_revenue(now - 86400)
+                proportional_budget = int(revenue_24h * self.config.proportional_budget_pct)
+                effective_budget = max(self.config.daily_budget_sats, proportional_budget)
+                
+                self.plugin.log(
+                    f"CAPITAL CONTROL: Revenue-proportional budget active. "
+                    f"Revenue 24h: {revenue_24h} sats, {self.config.proportional_budget_pct*100:.1f}% = {proportional_budget} sats, "
+                    f"Effective budget: {effective_budget} sats (floor: {self.config.daily_budget_sats})",
+                    level='debug'
+                )
                 
             fees_spent_24h = self.database.get_total_rebalance_fees(int(time.time()) - 86400)
-            if fees_spent_24h >= self.config.daily_budget_sats:
+            if fees_spent_24h >= effective_budget:
                 self.plugin.log(
                     f"CAPITAL CONTROL: Daily budget exceeded "
-                    f"({fees_spent_24h} >= {self.config.daily_budget_sats})", 
+                    f"({fees_spent_24h} >= {effective_budget})", 
                     level='warning'
                 )
                 return False

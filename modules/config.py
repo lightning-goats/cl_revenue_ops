@@ -67,8 +67,13 @@ class Config:
     estimated_open_cost_sats: int = 5000  # Estimated on-chain fee for channel open
     
     # Global Capital Controls
-    daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period
+    daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period (fixed floor)
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
+    
+    # Revenue-Proportional Budget (Phase 7: Dynamic Budget Scaling)
+    enable_proportional_budget: bool = False  # If True, scale daily budget based on revenue
+    proportional_budget_pct: float = 0.05     # Budget = max(daily_budget_sats, revenue_24h * pct)
+                                               # Default 5% of 24h revenue
     
     # HTLC Congestion threshold
     htlc_congestion_threshold: float = 0.8  # Mark channel as CONGESTED if >80% HTLC slots used

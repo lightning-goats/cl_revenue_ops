@@ -14,14 +14,14 @@
 
 ## Executive Summary
 
-The codebase demonstrates **mature thread-safety patterns** and **defensive programming practices**. The Phase 5.5 stability patches have been properly implemented. The audit identified **1 Logic Inconsistency** and **1 Hardening Opportunity**, both of which have been **implemented and verified**.
+The codebase demonstrates **mature thread-safety patterns** and **defensive programming practices**. The Phase 5.5 stability patches have been properly implemented. The audit identified **1 Logic Inconsistency** and **4 Hardening Opportunities**, all of which have been **implemented and verified**.
 
 | Verdict | Status |
 |---------|--------|
 | **Production Deployment** | ✅ **APPROVED** |
 | **Critical Failures** | 0 |
 | **Logic Inconsistencies** | 1 ✅ FIXED (LC-01 - Priority Order Documentation) |
-| **Hardening Opportunities** | 1 ✅ FIXED (HO-01 - Assertion Guards) |
+| **Hardening Opportunities** | 4 ✅ FIXED (HO-01 through HO-04) |
 
 ---
 
@@ -33,6 +33,9 @@ The codebase demonstrates **mature thread-safety patterns** and **defensive prog
 | **DB Thread Safety** | ✅ SECURE | `threading.local()` pattern; WAL pragma on every connection |
 | **Input Sanitization** | ✅ SECURE | Explicit `str()`, `int()` casting before SQLite bindings |
 | **Alpha Sequence Priority** | ✅ SECURE | Correct priority: Congestion → Zero-Fee → Fire Sale → Hill Climbing |
+| **Diagnostic Capital Controls** | ✅ SECURE | `diagnostic_rebalance()` checks `_check_capital_controls()` (HO-03) |
+| **Manual Rebalance Visibility** | ✅ SECURE | Logs warning + returns flag when bypassing controls (HO-04) |
+| **Proportional Budget** | ✅ AVAILABLE | Optional: `enable_proportional_budget` + `proportional_budget_pct` |
 | **Gossip Hysteresis** | ✅ SECURE | `last_broadcast_fee_ppm` only updated after successful RPC |
 | **Null Safety** | ✅ SECURE | `or 0` pattern used for `last_success_time` |
 
@@ -353,36 +356,277 @@ outbound_fee_ppm = broadcast_fee_ppm  # ✅ Uses broadcast, not internal target
 
 ### 3.3 Defibrillator Logic
 
-**File:** `modules/rebalancer.py` (Lines 1371-1387)
+**File:** `modules/rebalancer.py` (Lines 1375-1460)
 
-#### ✅ VERIFIED: Diagnostic Rebalance is Passive (No Money Movement)
+#### ✅ VERIFIED: Diagnostic Rebalance with Active Shock (Controlled Risk)
+
+The Channel Defibrillator implements a two-phase liveness check with controlled budget exposure.
+
+---
+
+#### Phase 1: Zero-Fee Flag (Passive Lure)
 
 ```python
-def diagnostic_rebalance(self, channel_id: str) -> Dict[str, Any]:
-    """
-    Trigger a "Zero-Fee Probe" (Passive Defibrillator).
-    
-    This sets the channel fee to 0 PPM using a probe flag in the database. 
-    The fee_controller will pick it up and enforce the price change.
-    """
-    self.plugin.log(f"Defibrillator: Triggering Zero-Fee Probe for channel {channel_id}")
-    
-    # 1. Set the probe flag in the database
-    self.database.set_channel_probe(channel_id, probe_type='zero_fee')
-    
-    # 2. Inform the Fee Controller to pick it up in the next cycle
+# Line 1389
+self.database.set_channel_probe(channel_id, probe_type='zero_fee')
+```
+
+**Analysis:**
+- ✅ Uses parameterized SQL binding (Line 413 in database.py): `VALUES (?, ?, ?)`
+- ✅ `channel_id` passed as `str` type
+- ✅ `probe_type` is a safe literal `'zero_fee'`
+- ✅ No SQL injection vector
+
+---
+
+#### Phase 2: Active Shock (Controlled Money Movement)
+
+**2a. Channel Validation**
+
+```python
+# Lines 1393-1396
+channels = self._get_channels_with_balances()
+if channel_id not in channels:
+    return {"success": False, "message": "Channel not found locally"}
+```
+
+**Analysis:**
+- ✅ Validates channel exists in local node before any action
+- ✅ Returns early if channel not found (prevents blind operations)
+
+---
+
+**2b. Source Selection Security**
+
+```python
+# Lines 1400-1403
+valid_sources = [
+    (cid, info) for cid, info in channels.items() 
+    if cid != channel_id and info.get('spendable_sats', 0) > 100_000
+]
+```
+
+**Analysis:**
+- ✅ Excludes target channel from sources (prevents self-loop)
+- ✅ Requires minimum 100k sats spendable (prevents dust source selection)
+- ✅ Uses `.get('spendable_sats', 0)` with safe default (null safety)
+
+---
+
+**2c. Budget Cap Enforcement** ⚠️ CRITICAL SECURITY CHECK
+
+```python
+# Lines 1426-1442
+candidate = RebalanceCandidate(
+    ...
+    amount_sats=shock_amount,             # 50,000 sats
+    max_budget_sats=100,                  # CAP: 100 sats maximum fee
+    max_budget_msat=100_000,              # CAP: 100,000 msat
+    max_fee_ppm=2000,                     # CAP: 2000 PPM
+    ...
+)
+```
+
+**Adversarial Question:** Can an attacker bypass the 100 sat cap?
+
+**Verification Path:**
+1. `max_budget_sats=100` set in `RebalanceCandidate` (Line 1437)
+2. Recorded in DB via `db_max_fee = int(candidate.max_budget_sats)` (Line 1324)
+3. Passed to sling via `maxppm=candidate.max_fee_ppm` (Line 265)
+
+**⚠️ FINDING: PPM vs Absolute Cap Mismatch**
+
+The sling plugin receives `maxppm=2000`, NOT `max_budget_sats=100`. Let's verify:
+
+```
+50,000 sats × 2000 PPM = 100 sats maximum fee
+```
+
+✅ **VERIFIED:** The math confirms the cap:
+- `amount_sats=50,000` × `max_fee_ppm=2000` ÷ 1,000,000 = **100 sats**
+- The PPM limit of 2000 on a 50k sat payment enforces the 100 sat absolute cap
+
+**Additional Check:** Could a different amount bypass this?
+- The `shock_amount = 50_000` is hardcoded (Line 1419)
+- Not configurable or injectable from external input
+- ✅ **SECURE** — Amount cannot be manipulated to increase exposure
+
+---
+
+**2d. Type Safety in RebalanceCandidate Construction**
+
+```python
+# Lines 1426-1442
+candidate = RebalanceCandidate(
+    source_candidates=[best_source_id],           # List[str]
+    to_channel=channel_id,                         # str
+    primary_source_peer_id=best_source_info.get('peer_id', ''),  # str with default
+    to_peer_id=dest_info.get('peer_id', ''),      # str with default
+    amount_sats=shock_amount,                      # int (hardcoded 50000)
+    amount_msat=shock_amount * 1000,               # int
+    ...
+)
+```
+
+**Analysis:**
+- ✅ All string fields use `.get('field', '')` with empty string default
+- ✅ `shock_amount` is hardcoded `int`, not derived from user input
+- ✅ No external data flows into critical numeric fields
+
+---
+
+**2e. Execution Tagging for Audit Trail**
+
+```python
+# Line 1447
+result = self.execute_rebalance(candidate, rebalance_type='diagnostic')
+```
+
+**Analysis:**
+- ✅ `rebalance_type='diagnostic'` passed to `execute_rebalance()`
+- ✅ Recorded in DB via `rebalance_type=kwargs.get('rebalance_type', 'normal')` (Line 1336)
+- ✅ Enables filtering diagnostic vs normal rebalances in audit queries
+
+---
+
+**2f. Exception Handling**
+
+```python
+# Lines 1455-1460
+except Exception as e:
+    self.plugin.log(f"Defibrillator shock failed: {e}", level='error')
     return {
-        "success": True, 
-        "message": f"Zero-Fee Probe active for {channel_id}..."
+        "success": True,  # Zero-Fee flag was set successfully
+        "message": f"Zero-Fee flag set, but active shock failed: {e}"
     }
 ```
 
 **Analysis:**
-- ✅ Only calls `database.set_channel_probe()` (flag setting)
-- ✅ No `execute_rebalance()` or `sling-job` calls
-- ✅ No money movement - purely a fee signal
+- ✅ Exception caught and logged (no silent failures)
+- ✅ Returns `success=True` because Phase 1 (flag) succeeded
+- ✅ Error message included in response for debugging
+- ⚠️ Uses broad `Exception` catch (pre-existing pattern, acceptable for resilience)
 
-**Status:** Defibrillator is passive/safe. **SECURE**.
+---
+
+#### Capital Controls Integration (HO-03)
+
+**Finding:** During security review, discovered that `diagnostic_rebalance()` initially bypassed `_check_capital_controls()` by calling `execute_rebalance()` directly.
+
+**Fix Applied:** Added explicit capital controls check before Active Shock execution:
+
+```python
+# Lines 1449-1455 (rebalancer.py)
+# Capital Controls Check - diagnostic rebalances count against daily budget
+if not self._check_capital_controls():
+    self.plugin.log("Defibrillator Active Shock blocked by capital controls", level='warning')
+    return {
+        "success": True,
+        "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
+    }
+```
+
+**Behavior:**
+- If daily budget is exhausted OR wallet reserve is too low, Active Shock is blocked
+- Phase 1 (Zero-Fee flag) still succeeds - passive lure remains active
+- All diagnostic fees ARE recorded to `rebalance_history` and count toward daily budget
+
+---
+
+#### Security Summary: Active Shock Budget Controls
+
+| Control | Mechanism | Value | Verified |
+|---------|-----------|-------|----------|
+| **Amount** | Hardcoded | 50,000 sats | ✅ Not injectable |
+| **Max Fee (PPM)** | Candidate field | 2000 PPM | ✅ Enforced by sling |
+| **Max Fee (Absolute)** | Derived | 100 sats | ✅ Math verified |
+| **Source Minimum** | Filter | 100,000 spendable | ✅ Prevents dust sources |
+| **Daily Budget** | Capital Controls | Shared with rebalancer | ✅ `_check_capital_controls()` |
+| **Wallet Reserve** | Capital Controls | `min_wallet_reserve` config | ✅ `_check_capital_controls()` |
+| **Audit Tag** | DB field | `rebalance_type='diagnostic'` | ✅ Queryable |
+
+---
+
+#### Risk Assessment
+
+| Risk | Probability | Impact | Mitigation |
+|------|-------------|--------|------------|
+| **Budget Overrun** | Very Low | 100 sats max | Hardcoded limits + capital controls |
+| **Repeat Spam** | Very Low | Blocked at budget | Capital controls + Lifecycle rate-limits |
+| **Source Drain** | Very Low | 50k sats moved | Requires >100k spendable source |
+| **Injection Attack** | None | N/A | No external input to numeric fields |
+
+---
+
+**Status:** Defibrillator Active Shock has **layered budget controls**, **capital controls integration**, and **no injection vectors**. Maximum exposure per invocation is **100 sats**; total exposure is capped by `daily_budget_sats`. **SECURE**.
+
+---
+
+### 3.4 Manual Rebalance Budget Bypass (HO-04)
+
+**File:** `modules/rebalancer.py` (Lines 1471-1530)
+
+#### ⚠️ FINDING: Manual Rebalance Design Decision
+
+The `manual_rebalance()` method bypasses `_check_capital_controls()` by design - it's an explicit user override. However, the fees ARE recorded and count toward the daily budget for automated rebalances.
+
+**Resolution:** Added warning log and result flag when capital controls would have blocked:
+
+```python
+# Lines 1471-1484 (rebalancer.py)
+def manual_rebalance(self, from_channel: str, to_channel: str, 
+                     amount_sats: int, max_fee_sats: Optional[int] = None) -> Dict[str, Any]:
+    """Execute a manual rebalance between two channels.
+    
+    Note: Manual rebalances bypass capital controls by design (user override),
+    but fees ARE recorded and count toward the daily budget for automated rebalances.
+    """
+    # Warn if capital controls would block this (but don't enforce for manual)
+    capital_ok = self._check_capital_controls()
+    if not capital_ok:
+        self.plugin.log(
+            "WARNING: Manual rebalance executing despite capital controls. "
+            "Budget may be exhausted or reserve low.", 
+            level='warning'
+        )
+```
+
+**Rationale:** Manual operations are explicit user commands; blocking them would reduce operator control. The warning provides visibility without blocking.
+
+---
+
+### 3.5 Revenue-Proportional Budget (Enhancement)
+
+**File:** `modules/rebalancer.py` (Lines 1559-1577), `modules/config.py` (Lines 73-76)
+
+#### ✅ IMPLEMENTED: Dynamic Budget Scaling
+
+Added capability to scale daily budget as a percentage of trailing 24h revenue.
+
+**Configuration Options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enable_proportional_budget` | `false` | Enable revenue-proportional budgeting |
+| `proportional_budget_pct` | `0.05` | Percentage of 24h revenue (default 5%) |
+
+**Formula:**
+```
+effective_budget = max(daily_budget_sats, revenue_24h × proportional_budget_pct)
+```
+
+**Key Properties:**
+- `daily_budget_sats` acts as a **floor** (never spend less than this)
+- Revenue-proportional scaling only **increases** the budget, never decreases
+- Prevents over-spending during low-revenue periods (fixed floor protects)
+- Allows aggressive rebalancing during high-revenue periods (profitable scaling)
+
+**Database Support:**
+```python
+# database.py - New method
+def get_total_routing_revenue(self, since_timestamp: int) -> int:
+    """Get total routing revenue (fees earned) since a given timestamp."""
+```
 
 ---
 

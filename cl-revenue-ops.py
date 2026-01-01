@@ -243,13 +243,25 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-daily-budget-sats',
     default='5000',
-    description='Max rebalancing fees to spend in 24 hours (default: 5000)'
+    description='Max rebalancing fees to spend in 24 hours - acts as floor when proportional budget enabled (default: 5000)'
 )
 
 plugin.add_option(
     name='revenue-ops-min-wallet-reserve',
     default='1000000',
     description='Minimum total funds (on-chain + off-chain) to keep in reserve (default: 1,000,000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-proportional-budget',
+    default='false',
+    description='If true, scale daily budget based on 24h revenue (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-proportional-budget-pct',
+    default='0.05',
+    description='Percentage of 24h revenue to use as budget when proportional budget enabled (default: 0.05 = 5%)'
 )
 
 plugin.add_option(
@@ -339,6 +351,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalancer_plugin=options['revenue-ops-rebalancer'],
         daily_budget_sats=int(options['revenue-ops-daily-budget-sats']),
         min_wallet_reserve=int(options['revenue-ops-min-wallet-reserve']),
+        enable_proportional_budget=options['revenue-ops-proportional-budget'].lower() == 'true',
+        proportional_budget_pct=float(options['revenue-ops-proportional-budget-pct']),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
         htlc_congestion_threshold=float(options['revenue-ops-htlc-congestion-threshold']),
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',

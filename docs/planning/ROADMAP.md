@@ -87,7 +87,10 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Replacement Cost Pricing**: Base fee floor on *current* on-chain replacement cost, not historical cost.
 - [x] **"Fire Sale" Mode**: Automatically dump inventory for Zombie or Underwater channels at 0-1 PPM fees to avoid manual closure costs.
 - [x] **"Stagnant Inventory" Awakening**: Treat balanced but low-volume channels as Sources to redeploy idle capital to high-demand areas.
-- [x] **The Channel Defibrillator (Zero-Fee Probe)**: Automatically jumpstart stagnant channels by overriding fees to 0 PPM before confirming them as "Zombies" for closure.
+- [x] **The Channel Defibrillator (Active Shock)**: Two-phase liveness verification for stagnant channels:
+    - Phase 1: Set fee to 0 PPM (passive lure for organic traffic)
+    - Phase 2: Execute 50k sat "shock" rebalance to force liquidity and prove liveness
+    - Failure logged to `rebalance_history` for Zombie confirmation
 
 ## Phase 7: "The 1% Node" Defense
 *Status: HARDENED (Post-Red Team Review)*

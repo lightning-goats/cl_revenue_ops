@@ -94,33 +94,26 @@ This document details the implementation steps for the remaining items in the ro
 
 ## Phase 8.0: Liquidity Dividend System (LDS)
 
-### 17. The "Channel Defibrillator" (Zero-Fee Probe) ✅ COMPLETED
-**Objective:** Prevent premature channel closures. Before the Lifecycle Manager assumes a channel is a "Zombie," the system must attempt a "Zero-Fee Probe" to jumpstart flow and verify reachability without active rebalance costs.
+### 17. The "Channel Defibrillator" (Active Shock) ✅ COMPLETED
+**Objective:** Prevent premature channel closures. Before the Lifecycle Manager assumes a channel is a "Zombie," the system must attempt a two-phase liveness check.
+
+**Implementation (v1.1):**
+- **Phase 1 (Passive Lure):** Set channel fee to 0 PPM via probe flag in database
+- **Phase 2 (Active Shock):** Execute immediate 50k sat rebalance to force liquidity into channel
+  - Finds best source channel (highest spendable balance >100k sats)
+  - Budget capped at 100 sats (diagnostic OpEx)
+  - Fee tolerance up to 2000 PPM for pathfinding
+  - Result logged to `rebalance_history` for Zombie confirmation
 
 **Context Files:**
-- `modules/rebalancer.py`
-- `modules/profitability_analyzer.py`
-- `modules/capacity_planner.py`
+- `modules/rebalancer.py` — `diagnostic_rebalance()` method
+- `modules/fee_controller.py` — Zero-Fee Probe priority logic
+- `modules/database.py` — `set_channel_probe()`, `get_diagnostic_rebalance_stats()`
 
-**AI Prompt:**
-```text
-Implement the "Channel Defibrillator" logic to verify stagnant channels before closure.
-
-1. **Identification**:
-   - In `profitability_analyzer.py`, flag channels with 0 forwards in the last 7 days as "STAGNANT_CANDIDATE."
-
-2. **The Defibrillator Trigger**:
-   - In `rebalancer.py`, create a `diagnostic_rebalance(channel_id)` method.
-   - For stagnant candidates, trigger a small, low-fee rebalance (e.g., 50,000 sats). 
-   - We are willing to accept a 0% profit or even a tiny loss for this move, as it is a "diagnostic cost" to save a larger CapEx investment (the channel).
-
-3. **Lifecycle Integration**:
-   - Update `capacity_planner.py` (The Pruner).
-   - A channel cannot be recommended for "Close" or "Splice-out" until the `diagnostic_rebalance` has been attempted at least twice in the last 14 days.
-   - If the diagnostic rebalance succeeds but the channel STILL doesn't route within 48 hours, *then* it is confirmed as a ZOMBIE.
-
-4. **Benefit**: This ensures we don't close channels that just needed a "nudge" to move their liquidity into a more active demand zone, or channels that were temporarily path-blocked.
-```
+**Why Active Shock:**
+- Passive-only (old): Set 0 PPM and hope for organic routing
+- Active Shock (new): Forces liquidity *now*, proves liveness immediately
+- If shock fails: `rebalance_history` records failure, confirms ZOMBIE status
 
 ---
 

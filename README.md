@@ -36,6 +36,10 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - **Adaptive failure backoff**: Exponential cooldown for channels that keep failing
 - **HTLC Slot Awareness**: Prevents rebalancing into congested channels (>80% slot usage)
 - **Global Capital Controls**: Daily Budget and Wallet Reserve checks
+- **Channel Defibrillator (Active Shock)**: Two-phase liveness check for stagnant channels:
+  - Phase 1: Set fee to 0 PPM (passive lure)
+  - Phase 2: Execute 50k sat "shock" rebalance to force liquidity and prove liveness
+  - Budget capped at 100 sats (diagnostic OpEx)
 - Uses sling for async background job execution
 
 ### Module 4: Channel Profitability Analyzer
