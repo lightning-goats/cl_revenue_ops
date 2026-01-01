@@ -93,25 +93,26 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 *Status: HARDENED (Post-Red Team Review)*
 *Target Version: v1.3.0*
 *Security Level: High (Financial Risk Mitigation)*
+*Red Team Assessment: PASSED — See `PHASE7_RED_TEAM_REPORT.md`*
 
 ### v1.3.0: Core Architecture & Safety (Immediate)
 
 - [ ] **Dynamic Runtime Config (Hardened)**:
     - Allow the operator to tune the algorithm via CLI without plugin restarts.
     - Persist overrides in SQLite and load on startup.
-    - *Mitigation:* Implements `ConfigSnapshot` pattern to prevent "Torn Reads" (Critical-02).
-    - *Mitigation:* Transactional DB writes to prevent "Ghost States."
+    - *Mitigation (CRITICAL-02):* Implements `ConfigSnapshot` pattern to prevent "Torn Reads."
+    - *Mitigation (CRITICAL-03):* Transactional DB writes (Write → Read-Back → Update Memory) to prevent "Ghost Config."
 
 - [ ] **Mempool Acceleration (Vegas Reflex)**:
     - Detect L1 fee "shocks" and force an immediate re-price of inventory.
-    - *Mitigation:* Replaces binary latch with **Exponential Decay State** to prevent Latch Bomb DoS (Critical-01).
-    - *Mitigation:* Adds **Probabilistic Early Trigger** to prevent confirmation window front-running (High-03).
+    - *Mitigation (CRITICAL-01):* Replaces binary latch with **Exponential Decay State** to prevent Latch Bomb DoS.
+    - *Mitigation (HIGH-03):* Adds **Probabilistic Early Trigger** to prevent confirmation window front-running.
 
 - [ ] **HTLC Slot Scarcity Pricing**:
     - Transition from binary congestion gates to exponential pricing curves.
-    - *Mitigation:* Uses **Value-Weighted Utilization** (`max(slot_util, value_util)`) to neutralize Dust Flood attacks (High-01).
-    - *Mitigation:* Asymmetric EMA (Fast Up, Slow Down).
-    - *Mitigation:* Rebalancer forecasts post-rebalance utilization to prevent "Trap & Trap" deadlock.
+    - *Mitigation (HIGH-01):* Uses **Value-Weighted Utilization** to neutralize Dust Flood attacks.
+    - *Mitigation (MEDIUM-01):* Asymmetric EMA (α_up=0.4, α_down=0.1) to prevent downward lag.
+    - *Mitigation (HIGH-02):* Rebalancer forecasts post-rebalance utilization to prevent "Trap & Trap" deadlock.
 
 ### v1.4.0: Optimization & Yield (Deferred)
 *Reason: These features introduce complex game-theoretic risks that require stable baseline data from v1.3.*
