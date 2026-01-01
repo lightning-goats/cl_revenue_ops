@@ -1447,7 +1447,7 @@ class EVRebalancer:
             
             # Capital Controls Check - diagnostic rebalances count against daily budget
             if not self._check_capital_controls():
-                self.plugin.log("Defibrillator Active Shock blocked by capital controls", level='warning')
+                self.plugin.log("Defibrillator Active Shock blocked by capital controls", level='warn')
                 return {
                     "success": True,
                     "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
@@ -1481,7 +1481,7 @@ class EVRebalancer:
             self.plugin.log(
                 "WARNING: Manual rebalance executing despite capital controls. "
                 "Budget may be exhausted or reserve low.", 
-                level='warning'
+                level='warn'
             )
         
         channels = self._get_channels_with_balances()
@@ -1560,7 +1560,7 @@ class EVRebalancer:
                 self.plugin.log(
                     f"CAPITAL CONTROL: Wallet reserve (confirmed on-chain + channel spendable) {total_reserve} < "
                     f"{self.config.min_wallet_reserve}", 
-                    level='warning'
+                    level='warn'
                 )
                 return False
             
@@ -1586,7 +1586,7 @@ class EVRebalancer:
                 self.plugin.log(
                     f"CAPITAL CONTROL: Daily budget exceeded "
                     f"({fees_spent_24h} >= {effective_budget})", 
-                    level='warning'
+                    level='warn'
                 )
                 return False
                 
