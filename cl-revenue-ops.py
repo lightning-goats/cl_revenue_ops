@@ -1153,7 +1153,7 @@ def on_peer_connect(plugin: Plugin, **kwargs):
     
     if peer_id:
         database.record_connection_event(peer_id, "connected")
-        plugin.log(f"Peer connected: {peer_id[:12]}...", level='info')
+        plugin.log(f"Peer connected: {peer_id[:12]}...", level='debug')
     else:
         plugin.log(f"Connect event - could not extract peer_id from: {kwargs}", level='warn')
 
@@ -1188,7 +1188,7 @@ def on_peer_disconnect(plugin: Plugin, **kwargs):
     
     if peer_id:
         database.record_connection_event(peer_id, "disconnected")
-        plugin.log(f"Peer disconnected: {peer_id[:12]}...", level='info')
+        plugin.log(f"Peer disconnected: {peer_id[:12]}...", level='debug')
     else:
         plugin.log(f"Disconnect event - could not extract peer_id from: {kwargs}", level='warn')
 
