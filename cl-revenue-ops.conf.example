@@ -40,11 +40,6 @@
 # Fee ceiling - maximum fee rate
 #revenue-ops-max-fee-ppm=5000
 
-# PID controller tuning (advanced - defaults are stable)
-#revenue-ops-pid-kp=0.1
-#revenue-ops-pid-ki=0.01
-#revenue-ops-pid-kd=0.05
-
 # ============================================================================
 # REBALANCING
 # ============================================================================

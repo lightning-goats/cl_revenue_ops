@@ -38,15 +38,6 @@ class Config:
     max_fee_ppm: int = 5000        # Ceiling fee in PPM
     base_fee_msat: int = 0         # Base fee (we focus on PPM)
     
-    # PID Controller gains
-    pid_kp: float = 0.5            # Proportional gain
-    pid_ki: float = 0.1            # Integral gain
-    pid_kd: float = 0.05           # Derivative gain
-    
-    # PID limits to prevent runaway
-    pid_integral_max: float = 1000.0   # Max accumulated integral
-    pid_output_max: float = 500.0      # Max single adjustment step
-    
     # Rebalancing parameters
     rebalance_min_profit: int = 10     # Min profit in sats to trigger
     rebalance_max_amount: int = 5000000  # Max rebalance amount in sats

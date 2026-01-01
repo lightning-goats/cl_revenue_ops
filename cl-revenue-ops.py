@@ -205,24 +205,6 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-pid-kp',
-    default='0.5',
-    description='PID Proportional gain (default: 0.5)'
-)
-
-plugin.add_option(
-    name='revenue-ops-pid-ki',
-    default='0.1',
-    description='PID Integral gain (default: 0.1)'
-)
-
-plugin.add_option(
-    name='revenue-ops-pid-kd',
-    default='0.05',
-    description='PID Derivative gain (default: 0.05)'
-)
-
-plugin.add_option(
     name='revenue-ops-flow-window-days',
     default='7',
     description='Number of days to analyze for flow calculation (default: 7)'
@@ -343,9 +325,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_fee_ppm=int(options['revenue-ops-min-fee-ppm']),
         max_fee_ppm=int(options['revenue-ops-max-fee-ppm']),
         rebalance_min_profit=int(options['revenue-ops-rebalance-min-profit']),
-        pid_kp=float(options['revenue-ops-pid-kp']),
-        pid_ki=float(options['revenue-ops-pid-ki']),
-        pid_kd=float(options['revenue-ops-pid-kd']),
         flow_window_days=int(options['revenue-ops-flow-window-days']),
         clboss_enabled=options['revenue-ops-clboss-enabled'].lower() == 'true',
         rebalancer_plugin=options['revenue-ops-rebalancer'],
