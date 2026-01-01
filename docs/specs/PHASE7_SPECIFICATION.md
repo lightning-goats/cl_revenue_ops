@@ -305,6 +305,6 @@ This specification addresses all **7 vulnerabilities** identified in the consoli
 ---
 
 *Specification Author: Lightning Goats Team*  
-*Red Team Review: PASSED — See `PHASE7_RED_TEAM_REPORT.md` (Final Consolidated)*  
+*Red Team Review: PASSED — See [`PHASE7_RED_TEAM_REPORT.md`](../audits/PHASE7_RED_TEAM_REPORT.md) (Final Consolidated)*  
 *Approval: Senior Red Team Lead*  
 *Last Updated: January 1, 2026*

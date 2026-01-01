@@ -33,13 +33,13 @@ This document details the implementation steps for the remaining items in the ro
 - **Verdict:** Production Deployment APPROVED
 - **Critical Failures:** 0
 - **Recommendations Implemented:** LC-01 (Priority Documentation), HO-01 (Assertion Guards)
-- **Documentation:** See `ZERO_TOLERANCE_AUDIT.md`
+- **Documentation:** See [`ZERO_TOLERANCE_AUDIT.md`](../audits/ZERO_TOLERANCE_AUDIT.md)
 
 ---
 
 ## Phase 7.0: "The 1% Node" Defense (v1.3.0)
 *Red Team Assessment: PASSED — 7 vulnerabilities addressed (3 Critical, 3 High, 1 Medium)*
-*See: `PHASE7_SPECIFICATION.md` and `PHASE7_RED_TEAM_REPORT.md`*
+*See: [`PHASE7_SPECIFICATION.md`](../specs/PHASE7_SPECIFICATION.md) and [`PHASE7_RED_TEAM_REPORT.md`](../audits/PHASE7_RED_TEAM_REPORT.md)*
 
 ### 12. Dynamic Runtime Configuration (CRITICAL-02, CRITICAL-03)
 **Objective:** Allow the operator to tune the algorithm via CLI without plugin restarts.

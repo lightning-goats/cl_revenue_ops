@@ -178,5 +178,16 @@ Every 15 minutes (configurable), the plugin:
 ### Fire Sale Mode
 Zombie or deeply Underwater channels are automatically set to 0-1 PPM fees. This encourages the network to drain the channel for us, avoiding on-chain closing costs.
 
+## Documentation
+
+| Document | Location | Description |
+|----------|----------|-------------|
+| **Roadmap** | [`docs/planning/ROADMAP.md`](docs/planning/ROADMAP.md) | Development phases and feature status |
+| **TODO** | [`docs/planning/TODO.md`](docs/planning/TODO.md) | Implementation checklist with prompts |
+| **Phase 7 Spec** | [`docs/specs/PHASE7_SPECIFICATION.md`](docs/specs/PHASE7_SPECIFICATION.md) | v1.3 "The 1% Node" technical specification |
+| **LDS Spec** | [`docs/specs/liquidity-dividend_system.md`](docs/specs/liquidity-dividend_system.md) | Liquidity Dividend System design |
+| **Red Team Report** | [`docs/audits/PHASE7_RED_TEAM_REPORT.md`](docs/audits/PHASE7_RED_TEAM_REPORT.md) | Security assessment (7 vulnerabilities addressed) |
+| **Zero Tolerance Audit** | [`docs/audits/ZERO_TOLERANCE_AUDIT.md`](docs/audits/ZERO_TOLERANCE_AUDIT.md) | Production code security audit |
+
 ## License
 MIT

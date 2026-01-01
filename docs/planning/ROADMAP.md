@@ -93,7 +93,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 *Status: HARDENED (Post-Red Team Review)*
 *Target Version: v1.3.0*
 *Security Level: High (Financial Risk Mitigation)*
-*Red Team Assessment: PASSED — See `PHASE7_RED_TEAM_REPORT.md`*
+*Red Team Assessment: PASSED — See [`PHASE7_RED_TEAM_REPORT.md`](../audits/PHASE7_RED_TEAM_REPORT.md)*
 
 ### v1.3.0: Core Architecture & Safety (Immediate)
 
