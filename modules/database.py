@@ -283,6 +283,16 @@ class Database:
             )
         """)
         
+        # Ignored peers table (Blacklist)
+        # Prevents cl-revenue-ops from managing fees or rebalancing for specific peers
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ignored_peers (
+                peer_id TEXT PRIMARY KEY,
+                reason TEXT,
+                ignored_at INTEGER NOT NULL
+            )
+        """)
+        
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
@@ -1663,6 +1673,36 @@ class Database:
         
         uptime_pct = (total_connected_time / actual_duration) * 100.0
         return min(100.0, max(0.0, uptime_pct))
+    
+    # =========================================================================
+    # Ignored Peers (Blacklist) Methods
+    # =========================================================================
+    
+    def add_ignored_peer(self, peer_id: str, reason: str = "manual"):
+        """Add a peer to the ignore list."""
+        conn = self._get_connection()
+        now = int(time.time())
+        conn.execute("""
+            INSERT OR REPLACE INTO ignored_peers (peer_id, reason, ignored_at)
+            VALUES (?, ?, ?)
+        """, (peer_id, reason, now))
+
+    def remove_ignored_peer(self, peer_id: str):
+        """Remove a peer from the ignore list."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM ignored_peers WHERE peer_id = ?", (peer_id,))
+
+    def is_peer_ignored(self, peer_id: str) -> bool:
+        """Check if a peer is ignored."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT 1 FROM ignored_peers WHERE peer_id = ?", (peer_id,)).fetchone()
+        return row is not None
+
+    def get_ignored_peers(self) -> List[Dict[str, Any]]:
+        """Get list of all ignored peers."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM ignored_peers ORDER BY ignored_at DESC").fetchall()
+        return [dict(row) for row in rows]
     
     def close(self):
         """Close the thread-local database connection (if any)."""

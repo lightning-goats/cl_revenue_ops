@@ -752,6 +752,11 @@ class EVRebalancer:
                 if capacity == 0: 
                     continue
                 
+                # Skip ignored peers (Blacklist)
+                peer_id = info.get("peer_id")
+                if peer_id and self.database.is_peer_ignored(peer_id):
+                    continue
+                
                 outbound_ratio = spendable / capacity
                 
                 # Skip channels with active jobs
@@ -1123,13 +1128,17 @@ class EVRebalancer:
             normalized = cid.replace(':', 'x')
             if normalized in active_channels:
                 continue
+            
+            # Skip ignored peers (Blacklist)
+            pid = info.get("peer_id", "")
+            if pid and self.database.is_peer_ignored(pid):
+                continue
                 
             # Skip if insufficient balance
             if info.get("spendable_sats", 0) < amount_needed: 
                 continue
             
             # Skip disconnected peers
-            pid = info.get("peer_id", "")
             if pid and pid in peers and not peers[pid].get("connected"): 
                 continue
             

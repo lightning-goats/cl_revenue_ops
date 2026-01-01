@@ -206,6 +206,10 @@ class HillClimbingFeeController:
             if not channel_id or not peer_id:
                 continue
             
+            # Skip ignored peers (Blacklist)
+            if self.database.is_peer_ignored(peer_id):
+                continue
+            
             # Get channel info
             channel_info = channels.get(channel_id)
             if not channel_info:

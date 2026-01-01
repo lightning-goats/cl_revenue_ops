@@ -35,6 +35,13 @@ This document details the implementation steps for the remaining items in the ro
 - **Recommendations Implemented:** LC-01 (Priority Documentation), HO-01 (Assertion Guards)
 - **Documentation:** See [`ZERO_TOLERANCE_AUDIT.md`](../audits/ZERO_TOLERANCE_AUDIT.md)
 
+### Ignore Peer Command ✅ COMPLETED
+**Status:** Implemented `ignored_peers` table and RPC commands.
+- `revenue-ignore peer_id [reason]` - Stop managing a peer
+- `revenue-unignore peer_id` - Resume management
+- `revenue-list-ignored` - List all ignored peers
+- Fee Controller and Rebalancer check `is_peer_ignored()` before taking action
+
 ---
 
 ## Phase 7.0: "The 1% Node" Defense (v1.3.0)

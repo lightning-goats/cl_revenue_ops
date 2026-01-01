@@ -970,6 +970,57 @@ def revenue_remanage(plugin: Plugin, peer_id: str, tag: Optional[str] = None) ->
         return {"status": "error", "error": str(e)}
 
 
+@plugin.method("revenue-ignore")
+def revenue_ignore(plugin: Plugin, peer_id: str, reason: str = "manual") -> Dict[str, Any]:
+    """
+    Stop cl-revenue-ops from managing this peer (fees or rebalancing).
+    
+    Usage: lightning-cli revenue-ignore peer_id [reason]
+    """
+    if database is None:
+        return {"error": "Plugin not initialized"}
+    
+    database.add_ignored_peer(peer_id, reason)
+    return {
+        "status": "success",
+        "action": "ignore",
+        "peer_id": peer_id,
+        "reason": reason,
+        "message": f"Peer {peer_id} added to ignore list. cl-revenue-ops will no longer manage fees or rebalancing for this peer."
+    }
+
+
+@plugin.method("revenue-unignore")
+def revenue_unignore(plugin: Plugin, peer_id: str) -> Dict[str, Any]:
+    """
+    Resume cl-revenue-ops management for this peer.
+    
+    Usage: lightning-cli revenue-unignore peer_id
+    """
+    if database is None:
+        return {"error": "Plugin not initialized"}
+    
+    database.remove_ignored_peer(peer_id)
+    return {
+        "status": "success",
+        "action": "unignore",
+        "peer_id": peer_id,
+        "message": f"Peer {peer_id} removed from ignore list."
+    }
+
+
+@plugin.method("revenue-list-ignored")
+def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
+    """
+    List all peers currently ignored by cl-revenue-ops.
+    """
+    if database is None:
+        return {"error": "Plugin not initialized"}
+    
+    ignored = database.get_ignored_peers()
+    return {"ignored_peers": ignored, "count": len(ignored)}
+
+
 # =============================================================================
 # HOOKS - React to Lightning events
 # =============================================================================

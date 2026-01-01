@@ -76,6 +76,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 - [x] **Fire Sale Momentum Guard**: Protect improving but technically "underwater" channels from premature liquidation.
 - [x] **Zero-Fee Probe Priority Fix**: Ensure Defibrillator (0 PPM) takes precedence over Fire Sale (1 PPM) in Alpha Sequence.
 - [x] **Zero Tolerance Security Audit**: Full adversarial code audit completed. Production deployment APPROVED. All recommendations (LC-01, HO-01) implemented.
+- [x] **Operational Blacklist**: Implement `revenue-ignore` to prevent algorithmic interference with manual/sensitive peers.
 
 ## Phase 6: Market Dynamics & Lifecycle (Planned v1.2)
 *Objective: This phase shifts the plugin from "Maintenance" to "Growth & Pruning," automating the capital allocation decisions that usually require manual operator intervention.*
