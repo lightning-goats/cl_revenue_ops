@@ -236,7 +236,7 @@ This document details the implementation steps for the remaining items in the ro
 
 ---
 
-### 18. Proactive HTLC Slot Pricing (Congestion Defense 2.0)
+### 26. Proactive HTLC Slot Pricing (Congestion Defense 2.0)
 **Objective:** Proactively price the scarcity of HTLC slots, starting from a 50% utilization, to prevent low-margin traffic from crowding out high-margin payments.
 
 **AI Prompt:**
@@ -248,9 +248,7 @@ This document details the implementation steps for the remaining items in the ro
 
 ---
 
-## Phase 8.0: Liquidity Dividend System (LDS)
-
-### 19. The Solvency & TWAB Driver
+### 27. The Solvency & TWAB Driver
 **Objective:** Track investor capital and ensure system solvency.
 
 **Context Files:**
@@ -266,7 +264,7 @@ Update `modules/database.py` to support LDS tracking.
 3. In `cl-revenue-ops.py`, create a `verify_solvency()` function that aborts the payout loop if total virtual liabilities exceed 85% of the physical local balance found in CLN `listfunds`.
 ```
 
-### 20. The LNbits Extension (Spend Guard)
+### 28. The LNbits Extension (Spend Guard)
 **Objective:** Enforce lock-up periods for investor capital.
 
 **AI Prompt:**
@@ -278,7 +276,7 @@ Build an LNbits extension called 'LDS Vault'.
 3. If the source wallet is LOCKED and the `lock_expiry` hasn't passed, return a 403 error: 'Capital is currently deployed in routing channels and is time-locked'.
 ```
 
-### 21. The Profit Distribution Loop
+### 29. The Profit Distribution Loop
 **Objective:** Distribute net profits to investors.
 
 **AI Prompt:**
