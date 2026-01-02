@@ -44,43 +44,47 @@ This document details the implementation steps for the remaining items in the ro
 
 ---
 
-## Phase 7.0: "The 1% Node" Defense (v1.3.0)
+## Phase 7.0: "The 1% Node" Defense (v1.3.0) ✅ COMPLETED
 *Red Team Assessment: PASSED — 7 vulnerabilities addressed (3 Critical, 3 High, 1 Medium)*
 *See: [`PHASE7_SPECIFICATION.md`](../specs/PHASE7_SPECIFICATION.md) and [`PHASE7_RED_TEAM_REPORT.md`](../audits/PHASE7_RED_TEAM_REPORT.md)*
 
-### 12. Dynamic Runtime Configuration (CRITICAL-02, CRITICAL-03)
+### 12. Dynamic Runtime Configuration (CRITICAL-02, CRITICAL-03) ✅ COMPLETED
 **Objective:** Allow the operator to tune the algorithm via CLI without plugin restarts.
 **Hardened Implementation:**
 - `ConfigSnapshot` pattern: Worker threads bind to immutable config version at cycle start
 - Transactional Update Flow: Validate → Write DB → Read-Back Verify → Update Memory
 - Version monotonic: Stale snapshots detectable via generation counter
+- **RPC Commands:** `revenue-config get`, `revenue-config set <key> <value>`, `revenue-config reset <key>`
+- **Plugin Options:** `--revenue-ops-vegas-reflex`, `--revenue-ops-scarcity-pricing`
 
 **Context Files:**
 - `cl-revenue-ops.py`
 - `modules/config.py`
 - `modules/database.py`
 
-### 13. Mempool Acceleration (Vegas Reflex) (CRITICAL-01, HIGH-03)
+### 13. Mempool Acceleration (Vegas Reflex) (CRITICAL-01, HIGH-03) ✅ COMPLETED
 **Objective:** Detect L1 fee "shocks" and force an immediate re-price of inventory.
 **Hardened Implementation:**
 - **Exponential Decay State** (not binary latch): Intensity fades when mempool calms
 - **Probabilistic Early Trigger**: Spikes 200-400% have linear probability of immediate trigger
 - Decay rate: 0.85 per cycle (~30min half-life)
+- **VegasReflexState class:** Tracks intensity and applies floor multiplier (1.0x-3.0x)
+- **Mempool history:** Stored in `mempool_fee_history` table for moving average
 
 **Context Files:**
 - `modules/fee_controller.py`
 - `modules/database.py`
 
-### 14. HTLC Slot Scarcity Pricing (HIGH-01, HIGH-02, MEDIUM-01)
-**Objective:** Transition from binary congestion gates to exponential pricing curves.
+### 14. Scarcity Pricing (Balance-Based) ✅ COMPLETED
+**Objective:** Charge premium fees when local balance is scarce.
 **Hardened Implementation:**
-- **Value-Weighted Utilization**: 1M sat HTLC = 10 slots, 1K sat = 0.01 slots (prevents Dust Flood)
-- **Asymmetric EMA**: α_up=0.4 (fast defense), α_down=0.1 (stable release)
-- **Rebalancer Forecast**: `_check_scarcity_safe()` prevents "Trap & Trap" deadlock
+- **Balance-Based Scarcity**: Triggers when outbound ratio < 30% (configurable)
+- **Linear Multiplier**: 1.0x at threshold, 3.0x at 0% balance
+- **Runtime Configurable**: Enable via `revenue-config set enable_scarcity_pricing true`
 
 **Context Files:**
 - `modules/fee_controller.py`
-- `modules/rebalancer.py`
+- `modules/config.py`
 
 ---
 
