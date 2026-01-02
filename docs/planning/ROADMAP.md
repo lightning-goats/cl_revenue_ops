@@ -165,6 +165,22 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - **Safety Guard**: Exception Hierarchy - emergency states (Fire Sale/Congestion) take precedence over syncing.
     - *Deferred:* High-02 Arbitrage Risk. Requires "Baseline/Floor" architecture rather than "Leader Override."
 
+## Phase 8: The Sovereign Dashboard (P&L Engine)
+*Objective: Provide comprehensive financial visibility and identify underperforming channels.*
+
+- [ ] **Financial Snapshots (Database)**:
+    - Record node TLV (Total Locked Value) daily to track Net Worth over time.
+    - New `financial_snapshots` table with `record_financial_snapshot()` and `get_financial_history()` methods.
+
+- [ ] **P&L Logic & "Bleeder" Detection**:
+    - Calculate Gross Revenue, OpEx, Net Profit, and Margin via `profitability_analyzer`.
+    - Identify "Bleeders": channels where `rebalance_costs > revenue` over 30 days.
+    - Calculate Return on Capacity (ROC) metric per channel.
+
+- [ ] **`revenue-dashboard` RPC Command**:
+    - Single command for operator to check node financial health.
+    - JSON output: TLV, Margins, ROC, and Warnings (Bleeders list).
+
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*
 *Roadmap updated: January 2, 2026*

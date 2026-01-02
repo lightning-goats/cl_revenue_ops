@@ -30,10 +30,10 @@ This document details the implementation steps for the remaining items in the ro
 
 ### 🛡️ Liquidity Hardening & Efficiency (Immediate)
 
-#### 15. Implement "Orphan Job" Cleanup (Startup Hygiene) ✅ COMPLETED
+#### 13. Implement "Orphan Job" Cleanup (Startup Hygiene) ✅ COMPLETED
 **Status:** Implemented `cleanup_orphans()` method in `JobManager` (`modules/rebalancer.py`). Called during `init()` in `cl-revenue-ops.py`. Also added `stop_all_jobs()` call in SIGTERM handler to prevent phantom spending during shutdown.
 
-#### 16. Implement Volume-Weighted Liquidity Targets (Smart Allocation)
+#### 14. Implement Volume-Weighted Liquidity Targets (Smart Allocation)
 **Context:** Currently, the rebalancer targets fixed ratios (50% for Balanced, 85% for Source). On large channels (e.g., 10M sats) with low volume (e.g., 10k/day), this traps massive amounts of "Lazy Capital" (5M sats) that sits idle.
 **Tasks:**
 1.  **Modify `modules/rebalancer.py`** in `_analyze_rebalance_ev`:
@@ -52,7 +52,7 @@ This document details the implementation steps for the remaining items in the ro
       ```
 **Benefit:** Frees up idle Bitcoin from slow-moving large channels to be deployed to high-velocity channels, significantly improving Return on Capital (ROC).
 
-#### 17. Implement "Futility" Circuit Breaker
+#### 15. Implement "Futility" Circuit Breaker
 **Context:** Some channels have positive EV spreads but broken routing paths. Exponential backoff slows down retries, but doesn't stop them. After ~10 failures, the channel is likely a "Dead End" and further attempts waste gossip bandwidth and lock HTLCs.
 **Tasks:**
 1.  **Modify `modules/rebalancer.py`** in `find_rebalance_candidates`:
@@ -68,7 +68,7 @@ This document details the implementation steps for the remaining items in the ro
 
 ### 🔧 Architectural Hardening & Optimization (High-Scale Stability)
 
-#### 18. Plugin Lifecycle Management (Graceful Shutdown) ✅ COMPLETED
+#### 16. Plugin Lifecycle Management (Graceful Shutdown) ✅ COMPLETED
 **Status:** Implemented `shutdown_event` threading.Event and SIGTERM signal handler in `cl-revenue-ops.py`. All background loops now use `shutdown_event.wait(timeout)` instead of `time.sleep(timeout)`, enabling instant clean shutdown via `lightning-cli plugin stop`.
 
 **Verified Components:**
@@ -76,7 +76,7 @@ This document details the implementation steps for the remaining items in the ro
 - `modules/rebalancer.py`: `stop_all_jobs()` terminates active sling jobs on shutdown ✅
 - `cl-revenue-ops.py`: SIGTERM handler calls both cleanup methods ✅
 
-#### 19. Optimize Database Indexes (Composite Indexing)
+#### 17. Optimize Database Indexes (Composite Indexing)
 **Context:** The Fee Controller runs `get_volume_since` for every channel every 30 minutes. The query filters by `out_channel` AND `timestamp`. Currently, these columns are indexed separately, requiring the database to scan results. On nodes with millions of forwards, this causes lag.
 **Tasks:**
 1.  **Modify `modules/database.py`** in `initialize`:
@@ -86,7 +86,7 @@ This document details the implementation steps for the remaining items in the ro
       ```
 **Benefit:** Changes query complexity from $O(N)$ to $O(\log N)$, ensuring instant fee calculations regardless of history size.
 
-#### 20. Implement In-Memory "Garbage Collection"
+#### 18. Implement In-Memory "Garbage Collection"
 **Context:** The `FeeController` caches state objects (`HillClimbState`, `ScarcityState`) in Python dictionaries. When channels are closed, these objects remain in memory forever, causing a slow memory leak over months of operation.
 **Tasks:**
 1.  **Modify `modules/fee_controller.py`**:
@@ -97,7 +97,7 @@ This document details the implementation steps for the remaining items in the ro
     - Similar logic for `self.source_failure_counts`.
 **Benefit:** Prevents memory bloat and ensures long-term stability without restarts.
 
-#### 21. Switch Flow Analysis to Local DB (The "Double-Dip" Fix)
+#### 19. Switch Flow Analysis to Local DB (The "Double-Dip" Fix)
 **Context:** Currently, `flow_analysis.py` calls the `listforwards` RPC every hour. On established nodes, this returns hundreds of megabytes of JSON, causing CPU spikes and potential Out-Of-Memory crashes. However, we *already* save every forward to our local SQLite DB via the `forward_event` hook.
 **Tasks:**
 1.  **Implement "Hydration" in `cl-revenue-ops.py`**:
@@ -139,7 +139,7 @@ This document details the implementation steps for the remaining items in the ro
 *Red Team Assessment: PASSED — 7 vulnerabilities addressed (3 Critical, 3 High, 1 Medium)*
 *See: [`PHASE7_SPECIFICATION.md`](../specs/PHASE7_SPECIFICATION.md) and [`PHASE7_RED_TEAM_REPORT.md`](../audits/PHASE7_RED_TEAM_REPORT.md)*
 
-### 12. Dynamic Runtime Configuration (CRITICAL-02, CRITICAL-03) ✅ COMPLETED
+### 20. Dynamic Runtime Configuration (CRITICAL-02, CRITICAL-03) ✅ COMPLETED
 **Objective:** Allow the operator to tune the algorithm via CLI without plugin restarts.
 **Hardened Implementation:**
 - `ConfigSnapshot` pattern: Worker threads bind to immutable config version at cycle start
@@ -153,7 +153,7 @@ This document details the implementation steps for the remaining items in the ro
 - `modules/config.py`
 - `modules/database.py`
 
-### 13. Mempool Acceleration (Vegas Reflex) (CRITICAL-01, HIGH-03) ✅ COMPLETED
+### 21. Mempool Acceleration (Vegas Reflex) (CRITICAL-01, HIGH-03) ✅ COMPLETED
 **Objective:** Detect L1 fee "shocks" and force an immediate re-price of inventory.
 **Hardened Implementation:**
 - **Exponential Decay State** (not binary latch): Intensity fades when mempool calms
@@ -166,7 +166,7 @@ This document details the implementation steps for the remaining items in the ro
 - `modules/fee_controller.py`
 - `modules/database.py`
 
-### 14. Scarcity Pricing (Balance-Based) ✅ COMPLETED
+### 22. Scarcity Pricing (Balance-Based) ✅ COMPLETED
 **Objective:** Charge premium fees when local balance is scarce.
 **Hardened Implementation:**
 - **Balance-Based Scarcity**: Triggers when outbound ratio < 30% (configurable)
@@ -182,19 +182,19 @@ This document details the implementation steps for the remaining items in the ro
 ## Phase 7.1: Optimization & Yield (Deferred to v1.4)
 *Reason: These features introduce game-theoretic risks requiring stable baseline data from v1.3*
 
-### 22. Flow Asymmetry (Rare Liquidity Premium) — DEFERRED
+### 23. Flow Asymmetry (Rare Liquidity Premium) — DEFERRED
 **Objective:** Charge a premium for "One-Way Street" channels (high outflow, zero organic refill).
 **Safety Guard:** **Velocity Gate.** Only apply to high-volume channels (>50k sats/day).
 **Deferral Reason:** Risk of false positive taxation on valid circular rebalances.
 
-### 23. Peer-Level Atomic Fee Syncing — DEFERRED
+### 24. Peer-Level Atomic Fee Syncing — DEFERRED
 **Objective:** Unified liquidity pool pricing per peer node.
 **Safety Guard:** **Exception Hierarchy.** Emergency states (Fire Sale/Congestion) take precedence.
 **Deferral Reason:** HIGH-02 "Anchor & Drain" arbitrage risk. Requires "Floor-Only" architecture.
 
 ### 📊 v1.4.0 Readiness (Data Analysis)
 
-#### 24. Traffic & Elasticity Analysis (The "Optimization" Audit)
+#### 25. Traffic & Elasticity Analysis (The "Optimization" Audit)
 **Context:** Before implementing **Flow Asymmetry** and **Peer Syncing** (v1.4), we need empirical proof that these strategies won't cannibalize revenue. We need ~30 days of v1.3 production data to distinguish structural market advantages from random noise.
 
 **Tasks:**
@@ -208,3 +208,33 @@ This document details the implementation steps for the remaining items in the ro
 4.  **Metric 3: Scarcity Pricing Impact:**
     - Compare revenue/volume during periods where Scarcity Multiplier > 1.0 vs baseline.
     - *Goal:* Ensure exponential fees are protecting capacity without destroying total revenue.
+
+---
+
+### 📊 Phase 8: The Sovereign Dashboard (P&L Engine)
+
+#### 26. Implement Financial Snapshots (Database)
+**Context:** To track Net Worth (TLV) over time, we need to record the state of the node periodically.
+**Tasks:**
+1.  **Modify `modules/database.py`**:
+    - Add `financial_snapshots` table schema in `initialize()`.
+    - Add `record_financial_snapshot(...)` method.
+    - Add `get_financial_history(limit=30)` method.
+2.  **Modify `cl-revenue-ops.py`**:
+    - Add a background timer (24h interval) or hook into an existing loop to take a snapshot once per day.
+
+#### 27. Implement P&L Logic & "Bleeder" Detection
+**Context:** We need to identify channels that are operationally active but financially negative (burning rebalance fees).
+**Tasks:**
+1.  **Modify `modules/profitability_analyzer.py`**:
+    - Add `get_pnl_summary(window_days)`: Calculate Gross Rev, OpEx, Net Profit, and Margin.
+    - Add `identify_bleeders()`: Find channels where `rebalance_costs > revenue` over the last 30 days.
+    - Add `calculate_roc()`: Return on Capacity metric.
+
+#### 28. Implement `revenue-dashboard` RPC
+**Context:** Provide a single command for the operator to check the financial health of the node.
+**Tasks:**
+1.  **Modify `cl-revenue-ops.py`**:
+    - Register `revenue-dashboard` command.
+    - Aggregate data from `profitability_analyzer` and `database`.
+    - Format JSON output containing TLV, Margins, ROC, and Warnings (Bleeders).
