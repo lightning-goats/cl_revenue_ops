@@ -304,6 +304,16 @@ class Database:
             )
         """)
         
+        # Mempool fee history (Phase 7: Vegas Reflex MA calculation)
+        # Tracks on-chain fee rates for detecting spikes
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mempool_fee_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sat_per_vbyte REAL NOT NULL,
+                timestamp INTEGER NOT NULL
+            )
+        """)
+        
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
@@ -312,6 +322,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_channel ON rebalance_costs(channel_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_states_peer ON channel_states(peer_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connection_history_peer_time ON peer_connection_history(peer_id, timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_time ON mempool_fee_history(timestamp)")
         
         # Daily aggregated forwarding stats (Granular History)
         # Replacing the single 'lifetime_aggregates' counter with daily resolution
@@ -1765,6 +1776,46 @@ class Database:
         conn = self._get_connection()
         cursor = conn.execute("DELETE FROM config_overrides WHERE key = ?", (key,))
         return cursor.rowcount > 0
+    
+    # =========================================================================
+    # Mempool Fee History Methods (Phase 7: Vegas Reflex)
+    # =========================================================================
+    
+    def record_mempool_fee(self, sat_per_vbyte: float) -> None:
+        """
+        Record current mempool fee rate.
+        
+        Automatically prunes entries older than 48 hours to prevent bloat.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO mempool_fee_history (sat_per_vbyte, timestamp) VALUES (?, ?)",
+            (sat_per_vbyte, now)
+        )
+        # Prune old entries (keep 48h)
+        conn.execute(
+            "DELETE FROM mempool_fee_history WHERE timestamp < ?",
+            (now - 172800,)
+        )
+
+    def get_mempool_ma(self, window_seconds: int = 86400) -> float:
+        """
+        Get moving average of mempool fees over window.
+        
+        Args:
+            window_seconds: Time window for average (default 24h)
+            
+        Returns:
+            Average sat/vB over the window, or 1.0 if no data
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - window_seconds
+        row = conn.execute(
+            "SELECT AVG(sat_per_vbyte) as avg_fee FROM mempool_fee_history WHERE timestamp >= ?",
+            (cutoff,)
+        ).fetchone()
+        return row['avg_fee'] if row and row['avg_fee'] else 1.0
     
     def close(self):
         """Close the thread-local database connection (if any)."""

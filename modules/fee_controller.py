@@ -82,6 +82,81 @@ class HillClimbState:
 
 
 @dataclass
+class VegasReflexState:
+    """
+    State for Vegas Reflex mempool acceleration (Phase 7).
+    
+    Protects against arbitrageurs draining channels during high on-chain fee spikes
+    by dynamically raising fee floors.
+    
+    Defenses implemented:
+    - CRITICAL-01: Exponential decay prevents permanent latch (no DoS via fee spamming)
+    - HIGH-03: Probabilistic early trigger at 200-400% spikes
+    
+    Attributes:
+        intensity: Current reflex intensity (0.0 to 1.0)
+        decay_rate: Per-cycle decay factor (~30min half-life at 0.85)
+        last_sat_vb: Last observed sat/vB rate
+        last_update: Unix timestamp of last update
+        consecutive_spikes: Count for confirmation window
+    """
+    intensity: float = 0.0          # Range: 0.0 to 1.0
+    decay_rate: float = 0.85        # Per-cycle decay (~30min half-life at 30min intervals)
+    last_sat_vb: float = 1.0        # Last observed sat/vB
+    last_update: int = 0            # Unix timestamp
+    consecutive_spikes: int = 0     # For confirmation window
+    
+    def update(self, current_sat_vb: float, ma_sat_vb: float) -> None:
+        """
+        Update intensity based on mempool spike ratio.
+        
+        Args:
+            current_sat_vb: Current mempool fee rate in sat/vB
+            ma_sat_vb: Moving average fee rate (24h)
+        """
+        import random
+        
+        if ma_sat_vb <= 0:
+            ma_sat_vb = 1.0  # Prevent division by zero
+        
+        spike_ratio = current_sat_vb / ma_sat_vb
+        
+        # Track consecutive spikes for confirmation window
+        if spike_ratio >= 2.0:
+            self.consecutive_spikes += 1
+        else:
+            self.consecutive_spikes = 0
+        
+        if spike_ratio >= 4.0:
+            # Immediate trigger: set intensity to max (>400% spike)
+            self.intensity = 1.0
+        elif spike_ratio >= 2.0:
+            # HIGH-03 Defense: Probabilistic boost for 200-400% spikes
+            # Either 2 consecutive spikes OR random chance proportional to spike
+            boost = (spike_ratio - 2.0) / 2.0  # 0.0 to 1.0
+            
+            if self.consecutive_spikes >= 2 or random.random() < boost * 0.5:
+                self.intensity = min(1.0, self.intensity + boost * 0.3)
+        
+        # Always decay toward zero (CRITICAL-01 defense)
+        self.intensity *= self.decay_rate
+        self.last_sat_vb = current_sat_vb
+        self.last_update = int(time.time())
+    
+    def get_floor_multiplier(self) -> float:
+        """
+        Get fee floor multiplier based on intensity.
+        
+        Returns:
+            Multiplier from 1.0x (calm) to 3.0x (max intensity)
+        """
+        if self.intensity < 0.01:
+            return 1.0
+        # Smooth curve using square root for gradual response
+        return 1.0 + (self.intensity ** 0.5) * 2.0
+
+
+@dataclass
 class FeeAdjustment:
     """
     Record of a fee adjustment.
@@ -173,6 +248,9 @@ class HillClimbingFeeController:
         
         # In-memory cache of Hill Climbing states (also persisted to DB)
         self._hill_climb_states: Dict[str, HillClimbState] = {}
+        
+        # Phase 7: Vegas Reflex state (global, not per-channel)
+        self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
     
     def adjust_all_fees(self) -> List[FeeAdjustment]:
         """
@@ -198,6 +276,22 @@ class HillClimbingFeeController:
         # OPTIMIZATION: Hoist feerates RPC call outside the loop
         # This reduces N RPC calls to 1 per adjust_all_fees cycle
         chain_costs = self._get_dynamic_chain_costs()
+        
+        # Phase 7: Take ConfigSnapshot for thread-safe reads
+        cfg = self.config.snapshot()
+        
+        # Phase 7: Vegas Reflex - update mempool acceleration state
+        if cfg.enable_vegas_reflex and chain_costs:
+            current_sat_vb = chain_costs.get("sat_per_vbyte", 1.0)
+            self.database.record_mempool_fee(current_sat_vb)
+            ma_sat_vb = self.database.get_mempool_ma(86400)  # 24h moving average
+            self._vegas_state.update(current_sat_vb, ma_sat_vb)
+            if self._vegas_state.intensity > 0.1:
+                self.plugin.log(
+                    f"VEGAS REFLEX: intensity={self._vegas_state.intensity:.2f}, "
+                    f"multiplier={self._vegas_state.get_floor_multiplier():.2f}x",
+                    level='info'
+                )
         
         for state in channel_states:
             channel_id = state.get("channel_id")
@@ -938,6 +1032,17 @@ class HillClimbingFeeController:
                             level='info'
                         )
                     floor_ppm = risk_premium_ppm
+        
+        # Phase 7: Vegas Reflex - apply mempool acceleration multiplier
+        vegas_multiplier = self._vegas_state.get_floor_multiplier()
+        if vegas_multiplier > 1.0:
+            original_floor = floor_ppm
+            floor_ppm = int(floor_ppm * vegas_multiplier)
+            self.plugin.log(
+                f"VEGAS REFLEX: Applied {vegas_multiplier:.2f}x multiplier to floor "
+                f"({original_floor} -> {floor_ppm} PPM)",
+                level='debug'
+            )
         
         return max(1, int(floor_ppm))
     
