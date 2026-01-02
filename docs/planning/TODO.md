@@ -25,19 +25,8 @@ This document details the implementation steps for the remaining items in the ro
 
 ## 🚨 Immediate Fixes (Critical)
 
-### 12. Implement "Virgin Channel Amnesty" (Fix Remote Open Pricing)
-**Context:** Channels opened by remote peers naturally start with 0% local balance. The current **Scarcity Pricing** logic treats these as "Depleted/Drained" channels and applies a maximum fee multiplier (e.g., 3x). This "poisons" the channel with absurd fees (e.g., 46,000 PPM) before it has ever routed a payment, discouraging the network from using it.
-
-**Tasks:**
-1.  **Modify `modules/fee_controller.py`** in `_adjust_channel_fee`:
-    - Check channel opener: `opener = channel_info.get("opener")`.
-    - Check lifetime usage: `total_out = state.get("sats_out", 0)`.
-    - **Logic:** If `opener == 'remote'` AND `total_out == 0`:
-        - Set `is_virgin_remote = True`.
-        - **Bypass** the Scarcity Pricing block (`scarcity_multiplier`).
-    - *Log:* "Channel {id} is VIRGIN REMOTE. Suppressing Scarcity Pricing to encourage break-in."
-
-**Benefit:** Allows new remote channels to sit at competitive fees (`min_fee_ppm` or calculated floor) to attract their first rebalance/payment, rather than being priced out immediately.
+### 12. Implement "Virgin Channel Amnesty" (Fix Remote Open Pricing) ✅ COMPLETED
+**Status:** Implemented in `modules/fee_controller.py` → `_adjust_channel_fee()`. Remote-opened channels with zero outbound traffic (`sats_out == 0`) now bypass Scarcity Pricing to allow competitive fees during break-in period.
 
 ---
 

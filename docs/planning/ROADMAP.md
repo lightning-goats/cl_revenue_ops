@@ -115,7 +115,7 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - Charge premium fees when local balance drops below threshold (30%).
     - Linear multiplier from 1.0x (at threshold) to 3.0x (at 0% balance).
     - Runtime configurable via `revenue-config set enable_scarcity_pricing true`.
-    - **Known Limitation:** Remote-opened channels start at 0% local balance and trigger maximum scarcity multiplier before any traffic. See TODO #12 "Virgin Channel Amnesty" for fix.
+    - **Virgin Channel Amnesty:** Remote-opened channels with no outbound traffic bypass scarcity pricing to encourage break-in.
 
 ### v1.4.0: Optimization & Yield (Deferred)
 *Reason: These features introduce complex game-theoretic risks that require stable baseline data from v1.3.*

@@ -750,17 +750,30 @@ class HillClimbingFeeController:
             new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
             
             # Phase 7: Scarcity Pricing - premium for low local balance
+            # Phase 7.1: Virgin Channel Amnesty - bypass for remote-opened channels with no traffic
             cfg = self.config.snapshot()
+            opener = channel_info.get("opener", "local")
+            total_sats_out = state.get("sats_out", 0) if state else 0
+            is_virgin_remote = (opener == "remote" and total_sats_out == 0)
+            
             if cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
-                scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
-                original_fee = new_fee_ppm
-                new_fee_ppm = int(new_fee_ppm * scarcity_mult)
-                self.plugin.log(
-                    f"SCARCITY PRICING: {channel_id[:12]}... balance={outbound_ratio:.1%} "
-                    f"(below {cfg.scarcity_threshold:.0%}). Applied {scarcity_mult:.2f}x "
-                    f"({original_fee} -> {new_fee_ppm} PPM)",
-                    level='info'
-                )
+                if is_virgin_remote:
+                    # Virgin Remote Channel: Suppress scarcity pricing to encourage break-in traffic
+                    self.plugin.log(
+                        f"VIRGIN CHANNEL AMNESTY: {channel_id[:12]}... is remote-opened with 0 outbound traffic. "
+                        f"Suppressing Scarcity Pricing to encourage break-in.",
+                        level='info'
+                    )
+                else:
+                    scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
+                    original_fee = new_fee_ppm
+                    new_fee_ppm = int(new_fee_ppm * scarcity_mult)
+                    self.plugin.log(
+                        f"SCARCITY PRICING: {channel_id[:12]}... balance={outbound_ratio:.1%} "
+                        f"(below {cfg.scarcity_threshold:.0%}). Applied {scarcity_mult:.2f}x "
+                        f"({original_fee} -> {new_fee_ppm} PPM)",
+                        level='info'
+                    )
             
             new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
 

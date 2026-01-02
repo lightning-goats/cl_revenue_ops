@@ -183,9 +183,9 @@ class ScarcityState:
 
 | Limitation | Impact | Status |
 |------------|--------|--------|
-| **Virgin Remote Channels** | Remote-opened channels start at 0% local balance, triggering maximum 3x scarcity multiplier before first payment | TODO #12: Virgin Channel Amnesty |
+| **Virgin Remote Channels** | Remote-opened channels start at 0% local balance, triggering maximum 3x scarcity multiplier before first payment | ✅ FIXED: Virgin Channel Amnesty |
 
-> **Mitigation (Planned):** Bypass scarcity pricing for channels where `opener == 'remote'` AND `sats_out == 0`.
+> **Mitigation (Implemented):** Bypass scarcity pricing for channels where `opener == 'remote'` AND `sats_out == 0`.
 
 #### Rebalancer Integration (Trap & Trap Prevention)
 
