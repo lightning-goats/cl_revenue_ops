@@ -288,6 +288,35 @@ class HillClimbingFeeController:
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
     
+    def _prune_stale_states(self, active_channel_ids: set) -> int:
+        """
+        Remove in-memory state for channels that no longer exist.
+        
+        This prevents memory bloat from closed channels over time.
+        Called at the end of adjust_all_fees to clean up orphaned state.
+        
+        Args:
+            active_channel_ids: Set of currently active channel IDs
+            
+        Returns:
+            Number of stale states pruned
+        """
+        pruned = 0
+        
+        # Prune Hill Climbing states
+        stale_keys = [k for k in self._hill_climb_states.keys() if k not in active_channel_ids]
+        for key in stale_keys:
+            del self._hill_climb_states[key]
+            pruned += 1
+        
+        if pruned > 0:
+            self.plugin.log(
+                f"GC: Pruned {pruned} stale Hill Climbing states from closed channels",
+                level='debug'
+            )
+        
+        return pruned
+    
     def adjust_all_fees(self) -> List[FeeAdjustment]:
         """
         Adjust fees for all channels using Hill Climbing optimization.
@@ -359,6 +388,10 @@ class HillClimbingFeeController:
                     
             except Exception as e:
                 self.plugin.log(f"Error adjusting fee for {channel_id}: {e}", level='error')
+        
+        # Garbage Collection: Prune state for closed channels (TODO #18)
+        active_channel_ids = set(channels.keys())
+        self._prune_stale_states(active_channel_ids)
         
         return adjustments
     

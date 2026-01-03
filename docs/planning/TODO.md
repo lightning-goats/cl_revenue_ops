@@ -79,16 +79,11 @@ This document details the implementation steps for the remaining items in the ro
 #### 17. Optimize Database Indexes (Composite Indexing) ✅ COMPLETED
 **Status:** Added composite index `idx_forwards_out_channel_time ON forwards(out_channel, timestamp)` in `modules/database.py` → `initialize()`. Changes query complexity from O(N) to O(log N) for `get_volume_since` calls.
 
-#### 18. Implement In-Memory "Garbage Collection"
-**Context:** The `FeeController` caches state objects (`HillClimbState`, `ScarcityState`) in Python dictionaries. When channels are closed, these objects remain in memory forever, causing a slow memory leak over months of operation.
-**Tasks:**
-1.  **Modify `modules/fee_controller.py`**:
-    - Add method `prune_state(active_channel_ids: Set[str])`.
-    - Iterate `list(self._hill_climb_states.keys())`. If key not in `active_channel_ids`, `del` it.
-    - Call this method at the end of `adjust_all_fees`.
-2.  **Modify `modules/rebalancer.py`**:
-    - Similar logic for `self.source_failure_counts`.
-**Benefit:** Prevents memory bloat and ensures long-term stability without restarts.
+#### 18. Implement In-Memory "Garbage Collection" ✅ COMPLETED
+**Status:** Implemented garbage collection to prevent memory bloat from closed channels.
+- Added `_prune_stale_states()` in `modules/fee_controller.py` - removes orphaned `HillClimbState` entries
+- Added `prune_stale_source_failures()` in `modules/rebalancer.py` (JobManager) - removes orphaned failure counts
+- Both methods called at end of their respective main loops (`adjust_all_fees` and `find_rebalance_candidates`)
 
 #### 19. Switch Flow Analysis to Local DB (The "Double-Dip" Fix)
 **Context:** Currently, `flow_analysis.py` calls the `listforwards` RPC every hour. On established nodes, this returns hundreds of megabytes of JSON, causing CPU spikes and potential Out-Of-Memory crashes. However, we *already* save every forward to our local SQLite DB via the `forward_event` hook.

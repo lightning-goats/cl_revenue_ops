@@ -167,6 +167,32 @@ class JobManager:
         self.source_failure_counts: Dict[str, float] = {}
         self.last_decay_time = time.time()
     
+    def prune_stale_source_failures(self, active_channel_ids: set) -> int:
+        """
+        Remove in-memory failure counts for channels that no longer exist.
+        
+        This prevents memory bloat from closed channels over time.
+        
+        Args:
+            active_channel_ids: Set of currently active channel IDs
+            
+        Returns:
+            Number of stale entries pruned
+        """
+        pruned = 0
+        stale_keys = [k for k in self.source_failure_counts.keys() if k not in active_channel_ids]
+        for key in stale_keys:
+            del self.source_failure_counts[key]
+            pruned += 1
+        
+        if pruned > 0:
+            self.plugin.log(
+                f"GC: Pruned {pruned} stale source failure counts from closed channels",
+                level='debug'
+            )
+        
+        return pruned
+    
     @property
     def active_job_count(self) -> int:
         """Returns the number of currently active jobs."""
@@ -884,6 +910,14 @@ class EVRebalancer:
         finally:
             # Clear ephemeral fee cache at end of run
             self._fee_cache = {}
+            
+            # Garbage Collection: Prune stale source failure counts (TODO #18)
+            try:
+                active_channel_ids = set(channels.keys()) if 'channels' in dir() else set()
+                if active_channel_ids:
+                    self.job_manager.prune_stale_source_failures(active_channel_ids)
+            except Exception:
+                pass  # Don't fail the main method for GC errors
 
     def _analyze_rebalance_ev(self, dest_channel: str, dest_info: Dict[str, Any],
                               dest_ratio: float,
