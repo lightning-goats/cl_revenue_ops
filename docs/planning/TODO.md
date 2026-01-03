@@ -41,19 +41,12 @@ This document details the implementation steps for the remaining items in the ro
 - Safety floor at `rebalance_min_amount` to handle traffic bursts
 - Logs when volume-weighting significantly reduces target (debug level)
 
-#### 15. Implement "Futility" Circuit Breaker
-**Context:** Some channels have positive EV spreads but broken routing paths. Exponential backoff slows down retries, but doesn't stop them. After ~10 failures, the channel is likely a "Dead End" and further attempts waste gossip bandwidth and lock HTLCs.
-**Tasks:**
-1.  **Modify `modules/rebalancer.py`** in `find_rebalance_candidates`:
-    - Retrieve failure stats: `fail_count, last_fail = self.database.get_failure_count(channel_id)`.
-    - **Logic:**
-      ```python
-      # Hard Cap: If failed > 10 times, require 48h cooldown
-      if fail_count > 10:
-          if (now - last_fail) < 172800: # 48 hours
-              self.plugin.log(f"Skipping {channel_id}: Futility Circuit Breaker active ({fail_count} fails)", level='debug')
-              continue
-      ```
+#### 15. Implement "Futility" Circuit Breaker ✅ COMPLETED
+**Status:** Implemented in `modules/rebalancer.py` → `find_rebalance_candidates()`. Channels with >10 consecutive failures are blocked from rebalancing for 48 hours.
+- Retrieves failure stats via `database.get_failure_count(channel_id)`
+- Hard cap: If `fail_count > 10` AND `(now - last_fail) < 48h`, skip candidate
+- Logs cooldown time remaining at debug level
+- When cooldown expires, logs at info level that retry is being allowed
 
 ### 🔧 Architectural Hardening & Optimization (High-Scale Stability)
 

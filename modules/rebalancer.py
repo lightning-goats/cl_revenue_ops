@@ -869,6 +869,34 @@ class EVRebalancer:
                 if self._is_pending_with_backoff(dest_id): 
                     continue
                 
+                # =====================================================================
+                # FUTILITY CIRCUIT BREAKER (TODO #15)
+                # =====================================================================
+                # Some channels have positive EV spreads but broken routing paths.
+                # Exponential backoff slows down retries, but doesn't stop them.
+                # After 10+ failures, the channel is likely a "Dead End" and further
+                # attempts waste gossip bandwidth and lock HTLCs.
+                #
+                # Hard Cap: If failed > 10 times, require 48h cooldown before retry
+                # =====================================================================
+                fail_count, last_fail = self.database.get_failure_count(dest_id)
+                if fail_count > 10:
+                    now = int(time.time())
+                    futility_cooldown = 172800  # 48 hours in seconds
+                    if (now - last_fail) < futility_cooldown:
+                        self.plugin.log(
+                            f"FUTILITY BREAKER: Skipping {dest_id[:12]}... - {fail_count} consecutive failures, "
+                            f"cooldown {(futility_cooldown - (now - last_fail)) // 3600}h remaining",
+                            level='debug'
+                        )
+                        continue
+                    else:
+                        # Cooldown expired - allow retry but log it
+                        self.plugin.log(
+                            f"FUTILITY BREAKER: {dest_id[:12]}... cooldown expired after {fail_count} failures, allowing retry",
+                            level='info'
+                        )
+                
                 # CONGESTION PROTECTION: Skip congested channels as rebalance destinations
                 # Rebalancing into a slot-congested channel can worsen HTLC contention
                 dest_state = self.database.get_channel_state(dest_id)
