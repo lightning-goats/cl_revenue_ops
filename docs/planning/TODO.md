@@ -33,24 +33,13 @@ This document details the implementation steps for the remaining items in the ro
 #### 13. Implement "Orphan Job" Cleanup (Startup Hygiene) ✅ COMPLETED
 **Status:** Implemented `cleanup_orphans()` method in `JobManager` (`modules/rebalancer.py`). Called during `init()` in `cl-revenue-ops.py`. Also added `stop_all_jobs()` call in SIGTERM handler to prevent phantom spending during shutdown.
 
-#### 14. Implement Volume-Weighted Liquidity Targets (Smart Allocation)
-**Context:** Currently, the rebalancer targets fixed ratios (50% for Balanced, 85% for Source). On large channels (e.g., 10M sats) with low volume (e.g., 10k/day), this traps massive amounts of "Lazy Capital" (5M sats) that sits idle.
-**Tasks:**
-1.  **Modify `modules/rebalancer.py`** in `_analyze_rebalance_ev`:
-    - Retrieve flow stats: `state = self.database.get_channel_state(dest_channel)`.
-    - Calculate `daily_volume = (state['sats_in'] + state['sats_out']) / 7` (approx).
-    - **New Target Logic:**
-      ```python
-      # Target 3 days of buffer OR 50% capacity, whichever is LOWER
-      vol_target = daily_volume * 3
-      cap_target = int(capacity * target_ratio) # e.g. 0.5
-      
-      target_spendable = min(cap_target, vol_target)
-      
-      # Safety Floor: Never target less than min_rebalance_amount (e.g. 500k) to handle bursts
-      target_spendable = max(self.config.rebalance_min_amount, target_spendable)
-      ```
-**Benefit:** Frees up idle Bitcoin from slow-moving large channels to be deployed to high-velocity channels, significantly improving Return on Capital (ROC).
+#### 14. Implement Volume-Weighted Liquidity Targets (Smart Allocation) ✅ COMPLETED
+**Status:** Implemented in `modules/rebalancer.py` → `_analyze_rebalance_ev()`. Instead of blindly targeting fixed ratios (50%/85%), now calculates volume-aware targets:
+- Calculates daily volume from 7-day flow stats
+- Volume target = 3 days of buffer (daily_volume × 3)
+- Uses min(cap_target, vol_target) to prevent overfilling slow channels
+- Safety floor at `rebalance_min_amount` to handle traffic bursts
+- Logs when volume-weighting significantly reduces target (debug level)
 
 #### 15. Implement "Futility" Circuit Breaker
 **Context:** Some channels have positive EV spreads but broken routing paths. Exponential backoff slows down retries, but doesn't stop them. After ~10 failures, the channel is likely a "Dead End" and further attempts waste gossip bandwidth and lock HTLCs.

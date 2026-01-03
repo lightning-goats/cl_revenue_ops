@@ -970,7 +970,7 @@ class EVRebalancer:
         capacity = dest_info.get("capacity", 0)
         spendable = dest_info.get("spendable_sats", 0)
         
-        # Dynamic targeting
+        # Dynamic targeting based on flow state
         if dest_flow_state == "source": 
             target_ratio = 0.85
         elif dest_flow_state == "sink": 
@@ -978,7 +978,56 @@ class EVRebalancer:
         else: 
             target_ratio = 0.50
         
-        target_spendable = int(capacity * target_ratio)
+        # =====================================================================
+        # VOLUME-WEIGHTED LIQUIDITY TARGETS (TODO #14 - Smart Allocation)
+        # =====================================================================
+        # Instead of blindly targeting fixed ratios (e.g., 50% for Balanced),
+        # we calculate a volume-aware target:
+        # 1. Velocity: Average daily volume over the last 7 days
+        # 2. Inventory Goal: Enough liquidity for 3 days of flow
+        # 3. Cap: Never exceed capacity * target_ratio (don't overfill)
+        # 4. Floor: Never drop below rebalance_min_amount (burst buffer)
+        #
+        # Benefit: Frees idle Bitcoin from slow-moving large channels to be
+        # deployed to high-velocity channels, improving Return on Capital.
+        # =====================================================================
+        
+        # Get flow stats for volume calculation
+        if dest_state:
+            sats_in = dest_state.get("sats_in", 0)
+            sats_out = dest_state.get("sats_out", 0)
+            # Daily volume is the average of 7-day totals
+            daily_volume = (sats_in + sats_out) / max(self.config.flow_window_days, 1)
+        else:
+            daily_volume = 0
+        
+        # Calculate volume-based target (3 days of buffer)
+        vol_target = int(daily_volume * 3)
+        
+        # Calculate capacity-based target (original logic)
+        cap_target = int(capacity * target_ratio)
+        
+        # Smart Allocation: Use the LOWER of volume target or capacity target
+        # This prevents overfilling slow channels while still allowing fast channels
+        # to be fully stocked
+        if vol_target > 0:
+            target_spendable = min(cap_target, vol_target)
+        else:
+            # No volume data yet - fall back to capacity-based target
+            target_spendable = cap_target
+        
+        # Safety Floor: Never target less than min_rebalance_amount to handle bursts
+        target_spendable = max(self.config.rebalance_min_amount, target_spendable)
+        
+        # Log when volume-weighting reduces target significantly
+        if vol_target > 0 and vol_target < cap_target * 0.8:
+            self.plugin.log(
+                f"SMART ALLOCATION: {dest_channel[:12]}... volume-weighted target "
+                f"{target_spendable:,} sats (vol: {vol_target:,}, cap: {cap_target:,}, "
+                f"daily_vol: {daily_volume:,.0f})",
+                level='debug'
+            )
+        
         amount_needed = target_spendable - spendable
         if amount_needed <= 0: 
             return None
