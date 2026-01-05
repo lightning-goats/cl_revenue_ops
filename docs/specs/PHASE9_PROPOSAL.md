@@ -7,6 +7,7 @@
 | **Architecture** | **Agent-Based Swarm (Distributed State)** |
 | **Authentication** | Public Key Infrastructure (PKI) |
 | **Objective** | Create a self-organizing "Super-Node" from a fleet of independent peers. |
+| **Status** | **DRAFT SPECIFICATION** |
 
 ---
 
@@ -14,35 +15,48 @@
 
 **"The Hive"** is a protocol that allows independent Lightning nodes to function as a single, distributed organism.
 
-Unlike centralized control systems (which introduce single points of failure), The Hive utilizes **Swarm Intelligence**. Each node acts as an autonomous agent: observing the shared state of the fleet, making independent decisions to maximize the fleet's total surface area, and synchronizing actions to prevent resource conflicts.
+The **Liquidity Dividend System (LDS)** was rejected due to regulatory risks (custody of third-party funds) and solvency complexities. The Hive pivots from a "Central Bank" model to a **"Meritocratic Federation"**.
 
-The result is **Virtual Centrality**: A fleet of 5 small nodes (e.g., 2 BTC each) achieves the routing efficiency, fault tolerance, and market dominance of a single 10 BTC whale node.
+Instead of a central controller, The Hive utilizes **Swarm Intelligence**. Each node acts as an autonomous agent: observing the shared state of the fleet, making independent decisions to maximize the fleet's total surface area, and synchronizing actions to prevent resource conflicts.
+
+The result is **Virtual Centrality**: A fleet of 5 small nodes achieves the routing efficiency, fault tolerance, and market dominance of a single massive whale node, while remaining 100% non-custodial and voluntary.
 
 ---
 
-## 2. The Core Loop: Observe, Orient, Decide, Act, Share
+## 2. Strategic Pivot: Solving the LDS Pitfalls
 
-The Hive operates on a continuous OODA loop running locally on every member node.
+| Issue | The LDS Failure Mode | The Hive Solution |
+| :--- | :--- | :--- |
+| **Custody** | **High Risk.** Operator holds keys for LPs. Regulated as Money Transmission. | **Solved.** LPs run their own nodes/keys. The Hive is just a communication protocol between them. |
+| **Liability** | **High.** If the central node is hacked, all LP funds are lost. | **Solved.** Funds are distributed. A hack on one node does not compromise the others. |
+| **Solvency** | **Fragile.** "Runs on the bank" could lock up the central node. | **Robust.** There is no central bank. Nodes trade liquidity bilaterally via standard Lightning channels. |
+| **Regulation** | **Security.** "Investment contract" via pooled profits. | **Trade Agreement.** "Preferential Routing" between independent peers. |
 
-### 2.1 Observe (Gossip State)
+---
+
+## 3. The Core Loop: Observe, Orient, Decide, Act, Share
+
+The Hive operates on a continuous OODA loop running locally on every member node. There is no central server.
+
+### 3.1 Observe (Gossip State)
 Nodes broadcast compressed heartbeat messages via Custom Messages (BOLT 8 encrypted).
 *   **Topology:** "I am connected to [Binance, River, ACINQ]."
-*   **Liquidity:** "I have 50M sats outbound capacity."
+*   **Liquidity:** "I have 50M sats outbound capacity available."
 *   **Reputation:** "Peer X is toxic (high failure rate)."
 *   **Opportunities:** "Peer Y is high-yield (hidden gem)."
 
-### 2.2 Orient (Global Context)
+### 3.2 Orient (Global Context)
 Before taking action, a node contextualizes its local view against the Hive's state.
 *   *Local View:* "I should open a channel to Binance."
 *   *Hive View:* "Node A already has 10 BTC to Binance. The fleet is saturated."
 *   *Adjustment:* "I will `clboss-ignore` Binance to prevent capital duplication."
 
-### 2.3 Decide (Autonomous Optimization)
-The node calculates the highest-value action for the **Fleet**, not just itself.
+### 3.3 Decide (Autonomous Optimization)
+The node calculates the highest-value action for itself and the Fleet.
 *   **Surface Area Expansion:** "The Hive has 0 connections to Kraken. I have spare capital. I will connect to Kraken."
 *   **Load Balancing:** "Node A is empty. I am full. I will push liquidity to Node A."
 
-### 2.4 Act & Share (Conflict Resolution)
+### 3.4 Act & Share (Conflict Resolution)
 The node executes the action and **immediately** broadcasts a "Lock" message.
 *   **Action:** `fundchannel` to Kraken.
 *   **Broadcast:** `HIVE_ACTION: OPENING [Kraken_Pubkey]`.
@@ -50,75 +64,91 @@ The node executes the action and **immediately** broadcasts a "Lock" message.
 
 ---
 
-## 3. Alpha Capabilities (The "Unfair Advantages")
+## 4. Alpha Capabilities (The "Unfair Advantages")
 
-### 3.1 Coordinated Graph Mapping (Strategic Coverage)
-**The Problem:** Uncoordinated nodes overlap. If 5 fleet nodes all connect to the same 3 hubs, they compete with each other and miss 99% of the network.
-**The Hive Solution:** **Maximum Unique Coverage.**
-*   The Hive incentivizes nodes to capture *unique* routing corridors.
-*   If Node A holds the "Western Hubs" and Node B holds the "Eastern Hubs," the fleet captures flows moving East-West that neither could capture alone.
-
-### 3.2 Virtual Centrality (Zero-Cost Teleportation)
+### 4.1 Zero-Cost Capital Teleportation
 **The Mechanism:** Fleet members whitelist each other for **0-Fee Routing**.
-**The Result:**
-1.  Payment arrives at **Node A** destined for **Peer Z**.
-2.  Node A has no channel to Peer Z.
-3.  Node A sees **Node B** *does* have a channel to Peer Z.
-4.  Node A wraps the payment and routes `A -> B -> Z` with 0 internal fees.
-5.  **External View:** The sender sees a successful route. The network graph interprets The Hive as having high centrality.
+**The Result:** Capital becomes "super-fluid." Liquidity can instantly move to whichever node has the highest demand without friction cost.
 
-### 3.3 The "Borg" Defense (Distributed Immunity)
-**The Mechanism:** Shared `ignored_peers` list.
-*   If Node A detects a "Dust Attack" or "HTLC Jamming" from Peer X, it broadcasts a **Signed Ban**.
-*   Nodes B, C, and D immediately add Peer X to their `revenue-ignore` list.
-*   **Result:** The attacker is firewalled from the entire fleet instantly.
+### 4.2 Inventory Load Balancing ("Push" Rebalancing)
+**The Mechanism:** Proactive "Push." Node A (Surplus) proactively routes funds to Node B (Deficit) *before* Node B runs dry.
+**The Result:** Zero downtime for high-demand channels.
+
+### 4.3 The "Borg" Defense (Distributed Immunity)
+**The Mechanism:** Shared `ignored_peers` list. If Node A detects a "Dust Attack" from Peer X, it broadcasts a **Signed Ban**. All Hive members immediately blacklist Peer X.
+
+### 4.4 Coordinated Graph Mapping
+**The Mechanism:** The Hive Planner. The fleet intelligently spreads out connections to maximize unique destination coverage, rather than overlapping on the same few hubs.
 
 ---
 
-## 4. Protocol Architecture: PKI & Manifests
+## 5. Governance Modes: The Decision Engine
+
+The Hive identifies opportunities, but the **execution** is governed by a configurable Decision Engine. This supports a hybrid fleet of manual operators, automated bots, and AI agents.
+
+### 5.1 Mode A: Advisor (Default)
+**"Human in the Loop"**
+*   **Behavior:** The Hive calculates the optimal move but **does not execute it**.
+*   **Action:** Records proposal. Triggers notification (Webhook). Operator approves via RPC.
+
+### 5.2 Mode B: Autonomous (The Swarm)
+**"Algorithmic Execution"**
+*   **Behavior:** The node executes the action immediately, provided it passes strict **Safety Constraints** (Budget Caps, Rate Limits, Confidence Thresholds).
+
+### 5.3 Mode C: Oracle (AI / External API)
+**"The Quant Strategy"**
+*   **Behavior:** The node delegates the final decision to an external intelligence.
+*   **Flow:** Node sends a `Decision Packet` (JSON) to a configured API endpoint (e.g., an LLM or ML model). The API replies `APPROVE` or `DENY`.
+
+---
+
+## 6. Protocol Architecture: PKI & Manifests
 
 To ensure the "Organism" is not infected by rogue nodes, membership is strictly controlled via **Signed Manifests**.
 
-### 4.1 The Handshake
-1.  **Invitation:** An Admin Node generates a time-limited `Hive Ticket` (signed blob).
-2.  **Connection:** Candidate connects to Member.
-3.  **Attestation:** Candidate sends `HIVE_HELLO` with the Ticket and a **Manifest** proving it meets technical requirements (e.g., "Splicing Enabled", "v1.4+").
-4.  **Verification:** Member verifies signatures and runs an **Active Probe** (test operation) to verify capabilities.
-5.  **Assimilation:** If valid, the Candidate receives the current Hive State Map.
+### 6.1 The "Hive Ticket" (The Invitation)
+An Admin Node generates a time-limited, cryptographically signed token.
+`lightning-cli revenue-hive-invite --valid-hours=24 --req-splice`
 
-### 4.2 Deterministic Conflict Resolution
-If Node A and Node B decide to open a channel to the same target at the exact same millisecond:
-*   **Rule:** Lowest Lexicographical Pubkey wins.
-*   **Result:** The loser backs off automatically. No central coordinator required.
+### 6.2 The Handshake & Certification Flow
+1.  **Connection:** Candidate Node connects to Member Node.
+2.  **Attestation:** Candidate sends `HIVE_HELLO` with the Ticket and a **Manifest** proving it meets technical requirements (e.g., "Splicing Enabled", "v1.4+").
+3.  **Verification:** Member verifies signatures and runs an **Active Probe** (test operation) to verify capabilities.
+4.  **Adoption:** If certified, the Candidate is added to the local `fleet_nodes` database.
 
 ---
 
-## 5. Implementation Roadmap
+## 7. The Evolutionary Marketplace (Meritocracy)
 
-### Phase 9.1: The Nervous System (Messaging)
-*   Implement `sendcustommsg` infrastructure.
-*   Implement the PKI Handshake (`revenue-hive-invite`, `revenue-hive-join`).
+The Hive is not a "Central Command." It is a **Federation**. Individual nodes compete to find the best strategies and share them for mutual benefit.
 
-### Phase 9.2: The Brain (Shared State)
-*   Implement `HIVE_STATE` gossip.
-*   Build the in-memory `HiveMap` (Who connects to whom).
+### 7.1 Hive Reputation
+Reputation is algorithmic, not social.
+*   **Metric:** `Contribution Ratio = Liquidity_Provided_To_Fleet / Liquidity_Consumed_From_Fleet`.
+*   **Effect:** Nodes that hoard liquidity (Leeches) see their reputation drop. Low reputation nodes receive fewer "Alpha" broadcasts and lower priority for 0-fee rebalances.
 
-### Phase 9.3: The Limbs (Coordinated Action)
-*   Implement **Anti-Overlap:** `clboss-ignore` logic based on Hive Map.
-*   Implement **Internal Routing:** 0-Fee logic for fleet members.
+### 7.2 Strategy Gossip (The Learning Engine)
+When a node finds a winning strategy (e.g., "High Yield on Peer Z"), it shares it via `HIVE_STRATEGY_GOSSIP`.
+*   **Anti-Fratricide:** To prevent the fleet from cannibalizing the winner's profits immediately, the broadcast is **Time-Delayed** (e.g., 24 hours). The discoverer gets exclusivity on the Alpha before sharing.
+*   **Verification:** Nodes cryptographically sign their yield reports. Lying about yield results in an immediate Ban.
+
+### 7.3 Voluntary Exit (The Safety Valve)
+**Core Principle:** All interactions are voluntary.
+*   **Non-Custodial:** `cl-revenue-ops` never holds keys.
+*   **Exit:** An operator can disable the plugin or leave the Hive at any time. Their funds (channels) remain theirs. There is no "Lock-up period."
 
 ---
 
-## 6. Risk Mitigation
+## 8. Implementation Roadmap
 
-| Risk | Mitigation |
-|------|------------|
-| **Sybil Attack** | PKI Handshake makes it mathematically impossible to join without a signed ticket. |
-| **Bad Data** | Local nodes treat external data as *signals*, not commands. Local safety floors (`min_fee`) always override Hive suggestions. |
-| **Privacy** | All custom messages travel over BOLT 8 (Encrypted & Authenticated). Only direct peers can read the Hive traffic. |
+| Phase | Component | Focus |
+|-------|-----------|-------|
+| **9.1** | **The Nervous System** | `sendcustommsg` infrastructure, PKI Handshake (`invite`/`join`), Manifest verification. |
+| **9.2** | **The Brain** | `HIVE_STATE` gossip, Shared State Map, `revenue-ignore` synchronization. |
+| **9.3** | **The Limbs** | Coordinated Rebalancing (0-Fee), Anti-Overlap Logic (`clboss` integration). |
+| **9.4** | **The Mind** | Decision Engine (Advisor/Oracle modes), Reputation scoring. |
 
 ---
 
 *Specification Author: Lightning Goats Team*  
-*Architecture: Distributed Agent Model*  
-*Status: Proposal*
+*Architecture: Distributed Agent Model*
