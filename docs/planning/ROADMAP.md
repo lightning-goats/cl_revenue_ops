@@ -183,20 +183,40 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - JSON output: TLV, Margins, ROC, and Warnings (Bleeders list).
 
 ## Phase 9: "The Hive" (External Integration)
-*Status: IN PROGRESS*
+*Status: IN PROGRESS — Implementation Plan Approved*
 
 The distributed fleet coordination logic has been decoupled into a standalone plugin to improve modularity and security.
 
 *   **Repository:** `cl-hive`
+*   **Implementation Plan:** [`cl-hive/docs/planning/IMPLEMENTATION_PLAN.md`](../../../cl-hive/docs/planning/IMPLEMENTATION_PLAN.md)
 *   **Goal:** Provide API hooks in `cl-revenue-ops` to accept signals from `cl-hive` regarding whitelist fees and rebalance priorities.
 
-### v1.4.0: Hive Foundation ✅ COMPLETED
+### v1.4.0: Hive Foundation (cl-revenue-ops side) ✅ COMPLETED
 
 - [x] **Strategic Rebalance Exemption (Zero-Fee Paradox Fix)**:
     - Allow "negative EV" rebalances for Hive peers to facilitate inventory load balancing.
     - New config: `hive_fee_ppm` (default: 0), `hive_rebalance_tolerance` (default: 50 sats).
     - Rebalancer checks destination policy; Hive peers allow loss up to tolerance.
     - Solves: Hive members at 0 PPM were blocked from ALL rebalances due to `expected_income = 0`.
+
+- [x] **Policy-Driven Architecture (Hive Integration Point)**:
+    - `revenue-policy set <peer_id> strategy=hive` — cl-hive uses this to mark fleet members.
+    - `FeeStrategy.HIVE` enforces 0 PPM fees and enables Strategic Exemption.
+    - Supersedes the original "Hive Signal API Hooks" design.
+
+### cl-hive Plugin (Standalone) — IN DEVELOPMENT
+
+*See [`IMPLEMENTATION_PLAN.md`](../../../cl-hive/docs/planning/IMPLEMENTATION_PLAN.md) for detailed phases.*
+
+- [ ] **Phase 0:** Plugin skeleton, database schema, config.
+- [ ] **Phase 1:** BOLT 8 protocol layer (custom messages, PKI handshake).
+- [ ] **Phase 2:** State management (HiveMap, Anti-Entropy sync).
+- [ ] **Phase 3:** Intent Lock Protocol (deterministic conflict resolution).
+- [ ] **Phase 4:** Integration Bridge (Paranoid) — calls `revenue-policy` API.
+- [ ] **Phase 5:** Governance & Membership (two-tier system, Proof of Utility).
+- [ ] **Phase 6:** Hive Planner (topology optimization, saturation analysis).
+- [ ] **Phase 7:** Governance Modes (Advisor, Autonomous, Oracle).
+- [ ] **Phase 8:** RPC Commands (`hive-status`, `hive-join`, `hive-topology`, etc.).
 
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*

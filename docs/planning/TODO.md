@@ -204,11 +204,13 @@ This document details the implementation steps for the remaining items in the ro
 
 ---
 
-## Phase 9: "The Hive" (External Integration) — MOVED
+## Phase 9: "The Hive" (External Integration) — IN DEVELOPMENT
 
-**Status:** Decoupled to standalone plugin.
+**Status:** Implementation Plan Approved (Red Team Hardened).
 
 **Repository:** `cl-hive`
+
+**Implementation Plan:** See [`cl-hive/docs/planning/IMPLEMENTATION_PLAN.md`](../../../cl-hive/docs/planning/IMPLEMENTATION_PLAN.md)
 
 **Integration Points (for `cl-revenue-ops`):**
 
