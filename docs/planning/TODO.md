@@ -201,3 +201,26 @@ This document details the implementation steps for the remaining items in the ro
     - Register `revenue-dashboard` command.
     - Aggregate data from `profitability_analyzer` and `database`.
     - Format JSON output containing TLV, Margins, ROC, and Warnings (Bleeders).
+
+---
+
+## Phase 9: "The Hive" (External Integration) — MOVED
+
+**Status:** Decoupled to standalone plugin.
+
+**Repository:** `cl-hive`
+
+**Integration Points (for `cl-revenue-ops`):**
+
+#### 29. Implement Hive Signal API Hooks
+**Context:** Allow `cl-hive` to send fee and rebalance priority signals to this plugin.
+**Tasks:**
+1.  **Modify `modules/fee_controller.py`**:
+    - Add `set_hive_fee_override(channel_id, fee_ppm, ttl)` method.
+    - Priority: Hive override > Alpha Sequence (if within TTL).
+2.  **Modify `modules/rebalancer.py`**:
+    - Add `set_hive_priority(channel_id, priority_score)` method.
+    - Boost candidate scoring for Hive-prioritized channels.
+3.  **Modify `cl-revenue-ops.py`**:
+    - Register `revenue-hive-signal` RPC for `cl-hive` to call.
+    - Validate signatures/authentication if cross-node communication is used.

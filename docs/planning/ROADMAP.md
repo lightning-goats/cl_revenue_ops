@@ -182,6 +182,14 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - Single command for operator to check node financial health.
     - JSON output: TLV, Margins, ROC, and Warnings (Bleeders list).
 
+## Phase 9: "The Hive" (External Integration)
+*Status: MOVED*
+
+The distributed fleet coordination logic has been decoupled into a standalone plugin to improve modularity and security.
+
+*   **Repository:** `cl-hive`
+*   **Goal:** Provide API hooks in `cl-revenue-ops` to accept signals from `cl-hive` regarding whitelist fees and rebalance priorities.
+
 ---
 *Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*
-*Roadmap updated: January 3, 2026*
+*Roadmap updated: January 5, 2026*
