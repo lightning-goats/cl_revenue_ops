@@ -43,6 +43,7 @@ from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
 from .metrics import PrometheusExporter, MetricNames, METRIC_HELP
+from .policy_manager import PolicyManager, FeeStrategy
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -262,6 +263,7 @@ class HillClimbingFeeController:
     
     def __init__(self, plugin: Plugin, config: Config, database: Database, 
                  clboss_manager: ClbossManager,
+                 policy_manager: Optional[PolicyManager] = None,
                  profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
                  metrics_exporter: Optional[PrometheusExporter] = None):
         """
@@ -272,6 +274,7 @@ class HillClimbingFeeController:
             config: Configuration object
             database: Database instance
             clboss_manager: ClbossManager for handling overrides
+            policy_manager: Optional PolicyManager for peer-level fee policies
             profitability_analyzer: Optional profitability analyzer for ROI-based adjustments
             metrics_exporter: Optional Prometheus metrics exporter for observability
         """
@@ -279,6 +282,7 @@ class HillClimbingFeeController:
         self.config = config
         self.database = database
         self.clboss = clboss_manager
+        self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
         self.metrics = metrics_exporter
         
@@ -365,9 +369,60 @@ class HillClimbingFeeController:
             if not channel_id or not peer_id:
                 continue
             
-            # Skip ignored peers (Blacklist)
-            if self.database.is_peer_ignored(peer_id):
-                continue
+            # Check policy for this peer (v1.4: Policy-Driven Architecture)
+            if self.policy_manager:
+                policy = self.policy_manager.get_policy(peer_id)
+                
+                # Skip PASSIVE strategy (equivalent to old is_peer_ignored)
+                if policy.strategy == FeeStrategy.PASSIVE:
+                    continue
+                
+                # Handle STATIC strategy: apply fixed fee
+                if policy.strategy == FeeStrategy.STATIC and policy.fee_ppm_target is not None:
+                    channel_info = channels.get(channel_id)
+                    if channel_info:
+                        current_fee = channel_info.get("fee_proportional_millionths", 0)
+                        if current_fee != policy.fee_ppm_target:
+                            try:
+                                self._set_channel_fee(channel_id, policy.fee_ppm_target, current_fee)
+                                adjustments.append(FeeAdjustment(
+                                    channel_id=channel_id,
+                                    peer_id=peer_id,
+                                    old_fee_ppm=current_fee,
+                                    new_fee_ppm=policy.fee_ppm_target,
+                                    reason="Policy: STATIC fee override",
+                                    hill_climb_values={"policy": "static"}
+                                ))
+                            except Exception as e:
+                                self.plugin.log(f"Error setting static fee for {channel_id}: {e}", level='error')
+                    continue
+                
+                # Handle HIVE strategy: set low/zero fee (cl-hive fleet member)
+                if policy.strategy == FeeStrategy.HIVE:
+                    channel_info = channels.get(channel_id)
+                    if channel_info:
+                        hive_fee = getattr(self.config, 'hive_fee_ppm', 0)  # Default 0 PPM for Hive
+                        current_fee = channel_info.get("fee_proportional_millionths", 0)
+                        if current_fee != hive_fee:
+                            try:
+                                self._set_channel_fee(channel_id, hive_fee, current_fee)
+                                adjustments.append(FeeAdjustment(
+                                    channel_id=channel_id,
+                                    peer_id=peer_id,
+                                    old_fee_ppm=current_fee,
+                                    new_fee_ppm=hive_fee,
+                                    reason="Policy: HIVE fleet member",
+                                    hill_climb_values={"policy": "hive"}
+                                ))
+                            except Exception as e:
+                                self.plugin.log(f"Error setting hive fee for {channel_id}: {e}", level='error')
+                    continue
+                
+                # DYNAMIC strategy continues to normal Hill Climbing below
+            else:
+                # Legacy fallback: check is_peer_ignored
+                if self.database.is_peer_ignored(peer_id):
+                    continue
             
             # Get channel info
             channel_info = channels.get(channel_id)

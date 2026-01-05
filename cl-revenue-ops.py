@@ -52,6 +52,7 @@ from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
 from modules.metrics import PrometheusExporter, MetricNames, METRIC_HELP
+from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
 
 # Initialize the plugin
 plugin = Plugin()
@@ -157,6 +158,7 @@ profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
 capacity_planner: Optional[CapacityPlanner] = None
 metrics_exporter: Optional[PrometheusExporter] = None
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
+policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
@@ -347,7 +349,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     4. Set up timers for periodic execution
     5. Start Prometheus metrics exporter (if enabled)
     """
-    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, metrics_exporter, safe_plugin
+    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, metrics_exporter, safe_plugin, policy_manager
     
     plugin.log("Initializing cl-revenue-ops plugin...")
     
@@ -539,14 +541,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize clboss manager (handles unmanage commands)
     clboss_manager = ClbossManager(safe_plugin, config)
     
+    # Initialize policy manager (v1.4: Policy-Driven Architecture)
+    policy_manager = PolicyManager(database, safe_plugin)
+    plugin.log("PolicyManager initialized for peer-level fee/rebalance policies")
+    
     # Initialize profitability analyzer (with metrics exporter)
     profitability_analyzer = ChannelProfitabilityAnalyzer(safe_plugin, config, database, metrics_exporter)
     
     # Initialize analysis modules with profitability analyzer and metrics exporter
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
     capacity_planner = CapacityPlanner(safe_plugin, config, profitability_analyzer, flow_analyzer)
-    fee_controller = PIDFeeController(safe_plugin, config, database, clboss_manager, profitability_analyzer, metrics_exporter)
-    rebalancer = EVRebalancer(safe_plugin, config, database, clboss_manager, metrics_exporter)
+    fee_controller = PIDFeeController(safe_plugin, config, database, clboss_manager, policy_manager, profitability_analyzer, metrics_exporter)
+    rebalancer = EVRebalancer(safe_plugin, config, database, clboss_manager, policy_manager, metrics_exporter)
     rebalancer.set_profitability_analyzer(profitability_analyzer)
     
     # Set up periodic background tasks using threading
@@ -1140,52 +1146,347 @@ def revenue_remanage(plugin: Plugin, peer_id: str, tag: Optional[str] = None) ->
 @plugin.method("revenue-ignore")
 def revenue_ignore(plugin: Plugin, peer_id: str, reason: str = "manual") -> Dict[str, Any]:
     """
+    DEPRECATED: Use 'revenue-policy set <peer_id> strategy=passive rebalance=disabled' instead.
+    
     Stop cl-revenue-ops from managing this peer (fees or rebalancing).
     
     Usage: lightning-cli revenue-ignore peer_id [reason]
     """
-    if database is None:
+    if policy_manager is None:
         return {"error": "Plugin not initialized"}
     
-    database.add_ignored_peer(peer_id, reason)
-    return {
-        "status": "success",
-        "action": "ignore",
-        "peer_id": peer_id,
-        "reason": reason,
-        "message": f"Peer {peer_id} added to ignore list. cl-revenue-ops will no longer manage fees or rebalancing for this peer."
-    }
+    plugin.log(
+        f"DEPRECATED: revenue-ignore is deprecated. Use 'revenue-policy set {peer_id} "
+        f"strategy=passive rebalance=disabled' instead.",
+        level='warn'
+    )
+    
+    # Map to new policy system: passive strategy + disabled rebalancing
+    try:
+        policy = policy_manager.set_policy(
+            peer_id=peer_id,
+            strategy="passive",
+            rebalance_mode="disabled",
+            tags=["ignored", reason] if reason != "ignored" else ["ignored"]
+        )
+        return {
+            "status": "success",
+            "action": "ignore",
+            "peer_id": peer_id,
+            "reason": reason,
+            "message": f"Peer {peer_id} set to passive strategy with rebalancing disabled.",
+            "warning": "DEPRECATED: Use 'revenue-policy set' instead."
+        }
+    except ValueError as e:
+        return {"status": "error", "error": str(e)}
 
 
 @plugin.method("revenue-unignore")
 def revenue_unignore(plugin: Plugin, peer_id: str) -> Dict[str, Any]:
     """
+    DEPRECATED: Use 'revenue-policy delete <peer_id>' instead.
+    
     Resume cl-revenue-ops management for this peer.
     
     Usage: lightning-cli revenue-unignore peer_id
     """
-    if database is None:
+    if policy_manager is None:
         return {"error": "Plugin not initialized"}
     
-    database.remove_ignored_peer(peer_id)
+    plugin.log(
+        f"DEPRECATED: revenue-unignore is deprecated. Use 'revenue-policy delete {peer_id}' instead.",
+        level='warn'
+    )
+    
+    # Map to new policy system: delete policy (reverts to defaults)
+    deleted = policy_manager.delete_policy(peer_id)
     return {
         "status": "success",
         "action": "unignore",
         "peer_id": peer_id,
-        "message": f"Peer {peer_id} removed from ignore list."
+        "message": f"Peer {peer_id} reverted to default policy (dynamic strategy, rebalancing enabled).",
+        "warning": "DEPRECATED: Use 'revenue-policy delete' instead."
     }
 
 
 @plugin.method("revenue-list-ignored")
 def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
     """
+    DEPRECATED: Use 'revenue-policy list' or 'revenue-report policies' instead.
+    
     List all peers currently ignored by cl-revenue-ops.
     """
-    if database is None:
+    if policy_manager is None:
         return {"error": "Plugin not initialized"}
     
-    ignored = database.get_ignored_peers()
-    return {"ignored_peers": ignored, "count": len(ignored)}
+    plugin.log(
+        "DEPRECATED: revenue-list-ignored is deprecated. Use 'revenue-policy list' instead.",
+        level='warn'
+    )
+    
+    # Find all peers with passive strategy and disabled rebalancing (equivalent to "ignored")
+    all_policies = policy_manager.get_all_policies()
+    ignored = []
+    for p in all_policies:
+        if p.strategy == FeeStrategy.PASSIVE and p.rebalance_mode == RebalanceMode.DISABLED:
+            ignored.append({
+                "peer_id": p.peer_id,
+                "reason": next((t for t in p.tags if t != "ignored"), "manual"),
+                "ignored_at": p.updated_at
+            })
+    
+    return {
+        "ignored_peers": ignored,
+        "count": len(ignored),
+        "warning": "DEPRECATED: Use 'revenue-policy list' instead."
+    }
+
+
+
+# =============================================================================
+# POLICY MANAGEMENT (v1.4: Policy-Driven Architecture)
+# =============================================================================
+
+@plugin.method("revenue-policy")
+def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
+                   strategy: str = None, rebalance: str = None,
+                   fee_ppm: int = None, tag: str = None) -> Dict[str, Any]:
+    """
+    Manage peer-level fee and rebalance policies (v1.4 API).
+    
+    Usage:
+      lightning-cli revenue-policy list                           # List all policies
+      lightning-cli revenue-policy get <peer_id>                  # Get policy for peer
+      lightning-cli revenue-policy set <peer_id> [options]        # Set/update policy
+      lightning-cli revenue-policy delete <peer_id>               # Delete policy (revert to defaults)
+      lightning-cli revenue-policy tag <peer_id> <tag>            # Add tag to peer
+      lightning-cli revenue-policy untag <peer_id> <tag>          # Remove tag from peer
+      lightning-cli revenue-policy find <tag>                     # Find peers by tag
+    
+    Options for 'set':
+      strategy=dynamic|static|hive|passive   Fee control strategy
+      rebalance=enabled|disabled|source_only|sink_only   Rebalance mode
+      fee_ppm=N   Target fee for static strategy (required if strategy=static)
+    
+    Strategies:
+      dynamic  - Hill Climbing + Scarcity Pricing (default)
+      static   - Fixed fee (requires fee_ppm)
+      hive     - Zero/low fee for fleet members (cl-hive integration)
+      passive  - Do not manage (CLBOSS/manual control)
+    
+    Rebalance Modes:
+      enabled     - Full rebalancing allowed (default)
+      disabled    - No rebalancing (equivalent to old 'ignore')
+      source_only - Can drain from, cannot fill
+      sink_only   - Can fill, cannot drain from
+    
+    Examples:
+      lightning-cli revenue-policy set 02abc... strategy=static fee_ppm=500
+      lightning-cli revenue-policy set 02abc... strategy=passive rebalance=disabled
+      lightning-cli revenue-policy tag 02abc... whale
+    """
+    if policy_manager is None:
+        return {"error": "Plugin not initialized"}
+    
+    try:
+        if action == "list":
+            policies = policy_manager.get_all_policies()
+            return {
+                "policies": [p.to_dict() for p in policies],
+                "count": len(policies)
+            }
+        
+        elif action == "get":
+            if not peer_id:
+                return {"error": "Usage: revenue-policy get <peer_id>"}
+            policy = policy_manager.get_policy(peer_id)
+            return {"policy": policy.to_dict()}
+        
+        elif action == "set":
+            if not peer_id:
+                return {"error": "Usage: revenue-policy set <peer_id> [strategy=X] [rebalance=X] [fee_ppm=N]"}
+            
+            # Set policy with provided options
+            policy = policy_manager.set_policy(
+                peer_id=peer_id,
+                strategy=strategy,
+                rebalance_mode=rebalance,
+                fee_ppm_target=fee_ppm
+            )
+            
+            return {
+                "status": "success",
+                "policy": policy.to_dict(),
+                "message": f"Policy updated for peer {peer_id[:12]}..."
+            }
+        
+        elif action == "delete":
+            if not peer_id:
+                return {"error": "Usage: revenue-policy delete <peer_id>"}
+            deleted = policy_manager.delete_policy(peer_id)
+            if deleted:
+                return {
+                    "status": "success",
+                    "peer_id": peer_id,
+                    "message": "Policy deleted, peer reverted to defaults (dynamic strategy, rebalancing enabled)"
+                }
+            return {"status": "noop", "message": "No policy existed for this peer"}
+        
+        elif action == "tag":
+            if not peer_id or not tag:
+                return {"error": "Usage: revenue-policy tag <peer_id> <tag>"}
+            policy = policy_manager.add_tag(peer_id, tag)
+            return {
+                "status": "success",
+                "peer_id": peer_id,
+                "tags": policy.tags
+            }
+        
+        elif action == "untag":
+            if not peer_id or not tag:
+                return {"error": "Usage: revenue-policy untag <peer_id> <tag>"}
+            policy = policy_manager.remove_tag(peer_id, tag)
+            return {
+                "status": "success",
+                "peer_id": peer_id,
+                "tags": policy.tags
+            }
+        
+        elif action == "find":
+            if not tag:
+                return {"error": "Usage: revenue-policy find <tag>"}
+            policies = policy_manager.get_peers_by_tag(tag)
+            return {
+                "peers": [p.to_dict() for p in policies],
+                "count": len(policies),
+                "tag": tag
+            }
+        
+        else:
+            return {"error": f"Unknown action: {action}. Use 'list', 'get', 'set', 'delete', 'tag', 'untag', or 'find'"}
+    
+    except ValueError as e:
+        return {"status": "error", "error": str(e)}
+    except Exception as e:
+        return {"status": "error", "error": f"Unexpected error: {e}"}
+
+
+@plugin.method("revenue-report")
+def revenue_report(plugin: Plugin, report_type: str = "summary",
+                   peer_id: str = None) -> Dict[str, Any]:
+    """
+    Generate reports for node financial health and peer status (v1.4 API).
+    
+    Usage:
+      lightning-cli revenue-report                    # Summary report
+      lightning-cli revenue-report summary            # Same as above
+      lightning-cli revenue-report peer <peer_id>    # Detailed peer report
+      lightning-cli revenue-report hive              # List hive fleet members
+      lightning-cli revenue-report policies          # Policy distribution stats
+    
+    Report Types:
+      summary   - Overall node P&L, active channels, warnings
+      peer      - Specific peer metrics (profitability, flow, policy)
+      hive      - List of peers with HIVE strategy (for cl-hive)
+      policies  - Statistics on policy distribution
+    """
+    if database is None or policy_manager is None:
+        return {"error": "Plugin not initialized"}
+    
+    try:
+        if report_type == "summary":
+            # Basic summary - expand with Phase 8 P&L when available
+            all_policies = policy_manager.get_all_policies()
+            
+            strategy_counts = {}
+            rebalance_counts = {}
+            for p in all_policies:
+                s = p.strategy.value
+                r = p.rebalance_mode.value
+                strategy_counts[s] = strategy_counts.get(s, 0) + 1
+                rebalance_counts[r] = rebalance_counts.get(r, 0) + 1
+            
+            return {
+                "type": "summary",
+                "policies": {
+                    "total": len(all_policies),
+                    "by_strategy": strategy_counts,
+                    "by_rebalance_mode": rebalance_counts
+                },
+                "generated_at": int(time.time())
+            }
+        
+        elif report_type == "peer":
+            if not peer_id:
+                return {"error": "Usage: revenue-report peer <peer_id>"}
+            
+            # Get policy
+            policy = policy_manager.get_policy(peer_id)
+            
+            # Get profitability if available
+            prof_data = None
+            if profitability_analyzer:
+                prof_data = profitability_analyzer.get_profitability_by_peer(peer_id)
+            
+            # Get flow state
+            flow_state = None
+            if database:
+                states = database.get_all_channel_states()
+                for s in states:
+                    if s.get("peer_id") == peer_id:
+                        flow_state = s
+                        break
+            
+            return {
+                "type": "peer",
+                "peer_id": peer_id,
+                "policy": policy.to_dict(),
+                "profitability": prof_data.to_dict() if prof_data else None,
+                "flow_state": flow_state
+            }
+        
+        elif report_type == "hive":
+            # List all hive members (for cl-hive integration)
+            hive_peers = policy_manager.get_peers_by_strategy(FeeStrategy.HIVE)
+            return {
+                "type": "hive",
+                "peers": [p.to_dict() for p in hive_peers],
+                "count": len(hive_peers)
+            }
+        
+        elif report_type == "policies":
+            all_policies = policy_manager.get_all_policies()
+            
+            by_strategy = {}
+            by_mode = {}
+            by_tag = {}
+            
+            for p in all_policies:
+                # Count by strategy
+                s = p.strategy.value
+                by_strategy[s] = by_strategy.get(s, 0) + 1
+                
+                # Count by mode
+                m = p.rebalance_mode.value
+                by_mode[m] = by_mode.get(m, 0) + 1
+                
+                # Count by tag
+                for t in p.tags:
+                    by_tag[t] = by_tag.get(t, 0) + 1
+            
+            return {
+                "type": "policies",
+                "total": len(all_policies),
+                "by_strategy": by_strategy,
+                "by_rebalance_mode": by_mode,
+                "by_tag": by_tag
+            }
+        
+        else:
+            return {"error": f"Unknown report type: {report_type}. Use 'summary', 'peer', 'hive', or 'policies'"}
+    
+    except Exception as e:
+        return {"status": "error", "error": f"Report generation failed: {e}"}
 
 
 @plugin.method("revenue-config")

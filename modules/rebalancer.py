@@ -30,6 +30,7 @@ from .config import Config
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
 from .metrics import PrometheusExporter, MetricNames, METRIC_HELP
+from .policy_manager import PolicyManager, RebalanceMode
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -740,11 +741,13 @@ class EVRebalancer:
     
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
+                 policy_manager: Optional[PolicyManager] = None,
                  metrics_exporter: Optional[PrometheusExporter] = None):
         self.plugin = plugin
         self.config = config
         self.database = database
         self.clboss = clboss_manager
+        self.policy_manager = policy_manager
         self.metrics = metrics_exporter
         self._pending: Dict[str, int] = {}
         self._our_node_id: Optional[str] = None
@@ -830,10 +833,16 @@ class EVRebalancer:
                 if capacity == 0: 
                     continue
                 
-                # Skip ignored peers (Blacklist)
+                # Check policy for this peer (v1.4: Policy-Driven Architecture)
                 peer_id = info.get("peer_id")
-                if peer_id and self.database.is_peer_ignored(peer_id):
-                    continue
+                if peer_id:
+                    if self.policy_manager:
+                        # Cannot fill if rebalance_mode is DISABLED or SOURCE_ONLY
+                        if not self.policy_manager.should_rebalance(peer_id, as_destination=True):
+                            continue
+                    elif self.database.is_peer_ignored(peer_id):
+                        # Legacy fallback
+                        continue
                 
                 outbound_ratio = spendable / capacity
                 
@@ -1292,10 +1301,16 @@ class EVRebalancer:
             if normalized in active_channels:
                 continue
             
-            # Skip ignored peers (Blacklist)
+            # Check policy for draining this source (v1.4: Policy-Driven Architecture)
             pid = info.get("peer_id", "")
-            if pid and self.database.is_peer_ignored(pid):
-                continue
+            if pid:
+                if self.policy_manager:
+                    # Cannot drain if rebalance_mode is DISABLED or SINK_ONLY
+                    if not self.policy_manager.should_rebalance(pid, as_destination=False):
+                        continue
+                elif self.database.is_peer_ignored(pid):
+                    # Legacy fallback
+                    continue
                 
             # Skip if insufficient balance
             if info.get("spendable_sats", 0) < amount_needed: 

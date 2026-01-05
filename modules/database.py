@@ -293,6 +293,19 @@ class Database:
             )
         """)
         
+        # Peer policies table (v1.4: Policy-Driven Architecture)
+        # Replaces ignored_peers with full strategy/mode control
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_policies (
+                peer_id TEXT PRIMARY KEY,
+                strategy TEXT NOT NULL DEFAULT 'dynamic',
+                rebalance_mode TEXT NOT NULL DEFAULT 'enabled',
+                fee_ppm_target INTEGER,
+                tags TEXT,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        
         # Config overrides table (Phase 7: Dynamic Runtime Configuration)
         # Stores operator overrides that persist across restarts
         conn.execute("""
@@ -393,7 +406,66 @@ class Database:
         except sqlite3.OperationalError:
             pass
         
+        # v1.4 Migration: Migrate ignored_peers to peer_policies
+        # This migrates legacy "ignored" peers to the new policy system
+        self._migrate_ignored_peers_to_policies(conn)
+        
         self.plugin.log("Database initialized successfully")
+    
+    def _migrate_ignored_peers_to_policies(self, conn):
+        """
+        Migrate legacy ignored_peers table to peer_policies.
+        
+        Conversion:
+        - ignored_peers entries become PASSIVE strategy + DISABLED rebalance
+        - Original ignore reason stored in tags as 'migrated_ignore'
+        - Original table renamed to _backup_ignored_peers
+        """
+        # Check if ignored_peers table exists and has data to migrate
+        try:
+            rows = conn.execute("SELECT peer_id, reason, ignored_at FROM ignored_peers").fetchall()
+        except sqlite3.OperationalError:
+            return  # Table doesn't exist, nothing to migrate
+        
+        if not rows:
+            return  # No data to migrate
+        
+        # Check if we've already migrated (look for _backup_ignored_peers)
+        try:
+            conn.execute("SELECT 1 FROM _backup_ignored_peers LIMIT 1")
+            return  # Backup exists, migration already done
+        except sqlite3.OperationalError:
+            pass  # Backup doesn't exist, proceed with migration
+        
+        migrated_count = 0
+        for row in rows:
+            peer_id = row['peer_id']
+            reason = row['reason'] or 'migrated_ignore'
+            ignored_at = row['ignored_at']
+            
+            # Check if peer already has a policy (don't overwrite)
+            existing = conn.execute(
+                "SELECT 1 FROM peer_policies WHERE peer_id = ?", (peer_id,)
+            ).fetchone()
+            
+            if not existing:
+                import json
+                tags = json.dumps(['migrated_ignore', reason] if reason != 'migrated_ignore' else ['migrated_ignore'])
+                conn.execute("""
+                    INSERT INTO peer_policies 
+                        (peer_id, strategy, rebalance_mode, fee_ppm_target, tags, updated_at)
+                    VALUES (?, 'passive', 'disabled', NULL, ?, ?)
+                """, (peer_id, tags, ignored_at))
+                migrated_count += 1
+        
+        # Rename old table to backup (preserve data for safety)
+        if migrated_count > 0:
+            conn.execute("ALTER TABLE ignored_peers RENAME TO _backup_ignored_peers")
+            self.plugin.log(
+                f"v1.4 Migration: Migrated {migrated_count} ignored peers to peer_policies. "
+                f"Old table renamed to _backup_ignored_peers.",
+                level='info'
+            )
     
     # =========================================================================
     # Channel State Methods
