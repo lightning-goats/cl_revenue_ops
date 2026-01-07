@@ -681,6 +681,28 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                f"fee_range=[{config.min_fee_ppm}, {config.max_fee_ppm}], "
                f"dry_run={config.dry_run}")
     
+    # Create thread-safe RPC proxy (Phase 5.5: High-Uptime Stability)
+    # All background threads share a single RPC connection - serialize access
+    # to prevent corruption from concurrent calls to lightningd
+
+    # Phase 1: RPC Broker (subprocess) + thread-safe proxy
+    rpc_socket_path = getattr(plugin.rpc, "socket_path", None)
+    if not rpc_socket_path:
+        # Best-effort derive from CLN init configuration if available.
+        ldir = configuration.get("lightning-dir") or configuration.get("lightning_dir")
+        rpcfile = configuration.get("rpc-file") or configuration.get("rpc_file")
+        if ldir and rpcfile:
+            rpc_socket_path = rpcfile if os.path.isabs(rpcfile) else os.path.join(ldir, rpcfile)
+
+    if not rpc_socket_path:
+        # Last-resort fallback (common default)
+        ldir = configuration.get("lightning-dir") or "~/.lightning"
+        rpc_socket_path = os.path.expanduser(os.path.join(ldir, "lightning-rpc"))
+
+    rpc_broker = RpcBroker(str(rpc_socket_path), plugin)
+    safe_plugin = ThreadSafePluginProxy(plugin, rpc_broker)
+    plugin.log(f"RPC broker initialized (socket={rpc_socket_path})", level="info")
+
     # =========================================================================
     # STARTUP DEPENDENCY CHECKS (Phase 4: Stability & Scaling)
     # Verify external plugins are available before initializing dependent modules
@@ -725,27 +747,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # Assume plugins are available if check fails
         config.sling_available = True
     
-    # Create thread-safe RPC proxy (Phase 5.5: High-Uptime Stability)
-    # All background threads share a single RPC connection - serialize access
-    # to prevent corruption from concurrent calls to lightningd
-
-    # Phase 1: RPC Broker (subprocess) + thread-safe proxy
-    rpc_socket_path = getattr(plugin.rpc, "socket_path", None)
-    if not rpc_socket_path:
-        # Best-effort derive from CLN init configuration if available.
-        ldir = configuration.get("lightning-dir") or configuration.get("lightning_dir")
-        rpcfile = configuration.get("rpc-file") or configuration.get("rpc_file")
-        if ldir and rpcfile:
-            rpc_socket_path = rpcfile if os.path.isabs(rpcfile) else os.path.join(ldir, rpcfile)
-
-    if not rpc_socket_path:
-        # Last-resort fallback (common default)
-        ldir = configuration.get("lightning-dir") or "~/.lightning"
-        rpc_socket_path = os.path.expanduser(os.path.join(ldir, "lightning-rpc"))
-
-    rpc_broker = RpcBroker(str(rpc_socket_path), plugin)
-    safe_plugin = ThreadSafePluginProxy(plugin, rpc_broker)
-    plugin.log(f"RPC broker initialized (socket={rpc_socket_path})", level="info")
     
     # Initialize database
     database = Database(config.db_path, safe_plugin)
