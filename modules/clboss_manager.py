@@ -116,7 +116,7 @@ class ClbossManager:
         Returns:
             Result dict with status and details
         """
-        return self.unmanage(peer_id, ClbossTags.FEE)
+        return self.unmanage(peer_id, ClbossTags.FEE_AND_BALANCE)
     
     def unmanage_for_rebalance(self, peer_id: str) -> Dict[str, Any]:
         """
@@ -128,7 +128,7 @@ class ClbossManager:
         Returns:
             Result dict with status and details
         """
-        return self.unmanage(peer_id, ClbossTags.BALANCE)
+        return self.unmanage(peer_id, ClbossTags.FEE_AND_BALANCE)
     
     def unmanage(self, peer_id: str, tag: str) -> Dict[str, Any]:
         """

@@ -1039,7 +1039,7 @@ class HillClimbingFeeController:
             # Step 1: Unmanage from clboss
             # This is critical - we MUST do this before setting fees
             if not self.clboss.ensure_unmanaged_for_channel(
-                channel_id, peer_id, ClbossTags.FEE, self.database
+                channel_id, peer_id, ClbossTags.FEE_AND_BALANCE, self.database
             ):
                 self.plugin.log(
                     f"Warning: Could not unmanage {peer_id} from clboss, "
