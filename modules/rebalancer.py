@@ -277,7 +277,7 @@ class JobManager:
         chunk_size = min(candidate.amount_sats, self.chunk_size_sats)
 
         # ZERO-TOLERANCE: Enforce sats-budget-derived fee cap on the execution unit (chunk).
-        budget_ppm = (candidate.max_budget_sats * 1_000_000) // chunk_size if chunk_size > 0 else 0
+        budget_ppm = (candidate.max_budget_msat * 1_000_000) // (chunk_size * 1000) if chunk_size > 0 else 0
         maxppm = max(1, min(candidate.max_fee_ppm, budget_ppm)) if budget_ppm > 0 else 0
         if maxppm <= 0:
             return {"success": False, "error": "Budget too small to allow any routing fee (maxppm=0)"}
@@ -443,14 +443,14 @@ class JobManager:
             # Get job-specific stats from sling
             job_stats = sling_stats.get(job.scid, {})
 
-            # ZERO-TOLERANCE: Abort if the job is spending at/above its sats budget.
-            fee_sats = job_stats.get("fee_total_sats", 0) or 0
-            if not fee_sats:
-                fee_msat = job_stats.get("fee_total_msat", 0) or 0
-                fee_sats = fee_msat // 1000 if fee_msat else 0
+            # ZERO-TOLERANCE: Abort if the job is spending at/above its msat budget.
+            fee_msat = job_stats.get("fee_total_msat", 0) or 0
+            if not fee_msat:
+                fee_sats = job_stats.get("fee_total_sats", 0) or 0
+                fee_msat = fee_sats * 1000 if fee_sats else 0
 
-            if fee_sats and job.candidate and fee_sats > job.candidate.max_budget_sats:
-                self._handle_job_budget_exceeded(job, fee_sats, job_stats)
+            if fee_msat and job.candidate and fee_msat > job.candidate.max_budget_msat:
+                self._handle_job_budget_exceeded(job, fee_msat, job_stats)
                 summary["failed"] += 1
                 continue
             
@@ -615,12 +615,12 @@ class JobManager:
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
     
-    def _handle_job_budget_exceeded(self, job: ActiveJob, fee_sats: int,
+    def _handle_job_budget_exceeded(self, job: ActiveJob, fee_msat: int,
                                     stats: Dict[str, Any]) -> None:
         """Handle a job that exceeded its configured sats budget."""
         error_msg = stats.get("last_error", "")
-        budget_sats = job.candidate.max_budget_sats if job.candidate else 0
-        msg = f"Exceeded sats budget: fee_sats={fee_sats} > budget_sats={budget_sats}"
+        budget_msat = job.candidate.max_budget_msat if job.candidate else 0
+        msg = f"Exceeded msat budget: fee_msat={fee_msat} > budget_msat={budget_msat}"
         if error_msg:
             msg = f"{msg}; last_error={error_msg}"
 
@@ -633,7 +633,7 @@ class JobManager:
         self.database.update_rebalance_result(
             job.rebalance_id,
             'failed',
-            actual_fee_sats=fee_sats,
+            actual_fee_sats=(fee_msat + 999) // 1000,
             error_message=f"exceeded_budget: {msg}"
         )
         self.database.increment_failure_count(job.scid_normalized)
@@ -1208,8 +1208,13 @@ class EVRebalancer:
         if spread_ppm <= 0: 
             return None
         
-        max_budget_sats = (spread_ppm * rebalance_amount) // 1_000_000
-        max_budget_msat = max_budget_sats * 1000
+        raw_budget_msat = (spread_ppm * amount_msat) // 1_000_000
+        # ZERO-TOLERANCE: Avoid a zero-sats budget due to integer truncation.
+        # We clamp to at least 1 sat (1000 msat). This is conservative: it makes EV slightly worse,
+        # and ensures execution can enforce a non-zero fee cap.
+        max_budget_msat = max(1000, raw_budget_msat)
+        # Use ceiling sats for conservative accounting.
+        max_budget_sats = (max_budget_msat + 999) // 1000
         
         # Kelly logic
         if self.config.enable_kelly:
@@ -1229,7 +1234,7 @@ class EVRebalancer:
             # ZERO-TOLERANCE: Derive max routing fee from the sats budget for this chunk.
             # Our EV math subtracts max_budget_sats as a worst-case routing cost, so we must
             # ensure execution cannot exceed that budget.
-            budget_ppm = (max_budget_sats * 1_000_000) // rebalance_amount if rebalance_amount > 0 else 0
+            budget_ppm = (max_budget_msat * 1_000_000) // amount_msat if amount_msat > 0 else 0
 
             # Optional heuristic upper bound, but ALWAYS clamp to the sats-budget-derived ppm.
             heuristic_ppm = inbound_fee_ppm + (spread_ppm // 2)
@@ -1793,8 +1798,7 @@ class EVRebalancer:
             }
 
     def manual_rebalance(self, from_channel: str, to_channel: str, 
-                         amount_sats: int, max_fee_sats: Optional[int] = None,
-                         force: bool = False) -> Dict[str, Any]:
+                         amount_sats: int, max_fee_sats: Optional[int] = None) -> Dict[str, Any]:
         """Execute a manual rebalance between two channels.
         
         Note: Manual rebalances bypass capital controls by design (user override),
@@ -1803,11 +1807,6 @@ class EVRebalancer:
         # Warn if capital controls would block this (but don't enforce for manual)
         capital_ok = self._check_capital_controls()
         if not capital_ok:
-            if not force:
-                return {
-                    "success": False,
-                    "error": "Capital controls (budget or reserve) would block this rebalance. Use force=true to bypass."
-                }
             self.plugin.log(
                 "WARNING: Manual rebalance executing despite capital controls. "
                 "Budget may be exhausted or reserve low.", 
