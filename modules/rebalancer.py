@@ -26,7 +26,7 @@ from enum import Enum
 
 from pyln.client import Plugin, RpcError
 
-from .config import Config
+from .config import Config, ConfigSnapshot
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
 from .metrics import PrometheusExporter, MetricNames, METRIC_HELP
@@ -849,6 +849,9 @@ class EVRebalancer:
         # Initialize ephemeral fee cache for this run (cleared at end)
         self._fee_cache: Dict[str, Optional[int]] = {}
 
+        # Thread-safe config snapshot for this rebalance cycle
+        cfg = self.config.snapshot()
+
         try:
             # CRITICAL-01 FIX: Clean up stale budget reservations periodically
             # Reservations older than 4 hours are likely from crashed jobs
@@ -874,8 +877,8 @@ class EVRebalancer:
                 )
                 return candidates
             
-            # Check capital controls
-            if not self._check_capital_controls():
+            # Check capital controls (pass cfg for thread-safe config access)
+            if not self._check_capital_controls(cfg):
                 return candidates
             
             channels = self._get_channels_with_balances()
@@ -926,9 +929,9 @@ class EVRebalancer:
                     source_channels.append((channel_id, info, outbound_ratio))
                     self.plugin.log(f"STAGNANT AWAKENING: {channel_id[:12]}... is idle (turnover {turnover:.4f}). Adding to source pool.", level='debug')
                 
-                elif outbound_ratio < self.config.low_liquidity_threshold:
+                elif outbound_ratio < cfg.low_liquidity_threshold:
                     depleted_channels.append((channel_id, info, outbound_ratio))
-                elif outbound_ratio > self.config.high_liquidity_threshold:
+                elif outbound_ratio > cfg.high_liquidity_threshold:
                     source_channels.append((channel_id, info, outbound_ratio))
             
             if not depleted_channels or not source_channels:
@@ -1653,12 +1656,15 @@ class EVRebalancer:
     def execute_rebalance(self, candidate: RebalanceCandidate, **kwargs) -> Dict[str, Any]:
         """
         Execute a rebalance for the given candidate.
-        
+
         Uses the async JobManager to spawn sling background jobs.
         This plugin acts as the "Strategist" while sling workers handle execution.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         self._pending[candidate.to_channel] = int(time.time())
+
+        # Thread-safe config snapshot for this execution
+        cfg = self.config.snapshot()
         
         try:
             # Ensure channels are unmanaged from clboss
@@ -1702,11 +1708,11 @@ class EVRebalancer:
             since_24h = now - 86400
 
             # Calculate effective budget (same logic as _check_capital_controls)
-            effective_budget = self.config.daily_budget_sats
-            if self.config.enable_proportional_budget:
+            effective_budget = cfg.daily_budget_sats
+            if cfg.enable_proportional_budget:
                 revenue_24h = self.database.get_total_routing_revenue(since_24h)
-                proportional_budget = int(revenue_24h * self.config.proportional_budget_pct)
-                effective_budget = max(self.config.daily_budget_sats, proportional_budget)
+                proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
+                effective_budget = max(cfg.daily_budget_sats, proportional_budget)
 
             reserved, remaining = self.database.reserve_budget(
                 reservation_id=rebalance_id,
@@ -1729,7 +1735,7 @@ class EVRebalancer:
                 )
                 return result
 
-            if self.config.dry_run:
+            if cfg.dry_run:
                 self.plugin.log(f"[DRY RUN] Would rebalance {candidate.amount_sats} sats "
                               f"from {candidate.from_channel} to {candidate.to_channel}")
                 self.database.update_rebalance_result(
@@ -1926,8 +1932,10 @@ class EVRebalancer:
         
         return result
 
-    def _check_capital_controls(self) -> bool:
+    def _check_capital_controls(self, cfg: Optional[ConfigSnapshot] = None) -> bool:
         """Check if capital controls allow rebalancing."""
+        if cfg is None:
+            cfg = self.config.snapshot()
         try:
             listfunds = self.plugin.rpc.listfunds()
             onchain_sats = 0
@@ -1950,28 +1958,28 @@ class EVRebalancer:
                     channel_spendable_sats += spendable
             
             total_reserve = onchain_sats + channel_spendable_sats
-            if total_reserve < self.config.min_wallet_reserve:
+            if total_reserve < cfg.min_wallet_reserve:
                 self.plugin.log(
                     f"CAPITAL CONTROL: Wallet reserve (confirmed on-chain + channel spendable) {total_reserve} < "
-                    f"{self.config.min_wallet_reserve}", 
+                    f"{cfg.min_wallet_reserve}",
                     level='warn'
                 )
                 return False
-            
+
             # Calculate effective daily budget
             # If proportional budget enabled: max(fixed_floor, revenue_24h * percentage)
-            effective_budget = self.config.daily_budget_sats
-            
-            if self.config.enable_proportional_budget:
+            effective_budget = cfg.daily_budget_sats
+
+            if cfg.enable_proportional_budget:
                 now = int(time.time())
                 revenue_24h = self.database.get_total_routing_revenue(now - 86400)
-                proportional_budget = int(revenue_24h * self.config.proportional_budget_pct)
-                effective_budget = max(self.config.daily_budget_sats, proportional_budget)
-                
+                proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
+                effective_budget = max(cfg.daily_budget_sats, proportional_budget)
+
                 self.plugin.log(
                     f"CAPITAL CONTROL: Revenue-proportional budget active. "
-                    f"Revenue 24h: {revenue_24h} sats, {self.config.proportional_budget_pct*100:.1f}% = {proportional_budget} sats, "
-                    f"Effective budget: {effective_budget} sats (floor: {self.config.daily_budget_sats})",
+                    f"Revenue 24h: {revenue_24h} sats, {cfg.proportional_budget_pct*100:.1f}% = {proportional_budget} sats, "
+                    f"Effective budget: {effective_budget} sats (floor: {cfg.daily_budget_sats})",
                     level='debug'
                 )
                 

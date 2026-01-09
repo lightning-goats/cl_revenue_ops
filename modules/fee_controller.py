@@ -401,7 +401,7 @@ class HillClimbingFeeController:
                 if policy.strategy == FeeStrategy.HIVE:
                     channel_info = channels.get(channel_id)
                     if channel_info:
-                        hive_fee = getattr(self.config, 'hive_fee_ppm', 0)  # Default 0 PPM for Hive
+                        hive_fee = cfg.hive_fee_ppm  # Use ConfigSnapshot for thread-safety
                         current_fee = channel_info.get("fee_proportional_millionths", 0)
                         if current_fee != hive_fee:
                             try:
@@ -435,7 +435,8 @@ class HillClimbingFeeController:
                     peer_id=peer_id,
                     state=state,
                     channel_info=channel_info,
-                    chain_costs=chain_costs
+                    chain_costs=chain_costs,
+                    cfg=cfg
                 )
                 
                 if adjustment:
@@ -451,20 +452,21 @@ class HillClimbingFeeController:
         return adjustments
     
     def _adjust_channel_fee(self, channel_id: str, peer_id: str,
-                           state: Dict[str, Any], 
+                           state: Dict[str, Any],
                            channel_info: Dict[str, Any],
-                           chain_costs: Optional[Dict[str, int]] = None) -> Optional[FeeAdjustment]:
+                           chain_costs: Optional[Dict[str, int]] = None,
+                           cfg: Optional['ConfigSnapshot'] = None) -> Optional[FeeAdjustment]:
         """
         Adjust fee for a single channel using Hill Climbing optimization.
-        
+
         UPDATED: Rate-Based Feedback with Wiggle Dampening
-        
+
         Key Changes from Previous Version:
         1. Rate-Based Feedback: Uses volume since last fee change (not 7-day average)
            to measure revenue per hour, eliminating lag in the feedback loop.
         2. Wiggle Dampening: When the algorithm reverses direction (overshot peak),
            the step size is decayed by DAMPENING_FACTOR to converge on the optimum.
-        
+
         Hill Climbing (Perturb & Observe) Algorithm:
         1. Get volume since last fee change via get_volume_since()
         2. Calculate revenue RATE (sats/hour) = (volume * fee) / hours_elapsed
@@ -472,17 +474,21 @@ class HillClimbingFeeController:
         4. If rate increased: continue in same direction
         5. If rate decreased: reverse direction AND reduce step (dampening)
         6. Apply step change in calculated direction
-        
+
         Args:
             channel_id: Channel to adjust
             peer_id: Peer node ID
             state: Channel state from flow analysis
             channel_info: Current channel info (capacity, balance, etc.)
             chain_costs: Pre-fetched chain costs from feerates RPC (optimization)
-            
+            cfg: ConfigSnapshot for thread-safe config access
+
         Returns:
             FeeAdjustment if fee was changed, None otherwise
         """
+        # Ensure we have a ConfigSnapshot
+        if cfg is None:
+            cfg = self.config.snapshot()
         # Detect critical state (Phase 5.5)
         is_congested = (state and state.get("state") == "congested")
         
@@ -490,7 +496,7 @@ class HillClimbingFeeController:
         raw_chain_fee = channel_info.get("fee_proportional_millionths", 0)
         current_fee_ppm = raw_chain_fee
         if current_fee_ppm == 0:
-            current_fee_ppm = self.config.min_fee_ppm  # Initialize if not set
+            current_fee_ppm = cfg.min_fee_ppm  # Initialize if not set
         
         # Load Hill Climbing state
         hc_state = self._get_hill_climb_state(channel_id)
@@ -547,7 +553,7 @@ class HillClimbingFeeController:
             else:
                 # Still within sleep period - check for revenue spike that should wake us
                 # Calculate current revenue rate to detect significant changes
-                if self.config.enable_reputation:
+                if cfg.enable_reputation:
                     volume_since_sats = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
                 else:
                     volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
@@ -614,7 +620,7 @@ class HillClimbingFeeController:
         # Effective Volume = Raw Volume * Peer_Success_Rate
         #
         # EXCEPTION: If channel is SHIELDED, we always use raw volume.
-        if self.config.enable_reputation and not is_shielded:
+        if cfg.enable_reputation and not is_shielded:
             volume_since_sats = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
         else:
             volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
@@ -689,12 +695,12 @@ class HillClimbingFeeController:
         
         # Calculate Floor and Ceiling
         floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id)
-        floor_ppm = max(floor_ppm, self.config.min_fee_ppm)
+        floor_ppm = max(floor_ppm, cfg.min_fee_ppm)
         # Apply flow state to floor (sinks can go lower)
         floor_ppm = int(floor_ppm * flow_state_multiplier)
         floor_ppm = max(floor_ppm, 1)  # Never go below 1 ppm
-        
-        ceiling_ppm = self.config.max_fee_ppm
+
+        ceiling_ppm = cfg.max_fee_ppm
         
         # =====================================================================
         # PRIORITY OVERRIDE: Zero-Fee Probe > Fire Sale
@@ -739,7 +745,7 @@ class HillClimbingFeeController:
         # Priority 3: Zero-Fee Probe Logic (Jumpstarting)
         if not target_found and is_under_probe:
             # Calculate current revenue rate (reuse logic from rate calculation below)
-            if self.config.enable_reputation and not is_shielded:
+            if cfg.enable_reputation and not is_shielded:
                 v_since = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
             else:
                 v_since = self.database.get_volume_since(channel_id, hc_state.last_update)
@@ -794,7 +800,7 @@ class HillClimbingFeeController:
             if hc_state.last_update > 0 and rate_change_ratio < self.STABILITY_THRESHOLD:
                 hc_state.stable_cycles += 1
                 if hc_state.stable_cycles >= self.STABLE_CYCLES_REQUIRED:
-                    sleep_duration_seconds = self.config.fee_interval * self.SLEEP_CYCLES
+                    sleep_duration_seconds = cfg.fee_interval * self.SLEEP_CYCLES
                     hc_state.is_sleeping = True
                     hc_state.sleep_until = now + sleep_duration_seconds
                     hc_state.last_revenue_rate = current_revenue_rate
@@ -837,10 +843,10 @@ class HillClimbingFeeController:
 
             base_new_fee = current_fee_ppm + (new_direction * step_ppm)
             new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
-            
+
             # Phase 7: Scarcity Pricing - premium for low local balance
             # Phase 7.1: Virgin Channel Amnesty - bypass for remote-opened channels with no traffic
-            cfg = self.config.snapshot()
+            # Note: cfg already passed as parameter - don't create a new snapshot here
             opener = channel_info.get("opener", "local")
             total_sats_out = state.get("sats_out", 0) if state else 0
             is_virgin_remote = (opener == "remote" and total_sats_out == 0)
