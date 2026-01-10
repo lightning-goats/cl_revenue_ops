@@ -416,6 +416,22 @@ class Database:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_budget_reservations_status ON budget_reservations(status, reserved_at)")
 
+        # Phase 8: Financial Snapshots for P&L Dashboard
+        # Records daily node state for TLV tracking and trend analysis
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS financial_snapshots (
+                timestamp INTEGER PRIMARY KEY,
+                total_local_balance_sats INTEGER NOT NULL,
+                total_remote_balance_sats INTEGER NOT NULL,
+                total_onchain_sats INTEGER NOT NULL,
+                total_capacity_sats INTEGER NOT NULL,
+                total_revenue_accumulated_sats INTEGER NOT NULL,
+                total_rebalance_cost_accumulated_sats INTEGER NOT NULL,
+                channel_count INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_financial_snapshots_time ON financial_snapshots(timestamp)")
+
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
         try:
@@ -1007,6 +1023,189 @@ class Database:
         
         # Convert msat to sats
         return (row['total_fees_msat'] // 1000) if row else 0
+
+    # =========================================================================
+    # Phase 8: Financial Snapshots for P&L Dashboard
+    # =========================================================================
+
+    def record_financial_snapshot(self, local_balance_sats: int, remote_balance_sats: int,
+                                   onchain_sats: int, capacity_sats: int,
+                                   revenue_accumulated_sats: int,
+                                   rebalance_cost_accumulated_sats: int,
+                                   channel_count: int) -> bool:
+        """
+        Record a daily financial snapshot for P&L tracking.
+
+        This captures the node's financial state at a point in time for
+        trend analysis and Net Worth tracking.
+
+        Args:
+            local_balance_sats: Total local balance across all channels
+            remote_balance_sats: Total remote balance across all channels
+            onchain_sats: Total confirmed on-chain balance
+            capacity_sats: Total channel capacity
+            revenue_accumulated_sats: Lifetime routing revenue
+            rebalance_cost_accumulated_sats: Lifetime rebalance costs
+            channel_count: Number of active channels
+
+        Returns:
+            True if snapshot recorded, False on error
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO financial_snapshots
+                (timestamp, total_local_balance_sats, total_remote_balance_sats,
+                 total_onchain_sats, total_capacity_sats,
+                 total_revenue_accumulated_sats, total_rebalance_cost_accumulated_sats,
+                 channel_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (now, local_balance_sats, remote_balance_sats, onchain_sats,
+                  capacity_sats, revenue_accumulated_sats,
+                  rebalance_cost_accumulated_sats, channel_count))
+
+            self.plugin.log(
+                f"Financial snapshot recorded: TLV={local_balance_sats + onchain_sats} sats, "
+                f"{channel_count} channels",
+                level='info'
+            )
+            return True
+
+        except Exception as e:
+            self.plugin.log(f"Error recording financial snapshot: {e}", level='error')
+            return False
+
+    def get_financial_history(self, limit: int = 30) -> List[Dict[str, Any]]:
+        """
+        Get recent financial snapshots for trend analysis.
+
+        Args:
+            limit: Maximum number of snapshots to return (default 30 days)
+
+        Returns:
+            List of snapshot dicts, most recent first
+        """
+        conn = self._get_connection()
+
+        rows = conn.execute("""
+            SELECT timestamp, total_local_balance_sats, total_remote_balance_sats,
+                   total_onchain_sats, total_capacity_sats,
+                   total_revenue_accumulated_sats, total_rebalance_cost_accumulated_sats,
+                   channel_count
+            FROM financial_snapshots
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_latest_financial_snapshot(self) -> Optional[Dict[str, Any]]:
+        """
+        Get the most recent financial snapshot.
+
+        Returns:
+            Snapshot dict or None if no snapshots exist
+        """
+        conn = self._get_connection()
+
+        row = conn.execute("""
+            SELECT timestamp, total_local_balance_sats, total_remote_balance_sats,
+                   total_onchain_sats, total_capacity_sats,
+                   total_revenue_accumulated_sats, total_rebalance_cost_accumulated_sats,
+                   channel_count
+            FROM financial_snapshots
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """).fetchone()
+
+        return dict(row) if row else None
+
+    def get_lifetime_stats(self) -> Dict[str, int]:
+        """
+        Get lifetime aggregated stats for P&L calculations.
+
+        Returns:
+            Dict with total_revenue_sats, total_rebalance_cost_sats, total_forwards
+        """
+        conn = self._get_connection()
+
+        # Get lifetime revenue from forwards
+        rev_row = conn.execute("""
+            SELECT COALESCE(SUM(fee_msat), 0) as total_fee_msat,
+                   COUNT(*) as forward_count
+            FROM forwards
+        """).fetchone()
+
+        # Get lifetime rebalance costs
+        cost_row = conn.execute("""
+            SELECT COALESCE(SUM(actual_fee_sats), 0) as total_cost
+            FROM rebalance_history
+            WHERE status = 'success' AND actual_fee_sats IS NOT NULL
+        """).fetchone()
+
+        # Add any pruned data from lifetime_aggregates
+        pruned_row = conn.execute("""
+            SELECT pruned_revenue_msat, pruned_forward_count
+            FROM lifetime_aggregates
+            WHERE id = 1
+        """).fetchone()
+
+        pruned_revenue_msat = pruned_row['pruned_revenue_msat'] if pruned_row else 0
+        pruned_forward_count = pruned_row['pruned_forward_count'] if pruned_row else 0
+
+        total_revenue_msat = (rev_row['total_fee_msat'] if rev_row else 0) + pruned_revenue_msat
+        total_forwards = (rev_row['forward_count'] if rev_row else 0) + pruned_forward_count
+        total_cost = cost_row['total_cost'] if cost_row else 0
+
+        return {
+            'total_revenue_sats': total_revenue_msat // 1000,
+            'total_rebalance_cost_sats': total_cost,
+            'total_forwards': total_forwards
+        }
+
+    def get_channel_pnl(self, channel_id: str, window_days: int = 30) -> Dict[str, Any]:
+        """
+        Get P&L breakdown for a specific channel.
+
+        Args:
+            channel_id: The channel SCID
+            window_days: Time window for calculations (default 30 days)
+
+        Returns:
+            Dict with revenue_sats, rebalance_cost_sats, net_pnl_sats, forward_count
+        """
+        conn = self._get_connection()
+        since = int(time.time()) - (window_days * 86400)
+
+        # Revenue from this channel (as outbound)
+        rev_row = conn.execute("""
+            SELECT COALESCE(SUM(fee_msat), 0) as revenue_msat,
+                   COUNT(*) as forward_count
+            FROM forwards
+            WHERE out_channel = ? AND timestamp >= ?
+        """, (channel_id, since)).fetchone()
+
+        # Rebalance costs for this channel
+        cost_row = conn.execute("""
+            SELECT COALESCE(SUM(actual_fee_sats), 0) as cost_sats
+            FROM rebalance_history
+            WHERE to_channel = ? AND timestamp >= ? AND status = 'success'
+        """, (channel_id, since)).fetchone()
+
+        revenue_sats = (rev_row['revenue_msat'] // 1000) if rev_row else 0
+        cost_sats = cost_row['cost_sats'] if cost_row else 0
+        forward_count = rev_row['forward_count'] if rev_row else 0
+
+        return {
+            'channel_id': channel_id,
+            'window_days': window_days,
+            'revenue_sats': revenue_sats,
+            'rebalance_cost_sats': cost_sats,
+            'net_pnl_sats': revenue_sats - cost_sats,
+            'forward_count': forward_count
+        }
 
     # =========================================================================
     # Atomic Budget Reservation System (CRITICAL-01 fix)

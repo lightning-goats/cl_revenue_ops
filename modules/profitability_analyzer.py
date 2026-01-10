@@ -735,7 +735,195 @@ class ChannelProfitabilityAnalyzer:
             "lifetime_roi_percent": lifetime_roi_percent,
             "lifetime_forward_count": stats["total_forwards"]
         }
-    
+
+    # =========================================================================
+    # Phase 8: P&L Dashboard Methods
+    # =========================================================================
+
+    def get_pnl_summary(self, window_days: int = 30) -> Dict[str, Any]:
+        """
+        Get P&L summary for a given time window.
+
+        Calculates key financial metrics for the Sovereign Dashboard:
+        - Gross Revenue: Total routing fees earned
+        - Operating Expense (OpEx): Total rebalance costs
+        - Net Profit: Revenue - OpEx
+        - Operating Margin: (Net Profit / Gross Revenue) * 100
+
+        Args:
+            window_days: Time window for calculations (default 30 days)
+
+        Returns:
+            Dict with revenue, opex, net_profit, margin, and forward_count
+        """
+        since_timestamp = int(time.time()) - (window_days * 86400)
+
+        # Get revenue (routing fees earned)
+        gross_revenue_sats = self.database.get_total_routing_revenue(since_timestamp)
+
+        # Get OpEx (rebalance costs)
+        opex_sats = self.database.get_total_rebalance_fees(since_timestamp)
+
+        # Calculate net profit
+        net_profit_sats = gross_revenue_sats - opex_sats
+
+        # Calculate operating margin (avoid division by zero)
+        if gross_revenue_sats > 0:
+            operating_margin_pct = round((net_profit_sats / gross_revenue_sats) * 100, 2)
+        else:
+            # No revenue - margin is undefined, use 0 if no costs, -100 if costs
+            operating_margin_pct = 0.0 if opex_sats == 0 else -100.0
+
+        return {
+            'window_days': window_days,
+            'gross_revenue_sats': gross_revenue_sats,
+            'opex_sats': opex_sats,
+            'net_profit_sats': net_profit_sats,
+            'operating_margin_pct': operating_margin_pct
+        }
+
+    def identify_bleeders(self, window_days: int = 30) -> List[Dict[str, Any]]:
+        """
+        Identify "Bleeder" channels that are losing money.
+
+        A Bleeder is a channel where:
+        - Net P&L < 0 (rebalance costs exceed revenue)
+        - Volume > 0 (channel is active, not just stagnant)
+
+        These channels actively drain sats through rebalancing without
+        generating sufficient revenue to cover costs.
+
+        Args:
+            window_days: Time window for analysis (default 30 days)
+
+        Returns:
+            List of bleeder channel dicts with P&L breakdown, sorted by loss
+        """
+        bleeders = []
+
+        try:
+            # Get all active channels
+            channels = self._get_all_channels()
+
+            for channel_id, info in channels.items():
+                # Get P&L for this channel
+                pnl = self.database.get_channel_pnl(channel_id, window_days)
+
+                # Check for bleeder condition: net < 0 AND has activity
+                if pnl['net_pnl_sats'] < 0 and pnl['forward_count'] > 0:
+                    bleeders.append({
+                        'channel_id': channel_id,
+                        'peer_id': info.get('peer_id', ''),
+                        'capacity_sats': info.get('capacity', 0),
+                        'revenue_sats': pnl['revenue_sats'],
+                        'rebalance_cost_sats': pnl['rebalance_cost_sats'],
+                        'net_pnl_sats': pnl['net_pnl_sats'],
+                        'forward_count': pnl['forward_count'],
+                        'loss_per_forward': abs(pnl['net_pnl_sats']) // max(pnl['forward_count'], 1)
+                    })
+
+            # Sort by loss (most negative first)
+            bleeders.sort(key=lambda x: x['net_pnl_sats'])
+
+        except Exception as e:
+            self.plugin.log(f"Error identifying bleeders: {e}", level='error')
+
+        return bleeders
+
+    def calculate_roc(self, window_days: int = 30) -> Dict[str, Any]:
+        """
+        Calculate Return on Capacity (ROC).
+
+        ROC measures the yield on deployed capital, normalized to annual percentage:
+        ROC = (Net_Profit_window / Total_Capacity) * (365 / window_days)
+
+        This tells operators their annualized return on the BTC locked in channels.
+
+        Args:
+            window_days: Time window for net profit calculation (default 30 days)
+
+        Returns:
+            Dict with total_capacity, net_profit, roc_pct, and annualized_roc_pct
+        """
+        # Get P&L for the window
+        pnl = self.get_pnl_summary(window_days)
+
+        # Get total channel capacity
+        total_capacity_sats = 0
+        try:
+            channels = self._get_all_channels()
+            for info in channels.values():
+                total_capacity_sats += info.get('capacity', 0)
+        except Exception as e:
+            self.plugin.log(f"Error getting capacity for ROC: {e}", level='error')
+
+        # Calculate ROC (avoid division by zero)
+        if total_capacity_sats > 0:
+            # ROC for the window period
+            roc_pct = (pnl['net_profit_sats'] / total_capacity_sats) * 100
+
+            # Annualized ROC
+            annualized_roc_pct = roc_pct * (365 / window_days)
+        else:
+            roc_pct = 0.0
+            annualized_roc_pct = 0.0
+
+        return {
+            'window_days': window_days,
+            'total_capacity_sats': total_capacity_sats,
+            'net_profit_sats': pnl['net_profit_sats'],
+            'roc_pct': round(roc_pct, 4),
+            'annualized_roc_pct': round(annualized_roc_pct, 2)
+        }
+
+    def get_tlv(self) -> Dict[str, int]:
+        """
+        Calculate Total Liquidating Value (TLV).
+
+        TLV represents the node's "Net Worth" if all channels were
+        cooperatively closed today:
+        TLV = On-chain Balance + Sum(Channel Local Balances)
+
+        Returns:
+            Dict with onchain_sats, local_balance_sats, tlv_sats
+        """
+        onchain_sats = 0
+        local_balance_sats = 0
+        remote_balance_sats = 0
+        channel_count = 0
+
+        try:
+            # Get on-chain balance from listfunds
+            listfunds = self.plugin.rpc.listfunds()
+
+            for output in listfunds.get("outputs", []):
+                if output.get("status") == "confirmed":
+                    amount_msat = self._parse_msat(output.get("amount_msat", 0))
+                    onchain_sats += amount_msat // 1000
+
+            # Get channel balances
+            for channel in listfunds.get("channels", []):
+                if channel.get("state") != "CHANNELD_NORMAL":
+                    continue
+
+                our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
+                amount_msat = self._parse_msat(channel.get("amount_msat", 0))
+
+                local_balance_sats += our_amount_msat // 1000
+                remote_balance_sats += (amount_msat - our_amount_msat) // 1000
+                channel_count += 1
+
+        except Exception as e:
+            self.plugin.log(f"Error calculating TLV: {e}", level='error')
+
+        return {
+            'onchain_sats': onchain_sats,
+            'local_balance_sats': local_balance_sats,
+            'remote_balance_sats': remote_balance_sats,
+            'tlv_sats': onchain_sats + local_balance_sats,
+            'channel_count': channel_count
+        }
+
     # =========================================================================
     # Private Helper Methods
     # =========================================================================

@@ -1108,7 +1108,73 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log(f"Error in delayed snapshot: {e}", level='warn')
             import traceback
             plugin.log(f"Traceback: {traceback.format_exc()}", level='warn')
-    
+
+    def financial_snapshot_loop():
+        """
+        Background loop for daily financial snapshots (Phase 8: Dashboard).
+
+        Takes a snapshot of TLV, balances, and accumulated P&L metrics
+        once every 24 hours for historical trend analysis.
+        """
+        SNAPSHOT_INTERVAL = 86400  # 24 hours in seconds
+
+        # Initial delay: wait 5 minutes to let everything stabilize
+        if shutdown_event.wait(300):
+            plugin.log("Financial snapshot loop cancelled during startup delay")
+            return
+
+        # Take an initial snapshot on startup
+        try:
+            _take_financial_snapshot()
+        except Exception as e:
+            plugin.log(f"Error taking initial financial snapshot: {e}", level='warn')
+
+        while not shutdown_event.is_set():
+            # Calculate +/- 10% jitter (about 2.4 hours variance)
+            jitter_seconds = int(SNAPSHOT_INTERVAL * 0.1)
+            sleep_time = SNAPSHOT_INTERVAL + random.randint(-jitter_seconds, jitter_seconds)
+            plugin.log(f"Financial snapshot sleeping for {sleep_time // 3600}h {(sleep_time % 3600) // 60}m")
+
+            # Interruptible sleep
+            if shutdown_event.wait(sleep_time):
+                plugin.log("Financial snapshot loop stopping due to shutdown signal")
+                break
+
+            try:
+                _take_financial_snapshot()
+            except (RPCTimeoutError, RPCBreakerOpen) as e:
+                plugin.log(f"RPC degraded in financial snapshot: {e}. Skipping this cycle.", level='warn')
+            except Exception as e:
+                plugin.log(f"Error in financial snapshot: {e}", level='error')
+
+    def _take_financial_snapshot():
+        """Take a single financial snapshot and record it to the database."""
+        if database is None or profitability_analyzer is None:
+            plugin.log("Cannot take financial snapshot: components not initialized", level='warn')
+            return
+
+        # Get current TLV data
+        tlv_data = profitability_analyzer.get_tlv()
+
+        # Get lifetime accumulated stats
+        lifetime_stats = database.get_lifetime_stats()
+
+        # Record the snapshot
+        database.record_financial_snapshot(
+            total_local_balance_sats=tlv_data.get("total_local_sats", 0),
+            total_remote_balance_sats=tlv_data.get("total_remote_sats", 0),
+            total_onchain_sats=tlv_data.get("onchain_sats", 0),
+            total_capacity_sats=tlv_data.get("total_capacity_sats", 0),
+            total_revenue_accumulated_sats=lifetime_stats.get("total_revenue_sats", 0),
+            total_rebalance_cost_accumulated_sats=lifetime_stats.get("total_rebalance_cost_sats", 0),
+            channel_count=tlv_data.get("channel_count", 0)
+        )
+
+        plugin.log(
+            f"Financial snapshot recorded: TLV={tlv_data.get('tlv_sats', 0)} sats, "
+            f"channels={tlv_data.get('channel_count', 0)}"
+        )
+
     # =========================================================================
     # SIGNAL HANDLER: Clean Shutdown on `lightning-cli plugin stop`
     # =========================================================================
@@ -1169,7 +1235,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=fee_adjustment_loop, daemon=True, name="fee-adjustment").start()
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
-    
+    threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
+
     plugin.log("cl-revenue-ops plugin initialized successfully!")
     return None
 
@@ -2028,6 +2095,91 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
     
     else:
         return {"error": f"Unknown action: {action}. Use 'get', 'set', 'reset', or 'list-mutable'"}
+
+
+@plugin.method("revenue-dashboard")
+def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
+    """
+    Phase 8: The Sovereign Dashboard - P&L Engine
+
+    Returns financial health metrics and warnings about underperforming channels.
+
+    Args:
+        window_days: Number of days for P&L calculation (default: 30)
+
+    Returns:
+        {
+            "financial_health": {
+                "tlv_sats": int,           # Total Liquidating Value
+                "net_profit_sats": int,    # Net profit for window
+                "operating_margin_pct": float,  # (Net/Gross)*100
+                "annualized_roc_pct": float     # Return on Capacity annualized
+            },
+            "period": {
+                "window_days": int,
+                "gross_revenue_sats": int,
+                "opex_sats": int
+            },
+            "warnings": [str]  # Bleeder channel warnings
+        }
+    """
+    if profitability_analyzer is None:
+        return {"error": "Profitability analyzer not initialized"}
+
+    if database is None:
+        return {"error": "Database not initialized"}
+
+    try:
+        # Get TLV (Total Liquidating Value)
+        tlv_data = profitability_analyzer.get_tlv()
+        tlv_sats = tlv_data.get("tlv_sats", 0)
+
+        # Get P&L summary for the window
+        pnl = profitability_analyzer.get_pnl_summary(window_days)
+
+        # Get annualized ROC
+        roc_data = profitability_analyzer.calculate_roc(window_days)
+        annualized_roc_pct = roc_data.get("annualized_roc_pct", 0.0)
+
+        # Identify bleeder channels
+        bleeders = profitability_analyzer.identify_bleeders(window_days)
+
+        # Build warnings list
+        warnings = []
+        for bleeder in bleeders:
+            scid = bleeder.get("short_channel_id", "unknown")
+            spent = bleeder.get("rebalance_cost_sats", 0)
+            earned = bleeder.get("revenue_sats", 0)
+            alias = bleeder.get("alias", "")
+            if alias:
+                warnings.append(
+                    f"Channel {scid} ({alias}) is bleeding: "
+                    f"Spent {spent} sats rebalancing, earned {earned} sats."
+                )
+            else:
+                warnings.append(
+                    f"Channel {scid} is bleeding: "
+                    f"Spent {spent} sats rebalancing, earned {earned} sats."
+                )
+
+        return {
+            "financial_health": {
+                "tlv_sats": tlv_sats,
+                "net_profit_sats": pnl.get("net_profit_sats", 0),
+                "operating_margin_pct": pnl.get("operating_margin_pct", 0.0),
+                "annualized_roc_pct": annualized_roc_pct
+            },
+            "period": {
+                "window_days": window_days,
+                "gross_revenue_sats": pnl.get("gross_revenue_sats", 0),
+                "opex_sats": pnl.get("opex_sats", 0)
+            },
+            "warnings": warnings,
+            "bleeder_count": len(bleeders)
+        }
+    except Exception as e:
+        plugin.log(f"Error generating revenue dashboard: {e}", level='error')
+        return {"error": str(e)}
 
 
 # =============================================================================
