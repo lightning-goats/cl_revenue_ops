@@ -1161,12 +1161,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
         # Record the snapshot
         database.record_financial_snapshot(
-            total_local_balance_sats=tlv_data.get("total_local_sats", 0),
-            total_remote_balance_sats=tlv_data.get("total_remote_sats", 0),
-            total_onchain_sats=tlv_data.get("onchain_sats", 0),
-            total_capacity_sats=tlv_data.get("total_capacity_sats", 0),
-            total_revenue_accumulated_sats=lifetime_stats.get("total_revenue_sats", 0),
-            total_rebalance_cost_accumulated_sats=lifetime_stats.get("total_rebalance_cost_sats", 0),
+            local_balance_sats=tlv_data.get("total_local_sats", 0),
+            remote_balance_sats=tlv_data.get("total_remote_sats", 0),
+            onchain_sats=tlv_data.get("onchain_sats", 0),
+            capacity_sats=tlv_data.get("total_capacity_sats", 0),
+            revenue_accumulated_sats=lifetime_stats.get("total_revenue_sats", 0),
+            rebalance_cost_accumulated_sats=lifetime_stats.get("total_rebalance_cost_sats", 0),
             channel_count=tlv_data.get("channel_count", 0)
         )
 
