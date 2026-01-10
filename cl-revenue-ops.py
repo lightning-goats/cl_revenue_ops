@@ -61,6 +61,12 @@ from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, Pe
 
 
 # =============================================================================
+# PLUGIN VERSION
+# =============================================================================
+PLUGIN_VERSION = "1.4.0"
+
+
+# =============================================================================
 # RATE LIMITER FOR FORCE OPERATIONS (MAJOR-09 FIX)
 # =============================================================================
 # Prevents abuse of force=true parameters which bypass safety checks.
@@ -1404,6 +1410,7 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     
     return {
         "status": "running",
+        "version": PLUGIN_VERSION,
         "config": {
             "target_flow_sats": config.target_flow,
             "fee_range_ppm": [config.min_fee_ppm, config.max_fee_ppm],
