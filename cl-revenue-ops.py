@@ -1159,13 +1159,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # Get lifetime accumulated stats
         lifetime_stats = database.get_lifetime_stats()
 
+        # Convert revenue from msat to sats (get_lifetime_stats returns msat)
+        revenue_msat = lifetime_stats.get("total_revenue_msat", 0)
+        revenue_sats = revenue_msat // 1000
+
         # Record the snapshot
         database.record_financial_snapshot(
             local_balance_sats=tlv_data.get("total_local_sats", 0),
             remote_balance_sats=tlv_data.get("total_remote_sats", 0),
             onchain_sats=tlv_data.get("onchain_sats", 0),
             capacity_sats=tlv_data.get("total_capacity_sats", 0),
-            revenue_accumulated_sats=lifetime_stats.get("total_revenue_sats", 0),
+            revenue_accumulated_sats=revenue_sats,
             rebalance_cost_accumulated_sats=lifetime_stats.get("total_rebalance_cost_sats", 0),
             channel_count=tlv_data.get("channel_count", 0)
         )

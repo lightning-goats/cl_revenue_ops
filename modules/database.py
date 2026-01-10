@@ -1122,48 +1122,8 @@ class Database:
 
         return dict(row) if row else None
 
-    def get_lifetime_stats(self) -> Dict[str, int]:
-        """
-        Get lifetime aggregated stats for P&L calculations.
-
-        Returns:
-            Dict with total_revenue_sats, total_rebalance_cost_sats, total_forwards
-        """
-        conn = self._get_connection()
-
-        # Get lifetime revenue from forwards
-        rev_row = conn.execute("""
-            SELECT COALESCE(SUM(fee_msat), 0) as total_fee_msat,
-                   COUNT(*) as forward_count
-            FROM forwards
-        """).fetchone()
-
-        # Get lifetime rebalance costs
-        cost_row = conn.execute("""
-            SELECT COALESCE(SUM(actual_fee_sats), 0) as total_cost
-            FROM rebalance_history
-            WHERE status = 'success' AND actual_fee_sats IS NOT NULL
-        """).fetchone()
-
-        # Add any pruned data from lifetime_aggregates
-        pruned_row = conn.execute("""
-            SELECT pruned_revenue_msat, pruned_forward_count
-            FROM lifetime_aggregates
-            WHERE id = 1
-        """).fetchone()
-
-        pruned_revenue_msat = pruned_row['pruned_revenue_msat'] if pruned_row else 0
-        pruned_forward_count = pruned_row['pruned_forward_count'] if pruned_row else 0
-
-        total_revenue_msat = (rev_row['total_fee_msat'] if rev_row else 0) + pruned_revenue_msat
-        total_forwards = (rev_row['forward_count'] if rev_row else 0) + pruned_forward_count
-        total_cost = cost_row['total_cost'] if cost_row else 0
-
-        return {
-            'total_revenue_sats': total_revenue_msat // 1000,
-            'total_rebalance_cost_sats': total_cost,
-            'total_forwards': total_forwards
-        }
+    # NOTE: get_lifetime_stats() is defined later in this file (line ~1954)
+    # with the complete implementation that includes opening costs.
 
     def get_channel_pnl(self, channel_id: str, window_days: int = 30) -> Dict[str, Any]:
         """

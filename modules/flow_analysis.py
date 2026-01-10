@@ -192,19 +192,21 @@ class FlowAnalyzer:
             peer_id = channel.get("peer_id", "")
             
             # Calculate capacity - may be null in some CLN versions
+            # Always fetch spendable/receivable first for balance calculation
+            spendable_msat = channel.get("spendable_msat", 0) or 0
+            receivable_msat = channel.get("receivable_msat", 0) or 0
+
             capacity_msat = channel.get("capacity_msat")
             if capacity_msat is None or capacity_msat == 0:
                 # Calculate from spendable + receivable (approximate)
-                spendable_msat = channel.get("spendable_msat", 0) or 0
-                receivable_msat = channel.get("receivable_msat", 0) or 0
                 capacity = (spendable_msat + receivable_msat) // 1000
             else:
                 capacity = capacity_msat // 1000
-            
+
             if capacity == 0:
                 capacity = channel.get("capacity", 0)
-            
-            # Get current balance for fallback inference (already fetched above for capacity calc)
+
+            # Get current balance for fallback inference
             our_balance = spendable_msat // 1000
             
             # Get daily buckets for this channel
