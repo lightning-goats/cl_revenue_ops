@@ -157,7 +157,13 @@ class PolicyManager:
         tags_json = row['tags'] or '[]'
         try:
             tags = json.loads(tags_json)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as e:
+            # Log warning for corrupted JSON - indicates database corruption
+            self.plugin.log(
+                f"PolicyManager: Corrupted tags JSON for peer {row['peer_id'][:12]}...: {e}. "
+                f"Defaulting to empty tags.",
+                level='unusual'
+            )
             tags = []
         
         return PeerPolicy(
