@@ -757,7 +757,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         enable_scarcity_pricing=options['revenue-ops-scarcity-pricing'].lower() == 'true',
         scarcity_threshold=float(options['revenue-ops-scarcity-threshold']),
         rpc_timeout_seconds=int(options['revenue-ops-rpc-timeout-seconds']),
-        rpc_circuit_breaker_seconds=int(options['revenue-ops-rpc-circuit-breaker-seconds'])
+        rpc_circuit_breaker_seconds=int(options['revenue-ops-rpc-circuit-breaker-seconds']),
+        # Phase 9: Hive Integration (cl-hive fleet coordination)
+        hive_fee_ppm=int(options['revenue-ops-hive-fee-ppm']),
+        hive_rebalance_tolerance=int(options['revenue-ops-hive-rebalance-tolerance'])
     )
     
     plugin.log(f"Configuration loaded: target_flow={config.target_flow}, "
