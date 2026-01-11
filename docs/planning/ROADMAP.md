@@ -243,5 +243,54 @@ The distributed fleet coordination logic has been decoupled into a standalone pl
 - [x] **Phase 7:** Governance Modes (Advisor, Autonomous, Oracle).
 - [x] **Phase 8:** RPC Commands (`hive-status`, `hive-join`, `hive-topology`, etc.).
 
+## Phase 10: Policy Manager v2.0 (Efficiency & Automation)
+*Status: COMPLETED (v1.7.0)*
+*Objective: Improve policy manager efficiency, add automation capabilities, and enable real-time response to policy changes.*
+
+### v1.7.0: Policy Manager Improvements ✅ COMPLETED
+
+Six security-hardened improvements for policy management:
+
+- [x] **Granular Cache Invalidation (Write-Through Pattern)**:
+    - Replace full cache rebuilds with single-peer updates.
+    - `_update_cache()` and `_remove_from_cache()` for O(1) operations.
+    - Eliminates cache thrashing during high-frequency policy updates.
+
+- [x] **Per-Policy Fee Multiplier Bounds**:
+    - Override fee multipliers per peer with `fee_multiplier_min` and `fee_multiplier_max`.
+    - Security: `GLOBAL_MIN_FEE_MULTIPLIER=0.1`, `GLOBAL_MAX_FEE_MULTIPLIER=5.0`.
+    - Allows fine-tuned control for specific peers while maintaining safety limits.
+
+- [x] **Auto-Policy Suggestions from Profitability**:
+    - `get_policy_suggestions()` analyzes profitability data to recommend changes.
+    - Detects bleeders (rebalance costs > revenue) → suggests `rebalance=disabled`.
+    - Detects zombies (no activity + underwater) → suggests `strategy=passive`.
+    - Detects high-velocity sources → suggests `rebalance=source_only`.
+    - Security: `MIN_OBSERVATION_DAYS=7` before suggesting.
+
+- [x] **Time-Limited Policy Overrides**:
+    - `expires_in_hours` parameter for temporary policies.
+    - `is_expired()` method and `cleanup_expired_policies()` for maintenance.
+    - Security: `MAX_POLICY_EXPIRY_DAYS=30` prevents forgotten policies.
+
+- [x] **Policy Change Events/Callbacks**:
+    - `register_on_change()` and `unregister_on_change()` for immediate response.
+    - Enables other modules (fee_controller, rebalancer) to react instantly.
+    - Security: Exception handling per callback prevents cascade failures.
+
+- [x] **Batch Policy Operations**:
+    - `set_policies_batch()` for atomic multi-peer updates.
+    - Uses `executemany` for database efficiency.
+    - Security: `MAX_BATCH_SIZE=100`, rate limiting applies.
+
+- [x] **Rate Limiting Security**:
+    - `MAX_POLICY_CHANGES_PER_MINUTE=10` per peer.
+    - Prevents policy change spam attacks.
+    - `_check_rate_limit()` with sliding window.
+
+- [x] **Database Schema Migration**:
+    - Added `fee_multiplier_min REAL`, `fee_multiplier_max REAL`, `expires_at INTEGER` columns.
+    - Backwards-compatible with existing policies.
+
 ---
 *Roadmap updated: January 11, 2026*

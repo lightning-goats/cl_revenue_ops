@@ -30,7 +30,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the **clbos
 - **Strategic Exemption:** Allows negative-EV rebalances for "Hive" peers (coordinated fleets).
 - **Uses cln-sling** for async background execution with orphan job cleanup.
 
-### Module 4: Policy Engine (v1.4)
+### Module 4: Policy Engine (v2.0)
 - **Centralized Control:** Manage per-peer behavior via `revenue-policy`.
 - **Strategies:**
   - `dynamic`: Full Hill Climbing + Scarcity (Default).
@@ -38,6 +38,12 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the **clbos
   - `passive`: Do not manage fees (let CLBOSS handle it).
   - `hive`: Fleet mode (0-fee internal routing).
 - **Rebalance Modes:** Enable/Disable rebalancing per peer or set directional (Sink-Only/Source-Only).
+- **v2.0 Improvements:**
+  - **Per-Policy Fee Bounds:** Override fee multipliers per peer (`fee_multiplier_min`, `fee_multiplier_max`).
+  - **Time-Limited Policies:** Auto-expiring overrides via `expires_in_hours` (max 30 days).
+  - **Auto-Suggestions:** Detect bleeders/zombies and suggest policy changes.
+  - **Batch Operations:** Update multiple policies atomically.
+  - **Rate Limiting:** Prevents policy change spam (10/minute per peer).
 
 ### Module 5: Observability & Reporting
 - **Prometheus Exporter:** Native HTTP server (localhost only) for Grafana dashboards.

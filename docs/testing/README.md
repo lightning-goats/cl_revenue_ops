@@ -108,6 +108,25 @@ All features are enabled by default and can be disabled via class constants in `
 - Strategy validation (static/dynamic/hive)
 - Rebalance mode configuration
 
+### Policy Manager v2.0 Improvements
+The policy manager includes six algorithm improvements with security mitigations:
+
+| Improvement | Description | Security Mitigations |
+|-------------|-------------|---------------------|
+| **Granular Cache Invalidation** | Write-through cache pattern for single-peer updates | Eliminates full cache rebuilds |
+| **Per-Policy Fee Multiplier Bounds** | Override fee multipliers per-peer | `GLOBAL_MIN=0.1`, `GLOBAL_MAX=5.0` |
+| **Auto-Policy Suggestions** | Suggest policy changes from profitability data | `MIN_OBSERVATION_DAYS=7`, bleeder detection |
+| **Time-Limited Policy Overrides** | Policies that auto-expire | `MAX_EXPIRY_DAYS=30`, `expires_in_hours` param |
+| **Policy Change Events/Callbacks** | Register callbacks for immediate response | Exception handling per callback |
+| **Batch Policy Operations** | Update multiple policies atomically | `MAX_BATCH_SIZE=100`, rate limiting |
+
+Additional security features:
+- **Rate Limiting**: `MAX_POLICY_CHANGES_PER_MINUTE=10` per peer
+- **Global Bounds Enforcement**: Fee multipliers clamped to global limits
+- **Expiry Validation**: Maximum expiry duration prevents forgotten policies
+
+All features are enabled by default and can be disabled via module constants in `policy_manager.py`.
+
 ### Profitability Analyzer
 - ROI calculation
 - Revenue tracking

@@ -504,6 +504,28 @@ class Database:
         except sqlite3.OperationalError:
             pass
 
+        # v2.0 Migration: Add peer_policies columns for Policy Manager v2.0
+        # - fee_multiplier_min: Per-peer fee multiplier floor
+        # - fee_multiplier_max: Per-peer fee multiplier ceiling
+        # - expires_at: Unix timestamp for time-limited policies
+        try:
+            conn.execute("ALTER TABLE peer_policies ADD COLUMN fee_multiplier_min REAL")
+            self.plugin.log("Added fee_multiplier_min column to peer_policies")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE peer_policies ADD COLUMN fee_multiplier_max REAL")
+            self.plugin.log("Added fee_multiplier_max column to peer_policies")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE peer_policies ADD COLUMN expires_at INTEGER")
+            self.plugin.log("Added expires_at column to peer_policies")
+        except sqlite3.OperationalError:
+            pass
+
         # v1.4 Migration: Migrate ignored_peers to peer_policies
         # This migrates legacy "ignored" peers to the new policy system
         self._migrate_ignored_peers_to_policies(conn)

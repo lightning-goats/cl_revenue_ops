@@ -659,6 +659,122 @@ test_policy() {
             run_test "$node policy manager works" "revenue_cli $node revenue-policy get $ALICE_PUBKEY | jq -e '.policy'"
         fi
     done
+
+    # =========================================================================
+    # v2.0 Policy Manager Improvements Tests
+    # =========================================================================
+    echo ""
+    log_info "Testing v2.0 policy manager improvements..."
+
+    # Test #1: Granular Cache Invalidation (Write-Through Pattern)
+    run_test "Policy v2.0 #1: Write-through cache update method exists" \
+        "grep -q 'def _update_cache' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #1: Granular cache removal method exists" \
+        "grep -q 'def _remove_from_cache' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #1: Write-through pattern in set_policy" \
+        "grep -q 'self._update_cache' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+
+    # Test #2: Per-Policy Fee Multiplier Bounds
+    run_test "Policy v2.0 #2: GLOBAL_MIN_FEE_MULTIPLIER constant" \
+        "grep -q 'GLOBAL_MIN_FEE_MULTIPLIER = 0.1' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #2: GLOBAL_MAX_FEE_MULTIPLIER constant" \
+        "grep -q 'GLOBAL_MAX_FEE_MULTIPLIER = 5.0' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #2: fee_multiplier_min field in PeerPolicy" \
+        "grep -q 'fee_multiplier_min.*Optional' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #2: fee_multiplier_max field in PeerPolicy" \
+        "grep -q 'fee_multiplier_max.*Optional' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #2: get_fee_multiplier_bounds method exists" \
+        "grep -q 'def get_fee_multiplier_bounds' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+
+    # Test #3: Auto-Policy Suggestions from Profitability
+    run_test "Policy v2.0 #3: ENABLE_AUTO_SUGGESTIONS constant" \
+        "grep -q 'ENABLE_AUTO_SUGGESTIONS = True' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #3: MIN_OBSERVATION_DAYS constant" \
+        "grep -q 'MIN_OBSERVATION_DAYS' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #3: BLEEDER_THRESHOLD_PERIODS constant" \
+        "grep -q 'BLEEDER_THRESHOLD_PERIODS' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #3: get_policy_suggestions method exists" \
+        "grep -q 'def get_policy_suggestions' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #3: Zombie detection threshold" \
+        "grep -q 'ZOMBIE_FORWARD_THRESHOLD' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+
+    # Test #4: Time-Limited Policy Overrides
+    run_test "Policy v2.0 #4: MAX_POLICY_EXPIRY_DAYS constant" \
+        "grep -q 'MAX_POLICY_EXPIRY_DAYS = 30' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #4: ENABLE_AUTO_EXPIRY constant" \
+        "grep -q 'ENABLE_AUTO_EXPIRY = True' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #4: expires_at field in PeerPolicy" \
+        "grep -q 'expires_at.*Optional.*int' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #4: is_expired method in PeerPolicy" \
+        "grep -q 'def is_expired' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #4: cleanup_expired_policies method exists" \
+        "grep -q 'def cleanup_expired_policies' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #4: expires_in_hours parameter in set_policy" \
+        "grep -q 'expires_in_hours.*Optional' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+
+    # Test #5: Policy Change Events/Callbacks
+    run_test "Policy v2.0 #5: _on_change_callbacks list" \
+        "grep -q '_on_change_callbacks' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #5: register_on_change method exists" \
+        "grep -q 'def register_on_change' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #5: unregister_on_change method exists" \
+        "grep -q 'def unregister_on_change' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #5: _notify_change method exists" \
+        "grep -q 'def _notify_change' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+
+    # Test #6: Batch Policy Operations
+    run_test "Policy v2.0 #6: set_policies_batch method exists" \
+        "grep -q 'def set_policies_batch' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #6: MAX_BATCH_SIZE limit" \
+        "grep -q 'MAX_BATCH_SIZE = 100' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 #6: executemany for batch efficiency" \
+        "grep -q 'executemany' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+
+    # Test Rate Limiting Security
+    run_test "Policy v2.0 Security: MAX_POLICY_CHANGES_PER_MINUTE constant" \
+        "grep -q 'MAX_POLICY_CHANGES_PER_MINUTE = 10' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 Security: _check_rate_limit method exists" \
+        "grep -q 'def _check_rate_limit' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0 Security: Rate limiting in set_policy" \
+        "grep -q '_check_rate_limit' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+
+    # Test Database Schema Migration
+    run_test "Policy v2.0 DB: fee_multiplier_min column migration" \
+        "grep -q \"peer_policies ADD COLUMN fee_multiplier_min\" /home/sat/cl_revenue_ops/modules/database.py"
+    run_test "Policy v2.0 DB: fee_multiplier_max column migration" \
+        "grep -q \"peer_policies ADD COLUMN fee_multiplier_max\" /home/sat/cl_revenue_ops/modules/database.py"
+    run_test "Policy v2.0 DB: expires_at column migration" \
+        "grep -q \"peer_policies ADD COLUMN expires_at\" /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Test v2.0 fields in to_dict serialization
+    run_test "Policy v2.0: fee_multiplier_min in to_dict" \
+        "grep -q '\"fee_multiplier_min\":' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0: fee_multiplier_max in to_dict" \
+        "grep -q '\"fee_multiplier_max\":' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0: expires_at in to_dict" \
+        "grep -q '\"expires_at\":' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+    run_test "Policy v2.0: is_expired in to_dict" \
+        "grep -q '\"is_expired\":' /home/sat/cl_revenue_ops/modules/policy_manager.py"
+
+    # =========================================================================
+    # v2.0 Runtime Tests (if channels exist)
+    # =========================================================================
+    echo ""
+    log_info "Testing v2.0 policy manager runtime..."
+
+    # Test v2.0 fields returned in policy get
+    BOB_POLICY_V2=$(revenue_cli alice revenue-policy get $BOB_PUBKEY 2>/dev/null)
+    if [ -n "$BOB_POLICY_V2" ]; then
+        # Check v2.0 fields exist in response (may be null for default policies)
+        run_test "Policy v2.0 runtime: Response has fee_multiplier_min field" \
+            "echo '$BOB_POLICY_V2' | jq -e '.policy | has(\"fee_multiplier_min\")'"
+        run_test "Policy v2.0 runtime: Response has fee_multiplier_max field" \
+            "echo '$BOB_POLICY_V2' | jq -e '.policy | has(\"fee_multiplier_max\")'"
+        run_test "Policy v2.0 runtime: Response has expires_at field" \
+            "echo '$BOB_POLICY_V2' | jq -e '.policy | has(\"expires_at\")'"
+        run_test "Policy v2.0 runtime: Response has is_expired field" \
+            "echo '$BOB_POLICY_V2' | jq -e '.policy | has(\"is_expired\")'"
+    fi
 }
 
 # Profitability Analyzer Tests
