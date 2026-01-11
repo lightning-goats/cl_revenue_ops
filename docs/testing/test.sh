@@ -334,6 +334,74 @@ test_fees() {
     FEE_INTERVAL=$(revenue_cli alice revenue-config get fee_interval 2>/dev/null | jq -r '.value // 300')
     log_info "fee_interval: $FEE_INTERVAL seconds"
     run_test "fee_interval configured" "[ '$FEE_INTERVAL' -gt 0 ]"
+
+    # =========================================================================
+    # v2.0 Fee Algorithm Improvements Tests
+    # =========================================================================
+    echo ""
+    log_info "Testing v2.0 fee algorithm improvements..."
+
+    # Test Improvement #1: Multipliers to Bounds
+    run_test "Improvement #1: Bounds multipliers enabled" \
+        "grep -q 'ENABLE_BOUNDS_MULTIPLIERS = True' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #1: Floor multiplier cap exists" \
+        "grep -q 'MAX_FLOOR_MULTIPLIER' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #1: Ceiling multiplier floor exists" \
+        "grep -q 'MIN_CEILING_MULTIPLIER' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+
+    # Test Improvement #2: Dynamic Observation Windows
+    run_test "Improvement #2: Dynamic windows enabled" \
+        "grep -q 'ENABLE_DYNAMIC_WINDOWS = True' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #2: Min forwards for signal" \
+        "grep -q 'MIN_FORWARDS_FOR_SIGNAL' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #2: Max observation hours (security)" \
+        "grep -q 'MAX_OBSERVATION_HOURS' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #2: get_forward_count_since in database" \
+        "grep -q 'def get_forward_count_since' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Test Improvement #3: Historical Response Curve
+    run_test "Improvement #3: Historical curve enabled" \
+        "grep -q 'ENABLE_HISTORICAL_CURVE = True' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #3: HistoricalResponseCurve class exists" \
+        "grep -q 'class HistoricalResponseCurve' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #3: Max observations limit (security)" \
+        "grep -q 'MAX_OBSERVATIONS = 100' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #3: Regime change detection" \
+        "grep -q 'detect_regime_change' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+
+    # Test Improvement #4: Elasticity Tracking
+    run_test "Improvement #4: Elasticity enabled" \
+        "grep -q 'ENABLE_ELASTICITY = True' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #4: ElasticityTracker class exists" \
+        "grep -q 'class ElasticityTracker' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #4: Outlier threshold (security)" \
+        "grep -q 'OUTLIER_THRESHOLD' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #4: Revenue-weighted elasticity" \
+        "grep -q 'revenue_change_pct.*fee_change_pct' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+
+    # Test Improvement #5: Thompson Sampling
+    run_test "Improvement #5: Thompson Sampling enabled" \
+        "grep -q 'ENABLE_THOMPSON_SAMPLING = True' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #5: ThompsonSamplingState class exists" \
+        "grep -q 'class ThompsonSamplingState' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #5: Max exploration bounded (security)" \
+        "grep -q 'MAX_EXPLORATION_PCT = 0.20' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #5: Beta distribution sampling" \
+        "grep -q 'betavariate' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "Improvement #5: Ramp-up period for new channels" \
+        "grep -q 'RAMP_UP_CYCLES' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+
+    # Test v2.0 Database Schema
+    run_test "v2.0 DB: v2_state_json column migration" \
+        "grep -q 'v2_state_json' /home/sat/cl_revenue_ops/modules/database.py"
+    run_test "v2.0 DB: forward_count_since_update column" \
+        "grep -q 'forward_count_since_update' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # Test v2.0 State Persistence
+    run_test "v2.0 State: JSON serialization in save" \
+        "grep -q 'json.dumps.*v2_data' /home/sat/cl_revenue_ops/modules/fee_controller.py"
+    run_test "v2.0 State: JSON deserialization in load" \
+        "grep -q 'json.loads.*v2_json' /home/sat/cl_revenue_ops/modules/fee_controller.py"
 }
 
 # Rebalancer Tests

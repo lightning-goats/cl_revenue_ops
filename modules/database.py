@@ -481,7 +481,29 @@ class Database:
             self.plugin.log("Added rebalance_type column to rebalance_history")
         except sqlite3.OperationalError:
             pass
-        
+
+        # v2.0 Migration: Add columns for fee algorithm improvements
+        # - forward_count_since_update: Dynamic observation windows (Improvement #2)
+        # - last_volume_sats: For elasticity tracking
+        # - v2_state_json: JSON blob for complex state (historical curve, elasticity, Thompson)
+        try:
+            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN forward_count_since_update INTEGER DEFAULT 0")
+            self.plugin.log("Added forward_count_since_update column to fee_strategy_state")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN last_volume_sats INTEGER DEFAULT 0")
+            self.plugin.log("Added last_volume_sats column to fee_strategy_state")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN v2_state_json TEXT DEFAULT '{}'")
+            self.plugin.log("Added v2_state_json column to fee_strategy_state")
+        except sqlite3.OperationalError:
+            pass
+
         # v1.4 Migration: Migrate ignored_peers to peer_policies
         # This migrates legacy "ignored" peers to the new policy system
         self._migrate_ignored_peers_to_policies(conn)
@@ -726,22 +748,22 @@ class Database:
     def get_fee_strategy_state(self, channel_id: str) -> Dict[str, Any]:
         """
         Get Hill Climbing fee strategy state for a channel.
-        
+
         Used by the revenue-maximizing Perturb & Observe algorithm.
-        
+
         Args:
             channel_id: Channel to get state for
-            
+
         Returns:
             Dict with last_revenue_rate, last_fee_ppm, trend_direction, step_ppm,
-            is_sleeping, sleep_until, stable_cycles, etc.
+            is_sleeping, sleep_until, stable_cycles, v2.0 fields, etc.
         """
         conn = self._get_connection()
         row = conn.execute(
             "SELECT * FROM fee_strategy_state WHERE channel_id = ?",
             (channel_id,)
         ).fetchone()
-        
+
         if row:
             result = dict(row)
             # Handle migration: old schema had last_revenue_sats (int)
@@ -760,8 +782,15 @@ class Database:
                 result['stable_cycles'] = 0
             if 'last_broadcast_fee_ppm' not in result:
                 result['last_broadcast_fee_ppm'] = result.get('last_fee_ppm', 0)
+            # v2.0 fields
+            if 'forward_count_since_update' not in result:
+                result['forward_count_since_update'] = 0
+            if 'last_volume_sats' not in result:
+                result['last_volume_sats'] = 0
+            if 'v2_state_json' not in result:
+                result['v2_state_json'] = '{}'
             return result
-        
+
         # Return default state if not found
         return {
             'channel_id': channel_id,
@@ -775,7 +804,11 @@ class Database:
             'last_state': 'unknown',
             'is_sleeping': 0,
             'sleep_until': 0,
-            'stable_cycles': 0
+            'stable_cycles': 0,
+            # v2.0 fields
+            'forward_count_since_update': 0,
+            'last_volume_sats': 0,
+            'v2_state_json': '{}'
         }
     
     def update_fee_strategy_state(self, channel_id: str, last_revenue_rate: float,
@@ -786,13 +819,16 @@ class Database:
                                    last_state: str = 'unknown',
                                    is_sleeping: int = 0,
                                    sleep_until: int = 0,
-                                   stable_cycles: int = 0):
+                                   stable_cycles: int = 0,
+                                   forward_count_since_update: int = 0,
+                                   last_volume_sats: int = 0,
+                                   v2_state_json: str = '{}'):
         """
         Update Hill Climbing fee strategy state for a channel.
-        
+
         Called after each fee adjustment iteration to record the state
         for the next observation period.
-        
+
         Args:
             channel_id: Channel to update
             last_revenue_rate: Revenue rate in sats/hour observed since last change
@@ -805,19 +841,24 @@ class Database:
             is_sleeping: Deadband hysteresis sleep state (0 = awake, 1 = sleeping)
             sleep_until: Unix timestamp when to wake up from sleep mode
             stable_cycles: Number of consecutive stable cycles (for hysteresis)
+            forward_count_since_update: v2.0 - Forwards since last fee change
+            last_volume_sats: v2.0 - Volume during last period (for elasticity)
+            v2_state_json: v2.0 - JSON blob for historical curve, elasticity, Thompson state
         """
         conn = self._get_connection()
         now = int(time.time())
-        
+
         conn.execute("""
-            INSERT OR REPLACE INTO fee_strategy_state 
+            INSERT OR REPLACE INTO fee_strategy_state
             (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
              step_ppm, consecutive_same_direction, last_update,
-             last_broadcast_fee_ppm, last_state, is_sleeping, sleep_until, stable_cycles)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             last_broadcast_fee_ppm, last_state, is_sleeping, sleep_until, stable_cycles,
+             forward_count_since_update, last_volume_sats, v2_state_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
               step_ppm, consecutive_same_direction, now,
-              last_broadcast_fee_ppm, last_state, is_sleeping, sleep_until, stable_cycles))
+              last_broadcast_fee_ppm, last_state, is_sleeping, sleep_until, stable_cycles,
+              forward_count_since_update, last_volume_sats, v2_state_json))
     
     def get_all_fee_strategy_states(self) -> List[Dict[str, Any]]:
         """Get fee strategy state for all channels."""
@@ -1741,10 +1782,34 @@ class Database:
             FROM forwards
             WHERE out_channel = ? AND timestamp > ?
         """, (channel_id, timestamp)).fetchone()
-        
+
         # Convert msat to sats
         return (row['total_out_msat'] // 1000) if row else 0
-    
+
+    def get_forward_count_since(self, channel_id: str, timestamp: int) -> int:
+        """
+        Get number of forwards for a channel since a specific timestamp.
+
+        Used by dynamic observation windows (Improvement #2) to determine
+        when we have enough data points for statistically significant fee decisions.
+
+        Args:
+            channel_id: Channel to count forwards for
+            timestamp: Unix timestamp to start counting from
+
+        Returns:
+            Number of forwards since the timestamp
+        """
+        conn = self._get_connection()
+
+        row = conn.execute("""
+            SELECT COUNT(*) as forward_count
+            FROM forwards
+            WHERE out_channel = ? AND timestamp > ?
+        """, (channel_id, timestamp)).fetchone()
+
+        return row['forward_count'] if row else 0
+
     def get_weighted_volume_since(self, channel_id: str, timestamp: int) -> int:
         """
         Get reputation-weighted outbound volume for a channel since a timestamp.

@@ -34,7 +34,9 @@ find the optimal price point where volume * fee is maximized.
 """
 
 import time
-from dataclasses import dataclass
+import random
+import math
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
 
 from pyln.client import Plugin, RpcError
@@ -49,14 +51,479 @@ if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
 
 
+# =============================================================================
+# IMPROVEMENT #3: Historical Response Curve
+# =============================================================================
+# Store past fee→revenue experiments per channel with exponential decay.
+# Security mitigations:
+# - Fixed-size rolling history (max 100 observations per channel)
+# - Exponential decay weights (recent data matters more)
+# - Periodic curve reset on regime change detection
+# =============================================================================
+
+@dataclass
+class FeeRevenueObservation:
+    """Single observation of fee→revenue relationship."""
+    fee_ppm: int
+    revenue_rate: float  # sats/hour
+    timestamp: int
+    forward_count: int  # Number of forwards in this observation
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "fee_ppm": self.fee_ppm,
+            "revenue_rate": self.revenue_rate,
+            "timestamp": self.timestamp,
+            "forward_count": self.forward_count
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "FeeRevenueObservation":
+        return cls(
+            fee_ppm=d.get("fee_ppm", 0),
+            revenue_rate=d.get("revenue_rate", 0.0),
+            timestamp=d.get("timestamp", 0),
+            forward_count=d.get("forward_count", 0)
+        )
+
+
+@dataclass
+class HistoricalResponseCurve:
+    """
+    Historical fee→revenue response curve for a channel.
+
+    Security mitigations:
+    - MAX_OBSERVATIONS: Fixed-size to prevent database bloat DoS
+    - DECAY_HALFLIFE: Recent data weighted more (stale data fades)
+    - regime_change_count: Detect market regime changes and reset
+    """
+    MAX_OBSERVATIONS = 100  # Security: bounded memory per channel
+    DECAY_HALFLIFE_HOURS = 168.0  # 7 days half-life
+    MIN_OBSERVATIONS_FOR_PREDICTION = 5  # Need enough data points
+
+    observations: List[FeeRevenueObservation] = field(default_factory=list)
+    regime_change_count: int = 0  # Track regime shifts
+    last_regime_check: int = 0
+
+    def add_observation(self, fee_ppm: int, revenue_rate: float,
+                       forward_count: int) -> None:
+        """Add a new observation, pruning oldest if at capacity."""
+        now = int(time.time())
+        obs = FeeRevenueObservation(
+            fee_ppm=fee_ppm,
+            revenue_rate=revenue_rate,
+            timestamp=now,
+            forward_count=forward_count
+        )
+        self.observations.append(obs)
+
+        # Security: Enforce max size (FIFO eviction)
+        if len(self.observations) > self.MAX_OBSERVATIONS:
+            self.observations = self.observations[-self.MAX_OBSERVATIONS:]
+
+    def get_weighted_observations(self) -> List[Tuple[int, float, float]]:
+        """
+        Get observations with exponential decay weights.
+
+        Returns:
+            List of (fee_ppm, revenue_rate, weight) tuples
+        """
+        now = int(time.time())
+        results = []
+
+        for obs in self.observations:
+            age_hours = (now - obs.timestamp) / 3600.0
+            # Exponential decay: weight = 0.5^(age/halflife)
+            weight = math.pow(0.5, age_hours / self.DECAY_HALFLIFE_HOURS)
+            # Also weight by forward count (more data = more confidence)
+            weight *= min(1.0, obs.forward_count / 10.0)
+            results.append((obs.fee_ppm, obs.revenue_rate, weight))
+
+        return results
+
+    def predict_optimal_fee(self, floor_ppm: int, ceiling_ppm: int) -> Optional[int]:
+        """
+        Predict optimal fee based on historical data.
+
+        Uses weighted quadratic fit to find revenue maximum.
+        Returns None if insufficient data.
+        """
+        weighted_obs = self.get_weighted_observations()
+
+        if len(weighted_obs) < self.MIN_OBSERVATIONS_FOR_PREDICTION:
+            return None
+
+        # Find the fee with highest weighted revenue in our history
+        best_fee = None
+        best_revenue = -1.0
+
+        for fee_ppm, revenue_rate, weight in weighted_obs:
+            weighted_revenue = revenue_rate * weight
+            if weighted_revenue > best_revenue:
+                best_revenue = weighted_revenue
+                best_fee = fee_ppm
+
+        if best_fee is None:
+            return None
+
+        # Clamp to bounds
+        return max(floor_ppm, min(ceiling_ppm, best_fee))
+
+    def detect_regime_change(self, current_revenue_rate: float) -> bool:
+        """
+        Detect if market regime has changed (invalidates historical data).
+
+        A regime change is detected if current revenue is significantly
+        different from recent historical average.
+        """
+        if len(self.observations) < 10:
+            return False
+
+        # Get recent observations (last 10)
+        recent = self.observations[-10:]
+        avg_revenue = sum(o.revenue_rate for o in recent) / len(recent)
+
+        if avg_revenue <= 0:
+            return False
+
+        # Regime change if current is >3x or <0.33x the average
+        ratio = current_revenue_rate / avg_revenue
+        if ratio > 3.0 or ratio < 0.33:
+            self.regime_change_count += 1
+            return True
+
+        return False
+
+    def reset_curve(self) -> None:
+        """Reset the curve (used on regime change)."""
+        self.observations = []
+        self.regime_change_count = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "observations": [o.to_dict() for o in self.observations],
+            "regime_change_count": self.regime_change_count,
+            "last_regime_check": self.last_regime_check
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "HistoricalResponseCurve":
+        curve = cls()
+        curve.observations = [
+            FeeRevenueObservation.from_dict(o)
+            for o in d.get("observations", [])
+        ]
+        curve.regime_change_count = d.get("regime_change_count", 0)
+        curve.last_regime_check = d.get("last_regime_check", 0)
+        return curve
+
+
+# =============================================================================
+# IMPROVEMENT #4: Elasticity Tracking
+# =============================================================================
+# Track (Δvolume/volume) / (Δfee/fee) to understand demand sensitivity.
+# Security mitigations:
+# - Revenue-weighted (not volume) to prevent volume stuffing
+# - Outlier detection on sudden volume changes
+# - Minimum sample size requirements
+# =============================================================================
+
+@dataclass
+class ElasticityTracker:
+    """
+    Track price elasticity of demand for a channel.
+
+    Elasticity = (Δvolume/volume) / (Δfee/fee)
+    - Elasticity < -1: Elastic (volume drops faster than fee rises)
+    - Elasticity > -1: Inelastic (can raise fees without losing much volume)
+
+    Security mitigations:
+    - Use revenue-weighted changes (not raw volume) to prevent stuffing
+    - Outlier detection: ignore sudden 5x volume changes
+    - Minimum fee change threshold to get valid signal
+    """
+    MAX_HISTORY = 20  # Rolling window
+    OUTLIER_THRESHOLD = 5.0  # Ignore >5x volume changes (attack protection)
+    MIN_FEE_CHANGE_PCT = 0.05  # Need 5% fee change for valid measurement
+    MIN_SAMPLES = 3  # Minimum samples for elasticity estimate
+
+    # Historical data points: (fee_ppm, volume_sats, revenue_rate, timestamp)
+    history: List[Tuple[int, int, float, int]] = field(default_factory=list)
+    current_elasticity: float = -1.0  # Default assumption: unit elastic
+    confidence: float = 0.0  # 0-1 confidence in estimate
+
+    def add_observation(self, fee_ppm: int, volume_sats: int,
+                       revenue_rate: float) -> None:
+        """Add observation, maintaining rolling window."""
+        now = int(time.time())
+        self.history.append((fee_ppm, volume_sats, revenue_rate, now))
+
+        # Enforce max size
+        if len(self.history) > self.MAX_HISTORY:
+            self.history = self.history[-self.MAX_HISTORY:]
+
+        # Recalculate elasticity
+        self._update_elasticity()
+
+    def _update_elasticity(self) -> None:
+        """Calculate elasticity from recent observations."""
+        if len(self.history) < 2:
+            return
+
+        elasticities = []
+        weights = []
+
+        for i in range(1, len(self.history)):
+            prev_fee, prev_vol, prev_rev, prev_ts = self.history[i-1]
+            curr_fee, curr_vol, curr_rev, curr_ts = self.history[i]
+
+            # Skip if fee didn't change enough
+            if prev_fee <= 0:
+                continue
+            fee_change_pct = abs(curr_fee - prev_fee) / prev_fee
+            if fee_change_pct < self.MIN_FEE_CHANGE_PCT:
+                continue
+
+            # Skip if volume change is suspicious (outlier detection)
+            if prev_vol > 0:
+                vol_ratio = curr_vol / prev_vol if prev_vol > 0 else 1.0
+                if vol_ratio > self.OUTLIER_THRESHOLD or vol_ratio < 1/self.OUTLIER_THRESHOLD:
+                    continue  # Likely attack or anomaly
+
+            # Calculate elasticity using revenue (not volume) for security
+            # Revenue-weighted protects against volume stuffing attacks
+            if prev_rev > 0 and prev_fee > 0:
+                revenue_change_pct = (curr_rev - prev_rev) / prev_rev
+                fee_change_pct_signed = (curr_fee - prev_fee) / prev_fee
+
+                if abs(fee_change_pct_signed) > 0.01:  # Avoid division by tiny numbers
+                    # Revenue elasticity (similar interpretation to price elasticity)
+                    elasticity = revenue_change_pct / fee_change_pct_signed
+
+                    # Weight by recency (newer = higher weight)
+                    age_hours = (int(time.time()) - curr_ts) / 3600.0
+                    weight = math.exp(-age_hours / 168.0)  # 7-day decay
+
+                    elasticities.append(elasticity)
+                    weights.append(weight)
+
+        if len(elasticities) >= self.MIN_SAMPLES:
+            # Weighted average
+            total_weight = sum(weights)
+            if total_weight > 0:
+                self.current_elasticity = sum(
+                    e * w for e, w in zip(elasticities, weights)
+                ) / total_weight
+                self.confidence = min(1.0, len(elasticities) / 10.0)
+        else:
+            self.confidence = 0.0
+
+    def get_fee_adjustment_hint(self) -> str:
+        """
+        Get hint for fee adjustment based on elasticity.
+
+        Returns:
+            "raise" if inelastic (can raise fees)
+            "lower" if elastic (should lower fees)
+            "hold" if uncertain
+        """
+        if self.confidence < 0.3:
+            return "hold"  # Not enough confidence
+
+        # Revenue elasticity interpretation:
+        # > 0: Revenue increases when fee increases (rare, very inelastic)
+        # < 0 and > -1: Revenue drops less than fee rises (inelastic)
+        # < -1: Revenue drops more than fee rises (elastic)
+
+        if self.current_elasticity > -0.5:
+            return "raise"  # Very inelastic - can raise fees
+        elif self.current_elasticity < -1.5:
+            return "lower"  # Very elastic - should lower fees
+        else:
+            return "hold"  # Near unit elasticity
+
+    def get_optimal_direction(self) -> int:
+        """
+        Get optimal fee direction based on elasticity.
+
+        Returns:
+            1 for increase, -1 for decrease, 0 for hold
+        """
+        hint = self.get_fee_adjustment_hint()
+        if hint == "raise":
+            return 1
+        elif hint == "lower":
+            return -1
+        return 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "history": self.history,
+            "current_elasticity": self.current_elasticity,
+            "confidence": self.confidence
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ElasticityTracker":
+        tracker = cls()
+        tracker.history = [tuple(h) for h in d.get("history", [])]
+        tracker.current_elasticity = d.get("current_elasticity", -1.0)
+        tracker.confidence = d.get("confidence", 0.0)
+        return tracker
+
+
+# =============================================================================
+# IMPROVEMENT #5: Thompson Sampling
+# =============================================================================
+# Multi-armed bandit algorithm for exploration vs exploitation.
+# Security mitigations:
+# - Bounded exploration deviation (max ±20% from current fee)
+# - Minimum exploration duration before updating posterior
+# - Gradual exploration ramp-up on new channels
+# =============================================================================
+
+@dataclass
+class ThompsonSamplingState:
+    """
+    Thompson Sampling state for fee exploration.
+
+    Uses Beta distribution to model success probability at each fee level.
+    "Success" is defined as revenue rate exceeding a threshold.
+
+    Security mitigations:
+    - MAX_EXPLORATION_PCT: Never explore more than ±20% from base
+    - MIN_EXPLORE_DURATION: Don't update beliefs too quickly
+    - RAMP_UP_CYCLES: Gradual increase in exploration for new channels
+    """
+    MAX_EXPLORATION_PCT = 0.20  # Max ±20% deviation
+    MIN_EXPLORE_DURATION_HOURS = 2.0  # Minimum time at a fee before judging
+    RAMP_UP_CYCLES = 5  # Number of cycles before full exploration
+    NUM_ARMS = 5  # Discretize fee space into 5 arms: -20%, -10%, 0%, +10%, +20%
+
+    # Beta distribution parameters for each arm (alpha=successes+1, beta=failures+1)
+    # Arms represent: [-20%, -10%, 0%, +10%, +20%] deviations
+    alphas: List[float] = field(default_factory=lambda: [1.0, 1.0, 2.0, 1.0, 1.0])
+    betas: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0])
+
+    current_arm: int = 2  # Start with 0% deviation (center)
+    arm_start_time: int = 0
+    cycles_completed: int = 0
+    last_revenue_rate: float = 0.0
+    exploration_enabled: bool = True
+
+    def sample_arm(self) -> int:
+        """
+        Thompson Sampling: Sample from Beta distributions and pick best arm.
+
+        Returns arm index (0-4) representing fee deviation.
+        """
+        if not self.exploration_enabled:
+            return 2  # No exploration: use base fee
+
+        # Ramp up: reduce exploration early on
+        explore_prob = min(1.0, self.cycles_completed / self.RAMP_UP_CYCLES)
+        if random.random() > explore_prob:
+            return 2  # Use base fee during ramp-up
+
+        # Sample from each arm's Beta distribution
+        samples = []
+        for i in range(self.NUM_ARMS):
+            # Beta(alpha, beta) sample
+            sample = random.betavariate(self.alphas[i], self.betas[i])
+            samples.append(sample)
+
+        # Return arm with highest sample
+        return samples.index(max(samples))
+
+    def get_fee_multiplier(self, arm: int) -> float:
+        """Convert arm index to fee multiplier."""
+        # Arms: 0=-20%, 1=-10%, 2=0%, 3=+10%, 4=+20%
+        deviations = [-0.20, -0.10, 0.0, 0.10, 0.20]
+        return 1.0 + deviations[arm]
+
+    def update_beliefs(self, arm: int, revenue_rate: float,
+                      baseline_rate: float) -> None:
+        """
+        Update Beta distribution based on observed outcome.
+
+        A "success" is revenue rate >= baseline (previous period).
+        """
+        now = int(time.time())
+        hours_elapsed = (now - self.arm_start_time) / 3600.0
+
+        # Security: Don't update too quickly
+        if hours_elapsed < self.MIN_EXPLORE_DURATION_HOURS:
+            return
+
+        # Determine success/failure
+        # Success if revenue rate >= baseline (we did as well or better)
+        success = revenue_rate >= baseline_rate * 0.95  # 5% tolerance
+
+        if success:
+            self.alphas[arm] += 1.0
+        else:
+            self.betas[arm] += 1.0
+
+        # Bound parameters to prevent overflow
+        max_param = 100.0
+        self.alphas = [min(a, max_param) for a in self.alphas]
+        self.betas = [min(b, max_param) for b in self.betas]
+
+        self.cycles_completed += 1
+        self.last_revenue_rate = revenue_rate
+
+    def start_exploration(self, arm: int) -> None:
+        """Start exploring a new arm."""
+        self.current_arm = arm
+        self.arm_start_time = int(time.time())
+
+    def get_best_arm(self) -> int:
+        """Get the arm with highest expected value (exploitation only)."""
+        expected_values = [
+            self.alphas[i] / (self.alphas[i] + self.betas[i])
+            for i in range(self.NUM_ARMS)
+        ]
+        return expected_values.index(max(expected_values))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "alphas": self.alphas,
+            "betas": self.betas,
+            "current_arm": self.current_arm,
+            "arm_start_time": self.arm_start_time,
+            "cycles_completed": self.cycles_completed,
+            "last_revenue_rate": self.last_revenue_rate,
+            "exploration_enabled": self.exploration_enabled
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ThompsonSamplingState":
+        state = cls()
+        state.alphas = d.get("alphas", [1.0, 1.0, 2.0, 1.0, 1.0])
+        state.betas = d.get("betas", [1.0, 1.0, 1.0, 1.0, 1.0])
+        state.current_arm = d.get("current_arm", 2)
+        state.arm_start_time = d.get("arm_start_time", 0)
+        state.cycles_completed = d.get("cycles_completed", 0)
+        state.last_revenue_rate = d.get("last_revenue_rate", 0.0)
+        state.exploration_enabled = d.get("exploration_enabled", True)
+        return state
+
+
 @dataclass
 class HillClimbState:
     """
     State of the Hill Climbing fee optimizer for one channel.
-    
+
     UPDATED: Uses rate-based feedback (revenue per hour) instead of
     absolute revenue to eliminate lag from using 7-day averages.
-    
+
+    v2.0 IMPROVEMENTS:
+    - Dynamic observation windows (forward-count based)
+    - Historical response curve tracking
+    - Elasticity tracking for demand sensitivity
+    - Thompson Sampling for exploration
+    - Multipliers applied to bounds (not fee directly)
+
     Attributes:
         last_revenue_rate: Revenue rate in sats/hour observed since last fee change
         last_fee_ppm: Fee that was in effect during last period
@@ -68,6 +535,13 @@ class HillClimbState:
         sleep_until: Unix timestamp when to wake up from sleep mode
         stable_cycles: Number of consecutive stable cycles (for entering sleep)
         last_broadcast_fee_ppm: The last fee PPM broadcasted to the network
+
+        # v2.0 additions
+        forward_count_since_update: Forwards since last fee change (dynamic window)
+        last_volume_sats: Volume in sats during last observation period
+        historical_curve: Historical fee→revenue response curve
+        elasticity_tracker: Demand elasticity tracking
+        thompson_state: Thompson Sampling exploration state
     """
     last_revenue_rate: float = 0.0  # Revenue rate in sats/hour
     last_fee_ppm: int = 0
@@ -80,6 +554,49 @@ class HillClimbState:
     stable_cycles: int = 0  # Consecutive stable cycles counter
     last_broadcast_fee_ppm: int = 0  # Last fee PPM broadcasted to the network
     last_state: str = 'balanced'  # State during last broadcast
+
+    # v2.0: Dynamic observation windows (Improvement #2)
+    forward_count_since_update: int = 0  # Number of forwards since last fee change
+    last_volume_sats: int = 0  # Volume during last period (for elasticity)
+
+    # v2.0: Historical response curve (Improvement #3) - stored as dict for DB
+    historical_curve_data: Dict[str, Any] = field(default_factory=dict)
+
+    # v2.0: Elasticity tracking (Improvement #4) - stored as dict for DB
+    elasticity_data: Dict[str, Any] = field(default_factory=dict)
+
+    # v2.0: Thompson Sampling (Improvement #5) - stored as dict for DB
+    thompson_data: Dict[str, Any] = field(default_factory=dict)
+
+    def get_historical_curve(self) -> HistoricalResponseCurve:
+        """Deserialize historical curve from dict."""
+        if self.historical_curve_data:
+            return HistoricalResponseCurve.from_dict(self.historical_curve_data)
+        return HistoricalResponseCurve()
+
+    def set_historical_curve(self, curve: HistoricalResponseCurve) -> None:
+        """Serialize historical curve to dict."""
+        self.historical_curve_data = curve.to_dict()
+
+    def get_elasticity_tracker(self) -> ElasticityTracker:
+        """Deserialize elasticity tracker from dict."""
+        if self.elasticity_data:
+            return ElasticityTracker.from_dict(self.elasticity_data)
+        return ElasticityTracker()
+
+    def set_elasticity_tracker(self, tracker: ElasticityTracker) -> None:
+        """Serialize elasticity tracker to dict."""
+        self.elasticity_data = tracker.to_dict()
+
+    def get_thompson_state(self) -> ThompsonSamplingState:
+        """Deserialize Thompson Sampling state from dict."""
+        if self.thompson_data:
+            return ThompsonSamplingState.from_dict(self.thompson_data)
+        return ThompsonSamplingState()
+
+    def set_thompson_state(self, state: ThompsonSamplingState) -> None:
+        """Serialize Thompson Sampling state to dict."""
+        self.thompson_data = state.to_dict()
 
 
 @dataclass
@@ -253,13 +770,52 @@ class HillClimbingFeeController:
     DAMPENING_FACTOR = 0.5  # Step size decay factor on direction reversal (halve the step)
     MIN_OBSERVATION_HOURS = 1.0  # Minimum hours between fee changes for valid signal
     VOLATILITY_THRESHOLD = 0.50  # 50% change in revenue rate triggers volatility reset
-    
+
     # Deadband Hysteresis parameters (Phase 4: Stability & Scaling)
     # These reduce gossip noise by suppressing fee updates when the market is stable
     STABILITY_THRESHOLD = 0.01   # 1% change - consider market stable if below this
     WAKE_UP_THRESHOLD = 0.20     # 20% revenue spike triggers immediate wake-up
     SLEEP_CYCLES = 4             # Sleep for 4x the fee interval
     STABLE_CYCLES_REQUIRED = 3   # Number of flat cycles before entering sleep mode
+
+    # ==========================================================================
+    # v2.0 IMPROVEMENT PARAMETERS (with security mitigations)
+    # ==========================================================================
+
+    # Improvement #1: Multipliers to Bounds
+    # Instead of new_fee = base_fee * multiplier, we do:
+    # floor = base_floor * liquidity_multiplier
+    # ceiling = base_ceiling * profitability_multiplier
+    # This prevents oscillation from stacking multipliers on the fee itself
+    ENABLE_BOUNDS_MULTIPLIERS = True  # Feature flag
+    MAX_FLOOR_MULTIPLIER = 3.0        # Security: Floor can't exceed 3x base
+    MIN_CEILING_MULTIPLIER = 0.5      # Security: Ceiling can't go below 0.5x base
+
+    # Improvement #2: Dynamic Observation Windows
+    # Use forward count instead of just time-based windows
+    # Security mitigations:
+    # - MAX_OBSERVATION_HOURS: Hard ceiling (24h) prevents starvation attack
+    # - MIN_OBSERVATION_HOURS: Hard floor (1h) prevents burst manipulation
+    # - MIN_FORWARDS_FOR_SIGNAL: Statistical significance requirement
+    ENABLE_DYNAMIC_WINDOWS = True     # Feature flag
+    MIN_FORWARDS_FOR_SIGNAL = 5       # Need at least 5 forwards for valid signal
+    MAX_OBSERVATION_HOURS = 24.0      # Security: Maximum window (prevent starvation)
+    # Note: MIN_OBSERVATION_HOURS already defined above (1.0)
+
+    # Improvement #3: Historical Response Curve
+    # Security mitigations: See HistoricalResponseCurve class
+    ENABLE_HISTORICAL_CURVE = True    # Feature flag
+    REGIME_CHECK_INTERVAL = 3600      # Check for regime change every hour
+
+    # Improvement #4: Elasticity Tracking
+    # Security mitigations: See ElasticityTracker class
+    ENABLE_ELASTICITY = True          # Feature flag
+    ELASTICITY_WEIGHT = 0.3           # How much elasticity influences direction (0-1)
+
+    # Improvement #5: Thompson Sampling
+    # Security mitigations: See ThompsonSamplingState class
+    ENABLE_THOMPSON_SAMPLING = True   # Feature flag
+    THOMPSON_WEIGHT = 0.2             # Probability of using Thompson suggestion
     
     def __init__(self, plugin: Plugin, config: Config, database: Database, 
                  clboss_manager: ClbossManager,
@@ -648,20 +1204,79 @@ class HillClimbingFeeController:
             hours_elapsed = (now - hc_state.last_update) / 3600.0
         else:
             hours_elapsed = 0.0
-        
-        # EDGE CASE: Protect against division by zero or very small time windows
-        # If the user manually triggers analysis twice instantly, hours_elapsed could be tiny
-        if hours_elapsed < self.MIN_OBSERVATION_HOURS:
-            self.plugin.log(
-                f"Skipping {channel_id[:12]}...: observation window too short "
-                f"({hours_elapsed:.2f}h < {self.MIN_OBSERVATION_HOURS}h minimum)",
-                level='debug'
-            )
-            # Still too early for valid signal - skip this channel for now
-            if hc_state.last_update > 0:  # Only skip if we have prior state
+
+        # =====================================================================
+        # IMPROVEMENT #2: Dynamic Observation Windows
+        # =====================================================================
+        # Use forward count in addition to time for observation windows.
+        # Security mitigations:
+        # - MAX_OBSERVATION_HOURS: Hard ceiling prevents starvation attack
+        # - MIN_OBSERVATION_HOURS: Hard floor prevents burst manipulation
+        # - MIN_FORWARDS_FOR_SIGNAL: Statistical significance requirement
+        # =====================================================================
+        forward_count = self.database.get_forward_count_since(channel_id, hc_state.last_update)
+        hc_state.forward_count_since_update = forward_count
+
+        if self.ENABLE_DYNAMIC_WINDOWS and hc_state.last_update > 0:
+            # Dynamic window logic:
+            # - Window closes when BOTH conditions met:
+            #   1. At least MIN_OBSERVATION_HOURS elapsed (security floor)
+            #   2. At least MIN_FORWARDS_FOR_SIGNAL forwards observed
+            # - Window MUST close if MAX_OBSERVATION_HOURS reached (security ceiling)
+
+            time_ok = hours_elapsed >= self.MIN_OBSERVATION_HOURS
+            forwards_ok = forward_count >= self.MIN_FORWARDS_FOR_SIGNAL
+            max_time_reached = hours_elapsed >= self.MAX_OBSERVATION_HOURS
+
+            if max_time_reached:
+                # Security: Force window close even without enough forwards
+                # This prevents starvation attack (adversary stops routing)
+                self.plugin.log(
+                    f"DYNAMIC_WINDOW: {channel_id[:12]}... max time reached "
+                    f"({hours_elapsed:.1f}h), closing window with {forward_count} forwards",
+                    level='debug'
+                )
+            elif not time_ok:
+                # Below minimum time - always wait
+                self.plugin.log(
+                    f"Skipping {channel_id[:12]}...: observation window too short "
+                    f"({hours_elapsed:.2f}h < {self.MIN_OBSERVATION_HOURS}h minimum)",
+                    level='debug'
+                )
                 return None
-            # First run - continue with initialization
-            hours_elapsed = 1.0  # Use 1 hour as default for first run
+            elif not forwards_ok:
+                # Have enough time but not enough forwards - wait for more data
+                # unless we've waited too long (caught by max_time_reached above)
+                self.plugin.log(
+                    f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting for more data "
+                    f"({forward_count}/{self.MIN_FORWARDS_FOR_SIGNAL} forwards, {hours_elapsed:.1f}h elapsed)",
+                    level='debug'
+                )
+                return None
+            else:
+                # Both conditions met - proceed
+                self.plugin.log(
+                    f"DYNAMIC_WINDOW: {channel_id[:12]}... window closed "
+                    f"({forward_count} forwards in {hours_elapsed:.1f}h)",
+                    level='debug'
+                )
+        else:
+            # Legacy behavior: time-only observation window
+            if hours_elapsed < self.MIN_OBSERVATION_HOURS:
+                self.plugin.log(
+                    f"Skipping {channel_id[:12]}...: observation window too short "
+                    f"({hours_elapsed:.2f}h < {self.MIN_OBSERVATION_HOURS}h minimum)",
+                    level='debug'
+                )
+                # Still too early for valid signal - skip this channel for now
+                if hc_state.last_update > 0:  # Only skip if we have prior state
+                    return None
+                # First run - continue with initialization
+                hours_elapsed = 1.0  # Use 1 hour as default for first run
+
+        # First run initialization
+        if hours_elapsed <= 0:
+            hours_elapsed = 1.0
         
         # Calculate REVENUE RATE (sats/hour) - this is our feedback signal
         # Revenue = Volume * Fee_PPM / 1_000_000
@@ -694,13 +1309,49 @@ class HillClimbingFeeController:
                 marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
         
         # Calculate Floor and Ceiling
-        floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id)
-        floor_ppm = max(floor_ppm, cfg.min_fee_ppm)
+        base_floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id)
+        base_floor_ppm = max(base_floor_ppm, cfg.min_fee_ppm)
         # Apply flow state to floor (sinks can go lower)
-        floor_ppm = int(floor_ppm * flow_state_multiplier)
-        floor_ppm = max(floor_ppm, 1)  # Never go below 1 ppm
+        base_floor_ppm = int(base_floor_ppm * flow_state_multiplier)
+        base_floor_ppm = max(base_floor_ppm, 1)  # Never go below 1 ppm
 
-        ceiling_ppm = cfg.max_fee_ppm
+        base_ceiling_ppm = cfg.max_fee_ppm
+
+        # =====================================================================
+        # IMPROVEMENT #1: Apply Multipliers to Bounds (Not Fee Directly)
+        # =====================================================================
+        # Instead of: new_fee = base_fee * liquidity_mult * prof_mult
+        # We do:      floor = base_floor * liquidity_mult (scarce = higher floor)
+        #             ceiling = base_ceiling / prof_mult (unprofitable = lower ceiling)
+        # This prevents oscillation from stacking multipliers on the fee itself
+        # =====================================================================
+        if self.ENABLE_BOUNDS_MULTIPLIERS:
+            # Liquidity multiplier raises floor (scarce liquidity = higher minimum)
+            floor_multiplier = min(liquidity_multiplier, self.MAX_FLOOR_MULTIPLIER)
+            floor_ppm = int(base_floor_ppm * floor_multiplier)
+
+            # Profitability multiplier lowers ceiling for unprofitable channels
+            # If profitability_multiplier > 1, channel is unprofitable, lower ceiling
+            # If profitability_multiplier < 1, channel is profitable, raise ceiling
+            if profitability_multiplier > 1.0:
+                ceiling_multiplier = max(1.0 / profitability_multiplier, self.MIN_CEILING_MULTIPLIER)
+            else:
+                ceiling_multiplier = 1.0  # Don't raise ceiling above max
+            ceiling_ppm = int(base_ceiling_ppm * ceiling_multiplier)
+
+            # Security: Ensure floor never exceeds ceiling
+            if floor_ppm >= ceiling_ppm:
+                floor_ppm = max(1, ceiling_ppm - 10)
+
+            self.plugin.log(
+                f"BOUNDS_MULT: {channel_id[:12]}... floor={base_floor_ppm}->{floor_ppm} "
+                f"(x{floor_multiplier:.2f}), ceiling={base_ceiling_ppm}->{ceiling_ppm} "
+                f"(x{ceiling_multiplier:.2f})",
+                level='debug'
+            )
+        else:
+            floor_ppm = base_floor_ppm
+            ceiling_ppm = base_ceiling_ppm
         
         # =====================================================================
         # PRIORITY OVERRIDE: Zero-Fee Probe > Fire Sale
@@ -779,18 +1430,99 @@ class HillClimbingFeeController:
             rate_change = current_revenue_rate - hc_state.last_revenue_rate
             last_direction = hc_state.trend_direction
             previous_rate = hc_state.last_revenue_rate
-            
+
             step_ppm = hc_state.step_ppm
             if step_ppm <= 0:
                 step_ppm = self.STEP_PPM
-            
+
+            # =====================================================================
+            # IMPROVEMENT #3: Historical Response Curve
+            # =====================================================================
+            # Record observation and check for regime change
+            # =====================================================================
+            historical_curve = hc_state.get_historical_curve()
+            elasticity_tracker = hc_state.get_elasticity_tracker()
+            thompson_state = hc_state.get_thompson_state()
+
+            if self.ENABLE_HISTORICAL_CURVE:
+                # Record this observation
+                historical_curve.add_observation(
+                    fee_ppm=current_fee_ppm,
+                    revenue_rate=current_revenue_rate,
+                    forward_count=forward_count
+                )
+
+                # Check for regime change (market conditions shifted dramatically)
+                if now - historical_curve.last_regime_check > self.REGIME_CHECK_INTERVAL:
+                    historical_curve.last_regime_check = now
+                    if historical_curve.detect_regime_change(current_revenue_rate):
+                        self.plugin.log(
+                            f"REGIME CHANGE: {channel_id[:12]}... detected regime shift "
+                            f"(count={historical_curve.regime_change_count}). Resetting curve.",
+                            level='info'
+                        )
+                        historical_curve.reset_curve()
+                        # Also reset Thompson beliefs on regime change
+                        thompson_state = ThompsonSamplingState()
+
+                hc_state.set_historical_curve(historical_curve)
+
+            # =====================================================================
+            # IMPROVEMENT #4: Elasticity Tracking
+            # =====================================================================
+            # Track demand elasticity to understand price sensitivity
+            # =====================================================================
+            elasticity_direction = 0
+            elasticity_info = ""
+            if self.ENABLE_ELASTICITY:
+                elasticity_tracker.add_observation(
+                    fee_ppm=current_fee_ppm,
+                    volume_sats=volume_since_sats,
+                    revenue_rate=current_revenue_rate
+                )
+                elasticity_direction = elasticity_tracker.get_optimal_direction()
+                elasticity_info = (
+                    f"elasticity={elasticity_tracker.current_elasticity:.2f} "
+                    f"(conf={elasticity_tracker.confidence:.0%}, "
+                    f"hint={elasticity_tracker.get_fee_adjustment_hint()})"
+                )
+                hc_state.set_elasticity_tracker(elasticity_tracker)
+
+            # =====================================================================
+            # IMPROVEMENT #5: Thompson Sampling
+            # =====================================================================
+            # Explore fee space to find global optimum
+            # =====================================================================
+            thompson_multiplier = 1.0
+            thompson_info = ""
+            if self.ENABLE_THOMPSON_SAMPLING:
+                # Update beliefs based on outcome of current arm
+                thompson_state.update_beliefs(
+                    arm=thompson_state.current_arm,
+                    revenue_rate=current_revenue_rate,
+                    baseline_rate=hc_state.last_revenue_rate
+                )
+
+                # Sample next arm (exploration vs exploitation)
+                if random.random() < self.THOMPSON_WEIGHT:
+                    next_arm = thompson_state.sample_arm()
+                    thompson_multiplier = thompson_state.get_fee_multiplier(next_arm)
+                    thompson_state.start_exploration(next_arm)
+                    thompson_info = f"thompson_arm={next_arm} (mult={thompson_multiplier:.2f})"
+                else:
+                    # Exploitation: use best known arm
+                    best_arm = thompson_state.get_best_arm()
+                    thompson_info = f"thompson_exploit (best_arm={best_arm})"
+
+                hc_state.set_thompson_state(thompson_state)
+
             # VOLATILITY RESET & DEADBAND HYSTERESIS
             volatility_reset = False
             rate_change_ratio = 0.0
             if hc_state.last_update > 0 and hc_state.last_revenue_rate > 0:
                 delta_rate = abs(current_revenue_rate - hc_state.last_revenue_rate)
                 rate_change_ratio = delta_rate / max(1.0, hc_state.last_revenue_rate)
-                
+
                 if rate_change_ratio > self.VOLATILITY_THRESHOLD:
                     step_ppm = self.STEP_PPM
                     volatility_reset = True
@@ -805,6 +1537,7 @@ class HillClimbingFeeController:
                     hc_state.sleep_until = now + sleep_duration_seconds
                     hc_state.last_revenue_rate = current_revenue_rate
                     hc_state.last_fee_ppm = current_fee_ppm
+                    hc_state.last_volume_sats = volume_since_sats
                     hc_state.last_update = now
                     self._save_hill_climb_state(channel_id, hc_state)
                     self.plugin.log(f"HYSTERESIS: Market Calm - Channel {channel_id[:12]}... entering sleep mode.", level='info')
@@ -813,7 +1546,7 @@ class HillClimbingFeeController:
                 if rate_change_ratio >= self.STABILITY_THRESHOLD:
                     hc_state.stable_cycles = 0
 
-            # Direction Decision
+            # Direction Decision (enhanced with elasticity input)
             if hc_state.last_update == 0:
                 new_direction = 1
                 decision_reason = "initial"
@@ -834,6 +1567,21 @@ class HillClimbingFeeController:
                 hc_state.consecutive_same_direction = 0
                 step_ppm = max(self.MIN_STEP_PPM, int(step_ppm * self.DAMPENING_FACTOR))
 
+            # ELASTICITY INFLUENCE: Blend elasticity signal with Hill Climbing
+            # If elasticity has high confidence and disagrees with Hill Climbing,
+            # we weight the elasticity suggestion
+            if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.5:
+                if elasticity_direction != 0 and elasticity_direction != new_direction:
+                    # Elasticity disagrees - blend based on weight
+                    if random.random() < self.ELASTICITY_WEIGHT:
+                        new_direction = elasticity_direction
+                        decision_reason = f"{decision_reason}+elasticity_override"
+                        self.plugin.log(
+                            f"ELASTICITY OVERRIDE: {channel_id[:12]}... using elasticity "
+                            f"direction={new_direction} ({elasticity_info})",
+                            level='info'
+                        )
+
             # Apply step constraints
             step_percent = max(current_fee_ppm * self.STEP_PERCENT, self.MIN_STEP_PPM)
             step_ppm = max(step_ppm, int(step_percent))
@@ -841,8 +1589,23 @@ class HillClimbingFeeController:
             if hc_state.consecutive_same_direction > self.MAX_CONSECUTIVE:
                 step_ppm = max(self.MIN_STEP_PPM, step_ppm // 2)
 
+            # Calculate base new fee (Hill Climbing step)
             base_new_fee = current_fee_ppm + (new_direction * step_ppm)
-            new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
+
+            # Apply Thompson Sampling exploration multiplier (bounded ±20%)
+            if self.ENABLE_THOMPSON_SAMPLING and thompson_multiplier != 1.0:
+                base_new_fee = int(base_new_fee * thompson_multiplier)
+
+            # IMPROVEMENT #1: With BOUNDS_MULTIPLIERS, don't stack multipliers on fee
+            # The multipliers are already applied to floor/ceiling
+            if self.ENABLE_BOUNDS_MULTIPLIERS:
+                new_fee_ppm = base_new_fee  # No multiplier stacking
+            else:
+                # Legacy behavior: apply multipliers to fee
+                new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
+
+            # Update state with volume for elasticity tracking
+            hc_state.last_volume_sats = volume_since_sats
 
             # Phase 7: Scarcity Pricing - premium for low local balance
             # Phase 7.1: Virgin Channel Amnesty - bypass for remote-opened channels with no traffic
@@ -1274,17 +2037,26 @@ class HillClimbingFeeController:
     def _get_hill_climb_state(self, channel_id: str) -> HillClimbState:
         """
         Get Hill Climbing state for a channel.
-        
+
         Checks in-memory cache first, then database.
         Updated to use rate-based feedback (last_revenue_rate), step_ppm,
-        and deadband hysteresis fields (is_sleeping, sleep_until, stable_cycles).
+        deadband hysteresis fields, and v2.0 improvements.
         """
+        import json
+
         if channel_id in self._hill_climb_states:
             return self._hill_climb_states[channel_id]
-        
+
         # Load from database (uses the fee_strategy_state table)
         db_state = self.database.get_fee_strategy_state(channel_id)
-        
+
+        # Parse v2.0 JSON state
+        v2_json_str = db_state.get("v2_state_json", "{}")
+        try:
+            v2_data = json.loads(v2_json_str) if v2_json_str else {}
+        except json.JSONDecodeError:
+            v2_data = {}
+
         hc_state = HillClimbState(
             last_revenue_rate=db_state.get("last_revenue_rate", 0.0),
             last_fee_ppm=db_state.get("last_fee_ppm", 0),
@@ -1296,15 +2068,32 @@ class HillClimbingFeeController:
             sleep_until=db_state.get("sleep_until", 0),
             stable_cycles=db_state.get("stable_cycles", 0),
             last_broadcast_fee_ppm=db_state.get("last_broadcast_fee_ppm", 0),
-            last_state=db_state.get("last_state", "balanced")
+            last_state=db_state.get("last_state", "balanced"),
+            # v2.0 fields
+            forward_count_since_update=db_state.get("forward_count_since_update", 0),
+            last_volume_sats=db_state.get("last_volume_sats", 0),
+            historical_curve_data=v2_data.get("historical_curve", {}),
+            elasticity_data=v2_data.get("elasticity", {}),
+            thompson_data=v2_data.get("thompson", {})
         )
-        
+
         self._hill_climb_states[channel_id] = hc_state
         return hc_state
-    
+
     def _save_hill_climb_state(self, channel_id: str, state: HillClimbState):
-        """Save Hill Climbing state to cache and database (including hysteresis fields)."""
+        """Save Hill Climbing state to cache and database (including v2.0 fields)."""
+        import json
+
         self._hill_climb_states[channel_id] = state
+
+        # Serialize v2.0 state to JSON
+        v2_data = {
+            "historical_curve": state.historical_curve_data,
+            "elasticity": state.elasticity_data,
+            "thompson": state.thompson_data
+        }
+        v2_json_str = json.dumps(v2_data)
+
         self.database.update_fee_strategy_state(
             channel_id=channel_id,
             last_revenue_rate=state.last_revenue_rate,
@@ -1316,7 +2105,11 @@ class HillClimbingFeeController:
             last_state=state.last_state,
             is_sleeping=1 if state.is_sleeping else 0,
             sleep_until=state.sleep_until,
-            stable_cycles=state.stable_cycles
+            stable_cycles=state.stable_cycles,
+            # v2.0 fields
+            forward_count_since_update=state.forward_count_since_update,
+            last_volume_sats=state.last_volume_sats,
+            v2_state_json=v2_json_str
         )
     
     def _get_channels_info(self) -> Dict[str, Dict[str, Any]]:

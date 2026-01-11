@@ -66,6 +66,19 @@ Automated test suite for the cl-revenue-ops plugin.
 - Fee range configuration (min/max PPM)
 - Hive member fee policy (0 PPM)
 
+### Fee Controller v2.0 Improvements
+The fee controller includes five algorithm improvements with security mitigations:
+
+| Improvement | Description | Security Mitigations |
+|-------------|-------------|---------------------|
+| **Bounds Multipliers** | Apply liquidity/profitability multipliers to floor/ceiling instead of fee directly | `MAX_FLOOR_MULTIPLIER=3.0`, `MIN_CEILING_MULTIPLIER=0.5` |
+| **Dynamic Observation Windows** | Use forward count + time for observation windows | `MAX_OBSERVATION_HOURS=24h` (anti-starvation), `MIN_FORWARDS_FOR_SIGNAL=5` |
+| **Historical Response Curve** | Track fee→revenue history with exponential decay | `MAX_OBSERVATIONS=100` (bounded memory), regime change detection |
+| **Elasticity Tracking** | Track demand sensitivity to fee changes | `OUTLIER_THRESHOLD=5.0` (ignore attacks), revenue-weighted |
+| **Thompson Sampling** | Explore fee space using multi-armed bandit | `MAX_EXPLORATION_PCT=±20%`, `RAMP_UP_CYCLES=5` for new channels |
+
+All features are enabled by default and can be disabled via class constants in `fee_controller.py`.
+
 ### Rebalancer
 - EV-based candidate selection
 - Flow-aware opportunity cost
@@ -138,6 +151,28 @@ cd /home/sat/cl-hive/docs/testing
 # 3. Run cl-revenue-ops tests
 cd /home/sat/cl_revenue_ops/docs/testing
 ./test.sh all 1
+```
+
+## Reloading Plugin After Code Changes
+
+When developing or testing code changes, you must reload the plugin to pick up new code:
+
+```bash
+# Reload cl-revenue-ops on all hive nodes
+for node in alice bob carol; do
+    CONTAINER="polar-n1-${node}"
+    CLI="docker exec $CONTAINER lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+
+    # Stop plugin
+    $CLI plugin stop /home/clightning/.lightning/plugins/cl-revenue-ops/cl-revenue-ops.py
+
+    # Copy updated code
+    docker cp /home/sat/cl_revenue_ops $CONTAINER:/home/clightning/.lightning/plugins/cl-revenue-ops
+    docker exec -u root $CONTAINER chown -R clightning:clightning /home/clightning/.lightning/plugins/cl-revenue-ops
+
+    # Start plugin
+    $CLI plugin start /home/clightning/.lightning/plugins/cl-revenue-ops/cl-revenue-ops.py
+done
 ```
 
 ## Troubleshooting

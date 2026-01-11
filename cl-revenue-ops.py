@@ -63,7 +63,13 @@ from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, Pe
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
-PLUGIN_VERSION = "1.4.0"
+# v1.5.0: Fee Controller v2.0 improvements
+#   - Bounds multipliers (apply to floor/ceiling instead of fee)
+#   - Dynamic observation windows (forward-count + time)
+#   - Historical response curve with exponential decay
+#   - Elasticity tracking with outlier detection
+#   - Thompson Sampling exploration with security bounds
+PLUGIN_VERSION = "1.5.0"
 
 
 # =============================================================================
