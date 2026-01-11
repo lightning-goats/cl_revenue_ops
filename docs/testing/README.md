@@ -61,6 +61,18 @@ Automated test suite for the cl-revenue-ops plugin.
 - Forward event tracking
 - Balance monitoring
 
+### Flow Analysis v2.0 Improvements
+The flow analyzer includes four algorithm improvements with security mitigations:
+
+| Improvement | Description | Security Mitigations |
+|-------------|-------------|---------------------|
+| **Flow Confidence Score** | Weight flow state influence by data quality (forward count + recency) | `MIN_CONFIDENCE=0.1` (never fully ignore), `MAX_CONFIDENCE=1.0` |
+| **Graduated Flow Multipliers** | Scale fee adjustments proportionally with flow magnitude | `MIN_FLOW_MULTIPLIER=0.5`, `MAX_FLOW_MULTIPLIER=2.0`, deadband at 0.1 |
+| **Flow Velocity Tracking** | Detect acceleration/deceleration of flow trends | `MAX_VELOCITY=±0.5`, outlier detection at 3x threshold |
+| **Adaptive EMA Decay** | Faster decay for volatile channels, slower for stable | `MIN_EMA_DECAY=0.6`, `MAX_EMA_DECAY=0.9` |
+
+All features are enabled by default and can be disabled via module constants in `flow_analysis.py`.
+
 ### Fee Controller
 - Dynamic fee adjustment
 - Fee range configuration (min/max PPM)

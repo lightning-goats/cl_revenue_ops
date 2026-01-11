@@ -276,10 +276,113 @@ test_flow() {
         # Check flow metrics
         run_test "Channels have sats_in" "echo '$CHANNELS' | jq -e '.[0].sats_in >= 0'"
         run_test "Channels have sats_out" "echo '$CHANNELS' | jq -e '.[0].sats_out >= 0'"
+
+        # =========================================================================
+        # v2.0 Flow Analysis Tests (runtime checks on channel_states)
+        # =========================================================================
+        echo ""
+        log_info "Testing v2.0 flow analysis fields..."
+
+        # Check v2.0 fields exist in channel_states
+        run_test "v2.0: Channels have confidence score" \
+            "echo '$CHANNELS' | jq -e '.[0].confidence != null'"
+        run_test "v2.0: Channels have velocity" \
+            "echo '$CHANNELS' | jq -e '.[0].velocity != null'"
+        run_test "v2.0: Channels have flow_multiplier" \
+            "echo '$CHANNELS' | jq -e '.[0].flow_multiplier != null'"
+        run_test "v2.0: Channels have ema_decay" \
+            "echo '$CHANNELS' | jq -e '.[0].ema_decay != null'"
+        run_test "v2.0: Channels have forward_count" \
+            "echo '$CHANNELS' | jq -e '.[0].forward_count != null'"
+
+        # Check v2.0 value ranges (security bounds)
+        CONFIDENCE=$(echo "$CHANNELS" | jq -r '.[0].confidence // 1.0')
+        MULTIPLIER=$(echo "$CHANNELS" | jq -r '.[0].flow_multiplier // 1.0')
+        DECAY=$(echo "$CHANNELS" | jq -r '.[0].ema_decay // 0.8')
+        VELOCITY=$(echo "$CHANNELS" | jq -r '.[0].velocity // 0.0')
+
+        log_info "v2.0 values: confidence=$CONFIDENCE multiplier=$MULTIPLIER decay=$DECAY velocity=$VELOCITY"
+
+        run_test "v2.0: confidence in valid range (0.1-1.0)" \
+            "awk 'BEGIN{exit ($CONFIDENCE >= 0.1 && $CONFIDENCE <= 1.0) ? 0 : 1}'"
+        run_test "v2.0: flow_multiplier in valid range (0.5-2.0)" \
+            "awk 'BEGIN{exit ($MULTIPLIER >= 0.5 && $MULTIPLIER <= 2.0) ? 0 : 1}'"
+        run_test "v2.0: ema_decay in valid range (0.6-0.9)" \
+            "awk 'BEGIN{exit ($DECAY >= 0.6 && $DECAY <= 0.9) ? 0 : 1}'"
+        run_test "v2.0: velocity in valid range (-0.5 to 0.5)" \
+            "awk 'BEGIN{exit ($VELOCITY >= -0.5 && $VELOCITY <= 0.5) ? 0 : 1}'"
     else
         log_info "No channels on Alice - skipping detailed flow tests"
         run_test "revenue-status handles no channels" "revenue_cli alice revenue-status | jq -e '.channel_states'"
     fi
+
+    # =========================================================================
+    # v2.0 Flow Analysis Code Verification Tests
+    # =========================================================================
+    echo ""
+    log_info "Verifying v2.0 flow analysis code features..."
+
+    # Improvement #1: Flow Confidence Score
+    run_test "Flow v2.0 #1: Confidence enabled" \
+        "grep -q 'ENABLE_FLOW_CONFIDENCE = True' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #1: MIN_CONFIDENCE bound" \
+        "grep -q 'MIN_CONFIDENCE = 0.1' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #1: MAX_CONFIDENCE bound" \
+        "grep -q 'MAX_CONFIDENCE = 1.0' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #1: _calculate_confidence method exists" \
+        "grep -q 'def _calculate_confidence' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+
+    # Improvement #2: Graduated Flow Multipliers
+    run_test "Flow v2.0 #2: Graduated multipliers enabled" \
+        "grep -q 'ENABLE_GRADUATED_MULTIPLIERS = True' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #2: MIN_FLOW_MULTIPLIER bound" \
+        "grep -q 'MIN_FLOW_MULTIPLIER = 0.5' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #2: MAX_FLOW_MULTIPLIER bound" \
+        "grep -q 'MAX_FLOW_MULTIPLIER = 2.0' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #2: _calculate_graduated_multiplier method exists" \
+        "grep -q 'def _calculate_graduated_multiplier' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+
+    # Improvement #3: Flow Velocity Tracking
+    run_test "Flow v2.0 #3: Velocity tracking enabled" \
+        "grep -q 'ENABLE_FLOW_VELOCITY = True' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #3: MAX_VELOCITY bound" \
+        "grep -q 'MAX_VELOCITY = 0.5' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #3: MIN_VELOCITY bound" \
+        "grep -q 'MIN_VELOCITY = -0.5' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #3: _calculate_velocity method exists" \
+        "grep -q 'def _calculate_velocity' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #3: Outlier detection threshold" \
+        "grep -q 'VELOCITY_OUTLIER_THRESHOLD' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+
+    # Improvement #5: Adaptive EMA Decay
+    run_test "Flow v2.0 #5: Adaptive decay enabled" \
+        "grep -q 'ENABLE_ADAPTIVE_DECAY = True' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #5: MIN_EMA_DECAY bound" \
+        "grep -q 'MIN_EMA_DECAY = 0.6' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #5: MAX_EMA_DECAY bound" \
+        "grep -q 'MAX_EMA_DECAY = 0.9' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0 #5: _calculate_adaptive_decay method exists" \
+        "grep -q 'def _calculate_adaptive_decay' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+
+    # FlowMetrics v2.0 fields
+    run_test "Flow v2.0: FlowMetrics has confidence field" \
+        "grep -q 'confidence: float' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0: FlowMetrics has velocity field" \
+        "grep -q 'velocity: float' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0: FlowMetrics has flow_multiplier field" \
+        "grep -q 'flow_multiplier: float' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+    run_test "Flow v2.0: FlowMetrics has ema_decay field" \
+        "grep -q 'ema_decay: float' /home/sat/cl_revenue_ops/modules/flow_analysis.py"
+
+    # Database v2.0 migration
+    run_test "Flow v2.0: Database migration exists" \
+        "grep -q '_migrate_flow_v2_schema' /home/sat/cl_revenue_ops/modules/database.py"
+    run_test "Flow v2.0: DB confidence column added" \
+        "grep -q 'confidence.*REAL DEFAULT' /home/sat/cl_revenue_ops/modules/database.py"
+    run_test "Flow v2.0: get_daily_flow_buckets returns count" \
+        "grep -q \"'count':\" /home/sat/cl_revenue_ops/modules/database.py"
+    run_test "Flow v2.0: get_daily_flow_buckets returns last_ts" \
+        "grep -q \"'last_ts':\" /home/sat/cl_revenue_ops/modules/database.py"
 
     # Check flow analysis on other nodes
     for node in bob carol; do

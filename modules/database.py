@@ -507,7 +507,10 @@ class Database:
         # v1.4 Migration: Migrate ignored_peers to peer_policies
         # This migrates legacy "ignored" peers to the new policy system
         self._migrate_ignored_peers_to_policies(conn)
-        
+
+        # v1.6 Migration: Add flow analysis v2.0 columns
+        self._migrate_flow_v2_schema(conn)
+
         self.plugin.log("Database initialized successfully")
     
 
@@ -624,27 +627,66 @@ class Database:
                 f"Old table renamed to _backup_ignored_peers.",
                 level='info'
             )
-    
+
+    def _migrate_flow_v2_schema(self, conn: sqlite3.Connection) -> None:
+        """
+        v1.6 Migration: Add flow analysis v2.0 columns to channel_states.
+
+        New columns:
+        - confidence: Flow confidence score (0.1 to 1.0)
+        - velocity: Rate of change of flow_ratio
+        - flow_multiplier: Graduated multiplier for fee adjustments
+        - ema_decay: Adaptive decay factor used
+        - forward_count: Number of forwards in analysis window
+        """
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(channel_states)").fetchall()]
+
+            new_cols = [
+                ("confidence", "REAL DEFAULT 1.0"),
+                ("velocity", "REAL DEFAULT 0.0"),
+                ("flow_multiplier", "REAL DEFAULT 1.0"),
+                ("ema_decay", "REAL DEFAULT 0.8"),
+                ("forward_count", "INTEGER DEFAULT 0"),
+            ]
+
+            for col_name, col_def in new_cols:
+                if col_name not in cols:
+                    self.plugin.log(f"DB migration: adding channel_states.{col_name}", level="info")
+                    conn.execute(f"ALTER TABLE channel_states ADD COLUMN {col_name} {col_def}")
+
+        except Exception as e:
+            self.plugin.log(f"DB migration warning: flow v2 schema migration failed: {e}", level="warn")
+
     # =========================================================================
     # Channel State Methods
     # =========================================================================
-    
-    def update_channel_state(self, channel_id: str, peer_id: str, state: str,
-                             flow_ratio: float, sats_in: int, sats_out: int, 
-                             capacity: int):
-        """Update the current state of a channel."""
+
+    def update_channel_state(
+        self, channel_id: str, peer_id: str, state: str,
+        flow_ratio: float, sats_in: int, sats_out: int, capacity: int,
+        # v2.0 fields (optional for backwards compatibility)
+        confidence: float = 1.0,
+        velocity: float = 0.0,
+        flow_multiplier: float = 1.0,
+        ema_decay: float = 0.8,
+        forward_count: int = 0
+    ):
+        """Update the current state of a channel (v2.0: includes flow metrics)."""
         conn = self._get_connection()
         now = int(time.time())
-        
+
         conn.execute("""
-            INSERT OR REPLACE INTO channel_states 
-            (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, now))
-        
+            INSERT OR REPLACE INTO channel_states
+            (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at,
+             confidence, velocity, flow_multiplier, ema_decay, forward_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, now,
+              confidence, velocity, flow_multiplier, ema_decay, forward_count))
+
         # Also record in history
         conn.execute("""
-            INSERT INTO flow_history 
+            INSERT INTO flow_history
             (channel_id, timestamp, sats_in, sats_out, flow_ratio, state)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (channel_id, now, sats_in, sats_out, flow_ratio, state))
@@ -1593,28 +1635,30 @@ class Database:
     def get_daily_flow_buckets(self, window_days: int = 7, channel_id: Optional[str] = None) -> Dict[str, list]:
         """
         Get daily flow buckets from the local forwards table.
-        
+
         This replaces the listforwards RPC call for flow analysis, providing
         the same data structure but from local SQLite aggregation.
-        
+
         TODO #19: This eliminates the heaviest RPC call in the plugin,
         reducing CPU usage by ~90% during flow analysis cycles.
-        
+
+        v2.0: Now also returns count and last_ts per bucket for confidence calculation.
+
         Args:
             window_days: Number of days to look back
             channel_id: Optional specific channel to query (None = all channels)
-            
+
         Returns:
             Dict mapping channel_id to a list of daily buckets:
-            {'scid': [{'in': 100, 'out': 50}, {'in': 200, 'out': 80}, ...]}
+            {'scid': [{'in': 100, 'out': 50, 'count': 5, 'last_ts': 1234567890}, ...]}
             where index 0 = today, index 1 = yesterday, etc.
         """
         conn = self._get_connection()
         now = int(time.time())
         start_time = now - (window_days * 86400)
-        
+
         flow_data: Dict[str, list] = {}
-        
+
         # Build query based on whether we're filtering by channel
         if channel_id:
             query = """
@@ -1630,33 +1674,46 @@ class Database:
                 WHERE timestamp >= ?
             """
             params = (start_time,)
-        
+
         rows = conn.execute(query, params).fetchall()
-        
+
+        def init_bucket():
+            """Initialize a single day bucket with v2.0 fields."""
+            return {'in': 0, 'out': 0, 'count': 0, 'last_ts': 0}
+
         for row in rows:
             in_channel = row['in_channel']
             out_channel = row['out_channel']
             in_msat = row['in_msat'] or 0
             out_msat = row['out_msat'] or 0
             timestamp = row['timestamp']
-            
+
             # Calculate age in days (0 = today/last 24h)
             age_days = int((now - timestamp) // 86400)
             if age_days >= window_days:
                 continue
-            
-            # Initialize bucket lists if needed
+
+            # Initialize bucket lists if needed (v2.0: with count and last_ts)
             if in_channel and in_channel not in flow_data:
-                flow_data[in_channel] = [{'in': 0, 'out': 0} for _ in range(window_days)]
+                flow_data[in_channel] = [init_bucket() for _ in range(window_days)]
             if out_channel and out_channel not in flow_data:
-                flow_data[out_channel] = [{'in': 0, 'out': 0} for _ in range(window_days)]
-            
+                flow_data[out_channel] = [init_bucket() for _ in range(window_days)]
+
             # Add to appropriate day bucket (convert msat to sats)
             if in_channel:
-                flow_data[in_channel][age_days]['in'] += in_msat // 1000
+                bucket = flow_data[in_channel][age_days]
+                bucket['in'] += in_msat // 1000
+                bucket['count'] += 1
+                if timestamp > bucket['last_ts']:
+                    bucket['last_ts'] = timestamp
+
             if out_channel:
-                flow_data[out_channel][age_days]['out'] += out_msat // 1000
-        
+                bucket = flow_data[out_channel][age_days]
+                bucket['out'] += out_msat // 1000
+                bucket['count'] += 1
+                if timestamp > bucket['last_ts']:
+                    bucket['last_ts'] = timestamp
+
         return flow_data
     
     
