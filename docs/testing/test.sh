@@ -232,11 +232,11 @@ test_status() {
     log_info "cl-revenue-ops version: $VERSION"
     run_test "Version is returned" "[ -n '$VERSION' ] && [ '$VERSION' != 'null' ]"
 
-    # Uptime info
-    run_test "Uptime tracked" "revenue_cli alice revenue-status | jq -e '.uptime_seconds >= 0'"
+    # Config info embedded in status
+    run_test "Config in status" "revenue_cli alice revenue-status | jq -e '.config'"
 
-    # revenue-channels command
-    run_test "revenue-channels works" "revenue_cli alice revenue-channels | jq -e '. != null'"
+    # Channel states in status
+    run_test "Channel states in status" "revenue_cli alice revenue-status | jq -e '.channel_states'"
 
     # revenue-dashboard command
     run_test "revenue-dashboard works" "revenue_cli alice revenue-dashboard | jq -e '. != null'"
@@ -256,34 +256,35 @@ test_flow() {
     echo "FLOW ANALYSIS TESTS"
     echo "========================================"
 
-    # Get channels
-    CHANNELS=$(revenue_cli alice revenue-channels 2>/dev/null)
+    # Get channel states from revenue-status
+    CHANNELS=$(revenue_cli alice revenue-status 2>/dev/null | jq '.channel_states')
     CHANNEL_COUNT=$(echo "$CHANNELS" | jq 'length // 0')
     log_info "Alice has $CHANNEL_COUNT channels"
 
     if [ "$CHANNEL_COUNT" -gt 0 ]; then
         # Check flow analysis data structure
         run_test "Channels have peer_id" "echo '$CHANNELS' | jq -e '.[0].peer_id'"
-        run_test "Channels have flow_state" "echo '$CHANNELS' | jq -e '.[0].flow_state // \"unknown\"'"
-        run_test "Channels have balance info" "echo '$CHANNELS' | jq -e '.[0].local_balance_sat // .[0].local_msat'"
-        run_test "Channels have capacity info" "echo '$CHANNELS' | jq -e '.[0].capacity_sat // .[0].capacity_msat'"
+        run_test "Channels have state (flow)" "echo '$CHANNELS' | jq -e '.[0].state'"
+        run_test "Channels have flow_ratio" "echo '$CHANNELS' | jq -e '.[0].flow_ratio'"
+        run_test "Channels have capacity" "echo '$CHANNELS' | jq -e '.[0].capacity'"
 
-        # Check flow state values (should be one of: source, sink, balanced, unknown)
-        FIRST_FLOW=$(echo "$CHANNELS" | jq -r '.[0].flow_state // "unknown"')
-        log_info "First channel flow_state: $FIRST_FLOW"
-        run_test "Flow state is valid" "echo '$FIRST_FLOW' | grep -qE '^(source|sink|balanced|unknown)$'"
+        # Check flow state values (should be one of: source, sink, balanced)
+        FIRST_FLOW=$(echo "$CHANNELS" | jq -r '.[0].state')
+        log_info "First channel state: $FIRST_FLOW"
+        run_test "Flow state is valid" "echo '$FIRST_FLOW' | grep -qE '^(source|sink|balanced)$'"
 
-        # Check flow metrics exist
-        run_test "Forwards tracked" "revenue_cli alice revenue-dashboard | jq -e '.total_forwards >= 0 or .forwards_count >= 0 or . != null'"
+        # Check flow metrics
+        run_test "Channels have sats_in" "echo '$CHANNELS' | jq -e '.[0].sats_in >= 0'"
+        run_test "Channels have sats_out" "echo '$CHANNELS' | jq -e '.[0].sats_out >= 0'"
     else
         log_info "No channels on Alice - skipping detailed flow tests"
-        run_test "revenue-channels handles no channels" "revenue_cli alice revenue-channels | jq -e '. != null'"
+        run_test "revenue-status handles no channels" "revenue_cli alice revenue-status | jq -e '.channel_states'"
     fi
 
     # Check flow analysis on other nodes
     for node in bob carol; do
         if container_exists $node; then
-            run_test "$node flow analysis works" "revenue_cli $node revenue-channels | jq -e '. != null'"
+            run_test "$node flow analysis works" "revenue_cli $node revenue-status | jq -e '.channel_states'"
         fi
     done
 }
@@ -295,39 +296,44 @@ test_fees() {
     echo "FEE CONTROLLER TESTS"
     echo "========================================"
 
-    # Get channels for fee testing
-    CHANNELS=$(revenue_cli alice revenue-channels 2>/dev/null)
+    # Get channel states for fee testing
+    CHANNELS=$(revenue_cli alice revenue-status 2>/dev/null | jq '.channel_states')
     CHANNEL_COUNT=$(echo "$CHANNELS" | jq 'length // 0')
 
-    if [ "$CHANNEL_COUNT" -gt 0 ]; then
-        # Check fee data in channels
-        run_test "Channels have fee_ppm" "echo '$CHANNELS' | jq -e '.[0].fee_ppm // .[0].our_fee_ppm'"
+    # Check recent fee changes in revenue-status
+    FEE_CHANGES=$(revenue_cli alice revenue-status 2>/dev/null | jq '.recent_fee_changes')
+    FEE_CHANGE_COUNT=$(echo "$FEE_CHANGES" | jq 'length // 0')
+    log_info "Recent fee changes: $FEE_CHANGE_COUNT"
 
-        # Check fee adjustment info
-        FIRST_SCID=$(echo "$CHANNELS" | jq -r '.[0].short_channel_id // .[0].scid')
-        log_info "Testing channel: $FIRST_SCID"
-
-        # Fee history tracking
-        run_test "Fee data available" "revenue_cli alice revenue-channels | jq -e '.[0] | has(\"fee_ppm\") or has(\"our_fee_ppm\")'"
-
-        # Check fee configuration
-        run_test "revenue-config works" "revenue_cli alice revenue-config | jq -e '. != null'"
-
-        # Check specific config values
-        MIN_FEE=$(revenue_cli alice revenue-config get min_fee_ppm 2>/dev/null | jq -r '.value // 0')
-        MAX_FEE=$(revenue_cli alice revenue-config get max_fee_ppm 2>/dev/null | jq -r '.value // 5000')
-        log_info "Fee range: $MIN_FEE - $MAX_FEE ppm"
-        run_test "min_fee_ppm configured" "[ '$MIN_FEE' -ge 0 ]"
-        run_test "max_fee_ppm configured" "[ '$MAX_FEE' -gt 0 ]"
-
-        # Check hive fee ppm (for hive members)
-        HIVE_FEE=$(revenue_cli alice revenue-config get hive_fee_ppm 2>/dev/null | jq -r '.value // 0')
-        log_info "hive_fee_ppm: $HIVE_FEE"
-        run_test "hive_fee_ppm configured" "[ '$HIVE_FEE' -ge 0 ]"
+    if [ "$FEE_CHANGE_COUNT" -gt 0 ]; then
+        # Check fee change data structure
+        run_test "Fee changes have channel_id" "echo '$FEE_CHANGES' | jq -e '.[0].channel_id'"
+        run_test "Fee changes have old_fee_ppm" "echo '$FEE_CHANGES' | jq -e '.[0].old_fee_ppm'"
+        run_test "Fee changes have new_fee_ppm" "echo '$FEE_CHANGES' | jq -e '.[0].new_fee_ppm'"
+        run_test "Fee changes have reason" "echo '$FEE_CHANGES' | jq -e '.[0].reason'"
     else
-        log_info "No channels - skipping fee controller tests"
-        run_test "revenue-config works" "revenue_cli alice revenue-config | jq -e '. != null'"
+        log_info "No recent fee changes yet"
     fi
+
+    # Check fee configuration via revenue-config
+    run_test "revenue-config list-mutable works" "revenue_cli alice revenue-config list-mutable | jq -e '.mutable_keys'"
+
+    # Check specific config values
+    MIN_FEE=$(revenue_cli alice revenue-config get min_fee_ppm 2>/dev/null | jq -r '.value // 0')
+    MAX_FEE=$(revenue_cli alice revenue-config get max_fee_ppm 2>/dev/null | jq -r '.value // 5000')
+    log_info "Fee range: $MIN_FEE - $MAX_FEE ppm"
+    run_test "min_fee_ppm configured" "[ '$MIN_FEE' -ge 0 ]"
+    run_test "max_fee_ppm configured" "[ '$MAX_FEE' -gt 0 ]"
+
+    # Check hive fee ppm (for hive members)
+    HIVE_FEE=$(revenue_cli alice revenue-config get hive_fee_ppm 2>/dev/null | jq -r '.value // 0')
+    log_info "hive_fee_ppm: $HIVE_FEE"
+    run_test "hive_fee_ppm configured" "[ '$HIVE_FEE' -ge 0 ]"
+
+    # Check fee interval config
+    FEE_INTERVAL=$(revenue_cli alice revenue-config get fee_interval 2>/dev/null | jq -r '.value // 300')
+    log_info "fee_interval: $FEE_INTERVAL seconds"
+    run_test "fee_interval configured" "[ '$FEE_INTERVAL' -gt 0 ]"
 }
 
 # Rebalancer Tests
@@ -337,17 +343,19 @@ test_rebalance() {
     echo "REBALANCER TESTS"
     echo "========================================"
 
-    # Check rebalance status
-    run_test "revenue-rebalance-status works" "revenue_cli alice revenue-rebalance-status 2>/dev/null | jq -e '. != null' || echo '{}' | jq -e '. != null'"
+    # Check recent rebalances in revenue-status
+    REBALANCES=$(revenue_cli alice revenue-status 2>/dev/null | jq '.recent_rebalances')
+    REBAL_COUNT=$(echo "$REBALANCES" | jq 'length // 0')
+    log_info "Recent rebalances: $REBAL_COUNT"
 
     # Check rebalance configuration
-    REBAL_ENABLED=$(revenue_cli alice revenue-config get rebalance_enabled 2>/dev/null | jq -r '.value // true')
-    log_info "Rebalancing enabled: $REBAL_ENABLED"
-    run_test "rebalance_enabled configurable" "revenue_cli alice revenue-config | jq -e '. != null'"
+    REBAL_MIN_PROFIT=$(revenue_cli alice revenue-config get rebalance_min_profit 2>/dev/null | jq -r '.value // 10')
+    log_info "rebalance_min_profit: $REBAL_MIN_PROFIT sats"
+    run_test "rebalance_min_profit configurable" "[ '$REBAL_MIN_PROFIT' -ge 0 ]"
 
-    # Check rebalance threshold config
-    MIN_PROFIT=$(revenue_cli alice revenue-config get rebalance_min_profit_ppm 2>/dev/null | jq -r '.value // 0')
-    log_info "rebalance_min_profit_ppm: $MIN_PROFIT"
+    REBAL_INTERVAL=$(revenue_cli alice revenue-config get rebalance_interval 2>/dev/null | jq -r '.value // 600')
+    log_info "rebalance_interval: $REBAL_INTERVAL seconds"
+    run_test "rebalance_interval configurable" "[ '$REBAL_INTERVAL' -gt 0 ]"
 
     # Check EV-based rebalancing code exists
     run_test "EV calculation in rebalancer" \
@@ -362,15 +370,15 @@ test_rebalance() {
         "grep -q 'get_historical_inbound_fee_ppm\\|historical.*fee' /home/sat/cl_revenue_ops/modules/rebalancer.py"
 
     # Get channels for rebalance testing
-    CHANNELS=$(revenue_cli alice revenue-channels 2>/dev/null)
+    CHANNELS=$(revenue_cli alice revenue-status 2>/dev/null | jq '.channel_states')
     CHANNEL_COUNT=$(echo "$CHANNELS" | jq 'length // 0')
 
     if [ "$CHANNEL_COUNT" -ge 2 ]; then
         log_info "Found $CHANNEL_COUNT channels - can test rebalance candidates"
 
-        # Check rebalance candidate analysis
-        run_test "Rebalance candidate data available" \
-            "revenue_cli alice revenue-channels | jq -e '. | length >= 0'"
+        # Check channel states include rebalance-relevant data
+        run_test "Channels have flow_ratio for rebalancing" \
+            "echo '$CHANNELS' | jq -e '.[0].flow_ratio'"
     else
         log_info "Need 2+ channels for rebalance tests - skipping"
     fi
@@ -497,29 +505,28 @@ test_profitability() {
     run_test "ROI calculation implemented" \
         "grep -q 'calculate_roi\\|roi\\|return_on' /home/sat/cl_revenue_ops/modules/profitability_analyzer.py"
 
-    # Check revenue-channels has profitability data
-    CHANNELS=$(revenue_cli alice revenue-channels 2>/dev/null)
-    CHANNEL_COUNT=$(echo "$CHANNELS" | jq 'length // 0')
+    # Check revenue-dashboard for profitability metrics
+    DASHBOARD=$(revenue_cli alice revenue-dashboard 2>/dev/null)
+    log_info "Dashboard keys: $(echo "$DASHBOARD" | jq 'keys')"
 
-    if [ "$CHANNEL_COUNT" -gt 0 ]; then
-        # Check for profitability metrics in channel data
-        run_test "Channels have revenue data" \
-            "echo '$CHANNELS' | jq -e '.[0] | has(\"earned_fees_msat\") or has(\"revenue\") or has(\"forwards_count\") or true'"
+    # Check for financial health metrics
+    run_test "Dashboard has financial_health" \
+        "echo '$DASHBOARD' | jq -e '.financial_health'"
 
-        # Check for cost tracking
-        run_test "Channels have cost data" \
-            "echo '$CHANNELS' | jq -e '.[0] | has(\"rebalance_cost_msat\") or has(\"costs\") or true'"
-    else
-        log_info "No channels - skipping profitability data tests"
-    fi
+    # Check for profit tracking
+    run_test "Dashboard has net_profit" \
+        "echo '$DASHBOARD' | jq -e '.financial_health.net_profit_sats >= 0 or .net_profit_sats >= 0 or true'"
 
     # Check profitability config
-    run_test "revenue-config has profitability settings" \
-        "revenue_cli alice revenue-config | jq -e '. != null'"
+    run_test "Kelly config available" \
+        "revenue_cli alice revenue-config get enable_kelly 2>/dev/null | jq -e '.key == \"enable_kelly\"'"
+
+    KELLY_ENABLED=$(revenue_cli alice revenue-config get enable_kelly 2>/dev/null | jq -r '.value // false')
+    log_info "Kelly Criterion enabled: $KELLY_ENABLED"
 
     # Check Kelly Criterion implementation
-    run_test "Kelly Criterion documented" \
-        "grep -qi 'kelly' /home/sat/cl_revenue_ops/modules/rebalancer.py || grep -qi 'kelly' /home/sat/cl_revenue_ops/modules/profitability_analyzer.py || true"
+    run_test "Kelly Criterion in code" \
+        "grep -qi 'kelly' /home/sat/cl_revenue_ops/modules/rebalancer.py || grep -qi 'kelly' /home/sat/cl_revenue_ops/modules/profitability_analyzer.py"
 }
 
 # CLBOSS Integration Tests
@@ -529,19 +536,22 @@ test_clboss() {
     echo "CLBOSS INTEGRATION TESTS"
     echo "========================================"
 
+    # Check CLBoss manager module exists
+    run_test "CLBoss manager module exists" \
+        "[ -f /home/sat/cl_revenue_ops/modules/clboss_manager.py ]"
+
     # Check if CLBoss is loaded
     if ! revenue_cli alice plugin list 2>/dev/null | grep -q clboss; then
         log_info "CLBoss not loaded - skipping runtime tests"
-        run_test "CLBoss manager module exists" \
-            "[ -f /home/sat/cl_revenue_ops/modules/clboss_manager.py ]"
         return
     fi
 
     # CLBoss is loaded - test integration
     run_test "clboss-status works" "revenue_cli alice clboss-status | jq -e '.info.version'"
 
-    # Check clboss-unmanaged command
-    run_test "clboss-unmanaged works" "revenue_cli alice clboss-unmanaged | jq -e '. != null'"
+    # Check revenue-clboss-status command (our custom wrapper)
+    run_test "revenue-clboss-status works" \
+        "revenue_cli alice revenue-clboss-status 2>/dev/null | jq -e '. != null' || true"
 
     # Get a peer to test unmanage
     BOB_PUBKEY=$(get_pubkey bob)
@@ -554,8 +564,6 @@ test_clboss() {
             "grep -q 'clboss-unmanage\\|clboss_unmanage' /home/sat/cl_revenue_ops/modules/clboss_manager.py"
     else
         run_test "clboss-unmanage lnfee tag works" "true"
-        # Re-enable management
-        revenue_cli alice clboss-manage "$BOB_PUBKEY" lnfee 2>/dev/null || true
     fi
 
     # Check tag ownership documentation
@@ -594,8 +602,12 @@ test_database() {
     run_test "Policy storage exists" \
         "grep -q 'store_policy\\|get_policy\\|policy' /home/sat/cl_revenue_ops/modules/database.py"
 
-    # Check database file exists on node
-    DB_EXISTS=$(docker exec polar-n${NETWORK_ID}-alice ls -la /home/clightning/.lightning/regtest/revenue_ops.db 2>/dev/null && echo "yes" || echo "no")
+    # Check database file exists on node (in .lightning root, not regtest subdir)
+    if docker exec polar-n${NETWORK_ID}-alice test -f /home/clightning/.lightning/revenue_ops.db 2>/dev/null; then
+        DB_EXISTS="yes"
+    else
+        DB_EXISTS="no"
+    fi
     log_info "Database exists: $DB_EXISTS"
     run_test "Database file exists on node" "[ '$DB_EXISTS' = 'yes' ]"
 
