@@ -153,19 +153,6 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - Hydrates forwards table on startup, then uses only local DB.
     - Reduces CPU usage by ~90% during flow analysis cycles.
 
-### v1.4.0: Optimization & Yield (Deferred)
-*Reason: These features introduce complex game-theoretic risks that require stable baseline data from v1.3.*
-
-- [ ] **Flow Asymmetry (Rare Liquidity Premium)**:
-    - Charge a premium for "One-Way Street" channels with high outflow.
-    - **Safety Guard**: Velocity Gate - only apply to high-volume channels (>50k sats/day).
-    - *Deferred:* Requires traffic pattern analysis to distinguish "One-Way Streets" from "Self-Loops."
-
-- [ ] **Peer-Level Atomic Fee Syncing**:
-    - Unified liquidity pool pricing per peer node to prevent "Gossip Cannibalization."
-    - **Safety Guard**: Exception Hierarchy - emergency states (Fire Sale/Congestion) take precedence over syncing.
-    - *Deferred:* High-02 Arbitrage Risk. Requires "Baseline/Floor" architecture rather than "Leader Override."
-
 ## Phase 8: The Sovereign Dashboard (P&L Engine)
 *Status: COMPLETED (v1.5.0)*
 *Objective: Provide comprehensive financial visibility and identify underperforming channels.*
@@ -185,8 +172,43 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - Single command for operator to check node financial health.
     - JSON output: `financial_health` (TLV, net profit, margin, ROC), `period` (window, revenue, opex), `warnings` (bleeders list).
 
+### v1.5.0: Fee Controller v2.0 (Algorithm Improvements) ✅ COMPLETED
+
+Five security-hardened algorithm improvements for fee optimization:
+
+- [x] **Bounds Multipliers**: Apply liquidity/profitability multipliers to floor/ceiling instead of fee directly.
+    - Security: `MAX_FLOOR_MULTIPLIER=3.0`, `MIN_CEILING_MULTIPLIER=0.5`
+
+- [x] **Dynamic Observation Windows**: Use forward count + time for observation windows.
+    - Security: `MAX_OBSERVATION_HOURS=24h` (anti-starvation), `MIN_FORWARDS_FOR_SIGNAL=5`
+
+- [x] **Historical Response Curve**: Track fee→revenue history with exponential decay.
+    - Security: `MAX_OBSERVATIONS=100` (bounded memory), regime change detection
+
+- [x] **Elasticity Tracking**: Track demand sensitivity to fee changes.
+    - Security: `OUTLIER_THRESHOLD=5.0` (ignore attacks), revenue-weighted
+
+- [x] **Thompson Sampling**: Explore fee space using multi-armed bandit.
+    - Security: `MAX_EXPLORATION_PCT=±20%`, `RAMP_UP_CYCLES=5` for new channels
+
+### v1.6.0: Flow Analysis v2.0 (Algorithm Improvements) ✅ COMPLETED
+
+Four security-hardened improvements for flow analysis accuracy:
+
+- [x] **Flow Confidence Score**: Weight flow state by data quality (forward count + recency).
+    - Security: `MIN_CONFIDENCE=0.1` (never fully ignore), `MAX_CONFIDENCE=1.0`
+
+- [x] **Graduated Flow Multipliers**: Scale fee adjustments proportionally with flow magnitude.
+    - Security: `MIN_FLOW_MULTIPLIER=0.5`, `MAX_FLOW_MULTIPLIER=2.0`, deadband at 0.1
+
+- [x] **Flow Velocity Tracking**: Detect acceleration/deceleration of flow trends.
+    - Security: `MAX_VELOCITY=±0.5`, outlier detection at 3x threshold
+
+- [x] **Adaptive EMA Decay**: Faster decay for volatile channels, slower for stable.
+    - Security: `MIN_EMA_DECAY=0.6`, `MAX_EMA_DECAY=0.9`
+
 ## Phase 9: "The Hive" (External Integration)
-*Status: IN PROGRESS — Implementation Plan Approved*
+*Status: COMPLETED*
 
 The distributed fleet coordination logic has been decoupled into a standalone plugin to improve modularity and security.
 
@@ -207,20 +229,19 @@ The distributed fleet coordination logic has been decoupled into a standalone pl
     - `FeeStrategy.HIVE` enforces 0 PPM fees and enables Strategic Exemption.
     - Supersedes the original "Hive Signal API Hooks" design.
 
-### cl-hive Plugin (Standalone) — IN DEVELOPMENT
+### cl-hive Plugin (Standalone) ✅ COMPLETED
 
-*See [`IMPLEMENTATION_PLAN.md`](../../../cl-hive/docs/planning/IMPLEMENTATION_PLAN.md) for detailed phases.*
+*See [cl-hive repository](https://github.com/LightningGoats/cl-hive) for implementation details.*
 
-- [ ] **Phase 0:** Plugin skeleton, database schema, config.
-- [ ] **Phase 1:** BOLT 8 protocol layer (custom messages, PKI handshake).
-- [ ] **Phase 2:** State management (HiveMap, Anti-Entropy sync).
-- [ ] **Phase 3:** Intent Lock Protocol (deterministic conflict resolution).
-- [ ] **Phase 4:** Integration Bridge (Paranoid) — calls `revenue-policy` API.
-- [ ] **Phase 5:** Governance & Membership (two-tier system, Proof of Utility).
-- [ ] **Phase 6:** Hive Planner (topology optimization, saturation analysis).
-- [ ] **Phase 7:** Governance Modes (Advisor, Autonomous, Oracle).
-- [ ] **Phase 8:** RPC Commands (`hive-status`, `hive-join`, `hive-topology`, etc.).
+- [x] **Phase 0:** Plugin skeleton, database schema, config.
+- [x] **Phase 1:** BOLT 8 protocol layer (custom messages, PKI handshake).
+- [x] **Phase 2:** State management (HiveMap, Anti-Entropy sync).
+- [x] **Phase 3:** Intent Lock Protocol (deterministic conflict resolution).
+- [x] **Phase 4:** Integration Bridge (Paranoid) — calls `revenue-policy` API.
+- [x] **Phase 5:** Governance & Membership (two-tier system, Proof of Utility).
+- [x] **Phase 6:** Hive Planner (topology optimization, saturation analysis).
+- [x] **Phase 7:** Governance Modes (Advisor, Autonomous, Oracle).
+- [x] **Phase 8:** RPC Commands (`hive-status`, `hive-join`, `hive-topology`, etc.).
 
 ---
-*Node Status: Self-Healing & Self-Optimizing (Current ROI: 44.43%)*
-*Roadmap updated: January 10, 2026*
+*Roadmap updated: January 11, 2026*

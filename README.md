@@ -104,13 +104,10 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 
 ## Documentation
 
-| Document | Location | Description |
-|----------|----------|-------------|
-| **Roadmap** | [`docs/planning/ROADMAP.md`](docs/planning/ROADMAP.md) | Development phases and feature status |
-| **Phase 7 Spec** | [`docs/specs/PHASE7_SPECIFICATION.md`](docs/specs/PHASE7_SPECIFICATION.md) | v1.3 "The 1% Node" Defense spec |
-| **Phase 8 Spec** | [`docs/specs/PHASE8_SPECIFICATION.md`](docs/specs/PHASE8_SPECIFICATION.md) | The Sovereign Dashboard (P&L) |
-| **API Spec** | [`docs/specs/API_UNIFICATION_SPEC.md`](docs/specs/API_UNIFICATION_SPEC.md) | v1.4 Policy Engine reference |
-| **Red Team Report** | [`docs/audits/PHASE7_RED_TEAM_REPORT.md`](docs/audits/PHASE7_RED_TEAM_REPORT.md) | Security Audit Findings |
+| Document | Description |
+|----------|-------------|
+| [Roadmap](docs/planning/ROADMAP.md) | Development phases and feature status |
+| [Testing Guide](docs/testing/README.md) | Automated test suite for Polar networks |
 
 ## License
 MIT
