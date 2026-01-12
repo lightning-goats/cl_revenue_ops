@@ -793,13 +793,12 @@ class HillClimbingFeeController:
 
     # Improvement #2: Dynamic Observation Windows
     # Use forward count instead of just time-based windows
-    # Security mitigations:
-    # - MAX_OBSERVATION_HOURS: Hard ceiling prevents starvation (stuck at bad fee)
-    # - MIN_OBSERVATION_HOURS: Hard floor (1h) prevents burst manipulation
-    # - MIN_FORWARDS_FOR_SIGNAL: Statistical significance requirement
-    ENABLE_DYNAMIC_WINDOWS = True     # Feature flag
-    MIN_FORWARDS_FOR_SIGNAL = 5       # Need at least 5 forwards for valid signal
-    MAX_OBSERVATION_HOURS = 6.0       # Force adjustment after 6h even with 0 forwards
+    # NOTE: Disabled by default - pure time-based windows are simpler and prevent
+    # channels from getting stuck at bad fees during quiet periods.
+    # The Hill Climbing algorithm already handles noisy signals via dampening.
+    ENABLE_DYNAMIC_WINDOWS = False    # Disabled: use time-based windows only
+    MIN_FORWARDS_FOR_SIGNAL = 3       # Only used if ENABLE_DYNAMIC_WINDOWS=True
+    MAX_OBSERVATION_HOURS = 6.0       # Only used if ENABLE_DYNAMIC_WINDOWS=True
     # Note: MIN_OBSERVATION_HOURS already defined above (1.0)
 
     # Improvement #3: Historical Response Curve
