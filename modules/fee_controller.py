@@ -794,12 +794,12 @@ class HillClimbingFeeController:
     # Improvement #2: Dynamic Observation Windows
     # Use forward count instead of just time-based windows
     # Security mitigations:
-    # - MAX_OBSERVATION_HOURS: Hard ceiling (24h) prevents starvation attack
+    # - MAX_OBSERVATION_HOURS: Hard ceiling prevents starvation (stuck at bad fee)
     # - MIN_OBSERVATION_HOURS: Hard floor (1h) prevents burst manipulation
     # - MIN_FORWARDS_FOR_SIGNAL: Statistical significance requirement
     ENABLE_DYNAMIC_WINDOWS = True     # Feature flag
     MIN_FORWARDS_FOR_SIGNAL = 5       # Need at least 5 forwards for valid signal
-    MAX_OBSERVATION_HOURS = 24.0      # Security: Maximum window (prevent starvation)
+    MAX_OBSERVATION_HOURS = 6.0       # Force adjustment after 6h even with 0 forwards
     # Note: MIN_OBSERVATION_HOURS already defined above (1.0)
 
     # Improvement #3: Historical Response Curve
