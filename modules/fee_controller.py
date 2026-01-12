@@ -880,14 +880,28 @@ class HillClimbingFeeController:
     def adjust_all_fees(self) -> List[FeeAdjustment]:
         """
         Adjust fees for all channels using Hill Climbing optimization.
-        
+
         This is the main entry point, called periodically by the timer.
-        
+
         Returns:
             List of FeeAdjustment records for channels that were adjusted
         """
         adjustments = []
-        
+
+        # Skip reason tracking for diagnostics
+        skip_reasons = {
+            "policy_passive": 0,
+            "policy_static": 0,
+            "policy_hive": 0,
+            "sleeping": 0,
+            "waiting_time": 0,
+            "waiting_forwards": 0,
+            "fee_unchanged": 0,
+            "gossip_hysteresis": 0,
+            "idempotent": 0,
+            "error": 0
+        }
+
         # Get all channel states from flow analysis
         channel_states = self.database.get_all_channel_states()
         
@@ -931,6 +945,7 @@ class HillClimbingFeeController:
                 
                 # Skip PASSIVE strategy (equivalent to old is_peer_ignored)
                 if policy.strategy == FeeStrategy.PASSIVE:
+                    skip_reasons["policy_passive"] += 1
                     continue
                 
                 # Handle STATIC strategy: apply fixed fee
@@ -951,8 +966,11 @@ class HillClimbingFeeController:
                                 ))
                             except Exception as e:
                                 self.plugin.log(f"Error setting static fee for {channel_id}: {e}", level='error')
+                                skip_reasons["error"] += 1
+                        else:
+                            skip_reasons["policy_static"] += 1
                     continue
-                
+
                 # Handle HIVE strategy: set low/zero fee (cl-hive fleet member)
                 if policy.strategy == FeeStrategy.HIVE:
                     channel_info = channels.get(channel_id)
@@ -972,6 +990,9 @@ class HillClimbingFeeController:
                                 ))
                             except Exception as e:
                                 self.plugin.log(f"Error setting hive fee for {channel_id}: {e}", level='error')
+                                skip_reasons["error"] += 1
+                        else:
+                            skip_reasons["policy_hive"] += 1
                     continue
                 
                 # DYNAMIC strategy continues to normal Hill Climbing below
@@ -986,6 +1007,10 @@ class HillClimbingFeeController:
                 continue
             
             try:
+                # Check Hill Climb state before adjustment to track skip reasons
+                hc_state = self._get_hill_climb_state(channel_id)
+                now = int(time.time())
+
                 adjustment = self._adjust_channel_fee(
                     channel_id=channel_id,
                     peer_id=peer_id,
@@ -994,17 +1019,45 @@ class HillClimbingFeeController:
                     chain_costs=chain_costs,
                     cfg=cfg
                 )
-                
+
                 if adjustment:
                     adjustments.append(adjustment)
-                    
+                else:
+                    # Track why this channel was skipped
+                    if hc_state.is_sleeping:
+                        skip_reasons["sleeping"] += 1
+                    elif hc_state.last_update > 0:
+                        hours_elapsed = (now - hc_state.last_update) / 3600.0
+                        forward_count = self.database.get_forward_count_since(
+                            channel_id, hc_state.last_update)
+                        if hours_elapsed < self.MIN_OBSERVATION_HOURS:
+                            skip_reasons["waiting_time"] += 1
+                        elif forward_count < self.MIN_FORWARDS_FOR_SIGNAL:
+                            skip_reasons["waiting_forwards"] += 1
+                        else:
+                            # Must be fee unchanged, gossip hysteresis, or idempotent
+                            skip_reasons["fee_unchanged"] += 1
+                    else:
+                        skip_reasons["fee_unchanged"] += 1
+
             except Exception as e:
                 self.plugin.log(f"Error adjusting fee for {channel_id}: {e}", level='error')
-        
+                skip_reasons["error"] += 1
+
         # Garbage Collection: Prune state for closed channels (TODO #18)
         active_channel_ids = set(channels.keys())
         self._prune_stale_states(active_channel_ids)
-        
+
+        # Log summary when no adjustments made (helps diagnose issues)
+        if len(adjustments) == 0 and len(channel_states) > 0:
+            active_skips = {k: v for k, v in skip_reasons.items() if v > 0}
+            if active_skips:
+                self.plugin.log(
+                    f"Fee adjustment: 0/{len(channel_states)} channels adjusted. "
+                    f"Skip reasons: {active_skips}",
+                    level='info'
+                )
+
         return adjustments
     
     def _adjust_channel_fee(self, channel_id: str, peer_id: str,

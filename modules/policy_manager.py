@@ -402,6 +402,78 @@ class PolicyManager:
         except Exception as e:
             self.plugin.log(f"PolicyManager: Error deleting expired policy: {e}", level='warn')
 
+    def get_policy_changes_since(self, since_timestamp: int) -> List[Dict[str, Any]]:
+        """
+        Get all policy changes since a given timestamp.
+
+        This method is designed for cl-hive integration, allowing efficient
+        polling for policy updates without fetching all policies.
+
+        Args:
+            since_timestamp: Unix timestamp. Returns policies updated after this time.
+
+        Returns:
+            List of policy dicts with peer_id, strategy, rebalance_mode, and updated_at.
+            Returns empty list if no changes since timestamp.
+
+        Example:
+            # Get policies changed in last 5 minutes
+            changes = policy_manager.get_policy_changes_since(int(time.time()) - 300)
+        """
+        try:
+            conn = self.database._get_connection()
+            rows = conn.execute(
+                """
+                SELECT peer_id, strategy, rebalance_mode, fee_ppm_target,
+                       tags, updated_at, fee_multiplier_min, fee_multiplier_max,
+                       expires_at
+                FROM peer_policies
+                WHERE updated_at > ?
+                ORDER BY updated_at DESC
+                """,
+                (since_timestamp,)
+            ).fetchall()
+
+            changes = []
+            for row in rows:
+                policy = self._row_to_policy(row)
+                # Skip expired policies
+                if policy.is_expired():
+                    continue
+                changes.append(policy.to_dict())
+
+            return changes
+
+        except Exception as e:
+            self.plugin.log(
+                f"PolicyManager: Error getting policy changes: {e}",
+                level='warn'
+            )
+            return []
+
+    def get_last_policy_change_timestamp(self) -> int:
+        """
+        Get the timestamp of the most recent policy change.
+
+        Useful for cl-hive to check if there are any new changes
+        without fetching all changes.
+
+        Returns:
+            Unix timestamp of most recent change, or 0 if no policies exist.
+        """
+        try:
+            conn = self.database._get_connection()
+            row = conn.execute(
+                "SELECT MAX(updated_at) as max_ts FROM peer_policies"
+            ).fetchone()
+            return row['max_ts'] or 0 if row else 0
+        except Exception as e:
+            self.plugin.log(
+                f"PolicyManager: Error getting last change timestamp: {e}",
+                level='warn'
+            )
+            return 0
+
     def set_policy(
         self,
         peer_id: str,

@@ -1569,11 +1569,104 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
     return result
 
 
+@plugin.method("revenue-fee-debug")
+def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
+    """
+    Diagnostic command to understand why fee adjustments may not be happening.
+
+    Shows:
+    - Hill Climb state for each channel (sleeping, last_update, forward count)
+    - Why each channel was skipped in the last cycle
+    - Dynamic window status
+    - Hysteresis/sleep status
+
+    Usage: lightning-cli revenue-fee-debug
+    """
+    if database is None or fee_controller is None:
+        return {"error": "Plugin not fully initialized"}
+
+    now = int(time.time())
+    result = {
+        "timestamp": now,
+        "config": {
+            "fee_interval_seconds": config.fee_interval if config else 1800,
+            "min_observation_hours": 1.0,
+            "min_forwards_for_signal": 5,
+            "max_observation_hours": 24.0,
+            "enable_dynamic_windows": True
+        },
+        "channels": [],
+        "summary": {
+            "total": 0,
+            "sleeping": 0,
+            "waiting_time": 0,
+            "waiting_forwards": 0,
+            "ready": 0
+        }
+    }
+
+    # Get all fee strategy states
+    fee_states = database.get_all_fee_strategy_states()
+    channel_states = database.get_all_channel_states()
+
+    # Create lookup for channel states
+    state_lookup = {s.get("channel_id"): s for s in channel_states}
+
+    for fs in fee_states:
+        channel_id = fs.get("channel_id", "unknown")
+        is_sleeping = fs.get("is_sleeping", 0)
+        sleep_until = fs.get("sleep_until", 0)
+        last_update = fs.get("last_update", 0)
+        forward_count = fs.get("forward_count_since_update", 0)
+        last_broadcast_fee = fs.get("last_broadcast_fee_ppm", 0)
+        last_revenue_rate = fs.get("last_revenue_rate", 0.0)
+
+        hours_since_update = (now - last_update) / 3600.0 if last_update > 0 else 0.0
+
+        # Determine skip reason
+        skip_reason = None
+        status = "ready"
+
+        if is_sleeping:
+            mins_until_wake = (sleep_until - now) // 60
+            skip_reason = f"SLEEPING (wake in {mins_until_wake} min)"
+            status = "sleeping"
+            result["summary"]["sleeping"] += 1
+        elif hours_since_update < 1.0:
+            skip_reason = f"WAITING_TIME ({hours_since_update:.2f}h < 1h min)"
+            status = "waiting_time"
+            result["summary"]["waiting_time"] += 1
+        elif forward_count < 5:
+            skip_reason = f"WAITING_FORWARDS ({forward_count}/5 forwards)"
+            status = "waiting_forwards"
+            result["summary"]["waiting_forwards"] += 1
+        else:
+            status = "ready"
+            result["summary"]["ready"] += 1
+
+        chan_state = state_lookup.get(channel_id, {})
+
+        result["channels"].append({
+            "channel_id": channel_id[:12] + "..." if len(channel_id) > 12 else channel_id,
+            "status": status,
+            "skip_reason": skip_reason,
+            "is_sleeping": bool(is_sleeping),
+            "hours_since_update": round(hours_since_update, 2),
+            "forwards_since_update": forward_count,
+            "last_broadcast_fee_ppm": last_broadcast_fee,
+            "last_revenue_rate": round(last_revenue_rate, 2),
+            "flow_state": chan_state.get("state", "unknown")
+        })
+        result["summary"]["total"] += 1
+
+    return result
+
+
 @plugin.method("revenue-analyze")
 def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Run flow analysis on demand (optionally for a specific channel).
-    
+
     Usage: lightning-cli revenue-analyze [channel_id]
     """
     if flow_analyzer is None:
@@ -1944,10 +2037,10 @@ def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
 @plugin.method("revenue-policy")
 def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
                    strategy: str = None, rebalance: str = None,
-                   fee_ppm: int = None, tag: str = None) -> Dict[str, Any]:
+                   fee_ppm: int = None, tag: str = None, **kwargs) -> Dict[str, Any]:
     """
     Manage peer-level fee and rebalance policies (v1.4 API).
-    
+
     Usage:
       lightning-cli revenue-policy list                           # List all policies
       lightning-cli revenue-policy get <peer_id>                  # Get policy for peer
@@ -1956,28 +2049,39 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
       lightning-cli revenue-policy tag <peer_id> <tag>            # Add tag to peer
       lightning-cli revenue-policy untag <peer_id> <tag>          # Remove tag from peer
       lightning-cli revenue-policy find <tag>                     # Find peers by tag
-    
+      lightning-cli revenue-policy changes [since=<timestamp>]    # Get policy changes (cl-hive)
+
     Options for 'set':
       strategy=dynamic|static|hive|passive   Fee control strategy
       rebalance=enabled|disabled|source_only|sink_only   Rebalance mode
       fee_ppm=N   Target fee for static strategy (required if strategy=static)
-    
+
     Strategies:
       dynamic  - Hill Climbing + Scarcity Pricing (default)
       static   - Fixed fee (requires fee_ppm)
       hive     - Zero/low fee for fleet members (cl-hive integration)
       passive  - Do not manage (CLBOSS/manual control)
-    
+
     Rebalance Modes:
       enabled     - Full rebalancing allowed (default)
       disabled    - No rebalancing (equivalent to old 'ignore')
       source_only - Can drain from, cannot fill
       sink_only   - Can fill, cannot drain from
-    
+
+    Options for 'changes' (cl-hive integration):
+      since=<timestamp>   Unix timestamp. Returns policies changed after this time.
+                          If omitted, returns all policies.
+
+    Options for 'batch' (cl-hive integration):
+      updates='[...]'     JSON array of policy updates. Each entry has:
+                          peer_id, strategy, rebalance_mode, fee_ppm_target, tags
+                          Bypasses rate limiting for bulk hive fleet updates.
+
     Examples:
       lightning-cli revenue-policy set 02abc... strategy=static fee_ppm=500
       lightning-cli revenue-policy set 02abc... strategy=passive rebalance=disabled
       lightning-cli revenue-policy tag 02abc... whale
+      lightning-cli -k revenue-policy action=changes since=1704067200
     """
     if policy_manager is None:
         return {"error": "Plugin not initialized"}
@@ -2055,9 +2159,53 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
                 "count": len(policies),
                 "tag": tag
             }
-        
+
+        elif action == "changes":
+            # cl-hive integration: Get policy changes since timestamp
+            # Usage: revenue-policy changes [since=<timestamp>]
+            since = kwargs.get('since', 0)
+            try:
+                since = int(since) if since else 0
+            except (ValueError, TypeError):
+                return {"error": "Invalid 'since' timestamp. Must be a Unix timestamp."}
+
+            changes = policy_manager.get_policy_changes_since(since)
+            last_change = policy_manager.get_last_policy_change_timestamp()
+            return {
+                "changes": changes,
+                "count": len(changes),
+                "since": since,
+                "last_change_timestamp": last_change
+            }
+
+        elif action == "batch":
+            # cl-hive integration: Bulk policy updates (bypasses rate limiting)
+            # Usage: revenue-policy batch updates='[{"peer_id": "...", "strategy": "hive"}, ...]'
+            updates_json = kwargs.get('updates', '[]')
+            try:
+                import json
+                if isinstance(updates_json, str):
+                    updates = json.loads(updates_json)
+                else:
+                    updates = updates_json
+                if not isinstance(updates, list):
+                    return {"error": "updates must be a JSON array"}
+            except json.JSONDecodeError as e:
+                return {"error": f"Invalid JSON in updates: {e}"}
+
+            try:
+                policies = policy_manager.set_policies_batch(updates)
+                return {
+                    "status": "success",
+                    "updated": len(policies),
+                    "policies": [p.to_dict() for p in policies],
+                    "message": f"Batch updated {len(policies)} policies"
+                }
+            except ValueError as e:
+                return {"status": "error", "error": str(e)}
+
         else:
-            return {"error": f"Unknown action: {action}. Use 'list', 'get', 'set', 'delete', 'tag', 'untag', or 'find'"}
+            return {"error": f"Unknown action: {action}. Use 'list', 'get', 'set', 'delete', 'tag', 'untag', 'find', 'changes', or 'batch'"}
     
     except ValueError as e:
         return {"status": "error", "error": str(e)}
@@ -2070,19 +2218,21 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
                    peer_id: str = None) -> Dict[str, Any]:
     """
     Generate reports for node financial health and peer status (v1.4 API).
-    
+
     Usage:
       lightning-cli revenue-report                    # Summary report
       lightning-cli revenue-report summary            # Same as above
       lightning-cli revenue-report peer <peer_id>    # Detailed peer report
       lightning-cli revenue-report hive              # List hive fleet members
       lightning-cli revenue-report policies          # Policy distribution stats
-    
+      lightning-cli revenue-report costs             # Closure/splice cost history (cl-hive)
+
     Report Types:
       summary   - Overall node P&L, active channels, warnings
       peer      - Specific peer metrics (profitability, flow, policy)
       hive      - List of peers with HIVE strategy (for cl-hive)
       policies  - Statistics on policy distribution
+      costs     - Closure/splice costs for capacity planning (cl-hive)
     """
     if database is None or policy_manager is None:
         return {"error": "Plugin not initialized"}
@@ -2150,24 +2300,24 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
         
         elif report_type == "policies":
             all_policies = policy_manager.get_all_policies()
-            
+
             by_strategy = {}
             by_mode = {}
             by_tag = {}
-            
+
             for p in all_policies:
                 # Count by strategy
                 s = p.strategy.value
                 by_strategy[s] = by_strategy.get(s, 0) + 1
-                
+
                 # Count by mode
                 m = p.rebalance_mode.value
                 by_mode[m] = by_mode.get(m, 0) + 1
-                
+
                 # Count by tag
                 for t in p.tags:
                     by_tag[t] = by_tag.get(t, 0) + 1
-            
+
             return {
                 "type": "policies",
                 "total": len(all_policies),
@@ -2175,9 +2325,57 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
                 "by_rebalance_mode": by_mode,
                 "by_tag": by_tag
             }
-        
+
+        elif report_type == "costs":
+            # cl-hive integration: Expose closure/splice costs for capacity planning
+            now = int(time.time())
+            day_ago = now - 86400
+            week_ago = now - (7 * 86400)
+            month_ago = now - (30 * 86400)
+
+            # Get historical costs
+            closure_costs_day = database.get_closure_costs_since(day_ago)
+            closure_costs_week = database.get_closure_costs_since(week_ago)
+            closure_costs_month = database.get_closure_costs_since(month_ago)
+            closure_costs_total = database.get_total_closure_costs()
+
+            splice_costs_day = database.get_splice_costs_since(day_ago)
+            splice_costs_week = database.get_splice_costs_since(week_ago)
+            splice_costs_month = database.get_splice_costs_since(month_ago)
+            splice_costs_total = database.get_total_splice_costs()
+
+            # Get splice summary for detailed breakdown
+            splice_summary = database.get_splice_summary()
+
+            # Include default chain cost estimates
+            from modules.config import ChainCostDefaults
+            estimated_costs = {
+                "channel_open_sats": ChainCostDefaults.CHANNEL_OPEN_COST_SATS,
+                "channel_close_sats": ChainCostDefaults.CHANNEL_CLOSE_COST_SATS,
+                "splice_sats": ChainCostDefaults.SPLICE_COST_SATS,
+            }
+
+            return {
+                "type": "costs",
+                "closure_costs": {
+                    "last_24h_sats": closure_costs_day,
+                    "last_7d_sats": closure_costs_week,
+                    "last_30d_sats": closure_costs_month,
+                    "total_sats": closure_costs_total
+                },
+                "splice_costs": {
+                    "last_24h_sats": splice_costs_day,
+                    "last_7d_sats": splice_costs_week,
+                    "last_30d_sats": splice_costs_month,
+                    "total_sats": splice_costs_total,
+                    "summary": splice_summary
+                },
+                "estimated_defaults": estimated_costs,
+                "generated_at": now
+            }
+
         else:
-            return {"error": f"Unknown report type: {report_type}. Use 'summary', 'peer', 'hive', or 'policies'"}
+            return {"error": f"Unknown report type: {report_type}. Use 'summary', 'peer', 'hive', 'policies', or 'costs'"}
     
     except Exception as e:
         return {"status": "error", "error": f"Report generation failed: {e}"}
