@@ -10,10 +10,10 @@ revenue-ops-min-fee-ppm=100
 revenue-ops-max-fee-ppm=2500
 revenue-ops-fee-interval=1800
 
-# V2.0 features
-revenue-ops-enable-scarcity-pricing=true
+# V2.0 features (correct option names)
+revenue-ops-scarcity-pricing=true
 revenue-ops-scarcity-threshold=0.15
-revenue-ops-enable-vegas-reflex=true
+revenue-ops-vegas-reflex=true
 
 # Rebalancing
 revenue-ops-rebalance-min-profit=50

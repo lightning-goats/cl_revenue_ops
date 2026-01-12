@@ -61,7 +61,7 @@
 # Protects valuable liquidity from being underpriced
 
 # Enable scarcity pricing
-#revenue-ops-enable-scarcity-pricing=true
+#revenue-ops-scarcity-pricing=true
 
 # Outbound ratio below which scarcity pricing kicks in (0.15 = 15%)
 #revenue-ops-scarcity-threshold=0.15
@@ -71,7 +71,7 @@
 # Protects against underpricing when on-chain costs spike
 
 # Enable Vegas Reflex mempool-aware floor adjustment
-#revenue-ops-enable-vegas-reflex=true
+#revenue-ops-vegas-reflex=true
 
 # ============================================================================
 # REBALANCING
@@ -172,7 +172,7 @@
 # revenue-ops-min-fee-ppm=50
 # revenue-ops-max-fee-ppm=1500
 # revenue-ops-fee-interval=1800
-# revenue-ops-enable-scarcity-pricing=true
+# revenue-ops-scarcity-pricing=true
 # revenue-ops-proportional-budget=true
 # revenue-ops-proportional-budget-pct=0.15
 # revenue-ops-enable-kelly=true
@@ -186,7 +186,7 @@
 # revenue-ops-min-fee-ppm=150
 # revenue-ops-max-fee-ppm=5000
 # revenue-ops-fee-interval=3600
-# revenue-ops-enable-scarcity-pricing=true
+# revenue-ops-scarcity-pricing=true
 # revenue-ops-daily-budget-sats=2000
 # revenue-ops-proportional-budget=false
 # revenue-ops-enable-kelly=true
@@ -201,6 +201,6 @@
 # revenue-ops-min-fee-ppm=100
 # revenue-ops-max-fee-ppm=2500
 # revenue-ops-fee-interval=1800
-# revenue-ops-enable-scarcity-pricing=true
+# revenue-ops-scarcity-pricing=true
 # revenue-ops-proportional-budget=true
 # revenue-ops-proportional-budget-pct=0.10
