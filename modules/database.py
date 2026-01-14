@@ -697,6 +697,14 @@ class Database:
         except sqlite3.OperationalError:
             pass
 
+        # v2.1 Migration: Add closer column to closed_channels
+        # Tracks who initiated the closure: 'local', 'remote', or 'mutual'
+        try:
+            conn.execute("ALTER TABLE closed_channels ADD COLUMN closer TEXT DEFAULT 'unknown'")
+            self.plugin.log("Added closer column to closed_channels")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # v1.4 Migration: Migrate ignored_peers to peer_policies
         # This migrates legacy "ignored" peers to the new policy system
         self._migrate_ignored_peers_to_policies(conn)
@@ -2622,7 +2630,8 @@ class Database:
         total_rebalance_cost_sats: int,
         forward_count: int,
         funding_txid: Optional[str] = None,
-        closing_txid: Optional[str] = None
+        closing_txid: Optional[str] = None,
+        closer: str = 'unknown'
     ) -> bool:
         """
         Record complete P&L history for a closed channel.
@@ -2644,6 +2653,7 @@ class Database:
             forward_count: Number of successful forwards
             funding_txid: Funding transaction ID
             closing_txid: Closing transaction ID
+            closer: Who initiated closure: 'local', 'remote', 'mutual', or 'unknown'
 
         Returns:
             True if recorded successfully
@@ -2659,16 +2669,16 @@ class Database:
                 INSERT OR REPLACE INTO closed_channels
                 (channel_id, peer_id, capacity_sats, opened_at, closed_at, close_type,
                  open_cost_sats, closure_cost_sats, total_revenue_sats, total_rebalance_cost_sats,
-                 forward_count, net_pnl_sats, days_open, funding_txid, closing_txid)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 forward_count, net_pnl_sats, days_open, funding_txid, closing_txid, closer)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (channel_id, peer_id, capacity_sats, opened_at, closed_at, close_type,
                   open_cost_sats, closure_cost_sats, total_revenue_sats, total_rebalance_cost_sats,
-                  forward_count, net_pnl, days_open, funding_txid, closing_txid))
+                  forward_count, net_pnl, days_open, funding_txid, closing_txid, closer))
             conn.commit()
 
             self.plugin.log(
                 f"Recorded closed channel history for {channel_id}: "
-                f"net_pnl={net_pnl} sats, days_open={days_open}",
+                f"net_pnl={net_pnl} sats, days_open={days_open}, closer={closer}",
                 level='info'
             )
             return True
@@ -2747,6 +2757,77 @@ class Database:
             "total_net_pnl": 0,
             "avg_days_open": 0
         }
+
+    def remove_closed_channel_data(self, channel_id: str, peer_id: Optional[str] = None) -> Dict[str, int]:
+        """
+        Remove a closed channel from active tracking tables.
+
+        After a channel is archived to closed_channels, we should clean up
+        the active tracking data to prevent stale state and reduce db bloat.
+
+        Args:
+            channel_id: The channel short ID
+            peer_id: Optional peer ID (used for clboss_unmanaged cleanup)
+
+        Returns:
+            Dict with counts of deleted rows per table
+        """
+        deleted = {
+            "channel_states": 0,
+            "channel_failures": 0,
+            "channel_probes": 0,
+            "clboss_unmanaged": 0
+        }
+
+        try:
+            conn = self._get_connection()
+
+            # Remove from channel_states
+            cursor = conn.execute(
+                "DELETE FROM channel_states WHERE channel_id = ?",
+                (channel_id,)
+            )
+            deleted["channel_states"] = cursor.rowcount
+
+            # Remove from channel_failures
+            cursor = conn.execute(
+                "DELETE FROM channel_failures WHERE channel_id = ?",
+                (channel_id,)
+            )
+            deleted["channel_failures"] = cursor.rowcount
+
+            # Remove from channel_probes
+            cursor = conn.execute(
+                "DELETE FROM channel_probes WHERE channel_id = ?",
+                (channel_id,)
+            )
+            deleted["channel_probes"] = cursor.rowcount
+
+            # Remove from clboss_unmanaged if peer_id provided
+            if peer_id:
+                cursor = conn.execute(
+                    "DELETE FROM clboss_unmanaged WHERE peer_id = ?",
+                    (peer_id,)
+                )
+                deleted["clboss_unmanaged"] = cursor.rowcount
+
+            conn.commit()
+
+            total = sum(deleted.values())
+            if total > 0:
+                self.plugin.log(
+                    f"Cleaned up closed channel {channel_id}: {deleted}",
+                    level='info'
+                )
+
+            return deleted
+
+        except Exception as e:
+            self.plugin.log(
+                f"Error cleaning up closed channel {channel_id}: {e}",
+                level='error'
+            )
+            return deleted
 
     # =========================================================================
     # Splice Cost Tracking (Accounting v2.0)

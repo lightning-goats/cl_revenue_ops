@@ -177,6 +177,71 @@ shutdown_event = threading.Event()
 RPC_LOCK = threading.Lock()
 
 
+# =============================================================================
+# CL-HIVE AVAILABILITY CACHE (Performance Optimization)
+# =============================================================================
+# Caches the cl-hive plugin availability check to avoid expensive
+# plugin("list") RPC calls on every channel event. TTL: 60 seconds.
+
+class HiveAvailabilityCache:
+    """Thread-safe cache for cl-hive plugin availability."""
+
+    def __init__(self, ttl_seconds: int = 60):
+        self._available: Optional[bool] = None
+        self._last_check: float = 0
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+
+    def is_available(self, rpc) -> bool:
+        """
+        Check if cl-hive plugin is available (cached).
+
+        Args:
+            rpc: RPC interface for plugin list call
+
+        Returns:
+            True if cl-hive is active, False otherwise
+        """
+        now = time.time()
+
+        with self._lock:
+            # Return cached value if still valid
+            if self._available is not None and (now - self._last_check) < self._ttl:
+                return self._available
+
+        # Cache miss or expired - fetch fresh
+        try:
+            plugins = rpc.plugin("list")
+            available = False
+            for p in plugins.get('plugins', []):
+                if 'cl-hive' in p.get('name', '') and p.get('active', False):
+                    available = True
+                    break
+
+            with self._lock:
+                self._available = available
+                self._last_check = now
+
+            return available
+
+        except Exception:
+            # On error, assume unavailable but don't cache failure long
+            with self._lock:
+                self._available = False
+                self._last_check = now - (self._ttl - 5)  # Retry after 5s
+            return False
+
+    def invalidate(self):
+        """Force cache refresh on next check."""
+        with self._lock:
+            self._available = None
+            self._last_check = 0
+
+
+# Global cache for cl-hive availability (60 second TTL)
+hive_availability_cache = HiveAvailabilityCache(ttl_seconds=60)
+
+
 class RPCTimeoutError(RpcError):
     """Exception raised when an RPC call times out."""
     def __init__(self, method):
@@ -2540,6 +2605,142 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+@plugin.method("revenue-cleanup-closed")
+def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
+    """
+    Detect and clean up closed channels from active tracking tables.
+
+    This is a backfill operation that finds channels in the tracking database
+    that no longer exist (have been closed) and:
+    1. Archives them to closed_channels table with P&L data
+    2. Removes them from active tracking tables
+
+    Use this to clean up stale data from channels that closed before the
+    cleanup feature was implemented.
+
+    Returns:
+        {
+            "archived": int,      # Number of channels archived
+            "cleaned": int,       # Number of tracking records removed
+            "channels": [str],    # List of cleaned channel IDs
+            "errors": [str]       # Any errors encountered
+        }
+    """
+    global database, safe_plugin
+
+    if database is None:
+        return {"error": "Database not initialized"}
+
+    if safe_plugin is None:
+        return {"error": "Plugin not initialized"}
+
+    result = {
+        "archived": 0,
+        "cleaned": 0,
+        "channels": [],
+        "errors": []
+    }
+
+    try:
+        import time
+
+        # Get all channels currently tracked in channel_states
+        tracked_channels = database.get_all_channel_states()
+        tracked_ids = {ch['channel_id'] for ch in tracked_channels}
+
+        if not tracked_ids:
+            return {"message": "No tracked channels found", **result}
+
+        # Get all currently open channels
+        open_ids = set()
+        try:
+            channels = safe_plugin.rpc.call("listpeerchannels")
+            for ch in channels.get('channels', []):
+                scid = ch.get('short_channel_id', '').replace(':', 'x')
+                if scid:
+                    open_ids.add(scid)
+        except Exception as e:
+            result["errors"].append(f"Failed to get open channels: {e}")
+            return result
+
+        # Find closed channels (in tracking but not open)
+        closed_ids = tracked_ids - open_ids
+
+        if not closed_ids:
+            return {"message": "No closed channels found to clean up", **result}
+
+        plugin.log(
+            f"Found {len(closed_ids)} closed channels to clean up: {closed_ids}",
+            level='info'
+        )
+
+        # Get closure info from listclosedchannels
+        closed_info = {}
+        try:
+            closed_list = safe_plugin.rpc.call("listclosedchannels")
+            for ch in closed_list.get('closedchannels', []):
+                scid = ch.get('short_channel_id', '').replace(':', 'x')
+                if scid:
+                    closed_info[scid] = ch
+        except Exception as e:
+            plugin.log(f"listclosedchannels not available: {e}", level='debug')
+
+        # Process each closed channel
+        for channel_id in closed_ids:
+            try:
+                # Get tracked state for peer_id
+                tracked_state = next(
+                    (ch for ch in tracked_channels if ch['channel_id'] == channel_id),
+                    None
+                )
+                peer_id = tracked_state.get('peer_id') if tracked_state else None
+
+                # Get info from listclosedchannels
+                ch_info = closed_info.get(channel_id, {})
+
+                # Determine close type and closer
+                close_type = 'unknown'
+                closer = ch_info.get('closer', 'unknown')
+
+                if ch_info:
+                    # Map CLN close cause to our close_type
+                    cause = ch_info.get('close_cause', '')
+                    if 'mutual' in cause.lower():
+                        close_type = 'mutual'
+                    elif closer == 'local':
+                        close_type = 'local_unilateral'
+                    elif closer == 'remote':
+                        close_type = 'remote_unilateral'
+
+                # Archive the channel
+                _archive_closed_channel(
+                    channel_id=channel_id,
+                    peer_id=peer_id or ch_info.get('peer_id'),
+                    close_type=close_type,
+                    closing_txid=ch_info.get('closing_txid')
+                )
+
+                result["archived"] += 1
+                result["cleaned"] += 1
+                result["channels"].append(channel_id)
+
+            except Exception as e:
+                result["errors"].append(f"Error processing {channel_id}: {e}")
+                plugin.log(f"Error cleaning up {channel_id}: {e}", level='error')
+
+        plugin.log(
+            f"Cleaned up {result['archived']} closed channels",
+            level='info'
+        )
+
+        return result
+
+    except Exception as e:
+        plugin.log(f"Error in cleanup-closed: {e}", level='error')
+        result["errors"].append(str(e))
+        return result
+
+
 # =============================================================================
 # HOOKS - React to Lightning events
 # =============================================================================
@@ -2803,6 +3004,25 @@ def on_channel_state_changed(plugin: Plugin, **kwargs):
     channel_id = channel_id.replace(':', 'x')
 
     # =========================================================================
+    # Channel Open Detection (Hive Integration)
+    # =========================================================================
+    # Channel is opened when it transitions TO CHANNELD_NORMAL from opening states
+    opening_states = {
+        'DUALOPEND_AWAITING_LOCKIN',
+        'DUALOPEND_OPEN_INIT',
+        'CHANNELD_AWAITING_LOCKIN',
+        'OPENINGD'
+    }
+    if new_state == 'CHANNELD_NORMAL' and old_state in opening_states:
+        plugin.log(
+            f"Channel opened: {channel_id} peer={peer_id[:16] if peer_id else 'unknown'}... "
+            f"(from {old_state})",
+            level='info'
+        )
+        _handle_channel_open(channel_id, peer_id, old_state, cause)
+        # Don't return - continue to allow normal channel handling
+
+    # =========================================================================
     # Splice Detection (Accounting v2.0)
     # =========================================================================
     # Splice is complete when channel transitions FROM CHANNELD_AWAITING_SPLICE
@@ -2907,6 +3127,280 @@ def _determine_close_type(new_state: str, old_state: str, cause: str) -> str:
             return 'remote_unilateral'
 
     return 'unknown'
+
+
+def _determine_closer(close_type: str) -> str:
+    """
+    Determine who initiated the closure from the close type.
+
+    Args:
+        close_type: Type of closure from _determine_close_type
+
+    Returns:
+        Who initiated: 'local', 'remote', 'mutual', or 'unknown'
+    """
+    if close_type == 'mutual':
+        return 'mutual'
+    elif close_type == 'local_unilateral':
+        return 'local'
+    elif close_type == 'remote_unilateral':
+        return 'remote'
+    return 'unknown'
+
+
+def _notify_hive_of_closure(channel_id: str, peer_id: str, closer: str,
+                             close_type: str, capacity_sats: int = 0,
+                             duration_days: int = 0, total_revenue_sats: int = 0,
+                             total_rebalance_cost_sats: int = 0, net_pnl_sats: int = 0,
+                             forward_count: int = 0) -> bool:
+    """
+    Notify cl-hive plugin of a channel closure if it's available.
+
+    ALL closures are sent to cl-hive for topology awareness.
+    Includes full profitability data to help hive members make decisions.
+
+    Args:
+        channel_id: The closed channel ID
+        peer_id: The peer whose channel closed
+        closer: Who initiated: 'local', 'remote', 'mutual', or 'unknown'
+        close_type: Type of closure
+        capacity_sats: Channel capacity that was closed
+        duration_days: How long channel was open
+        total_revenue_sats: Total routing fees earned
+        total_rebalance_cost_sats: Total rebalancing costs
+        net_pnl_sats: Net profit/loss
+        forward_count: Number of forwards routed
+
+    Returns:
+        True if notification was sent successfully
+    """
+    global safe_plugin
+
+    if safe_plugin is None:
+        return False
+
+    try:
+        # Check if cl-hive plugin is available (cached for performance)
+        if not hive_availability_cache.is_available(safe_plugin.rpc):
+            return False
+
+        # Calculate routing score from forward count
+        routing_score = 0.5  # Default mid-range
+        if forward_count > 100:
+            routing_score = 0.9
+        elif forward_count > 50:
+            routing_score = 0.7
+        elif forward_count > 10:
+            routing_score = 0.5
+        elif forward_count > 0:
+            routing_score = 0.3
+        else:
+            routing_score = 0.1
+
+        # Calculate profitability score
+        profitability_score = 0.5
+        if duration_days > 0 and capacity_sats > 0:
+            # Annualized ROC
+            annual_pnl = (net_pnl_sats / duration_days) * 365 if duration_days > 0 else 0
+            roc_pct = (annual_pnl / capacity_sats) * 100 if capacity_sats > 0 else 0
+            if roc_pct > 10:
+                profitability_score = 0.9
+            elif roc_pct > 5:
+                profitability_score = 0.7
+            elif roc_pct > 0:
+                profitability_score = 0.5
+            elif roc_pct > -5:
+                profitability_score = 0.3
+            else:
+                profitability_score = 0.1
+
+        # Get fee rates if available
+        our_fee_ppm = 0
+        their_fee_ppm = 0
+        forward_volume_sats = 0
+        if database:
+            try:
+                # Get our fee rate from strategy state
+                state = database.get_fee_strategy_state(channel_id)
+                if state:
+                    our_fee_ppm = state.get('current_fee_ppm', 0)
+
+                # Estimate volume from revenue
+                if our_fee_ppm > 0 and total_revenue_sats > 0:
+                    forward_volume_sats = (total_revenue_sats * 1_000_000) // our_fee_ppm
+            except Exception:
+                pass
+
+        # Call cl-hive's channel-closed notification with full data
+        result = safe_plugin.rpc.call("hive-channel-closed", {
+            "peer_id": peer_id,
+            "channel_id": channel_id,
+            "closer": closer,
+            "close_type": close_type,
+            "capacity_sats": capacity_sats,
+            "duration_days": duration_days,
+            "total_revenue_sats": total_revenue_sats,
+            "total_rebalance_cost_sats": total_rebalance_cost_sats,
+            "net_pnl_sats": net_pnl_sats,
+            "forward_count": forward_count,
+            "forward_volume_sats": forward_volume_sats,
+            "our_fee_ppm": our_fee_ppm,
+            "their_fee_ppm": their_fee_ppm,
+            "routing_score": routing_score,
+            "profitability_score": profitability_score
+        })
+
+        if result.get("action") == "notified_hive":
+            plugin.log(
+                f"Notified cl-hive of closure: {channel_id} by {closer} "
+                f"(pnl={net_pnl_sats}, forwards={forward_count})",
+                level='info'
+            )
+            return True
+
+        return False
+
+    except Exception as e:
+        # Log at warn level for visibility; include channel ID for debugging
+        plugin.log(
+            f"Failed to notify cl-hive of channel closure {channel_id}: {e}",
+            level='warn'
+        )
+        return False
+
+
+def _notify_hive_of_open(channel_id: str, peer_id: str, opener: str,
+                          capacity_sats: int = 0, our_funding_sats: int = 0,
+                          their_funding_sats: int = 0) -> bool:
+    """
+    Notify cl-hive plugin of a channel opening if it's available.
+
+    ALL opens are sent to cl-hive for topology awareness.
+
+    Args:
+        channel_id: The new channel ID
+        peer_id: The peer the channel was opened with
+        opener: Who initiated: 'local' or 'remote'
+        capacity_sats: Total channel capacity
+        our_funding_sats: Amount we funded
+        their_funding_sats: Amount they funded
+
+    Returns:
+        True if notification was sent successfully
+    """
+    global safe_plugin
+
+    if safe_plugin is None:
+        return False
+
+    try:
+        # Check if cl-hive plugin is available (cached for performance)
+        if not hive_availability_cache.is_available(safe_plugin.rpc):
+            return False
+
+        # Call cl-hive's channel-opened notification
+        result = safe_plugin.rpc.call("hive-channel-opened", {
+            "peer_id": peer_id,
+            "channel_id": channel_id,
+            "opener": opener,
+            "capacity_sats": capacity_sats,
+            "our_funding_sats": our_funding_sats,
+            "their_funding_sats": their_funding_sats
+        })
+
+        if result.get("action") == "notified_hive":
+            plugin.log(
+                f"Notified cl-hive of channel open: {channel_id} with {peer_id[:16]}... ({opener})",
+                level='info'
+            )
+            return True
+
+        return False
+
+    except Exception as e:
+        # Log at warn level for visibility; include channel ID for debugging
+        plugin.log(
+            f"Failed to notify cl-hive of channel open {channel_id}: {e}",
+            level='warn'
+        )
+        return False
+
+
+def _handle_channel_open(channel_id: str, peer_id: Optional[str],
+                          old_state: str, cause: str) -> None:
+    """
+    Handle a channel open event.
+
+    Called when a channel transitions to CHANNELD_NORMAL from an opening state.
+    Notifies cl-hive for topology awareness.
+
+    Args:
+        channel_id: The new channel ID
+        peer_id: The peer the channel was opened with
+        old_state: The previous state (indicates open type)
+        cause: The cause of the state change
+    """
+    global safe_plugin
+
+    if safe_plugin is None or not peer_id:
+        return
+
+    try:
+        # Determine opener from old_state and cause
+        # DUALOPEND states typically mean we initiated (dual-funded)
+        # CHANNELD_AWAITING_LOCKIN typically means remote initiated
+        opener = 'unknown'
+        if 'DUALOPEND' in old_state:
+            opener = 'local'  # We typically initiate dual-funded opens
+        elif cause == 'remote':
+            opener = 'remote'
+        elif cause == 'user':
+            opener = 'local'
+        else:
+            # Try to determine from channel info
+            try:
+                channels = safe_plugin.rpc.listpeerchannels(id=peer_id)
+                for ch in channels.get('channels', []):
+                    scid = ch.get('short_channel_id', '').replace(':', 'x')
+                    if scid == channel_id:
+                        opener = ch.get('opener', 'unknown')
+                        break
+            except Exception:
+                pass
+
+        # Get channel details
+        capacity_sats = 0
+        our_funding_sats = 0
+        their_funding_sats = 0
+
+        try:
+            channels = safe_plugin.rpc.listpeerchannels(id=peer_id)
+            for ch in channels.get('channels', []):
+                scid = ch.get('short_channel_id', '').replace(':', 'x')
+                if scid == channel_id:
+                    capacity_sats = ch.get('total_msat', 0) // 1000
+                    our_funding_sats = ch.get('funding', {}).get('local_funds_msat', 0) // 1000
+                    their_funding_sats = ch.get('funding', {}).get('remote_funds_msat', 0) // 1000
+
+                    # Also get opener if we didn't determine it yet
+                    if opener == 'unknown':
+                        opener = ch.get('opener', 'unknown')
+                    break
+        except Exception as e:
+            plugin.log(f"Failed to get channel details for {channel_id}: {e}", level='debug')
+
+        # Notify cl-hive
+        _notify_hive_of_open(
+            channel_id=channel_id,
+            peer_id=peer_id,
+            opener=opener,
+            capacity_sats=capacity_sats,
+            our_funding_sats=our_funding_sats,
+            their_funding_sats=their_funding_sats
+        )
+
+    except Exception as e:
+        plugin.log(f"Error handling channel open {channel_id}: {e}", level='debug')
 
 
 def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any]]:
@@ -3037,17 +3531,22 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
         total_rebalance_cost_sats = pnl.get('rebalance_cost_sats', 0)
         forward_count = pnl.get('forward_count', 0)
 
-        # Try to get capacity from listpeers (may fail if already closed)
+        # Determine closer from close_type
+        closer = _determine_closer(close_type)
+
+        # Try to get capacity and additional info from listclosedchannels (CLN v23.11+)
         capacity_sats = 0
         if safe_plugin:
             try:
-                # Try listclosedchannels first (CLN v23.11+)
                 closed = safe_plugin.rpc.call("listclosedchannels")
                 for ch in closed.get('closedchannels', []):
                     if ch.get('short_channel_id', '').replace(':', 'x') == channel_id:
                         capacity_sats = ch.get('total_msat', 0) // 1000
                         if not peer_id:
                             peer_id = ch.get('peer_id')
+                        # CLN provides 'closer' field in listclosedchannels (v24.02+)
+                        if closer == 'unknown' and ch.get('closer'):
+                            closer = ch.get('closer')  # 'local' or 'remote'
                         break
             except Exception:
                 pass
@@ -3068,14 +3567,37 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
             total_rebalance_cost_sats=total_rebalance_cost_sats,
             forward_count=forward_count,
             funding_txid=funding_txid,
-            closing_txid=closing_txid
+            closing_txid=closing_txid,
+            closer=closer
         )
 
         plugin.log(
             f"Archived closed channel {channel_id}: "
-            f"revenue={total_revenue_sats}, costs={open_cost_sats + closure_cost_sats + total_rebalance_cost_sats}",
+            f"revenue={total_revenue_sats}, costs={open_cost_sats + closure_cost_sats + total_rebalance_cost_sats}, "
+            f"closer={closer}",
             level='info'
         )
+
+        # Clean up active tracking tables now that channel is archived
+        database.remove_closed_channel_data(channel_id, peer_id)
+
+        # Notify cl-hive of ALL closures for topology awareness
+        # Includes full profitability data to help hive members make decisions
+        if peer_id:
+            days_open = ((now - opened_at) // 86400) if opened_at else 0
+            net_pnl = total_revenue_sats - (open_cost_sats + closure_cost_sats + total_rebalance_cost_sats)
+            _notify_hive_of_closure(
+                channel_id=channel_id,
+                peer_id=peer_id,
+                closer=closer,
+                close_type=close_type,
+                capacity_sats=capacity_sats,
+                duration_days=days_open,
+                total_revenue_sats=total_revenue_sats,
+                total_rebalance_cost_sats=total_rebalance_cost_sats,
+                net_pnl_sats=net_pnl,
+                forward_count=forward_count
+            )
 
     except Exception as e:
         plugin.log(f"Error archiving closed channel {channel_id}: {e}", level='error')
