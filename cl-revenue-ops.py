@@ -3359,7 +3359,7 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
         else:
             # Try to determine from channel info
             try:
-                channels = safe_plugin.rpc.listpeerchannels(id=peer_id)
+                channels = safe_plugin.rpc.call("listpeerchannels", {"id": peer_id})
                 for ch in channels.get('channels', []):
                     scid = ch.get('short_channel_id', '').replace(':', 'x')
                     if scid == channel_id:
@@ -3374,7 +3374,7 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
         their_funding_sats = 0
 
         try:
-            channels = safe_plugin.rpc.listpeerchannels(id=peer_id)
+            channels = safe_plugin.rpc.call("listpeerchannels", {"id": peer_id})
             for ch in channels.get('channels', []):
                 scid = ch.get('short_channel_id', '').replace(':', 'x')
                 if scid == channel_id:
