@@ -172,7 +172,11 @@ cl-revenue-ops/
 │   ├── database.py         # SQLite layer
 │   ├── config.py           # Configuration
 │   └── metrics.py          # Prometheus exporter
+├── config/
+│   ├── cl-revenue-ops.conf.full     # Full config with all options documented
+│   └── cl-revenue-ops.conf.minimal  # Quick-start production config
 ├── tests/                  # Test suite
+├── migrations/             # Database migrations
 └── docs/                   # Documentation
     ├── specs/              # Technical specifications
     ├── planning/           # Implementation plans

@@ -51,4 +51,7 @@ htmlcov/
 logs/
 data/
 
+# Vendor directory (bundled dependencies)
+vendor/
+
 #TODO.md
