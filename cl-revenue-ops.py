@@ -1915,6 +1915,7 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                 "profitable": [],
                 "break_even": [],
                 "underwater": [],
+                "stagnant_candidate": [],
                 "zombie": []
             }
             total_profit = 0
@@ -1939,6 +1940,7 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                     "profitable_count": len(summary["profitable"]),
                     "break_even_count": len(summary["break_even"]),
                     "underwater_count": len(summary["underwater"]),
+                    "stagnant_candidate_count": len(summary["stagnant_candidate"]),
                     "zombie_count": len(summary["zombie"]),
                     "total_profit_sats": total_profit,
                     "total_revenue_sats": total_revenue,
