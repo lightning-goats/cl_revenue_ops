@@ -1023,6 +1023,13 @@ class EVRebalancer:
         # Thread-safe config snapshot for this rebalance cycle
         cfg = self.config.snapshot()
 
+        # Issue #24: Clean up stale reservations before each rebalance cycle
+        # This prevents budget leakage from crashed jobs
+        timeout_seconds = cfg.reservation_timeout_hours * 3600
+        cleaned = self.database.cleanup_stale_reservations(timeout_seconds)
+        if cleaned > 0:
+            self.plugin.log(f"Cleaned {cleaned} stale budget reservations before rebalance cycle")
+
         try:
             # CRITICAL-01 FIX: Clean up stale budget reservations periodically
             # Reservations older than 4 hours are likely from crashed jobs

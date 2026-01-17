@@ -69,6 +69,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Phase 1: Operational Hardening
     'rpc_timeout_seconds': int,
     'rpc_circuit_breaker_seconds': int,
+    'reservation_timeout_hours': int,
 }
 
 # Range constraints for numeric fields
@@ -97,6 +98,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_min_profit_ppm': (0, 100000),
     'rpc_timeout_seconds': (1, 300),
     'rpc_circuit_breaker_seconds': (0, 3600),
+    'reservation_timeout_hours': (1, 24),
 }
 
 
@@ -162,6 +164,7 @@ class Config:
     # Phase 1: Operational Hardening
     rpc_timeout_seconds: int = 15
     rpc_circuit_breaker_seconds: int = 60
+    reservation_timeout_hours: int = 4  # Hours before stale budget reservations auto-release
     
     # HTLC Congestion threshold
     htlc_congestion_threshold: float = 0.8  # Mark channel as CONGESTED if >80% HTLC slots used
@@ -422,6 +425,7 @@ class ConfigSnapshot:
     # Phase 1: Operational Hardening
     rpc_timeout_seconds: int
     rpc_circuit_breaker_seconds: int
+    reservation_timeout_hours: int
 
     # Hive Parameters (v1.4.0) - MAJOR-12 FIX: Added missing fields
     hive_fee_ppm: int
@@ -487,6 +491,7 @@ class ConfigSnapshot:
             enable_peer_sync=config.enable_peer_sync,
             rpc_timeout_seconds=config.rpc_timeout_seconds,
             rpc_circuit_breaker_seconds=config.rpc_circuit_breaker_seconds,
+            reservation_timeout_hours=config.reservation_timeout_hours,
             hive_fee_ppm=config.hive_fee_ppm,
             hive_rebalance_tolerance=config.hive_rebalance_tolerance,
             version=config._version,

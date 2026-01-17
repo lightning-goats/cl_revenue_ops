@@ -1685,6 +1685,93 @@ class Database:
             self.plugin.log(f"Cleaned up {count} stale budget reservations", level='info')
         return count
 
+    def count_stale_reservations(self, max_age_seconds: int = 14400) -> int:
+        """
+        Count stale reservations without releasing them (Issue #24).
+
+        Useful for monitoring/debug output to see how many reservations
+        are stale without triggering cleanup.
+
+        Args:
+            max_age_seconds: Age threshold for "stale" (default 4 hours)
+
+        Returns:
+            Number of stale active reservations
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        result = conn.execute("""
+            SELECT COUNT(*) as count
+            FROM budget_reservations
+            WHERE status = 'active' AND reserved_at < ?
+        """, (cutoff,)).fetchone()
+        return result['count'] if result else 0
+
+    def get_daily_rebalance_spend(self, window_hours: int = 24) -> Dict[str, Any]:
+        """
+        Get rebalance spending summary for the specified window (Issue #23).
+
+        Provides a comprehensive view of rebalance spending for debugging
+        and monitoring the capital controls system.
+
+        Args:
+            window_hours: Time window in hours (default 24)
+
+        Returns:
+            Dict with:
+            - total_spent_sats: Actual fees paid for successful rebalances
+            - total_reserved_sats: Currently reserved budget (active jobs)
+            - job_count: Total number of rebalance attempts
+            - success_count: Number of successful rebalances
+            - failed_count: Number of failed rebalances
+            - success_rate: Percentage of successful rebalances
+            - stale_reservations: Count of reservations older than timeout
+            - window_hours: The time window used
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (window_hours * 3600)
+
+        # Get spending and job counts from rebalance history
+        stats = conn.execute("""
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'success' THEN actual_fee_sats ELSE 0 END), 0) as total_spent,
+                COUNT(*) as job_count,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_count
+            FROM rebalance_history
+            WHERE timestamp >= ?
+        """, (cutoff,)).fetchone()
+
+        # Get current active reservations
+        reserved = conn.execute("""
+            SELECT COALESCE(SUM(reserved_sats), 0) as total_reserved
+            FROM budget_reservations
+            WHERE status = 'active' AND reserved_at >= ?
+        """, (cutoff,)).fetchone()
+
+        # Get stale reservation count (Issue #24)
+        stale_count = self.count_stale_reservations()
+
+        total_spent = stats['total_spent'] if stats else 0
+        job_count = stats['job_count'] if stats else 0
+        success_count = stats['success_count'] if stats else 0
+        failed_count = stats['failed_count'] if stats else 0
+        total_reserved = reserved['total_reserved'] if reserved else 0
+
+        # Calculate success rate
+        success_rate = (success_count / job_count * 100) if job_count > 0 else 0.0
+
+        return {
+            'total_spent_sats': total_spent,
+            'total_reserved_sats': total_reserved,
+            'job_count': job_count,
+            'success_count': success_count,
+            'failed_count': failed_count,
+            'success_rate': round(success_rate, 1),
+            'stale_reservations': stale_count,
+            'window_hours': window_hours
+        }
+
     def get_budget_status(self, since_timestamp: int) -> Dict[str, int]:
         """
         Get current budget status including reservations.

@@ -782,6 +782,13 @@ plugin.add_option(
     description='Cooldown period after an RPC timeout for that method group (default: 60)'
 )
 
+plugin.add_option(
+    name='revenue-ops-reservation-timeout-hours',
+    default='4',
+    description='Hours before stale budget reservations are auto-released (default: 4)',
+    opt_type='int'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -835,6 +842,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         scarcity_threshold=float(options['revenue-ops-scarcity-threshold']),
         rpc_timeout_seconds=int(options['revenue-ops-rpc-timeout-seconds']),
         rpc_circuit_breaker_seconds=int(options['revenue-ops-rpc-circuit-breaker-seconds']),
+        reservation_timeout_hours=int(options['revenue-ops-reservation-timeout-hours']),
         # Phase 9: Hive Integration (cl-hive fleet coordination)
         hive_fee_ppm=int(options['revenue-ops-hive-fee-ppm']),
         hive_rebalance_tolerance=int(options['revenue-ops-hive-rebalance-tolerance'])
@@ -914,7 +922,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize database
     database = Database(config.db_path, safe_plugin)
     database.initialize()
-    
+
+    # Issue #24: Clean up stale budget reservations on startup
+    # Reservations from crashed jobs should be released immediately
+    timeout_seconds = config.reservation_timeout_hours * 3600
+    cleaned = database.cleanup_stale_reservations(timeout_seconds)
+    if cleaned > 0:
+        plugin.log(f"Startup cleanup: Released {cleaned} stale budget reservations")
+
     # Phase 7: Load config overrides from database (persisted runtime changes)
     try:
         config.load_overrides(database)
@@ -1555,9 +1570,13 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
         )
         total_liquid = onchain_sats + channel_sats
 
-        daily_spent = database.get_daily_rebalance_spend() if database else 0
+        # Get detailed spending info (Issue #23 + #24)
+        spend_info = database.get_daily_rebalance_spend() if database else {}
+        daily_spent = spend_info.get('total_spent_sats', 0)
+        daily_reserved = spend_info.get('total_reserved_sats', 0)
+        stale_count = spend_info.get('stale_reservations', 0)
         daily_budget = cfg.rebalance_budget_sats
-        budget_remaining = daily_budget - daily_spent
+        budget_remaining = daily_budget - daily_spent - daily_reserved
 
         result["capital_controls"] = {
             "onchain_sats": onchain_sats,
@@ -1567,8 +1586,13 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             "reserve_ok": total_liquid >= cfg.wallet_reserve_sats,
             "daily_budget_sats": daily_budget,
             "daily_spent_sats": daily_spent,
+            "daily_reserved_sats": daily_reserved,
+            "stale_reservations": stale_count,
             "budget_remaining_sats": budget_remaining,
-            "budget_ok": budget_remaining > 0
+            "budget_ok": budget_remaining > 0,
+            "job_count": spend_info.get('job_count', 0),
+            "success_count": spend_info.get('success_count', 0),
+            "success_rate": spend_info.get('success_rate', 0.0)
         }
 
         if total_liquid < cfg.wallet_reserve_sats:
@@ -1577,7 +1601,11 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             )
         if budget_remaining <= 0:
             result["rejection_reasons"].append(
-                f"Daily budget exhausted: spent {daily_spent} of {daily_budget}"
+                f"Daily budget exhausted: spent {daily_spent} + reserved {daily_reserved} of {daily_budget}"
+            )
+        if stale_count > 0:
+            result["rejection_reasons"].append(
+                f"Warning: {stale_count} stale budget reservations detected (will auto-cleanup)"
             )
     except Exception as e:
         result["capital_controls"]["error"] = str(e)
