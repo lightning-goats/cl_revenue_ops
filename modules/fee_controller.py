@@ -543,7 +543,8 @@ class HillClimbState:
         elasticity_tracker: Demand elasticity tracking
         thompson_state: Thompson Sampling exploration state
     """
-    last_revenue_rate: float = 0.0  # Revenue rate in sats/hour
+    last_revenue_rate: float = 0.0  # Revenue rate in sats/hour (raw, unsmoothed)
+    ema_revenue_rate: float = 0.0   # Issue #28: EMA-smoothed revenue rate
     last_fee_ppm: int = 0
     trend_direction: int = 1  # 1 = try increasing fee, -1 = try decreasing
     step_ppm: int = 50  # Current step size (decays on reversal)
@@ -597,6 +598,33 @@ class HillClimbState:
     def set_thompson_state(self, state: ThompsonSamplingState) -> None:
         """Serialize Thompson Sampling state to dict."""
         self.thompson_data = state.to_dict()
+
+    def update_ema_revenue_rate(self, current_rate: float, alpha: float = 0.3) -> float:
+        """
+        Update EMA-smoothed revenue rate (Issue #28).
+
+        EMA formula: new_ema = alpha * current + (1 - alpha) * old_ema
+
+        This smooths out payment timing noise that causes erratic fee adjustments
+        when the observation window is short (< 1 hour).
+
+        Args:
+            current_rate: Current raw revenue rate (sats/hour)
+            alpha: Smoothing factor (0.1=slow, 0.5=fast). Default 0.3.
+
+        Returns:
+            The updated EMA revenue rate
+        """
+        if self.ema_revenue_rate == 0:
+            # First observation - seed with raw value
+            self.ema_revenue_rate = current_rate
+        else:
+            # EMA update: weight current vs historical
+            self.ema_revenue_rate = (
+                alpha * current_rate +
+                (1 - alpha) * self.ema_revenue_rate
+            )
+        return self.ema_revenue_rate
 
 
 @dataclass
@@ -1448,8 +1476,17 @@ class HillClimbingFeeController:
         # Calculate REVENUE RATE (sats/hour) - this is our feedback signal
         # Revenue = Volume * Fee_PPM / 1_000_000
         revenue_sats = (volume_since_sats * current_fee_ppm) // 1_000_000
-        current_revenue_rate = revenue_sats / hours_elapsed if hours_elapsed > 0 else 0.0
-        
+        raw_revenue_rate = revenue_sats / hours_elapsed if hours_elapsed > 0 else 0.0
+
+        # Issue #28: Apply EMA smoothing to reduce fee volatility
+        # EMA smooths out payment timing noise when observation window is short
+        smoothed_revenue_rate = hc_state.update_ema_revenue_rate(
+            raw_revenue_rate,
+            alpha=cfg.ema_smoothing_alpha
+        )
+        # Use smoothed rate for decisions, log both for debugging
+        current_revenue_rate = smoothed_revenue_rate
+
         # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity", 1)
         spendable = channel_info.get("spendable_msat", 0) // 1000
@@ -1904,8 +1941,10 @@ class HillClimbingFeeController:
         hill_dir = "up" if new_direction > 0 else "down"
         base_fee_note = f", base={int(base_new_fee)}ppm" if base_new_fee is not None else ""
         mult_note = f", mult=liq{liquidity_multiplier:.2f}*prof{profitability_multiplier:.2f}"
+        # Issue #28: Log both raw and EMA-smoothed rates for debugging
+        ema_note = f" (raw={raw_revenue_rate:.2f})" if raw_revenue_rate != current_revenue_rate else ""
         reason = (
-            f"HillClimb: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}){volatility_note}, "
+            f"HillClimb: rate={current_revenue_rate:.2f}sats/hr{ema_note} ({decision_reason}){volatility_note}, "
             f"hill_dir={hill_dir}, applied={applied_dir}({applied_delta:+d}ppm), "
             f"step={step_ppm}ppm{base_fee_note}{mult_note}, state={flow_state}, "
             f"liquidity={bucket} ({outbound_ratio:.0%}), "
@@ -2292,6 +2331,7 @@ class HillClimbingFeeController:
 
         hc_state = HillClimbState(
             last_revenue_rate=db_state.get("last_revenue_rate", 0.0),
+            ema_revenue_rate=v2_data.get("ema_revenue_rate", 0.0),  # Issue #28
             last_fee_ppm=db_state.get("last_fee_ppm", 0),
             trend_direction=db_state.get("trend_direction", 1),
             step_ppm=db_state.get("step_ppm", self.STEP_PPM),
@@ -2323,7 +2363,8 @@ class HillClimbingFeeController:
         v2_data = {
             "historical_curve": state.historical_curve_data,
             "elasticity": state.elasticity_data,
-            "thompson": state.thompson_data
+            "thompson": state.thompson_data,
+            "ema_revenue_rate": state.ema_revenue_rate  # Issue #28
         }
         v2_json_str = json.dumps(v2_data)
 

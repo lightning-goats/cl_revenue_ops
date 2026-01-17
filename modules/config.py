@@ -70,6 +70,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rpc_timeout_seconds': int,
     'rpc_circuit_breaker_seconds': int,
     'reservation_timeout_hours': int,
+    # Issue #28: Revenue rate smoothing
+    'ema_smoothing_alpha': float,
 }
 
 # Range constraints for numeric fields
@@ -99,6 +101,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rpc_timeout_seconds': (1, 300),
     'rpc_circuit_breaker_seconds': (0, 3600),
     'reservation_timeout_hours': (1, 24),
+    # Issue #28: Revenue rate smoothing
+    'ema_smoothing_alpha': (0.1, 0.9),
 }
 
 
@@ -216,7 +220,12 @@ class Config:
     # Deferred (v1.4.0)
     enable_flow_asymmetry: bool = False    # Rare liquidity premium
     enable_peer_sync: bool = False         # Peer-level fee syncing
-    
+
+    # Issue #28: Revenue rate EMA smoothing
+    # EMA formula: new_ema = alpha * current + (1 - alpha) * old_ema
+    # Lower alpha = slower response (more smoothing), higher = faster response
+    ema_smoothing_alpha: float = 0.3       # Default 0.3 balances responsiveness and stability
+
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
     
@@ -431,6 +440,9 @@ class ConfigSnapshot:
     hive_fee_ppm: int
     hive_rebalance_tolerance: int
 
+    # Issue #28: Revenue rate EMA smoothing
+    ema_smoothing_alpha: float
+
     # Version tracking
     version: int = 0
     
@@ -494,6 +506,7 @@ class ConfigSnapshot:
             reservation_timeout_hours=config.reservation_timeout_hours,
             hive_fee_ppm=config.hive_fee_ppm,
             hive_rebalance_tolerance=config.hive_rebalance_tolerance,
+            ema_smoothing_alpha=config.ema_smoothing_alpha,
             version=config._version,
         )
 
