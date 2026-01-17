@@ -1575,7 +1575,7 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
         daily_spent = spend_info.get('total_spent_sats', 0)
         daily_reserved = spend_info.get('total_reserved_sats', 0)
         stale_count = spend_info.get('stale_reservations', 0)
-        daily_budget = cfg.rebalance_budget_sats
+        daily_budget = cfg.daily_budget_sats
         budget_remaining = daily_budget - daily_spent - daily_reserved
 
         result["capital_controls"] = {
