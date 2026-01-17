@@ -1041,7 +1041,49 @@ class EVRebalancer:
                 self.plugin.log(f"Error getting our node ID: {e}", level='error')
                 self._our_node_id = ""
         return self._our_node_id
-    
+
+    def _get_channel_age_days(self, channel_id: str, channel_info: Dict = None) -> int:
+        """
+        Get the age of a channel in days (Issue #30: Velocity Gate).
+
+        Uses SCID block height to estimate channel age. SCID format is
+        "blockheight x txindex x output".
+
+        Args:
+            channel_id: Short channel ID
+            channel_info: Optional channel info dict (for future use)
+
+        Returns:
+            Estimated channel age in days (0 if unknown)
+        """
+        try:
+            # Parse block height from SCID
+            if 'x' in channel_id:
+                block_height = int(channel_id.split('x')[0])
+            elif ':' in channel_id:
+                block_height = int(channel_id.split(':')[0])
+            else:
+                return 0
+
+            # Get current block height
+            getinfo = self.plugin.rpc.getinfo()
+            current_height = getinfo.get("blockheight", 0)
+
+            if current_height <= 0 or block_height <= 0:
+                return 0
+
+            # Blocks since channel opened
+            blocks_since_open = current_height - block_height
+
+            # ~10 minutes per block = 144 blocks per day
+            days_open = blocks_since_open // 144
+
+            return max(0, days_open)
+
+        except Exception as e:
+            self.plugin.log(f"Error getting channel age: {e}", level='debug')
+            return 0
+
     def set_profitability_analyzer(self, analyzer: 'ChannelProfitabilityAnalyzer') -> None:
         self._profitability_analyzer = analyzer
     
