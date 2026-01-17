@@ -1555,9 +1555,12 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
         )
         total_liquid = onchain_sats + channel_sats
 
-        daily_spent = database.get_daily_rebalance_spend() if database else 0
+        # Get detailed spending info (Issue #23)
+        spend_info = database.get_daily_rebalance_spend() if database else {}
+        daily_spent = spend_info.get('total_spent_sats', 0) if spend_info else 0
+        daily_reserved = spend_info.get('total_reserved_sats', 0) if spend_info else 0
         daily_budget = cfg.rebalance_budget_sats
-        budget_remaining = daily_budget - daily_spent
+        budget_remaining = daily_budget - daily_spent - daily_reserved
 
         result["capital_controls"] = {
             "onchain_sats": onchain_sats,
@@ -1567,8 +1570,12 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             "reserve_ok": total_liquid >= cfg.wallet_reserve_sats,
             "daily_budget_sats": daily_budget,
             "daily_spent_sats": daily_spent,
+            "daily_reserved_sats": daily_reserved,
             "budget_remaining_sats": budget_remaining,
-            "budget_ok": budget_remaining > 0
+            "budget_ok": budget_remaining > 0,
+            "job_count": spend_info.get('job_count', 0) if spend_info else 0,
+            "success_count": spend_info.get('success_count', 0) if spend_info else 0,
+            "success_rate": spend_info.get('success_rate', 0.0) if spend_info else 0.0
         }
 
         if total_liquid < cfg.wallet_reserve_sats:
@@ -1577,7 +1584,7 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             )
         if budget_remaining <= 0:
             result["rejection_reasons"].append(
-                f"Daily budget exhausted: spent {daily_spent} of {daily_budget}"
+                f"Daily budget exhausted: spent {daily_spent} + reserved {daily_reserved} of {daily_budget}"
             )
     except Exception as e:
         result["capital_controls"]["error"] = str(e)

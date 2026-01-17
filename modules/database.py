@@ -1718,6 +1718,71 @@ class Database:
             'total_committed': spent + reserved
         }
 
+    def get_daily_rebalance_spend(self, window_hours: int = 24) -> Dict[str, Any]:
+        """
+        Get rebalance spending summary for the specified window (Issue #23).
+
+        Provides a comprehensive view of rebalance spending for debugging
+        and monitoring the capital controls system.
+
+        Args:
+            window_hours: Time window in hours (default 24)
+
+        Returns:
+            Dict with:
+            - total_spent_sats: Actual fees paid for successful rebalances
+            - total_reserved_sats: Currently reserved budget (active jobs)
+            - job_count: Total number of rebalance attempts
+            - success_count: Number of successful rebalances
+            - failed_count: Number of failed rebalances
+            - success_rate: Percentage of successful rebalances
+            - budget_remaining_sats: Available budget after spent + reserved
+            - window_hours: The time window used
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (window_hours * 3600)
+
+        # Get spending and job counts from rebalance history
+        stats = conn.execute("""
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'success' THEN actual_fee_sats ELSE 0 END), 0) as total_spent,
+                COUNT(*) as job_count,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_count
+            FROM rebalance_history
+            WHERE timestamp >= ?
+        """, (cutoff,)).fetchone()
+
+        # Get current active reservations
+        reserved = conn.execute("""
+            SELECT COALESCE(SUM(reserved_sats), 0) as total_reserved
+            FROM budget_reservations
+            WHERE status = 'active' AND reserved_at >= ?
+        """, (cutoff,)).fetchone()
+
+        total_spent = stats['total_spent'] if stats else 0
+        job_count = stats['job_count'] if stats else 0
+        success_count = stats['success_count'] if stats else 0
+        failed_count = stats['failed_count'] if stats else 0
+        total_reserved = reserved['total_reserved'] if reserved else 0
+
+        # Calculate success rate
+        success_rate = (success_count / job_count * 100) if job_count > 0 else 0.0
+
+        # Get budget status for remaining calculation
+        budget_status = self.get_budget_status(cutoff)
+
+        return {
+            'total_spent_sats': total_spent,
+            'total_reserved_sats': total_reserved,
+            'job_count': job_count,
+            'success_count': success_count,
+            'failed_count': failed_count,
+            'success_rate': round(success_rate, 1),
+            'budget_remaining_sats': max(0, budget_status.get('spent', 0) - total_spent - total_reserved),
+            'window_hours': window_hours
+        }
+
     def get_rebalance_history_by_peer(self, peer_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Get rebalance history for channels belonging to a specific peer.
