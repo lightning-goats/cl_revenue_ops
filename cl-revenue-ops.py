@@ -2851,6 +2851,54 @@ def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
         return result
 
 
+@plugin.method("revenue-clear-reservations")
+def revenue_clear_reservations(plugin: Plugin) -> Dict[str, Any]:
+    """
+    Clear all active budget reservations (Issue #33).
+
+    Use this command after manually stopping sling jobs to release their
+    budget reservations. This resets the reservation system so new
+    rebalances can use the daily budget.
+
+    Typical workflow:
+    1. lightning-cli sling-deletejob all   # Stop all sling jobs
+    2. lightning-cli revenue-clear-reservations  # Release budget
+
+    Returns:
+        {
+            "status": "success",
+            "cleared_count": int,    # Number of reservations cleared
+            "released_sats": int,    # Total sats released back to budget
+            "budget_available": int  # New available budget after clearing
+        }
+    """
+    global database, config
+
+    if database is None:
+        return {"error": "Database not initialized"}
+
+    try:
+        # Clear all active reservations
+        result = database.clear_all_reservations()
+
+        # Get updated budget status
+        cfg = config.snapshot() if hasattr(config, 'snapshot') else config
+        spend_info = database.get_daily_rebalance_spend()
+        daily_spent = spend_info.get('total_spent_sats', 0)
+        budget_available = max(0, cfg.daily_budget_sats - daily_spent)
+
+        return {
+            "status": "success",
+            "cleared_count": result["cleared_count"],
+            "released_sats": result["released_sats"],
+            "budget_available": budget_available
+        }
+
+    except Exception as e:
+        plugin.log(f"Error clearing reservations: {e}", level='error')
+        return {"error": str(e)}
+
+
 # =============================================================================
 # HOOKS - React to Lightning events
 # =============================================================================

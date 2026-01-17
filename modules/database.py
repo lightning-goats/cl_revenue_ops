@@ -1707,6 +1707,47 @@ class Database:
         """, (cutoff,)).fetchone()
         return result['count'] if result else 0
 
+    def clear_all_reservations(self) -> Dict[str, Any]:
+        """
+        Clear ALL active budget reservations (Issue #33).
+
+        Use this to reset the reservation system when sling jobs are
+        manually stopped or stuck. Releases all active reservations
+        regardless of age.
+
+        Returns:
+            Dict with count of cleared reservations and total amount released
+        """
+        conn = self._get_connection()
+
+        # First get stats on what we're clearing
+        stats = conn.execute("""
+            SELECT COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
+            FROM budget_reservations
+            WHERE status = 'active'
+        """).fetchone()
+
+        count = stats['count'] if stats else 0
+        total_sats = stats['total_sats'] if stats else 0
+
+        # Release all active reservations
+        conn.execute("""
+            UPDATE budget_reservations
+            SET status = 'released'
+            WHERE status = 'active'
+        """)
+
+        if count > 0:
+            self.plugin.log(
+                f"Cleared {count} active budget reservations ({total_sats} sats)",
+                level='info'
+            )
+
+        return {
+            "cleared_count": count,
+            "released_sats": total_sats
+        }
+
     def get_daily_rebalance_spend(self, window_hours: int = 24) -> Dict[str, Any]:
         """
         Get rebalance spending summary for the specified window (Issue #23).
