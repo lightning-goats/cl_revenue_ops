@@ -1150,7 +1150,9 @@ class HillClimbingFeeController:
             
             try:
                 # Check Hill Climb state before adjustment to track skip reasons
-                hc_state = self._get_hill_climb_state(channel_id)
+                # Issue #32: pass actual fee for desync detection
+                actual_fee = channel_info.get("fee_proportional_millionths", 0)
+                hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=actual_fee)
                 now = int(time.time())
 
                 adjustment = self._adjust_channel_fee(
@@ -1248,9 +1250,9 @@ class HillClimbingFeeController:
         current_fee_ppm = raw_chain_fee
         if current_fee_ppm == 0:
             current_fee_ppm = cfg.min_fee_ppm  # Initialize if not set
-        
-        # Load Hill Climbing state
-        hc_state = self._get_hill_climb_state(channel_id)
+
+        # Load Hill Climbing state (Issue #32: pass actual fee for desync detection)
+        hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=raw_chain_fee)
         
         # =====================================================================
         # ZERO-FEE PROBE: Defibrillator Override (Phase 8.1)
@@ -2102,7 +2104,7 @@ class HillClimbingFeeController:
                 fee_ppm                        # feeppm
             )
 
-            # MAJOR-08 FIX: Verify fee was actually set (detect CLBOSS reversion)
+            # Issue #32: Verify fee was actually set (detect CLBOSS reversion or external changes)
             # Small delay to allow gossip propagation, then verify
             time.sleep(0.1)  # 100ms
             try:
@@ -2111,15 +2113,29 @@ class HillClimbingFeeController:
                 actual_fee = verify_info.get("fee_proportional_millionths", -1)
                 if actual_fee != fee_ppm and actual_fee != -1:
                     self.plugin.log(
-                        f"CLBOSS CONFLICT: Fee for {channel_id[:16]}... was reverted "
+                        f"FEE CONFLICT: Fee for {channel_id[:16]}... was reverted "
                         f"(wanted {fee_ppm}, got {actual_fee}). Re-unmanaging and retrying.",
                         level='warn'
                     )
                     # Re-unmanage and retry once
                     self.clboss.unmanage(peer_id, ClbossTags.FEE_AND_BALANCE)
                     self.plugin.rpc.setchannel(channel_id, self.config.base_fee_msat, fee_ppm)
+
+                    # Issue #32: Verify retry succeeded
+                    time.sleep(0.1)
+                    verify_channels2 = self._get_channels_info()
+                    verify_info2 = verify_channels2.get(channel_id, {})
+                    final_fee = verify_info2.get("fee_proportional_millionths", -1)
+                    if final_fee != fee_ppm and final_fee != -1:
+                        result["message"] = (
+                            f"FEE CONFLICT UNRESOLVED: Wanted {fee_ppm} ppm, "
+                            f"got {final_fee} ppm after retry. External override active."
+                        )
+                        self.plugin.log(result["message"], level='error')
+                        return result  # Return with success=False
             except Exception as verify_err:
-                self.plugin.log(f"Fee verification failed: {verify_err}", level='debug')
+                self.plugin.log(f"Fee verification failed: {verify_err}", level='warn')
+                # Don't fail on verification errors - fee may have been set correctly
 
             # Step 3: Record the change
             self.database.record_fee_change(
@@ -2306,18 +2322,35 @@ class HillClimbingFeeController:
             self.plugin.log(f"Error getting feerates: {e}", level='debug')
             return None
     
-    def _get_hill_climb_state(self, channel_id: str) -> HillClimbState:
+    def _get_hill_climb_state(self, channel_id: str, actual_fee_ppm: int = None) -> HillClimbState:
         """
         Get Hill Climbing state for a channel.
 
         Checks in-memory cache first, then database.
         Updated to use rate-based feedback (last_revenue_rate), step_ppm,
         deadband hysteresis fields, and v2.0 improvements.
+
+        Args:
+            channel_id: The channel ID
+            actual_fee_ppm: Optional actual fee from chain - if provided and there's
+                           a large mismatch with tracked fee, will resync (Issue #32)
         """
         import json
 
         if channel_id in self._hill_climb_states:
-            return self._hill_climb_states[channel_id]
+            cached_state = self._hill_climb_states[channel_id]
+            # Issue #32: Check for desync even on cached state
+            if actual_fee_ppm is not None and actual_fee_ppm > 0:
+                tracked = cached_state.last_broadcast_fee_ppm
+                if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
+                    self.plugin.log(
+                        f"FEE DESYNC (cached): {channel_id[:16]}... "
+                        f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
+                        level='warn'
+                    )
+                    cached_state.last_broadcast_fee_ppm = actual_fee_ppm
+                    self._save_hill_climb_state(channel_id, cached_state)
+            return cached_state
 
         # Load from database (uses the fee_strategy_state table)
         db_state = self.database.get_fee_strategy_state(channel_id)
@@ -2349,6 +2382,17 @@ class HillClimbingFeeController:
             elasticity_data=v2_data.get("elasticity", {}),
             thompson_data=v2_data.get("thompson", {})
         )
+
+        # Issue #32: Check for desync when loading from database
+        if actual_fee_ppm is not None and actual_fee_ppm > 0:
+            tracked = hc_state.last_broadcast_fee_ppm
+            if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
+                self.plugin.log(
+                    f"FEE DESYNC (db load): {channel_id[:16]}... "
+                    f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
+                    level='warn'
+                )
+                hc_state.last_broadcast_fee_ppm = actual_fee_ppm
 
         self._hill_climb_states[channel_id] = hc_state
         return hc_state
