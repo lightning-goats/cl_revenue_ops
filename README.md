@@ -212,8 +212,8 @@ All options can be set in your CLN config file or via `revenue-config set`.
 | `revenue-ops-rebalance-min-profit` | `10` | Minimum profit to trigger (sats) |
 | `revenue-ops-daily-budget-sats` | `5000` | Max daily rebalance spend (sats) |
 | `revenue-ops-min-wallet-reserve` | `1000000` | Minimum reserve to maintain (sats) |
-| `revenue-ops-proportional-budget` | `false` | Scale budget based on revenue |
-| `revenue-ops-proportional-budget-pct` | `0.05` | Percentage of revenue for budget |
+| `revenue-ops-proportional-budget` | `true` | Scale budget based on revenue |
+| `revenue-ops-proportional-budget-pct` | `0.30` | Percentage of revenue for budget |
 
 ### Advanced Fee Settings
 

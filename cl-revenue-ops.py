@@ -673,14 +673,14 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-proportional-budget',
-    default='false',
-    description='If true, scale daily budget based on 24h revenue (default: false)'
+    default='true',
+    description='If true, scale daily budget based on 24h revenue (default: true)'
 )
 
 plugin.add_option(
     name='revenue-ops-proportional-budget-pct',
-    default='0.05',
-    description='Percentage of 24h revenue to use as budget when proportional budget enabled (default: 0.05 = 5%)'
+    default='0.30',
+    description='Percentage of 24h revenue to use as budget when proportional budget enabled (default: 0.30 = 30%)'
 )
 
 plugin.add_option(

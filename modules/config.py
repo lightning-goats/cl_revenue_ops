@@ -155,9 +155,9 @@ class Config:
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
     
     # Revenue-Proportional Budget (Phase 7: Dynamic Budget Scaling)
-    enable_proportional_budget: bool = False  # If True, scale daily budget based on revenue
-    proportional_budget_pct: float = 0.05     # Budget = max(daily_budget_sats, revenue_24h * pct)
-                                               # Default 5% of 24h revenue
+    enable_proportional_budget: bool = True   # Scale daily budget based on revenue (Issue #22)
+    proportional_budget_pct: float = 0.30     # Budget = max(daily_budget_sats, revenue_24h * pct)
+                                               # Default 30% of 24h revenue
     
     # Phase 1: Operational Hardening
     rpc_timeout_seconds: int = 15
