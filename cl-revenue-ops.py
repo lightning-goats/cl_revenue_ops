@@ -1890,18 +1890,58 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
             # Analyze single channel
             result = profitability_analyzer.analyze_channel(channel_id)
             if result:
+                # Calculate flow profile
+                outbound_count = result.revenue.forward_count
+                inbound_count = result.revenue.sourced_forward_count
+                total_count = outbound_count + inbound_count
+
+                if total_count == 0:
+                    flow_profile = "inactive"
+                    inbound_outbound_ratio = 0.0
+                elif outbound_count == 0:
+                    flow_profile = "inbound_only"
+                    inbound_outbound_ratio = float('inf')
+                elif inbound_count == 0:
+                    flow_profile = "outbound_only"
+                    inbound_outbound_ratio = 0.0
+                else:
+                    inbound_outbound_ratio = round(inbound_count / outbound_count, 2)
+                    if inbound_outbound_ratio > 3.0:
+                        flow_profile = "inbound_dominant"
+                    elif inbound_outbound_ratio < 0.33:
+                        flow_profile = "outbound_dominant"
+                    else:
+                        flow_profile = "balanced"
+
                 return {
                     "channel_id": channel_id,
                     "profitability": {
                         "total_costs_sats": result.costs.total_cost_sats,
-                        "total_revenue_sats": result.revenue.fees_earned_sats,
+                        "total_contribution_sats": result.revenue.total_contribution_sats,
                         "net_profit_sats": result.net_profit_sats,
                         "roi_percentage": round(result.roi_percent, 2),
                         "profitability_class": result.classification.value,
                         "days_active": result.days_open,
+                        "fee_multiplier": profitability_analyzer.get_fee_multiplier(channel_id),
+                        # Outbound flow (channel as exit - we earn fees)
+                        "outbound_flow": {
+                            "payment_count": outbound_count,
+                            "volume_sats": result.revenue.volume_routed_sats,
+                            "revenue_earned_sats": result.revenue.fees_earned_sats
+                        },
+                        # Inbound flow (channel as entry - generates revenue elsewhere)
+                        "inbound_flow": {
+                            "payment_count": inbound_count,
+                            "volume_sats": result.revenue.sourced_volume_sats,
+                            "contribution_to_other_channels_sats": result.revenue.sourced_fee_contribution_sats
+                        },
+                        # Flow profile summary
+                        "flow_profile": flow_profile,
+                        "inbound_outbound_ratio": inbound_outbound_ratio if inbound_outbound_ratio != float('inf') else "infinite",
+                        # Legacy fields for backward compatibility
+                        "total_revenue_sats": result.revenue.fees_earned_sats,
                         "volume_routed_sats": result.revenue.volume_routed_sats,
-                        "forward_count": result.revenue.forward_count,
-                        "fee_multiplier": profitability_analyzer.get_fee_multiplier(channel_id)
+                        "forward_count": result.revenue.forward_count
                     }
                 }
             else:
@@ -1909,7 +1949,7 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
         else:
             # Analyze all channels
             all_results = profitability_analyzer.analyze_all_channels()
-            
+
             # Group by profitability class
             summary = {
                 "profitable": [],
@@ -1918,22 +1958,54 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                 "stagnant_candidate": [],
                 "zombie": []
             }
+            # Track flow profiles
+            flow_profiles = {
+                "inbound_dominant": [],
+                "outbound_dominant": [],
+                "balanced": [],
+                "inbound_only": [],
+                "outbound_only": [],
+                "inactive": []
+            }
             total_profit = 0
             total_revenue = 0
+            total_contribution = 0
             total_costs = 0
-            
+
             for ch_id, result in all_results.items():
+                # Calculate flow profile
+                outbound_count = result.revenue.forward_count
+                inbound_count = result.revenue.sourced_forward_count
+
+                if outbound_count + inbound_count == 0:
+                    flow_profile = "inactive"
+                elif outbound_count == 0:
+                    flow_profile = "inbound_only"
+                elif inbound_count == 0:
+                    flow_profile = "outbound_only"
+                else:
+                    ratio = inbound_count / outbound_count
+                    if ratio > 3.0:
+                        flow_profile = "inbound_dominant"
+                    elif ratio < 0.33:
+                        flow_profile = "outbound_dominant"
+                    else:
+                        flow_profile = "balanced"
+
                 channel_summary = {
                     "channel_id": ch_id,
                     "net_profit_sats": result.net_profit_sats,
                     "roi_percentage": round(result.roi_percent, 2),
-                    "days_active": result.days_open
+                    "days_active": result.days_open,
+                    "flow_profile": flow_profile
                 }
                 summary[result.classification.value].append(channel_summary)
+                flow_profiles[flow_profile].append(ch_id)
                 total_profit += result.net_profit_sats
                 total_revenue += result.revenue.fees_earned_sats
+                total_contribution += result.revenue.total_contribution_sats
                 total_costs += result.costs.total_cost_sats
-            
+
             return {
                 "summary": {
                     "total_channels": len(all_results),
@@ -1944,8 +2016,16 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                     "zombie_count": len(summary["zombie"]),
                     "total_profit_sats": total_profit,
                     "total_revenue_sats": total_revenue,
+                    "total_contribution_sats": total_contribution,
                     "total_costs_sats": total_costs,
-                    "overall_roi_pct": round((total_profit / total_costs * 100) if total_costs > 0 else 0, 2)
+                    "overall_roi_pct": round((total_profit / total_costs * 100) if total_costs > 0 else 0, 2),
+                    # Flow profile distribution
+                    "flow_profiles": {
+                        "inbound_dominant_count": len(flow_profiles["inbound_dominant"]),
+                        "outbound_dominant_count": len(flow_profiles["outbound_dominant"]),
+                        "balanced_count": len(flow_profiles["balanced"]),
+                        "inactive_count": len(flow_profiles["inactive"])
+                    }
                 },
                 "channels_by_class": summary
             }
