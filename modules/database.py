@@ -1722,7 +1722,7 @@ class Database:
 
         # First get stats on what we're clearing
         stats = conn.execute("""
-            SELECT COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
+            SELECT COUNT(*) as count, COALESCE(SUM(reserved_sats), 0) as total_sats
             FROM budget_reservations
             WHERE status = 'active'
         """).fetchone()
