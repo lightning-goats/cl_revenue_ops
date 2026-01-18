@@ -199,35 +199,6 @@ class FlowAnalyzer:
         self.plugin = plugin
         self.config = config
         self.database = database
-        self._bookkeeper_available: Optional[bool] = None
-    
-    def is_bookkeeper_available(self) -> bool:
-        """
-        Check if the bookkeeper plugin is available.
-        
-        Returns:
-            True if bookkeeper commands are available
-        """
-        if self._bookkeeper_available is not None:
-            return self._bookkeeper_available
-        
-        try:
-            # Try a bookkeeper command
-            self.plugin.rpc.call("bkpr-listbalances")
-            self._bookkeeper_available = True
-            self.plugin.log("bookkeeper plugin detected and available")
-            return True
-        except RpcError as e:
-            if "Unknown command" in str(e):
-                self._bookkeeper_available = False
-                self.plugin.log("bookkeeper not available, using listforwards fallback")
-                return False
-            # Other errors might be temporary
-            return True
-        except Exception as e:
-            self.plugin.log(f"Error checking bookkeeper: {e}", level='warn')
-            self._bookkeeper_available = False
-            return False
 
     # =========================================================================
     # v2.0 IMPROVEMENT METHODS
@@ -463,8 +434,10 @@ class FlowAnalyzer:
 
             # Get previous flow state for velocity calculation
             prev_state = self.database.get_channel_state(channel_id)
-            prev_ratio = prev_state.get("flow_ratio", 0.0) if prev_state else 0.0
-            prev_ts = prev_state.get("updated_at", 0) if prev_state else 0
+            prev_ratio = float(prev_state.get("flow_ratio", 0.0)) if prev_state else 0.0
+            # BUG FIX: Ensure updated_at is an integer timestamp
+            prev_ts_raw = prev_state.get("updated_at", 0) if prev_state else 0
+            prev_ts = int(prev_ts_raw) if prev_ts_raw else 0
 
             # Calculate metrics (with balance fallback for zero-flow channels)
             metrics = self._calculate_metrics(
@@ -560,8 +533,10 @@ class FlowAnalyzer:
 
         # Get previous flow state for velocity calculation
         prev_state = self.database.get_channel_state(channel_id)
-        prev_ratio = prev_state.get("flow_ratio", 0.0) if prev_state else 0.0
-        prev_ts = prev_state.get("updated_at", 0) if prev_state else 0
+        prev_ratio = float(prev_state.get("flow_ratio", 0.0)) if prev_state else 0.0
+        # BUG FIX: Ensure updated_at is an integer timestamp
+        prev_ts_raw = prev_state.get("updated_at", 0) if prev_state else 0
+        prev_ts = int(prev_ts_raw) if prev_ts_raw else 0
 
         return self._calculate_metrics(
             channel_id=channel_id,
@@ -745,6 +720,10 @@ class FlowAnalyzer:
            Day 2: 0.64
            ...
 
+        IMPORTANT: daily_buckets MUST be sorted by age ascending (index 0 = today,
+        index 1 = yesterday, etc.). The database.get_daily_flow_buckets() method
+        is responsible for returning buckets in this order.
+
         Returns:
             (ema_in, ema_out, total_in, total_out, forward_count, last_forward_ts)
         """
@@ -762,14 +741,18 @@ class FlowAnalyzer:
         for age, bucket in enumerate(daily_buckets):
             weight = decay_factor ** age
 
-            ema_in += bucket['in'] * weight
-            ema_out += bucket['out'] * weight
+            # BUG FIX: Use .get() with defaults to handle malformed buckets
+            bucket_in = bucket.get('in', 0) or 0
+            bucket_out = bucket.get('out', 0) or 0
 
-            total_in += bucket['in']
-            total_out += bucket['out']
+            ema_in += bucket_in * weight
+            ema_out += bucket_out * weight
+
+            total_in += bucket_in
+            total_out += bucket_out
 
             # v2.0: Track forward count and last timestamp
-            bucket_count = bucket.get('count', 0)
+            bucket_count = bucket.get('count', 0) or 0
             forward_count += bucket_count
 
             # Track most recent forward timestamp (day 0 has newest data)
@@ -835,16 +818,25 @@ class FlowAnalyzer:
     def get_channel_state(self, channel_id: str) -> ChannelState:
         """
         Get the cached state of a channel.
-        
+
         Args:
             channel_id: The channel to check
-            
+
         Returns:
             The channel's current state classification
         """
         state_data = self.database.get_channel_state(channel_id)
         if state_data:
-            return ChannelState(state_data.get("state", "unknown"))
+            state_str = state_data.get("state", "unknown")
+            # BUG FIX: Validate state string before enum conversion
+            try:
+                return ChannelState(state_str)
+            except ValueError:
+                self.plugin.log(
+                    f"Invalid state '{state_str}' in database for channel {channel_id}, returning UNKNOWN",
+                    level='warning'
+                )
+                return ChannelState.UNKNOWN
         return ChannelState.UNKNOWN
     
     def get_sources(self) -> List[Dict[str, Any]]:

@@ -595,12 +595,13 @@ class ChannelProfitabilityAnalyzer:
         
         # Priority based on classification
         priorities = {
-            ProfitabilityClass.PROFITABLE: 1.5,     # High priority - proven earner
-            ProfitabilityClass.BREAK_EVEN: 1.0,     # Normal priority
-            ProfitabilityClass.UNDERWATER: 0.5,     # Low priority - not worth much
-            ProfitabilityClass.ZOMBIE: 0.0,         # Skip entirely - don't waste fees
+            ProfitabilityClass.PROFITABLE: 1.5,          # High priority - proven earner
+            ProfitabilityClass.BREAK_EVEN: 1.0,          # Normal priority
+            ProfitabilityClass.UNDERWATER: 0.5,          # Low priority - not worth much
+            ProfitabilityClass.STAGNANT_CANDIDATE: 0.3,  # Very low - needs diagnostic first
+            ProfitabilityClass.ZOMBIE: 0.0,              # Skip entirely - don't waste fees
         }
-        
+
         return priorities.get(profitability.classification, 1.0)
     
     def get_max_rebalance_fee_multiplier(self, channel_id: str) -> float:
@@ -628,6 +629,9 @@ class ChannelProfitabilityAnalyzer:
             return 1.0
         elif profitability.classification == ProfitabilityClass.UNDERWATER:
             return 0.5  # Half budget - already losing money
+        elif profitability.classification == ProfitabilityClass.STAGNANT_CANDIDATE:
+            # BUG FIX: Stagnant channels need some budget for diagnostic rebalances
+            return 0.3  # Reduced budget - needs diagnostic testing first
         else:  # ZOMBIE
             return 0.0  # No budget - don't rebalance
     
@@ -961,11 +965,15 @@ class ChannelProfitabilityAnalyzer:
         - Operating Margin: (Net Profit / Gross Revenue) * 100
 
         Args:
-            window_days: Time window for calculations (default 30 days)
+            window_days: Time window for calculations (default 30 days, minimum 1)
 
         Returns:
             Dict with revenue, opex breakdown, net_profit, margin
         """
+        # BUG FIX: Validate window_days to prevent empty/confusing results
+        if window_days < 1:
+            window_days = 1
+
         since_timestamp = int(time.time()) - (window_days * 86400)
 
         # Get revenue (routing fees earned)
@@ -1016,11 +1024,15 @@ class ChannelProfitabilityAnalyzer:
         volume but don't earn direct exit fees.
 
         Args:
-            window_days: Time window for analysis (default 30 days)
+            window_days: Time window for analysis (default 30 days, minimum 1)
 
         Returns:
             List of bleeder channel dicts with P&L breakdown, sorted by loss
         """
+        # BUG FIX: Validate window_days to prevent empty/confusing results
+        if window_days < 1:
+            window_days = 1
+
         bleeders = []
 
         try:
@@ -1077,11 +1089,15 @@ class ChannelProfitabilityAnalyzer:
         This tells operators their annualized return on the BTC locked in channels.
 
         Args:
-            window_days: Time window for net profit calculation (default 30 days)
+            window_days: Time window for net profit calculation (default 30 days, minimum 1)
 
         Returns:
             Dict with total_capacity, net_profit, roc_pct, and annualized_roc_pct
         """
+        # BUG FIX: Validate window_days to prevent division by zero in annualization
+        if window_days < 1:
+            window_days = 1
+
         # Get P&L for the window
         pnl = self.get_pnl_summary(window_days)
 

@@ -56,38 +56,33 @@ class CapacityPlanner:
             return "UNKNOWN: Could not fetch feerates."
 
     def _get_peer_splice_map(self) -> Dict[str, bool]:
-        """Identify which peers support splicing (bits 161/162)."""
+        """Identify which peers support splicing (bits 62/63 for option_splice)."""
         splice_map = {}
         try:
             peers = self.plugin.rpc.listpeers().get("peers", [])
             for peer in peers:
                 peer_id = peer.get("id")
                 features = peer.get("features", "")
-                # Bits 161/162 for splicing
-                # features is a hex string in CLN listpeers
-                # We can check for 'a1' (161 set) etc but simplest is checking feature bits if available
-                # or just parsing the hex.
-                
-                # Check for feature bits 161 or 162
-                # features hex: 0-indexed from right? No, left-to-right hex.
-                # CLN actually provides 'features' as hex string.
-                # We can convert hex to int and check bits.
+                # BOLT 9: option_splice uses feature bits 62 (even=required) / 63 (odd=optional)
+                # CLN provides 'features' as a hex string.
+                # We convert hex to int and check the appropriate bits.
                 if not features:
                     splice_map[peer_id] = False
                     continue
-                    
+
                 has_splice = False
                 try:
                     feat_int = int(features, 16)
-                    if (feat_int & (1 << 160)) or (feat_int & (1 << 161)):
+                    # BUG FIX: Check correct feature bits for option_splice (62/63)
+                    if (feat_int & (1 << 62)) or (feat_int & (1 << 63)):
                         has_splice = True
-                except:
+                except Exception:
                     pass
-                
+
                 splice_map[peer_id] = has_splice
         except Exception as e:
             self.plugin.log(f"Error mapping peer splice support: {e}", level='debug')
-            
+
         return splice_map
 
     def _identify_winners(self) -> List[Dict[str, Any]]:
@@ -143,7 +138,8 @@ class CapacityPlanner:
             
             # Fetch diagnostic stats from DB
             diag_stats = self.profitability.database.get_diagnostic_rebalance_stats(scid, days=14)
-            attempt_count = diag_stats["attempt_count"]
+            # BUG FIX: Use .get() to avoid KeyError if key is missing
+            attempt_count = diag_stats.get("attempt_count", 0)
             
             # SCID formatting check - ensure 'x' separator
             scid_display = scid.replace(':', 'x')

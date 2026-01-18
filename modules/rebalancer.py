@@ -239,49 +239,7 @@ class JobManager:
             self.plugin.log(f"Error getting channel balance: {e}", level='debug')
         return 0
 
-    def _get_channel_age_days(self, channel_id: str, channel_info: Dict = None) -> int:
-        """
-        Get the age of a channel in days (Issue #30: Velocity Gate).
-
-        Uses SCID block height to estimate channel age. SCID format is
-        "blockheight x txindex x output".
-
-        Args:
-            channel_id: Short channel ID
-            channel_info: Optional channel info dict (for future use)
-
-        Returns:
-            Estimated channel age in days (0 if unknown)
-        """
-        import time
-
-        try:
-            # Parse block height from SCID
-            if 'x' in channel_id:
-                block_height = int(channel_id.split('x')[0])
-            elif ':' in channel_id:
-                block_height = int(channel_id.split(':')[0])
-            else:
-                return 0
-
-            # Get current block height
-            getinfo = self.plugin.rpc.getinfo()
-            current_height = getinfo.get("blockheight", 0)
-
-            if current_height <= 0 or block_height <= 0:
-                return 0
-
-            # Blocks since channel opened
-            blocks_since_open = current_height - block_height
-
-            # ~10 minutes per block = 144 blocks per day
-            days_open = blocks_since_open // 144
-
-            return max(0, days_open)
-
-        except Exception as e:
-            self.plugin.log(f"Error getting channel age: {e}", level='debug')
-            return 0
+    # NOTE: _get_channel_age_days removed - duplicate of EVRebalancer method and was never called
 
     def start_job(self, candidate: RebalanceCandidate, rebalance_id: int) -> Dict[str, Any]:
         """
@@ -309,7 +267,7 @@ class JobManager:
         if self.active_job_count >= self.max_concurrent_jobs:
             return {"success": False, "error": "No job slots available"}
         
-        # Convert SCIDs to sling format (colon-separated)
+        # Convert SCIDs to sling format (x-separated, e.g., 930866x2599x2)
         to_scid = self._to_sling_scid(candidate.to_channel)
         
         # Convert all source candidates to sling format
@@ -821,7 +779,8 @@ class JobManager:
                 
                 try:
                     # Delete the orphan job
-                    self.plugin.rpc.call("sling-deletejob", {"scid": scid})
+                    # BUG FIX: Use "job" key to match stop_job() method
+                    self.plugin.rpc.call("sling-deletejob", {"job": scid})
                     orphan_count += 1
                     self.plugin.log(f"Startup Hygiene: Terminated orphan job for {scid}", level='debug')
                 except RpcError as e:
@@ -995,11 +954,13 @@ class JobManager:
     
     def get_all_jobs_status(self) -> List[Dict[str, Any]]:
         """Get status info for all active jobs."""
-        return [
-            self.get_job_status(scid) 
-            for scid in self._active_jobs.keys()
-            if self.get_job_status(scid)
-        ]
+        # BUG FIX: Avoid calling get_job_status twice per channel
+        result = []
+        for scid in self._active_jobs.keys():
+            status = self.get_job_status(scid)
+            if status:
+                result.append(status)
+        return result
 
     def get_source_failure_count(self, channel_id: str) -> float:
         """Get the recent failure count for a source channel."""
@@ -1277,11 +1238,12 @@ class EVRebalancer:
             self._fee_cache = {}
             
             # Garbage Collection: Prune stale source failure counts (TODO #18)
+            # BUG FIX: Use try/except to check if 'channels' exists (may not if early exception)
             try:
-                active_channel_ids = set(channels.keys()) if 'channels' in dir() else set()
+                active_channel_ids = set(channels.keys())
                 if active_channel_ids:
                     self.job_manager.prune_stale_source_failures(active_channel_ids)
-            except Exception:
+            except (NameError, Exception):
                 pass  # Don't fail the main method for GC errors
 
     def _analyze_rebalance_ev(self, dest_channel: str, dest_info: Dict[str, Any],
