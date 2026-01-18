@@ -136,7 +136,6 @@ CONFIG_FIELD_TYPES = {
     'high_liquidity_threshold': float,
     'htlc_congestion_threshold': float,
     'enable_reputation': bool,
-    'enable_prometheus': bool,
     'enable_kelly': bool,
     'enable_proportional_budget': bool,
     'proportional_budget_pct': float,

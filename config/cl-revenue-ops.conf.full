@@ -144,16 +144,6 @@
 #revenue-ops-high-liquidity-threshold=0.8
 
 # ============================================================================
-# OBSERVABILITY (Prometheus Metrics)
-# ============================================================================
-
-# Enable Prometheus metrics exporter
-#revenue-ops-enable-prometheus=false
-
-# Prometheus HTTP server port
-#revenue-ops-prometheus-port=9800
-
-# ============================================================================
 # DATABASE
 # ============================================================================
 

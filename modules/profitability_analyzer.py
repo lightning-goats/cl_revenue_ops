@@ -24,9 +24,6 @@ import time
 
 from pyln.client import Plugin
 
-if TYPE_CHECKING:
-    from .metrics import PrometheusExporter
-
 
 class ProfitabilityClass(Enum):
     """Channel profitability classification."""
@@ -281,21 +278,18 @@ class ChannelProfitabilityAnalyzer:
     ZOMBIE_DAYS_INACTIVE = 30          # No routing for 30 days
     ZOMBIE_MIN_LOSS_SATS = 1000        # Minimum loss to be zombie
     
-    def __init__(self, plugin: Plugin, config, database,
-                 metrics_exporter: Optional["PrometheusExporter"] = None):
+    def __init__(self, plugin: Plugin, config, database):
         """
         Initialize the profitability analyzer.
-        
+
         Args:
             plugin: Reference to the pyln Plugin
             config: Configuration object
             database: Database instance for persistence
-            metrics_exporter: Optional Prometheus metrics exporter for observability
         """
         self.plugin = plugin
         self.config = config
         self.database = database
-        self.metrics = metrics_exporter
         
         # Cache for profitability data (refreshed periodically)
         self._profitability_cache: Dict[str, ChannelProfitability] = {}
@@ -462,28 +456,6 @@ class ChannelProfitabilityAnalyzer:
                 days_open=days_open,
                 last_routed=last_routed
             )
-            
-            # Export metrics (Phase 2: Observability)
-            if self.metrics:
-                from .metrics import MetricNames, METRIC_HELP
-                
-                labels = {"channel_id": channel_id, "peer_id": peer_id}
-                
-                # Gauge: Marginal ROI percentage (operational profitability)
-                self.metrics.set_gauge(
-                    MetricNames.CHANNEL_MARGINAL_ROI_PERCENT,
-                    profitability.marginal_roi_percent,
-                    labels,
-                    METRIC_HELP.get(MetricNames.CHANNEL_MARGINAL_ROI_PERCENT, "")
-                )
-                
-                # Gauge: Channel capacity
-                self.metrics.set_gauge(
-                    MetricNames.CHANNEL_CAPACITY_SATS,
-                    capacity,
-                    labels,
-                    METRIC_HELP.get(MetricNames.CHANNEL_CAPACITY_SATS, "")
-                )
             
             return profitability
             

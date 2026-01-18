@@ -66,7 +66,6 @@ Centralized control via `revenue-policy` command.
 - **Rate Limiting:** Prevents policy change spam (10/minute per peer)
 
 ### Module 5: Observability & Reporting
-- **Prometheus Exporter:** Native HTTP server for Grafana dashboards
 - **Financial Snapshots:** Daily recording of Net Worth, Margins, ROC
 - **`revenue-report`:** Unified RPC for P&L summaries and peer analytics
 
@@ -246,13 +245,6 @@ All options can be set in your CLN config file or via `revenue-config set`.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `revenue-ops-clboss-enabled` | `true` | Enable CLBoss integration |
-
-### Prometheus Metrics
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `revenue-ops-enable-prometheus` | `false` | Enable Prometheus exporter |
-| `revenue-ops-prometheus-port` | `9800` | Prometheus HTTP port |
 
 ### RPC Settings
 

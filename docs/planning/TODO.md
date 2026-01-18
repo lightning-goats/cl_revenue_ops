@@ -54,9 +54,8 @@ This document details the implementation steps for the remaining items in the ro
 **Status:** Implemented `shutdown_event` threading.Event and SIGTERM signal handler in `cl-revenue-ops.py`. All background loops now use `shutdown_event.wait(timeout)` instead of `time.sleep(timeout)`, enabling instant clean shutdown via `lightning-cli plugin stop`.
 
 **Verified Components:**
-- `modules/metrics.py`: `stop_server()` correctly calls `self._server.shutdown()` to unblock the HTTP server thread ✅
 - `modules/rebalancer.py`: `stop_all_jobs()` terminates active sling jobs on shutdown ✅
-- `cl-revenue-ops.py`: SIGTERM handler calls both cleanup methods ✅
+- `cl-revenue-ops.py`: SIGTERM handler calls cleanup methods ✅
 
 #### 17. Optimize Database Indexes (Composite Indexing) ✅ COMPLETED
 **Status:** Added composite index `idx_forwards_out_channel_time ON forwards(out_channel, timestamp)` in `modules/database.py` → `initialize()`. Changes query complexity from O(N) to O(log N) for `get_volume_since` calls.

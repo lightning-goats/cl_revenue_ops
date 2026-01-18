@@ -36,7 +36,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'high_liquidity_threshold': float,
     'htlc_congestion_threshold': float,
     'enable_reputation': bool,
-    'enable_prometheus': bool,
     'enable_kelly': bool,
     'enable_proportional_budget': bool,
     'proportional_budget_pct': float,
@@ -57,7 +56,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_min_amount': int,
     'rebalance_cooldown_hours': int,
     'inbound_fee_estimate_ppm': int,
-    'prometheus_port': int,
     # Phase 7 additions
     'enable_vegas_reflex': bool,
     'vegas_decay_rate': float,
@@ -184,11 +182,7 @@ class Config:
     enable_reputation: bool = True  # If True, weight volume by peer success rate
     reputation_decay: float = 0.98  # Decay factor per flow_interval (default hourly)
                                      # 0.98^24 ≈ 0.61, meaning old data loses ~40% weight daily
-    
-    # Prometheus Metrics (Phase 2: Observability)
-    enable_prometheus: bool = False  # If True, start Prometheus metrics exporter (disabled by default)
-    prometheus_port: int = 9800      # Port for Prometheus HTTP server
-    
+
     # Kelly Criterion Position Sizing (Phase 4: Risk Management)
     enable_kelly: bool = False       # If True, scale rebalance budget by Kelly fraction
     kelly_fraction: float = 0.5      # Multiplier for Kelly fraction ("Half Kelly" is standard)
@@ -406,11 +400,7 @@ class ConfigSnapshot:
     # Reputation-weighted volume
     enable_reputation: bool
     reputation_decay: float
-    
-    # Prometheus Metrics
-    enable_prometheus: bool
-    prometheus_port: int
-    
+
     # Kelly Criterion Position Sizing
     enable_kelly: bool
     kelly_fraction: float
@@ -498,8 +488,6 @@ class ConfigSnapshot:
             htlc_congestion_threshold=config.htlc_congestion_threshold,
             enable_reputation=config.enable_reputation,
             reputation_decay=config.reputation_decay,
-            enable_prometheus=config.enable_prometheus,
-            prometheus_port=config.prometheus_port,
             enable_kelly=config.enable_kelly,
             kelly_fraction=config.kelly_fraction,
             max_concurrent_jobs=config.max_concurrent_jobs,

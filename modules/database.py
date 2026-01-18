@@ -1615,8 +1615,8 @@ class Database:
         except Exception as e:
             try:
                 conn.execute("ROLLBACK")
-            except:
-                pass
+            except Exception:
+                pass  # Rollback failed - original exception is more important
             self.plugin.log(f"Budget reservation failed: {e}", level='error')
             return (False, 0)
 

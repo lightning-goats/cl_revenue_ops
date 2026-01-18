@@ -56,7 +56,6 @@ from modules.config import Config
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
-from modules.metrics import PrometheusExporter, MetricNames, METRIC_HELP
 from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
 
 
@@ -579,7 +578,6 @@ database: Optional[Database] = None
 config: Optional[Config] = None
 profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
 capacity_planner: Optional[CapacityPlanner] = None
-metrics_exporter: Optional[PrometheusExporter] = None
 rpc_broker: Optional['RpcBroker'] = None  # RPC broker subprocess
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
@@ -708,18 +706,6 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-enable-prometheus',
-    default='false',
-    description='If true, start Prometheus metrics exporter HTTP server (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-prometheus-port',
-    default='9800',
-    description='Port for Prometheus HTTP metrics server (default: 9800)'
-)
-
-plugin.add_option(
     name='revenue-ops-enable-kelly',
     default='false',
     description='If true, scale rebalance budget using Kelly Criterion based on peer reputation (default: false)'
@@ -804,9 +790,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     2. Initialize the database
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
-    5. Start Prometheus metrics exporter (if enabled)
     """
-    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, metrics_exporter, safe_plugin, policy_manager
+    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager
     
     plugin.log("Initializing cl-revenue-ops plugin...")
     
@@ -831,8 +816,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         htlc_congestion_threshold=float(options['revenue-ops-htlc-congestion-threshold']),
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
         reputation_decay=float(options['revenue-ops-reputation-decay']),
-        enable_prometheus=options['revenue-ops-enable-prometheus'].lower() == 'true',
-        prometheus_port=int(options['revenue-ops-prometheus-port']),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
         kelly_fraction=float(options['revenue-ops-kelly-fraction']),
         # Phase 7 options (v1.3.0)
@@ -1016,16 +999,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         import traceback
         plugin.log(f"Traceback: {traceback.format_exc()}", level='warn')
     
-    # Initialize Prometheus metrics exporter (Phase 2: Observability)
-    if config.enable_prometheus:
-        metrics_exporter = PrometheusExporter(port=config.prometheus_port, plugin=safe_plugin)
-        if not metrics_exporter.start_server():
-            plugin.log("Prometheus metrics disabled due to server startup failure", level='warn')
-            metrics_exporter = None
-    else:
-        metrics_exporter = None
-        plugin.log("Prometheus metrics exporter disabled by configuration")
-    
     # Initialize clboss manager (handles unmanage commands)
     clboss_manager = ClbossManager(safe_plugin, config)
     
@@ -1033,14 +1006,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     policy_manager = PolicyManager(database, safe_plugin)
     plugin.log("PolicyManager initialized for peer-level fee/rebalance policies")
     
-    # Initialize profitability analyzer (with metrics exporter)
-    profitability_analyzer = ChannelProfitabilityAnalyzer(safe_plugin, config, database, metrics_exporter)
-    
-    # Initialize analysis modules with profitability analyzer and metrics exporter
+    # Initialize profitability analyzer
+    profitability_analyzer = ChannelProfitabilityAnalyzer(safe_plugin, config, database)
+
+    # Initialize analysis modules with profitability analyzer
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
     capacity_planner = CapacityPlanner(safe_plugin, config, profitability_analyzer, flow_analyzer)
-    fee_controller = PIDFeeController(safe_plugin, config, database, clboss_manager, policy_manager, profitability_analyzer, metrics_exporter)
-    rebalancer = EVRebalancer(safe_plugin, config, database, clboss_manager, policy_manager, metrics_exporter)
+    fee_controller = PIDFeeController(safe_plugin, config, database, clboss_manager, policy_manager, profitability_analyzer)
+    rebalancer = EVRebalancer(safe_plugin, config, database, clboss_manager, policy_manager)
     rebalancer.set_profitability_analyzer(profitability_analyzer)
     
     # Set up periodic background tasks using threading
@@ -1066,19 +1039,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     days_to_keep = max(8, config.flow_window_days + 1)
                     database.cleanup_old_data(days_to_keep=days_to_keep)
                 
-                # Export peer reputation metrics (Phase 2: Observability)
-                if metrics_exporter and database:
-                    update_peer_reputation_metrics()
-                
-                # Update last run timestamp for health monitoring
-                if metrics_exporter:
-                    metrics_exporter.set_gauge(
-                        MetricNames.SYSTEM_LAST_RUN_TIMESTAMP,
-                        int(time.time()),
-                        {"task": "flow"},
-                        METRIC_HELP.get(MetricNames.SYSTEM_LAST_RUN_TIMESTAMP, "")
-                    )
-                    
             except (RPCTimeoutError, RPCBreakerOpen) as e:
                 plugin.log(f"RPC degraded in flow analysis: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
@@ -1105,15 +1065,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             try:
                 plugin.log("Running scheduled fee adjustment...")
                 run_fee_adjustment()
-                
-                # Update last run timestamp for health monitoring
-                if metrics_exporter:
-                    metrics_exporter.set_gauge(
-                        MetricNames.SYSTEM_LAST_RUN_TIMESTAMP,
-                        int(time.time()),
-                        {"task": "fee"},
-                        METRIC_HELP.get(MetricNames.SYSTEM_LAST_RUN_TIMESTAMP, "")
-                    )
             except (RPCTimeoutError, RPCBreakerOpen) as e:
                 plugin.log(f"RPC degraded in fee adjustment: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
@@ -1145,15 +1096,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             try:
                 plugin.log("Running scheduled rebalance check...")
                 run_rebalance_check()
-                
-                # Update last run timestamp for health monitoring
-                if metrics_exporter:
-                    metrics_exporter.set_gauge(
-                        MetricNames.SYSTEM_LAST_RUN_TIMESTAMP,
-                        int(time.time()),
-                        {"task": "rebalance"},
-                        METRIC_HELP.get(MetricNames.SYSTEM_LAST_RUN_TIMESTAMP, "")
-                    )
             except (RPCTimeoutError, RPCBreakerOpen) as e:
                 plugin.log(f"RPC degraded in rebalance check: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
@@ -1297,13 +1239,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             except Exception as e:
                 plugin.log(f"Error stopping rebalance jobs: {e}", level='warn')
         
-        # Stop Prometheus server if running
-        if metrics_exporter:
-            try:
-                metrics_exporter.stop_server()
-            except Exception as e:
-                plugin.log(f"Error stopping metrics server: {e}", level='warn')
-
         # Stop RPC broker subprocess
         if rpc_broker:
             try:
@@ -1426,60 +1361,6 @@ def run_rebalance_check():
     except Exception as e:
         plugin.log(f"Rebalance check failed: {e}", level='error')
         raise
-
-
-def update_peer_reputation_metrics():
-    """
-    Export peer reputation data to Prometheus metrics.
-    
-    Phase 2: Observability - Track peer reliability scores.
-    
-    Called periodically from flow_analysis_loop to update:
-    - cl_revenue_peer_reputation_score: Success rate (0.0 to 1.0)
-    - cl_revenue_peer_success_count: Total successful forwards
-    - cl_revenue_peer_failure_count: Total failed forwards
-    """
-    if database is None or metrics_exporter is None:
-        return
-    
-    try:
-        reputations = database.get_all_peer_reputations()
-        
-        for rep in reputations:
-            peer_id = rep.get('peer_id', '')
-            if not peer_id:
-                continue
-            
-            labels = {"peer_id": peer_id}
-            
-            # Gauge: Reputation score (success rate 0.0 to 1.0)
-            metrics_exporter.set_gauge(
-                MetricNames.PEER_REPUTATION_SCORE,
-                rep.get('score', 1.0),
-                labels,
-                METRIC_HELP.get(MetricNames.PEER_REPUTATION_SCORE, "")
-            )
-            
-            # Gauge: Success count (using gauge so we can see current state)
-            metrics_exporter.set_gauge(
-                MetricNames.PEER_SUCCESS_COUNT,
-                rep.get('successes', 0),
-                labels,
-                METRIC_HELP.get(MetricNames.PEER_SUCCESS_COUNT, "")
-            )
-            
-            # Gauge: Failure count
-            metrics_exporter.set_gauge(
-                MetricNames.PEER_FAILURE_COUNT,
-                rep.get('failures', 0),
-                labels,
-                METRIC_HELP.get(MetricNames.PEER_FAILURE_COUNT, "")
-            )
-        
-        plugin.log(f"Updated Prometheus metrics for {len(reputations)} peer reputations", level='debug')
-        
-    except Exception as e:
-        plugin.log(f"Error updating peer reputation metrics: {e}", level='warn')
 
 
 # =============================================================================
@@ -3038,28 +2919,6 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
                 # Failure - increment failure count
                 database.update_peer_reputation(peer_id, is_success=False)
             
-            # Real-time metrics update (Phase 2: Observability)
-            # Update Prometheus metrics immediately after DB update
-            if metrics_exporter:
-                rep = database.get_peer_reputation(peer_id)
-                labels = {"peer_id": peer_id}
-                
-                metrics_exporter.set_gauge(
-                    MetricNames.PEER_REPUTATION_SCORE,
-                    rep.get('score', 1.0),
-                    labels
-                )
-                metrics_exporter.set_gauge(
-                    MetricNames.PEER_SUCCESS_COUNT,
-                    rep.get('successes', 0),
-                    labels
-                )
-                metrics_exporter.set_gauge(
-                    MetricNames.PEER_FAILURE_COUNT,
-                    rep.get('failures', 0),
-                    labels
-                )
-    
     # Record successful forwards for flow metrics
     if status == "settled":
         out_channel = forward_event.get("out_channel")

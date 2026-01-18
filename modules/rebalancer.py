@@ -29,7 +29,6 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ConfigSnapshot
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
-from .metrics import PrometheusExporter, MetricNames, METRIC_HELP
 from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
 
 if TYPE_CHECKING:
@@ -146,12 +145,10 @@ class JobManager:
     # Default timeout: 2 hours (configurable)
     DEFAULT_JOB_TIMEOUT_SECONDS = 7200
     
-    def __init__(self, plugin: Plugin, config: Config, database: Database,
-                 metrics_exporter: Optional[PrometheusExporter] = None):
+    def __init__(self, plugin: Plugin, config: Config, database: Database):
         self.plugin = plugin
         self.config = config
         self.database = database
-        self.metrics = metrics_exporter
         
         # Active jobs indexed by target channel SCID (normalized format)
         self._active_jobs: Dict[str, ActiveJob] = {}
@@ -623,14 +620,6 @@ class JobManager:
                 # Significant reduction (rewarding success)
                 self.source_failure_counts[primary_source] = 0.0
 
-        # Update metrics
-        if self.metrics:
-            self.metrics.inc_counter(
-                MetricNames.REBALANCE_COST_TOTAL_SATS,
-                fee_sats,
-                {"channel_id": job.scid_normalized}
-            )
-
         # Mark budget reservation as spent (CRITICAL-01 fix)
         self.database.mark_budget_spent(job.rebalance_id, fee_sats)
 
@@ -978,20 +967,18 @@ class EVRebalancer:
     
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
-                 policy_manager: Optional[PolicyManager] = None,
-                 metrics_exporter: Optional[PrometheusExporter] = None):
+                 policy_manager: Optional[PolicyManager] = None):
         self.plugin = plugin
         self.config = config
         self.database = database
         self.clboss = clboss_manager
         self.policy_manager = policy_manager
-        self.metrics = metrics_exporter
         self._pending: Dict[str, int] = {}
         self._our_node_id: Optional[str] = None
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
-        
+
         # Initialize job manager for async execution
-        self.job_manager = JobManager(plugin, config, database, metrics_exporter)
+        self.job_manager = JobManager(plugin, config, database)
     
     def _get_our_node_id(self) -> str:
         if self._our_node_id is None:

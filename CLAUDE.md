@@ -49,7 +49,6 @@ Core Lightning
 | `clboss_manager.py` | Optional CLBoss integration for unmanage commands |
 | `database.py` | SQLite with WAL mode, accounting tables, closed channel history |
 | `config.py` | Hot-reloadable configuration |
-| `metrics.py` | Prometheus metrics exporter |
 
 ### Key Algorithms
 
@@ -146,7 +145,6 @@ Core Lightning
 
 - Main plugin file: `cl-revenue-ops.py` (~146KB)
 - All config hot-reloadable via `revenue-config set`
-- Prometheus metrics on port 9800 (disabled by default)
 - Supports CLN's `setconfig` for runtime changes
 
 ## Testing Conventions
@@ -170,8 +168,7 @@ cl-revenue-ops/
 │   ├── capacity_planner.py # Channel recommendations
 │   ├── clboss_manager.py   # Optional CLBoss integration
 │   ├── database.py         # SQLite layer
-│   ├── config.py           # Configuration
-│   └── metrics.py          # Prometheus exporter
+│   └── config.py           # Configuration
 ├── config/
 │   ├── cl-revenue-ops.conf.full     # Full config with all options documented
 │   └── cl-revenue-ops.conf.minimal  # Quick-start production config

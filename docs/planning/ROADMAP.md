@@ -13,8 +13,8 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 ## Phase 2: Observability
 *Objective: "You cannot manage what you cannot measure." Provide real-time visualization and auditing of algorithmic decisions.*
 
-- [x] **Prometheus Metrics Exporter**: Expose a local HTTP endpoint (or `.prom` file writer) to output time-series data.
-- [x] **Real-Time Metrics**: Updated event hooks to push metrics instantly, removing dashboard lag.
+- [x] ~~**Prometheus Metrics Exporter**~~: *Removed in v1.5 - replaced with native RPC reporting*
+- [x] **Real-Time Metrics**: Updated event hooks for instant database updates.
 - [x] **Lifetime History**: Added `revenue-history` to track total P&L including closed channels.
 - [x] Fix revenue-history pruning issue
 - [x] Record rebalance_costs on success

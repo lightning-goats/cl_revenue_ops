@@ -44,7 +44,6 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
-from .metrics import PrometheusExporter, MetricNames, METRIC_HELP
 from .policy_manager import PolicyManager, FeeStrategy
 
 if TYPE_CHECKING:
@@ -867,14 +866,13 @@ class HillClimbingFeeController:
     ZERO_FLOW_REDUCTION_MODERATE = 0.75  # 25% ceiling reduction after 3 days
     ZERO_FLOW_REDUCTION_SEVERE = 0.50    # 50% ceiling reduction after 7 days
 
-    def __init__(self, plugin: Plugin, config: Config, database: Database, 
+    def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
                  policy_manager: Optional[PolicyManager] = None,
-                 profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
-                 metrics_exporter: Optional[PrometheusExporter] = None):
+                 profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None):
         """
         Initialize the fee controller.
-        
+
         Args:
             plugin: Reference to the pyln Plugin
             config: Configuration object
@@ -882,7 +880,6 @@ class HillClimbingFeeController:
             clboss_manager: ClbossManager for handling overrides
             policy_manager: Optional PolicyManager for peer-level fee policies
             profitability_analyzer: Optional profitability analyzer for ROI-based adjustments
-            metrics_exporter: Optional Prometheus metrics exporter for observability
         """
         self.plugin = plugin
         self.config = config
@@ -890,7 +887,6 @@ class HillClimbingFeeController:
         self.clboss = clboss_manager
         self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
-        self.metrics = metrics_exporter
         
         # In-memory cache of Hill Climbing states (also persisted to DB)
         self._hill_climb_states: Dict[str, HillClimbState] = {}
@@ -1407,14 +1403,6 @@ class HillClimbingFeeController:
                         f"(wake in {(hc_state.sleep_until - now) // 60} min)",
                         level='debug'
                     )
-                    # Export sleep state metric (Observability)
-                    if self.metrics:
-                        self.metrics.set_gauge(
-                            MetricNames.CHANNEL_IS_SLEEPING,
-                            1,
-                            {"channel_id": channel_id, "peer_id": peer_id},
-                            METRIC_HELP.get(MetricNames.CHANNEL_IS_SLEEPING, "")
-                        )
                     return None
         
         # PROFITABILITY SHIELD: Protect high-value peers from reputation penalties
@@ -2050,34 +2038,7 @@ class HillClimbingFeeController:
             hc_state.step_ppm = step_ppm
             hc_state.last_update = now
             self._save_hill_climb_state(channel_id, hc_state)
-            # Export metrics (Phase 2: Observability)
-            if self.metrics:
-                labels = {"channel_id": channel_id, "peer_id": peer_id}
-                
-                # Gauge: Current fee PPM
-                self.metrics.set_gauge(
-                    MetricNames.CHANNEL_FEE_PPM,
-                    new_fee_ppm,
-                    labels,
-                    METRIC_HELP.get(MetricNames.CHANNEL_FEE_PPM, "")
-                )
-                
-                # Gauge: Revenue rate (sats/hour)
-                self.metrics.set_gauge(
-                    MetricNames.CHANNEL_REVENUE_RATE_SATS_HR,
-                    current_revenue_rate,
-                    labels,
-                    METRIC_HELP.get(MetricNames.CHANNEL_REVENUE_RATE_SATS_HR, "")
-                )
-                
-                # Gauge: Sleep state (0 = awake, actively adjusting)
-                self.metrics.set_gauge(
-                    MetricNames.CHANNEL_IS_SLEEPING,
-                    0,
-                    labels,
-                    METRIC_HELP.get(MetricNames.CHANNEL_IS_SLEEPING, "")
-                )
-            
+
             return FeeAdjustment(
                 channel_id=channel_id,
                 peer_id=peer_id,
