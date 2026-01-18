@@ -18,7 +18,7 @@ Classifications:
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Any, Optional, Tuple
 from enum import Enum
 import time
 

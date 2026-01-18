@@ -947,45 +947,7 @@ class Database:
         conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
     
     # =========================================================================
-    # PID State Methods (DEPRECATED - table kept for migration compatibility)
-    # The fee controller now uses Hill Climbing, not PID. These methods and
-    # the pid_state table are retained only to prevent errors on upgrade.
-    # =========================================================================
-    
-    def get_pid_state(self, channel_id: str) -> Dict[str, Any]:
-        """Get PID controller state for a channel (DEPRECATED - unused)."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT * FROM pid_state WHERE channel_id = ?",
-            (channel_id,)
-        ).fetchone()
-        
-        if row:
-            return dict(row)
-        
-        # Return default state if not found
-        return {
-            'channel_id': channel_id,
-            'integral': 0.0,
-            'last_error': 0.0,
-            'last_fee_ppm': 0,
-            'last_update': 0
-        }
-    
-    def update_pid_state(self, channel_id: str, integral: float, last_error: float, 
-                         last_fee_ppm: int):
-        """Update PID controller state for a channel (DEPRECATED - unused)."""
-        conn = self._get_connection()
-        now = int(time.time())
-        
-        conn.execute("""
-            INSERT OR REPLACE INTO pid_state 
-            (channel_id, integral, last_error, last_fee_ppm, last_update)
-            VALUES (?, ?, ?, ?, ?)
-        """, (channel_id, integral, last_error, last_fee_ppm, now))
-    
-    # =========================================================================
-    # Fee Strategy State Methods (NEW - Hill Climbing Controller)
+    # Fee Strategy State Methods (Hill Climbing Controller)
     # =========================================================================
     
     def get_fee_strategy_state(self, channel_id: str) -> Dict[str, Any]:
@@ -3709,36 +3671,6 @@ class Database:
         
         uptime_pct = (total_connected_time / actual_duration) * 100.0
         return min(100.0, max(0.0, uptime_pct))
-    
-    # =========================================================================
-    # Ignored Peers (Blacklist) Methods
-    # =========================================================================
-    
-    def add_ignored_peer(self, peer_id: str, reason: str = "manual"):
-        """Add a peer to the ignore list."""
-        conn = self._get_connection()
-        now = int(time.time())
-        conn.execute("""
-            INSERT OR REPLACE INTO ignored_peers (peer_id, reason, ignored_at)
-            VALUES (?, ?, ?)
-        """, (peer_id, reason, now))
-
-    def remove_ignored_peer(self, peer_id: str):
-        """Remove a peer from the ignore list."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM ignored_peers WHERE peer_id = ?", (peer_id,))
-
-    def is_peer_ignored(self, peer_id: str) -> bool:
-        """Check if a peer is ignored."""
-        conn = self._get_connection()
-        row = conn.execute("SELECT 1 FROM ignored_peers WHERE peer_id = ?", (peer_id,)).fetchone()
-        return row is not None
-
-    def get_ignored_peers(self) -> List[Dict[str, Any]]:
-        """Get list of all ignored peers."""
-        conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM ignored_peers ORDER BY ignored_at DESC").fetchall()
-        return [dict(row) for row in rows]
     
     # =========================================================================
     # Config Overrides Methods (Phase 7: Dynamic Runtime Configuration)

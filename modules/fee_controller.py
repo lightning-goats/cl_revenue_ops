@@ -1201,11 +1201,7 @@ class HillClimbingFeeController:
                     continue
                 
                 # DYNAMIC strategy continues to normal Hill Climbing below
-            else:
-                # Legacy fallback: check is_peer_ignored
-                if self.database.is_peer_ignored(peer_id):
-                    continue
-            
+
             # Get channel info
             channel_info = channels.get(channel_id)
             if not channel_info:

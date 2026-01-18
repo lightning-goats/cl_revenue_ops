@@ -829,14 +829,6 @@ class JobManager:
                 except Exception as e:
                     self.plugin.log(f"Could not get policies for exclusion sync: {e}", level='debug')
 
-            # From legacy ignored peers (if any remain)
-            try:
-                ignored = self.database.get_ignored_peers()
-                for entry in ignored:
-                    peers_to_exclude.add(entry['peer_id'])
-            except Exception:
-                pass
-
             # Add new exclusions to sling
             for peer_id in peers_to_exclude:
                 if peer_id not in current_exclusions:
@@ -1111,13 +1103,9 @@ class EVRebalancer:
                 
                 # Check policy for this peer (v1.4: Policy-Driven Architecture)
                 peer_id = info.get("peer_id")
-                if peer_id:
-                    if self.policy_manager:
-                        # Cannot fill if rebalance_mode is DISABLED or SOURCE_ONLY
-                        if not self.policy_manager.should_rebalance(peer_id, as_destination=True):
-                            continue
-                    elif self.database.is_peer_ignored(peer_id):
-                        # Legacy fallback
+                if peer_id and self.policy_manager:
+                    # Cannot fill if rebalance_mode is DISABLED or SOURCE_ONLY
+                    if not self.policy_manager.should_rebalance(peer_id, as_destination=True):
                         continue
                 
                 outbound_ratio = spendable / capacity
@@ -1819,14 +1807,9 @@ class EVRebalancer:
 
             # Check policy for draining this source (v1.4: Policy-Driven Architecture)
             pid = info.get("peer_id", "")
-            if pid:
-                if self.policy_manager:
-                    # Cannot drain if rebalance_mode is DISABLED or SINK_ONLY
-                    if not self.policy_manager.should_rebalance(pid, as_destination=False):
-                        rejections['policy_blocked'] += 1
-                        continue
-                elif self.database.is_peer_ignored(pid):
-                    # Legacy fallback
+            if pid and self.policy_manager:
+                # Cannot drain if rebalance_mode is DISABLED or SINK_ONLY
+                if not self.policy_manager.should_rebalance(pid, as_destination=False):
                     rejections['policy_blocked'] += 1
                     continue
 

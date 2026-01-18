@@ -28,18 +28,13 @@ License: MIT
 """
 
 import os
-import sys
 import time
 import json
 import random
-import sqlite3
 import threading
 import signal
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
-from collections import defaultdict
-from pathlib import Path
-import concurrent.futures
 
 import multiprocessing
 import queue
