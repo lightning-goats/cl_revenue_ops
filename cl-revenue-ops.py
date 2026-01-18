@@ -1781,6 +1781,12 @@ def revenue_rebalance(plugin: Plugin,
 
     try:
         result = rebalancer.manual_rebalance(from_channel, to_channel, amount_sats, max_fee_sats, force=force)
+        # Check if manual_rebalance returned an error dict
+        if "error" in result:
+            return {"status": "error", **result}
+        # Check the success field from execute_rebalance
+        if result.get("success") is False:
+            return {"status": "error", **result}
         return {"status": "success", **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
