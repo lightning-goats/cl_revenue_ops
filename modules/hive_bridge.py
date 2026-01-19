@@ -1965,6 +1965,220 @@ class HiveFeeIntelligenceBridge:
         return result
 
     # =========================================================================
+    # TIME-BASED FEE QUERIES (Phase 7.4)
+    # =========================================================================
+
+    def query_time_fee_adjustment(
+        self,
+        channel_id: str,
+        base_fee: int = 250
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query time-based fee adjustment for a channel from cl-hive.
+
+        Uses temporal patterns to determine if current time is peak or low activity,
+        returning adjusted fee recommendation.
+
+        Args:
+            channel_id: Channel SCID
+            base_fee: Current/base fee in ppm (default: 250)
+
+        Returns:
+            Adjustment dict or None:
+            {
+                "channel_id": "123x1x0",
+                "base_fee_ppm": 250,
+                "adjusted_fee_ppm": 275,
+                "adjustment_pct": 10.0,
+                "adjustment_type": "peak_increase",
+                "current_hour": 14,
+                "current_day": 2,
+                "pattern_intensity": 0.85,
+                "confidence": 0.75,
+                "reason": "Peak outbound hour (85% intensity, +10%)"
+            }
+        """
+        if not self._hive_available or self._circuit.is_open:
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-time-fee-adjustment", {
+                "channel_id": channel_id,
+                "base_fee": base_fee
+            })
+
+            if result.get("error"):
+                self._log(f"Time fee query error: {result.get('error')}", level="debug")
+                return None
+
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query time fee adjustment: {e}", level="debug")
+            self._circuit.record_failure()
+            return None
+
+    def query_time_fee_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Query time-based fee system status from cl-hive.
+
+        Returns overview of active time-based adjustments and configuration.
+
+        Returns:
+            Status dict or None:
+            {
+                "enabled": True,
+                "current_hour": 14,
+                "current_day": 2,
+                "current_day_name": "Wed",
+                "active_adjustments": 5,
+                "adjustments": [...],
+                "config": {
+                    "max_increase_pct": 25,
+                    "max_decrease_pct": 15,
+                    "peak_threshold": 0.7,
+                    "low_threshold": 0.3,
+                    "min_confidence": 0.5
+                }
+            }
+        """
+        if not self._hive_available or self._circuit.is_open:
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-time-fee-status", {})
+
+            if result.get("error"):
+                self._log(f"Time fee status error: {result.get('error')}", level="debug")
+                return None
+
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query time fee status: {e}", level="debug")
+            self._circuit.record_failure()
+            return None
+
+    def query_channel_peak_hours(
+        self,
+        channel_id: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Query detected peak hours for a channel from cl-hive.
+
+        Returns hours with above-average routing volume.
+
+        Args:
+            channel_id: Channel SCID
+
+        Returns:
+            List of peak hour dicts or None:
+            [
+                {
+                    "hour": 14,
+                    "day": -1,
+                    "day_name": "Any",
+                    "intensity": 0.85,
+                    "direction": "outbound",
+                    "confidence": 0.8,
+                    "samples": 45
+                }
+            ]
+        """
+        if not self._hive_available or self._circuit.is_open:
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-time-peak-hours", {
+                "channel_id": channel_id
+            })
+
+            if result.get("error"):
+                self._log(f"Peak hours query error: {result.get('error')}", level="debug")
+                return None
+
+            return result.get("peak_hours", [])
+
+        except Exception as e:
+            self._log(f"Failed to query peak hours: {e}", level="debug")
+            self._circuit.record_failure()
+            return None
+
+    def should_use_time_adjusted_fee(
+        self,
+        channel_id: str,
+        current_fee: int
+    ) -> Dict[str, Any]:
+        """
+        Check if a time-adjusted fee should be used for a channel.
+
+        Combines current fee with time-based adjustment to recommend
+        whether to change the fee.
+
+        Args:
+            channel_id: Channel SCID
+            current_fee: Current fee in ppm
+
+        Returns:
+            Recommendation dict:
+            {
+                "should_adjust": True,
+                "recommended_fee": 275,
+                "adjustment_pct": 10.0,
+                "adjustment_type": "peak_increase",
+                "reason": "Peak hour detected - increase fee to capture premium",
+                "reverts_in_hours": 2
+            }
+        """
+        result = {
+            "should_adjust": False,
+            "recommended_fee": current_fee,
+            "adjustment_pct": 0.0,
+            "adjustment_type": "none",
+            "reason": "No time adjustment available",
+            "reverts_in_hours": None
+        }
+
+        adjustment = self.query_time_fee_adjustment(channel_id, current_fee)
+        if not adjustment:
+            return result
+
+        adj_type = adjustment.get("adjustment_type", "none")
+        if adj_type == "none":
+            result["reason"] = "Current time is normal activity period"
+            return result
+
+        adjusted_fee = adjustment.get("adjusted_fee_ppm", current_fee)
+        adj_pct = adjustment.get("adjustment_pct", 0)
+
+        # Only recommend if change is meaningful (>5%)
+        fee_diff_pct = abs(adjusted_fee - current_fee) / max(current_fee, 1) * 100
+        if fee_diff_pct < 5:
+            result["reason"] = f"Adjustment too small ({fee_diff_pct:.1f}%)"
+            return result
+
+        result["should_adjust"] = True
+        result["recommended_fee"] = adjusted_fee
+        result["adjustment_pct"] = adj_pct
+        result["adjustment_type"] = adj_type
+
+        if adj_type == "peak_increase":
+            result["reason"] = (
+                f"Peak hour detected ({adjustment.get('pattern_intensity', 0):.0%} intensity) - "
+                "increase fee to capture premium"
+            )
+        elif adj_type == "low_decrease":
+            result["reason"] = (
+                f"Low activity period ({adjustment.get('pattern_intensity', 0):.0%} intensity) - "
+                "decrease fee to attract flow"
+            )
+
+        # Estimate when adjustment reverts (rough: 1-2 hours typically)
+        result["reverts_in_hours"] = 1
+
+        return result
+
+    # =========================================================================
     # DIAGNOSTIC METHODS
     # =========================================================================
 
