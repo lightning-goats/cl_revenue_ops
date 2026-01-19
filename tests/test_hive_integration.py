@@ -317,3 +317,352 @@ class TestBidirectionalIntegration:
         assert result["count"] == 1
         assert len(result["changes"]) == 1
         assert result["changes"][0]["strategy"] == "hive"
+
+
+# =============================================================================
+# YIELD OPTIMIZATION PHASE 2: FEE COORDINATION INTEGRATION TESTS
+# =============================================================================
+
+class TestCoordinatedFeeRecommendation:
+    """Test coordinated fee recommendation integration."""
+
+    def test_query_coordinated_fee_recommendation_success(self, mock_rpc, mock_plugin):
+        """Test successful coordinated fee recommendation query."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {
+            "recommended_fee_ppm": 350,
+            "is_primary": True,
+            "corridor_role": "primary",
+            "adjustment_reason": "Corridor primary, competitive rate",
+            "pheromone_level": 0.75,
+            "defense_multiplier": 1.0,
+            "confidence": 0.85
+        }
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.query_coordinated_fee_recommendation(
+            channel_id="123x1x0",
+            current_fee=500,
+            local_balance_pct=0.5
+        )
+
+        assert result is not None
+        assert result["recommended_fee_ppm"] == 350
+        assert result["corridor_role"] == "primary"
+        assert result["confidence"] == 0.85
+
+    def test_query_coordinated_fee_recommendation_hive_unavailable(self, mock_rpc, mock_plugin):
+        """Test coordinated fee when hive unavailable returns None."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = False
+
+        result = bridge.query_coordinated_fee_recommendation(
+            channel_id="123x1x0",
+            current_fee=500,
+            local_balance_pct=0.5
+        )
+
+        assert result is None
+
+
+class TestRoutingOutcomeReporting:
+    """Test routing outcome reporting for stigmergic learning."""
+
+    def test_report_routing_outcome_success(self, mock_rpc, mock_plugin):
+        """Test successful routing outcome reporting."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {"success": True}
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.report_routing_outcome(
+            channel_id="123x1x0",
+            peer_id="02" + "a" * 64,
+            fee_ppm=500,
+            success=True,
+            amount_sats=100000,
+            source="02" + "b" * 64,
+            destination="02" + "c" * 64
+        )
+
+        assert result is True
+        mock_rpc.call.assert_called()
+
+    def test_report_routing_outcome_failure(self, mock_rpc, mock_plugin):
+        """Test routing outcome reporting for failed forward."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {"success": True}
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.report_routing_outcome(
+            channel_id="123x1x0",
+            peer_id="02" + "a" * 64,
+            fee_ppm=0,
+            success=False,
+            amount_sats=0,
+            source="02" + "b" * 64,
+            destination="02" + "c" * 64
+        )
+
+        assert result is True
+
+
+class TestDefenseStatus:
+    """Test defense status query for threat peers."""
+
+    def test_query_defense_status_with_threat(self, mock_rpc, mock_plugin):
+        """Test defense status query when peer is a threat."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {
+            "peer_threat": {
+                "is_threat": True,
+                "threat_type": "drain",
+                "severity": 0.8,
+                "defensive_multiplier": 2.6
+            },
+            "warning_count": 1
+        }
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.query_defense_status(peer_id="02" + "a" * 64)
+
+        assert result is not None
+        assert result["peer_threat"]["is_threat"] is True
+        assert result["peer_threat"]["defensive_multiplier"] == 2.6
+
+    def test_broadcast_peer_warning_success(self, mock_rpc, mock_plugin):
+        """Test broadcasting a threat warning."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {"broadcasted": True}
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.broadcast_peer_warning(
+            peer_id="02" + "a" * 64,
+            threat_type="drain",
+            severity=0.8,
+            evidence={"drain_rate": 5.5}
+        )
+
+        assert result is True
+
+
+# =============================================================================
+# YIELD OPTIMIZATION PHASE 3: COST REDUCTION TESTS
+# =============================================================================
+
+class TestVelocityPrediction:
+    """Test velocity prediction for predictive rebalancing."""
+
+    def test_query_velocity_prediction_success(self, mock_rpc, mock_plugin):
+        """Test successful velocity prediction query."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {
+            "channel_id": "123x1x0",
+            "current_local_pct": 0.35,
+            "velocity_pct_per_hour": -0.02,
+            "predicted_local_pct": 0.11,
+            "hours_to_depletion": 17.5,
+            "depletion_risk": 0.75,
+            "recommended_action": "preemptive_rebalance",
+            "urgency": "low"
+        }
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.query_velocity_prediction(
+            channel_id="123x1x0",
+            hours=24
+        )
+
+        assert result is not None
+        assert result["depletion_risk"] == 0.75
+        assert result["recommended_action"] == "preemptive_rebalance"
+
+    def test_query_critical_velocity_channels(self, mock_rpc, mock_plugin):
+        """Test query for channels with critical velocity."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {
+            "channels": [
+                {"channel_id": "123x1x0", "hours_to_depletion": 12},
+                {"channel_id": "456x2x1", "hours_to_saturation": 8}
+            ]
+        }
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.query_critical_velocity_channels(hours_threshold=24)
+
+        assert len(result) == 2
+
+
+class TestFleetRebalancePath:
+    """Test fleet rebalance path optimization."""
+
+    def test_query_fleet_rebalance_path_available(self, mock_rpc, mock_plugin):
+        """Test when fleet path is available and cheaper."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {
+            "fleet_path_available": True,
+            "fleet_path": ["node1", "node2"],
+            "estimated_fleet_cost_sats": 150,
+            "estimated_external_cost_sats": 500,
+            "savings_pct": 70,
+            "recommendation": "use_fleet_path"
+        }
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.query_fleet_rebalance_path(
+            from_channel="123x1x0",
+            to_channel="456x2x1",
+            amount_sats=100000
+        )
+
+        assert result is not None
+        assert result["fleet_path_available"] is True
+        assert result["savings_pct"] == 70
+
+
+# =============================================================================
+# YIELD OPTIMIZATION PHASE 5: POSITIONING TESTS
+# =============================================================================
+
+class TestFlowRecommendations:
+    """Test Physarum-inspired flow recommendations."""
+
+    def test_query_flow_recommendations_success(self, mock_rpc, mock_plugin):
+        """Test successful flow recommendations query."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {
+            "recommendations": [
+                {
+                    "channel_id": "123x1x0",
+                    "flow_intensity": 0.035,
+                    "action": "strengthen",
+                    "method": "splice_in",
+                    "recommended_amount_sats": 2000000
+                }
+            ],
+            "summary": {
+                "strengthen_count": 1,
+                "maintain_count": 5,
+                "atrophy_count": 1
+            }
+        }
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.query_flow_recommendations()
+
+        assert result is not None
+        assert len(result["recommendations"]) == 1
+        assert result["recommendations"][0]["action"] == "strengthen"
+
+
+class TestInternalCompetition:
+    """Test internal competition detection."""
+
+    def test_query_internal_competition(self, mock_rpc, mock_plugin):
+        """Test internal competition detection query."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {
+            "competing_routes": [
+                {
+                    "source": "02" + "a" * 64,
+                    "destination": "02" + "b" * 64,
+                    "competing_members": ["node1", "node2"],
+                    "member_count": 2,
+                    "recommendation": "coordinate_fees"
+                }
+            ],
+            "competition_index": 0.25
+        }
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.query_internal_competition()
+
+        assert result is not None
+        assert result["competition_index"] == 0.25
+        assert len(result["competing_routes"]) == 1
+
+
+class TestYieldMetrics:
+    """Test yield metrics reporting."""
+
+    def test_report_yield_metrics_success(self, mock_rpc, mock_plugin):
+        """Test successful yield metrics reporting."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {"success": True}
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.report_yield_metrics(
+            tlv_sats=165000000,
+            operating_costs_sats=50000,
+            routing_revenue_sats=150000,
+            period_days=30
+        )
+
+        assert result is True
+
+    def test_query_yield_summary_success(self, mock_rpc, mock_plugin):
+        """Test successful yield summary query."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+        mock_plugin.rpc = mock_rpc
+        mock_rpc.call.return_value = {
+            "fleet_tlv_sats": 1650000000,
+            "fleet_revenue_30d_sats": 150000,
+            "fleet_costs_30d_sats": 50000,
+            "fleet_net_yield_30d_sats": 100000,
+            "annualized_roc_pct": 7.3
+        }
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+
+        result = bridge.query_yield_summary()
+
+        assert result is not None
+        assert result["annualized_roc_pct"] == 7.3

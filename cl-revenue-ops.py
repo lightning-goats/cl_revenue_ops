@@ -2933,7 +2933,29 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
             elif status in ("failed", "local_failed"):
                 # Failure - increment failure count
                 database.update_peer_reputation(peer_id, is_success=False)
-            
+
+                # Report failure to cl-hive for pheromone evaporation (Yield Optimization Phase 2)
+                # Failed forwards cause pheromone to evaporate, triggering fee exploration
+                if hive_bridge:
+                    try:
+                        out_channel = forward_event.get("out_channel")
+                        if out_channel:
+                            out_channel = out_channel.replace(':', 'x')
+                            out_peer_id = _resolve_scid_to_peer(out_channel)
+                            if out_peer_id:
+                                # Report failure with 0 amount to trigger evaporation
+                                hive_bridge.report_routing_outcome(
+                                    channel_id=out_channel,
+                                    peer_id=out_peer_id,
+                                    fee_ppm=0,  # Unknown for failures
+                                    success=False,
+                                    amount_sats=0,
+                                    source=peer_id,
+                                    destination=out_peer_id
+                                )
+                    except Exception as e:
+                        plugin.log(f"FORWARD_EVENT: Hive failure report failed: {e}", level="debug")
+
     # Record successful forwards for flow metrics
     if status == "settled":
         out_channel = forward_event.get("out_channel")
@@ -2952,6 +2974,29 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
         resolution_duration = resolved_time - received_time if resolved_time > 0 else 0
         
         database.record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat, int(received_time or 0), int(resolved_time or 0), resolution_duration)
+
+        # Report routing outcome to cl-hive for stigmergic learning (Yield Optimization Phase 2)
+        # This enables pheromone-based fee learning and fleet coordination
+        if hive_bridge and out_channel:
+            try:
+                out_peer_id = _resolve_scid_to_peer(out_channel)
+                in_peer_id = _resolve_scid_to_peer(in_channel) if in_channel else None
+                amount_sats = out_msat // 1000 if out_msat else 0
+                fee_ppm = (fee_msat * 1_000_000 // out_msat) if out_msat > 0 else 0
+
+                if out_peer_id:
+                    hive_bridge.report_routing_outcome(
+                        channel_id=out_channel,
+                        peer_id=out_peer_id,
+                        fee_ppm=fee_ppm,
+                        success=True,
+                        amount_sats=amount_sats,
+                        source=in_peer_id,  # Where payment came from
+                        destination=out_peer_id  # Where it went
+                    )
+            except Exception as e:
+                # Don't let hive reporting failures affect core functionality
+                plugin.log(f"FORWARD_EVENT: Hive routing outcome report failed: {e}", level="debug")
 
 
 @plugin.subscribe("connect")

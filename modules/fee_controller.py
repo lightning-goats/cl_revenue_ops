@@ -888,6 +888,18 @@ class HillClimbingFeeController:
     HIVE_INTELLIGENCE_WEIGHT = 0.25   # How much to weight hive data (0-1)
     HIVE_MIN_CONFIDENCE = 0.3         # Ignore data below this confidence
 
+    # ==========================================================================
+    # Hive Fee Coordination Integration (Yield Optimization Phase 2)
+    # ==========================================================================
+    # Query cl-hive for coordinated fee recommendations that consider:
+    # - Corridor ownership (primary vs secondary member)
+    # - Pheromone signals (historical success)
+    # - Stigmergic markers (fleet observations)
+    # - Defense status (threat peer multipliers)
+    ENABLE_HIVE_COORDINATION = True   # Feature flag for coordinated fees
+    HIVE_COORDINATION_WEIGHT = 0.5    # Weight for coordinated recommendations (0-1)
+    HIVE_COORDINATION_MIN_CONFIDENCE = 0.5  # Minimum confidence to use recommendation
+
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
                  policy_manager: Optional[PolicyManager] = None,
@@ -1184,6 +1196,144 @@ class HillClimbingFeeController:
                 return min(adjusted, self.config.max_fee_ppm)
 
         return base_fee
+
+    # =========================================================================
+    # Yield Optimization Phase 2: Coordinated Fee Recommendations
+    # =========================================================================
+
+    def _get_coordinated_fee_recommendation(
+        self,
+        channel_id: str,
+        peer_id: str,
+        current_fee: int,
+        local_balance_pct: float
+    ) -> Optional[int]:
+        """
+        Query cl-hive for coordinated fee recommendation.
+
+        The coordinated fee considers:
+        - Corridor ownership (primary vs secondary role)
+        - Pheromone signals (historical success at this fee)
+        - Stigmergic markers (fleet routing observations)
+        - Defense status (threat peer multipliers)
+        - Fleet fee floor/ceiling
+
+        This enables fleet-wide fee coordination without direct messaging,
+        using swarm intelligence principles.
+
+        Args:
+            channel_id: Channel SCID
+            peer_id: Peer pubkey
+            current_fee: Current fee in ppm
+            local_balance_pct: Current local balance percentage (0.0-1.0)
+
+        Returns:
+            Recommended fee in ppm, or None if no recommendation available
+        """
+        if not self.ENABLE_HIVE_COORDINATION or not self.hive_bridge:
+            return None
+
+        try:
+            rec = self.hive_bridge.query_coordinated_fee_recommendation(
+                channel_id=channel_id,
+                current_fee=current_fee,
+                local_balance_pct=local_balance_pct
+            )
+
+            if not rec:
+                return None
+
+            # Check confidence threshold
+            confidence = rec.get("confidence", 0)
+            if confidence < self.HIVE_COORDINATION_MIN_CONFIDENCE:
+                self.plugin.log(
+                    f"HIVE_COORD: Skipping low-confidence ({confidence:.2f}) "
+                    f"recommendation for {channel_id}",
+                    level="debug"
+                )
+                return None
+
+            recommended_fee = rec.get("recommended_fee_ppm")
+            if not recommended_fee:
+                return None
+
+            # Log the recommendation details
+            corridor_role = rec.get("corridor_role", "unknown")
+            defense_mult = rec.get("defense_multiplier", 1.0)
+            pheromone = rec.get("pheromone_level", 0)
+            reason = rec.get("adjustment_reason", "")
+
+            self.plugin.log(
+                f"HIVE_COORD: {channel_id} -> {peer_id[:12]}... "
+                f"recommended={recommended_fee} ppm (current={current_fee}) "
+                f"role={corridor_role} defense={defense_mult:.2f} "
+                f"pheromone={pheromone:.2f} reason='{reason}'",
+                level="debug"
+            )
+
+            return recommended_fee
+
+        except Exception as e:
+            self.plugin.log(
+                f"HIVE_COORD: Failed to get recommendation for {channel_id}: {e}",
+                level="debug"
+            )
+            return None
+
+    def _apply_defense_multiplier(
+        self,
+        peer_id: str,
+        base_fee: int
+    ) -> int:
+        """
+        Apply defensive fee multiplier if peer is flagged as a threat.
+
+        Part of the Mycelium Defense System - when one fleet member
+        detects a drain or unreliable peer, all members raise fees.
+
+        Args:
+            peer_id: Peer pubkey
+            base_fee: Base fee before defense adjustment
+
+        Returns:
+            Fee with defense multiplier applied (or original if no threat)
+        """
+        if not self.ENABLE_HIVE_COORDINATION or not self.hive_bridge:
+            return base_fee
+
+        try:
+            defense_status = self.hive_bridge.query_defense_status(peer_id=peer_id)
+            if not defense_status:
+                return base_fee
+
+            peer_threat = defense_status.get("peer_threat")
+            if not peer_threat or not peer_threat.get("is_threat"):
+                return base_fee
+
+            multiplier = peer_threat.get("defensive_multiplier", 1.0)
+            threat_type = peer_threat.get("threat_type", "unknown")
+            severity = peer_threat.get("severity", 0)
+
+            if multiplier <= 1.0:
+                return base_fee
+
+            adjusted_fee = int(base_fee * multiplier)
+
+            self.plugin.log(
+                f"HIVE_DEFENSE: Applying {multiplier:.2f}x multiplier to {peer_id[:12]}... "
+                f"({threat_type} threat, severity={severity:.2f}): "
+                f"{base_fee} -> {adjusted_fee} ppm",
+                level="info"
+            )
+
+            return adjusted_fee
+
+        except Exception as e:
+            self.plugin.log(
+                f"HIVE_DEFENSE: Failed to check defense status for {peer_id[:12]}...: {e}",
+                level="debug"
+            )
+            return base_fee
 
     def _prune_stale_states(self, active_channel_ids: set) -> int:
         """
@@ -2184,6 +2334,46 @@ class HillClimbingFeeController:
                     )
 
             new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
+
+            # =================================================================
+            # YIELD OPTIMIZATION PHASE 2: Coordinated Fee Recommendation
+            # Query cl-hive for coordinated fee that considers corridors,
+            # pheromones, stigmergic markers, and defense status.
+            # =================================================================
+            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not is_congested and not is_fire_sale:
+                coord_rec = self._get_coordinated_fee_recommendation(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    current_fee=new_fee_ppm,
+                    local_balance_pct=outbound_ratio  # 0.0-1.0
+                )
+                if coord_rec is not None:
+                    # Blend coordinated recommendation with local decision
+                    weight = self.HIVE_COORDINATION_WEIGHT
+                    blended_fee = int(new_fee_ppm * (1 - weight) + coord_rec * weight)
+
+                    # Clamp to bounds
+                    blended_fee = max(floor_ppm, min(effective_ceiling, blended_fee))
+
+                    if blended_fee != new_fee_ppm:
+                        self.plugin.log(
+                            f"HIVE_COORD: Blending recommendation for {channel_id[:12]}... "
+                            f"local={new_fee_ppm} coord={coord_rec} -> blended={blended_fee} "
+                            f"(weight={weight})",
+                            level='debug'
+                        )
+                        new_fee_ppm = blended_fee
+
+            # =================================================================
+            # YIELD OPTIMIZATION PHASE 2: Defense Multiplier
+            # Apply defensive fee multiplier if peer is flagged as a threat.
+            # Part of the Mycelium Defense System.
+            # =================================================================
+            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION:
+                defense_fee = self._apply_defense_multiplier(peer_id, new_fee_ppm)
+                if defense_fee != new_fee_ppm:
+                    # Defense multiplier can exceed normal ceiling for threats
+                    new_fee_ppm = max(floor_ppm, defense_fee)
 
             # =================================================================
             # PHASE 2: Fleet-Aware Fee Adjustment

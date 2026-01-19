@@ -13,8 +13,39 @@ Phase 1: Query Integration
 - query_fee_intelligence(): Get competitor fee data for a peer
 - is_available(): Check if cl-hive plugin is active
 
-Phase 2: Bidirectional Sharing (added later)
+Phase 2: Bidirectional Sharing
 - report_observation(): Report fee observations back to cl-hive
+- report_health_update(): Report health status to fleet
+- query_member_health(): Query member NNLB health
+- query_fleet_liquidity_state(): Query fleet liquidity for coordination
+- report_liquidity_state(): Report our liquidity state
+- check_rebalance_conflict(): Check for rebalancing conflicts
+
+Phase 3: Splice Coordination
+- check_splice_safety(): Advisory check for splice operations
+- get_splice_recommendations(): Get splice recommendations
+
+Yield Optimization Phase 2 - Fee Coordination:
+- query_coordinated_fee_recommendation(): Get coordinated fee (corridors, pheromones, defense)
+- report_routing_outcome(): Report routing for stigmergic learning
+- query_defense_status(): Query threat peer defense status
+- broadcast_peer_warning(): Broadcast threat warning to fleet
+- query_fee_coordination_status(): Get overall coordination status
+
+Yield Optimization Phase 3 - Cost Reduction:
+- query_velocity_prediction(): Get channel velocity prediction
+- query_critical_velocity_channels(): Get channels needing attention
+- query_fleet_rebalance_path(): Check if fleet path is cheaper
+- report_rebalance_outcome(): Report rebalance for coordination
+
+Yield Optimization Phase 5 - Strategic Positioning:
+- query_flow_recommendations(): Get Physarum-inspired channel recommendations
+- report_flow_intensity(): Report flow metrics for optimization
+- query_internal_competition(): Detect internal competition
+
+Yield Metrics:
+- report_yield_metrics(): Report TLV, costs, revenue to fleet
+- query_yield_summary(): Get fleet yield summary
 
 Author: Lightning Goats Team
 """
@@ -906,6 +937,758 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to get splice recommendations: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    # =========================================================================
+    # YIELD OPTIMIZATION PHASE 2: FEE COORDINATION
+    # =========================================================================
+    # These methods integrate with cl-hive's Phase 2 fee coordination features:
+    # - Coordinated fee recommendations (corridor ownership, pheromones, defense)
+    # - Stigmergic learning via routing outcome reporting
+    # - Collective defense against drain attacks
+
+    def query_coordinated_fee_recommendation(
+        self,
+        channel_id: str,
+        current_fee: int = 500,
+        local_balance_pct: float = 0.5,
+        source: str = None,
+        destination: str = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query cl-hive for coordinated fee recommendation.
+
+        Uses corridor ownership, pheromone signals, stigmergic markers,
+        and defense status to recommend optimal fee that avoids internal
+        competition while maximizing fleet-wide yield.
+
+        Args:
+            channel_id: Channel to get recommendation for
+            current_fee: Current fee in ppm
+            local_balance_pct: Current local balance percentage (0.0-1.0)
+            source: Source peer hint for corridor lookup (optional)
+            destination: Destination peer hint for corridor lookup (optional)
+
+        Returns:
+            Fee recommendation dict or None if unavailable:
+            {
+                "recommended_fee_ppm": 350,
+                "is_primary": True,
+                "corridor_role": "primary",
+                "adjustment_reason": "Corridor primary, competitive rate",
+                "pheromone_level": 0.75,
+                "defense_multiplier": 1.0,
+                "confidence": 0.85,
+                "floor_applied": False,
+                "ceiling_applied": False
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {
+                "channel_id": channel_id,
+                "current_fee": current_fee,
+                "local_balance_pct": local_balance_pct
+            }
+            if source:
+                params["source"] = source
+            if destination:
+                params["destination"] = destination
+
+            result = self.plugin.rpc.call("hive-coord-fee-recommendation", params)
+
+            if result.get("error"):
+                self._log(
+                    f"Coordinated fee recommendation error: {result.get('error')}",
+                    level="debug"
+                )
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query coordinated fee recommendation: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def report_routing_outcome(
+        self,
+        channel_id: str,
+        peer_id: str,
+        fee_ppm: int,
+        success: bool,
+        amount_sats: int,
+        source: str = None,
+        destination: str = None
+    ) -> bool:
+        """
+        Report routing outcome to cl-hive for stigmergic learning.
+
+        This enables pheromone-based fee learning and stigmergic coordination:
+        - Success deposits pheromone (reinforces the fee)
+        - Failure lets pheromone evaporate (explores new fees)
+        - Route markers help fleet coordinate without direct messaging
+
+        Args:
+            channel_id: Channel that routed the payment
+            peer_id: Peer on this channel
+            fee_ppm: Fee charged for this routing
+            success: Whether routing succeeded
+            amount_sats: Amount routed in satoshis
+            source: Source peer (where payment came from)
+            destination: Destination peer (where payment went)
+
+        Returns:
+            True if reported successfully
+        """
+        if not self.is_available():
+            return False
+
+        if self._is_circuit_open():
+            return False
+
+        try:
+            params = {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "fee_ppm": fee_ppm,
+                "success": success,
+                "amount_sats": amount_sats
+            }
+            if source:
+                params["source"] = source
+            if destination:
+                params["destination"] = destination
+
+            # Use deposit-marker RPC if source/destination provided
+            if source and destination:
+                result = self.plugin.rpc.call("hive-deposit-marker", params)
+            else:
+                # Fall back to generic pheromone update
+                result = self.plugin.rpc.call("hive-pheromone-levels", {
+                    "channel_id": channel_id,
+                    "action": "update",
+                    "fee_ppm": fee_ppm,
+                    "success": success,
+                    "amount_sats": amount_sats
+                })
+
+            if result.get("error"):
+                self._log(f"Routing outcome report error: {result.get('error')}", level="debug")
+                return False
+
+            return True
+
+        except Exception as e:
+            self._log(f"Failed to report routing outcome: {e}", level="debug")
+            return False
+
+    def query_defense_status(self, peer_id: str = None) -> Optional[Dict[str, Any]]:
+        """
+        Query defense status for potential threat peers.
+
+        The mycelium defense system detects drain attacks and unreliable
+        peers across the fleet. Use this to apply defensive fee multipliers.
+
+        Args:
+            peer_id: Specific peer to check (optional, None for all threats)
+
+        Returns:
+            Defense status dict or None:
+            {
+                "active_warnings": [
+                    {
+                        "peer_id": "02abc...",
+                        "threat_type": "drain",
+                        "severity": 0.8,
+                        "expires_at": 1705100000,
+                        "defensive_multiplier": 2.6
+                    }
+                ],
+                "warning_count": 1,
+                "peer_threat": {  # Only if peer_id specified
+                    "is_threat": True,
+                    "threat_type": "drain",
+                    "severity": 0.8,
+                    "defensive_multiplier": 2.6
+                }
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {}
+            if peer_id:
+                params["peer_id"] = peer_id
+
+            result = self.plugin.rpc.call("hive-defense-status", params)
+
+            if result.get("error"):
+                self._log(f"Defense status query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query defense status: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def broadcast_peer_warning(
+        self,
+        peer_id: str,
+        threat_type: str,
+        severity: float,
+        evidence: Dict[str, Any] = None
+    ) -> bool:
+        """
+        Broadcast a threat warning about a peer to the fleet.
+
+        Like mycelium warning signals - when one tree is attacked,
+        neighbors activate defenses. The fleet collectively raises
+        fees to threatening peers.
+
+        Args:
+            peer_id: Peer to warn about
+            threat_type: "drain" (outflow imbalance) or "unreliable" (high failures)
+            severity: Severity score 0.0-1.0 (higher = more severe)
+            evidence: Optional evidence dict (drain_rate, failure_rate, etc.)
+
+        Returns:
+            True if warning broadcasted successfully
+        """
+        if not self.is_available():
+            return False
+
+        if self._is_circuit_open():
+            return False
+
+        try:
+            params = {
+                "peer_id": peer_id,
+                "threat_type": threat_type,
+                "severity": severity
+            }
+            if evidence:
+                params["evidence"] = evidence
+
+            result = self.plugin.rpc.call("hive-broadcast-warning", params)
+
+            if result.get("error"):
+                self._log(f"Warning broadcast error: {result.get('error')}", level="debug")
+                return False
+
+            self._log(
+                f"Warning broadcasted: peer={peer_id[:12]}... type={threat_type} "
+                f"severity={severity:.2f}",
+                level="info"
+            )
+            return True
+
+        except Exception as e:
+            self._log(f"Failed to broadcast warning: {e}", level="debug")
+            return False
+
+    def query_fee_coordination_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Query overall fee coordination status from cl-hive.
+
+        Provides visibility into corridor assignments, active markers,
+        pheromone levels, and defense state.
+
+        Returns:
+            Coordination status dict or None:
+            {
+                "corridor_assignments": [...],
+                "active_markers": 15,
+                "defense_status": {...},
+                "fleet_fee_floor": 50,
+                "fleet_fee_ceiling": 2500,
+                "our_corridors": {
+                    "primary": 5,
+                    "secondary": 3
+                }
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-fee-coordination-status", {})
+
+            if result.get("error"):
+                self._log(f"Fee coordination status error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query fee coordination status: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    # =========================================================================
+    # YIELD OPTIMIZATION PHASE 3: COST REDUCTION (PREDICTIVE REBALANCING)
+    # =========================================================================
+    # These methods support predictive rebalancing and fleet path optimization
+    # to reduce rebalancing costs by up to 50%.
+
+    def query_velocity_prediction(
+        self,
+        channel_id: str,
+        hours: int = 24
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query velocity prediction for a channel.
+
+        Used for predictive rebalancing - rebalance BEFORE depletion
+        when urgency is low and fees are cheaper.
+
+        Args:
+            channel_id: Channel to predict
+            hours: Prediction window in hours (default: 24)
+
+        Returns:
+            Velocity prediction dict or None:
+            {
+                "channel_id": "123x1x0",
+                "current_local_pct": 0.35,
+                "velocity_pct_per_hour": -0.02,
+                "predicted_local_pct": 0.11,
+                "hours_to_depletion": 17.5,
+                "hours_to_saturation": null,
+                "depletion_risk": 0.75,
+                "saturation_risk": 0.0,
+                "recommended_action": "preemptive_rebalance",
+                "urgency": "low"
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-velocity-prediction", {
+                "channel_id": channel_id,
+                "hours": hours
+            })
+
+            if result.get("error"):
+                self._log(f"Velocity prediction error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query velocity prediction: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def query_critical_velocity_channels(
+        self,
+        hours_threshold: int = 24
+    ) -> List[Dict[str, Any]]:
+        """
+        Get channels with critical velocity (depleting/filling rapidly).
+
+        These channels need urgent attention - either rebalancing or
+        fee changes to prevent depletion/saturation.
+
+        Args:
+            hours_threshold: Alert threshold in hours
+
+        Returns:
+            List of channels with critical velocity
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return []
+
+        try:
+            result = self.plugin.rpc.call("hive-critical-velocity", {
+                "hours_threshold": hours_threshold
+            })
+
+            if result.get("error"):
+                self._log(f"Critical velocity query error: {result.get('error')}", level="debug")
+                return []
+
+            self._record_success()
+            return result.get("channels", [])
+
+        except Exception as e:
+            self._log(f"Failed to query critical velocity: {e}", level="debug")
+            self._record_failure()
+            return []
+
+    def query_fleet_rebalance_path(
+        self,
+        from_channel: str,
+        to_channel: str,
+        amount_sats: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check if rebalancing through fleet members is cheaper.
+
+        Fleet members have coordinated fees, so internal routes
+        may be cheaper than external paths.
+
+        Args:
+            from_channel: Source channel SCID
+            to_channel: Destination channel SCID
+            amount_sats: Amount to rebalance
+
+        Returns:
+            Fleet path recommendation or None:
+            {
+                "fleet_path_available": True,
+                "fleet_path": ["node1", "node2"],
+                "estimated_fleet_cost_sats": 150,
+                "estimated_external_cost_sats": 500,
+                "savings_pct": 70,
+                "recommendation": "use_fleet_path"
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-fleet-rebalance-path", {
+                "from_channel": from_channel,
+                "to_channel": to_channel,
+                "amount_sats": amount_sats
+            })
+
+            if result.get("error"):
+                # This might not be implemented yet - that's OK
+                if "unknown" in str(result.get("error")).lower():
+                    return None
+                self._log(f"Fleet path query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            # Method might not exist yet - fail gracefully
+            self._log(f"Failed to query fleet rebalance path: {e}", level="debug")
+            return None
+
+    def report_rebalance_outcome(
+        self,
+        from_channel: str,
+        to_channel: str,
+        amount_sats: int,
+        cost_sats: int,
+        success: bool,
+        via_fleet: bool = False
+    ) -> bool:
+        """
+        Report rebalance outcome for fleet coordination.
+
+        Helps detect circular flows (A→B→C→A) that waste fees
+        and enables better rebalance coordination across fleet.
+
+        Args:
+            from_channel: Source channel SCID
+            to_channel: Destination channel SCID
+            amount_sats: Amount rebalanced
+            cost_sats: Cost of rebalancing
+            success: Whether rebalance succeeded
+            via_fleet: Whether routed through fleet members
+
+        Returns:
+            True if reported successfully
+        """
+        if not self.is_available():
+            return False
+
+        if self._is_circuit_open():
+            return False
+
+        try:
+            result = self.plugin.rpc.call("hive-report-rebalance-outcome", {
+                "from_channel": from_channel,
+                "to_channel": to_channel,
+                "amount_sats": amount_sats,
+                "cost_sats": cost_sats,
+                "success": success,
+                "via_fleet": via_fleet
+            })
+
+            if result.get("error"):
+                # This might not be implemented yet - that's OK
+                if "unknown" in str(result.get("error")).lower():
+                    return True  # Silently succeed if not implemented
+                self._log(f"Rebalance outcome report error: {result.get('error')}", level="debug")
+                return False
+
+            return True
+
+        except Exception as e:
+            # Method might not exist yet - fail gracefully
+            self._log(f"Failed to report rebalance outcome: {e}", level="debug")
+            return True  # Don't block on this
+
+    # =========================================================================
+    # YIELD OPTIMIZATION PHASE 5: STRATEGIC POSITIONING (PHYSARUM)
+    # =========================================================================
+    # These methods support Physarum-inspired channel lifecycle management:
+    # - High flow channels → strengthen (splice in)
+    # - Low flow channels → atrophy (close)
+
+    def query_flow_recommendations(
+        self,
+        channel_id: str = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get Physarum-inspired flow recommendations for channels.
+
+        Like slime mold tubes that strengthen with flow and atrophy without,
+        channels should grow or shrink based on their flow intensity.
+
+        Args:
+            channel_id: Specific channel (optional, None for all)
+
+        Returns:
+            Flow recommendations dict or None:
+            {
+                "recommendations": [
+                    {
+                        "channel_id": "123x1x0",
+                        "peer_id": "02abc...",
+                        "flow_intensity": 0.035,
+                        "action": "strengthen",
+                        "method": "splice_in",
+                        "recommended_amount_sats": 2000000,
+                        "reason": "Flow intensity 3.5% exceeds 2% threshold",
+                        "expected_yield_improvement": 0.015
+                    },
+                    {
+                        "channel_id": "456x2x1",
+                        "peer_id": "03xyz...",
+                        "flow_intensity": 0.0005,
+                        "action": "atrophy",
+                        "method": "cooperative_close",
+                        "reason": "Mature channel with flow 0.05% below 0.1% threshold",
+                        "capital_to_redeploy": 5000000
+                    }
+                ],
+                "summary": {
+                    "strengthen_count": 3,
+                    "maintain_count": 18,
+                    "stimulate_count": 2,
+                    "atrophy_count": 2
+                }
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {}
+            if channel_id:
+                params["channel_id"] = channel_id
+
+            result = self.plugin.rpc.call("hive-flow-recommendations", params)
+
+            if result.get("error"):
+                # This might not be implemented yet
+                if "unknown" in str(result.get("error")).lower():
+                    return None
+                self._log(f"Flow recommendations error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query flow recommendations: {e}", level="debug")
+            return None
+
+    def report_flow_intensity(
+        self,
+        channel_id: str,
+        peer_id: str,
+        capacity_sats: int,
+        volume_7d_sats: int,
+        revenue_7d_sats: int,
+        forward_count_7d: int
+    ) -> bool:
+        """
+        Report flow intensity metrics for a channel.
+
+        Contributes to fleet-wide flow analysis for Physarum optimization.
+
+        Args:
+            channel_id: Channel SCID
+            peer_id: Peer pubkey
+            capacity_sats: Channel capacity
+            volume_7d_sats: 7-day volume
+            revenue_7d_sats: 7-day revenue
+            forward_count_7d: 7-day forward count
+
+        Returns:
+            True if reported successfully
+        """
+        if not self.is_available():
+            return False
+
+        if self._is_circuit_open():
+            return False
+
+        try:
+            result = self.plugin.rpc.call("hive-report-flow-intensity", {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "capacity_sats": capacity_sats,
+                "volume_7d_sats": volume_7d_sats,
+                "revenue_7d_sats": revenue_7d_sats,
+                "forward_count_7d": forward_count_7d
+            })
+
+            if result.get("error"):
+                # This might not be implemented yet
+                if "unknown" in str(result.get("error")).lower():
+                    return True  # Silently succeed
+                self._log(f"Flow intensity report error: {result.get('error')}", level="debug")
+                return False
+
+            return True
+
+        except Exception as e:
+            self._log(f"Failed to report flow intensity: {e}", level="debug")
+            return True  # Don't block on this
+
+    def query_internal_competition(self) -> Optional[Dict[str, Any]]:
+        """
+        Query internal competition detection from cl-hive.
+
+        Identifies routes where multiple fleet members compete,
+        enabling coordination to avoid undercutting.
+
+        Returns:
+            Internal competition analysis or None:
+            {
+                "competing_routes": [
+                    {
+                        "source": "02abc...",
+                        "destination": "03xyz...",
+                        "competing_members": ["node1", "node2", "node3"],
+                        "member_count": 3,
+                        "recommendation": "coordinate_fees",
+                        "estimated_revenue_loss_pct": 15
+                    }
+                ],
+                "competition_index": 0.25,
+                "recommendation": "High internal competition - enable fee coordination"
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-internal-competition", {})
+
+            if result.get("error"):
+                self._log(f"Internal competition query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query internal competition: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    # =========================================================================
+    # YIELD OPTIMIZATION: YIELD METRICS REPORTING
+    # =========================================================================
+    # Report yield metrics to cl-hive for fleet-wide tracking
+
+    def report_yield_metrics(
+        self,
+        tlv_sats: int,
+        operating_costs_sats: int,
+        routing_revenue_sats: int,
+        period_days: int = 30
+    ) -> bool:
+        """
+        Report yield metrics to cl-hive for fleet aggregation.
+
+        Args:
+            tlv_sats: Total Lightning Value (capacity under management)
+            operating_costs_sats: Operating costs in period (rebalancing, opens, etc.)
+            routing_revenue_sats: Routing revenue in period
+            period_days: Period length in days
+
+        Returns:
+            True if reported successfully
+        """
+        if not self.is_available():
+            return False
+
+        if self._is_circuit_open():
+            return False
+
+        try:
+            result = self.plugin.rpc.call("hive-report-yield-metrics", {
+                "tlv_sats": tlv_sats,
+                "operating_costs_sats": operating_costs_sats,
+                "routing_revenue_sats": routing_revenue_sats,
+                "period_days": period_days
+            })
+
+            if result.get("error"):
+                # This might not be implemented yet
+                if "unknown" in str(result.get("error")).lower():
+                    return True
+                self._log(f"Yield metrics report error: {result.get('error')}", level="debug")
+                return False
+
+            return True
+
+        except Exception as e:
+            self._log(f"Failed to report yield metrics: {e}", level="debug")
+            return True  # Don't block
+
+    def query_yield_summary(self) -> Optional[Dict[str, Any]]:
+        """
+        Query yield summary from cl-hive.
+
+        Returns:
+            Yield summary or None:
+            {
+                "fleet_tlv_sats": 1650000000,
+                "fleet_revenue_30d_sats": 150000,
+                "fleet_costs_30d_sats": 50000,
+                "fleet_net_yield_30d_sats": 100000,
+                "annualized_roc_pct": 7.3,
+                "our_contribution_pct": 18.5
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-yield-summary", {})
+
+            if result.get("error"):
+                self._log(f"Yield summary query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query yield summary: {e}", level="debug")
             self._record_failure()
             return None
 
