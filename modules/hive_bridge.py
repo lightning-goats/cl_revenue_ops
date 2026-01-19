@@ -1693,6 +1693,278 @@ class HiveFeeIntelligenceBridge:
             return None
 
     # =========================================================================
+    # ANTICIPATORY LIQUIDITY (Phase 7.1)
+    # =========================================================================
+    # These methods enable predictive rebalancing by leveraging temporal
+    # patterns detected by cl-hive. Rebalance BEFORE depletion when
+    # urgency is low and fees are cheaper.
+
+    def query_anticipatory_prediction(
+        self,
+        channel_id: str,
+        hours_ahead: int = 12
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query liquidity prediction for a channel from cl-hive.
+
+        Uses temporal patterns to predict future balance state,
+        enabling preemptive rebalancing before depletion/saturation.
+
+        Args:
+            channel_id: Channel SCID to predict
+            hours_ahead: Prediction horizon in hours (default: 12)
+
+        Returns:
+            Prediction dict or None:
+            {
+                "channel_id": "123x1x0",
+                "current_local_pct": 0.35,
+                "predicted_local_pct": 0.11,
+                "velocity_pct_per_hour": -0.02,
+                "depletion_risk": 0.75,
+                "saturation_risk": 0.0,
+                "hours_to_critical": 17.5,
+                "recommended_action": "preemptive_rebalance",
+                "urgency": "preemptive",
+                "confidence": 0.8,
+                "pattern_match": "weekday_afternoon_drain"
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-predict-liquidity", {
+                "channel_id": channel_id,
+                "hours_ahead": hours_ahead
+            })
+
+            if result.get("error"):
+                # No data is not a failure
+                if result.get("error") == "no_data":
+                    return None
+                self._log(f"Prediction query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query anticipatory prediction: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def query_all_anticipatory_predictions(
+        self,
+        hours_ahead: int = 12,
+        min_risk: float = 0.3
+    ) -> List[Dict[str, Any]]:
+        """
+        Query predictions for all at-risk channels from cl-hive.
+
+        Returns channels with significant depletion or saturation risk,
+        enabling proactive rebalancing prioritization.
+
+        Args:
+            hours_ahead: Prediction horizon in hours (default: 12)
+            min_risk: Minimum risk threshold to include (default: 0.3)
+
+        Returns:
+            List of prediction dicts for at-risk channels
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return []
+
+        try:
+            result = self.plugin.rpc.call("hive-anticipatory-predictions", {
+                "hours_ahead": hours_ahead,
+                "min_risk": min_risk
+            })
+
+            if result.get("error"):
+                self._log(f"All predictions query error: {result.get('error')}", level="debug")
+                return []
+
+            self._record_success()
+            return result.get("predictions", [])
+
+        except Exception as e:
+            self._log(f"Failed to query all predictions: {e}", level="debug")
+            self._record_failure()
+            return []
+
+    def query_temporal_patterns(
+        self,
+        channel_id: str = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query detected temporal patterns from cl-hive.
+
+        Patterns indicate when channels typically experience high flow
+        in either direction, enabling time-based fee and rebalancing optimization.
+
+        Args:
+            channel_id: Specific channel (None for summary of all)
+
+        Returns:
+            Pattern data dict or None:
+            {
+                "channel_id": "123x1x0",
+                "pattern_count": 3,
+                "patterns": [
+                    {
+                        "hour_of_day": 14,
+                        "day_of_week": null,
+                        "direction": "outbound",
+                        "intensity": 1.8,
+                        "confidence": 0.75,
+                        "avg_flow_sats": 500000
+                    }
+                ]
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params = {}
+            if channel_id:
+                params["channel_id"] = channel_id
+
+            result = self.plugin.rpc.call("hive-detect-patterns", params)
+
+            if result.get("error"):
+                self._log(f"Patterns query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query temporal patterns: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def report_flow_observation(
+        self,
+        channel_id: str,
+        inbound_sats: int,
+        outbound_sats: int,
+        timestamp: int = None
+    ) -> bool:
+        """
+        Report a flow observation to cl-hive for pattern building.
+
+        Should be called periodically (e.g., hourly) to build the historical
+        data needed for temporal pattern detection.
+
+        Args:
+            channel_id: Channel SCID
+            inbound_sats: Satoshis received in this period
+            outbound_sats: Satoshis sent in this period
+            timestamp: Observation timestamp (defaults to now)
+
+        Returns:
+            True if reported successfully
+        """
+        if not self.is_available():
+            return False
+
+        if self._is_circuit_open():
+            return False
+
+        try:
+            params = {
+                "channel_id": channel_id,
+                "inbound_sats": inbound_sats,
+                "outbound_sats": outbound_sats
+            }
+            if timestamp:
+                params["timestamp"] = timestamp
+
+            result = self.plugin.rpc.call("hive-record-flow", params)
+
+            if result.get("error"):
+                self._log(f"Flow report error: {result.get('error')}", level="debug")
+                return False
+
+            return True
+
+        except Exception as e:
+            self._log(f"Failed to report flow observation: {e}", level="debug")
+            return False
+
+    def should_preemptive_rebalance(
+        self,
+        channel_id: str,
+        current_local_pct: float
+    ) -> Dict[str, Any]:
+        """
+        Check if a channel should be rebalanced preemptively.
+
+        Combines current state with prediction to recommend
+        whether to rebalance now (preemptively) or wait.
+
+        Args:
+            channel_id: Channel SCID
+            current_local_pct: Current local balance percentage (0.0-1.0)
+
+        Returns:
+            Recommendation dict:
+            {
+                "should_rebalance": True,
+                "reason": "Predicted depletion in 8 hours",
+                "urgency": "preemptive",
+                "recommended_amount_pct": 0.25,
+                "cost_advantage": "Rebalancing now vs urgently saves ~20-40% in fees"
+            }
+        """
+        result = {
+            "should_rebalance": False,
+            "reason": "No prediction available",
+            "urgency": "none",
+            "recommended_amount_pct": 0.0,
+            "cost_advantage": None
+        }
+
+        prediction = self.query_anticipatory_prediction(channel_id, hours_ahead=24)
+        if not prediction:
+            return result
+
+        # Check urgency levels
+        urgency = prediction.get("urgency", "none")
+        depletion_risk = prediction.get("depletion_risk", 0)
+        saturation_risk = prediction.get("saturation_risk", 0)
+        hours_to_critical = prediction.get("hours_to_critical")
+
+        if urgency in ["critical", "urgent"]:
+            # Need to rebalance now regardless
+            result["should_rebalance"] = True
+            result["reason"] = f"Critical: {urgency} urgency, {hours_to_critical:.0f}h to critical"
+            result["urgency"] = urgency
+            result["recommended_amount_pct"] = 0.3 if depletion_risk > saturation_risk else -0.3
+
+        elif urgency == "preemptive":
+            # Ideal window for preemptive rebalancing
+            result["should_rebalance"] = True
+            result["reason"] = f"Preemptive window: {hours_to_critical:.0f}h to critical"
+            result["urgency"] = "preemptive"
+            result["recommended_amount_pct"] = 0.25 if depletion_risk > saturation_risk else -0.25
+            result["cost_advantage"] = "Rebalancing now vs urgently saves ~20-40% in fees"
+
+        elif urgency == "low":
+            # Could rebalance, but not urgent
+            if depletion_risk > 0.3 or saturation_risk > 0.3:
+                result["should_rebalance"] = True
+                result["reason"] = f"Optional: moderate risk ({max(depletion_risk, saturation_risk):.0%})"
+                result["urgency"] = "low"
+                result["recommended_amount_pct"] = 0.15 if depletion_risk > saturation_risk else -0.15
+            else:
+                result["reason"] = "Channel stable, no rebalancing needed"
+
+        return result
+
+    # =========================================================================
     # DIAGNOSTIC METHODS
     # =========================================================================
 
