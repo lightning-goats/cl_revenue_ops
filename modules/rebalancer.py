@@ -2150,7 +2150,26 @@ class EVRebalancer:
 
         # Thread-safe config snapshot for this execution
         cfg = self.config.snapshot()
-        
+
+        # =====================================================================
+        # PHASE 2: Check for Fleet Rebalancing Conflict
+        # Avoid competing for same routes as other hive members.
+        # INFORMATION ONLY - no fund transfers between nodes.
+        # =====================================================================
+        if self.hive_bridge:
+            conflict = self.hive_bridge.check_rebalance_conflict(candidate.to_peer_id)
+            if conflict.get("conflict"):
+                reason = conflict.get("reason", "Fleet member rebalancing through same peer")
+                self.plugin.log(
+                    f"FLEET_CONFLICT: Skipping rebalance to {candidate.to_channel[:12]}... "
+                    f"({reason})",
+                    level='info'
+                )
+                result["message"] = f"Skipped due to fleet conflict: {reason}"
+                result["fleet_conflict"] = True
+                del self._pending[candidate.to_channel]
+                return result
+
         try:
             # Ensure channels are unmanaged from clboss
             # Unmanage ALL source candidates since Sling may use any of them

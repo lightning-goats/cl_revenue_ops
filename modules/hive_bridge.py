@@ -603,6 +603,167 @@ class HiveFeeIntelligenceBridge:
             return False
 
     # =========================================================================
+    # PHASE 2: LIQUIDITY INTELLIGENCE SHARING
+    # =========================================================================
+    # These methods share INFORMATION about liquidity state.
+    # No fund transfers between nodes - purely informational coordination.
+
+    def query_fleet_liquidity_state(self) -> Optional[Dict[str, Any]]:
+        """
+        Query fleet liquidity state for coordinated decision-making.
+
+        Information only - helps us make better decisions about
+        our own rebalancing and fee adjustments.
+
+        Returns:
+            Fleet liquidity state or None if unavailable:
+            {
+                "active": True,
+                "fleet_summary": {
+                    "members_with_depleted_channels": 2,
+                    "members_with_saturated_channels": 3,
+                    "common_bottleneck_peers": ["02abc...", "03xyz..."]
+                },
+                "our_state": {...}
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-liquidity-state", {
+                "action": "status"
+            })
+
+            if result.get("error"):
+                self._log(f"Liquidity state query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query liquidity state: {e}", level="debug")
+            self._record_failure()
+            return None
+
+    def query_fleet_liquidity_needs(self) -> List[Dict[str, Any]]:
+        """
+        Get fleet liquidity needs for coordination.
+
+        Knowing what others need helps us:
+        - Adjust our fees to direct flow helpfully
+        - Avoid rebalancing through congested routes
+
+        Returns:
+            List of fleet liquidity needs with relevance scores
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return []
+
+        try:
+            result = self.plugin.rpc.call("hive-liquidity-state", {
+                "action": "needs"
+            })
+
+            if result.get("error"):
+                self._log(f"Fleet needs query error: {result.get('error')}", level="debug")
+                return []
+
+            self._record_success()
+            return result.get("fleet_needs", [])
+
+        except Exception as e:
+            self._log(f"Failed to query fleet needs: {e}", level="debug")
+            self._record_failure()
+            return []
+
+    def report_liquidity_state(
+        self,
+        depleted_channels: List[Dict[str, Any]],
+        saturated_channels: List[Dict[str, Any]],
+        rebalancing_active: bool = False,
+        rebalancing_peers: List[str] = None
+    ) -> bool:
+        """
+        Report our liquidity state to the fleet.
+
+        Sharing this information helps the fleet make better
+        coordinated decisions. No sats transfer.
+
+        Args:
+            depleted_channels: List of {peer_id, local_pct, capacity_sats}
+            saturated_channels: List of {peer_id, local_pct, capacity_sats}
+            rebalancing_active: Whether we're currently rebalancing
+            rebalancing_peers: Which peers we're rebalancing through
+
+        Returns:
+            True if reported successfully
+        """
+        if not self.is_available():
+            return False
+
+        try:
+            result = self.plugin.rpc.call("hive-report-liquidity-state", {
+                "depleted_channels": depleted_channels,
+                "saturated_channels": saturated_channels,
+                "rebalancing_active": rebalancing_active,
+                "rebalancing_peers": rebalancing_peers or []
+            })
+
+            if result.get("error"):
+                self._log(f"Liquidity state report error: {result.get('error')}", level="debug")
+                return False
+
+            self._log(
+                f"Liquidity state reported: depleted={result.get('depleted_count')}, "
+                f"saturated={result.get('saturated_count')}"
+            )
+            return True
+
+        except Exception as e:
+            self._log(f"Failed to report liquidity state: {e}", level="debug")
+            return False
+
+    def check_rebalance_conflict(self, peer_id: str) -> Dict[str, Any]:
+        """
+        Check if another fleet member is rebalancing through a peer.
+
+        Avoids competing for the same routes, which wastes fees.
+        Information-based coordination - no fund transfer.
+
+        Args:
+            peer_id: The peer to check
+
+        Returns:
+            Conflict info dict:
+            {
+                "conflict": True/False,
+                "member_id": "...",  # If conflict
+                "recommendation": "delay_rebalance"  # If conflict
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return {"conflict": False, "reason": "hive_unavailable"}
+
+        try:
+            result = self.plugin.rpc.call("hive-check-rebalance-conflict", {
+                "peer_id": peer_id
+            })
+
+            if result.get("error"):
+                self._log(f"Conflict check error: {result.get('error')}", level="debug")
+                return {"conflict": False, "reason": "check_failed"}
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to check rebalance conflict: {e}", level="debug")
+            self._record_failure()
+            return {"conflict": False, "reason": "exception"}
+
+    # =========================================================================
     # DIAGNOSTIC METHODS
     # =========================================================================
 

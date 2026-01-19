@@ -1108,6 +1108,83 @@ class HillClimbingFeeController:
 
         return adjusted_floor, adjusted_ceiling
 
+    # =========================================================================
+    # PHASE 2: Fleet-Aware Fee Adjustment
+    # =========================================================================
+    # Adjust fees considering fleet liquidity state.
+    # INFORMATION ONLY - no fund transfers between nodes.
+
+    def _get_fleet_aware_fee_adjustment(
+        self,
+        peer_id: str,
+        base_fee: int
+    ) -> int:
+        """
+        Adjust fee considering fleet liquidity state.
+
+        If a struggling member needs flow toward this peer,
+        we might lower our fees slightly to help direct traffic.
+        This is indirect help through the public network - no fund transfer.
+
+        Args:
+            peer_id: External peer we're setting fees toward
+            base_fee: The fee we would otherwise set
+
+        Returns:
+            Potentially adjusted fee (or original if no adjustment needed)
+        """
+        if not self.hive_bridge:
+            return base_fee
+
+        fleet_needs = self.hive_bridge.query_fleet_liquidity_needs()
+        if not fleet_needs:
+            return base_fee
+
+        # Check if any struggling member needs outbound to this peer
+        for need in fleet_needs:
+            if need.get("peer_id") != peer_id:
+                continue
+
+            # Only adjust for high-severity needs from struggling/vulnerable members
+            if need.get("severity") not in ("high", "critical"):
+                continue
+
+            member_tier = need.get("member_health_tier", "stable")
+            if member_tier not in ("struggling", "vulnerable"):
+                continue
+
+            need_type = need.get("need_type")
+
+            if need_type == "outbound":
+                # Member needs outbound to this peer
+                # Slightly lower our fee to attract flow toward this peer
+                # This routes through the public network, potentially helping
+                adjusted = int(base_fee * 0.95)  # 5% reduction
+
+                self.plugin.log(
+                    f"FLEET_AWARE: Lowering fee to {peer_id[:12]}... "
+                    f"from {base_fee} to {adjusted} ppm "
+                    f"(fleet member {need.get('member_id', 'unknown')[:8]}... "
+                    f"needs outbound, tier={member_tier})",
+                    level='debug'
+                )
+                return max(adjusted, self.config.min_fee_ppm)
+
+            elif need_type == "inbound":
+                # Member needs inbound from this peer
+                # Slightly raise our fee to discourage drain away from them
+                adjusted = int(base_fee * 1.05)  # 5% increase
+
+                self.plugin.log(
+                    f"FLEET_AWARE: Raising fee to {peer_id[:12]}... "
+                    f"from {base_fee} to {adjusted} ppm "
+                    f"(fleet member needs inbound, tier={member_tier})",
+                    level='debug'
+                )
+                return min(adjusted, self.config.max_fee_ppm)
+
+        return base_fee
+
     def _prune_stale_states(self, active_channel_ids: set) -> int:
         """
         Remove in-memory state for channels that no longer exist.
@@ -2107,6 +2184,19 @@ class HillClimbingFeeController:
                     )
 
             new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
+
+            # =================================================================
+            # PHASE 2: Fleet-Aware Fee Adjustment
+            # Apply minor adjustments based on fleet liquidity needs.
+            # INFORMATION ONLY - no fund transfers between nodes.
+            # =================================================================
+            if self.hive_bridge and not is_congested and not is_fire_sale:
+                fleet_adjusted_fee = self._get_fleet_aware_fee_adjustment(
+                    peer_id, new_fee_ppm
+                )
+                if fleet_adjusted_fee != new_fee_ppm:
+                    # Re-clamp to bounds after fleet adjustment
+                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, fleet_adjusted_fee))
 
 
         # Check if fee changed meaningfully (Alpha Guard)

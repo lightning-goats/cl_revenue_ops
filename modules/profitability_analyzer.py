@@ -373,8 +373,10 @@ class ChannelProfitabilityAnalyzer:
                 f"{classifications}"
             )
 
-            # Report health to cl-hive for NNLB coordination (if available)
+            # Report health and liquidity to cl-hive for fleet coordination
+            # INFORMATION ONLY - no fund transfers between nodes
             self._report_health_to_hive()
+            self._report_liquidity_state_to_hive()
 
         except Exception as e:
             self.plugin.log(f"Error in profitability analysis: {e}", level='error')
@@ -875,6 +877,75 @@ class ChannelProfitabilityAnalyzer:
                 f"NNLB: Reported health to hive - profitable={profitable}, "
                 f"underwater={underwater + zombie}, stagnant={stagnant}, "
                 f"trend={revenue_trend}",
+                level='debug'
+            )
+
+        return success
+
+    def _report_liquidity_state_to_hive(self) -> bool:
+        """
+        Report our liquidity state to cl-hive for fleet coordination.
+
+        This shares INFORMATION only - no sats move between nodes.
+        The liquidity state helps other hive members make coordinated
+        decisions about fees and rebalancing.
+
+        Returns:
+            True if reported successfully, False otherwise
+        """
+        if not self.hive_bridge:
+            return False
+
+        # Rate limit liquidity reports (use same interval as health)
+        now = int(time.time())
+        if (now - self._last_health_report) < self._health_report_interval:
+            return True  # Report health and liquidity together
+
+        depleted_channels = []
+        saturated_channels = []
+
+        for channel_id, prof in self._profitability_cache.items():
+            # Get channel state for balance info
+            state = self.database.get_channel_state(channel_id)
+            if not state:
+                continue
+
+            local = state.get("local_balance_sats", 0)
+            capacity = state.get("capacity_sats", 0)
+            peer_id = state.get("peer_id", "")
+
+            if capacity <= 0 or not peer_id:
+                continue
+
+            local_pct = local / capacity
+
+            if local_pct < 0.20:
+                # Depleted channel - we need outbound
+                depleted_channels.append({
+                    "peer_id": peer_id,
+                    "local_pct": round(local_pct, 3),
+                    "capacity_sats": capacity
+                })
+            elif local_pct > 0.80:
+                # Saturated channel - we need inbound
+                saturated_channels.append({
+                    "peer_id": peer_id,
+                    "local_pct": round(local_pct, 3),
+                    "capacity_sats": capacity
+                })
+
+        # Report to hive
+        success = self.hive_bridge.report_liquidity_state(
+            depleted_channels=depleted_channels,
+            saturated_channels=saturated_channels,
+            rebalancing_active=False,  # Will be updated by rebalancer when active
+            rebalancing_peers=[]
+        )
+
+        if success:
+            self.plugin.log(
+                f"LIQUIDITY: Reported to hive - depleted={len(depleted_channels)}, "
+                f"saturated={len(saturated_channels)}",
                 level='debug'
             )
 
