@@ -157,12 +157,13 @@ class HiveFeeIntelligenceBridge:
 
     def is_available(self) -> bool:
         """
-        Check if cl-hive plugin is available (cached).
+        Check if cl-hive plugin is available AND we are a hive member (cached).
 
         Returns cached result if within TTL to avoid expensive RPC calls.
+        Membership is verified by checking our tier via hive-status RPC.
 
         Returns:
-            True if cl-hive is active, False otherwise
+            True if cl-hive is active AND we are a member/neophyte, False otherwise
         """
         now = time.time()
 
@@ -171,21 +172,46 @@ class HiveFeeIntelligenceBridge:
                 (now - self._availability_check_time) < self._availability_ttl):
             return self._hive_available
 
-        # Check plugin list
+        # Check plugin list first
         try:
             plugins = self.plugin.rpc.plugin("list")
-            available = False
+            hive_loaded = False
             for p in plugins.get("plugins", []):
                 if "cl-hive" in p.get("name", "") and p.get("active", False):
-                    available = True
+                    hive_loaded = True
                     break
 
-            self._hive_available = available
-            self._availability_check_time = now
+            if not hive_loaded:
+                self._hive_available = False
+                self._availability_check_time = now
+                return False
 
-            if available:
-                self._log("cl-hive plugin detected as active")
-            return available
+            # Plugin is loaded - now check if we're actually a hive member
+            # This enables hive mode only when we have membership status
+            try:
+                status = self.plugin.rpc.call("hive-status")
+                tier = status.get("membership", {}).get("tier")
+
+                # Only activate hive mode if we're a member or neophyte
+                # Note: Admin tier was removed in permissionless join update
+                if tier in ["member", "neophyte"]:
+                    self._hive_available = True
+                    self._availability_check_time = now
+                    self._log(f"Hive mode active: tier={tier}")
+                    return True
+                else:
+                    # cl-hive is loaded but we're not a member yet
+                    self._hive_available = False
+                    self._availability_check_time = now
+                    self._log(f"cl-hive loaded but not a member (tier={tier})")
+                    return False
+
+            except Exception as e:
+                # hive-status RPC failed - cl-hive might be starting up
+                self._log(f"hive-status check failed: {e}", level="debug")
+                self._hive_available = False
+                self._availability_check_time = now - (self._availability_ttl - 10)
+                return False
 
         except Exception as e:
             self._log(f"Error checking cl-hive availability: {e}", level="warn")
@@ -2187,7 +2213,7 @@ class HiveFeeIntelligenceBridge:
         Get bridge status for diagnostics.
 
         Returns:
-            Dict with bridge status information
+            Dict with bridge status information including membership details
         """
         now = time.time()
 
@@ -2201,15 +2227,33 @@ class HiveFeeIntelligenceBridge:
             elif age < STALE_CACHE_TTL_SECONDS:
                 stale_count += 1
 
-        return {
+        status = {
             "hive_available": self._hive_available,
             "circuit_breaker_open": self._circuit.is_open,
             "circuit_failures": self._circuit.failures,
             "cache_entries": len(self._cache),
             "cache_fresh": fresh_count,
             "cache_stale": stale_count,
-            "last_availability_check": int(self._availability_check_time)
+            "last_availability_check": int(self._availability_check_time),
+            "membership": None
         }
+
+        # If hive is available, get membership details
+        if self._hive_available:
+            try:
+                hive_status = self.plugin.rpc.call("hive-status")
+                membership = hive_status.get("membership", {})
+                status["membership"] = {
+                    "tier": membership.get("tier"),
+                    "hive_id": membership.get("hive_id"),
+                    "joined_at": membership.get("joined_at"),
+                    "uptime_pct": membership.get("uptime_pct"),
+                    "contribution_ratio": membership.get("contribution_ratio")
+                }
+            except Exception as e:
+                self._log(f"Error fetching membership details: {e}", level="debug")
+
+        return status
 
     def clear_cache(self) -> int:
         """

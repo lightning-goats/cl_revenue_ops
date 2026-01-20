@@ -1028,13 +1028,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         if config.hive_enabled == 'true' and not hive_available:
             # Required mode but hive not available - warn but continue
             plugin.log("=" * 60, level='warn')
-            plugin.log("WARNING: hive-enabled=true but cl-hive plugin not detected!", level='warn')
-            plugin.log("Hive features will be unavailable until cl-hive is running", level='warn')
-            plugin.log("Plugin will continue in degraded mode", level='warn')
+            plugin.log("WARNING: hive-enabled=true but hive mode not active!", level='warn')
+            plugin.log("Possible reasons:", level='warn')
+            plugin.log("  - cl-hive plugin not loaded", level='warn')
+            plugin.log("  - Node not yet a hive member (open channel to a member)", level='warn')
+            plugin.log("Hive features will be unavailable until membership established", level='warn')
+            plugin.log("Plugin will continue in standalone mode", level='warn')
             plugin.log("=" * 60, level='warn')
         elif hive_available:
             plugin.log("=" * 60)
-            plugin.log("HIVE MODE ACTIVE: Connected to cl-hive fleet coordination")
+            plugin.log("HIVE MODE ACTIVE: Authenticated hive member")
             plugin.log("Hive features enabled:")
             plugin.log("  - Coordinated fee recommendations")
             plugin.log("  - Fleet-wide fee intelligence")
@@ -1044,9 +1047,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log("=" * 60)
         else:
             plugin.log("=" * 60)
-            plugin.log("STANDALONE MODE: cl-hive not detected (hive-enabled=auto)")
+            plugin.log("STANDALONE MODE: Not a hive member (hive-enabled=auto)")
             plugin.log("All fee optimization and rebalancing will use local-only algorithms")
-            plugin.log("To enable hive features, install and start cl-hive plugin")
+            plugin.log("To join a hive: open a channel to any hive member")
             plugin.log("=" * 60)
 
     # Initialize profitability analyzer with hive bridge for NNLB health reporting
@@ -1503,11 +1506,17 @@ def revenue_hive_status(plugin: Plugin) -> Dict[str, Any]:
             result["mode"] = "standalone_degraded" if config.hive_enabled == 'true' else "standalone"
             if config.hive_enabled == 'true':
                 result["recommendations"].append(
-                    "hive-enabled=true but cl-hive not detected. Install and start cl-hive plugin."
+                    "hive-enabled=true but hive mode not active. Check if cl-hive is loaded and you are a member."
+                )
+                result["recommendations"].append(
+                    "To join a hive: open a channel to any hive member (permissionless join)"
                 )
             else:
                 result["recommendations"].append(
-                    "cl-hive plugin not detected. Operating in standalone mode."
+                    "Not a hive member. Operating in standalone mode."
+                )
+                result["recommendations"].append(
+                    "To join a hive: install cl-hive and open a channel to any hive member"
                 )
 
         # Get bridge status for diagnostics
