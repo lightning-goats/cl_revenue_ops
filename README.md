@@ -97,7 +97,7 @@ This is the full feature set for individual node operators who don't want to par
 
 ### Hive Mode
 
-When connected to a cl-hive fleet (detected automatically or via `revenue-ops-hive-enabled=true`), you unlock additional features:
+When connected to a cl-hive fleet, you unlock additional features:
 
 | Feature | Description |
 |---------|-------------|
@@ -108,6 +108,28 @@ When connected to a cl-hive fleet (detected automatically or via `revenue-ops-hi
 | **Anticipatory Liquidity** | Predictive rebalancing based on temporal patterns |
 | **Time-Based Fees** | Peak/low hour fee adjustments from pattern analysis |
 
+**How Hive Mode Activates:**
+
+Hive mode requires TWO conditions:
+1. **cl-hive plugin is loaded** - The plugin must be installed and running
+2. **Membership established** - Your node must be a hive member (member or neophyte tier)
+
+Membership is verified by checking your tier via `hive-status` RPC. This ensures hive features only activate when you're actually part of a fleet.
+
+**Joining a Hive (Permissionless):**
+
+Lightning Hives use a permissionless join model - no tickets or admin approval required:
+
+1. Open a channel to any existing hive member
+2. Install and start cl-hive plugin
+3. Autodiscovery happens automatically via `peer_connected` hook
+4. You join as a **neophyte** (90-day probation, 50% revenue share)
+5. After probation (or majority vote), you become a **full member**
+
+```
+Channel Open → Autodiscovery → Neophyte (90 days) → Full Member
+```
+
 **Check your mode:**
 ```bash
 lightning-cli revenue-hive-status
@@ -117,7 +139,7 @@ lightning-cli revenue-hive-status
 ```bash
 # In your CLN config:
 revenue-ops-hive-enabled=false  # Force standalone
-revenue-ops-hive-enabled=true   # Require hive
+revenue-ops-hive-enabled=true   # Require hive (warn if not member)
 revenue-ops-hive-enabled=auto   # Auto-detect (default)
 ```
 
@@ -290,9 +312,11 @@ All options can be set in your CLN config file or via `revenue-config set`.
 | `revenue-ops-hive-rebalance-tolerance` | `50` | Max loss when rebalancing to Hive |
 
 **Hive Mode Settings:**
-- `auto` (default): Automatically detect cl-hive. If found, enable hive features. Otherwise, run standalone.
-- `true`: Require hive features. Warns if cl-hive not detected but continues in degraded mode.
-- `false`: Explicitly disable hive features. Runs in standalone mode even if cl-hive is present.
+- `auto` (default): Automatically detect cl-hive and verify membership. Hive mode activates only when both cl-hive is running AND you are a member (neophyte or full member).
+- `true`: Require hive features. Warns if not a member but continues in standalone mode until membership is established.
+- `false`: Explicitly disable hive features. Runs in standalone mode even if you are a hive member.
+
+**Note:** Membership is verified via `hive-status` RPC. To join a hive, open a channel to any existing member - no tickets or approval required.
 
 ### CLBoss Integration
 
