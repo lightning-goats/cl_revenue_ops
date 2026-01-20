@@ -194,7 +194,8 @@ class HiveFeeIntelligenceBridge:
 
                 # Only activate hive mode if we're a member or neophyte
                 # Note: Admin tier was removed in permissionless join update
-                if tier in ["member", "neophyte"]:
+                # but we still accept it for backward compatibility with existing DBs
+                if tier in ["member", "neophyte", "admin"]:
                     self._hive_available = True
                     self._availability_check_time = now
                     self._log(f"Hive mode active: tier={tier}")
