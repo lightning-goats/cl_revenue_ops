@@ -1580,11 +1580,20 @@ class EVRebalancer:
         
         outbound_fee_ppm = broadcast_fee_ppm
         inbound_fee_ppm = self._estimate_inbound_fee(dest_info.get("peer_id", ""))
-        
+
+        # Check if destination is a hive peer (relax profitability requirements)
+        is_hive_destination = False
+        if self.policy_manager:
+            dest_peer_id = dest_info.get("peer_id", "")
+            if dest_peer_id:
+                policy = self.policy_manager.get_policy(dest_peer_id)
+                if policy.strategy == FeeStrategy.HIVE:
+                    is_hive_destination = True
+
         # Get ALL profitable source candidates (sorted by score, best first)
         source_candidates = self._select_source_candidates(
             sources, rebalance_amount, dest_channel, outbound_fee_ppm, inbound_fee_ppm,
-            peer_status=peer_status
+            peer_status=peer_status, is_hive_destination=is_hive_destination
         )
         
         if not source_candidates: 
@@ -1923,19 +1932,21 @@ class EVRebalancer:
         return None
 
     def _select_source_candidates(
-        self, 
-        sources: List[Tuple[str, Dict[str, Any], float]], 
-        amount_needed: int, 
+        self,
+        sources: List[Tuple[str, Dict[str, Any], float]],
+        amount_needed: int,
         dest_channel: str,
         dest_outbound_fee_ppm: int,
         dest_inbound_fee_ppm: int,
-        peer_status: Optional[Dict] = None
+        peer_status: Optional[Dict] = None,
+        is_hive_destination: bool = False
     ) -> List[Tuple[str, Dict[str, Any], int, float]]:
         """
         Select all profitable source channels for a rebalance.
-        
+
         Instead of returning a single "best" source, this returns ALL sources
         that have a positive spread (EV > 0), sorted by score (highest first).
+        For hive destinations, allows negative spread up to hive_rebalance_tolerance.
         This allows Sling to handle pathfinding failover automatically.
         
         Args:
@@ -2081,8 +2092,17 @@ class EVRebalancer:
             # Calculate spread: what we earn minus what it costs
             spread_ppm = dest_outbound_fee_ppm - dest_inbound_fee_ppm - weighted_opp_cost
 
-            # Only include profitable sources (positive spread)
-            if spread_ppm <= 0:
+            # For hive destinations, allow negative spread up to tolerance
+            # (hive channels are 0-fee, so rebalancing is much cheaper)
+            if is_hive_destination:
+                # Convert tolerance from sats to approximate ppm for comparison
+                tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_needed, 1))
+                min_spread = -tolerance_ppm
+            else:
+                min_spread = 0
+
+            # Only include sources meeting spread threshold
+            if spread_ppm < min_spread:
                 rejections['negative_spread'] += 1
                 # Track the best rejected spread for diagnostics
                 if best_rejected_spread is None or spread_ppm > best_rejected_spread['spread']:
@@ -2092,7 +2112,8 @@ class EVRebalancer:
                         'dest_fee': dest_outbound_fee_ppm,
                         'inbound_fee': dest_inbound_fee_ppm,
                         'opp_cost': weighted_opp_cost,
-                        'flow_state': flow_state
+                        'flow_state': flow_state,
+                        'is_hive': is_hive_destination
                     }
                 continue
 
