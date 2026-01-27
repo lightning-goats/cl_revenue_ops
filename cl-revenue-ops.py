@@ -58,13 +58,15 @@ from modules.hive_bridge import HiveFeeIntelligenceBridge
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
-# v1.5.0: Fee Controller v2.0 improvements
-#   - Bounds multipliers (apply to floor/ceiling instead of fee)
-#   - Dynamic observation windows (forward-count + time)
-#   - Historical response curve with exponential decay
-#   - Elasticity tracking with outlier detection
-#   - Thompson Sampling exploration with security bounds
-PLUGIN_VERSION = "1.5.0"
+# v2.0.0: Thompson Sampling + AIMD Fee Controller
+#   - Replaces Hill Climbing with Gaussian Thompson Sampling
+#   - AIMD defense layer for rapid failure response
+#   - Fleet-informed priors from hive intelligence
+#   - Contextual posteriors (balance, pheromone, time, corridor role)
+#   - Stigmergic modulation for exploration/exploitation
+#   - P2 fleet integration: elasticity sharing, curve aggregation,
+#     regime coordination, competition avoidance, profitability weighting
+PLUGIN_VERSION = "2.0.0"
 
 
 # =============================================================================
