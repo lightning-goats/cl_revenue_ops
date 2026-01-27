@@ -380,10 +380,9 @@ lightning-cli revenue-history
 
 | Document | Description |
 |----------|-------------|
-| [Roadmap](docs/planning/ROADMAP.md) | Development phases and feature status |
-| [Phase 7 Spec](docs/specs/PHASE7_SPECIFICATION.md) | Detailed technical specification |
-| [Phase 8 Spec](docs/specs/PHASE8_SPECIFICATION.md) | Accounting v2.0 specification |
-| [API Unification](docs/specs/API_UNIFICATION_SPEC.md) | API design specification |
+| [Development Roadmap](docs/planning/ROADMAP.md) | Complete feature history and status |
+| [Technical Specs](docs/specs/) | Algorithm specifications (Phase 7, 8, API) |
+| [Security Audits](docs/audits/) | Red team reports and audit responses |
 
 ## Testing
 

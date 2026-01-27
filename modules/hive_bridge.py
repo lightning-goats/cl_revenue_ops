@@ -2969,6 +2969,258 @@ class HiveFeeIntelligenceBridge:
         return result
 
     # =========================================================================
+    # MCF (MIN-COST MAX-FLOW) OPTIMIZATION METHODS
+    # =========================================================================
+
+    def query_mcf_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Query MCF optimization status from cl-hive.
+
+        Gets coordinator election results, pending assignments, and
+        completion statistics.
+
+        Returns:
+            Dict with MCF status or None if unavailable
+        """
+        if not self._check_availability():
+            return None
+
+        if self._circuit.is_open:
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-mcf-status")
+            self._circuit.record_success()
+            return result
+
+        except Exception as e:
+            self._circuit.record_failure()
+            self._log(f"Error querying MCF status: {e}", level="debug")
+            return None
+
+    def query_mcf_assignment(self) -> Optional[Dict[str, Any]]:
+        """
+        Query our current MCF assignments from cl-hive.
+
+        Gets pending rebalance assignments computed by the fleet-wide
+        MCF optimizer.
+
+        Returns:
+            Dict with assignments or None if unavailable
+        """
+        if not self._check_availability():
+            return None
+
+        if self._circuit.is_open:
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-mcf-assignments")
+            self._circuit.record_success()
+            return result
+
+        except Exception as e:
+            self._circuit.record_failure()
+            self._log(f"Error querying MCF assignments: {e}", level="debug")
+            return None
+
+    def query_mcf_optimized_path(
+        self,
+        from_channel: str,
+        to_channel: str,
+        amount_sats: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query MCF-optimized rebalance path from cl-hive.
+
+        Uses the fleet-wide MCF solution if available, otherwise
+        falls back to BFS-based fleet routing.
+
+        Args:
+            from_channel: Source channel SCID
+            to_channel: Destination channel SCID
+            amount_sats: Amount to rebalance
+
+        Returns:
+            Dict with path recommendation or None if unavailable
+        """
+        if not self._check_availability():
+            return None
+
+        if self._circuit.is_open:
+            return None
+
+        try:
+            result = self.plugin.rpc.call(
+                "hive-mcf-optimized-path",
+                from_channel=from_channel,
+                to_channel=to_channel,
+                amount_sats=amount_sats
+            )
+            self._circuit.record_success()
+            return result
+
+        except Exception as e:
+            self._circuit.record_failure()
+            self._log(f"Error querying MCF optimized path: {e}", level="debug")
+            return None
+
+    def report_mcf_completion(
+        self,
+        assignment_id: str,
+        success: bool,
+        actual_amount_sats: int = 0,
+        actual_cost_sats: int = 0,
+        failure_reason: str = ""
+    ) -> bool:
+        """
+        Report completion of an MCF assignment to cl-hive.
+
+        After executing (or failing) an MCF-assigned rebalance,
+        report the outcome so the coordinator can track progress.
+
+        Args:
+            assignment_id: ID of the completed assignment
+            success: Whether rebalance succeeded
+            actual_amount_sats: Actual amount rebalanced
+            actual_cost_sats: Actual routing cost
+            failure_reason: Reason for failure if not successful
+
+        Returns:
+            True if report was accepted
+        """
+        if not self._check_availability():
+            return False
+
+        if self._circuit.is_open:
+            return False
+
+        try:
+            # Report via RPC (cl-hive will broadcast to fleet)
+            result = self.plugin.rpc.call(
+                "hive-report-mcf-completion",
+                assignment_id=assignment_id,
+                success=success,
+                actual_amount_sats=actual_amount_sats,
+                actual_cost_sats=actual_cost_sats,
+                failure_reason=failure_reason
+            )
+            self._circuit.record_success()
+            return result.get("success", False)
+
+        except Exception as e:
+            self._circuit.record_failure()
+            self._log(f"Error reporting MCF completion: {e}", level="debug")
+            return False
+
+    def get_pending_mcf_assignment(self) -> Optional[Dict[str, Any]]:
+        """
+        Get the highest priority pending MCF assignment for execution.
+
+        Convenience method that returns the next assignment to execute
+        based on priority ordering.
+
+        Returns:
+            Assignment dict or None if no pending assignments
+        """
+        assignments = self.query_mcf_assignment()
+        if not assignments:
+            return None
+
+        pending = assignments.get("pending", [])
+        if not pending:
+            return None
+
+        # Return highest priority (lowest priority number)
+        return min(pending, key=lambda a: a.get("priority", 999))
+
+    def claim_mcf_assignment(
+        self,
+        assignment_id: str = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Claim an MCF assignment for execution.
+
+        Marks the assignment as "executing" to prevent double execution
+        by multiple rebalancing attempts.
+
+        Args:
+            assignment_id: Specific assignment to claim, or None for next pending
+
+        Returns:
+            Claimed assignment dict or None if claim failed
+        """
+        if not self._check_availability():
+            return None
+
+        if self._circuit.is_open:
+            return None
+
+        try:
+            if assignment_id:
+                result = self.plugin.rpc.call(
+                    "hive-claim-mcf-assignment",
+                    assignment_id=assignment_id
+                )
+            else:
+                result = self.plugin.rpc.call("hive-claim-mcf-assignment")
+
+            self._circuit.record_success()
+
+            if result.get("success"):
+                return result.get("assignment")
+            return None
+
+        except Exception as e:
+            self._circuit.record_failure()
+            self._log(f"Error claiming MCF assignment: {e}", level="debug")
+            return None
+
+    def should_use_mcf_path(
+        self,
+        from_channel: str,
+        to_channel: str,
+        amount_sats: int,
+        max_fee_ppm: int
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """
+        Check if MCF-optimized path should be used for rebalancing.
+
+        Queries MCF for optimal path and validates it meets fee constraints.
+
+        Args:
+            from_channel: Source channel SCID
+            to_channel: Destination channel SCID
+            amount_sats: Amount to rebalance
+            max_fee_ppm: Maximum acceptable fee in ppm
+
+        Returns:
+            Tuple of (should_use, path_info)
+        """
+        path_info = self.query_mcf_optimized_path(
+            from_channel, to_channel, amount_sats
+        )
+
+        if not path_info:
+            return False, None
+
+        if not path_info.get("fleet_path_available"):
+            return False, path_info
+
+        # Check if cost is within budget
+        estimated_cost = path_info.get("estimated_fleet_cost_sats", 0)
+        estimated_ppm = (estimated_cost * 1_000_000) // amount_sats if amount_sats > 0 else 999999
+
+        if estimated_ppm > max_fee_ppm:
+            self._log(
+                f"MCF path too expensive: {estimated_ppm}ppm > {max_fee_ppm}ppm",
+                level="debug"
+            )
+            return False, path_info
+
+        return True, path_info
+
+    # =========================================================================
     # DIAGNOSTIC METHODS
     # =========================================================================
 
