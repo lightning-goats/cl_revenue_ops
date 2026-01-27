@@ -1888,6 +1888,113 @@ class HiveFeeIntelligenceBridge:
             self._log(f"Failed to query fleet rebalance path: {e}", level="debug")
             return None
 
+    def report_kalman_velocity(
+        self,
+        channel_id: str,
+        peer_id: str,
+        velocity_pct_per_hour: float,
+        uncertainty: float,
+        flow_ratio: float,
+        confidence: float,
+        is_regime_change: bool = False
+    ) -> bool:
+        """
+        Report Kalman-estimated velocity to cl-hive for coordinated predictions.
+
+        Shares our Kalman filter's velocity estimate with the hive so that
+        anticipatory_liquidity can use superior state estimation instead of
+        simple net flow calculations.
+
+        Args:
+            channel_id: Channel SCID
+            peer_id: Peer pubkey
+            velocity_pct_per_hour: Kalman velocity estimate (% balance change per hour)
+            uncertainty: Standard deviation of velocity estimate
+            flow_ratio: Current Kalman-estimated flow ratio (-1 to 1)
+            confidence: Observation confidence (0.0-1.0)
+            is_regime_change: True if regime change detected
+
+        Returns:
+            True if reported successfully
+        """
+        if not self.is_available():
+            return False
+
+        if self._is_circuit_open():
+            return False
+
+        try:
+            result = self.plugin.rpc.call("hive-report-kalman-velocity", {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "velocity_pct_per_hour": velocity_pct_per_hour,
+                "uncertainty": uncertainty,
+                "flow_ratio": flow_ratio,
+                "confidence": confidence,
+                "is_regime_change": is_regime_change
+            })
+
+            if result.get("error"):
+                # Method might not be implemented yet - that's OK
+                if "unknown" in str(result.get("error")).lower():
+                    return True  # Silently succeed if not implemented
+                self._log(f"Kalman velocity report error: {result.get('error')}", level="debug")
+                return False
+
+            self._record_success()
+            return True
+
+        except Exception as e:
+            # Method might not exist yet - fail gracefully
+            self._log(f"Failed to report Kalman velocity: {e}", level="debug")
+            return True  # Don't block on this
+
+    def query_kalman_velocity(
+        self,
+        channel_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query Kalman velocity data from cl-hive for a channel.
+
+        This returns the velocity estimate that was reported by any fleet
+        member who has a channel to the same peer.
+
+        Args:
+            channel_id: Channel SCID
+
+        Returns:
+            Kalman velocity data dict or None:
+            {
+                "velocity_pct_per_hour": -0.02,
+                "uncertainty": 0.005,
+                "flow_ratio": -0.3,
+                "confidence": 0.85,
+                "reporters": 2,
+                "is_consensus": True,
+                "last_update": 1706000000
+            }
+        """
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            result = self.plugin.rpc.call("hive-query-kalman-velocity", {
+                "channel_id": channel_id
+            })
+
+            if result.get("error"):
+                if "unknown" in str(result.get("error")).lower():
+                    return None
+                self._log(f"Kalman velocity query error: {result.get('error')}", level="debug")
+                return None
+
+            self._record_success()
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query Kalman velocity: {e}", level="debug")
+            return None
+
     def report_rebalance_outcome(
         self,
         from_channel: str,
