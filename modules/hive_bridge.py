@@ -63,6 +63,10 @@ from typing import Any, Dict, List, Optional, Tuple
 CACHE_TTL_SECONDS = 1800          # 30 minutes - fresh cache
 STALE_CACHE_TTL_SECONDS = 86400   # 24 hours - reduced confidence
 
+# Cache size limits (prevent unbounded memory growth)
+MAX_CACHE_ENTRIES = 500           # Maximum peers to cache
+CACHE_CLEANUP_INTERVAL = 3600     # Cleanup stale entries every hour
+
 # Circuit breaker settings
 CIRCUIT_FAILURES_THRESHOLD = 3    # Failures before opening circuit
 CIRCUIT_RESET_TIMEOUT = 60        # Seconds before trying again
@@ -291,11 +295,66 @@ class HiveFeeIntelligenceBridge:
             return None, False
 
     def _set_cached(self, peer_id: str, data: Dict) -> None:
-        """Cache a profile."""
+        """
+        Cache a profile with LRU eviction if at capacity.
+
+        Enforces MAX_CACHE_ENTRIES limit by evicting oldest entries
+        when cache is full.
+        """
+        # Evict oldest entries if at capacity
+        if len(self._cache) >= MAX_CACHE_ENTRIES and peer_id not in self._cache:
+            self._evict_oldest_cache_entries(count=10)  # Evict 10 at a time
+
         self._cache[peer_id] = CachedProfile(
             data=data,
             timestamp=time.time()
         )
+
+    def _evict_oldest_cache_entries(self, count: int = 10) -> None:
+        """
+        Evict the oldest cache entries.
+
+        Args:
+            count: Number of entries to evict
+        """
+        if not self._cache:
+            return
+
+        # Sort by timestamp (oldest first)
+        sorted_entries = sorted(
+            self._cache.items(),
+            key=lambda x: x[1].timestamp
+        )
+
+        # Remove oldest entries
+        for peer_id, _ in sorted_entries[:count]:
+            del self._cache[peer_id]
+
+        self._log(f"Evicted {min(count, len(sorted_entries))} old cache entries", level="debug")
+
+    def cleanup_stale_cache(self) -> int:
+        """
+        Remove stale cache entries older than STALE_CACHE_TTL_SECONDS.
+
+        Call this periodically (e.g., hourly) to prevent memory bloat
+        from accumulated stale entries.
+
+        Returns:
+            Number of entries removed
+        """
+        now = time.time()
+        stale_peers = [
+            peer_id for peer_id, cached in self._cache.items()
+            if (now - cached.timestamp) > STALE_CACHE_TTL_SECONDS
+        ]
+
+        for peer_id in stale_peers:
+            del self._cache[peer_id]
+
+        if stale_peers:
+            self._log(f"Cleaned up {len(stale_peers)} stale cache entries", level="debug")
+
+        return len(stale_peers)
 
     def _stale_with_reduced_confidence(
         self,
