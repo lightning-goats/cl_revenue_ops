@@ -2773,6 +2773,241 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+# =============================================================================
+# PORTFOLIO OPTIMIZATION (Mean-Variance)
+# =============================================================================
+
+@plugin.method("revenue-portfolio")
+def revenue_portfolio(
+    plugin: Plugin,
+    risk_aversion: float = 1.0
+) -> Dict[str, Any]:
+    """
+    Analyze channel portfolio using Mean-Variance optimization.
+
+    Treats channels as assets in a portfolio, optimizing liquidity allocation
+    to maximize risk-adjusted returns (Sharpe ratio).
+
+    Args:
+        risk_aversion: Higher values penalize variance more (default: 1.0)
+                       0.5 = aggressive, 1.0 = balanced, 2.0 = conservative
+
+    Returns:
+        Complete portfolio analysis including:
+        - summary: Portfolio-level metrics (Sharpe, diversification, etc.)
+        - channel_statistics: Per-channel return/variance stats
+        - optimal_allocations: Recommended liquidity distribution
+        - recommendations: Prioritized rebalance actions
+        - correlations: Notable channel correlations
+        - hedging_opportunities: Negatively correlated pairs
+        - concentration_risks: Highly correlated pairs
+    """
+    global database, safe_plugin
+
+    if database is None:
+        return {"error": "Database not initialized"}
+
+    if safe_plugin is None:
+        return {"error": "Plugin not initialized"}
+
+    try:
+        from modules.portfolio_optimizer import PortfolioOptimizer
+
+        # Get channel data
+        channels = safe_plugin.rpc.listpeerchannels().get("channels", [])
+
+        # Get forwards from last 14 days
+        import time
+        now = int(time.time())
+        cutoff = now - (14 * 86400)
+
+        # Try bookkeeper first, fall back to listforwards
+        try:
+            income = safe_plugin.rpc.call("bkpr-listincome", {"consolidate_fees": False})
+            forwards = []
+            for event in income.get("income_events", []):
+                if event.get("tag") == "routed":
+                    forwards.append({
+                        "out_channel": event.get("outpoint", "").split(":")[0] if ":" in event.get("outpoint", "") else event.get("account", ""),
+                        "received_time": event.get("timestamp", 0),
+                        "fee_msat": event.get("credit_msat", 0),
+                        "out_msat": event.get("debit_msat", 0)
+                    })
+        except Exception:
+            # Fall back to listforwards
+            fwd_result = safe_plugin.rpc.listforwards(status="settled")
+            forwards = fwd_result.get("forwards", [])
+
+        # Get Kalman flow states if available
+        flow_states = {}
+        try:
+            states = database.get_all_channel_states()
+            for state in states:
+                if state.get("kalman_state"):
+                    import json
+                    ks = json.loads(state["kalman_state"])
+                    flow_states[state["channel_id"]] = ks
+        except Exception:
+            pass
+
+        # Initialize optimizer
+        optimizer = PortfolioOptimizer(
+            database=database,
+            plugin=plugin,
+            hive_bridge=None  # Can integrate later
+        )
+
+        # Run analysis
+        analysis = optimizer.analyze_portfolio(
+            channels=channels,
+            forwards=forwards,
+            flow_states=flow_states,
+            risk_aversion=risk_aversion
+        )
+
+        return {
+            "status": "ok",
+            **analysis
+        }
+
+    except Exception as e:
+        plugin.log(f"Error in portfolio analysis: {e}", level='error')
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+@plugin.method("revenue-portfolio-summary")
+def revenue_portfolio_summary(plugin: Plugin) -> Dict[str, Any]:
+    """
+    Get portfolio summary metrics only (lightweight).
+
+    Returns:
+        Portfolio-level metrics without full channel details.
+    """
+    result = revenue_portfolio(plugin, risk_aversion=1.0)
+
+    if "error" in result:
+        return result
+
+    return {
+        "status": "ok",
+        "summary": result.get("summary", {}),
+        "improvement_potential_pct": result.get("summary", {}).get("improvement_potential_pct", 0),
+        "recommendation_count": len(result.get("recommendations", [])),
+        "hedging_opportunities": len(result.get("hedging_opportunities", [])),
+        "concentration_risks": len(result.get("concentration_risks", []))
+    }
+
+
+@plugin.method("revenue-portfolio-rebalance")
+def revenue_portfolio_rebalance(
+    plugin: Plugin,
+    max_recommendations: int = 5
+) -> Dict[str, Any]:
+    """
+    Get portfolio-optimized rebalance recommendations.
+
+    Prioritizes rebalances that improve portfolio efficiency
+    (Sharpe ratio) rather than just individual channel balance.
+
+    Args:
+        max_recommendations: Maximum number of recommendations (default: 5)
+
+    Returns:
+        List of rebalance recommendations with priority and amounts.
+    """
+    global database, safe_plugin
+
+    if database is None:
+        return {"error": "Database not initialized"}
+
+    if safe_plugin is None:
+        return {"error": "Plugin not initialized"}
+
+    try:
+        from modules.portfolio_optimizer import PortfolioOptimizer
+
+        # Get channel data
+        channels = safe_plugin.rpc.listpeerchannels().get("channels", [])
+
+        # Get forwards
+        import time
+        now = int(time.time())
+
+        try:
+            income = safe_plugin.rpc.call("bkpr-listincome", {"consolidate_fees": False})
+            forwards = []
+            for event in income.get("income_events", []):
+                if event.get("tag") == "routed":
+                    forwards.append({
+                        "out_channel": event.get("outpoint", "").split(":")[0] if ":" in event.get("outpoint", "") else event.get("account", ""),
+                        "received_time": event.get("timestamp", 0),
+                        "fee_msat": event.get("credit_msat", 0),
+                        "out_msat": event.get("debit_msat", 0)
+                    })
+        except Exception:
+            fwd_result = safe_plugin.rpc.listforwards(status="settled")
+            forwards = fwd_result.get("forwards", [])
+
+        optimizer = PortfolioOptimizer(
+            database=database,
+            plugin=plugin
+        )
+
+        recommendations = optimizer.get_rebalance_priorities(
+            channels=channels,
+            forwards=forwards,
+            max_recommendations=max_recommendations
+        )
+
+        return {
+            "status": "ok",
+            "recommendation_count": len(recommendations),
+            "recommendations": recommendations
+        }
+
+    except Exception as e:
+        plugin.log(f"Error in portfolio rebalance: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-portfolio-correlations")
+def revenue_portfolio_correlations(
+    plugin: Plugin,
+    min_correlation: float = 0.3
+) -> Dict[str, Any]:
+    """
+    Get channel correlation analysis.
+
+    Identifies:
+    - Hedging opportunities (negatively correlated channels)
+    - Concentration risks (highly correlated channels)
+
+    Args:
+        min_correlation: Minimum |correlation| to include (default: 0.3)
+
+    Returns:
+        Correlation pairs with relationship classification.
+    """
+    result = revenue_portfolio(plugin, risk_aversion=1.0)
+
+    if "error" in result:
+        return result
+
+    correlations = result.get("correlations", [])
+
+    # Filter by minimum correlation
+    filtered = [c for c in correlations if abs(c.get("correlation", 0)) >= min_correlation]
+
+    return {
+        "status": "ok",
+        "total_pairs": len(filtered),
+        "hedging_opportunities": [c for c in filtered if c.get("relationship") == "hedging"],
+        "concentration_risks": [c for c in filtered if c.get("relationship") == "correlated"],
+        "all_correlations": filtered
+    }
+
+
 @plugin.method("revenue-cleanup-closed")
 def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
     """
