@@ -73,6 +73,229 @@ MIN_EMA_DECAY = 0.6  # Faster decay for volatile channels (more recent = more we
 MAX_EMA_DECAY = 0.9  # Slower decay for stable channels
 VOLATILITY_WINDOW_DAYS = 14  # Calculate volatility over longer window than flow
 
+# =============================================================================
+# IMPROVEMENT #6: Kalman Filter for Flow State Estimation
+# =============================================================================
+# Kalman Filter provides optimal state estimation with:
+# - Faster response to regime changes than EMA
+# - Adaptive noise estimation based on observed volatility
+# - Proper uncertainty quantification (covariance)
+# - Velocity tracking built into state vector
+#
+# State vector: [flow_ratio, flow_velocity]
+# Measurement: observed flow_ratio from daily buckets
+# =============================================================================
+ENABLE_KALMAN_FILTER = True
+
+# Process noise (Q) - how much we expect flow to change naturally
+# Higher = more responsive but noisier, Lower = smoother but slower
+KALMAN_BASE_PROCESS_NOISE = 0.01  # Base variance in flow_ratio per day
+KALMAN_VELOCITY_PROCESS_NOISE = 0.005  # Base variance in velocity per day
+KALMAN_MIN_PROCESS_NOISE = 0.001  # Security floor
+KALMAN_MAX_PROCESS_NOISE = 0.1  # Security ceiling
+
+# Measurement noise (R) - uncertainty in observations
+# Scaled inversely by forward count (more forwards = less noise)
+KALMAN_BASE_MEASUREMENT_NOISE = 0.05  # Base observation variance
+KALMAN_MIN_MEASUREMENT_NOISE = 0.01  # Floor (even with many forwards)
+KALMAN_MAX_MEASUREMENT_NOISE = 0.5  # Ceiling (very few forwards)
+
+# Initial state uncertainty
+KALMAN_INITIAL_VARIANCE = 0.1  # Starting P[0,0] and P[1,1]
+
+# Adaptation parameters
+KALMAN_VOLATILITY_SCALING = 2.0  # How much volatility increases process noise
+KALMAN_CONFIDENCE_SCALING = 0.8  # How much confidence reduces measurement noise
+
+
+@dataclass
+class KalmanFlowState:
+    """
+    Kalman Filter state for flow estimation.
+
+    State vector x = [flow_ratio, flow_velocity]
+    Covariance matrix P = [[var_ratio, cov], [cov, var_velocity]]
+
+    Attributes:
+        flow_ratio: Estimated flow ratio (-1 to 1)
+        flow_velocity: Estimated rate of change per day
+        variance_ratio: Uncertainty in flow_ratio estimate
+        variance_velocity: Uncertainty in velocity estimate
+        covariance: Cross-covariance between ratio and velocity
+        last_update: Timestamp of last filter update
+        innovation_variance: Recent prediction error variance (for adaptation)
+    """
+    flow_ratio: float = 0.0
+    flow_velocity: float = 0.0
+    variance_ratio: float = KALMAN_INITIAL_VARIANCE
+    variance_velocity: float = KALMAN_INITIAL_VARIANCE
+    covariance: float = 0.0
+    last_update: int = 0
+    innovation_variance: float = 0.01  # Running estimate of prediction errors
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "flow_ratio": self.flow_ratio,
+            "flow_velocity": self.flow_velocity,
+            "variance_ratio": self.variance_ratio,
+            "variance_velocity": self.variance_velocity,
+            "covariance": self.covariance,
+            "last_update": self.last_update,
+            "innovation_variance": self.innovation_variance
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "KalmanFlowState":
+        return cls(
+            flow_ratio=d.get("flow_ratio", 0.0),
+            flow_velocity=d.get("flow_velocity", 0.0),
+            variance_ratio=d.get("variance_ratio", KALMAN_INITIAL_VARIANCE),
+            variance_velocity=d.get("variance_velocity", KALMAN_INITIAL_VARIANCE),
+            covariance=d.get("covariance", 0.0),
+            last_update=d.get("last_update", 0),
+            innovation_variance=d.get("innovation_variance", 0.01)
+        )
+
+
+class KalmanFlowFilter:
+    """
+    Kalman Filter for optimal flow state estimation.
+
+    Replaces simple EMA with a proper state estimator that:
+    1. Tracks both flow_ratio and its velocity
+    2. Adapts to volatility (high volatility = trust new data more)
+    3. Weights by confidence (more forwards = trust observation more)
+    4. Provides uncertainty estimates
+
+    State transition model (discrete time, dt in days):
+        flow_ratio[k] = flow_ratio[k-1] + velocity[k-1] * dt + noise
+        velocity[k] = velocity[k-1] + noise
+
+    Measurement model:
+        observation[k] = flow_ratio[k] + noise
+    """
+
+    def __init__(self, state: Optional[KalmanFlowState] = None):
+        """Initialize filter with optional existing state."""
+        self.state = state or KalmanFlowState()
+
+    def predict(self, dt_days: float, volatility: float = 1.0) -> None:
+        """
+        Prediction step: Project state forward in time.
+
+        Args:
+            dt_days: Time since last update in days
+            volatility: Multiplier for process noise (higher = more uncertain)
+        """
+        if dt_days <= 0:
+            return
+
+        # State transition: x_k = A * x_{k-1}
+        # A = [[1, dt], [0, 1]]
+        # flow_ratio += velocity * dt
+        self.state.flow_ratio += self.state.flow_velocity * dt_days
+        # velocity stays the same (random walk)
+
+        # Process noise adaptation based on volatility
+        q_ratio = KALMAN_BASE_PROCESS_NOISE * volatility * KALMAN_VOLATILITY_SCALING
+        q_ratio = max(KALMAN_MIN_PROCESS_NOISE, min(KALMAN_MAX_PROCESS_NOISE, q_ratio))
+
+        q_velocity = KALMAN_VELOCITY_PROCESS_NOISE * volatility
+        q_velocity = max(KALMAN_MIN_PROCESS_NOISE / 10, min(KALMAN_MAX_PROCESS_NOISE / 10, q_velocity))
+
+        # Covariance prediction: P_k = A * P_{k-1} * A' + Q
+        # P = [[p00, p01], [p10, p11]] where p01 = p10 (symmetric)
+        p00 = self.state.variance_ratio
+        p01 = self.state.covariance
+        p11 = self.state.variance_velocity
+
+        # A * P * A' for A = [[1, dt], [0, 1]]
+        new_p00 = p00 + 2 * dt_days * p01 + dt_days * dt_days * p11 + q_ratio * dt_days
+        new_p01 = p01 + dt_days * p11
+        new_p11 = p11 + q_velocity * dt_days
+
+        self.state.variance_ratio = new_p00
+        self.state.covariance = new_p01
+        self.state.variance_velocity = new_p11
+
+    def update(self, observed_ratio: float, confidence: float = 1.0) -> float:
+        """
+        Update step: Incorporate new observation.
+
+        Args:
+            observed_ratio: Measured flow ratio from data
+            confidence: Observation confidence (0.1 to 1.0)
+
+        Returns:
+            Innovation (prediction error) for diagnostics
+        """
+        # Measurement noise adaptation based on confidence
+        # Low confidence = high noise = trust observation less
+        r = KALMAN_BASE_MEASUREMENT_NOISE / max(0.1, confidence * KALMAN_CONFIDENCE_SCALING)
+        r = max(KALMAN_MIN_MEASUREMENT_NOISE, min(KALMAN_MAX_MEASUREMENT_NOISE, r))
+
+        # Innovation (prediction error)
+        # y = z - H * x where H = [1, 0] (we only observe flow_ratio, not velocity)
+        innovation = observed_ratio - self.state.flow_ratio
+
+        # Innovation covariance: S = H * P * H' + R = P[0,0] + R
+        s = self.state.variance_ratio + r
+
+        # Prevent division by zero
+        if s < 1e-10:
+            s = 1e-10
+
+        # Kalman gain: K = P * H' / S
+        # K = [[P[0,0]/S], [P[0,1]/S]]
+        k0 = self.state.variance_ratio / s
+        k1 = self.state.covariance / s
+
+        # State update: x = x + K * y
+        self.state.flow_ratio += k0 * innovation
+        self.state.flow_velocity += k1 * innovation
+
+        # Covariance update: P = (I - K*H) * P
+        # This is the Joseph form for numerical stability
+        p00 = self.state.variance_ratio
+        p01 = self.state.covariance
+        p11 = self.state.variance_velocity
+
+        self.state.variance_ratio = (1 - k0) * p00
+        self.state.covariance = (1 - k0) * p01
+        self.state.variance_velocity = p11 - k1 * p01
+
+        # Ensure covariance stays positive definite
+        self.state.variance_ratio = max(1e-6, self.state.variance_ratio)
+        self.state.variance_velocity = max(1e-6, self.state.variance_velocity)
+
+        # Update innovation variance (exponential moving average)
+        self.state.innovation_variance = 0.9 * self.state.innovation_variance + 0.1 * innovation * innovation
+
+        self.state.last_update = int(time.time())
+
+        return innovation
+
+    def get_uncertainty(self) -> float:
+        """Get standard deviation of flow_ratio estimate."""
+        return math.sqrt(max(0, self.state.variance_ratio))
+
+    def is_regime_change(self, threshold: float = 2.0) -> bool:
+        """
+        Detect if recent innovations suggest a regime change.
+
+        A regime change is detected when the innovation (prediction error)
+        is significantly larger than expected based on the innovation variance.
+
+        Args:
+            threshold: Number of standard deviations for detection
+
+        Returns:
+            True if regime change detected
+        """
+        expected_innovation_std = math.sqrt(max(0.001, self.state.innovation_variance))
+        # Compare recent update's contribution to expected
+        return self.state.variance_ratio > threshold * expected_innovation_std
+
 
 class ChannelState(Enum):
     """
@@ -145,6 +368,11 @@ class FlowMetrics:
     forward_count: int = 0  # Forwards in analysis window
     previous_flow_ratio: float = 0.0  # For velocity calculation
     previous_ratio_timestamp: int = 0  # When previous was recorded
+    # v2.1 Kalman filter fields
+    kalman_flow_ratio: float = 0.0  # Kalman-filtered flow ratio estimate
+    kalman_velocity: float = 0.0  # Kalman-estimated velocity (ratio change/day)
+    kalman_uncertainty: float = 0.1  # Standard deviation of estimate
+    kalman_regime_change: bool = False  # True if regime change detected
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -169,7 +397,12 @@ class FlowMetrics:
             "velocity": round(self.velocity, 4),
             "flow_multiplier": round(self.flow_multiplier, 3),
             "ema_decay": round(self.ema_decay, 3),
-            "forward_count": self.forward_count
+            "forward_count": self.forward_count,
+            # v2.1 Kalman fields
+            "kalman_flow_ratio": round(self.kalman_flow_ratio, 4),
+            "kalman_velocity": round(self.kalman_velocity, 4),
+            "kalman_uncertainty": round(self.kalman_uncertainty, 4),
+            "kalman_regime_change": self.kalman_regime_change
         }
 
 
@@ -190,7 +423,7 @@ class FlowAnalyzer:
     def __init__(self, plugin: Plugin, config, database):
         """
         Initialize the flow analyzer.
-        
+
         Args:
             plugin: Reference to the pyln Plugin
             config: Configuration object
@@ -199,6 +432,142 @@ class FlowAnalyzer:
         self.plugin = plugin
         self.config = config
         self.database = database
+        # v2.1: Kalman filter state cache (channel_id -> KalmanFlowFilter)
+        self._kalman_filters: Dict[str, KalmanFlowFilter] = {}
+
+    # =========================================================================
+    # v2.1 KALMAN FILTER METHODS
+    # =========================================================================
+
+    def _get_kalman_filter(self, channel_id: str) -> KalmanFlowFilter:
+        """
+        Get or create Kalman filter for a channel.
+
+        Loads persisted state from database if available.
+        """
+        if channel_id in self._kalman_filters:
+            return self._kalman_filters[channel_id]
+
+        # Try to load from database
+        state_dict = self.database.get_kalman_state(channel_id)
+        if state_dict:
+            state = KalmanFlowState.from_dict(state_dict)
+            kf = KalmanFlowFilter(state)
+        else:
+            kf = KalmanFlowFilter()
+
+        self._kalman_filters[channel_id] = kf
+        return kf
+
+    def _save_kalman_filter(self, channel_id: str, kf: KalmanFlowFilter) -> None:
+        """Save Kalman filter state to database."""
+        self.database.save_kalman_state(channel_id, kf.state.to_dict())
+
+    def _calculate_kalman_volatility(self, daily_buckets: List[Dict[str, int]]) -> float:
+        """
+        Calculate volatility measure for Kalman process noise adaptation.
+
+        Higher volatility = higher process noise = trust new data more.
+
+        Returns:
+            Volatility multiplier (0.5 to 2.0)
+        """
+        if len(daily_buckets) < 3:
+            return 1.0  # Default
+
+        # Calculate daily net flows
+        net_flows = []
+        for bucket in daily_buckets:
+            net = (bucket.get('out', 0) or 0) - (bucket.get('in', 0) or 0)
+            net_flows.append(net)
+
+        if not net_flows:
+            return 1.0
+
+        # Calculate coefficient of variation (CV) of net flow changes
+        changes = [abs(net_flows[i] - net_flows[i-1]) for i in range(1, len(net_flows))]
+        if not changes:
+            return 1.0
+
+        mean_change = sum(changes) / len(changes)
+        mean_flow = sum(abs(nf) for nf in net_flows) / len(net_flows)
+
+        if mean_flow < 1000:  # Very low activity
+            return 0.5  # Low volatility assumption
+
+        cv = mean_change / max(1, mean_flow)
+
+        # Map CV to volatility multiplier (0.5 to 2.0)
+        # CV ~0 -> 0.5 (stable)
+        # CV ~0.5 -> 1.0 (moderate)
+        # CV ~1+ -> 2.0 (volatile)
+        volatility = 0.5 + min(1.5, cv * 3.0)
+        return volatility
+
+    def _apply_kalman_filter(
+        self,
+        channel_id: str,
+        observed_ratio: float,
+        confidence: float,
+        daily_buckets: List[Dict[str, int]],
+        prev_ts: int
+    ) -> Tuple[float, float, float, bool]:
+        """
+        Apply Kalman filter to get smoothed flow ratio estimate.
+
+        Args:
+            channel_id: Channel identifier
+            observed_ratio: Raw flow ratio from EMA
+            confidence: Observation confidence (0.1 to 1.0)
+            daily_buckets: Daily flow data for volatility calculation
+            prev_ts: Previous update timestamp
+
+        Returns:
+            (kalman_ratio, kalman_velocity, uncertainty, regime_change)
+        """
+        if not ENABLE_KALMAN_FILTER:
+            return observed_ratio, 0.0, 0.1, False
+
+        kf = self._get_kalman_filter(channel_id)
+
+        # Calculate time since last update
+        now = int(time.time())
+        if kf.state.last_update > 0:
+            dt_days = (now - kf.state.last_update) / 86400.0
+        else:
+            dt_days = 1.0  # First run, assume 1 day
+
+        # Cap dt to prevent explosion after long gaps
+        dt_days = min(dt_days, 7.0)
+
+        # Calculate volatility for process noise adaptation
+        volatility = self._calculate_kalman_volatility(daily_buckets)
+
+        # Predict step
+        kf.predict(dt_days, volatility)
+
+        # Update step with observation
+        innovation = kf.update(observed_ratio, confidence)
+
+        # Detect regime change
+        regime_change = kf.is_regime_change(threshold=2.5)
+
+        if regime_change:
+            self.plugin.log(
+                f"KALMAN: Regime change detected for {channel_id[:12]}... "
+                f"(innovation={innovation:.3f}, uncertainty={kf.get_uncertainty():.3f})",
+                level='info'
+            )
+
+        # Save state
+        self._save_kalman_filter(channel_id, kf)
+
+        return (
+            kf.state.flow_ratio,
+            kf.state.flow_velocity,
+            kf.get_uncertainty(),
+            regime_change
+        )
 
     # =========================================================================
     # v2.0 IMPROVEMENT METHODS
@@ -461,9 +830,34 @@ class FlowAnalyzer:
                 previous_ratio_ts=prev_ts
             )
 
+            # v2.1: Apply Kalman filter for improved flow estimation
+            if ENABLE_KALMAN_FILTER:
+                kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change = \
+                    self._apply_kalman_filter(
+                        channel_id=channel_id,
+                        observed_ratio=metrics.flow_ratio,
+                        confidence=metrics.confidence,
+                        daily_buckets=channel_daily,
+                        prev_ts=prev_ts
+                    )
+                metrics.kalman_flow_ratio = kalman_ratio
+                metrics.kalman_velocity = kalman_velocity
+                metrics.kalman_uncertainty = kalman_uncertainty
+                metrics.kalman_regime_change = regime_change
+
+                # Use Kalman estimate for state classification if enabled
+                # Kalman provides smoother estimates with faster regime change detection
+                if not metrics.is_congested:
+                    if kalman_ratio > self.config.source_threshold:
+                        metrics.state = ChannelState.SOURCE
+                    elif kalman_ratio < self.config.sink_threshold:
+                        metrics.state = ChannelState.SINK
+                    else:
+                        metrics.state = ChannelState.BALANCED
+
             results[channel_id] = metrics
 
-            # Store in database (with v2.0 fields)
+            # Store in database (with v2.0 and v2.1 fields)
             self.database.update_channel_state(
                 channel_id=channel_id,
                 peer_id=peer_id,
@@ -477,7 +871,11 @@ class FlowAnalyzer:
                 velocity=metrics.velocity,
                 flow_multiplier=metrics.flow_multiplier,
                 ema_decay=metrics.ema_decay,
-                forward_count=forward_count
+                forward_count=forward_count,
+                # v2.1 Kalman fields
+                kalman_flow_ratio=metrics.kalman_flow_ratio,
+                kalman_velocity=metrics.kalman_velocity,
+                kalman_uncertainty=metrics.kalman_uncertainty
             )
 
         return results
@@ -538,7 +936,7 @@ class FlowAnalyzer:
         prev_ts_raw = prev_state.get("updated_at", 0) if prev_state else 0
         prev_ts = int(prev_ts_raw) if prev_ts_raw else 0
 
-        return self._calculate_metrics(
+        metrics = self._calculate_metrics(
             channel_id=channel_id,
             peer_id=peer_id,
             sats_in=total_in,
@@ -558,7 +956,24 @@ class FlowAnalyzer:
             previous_ratio=prev_ratio,
             previous_ratio_ts=prev_ts
         )
-    
+
+        # v2.1: Apply Kalman filter
+        if ENABLE_KALMAN_FILTER:
+            kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change = \
+                self._apply_kalman_filter(
+                    channel_id=channel_id,
+                    observed_ratio=metrics.flow_ratio,
+                    confidence=metrics.confidence,
+                    daily_buckets=channel_daily,
+                    prev_ts=prev_ts
+                )
+            metrics.kalman_flow_ratio = kalman_ratio
+            metrics.kalman_velocity = kalman_velocity
+            metrics.kalman_uncertainty = kalman_uncertainty
+            metrics.kalman_regime_change = regime_change
+
+        return metrics
+
     def _calculate_metrics(
         self, channel_id: str, peer_id: str,
         sats_in: int, sats_out: int, capacity: int,

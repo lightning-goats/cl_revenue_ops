@@ -58,6 +58,13 @@ from modules.hive_bridge import HiveFeeIntelligenceBridge
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.1.0: Kalman Filter for Flow State Estimation
+#   - Replaces EMA with Kalman filter for optimal state estimation
+#   - Faster regime change detection via innovation monitoring
+#   - Adaptive process noise based on flow volatility
+#   - Confidence-weighted measurement noise
+#   - Velocity tracking built into state vector
+#   - Persistent filter state across restarts
 # v2.0.0: Thompson Sampling + AIMD Fee Controller
 #   - Replaces Hill Climbing with Gaussian Thompson Sampling
 #   - AIMD defense layer for rapid failure response
@@ -66,7 +73,7 @@ from modules.hive_bridge import HiveFeeIntelligenceBridge
 #   - Stigmergic modulation for exploration/exploitation
 #   - P2 fleet integration: elasticity sharing, curve aggregation,
 #     regime coordination, competition avoidance, profitability weighting
-PLUGIN_VERSION = "2.0.0"
+PLUGIN_VERSION = "2.1.0"
 
 
 # =============================================================================

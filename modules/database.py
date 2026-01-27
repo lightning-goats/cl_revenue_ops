@@ -712,6 +712,9 @@ class Database:
         # v1.6 Migration: Add flow analysis v2.0 columns
         self._migrate_flow_v2_schema(conn)
 
+        # v2.0 Migration: Add Kalman filter columns and table
+        self._migrate_kalman_schema(conn)
+
         self.plugin.log("Database initialized successfully")
     
 
@@ -859,6 +862,50 @@ class Database:
         except Exception as e:
             self.plugin.log(f"DB migration warning: flow v2 schema migration failed: {e}", level="warn")
 
+    def _migrate_kalman_schema(self, conn: sqlite3.Connection) -> None:
+        """
+        v2.0 Migration: Add Kalman filter columns to channel_states and create kalman_state table.
+
+        New columns in channel_states:
+        - kalman_flow_ratio: Kalman-filtered flow ratio estimate
+        - kalman_velocity: Kalman-estimated velocity
+        - kalman_uncertainty: Estimation uncertainty
+
+        New table kalman_state:
+        - Stores full Kalman filter state for persistence across restarts
+        """
+        try:
+            # Add columns to channel_states
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(channel_states)").fetchall()]
+
+            kalman_cols = [
+                ("kalman_flow_ratio", "REAL DEFAULT 0.0"),
+                ("kalman_velocity", "REAL DEFAULT 0.0"),
+                ("kalman_uncertainty", "REAL DEFAULT 0.1"),
+            ]
+
+            for col_name, col_def in kalman_cols:
+                if col_name not in cols:
+                    self.plugin.log(f"DB migration: adding channel_states.{col_name}", level="info")
+                    conn.execute(f"ALTER TABLE channel_states ADD COLUMN {col_name} {col_def}")
+
+            # Create kalman_state table for full filter state persistence
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS kalman_state (
+                    channel_id TEXT PRIMARY KEY,
+                    flow_ratio REAL DEFAULT 0.0,
+                    flow_velocity REAL DEFAULT 0.0,
+                    variance_ratio REAL DEFAULT 0.1,
+                    variance_velocity REAL DEFAULT 0.1,
+                    covariance REAL DEFAULT 0.0,
+                    last_update INTEGER DEFAULT 0,
+                    innovation_variance REAL DEFAULT 0.01
+                )
+            """)
+
+        except Exception as e:
+            self.plugin.log(f"DB migration warning: Kalman schema migration failed: {e}", level="warn")
+
     # =========================================================================
     # Channel State Methods
     # =========================================================================
@@ -871,19 +918,25 @@ class Database:
         velocity: float = 0.0,
         flow_multiplier: float = 1.0,
         ema_decay: float = 0.8,
-        forward_count: int = 0
+        forward_count: int = 0,
+        # v2.1 Kalman fields
+        kalman_flow_ratio: float = 0.0,
+        kalman_velocity: float = 0.0,
+        kalman_uncertainty: float = 0.1
     ):
-        """Update the current state of a channel (v2.0: includes flow metrics)."""
+        """Update the current state of a channel (v2.1: includes Kalman filter metrics)."""
         conn = self._get_connection()
         now = int(time.time())
 
         conn.execute("""
             INSERT OR REPLACE INTO channel_states
             (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at,
-             confidence, velocity, flow_multiplier, ema_decay, forward_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             confidence, velocity, flow_multiplier, ema_decay, forward_count,
+             kalman_flow_ratio, kalman_velocity, kalman_uncertainty)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, now,
-              confidence, velocity, flow_multiplier, ema_decay, forward_count))
+              confidence, velocity, flow_multiplier, ema_decay, forward_count,
+              kalman_flow_ratio, kalman_velocity, kalman_uncertainty))
 
         # Also record in history
         conn.execute("""
@@ -917,6 +970,47 @@ class Database:
             "SELECT * FROM channel_states WHERE state = ?",
             (state,)
         ).fetchall()
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Kalman Filter State Methods (v2.1)
+    # =========================================================================
+
+    def get_kalman_state(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Get Kalman filter state for a channel."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM kalman_state WHERE channel_id = ?",
+            (channel_id,)
+        ).fetchone()
+
+        if row:
+            return dict(row)
+        return None
+
+    def save_kalman_state(self, channel_id: str, state: Dict[str, Any]) -> None:
+        """Save Kalman filter state for a channel."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT OR REPLACE INTO kalman_state
+            (channel_id, flow_ratio, flow_velocity, variance_ratio, variance_velocity,
+             covariance, last_update, innovation_variance)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            channel_id,
+            state.get("flow_ratio", 0.0),
+            state.get("flow_velocity", 0.0),
+            state.get("variance_ratio", 0.1),
+            state.get("variance_velocity", 0.1),
+            state.get("covariance", 0.0),
+            state.get("last_update", 0),
+            state.get("innovation_variance", 0.01)
+        ))
+
+    def get_all_kalman_states(self) -> List[Dict[str, Any]]:
+        """Get Kalman filter states for all channels."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM kalman_state").fetchall()
         return [dict(row) for row in rows]
 
     # =========================================================================
