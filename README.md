@@ -82,6 +82,19 @@ Centralized control via `revenue-policy` command.
 - **Zero-Fee Routing:** Supports internal fleet whitelisting
 - **Inventory Load Balancing:** Supports "Push" rebalancing via Strategic Exemptions
 
+### Module 7: Kalman Flow Estimation (v2.1)
+- **Kalman Filter:** Smooth, noise-resistant flow state estimation
+- **Velocity Tracking:** Detect flow acceleration/deceleration trends
+- **Confidence Scoring:** Data quality-weighted flow classifications
+- **Fleet Sharing:** Report Kalman velocities to cl-hive for coordinated positioning
+
+### Module 8: Portfolio Optimization (v2.2)
+Applies Markowitz Mean-Variance portfolio theory to Lightning channel management:
+- **Risk-Adjusted Returns:** Optimize for Sharpe ratio, not just raw revenue
+- **Correlation Analysis:** Detect hedging opportunities (negatively correlated channels)
+- **Concentration Risk:** Identify over-correlated channel pairs
+- **Rebalance Recommendations:** Portfolio-optimized allocation targets
+
 ## Operating Modes
 
 cl-revenue-ops supports two operating modes:

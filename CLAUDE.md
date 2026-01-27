@@ -42,10 +42,12 @@ Core Lightning
 |--------|---------|
 | `fee_controller.py` | Thompson Sampling + AIMD fee optimization, Vegas Reflex, Scarcity Pricing |
 | `rebalancer.py` | EV-based rebalancing, sling integration, futility circuit breaker |
-| `flow_analysis.py` | Sink/Source detection, flow classification |
+| `flow_analysis.py` | Sink/Source detection, Kalman-filtered flow estimation |
 | `policy_manager.py` | Per-peer policy engine (dynamic/static/passive/hive) |
 | `profitability_analyzer.py` | P&L calculation, ROC metrics, capacity recommendations |
+| `portfolio_optimizer.py` | Mean-Variance optimization, Sharpe ratio, correlation analysis |
 | `capacity_planner.py` | Channel sizing recommendations ("Winners & Losers") |
+| `hive_bridge.py` | cl-hive integration, MCF assignments, Kalman velocity sharing |
 | `clboss_manager.py` | Optional CLBoss integration for unmanage commands |
 | `database.py` | SQLite with WAL mode, accounting tables, closed channel history |
 | `config.py` | Hot-reloadable configuration |
