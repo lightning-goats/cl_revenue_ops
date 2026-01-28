@@ -359,3 +359,189 @@ class TestRebalanceModeWithHive:
         # SOURCE_ONLY means can drain but not fill
         assert policy.strategy == FeeStrategy.HIVE
         assert policy.rebalance_mode == RebalanceMode.SOURCE_ONLY
+
+
+class TestRebalanceCostFloor:
+    """Test Issue #32: Rebalance cost-aware fee floor."""
+
+    def test_rebalance_floor_only_applies_to_source_channels(self, mock_database, mock_plugin):
+        """Rebalance floor should only apply to SOURCE flow state, not sink/router/dormant."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # Mock cost history with enough samples
+        mock_database.get_channel_cost_history.return_value = [
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400},
+            {"cost_sats": 120, "amount_sats": 1_200_000, "timestamp": int(time.time()) - 86400 * 2},
+            {"cost_sats": 80, "amount_sats": 800_000, "timestamp": int(time.time()) - 86400 * 3},
+        ]
+
+        # Should return floor for SOURCE
+        result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+        assert result is not None
+        assert result > 0
+
+        # Should return None for non-SOURCE flow states
+        assert fc._get_rebalance_cost_floor(channel_id, peer_id, "sink") is None
+        assert fc._get_rebalance_cost_floor(channel_id, peer_id, "router") is None
+        assert fc._get_rebalance_cost_floor(channel_id, peer_id, "dormant") is None
+
+    def test_rebalance_floor_calculates_cost_with_margin(self, mock_database, mock_plugin):
+        """Rebalance floor should be cost_ppm * REBALANCE_FLOOR_MARGIN."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # Mock: 100 sats cost per 1M sats = 100 ppm
+        mock_database.get_channel_cost_history.return_value = [
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 2},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 3},
+        ]
+
+        result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+
+        # Cost is 100ppm, with 20% margin = 120ppm
+        expected = int(100 * fc.REBALANCE_FLOOR_MARGIN)  # 120
+        assert result == expected
+
+    def test_rebalance_floor_requires_min_samples(self, mock_database, mock_plugin):
+        """Rebalance floor should return None if insufficient samples."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # Only 2 samples (default min is 3)
+        mock_database.get_channel_cost_history.return_value = [
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 2},
+        ]
+        # Also no peer history available
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+
+        result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+        assert result is None
+
+    def test_rebalance_floor_uses_peer_fallback(self, mock_database, mock_plugin):
+        """Rebalance floor should fall back to peer history when channel history insufficient."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # No channel history
+        mock_database.get_channel_cost_history.return_value = []
+
+        # But peer has history with medium confidence
+        mock_database.get_historical_inbound_fee_ppm.return_value = {
+            "avg_fee_ppm": 150,
+            "confidence": "medium",
+            "sample_count": 5
+        }
+
+        result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+
+        # 150ppm * 1.2 = 180ppm
+        expected = int(150 * fc.REBALANCE_FLOOR_MARGIN)
+        assert result == expected
+
+    def test_rebalance_floor_ignores_old_data(self, mock_database, mock_plugin):
+        """Rebalance floor should ignore data older than REBALANCE_FLOOR_WINDOW_DAYS."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # All data is older than 30 days
+        old_timestamp = int(time.time()) - (fc.REBALANCE_FLOOR_WINDOW_DAYS + 5) * 86400
+        mock_database.get_channel_cost_history.return_value = [
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": old_timestamp},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": old_timestamp - 86400},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": old_timestamp - 86400 * 2},
+        ]
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+
+        result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+        assert result is None
+
+    def test_rebalance_floor_disabled_returns_none(self, mock_database, mock_plugin):
+        """Rebalance floor returns None when feature is disabled."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc.ENABLE_REBALANCE_FLOOR = False  # Disable feature
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_database.get_channel_cost_history.return_value = [
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 2},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 3},
+        ]
+
+        result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+        assert result is None
+
+    def test_rebalance_floor_peer_fallback_requires_confidence(self, mock_database, mock_plugin):
+        """Peer fallback should only use medium/high confidence data."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_database.get_channel_cost_history.return_value = []
+
+        # Low confidence should be ignored
+        mock_database.get_historical_inbound_fee_ppm.return_value = {
+            "avg_fee_ppm": 150,
+            "confidence": "low",
+            "sample_count": 3
+        }
+
+        result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+        assert result is None

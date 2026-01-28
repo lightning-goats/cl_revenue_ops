@@ -2221,6 +2221,17 @@ class HillClimbingFeeController:
     ZERO_FLOW_REDUCTION_SEVERE = 0.50    # 50% ceiling reduction after 7 days
 
     # ==========================================================================
+    # Issue #32: Rebalance Cost-Aware Fee Floor
+    # ==========================================================================
+    # SOURCE channels (outbound-heavy) require rebalancing to maintain liquidity.
+    # This floor ensures fees recover the cost of that rebalancing with a margin.
+    # Prevents the scenario where a channel charges 80ppm but costs 100ppm to rebalance.
+    ENABLE_REBALANCE_FLOOR = True       # Feature flag
+    REBALANCE_FLOOR_MARGIN = 1.20       # Multiplier (1.20 = 20% margin)
+    REBALANCE_FLOOR_MIN_SAMPLES = 3     # Minimum rebalances for confidence
+    REBALANCE_FLOOR_WINDOW_DAYS = 30    # Lookback window for cost history
+
+    # ==========================================================================
     # Cold-Start Mode for Stagnant Channels
     # ==========================================================================
     # Channels with very low forward counts need price discovery - force fees
@@ -2667,6 +2678,74 @@ class HillClimbingFeeController:
             return max(global_min, self.LOW_BALANCE_MIN_FEE)
         else:
             return global_min
+
+    def _get_rebalance_cost_floor(
+        self,
+        channel_id: str,
+        peer_id: str,
+        flow_state: str
+    ) -> Optional[int]:
+        """
+        Calculate minimum fee floor based on historical rebalance costs (Issue #32).
+
+        Only applies to SOURCE channels (outbound-heavy, need rebalancing).
+        Uses per-channel cost history as primary data source, with per-peer
+        fallback for cold-start scenarios.
+
+        Args:
+            channel_id: The channel ID
+            peer_id: The peer node ID
+            flow_state: Channel flow classification ('source', 'sink', 'router', 'dormant')
+
+        Returns:
+            Minimum fee floor in PPM, or None if insufficient data or not applicable
+        """
+        if not self.ENABLE_REBALANCE_FLOOR:
+            return None
+
+        # Only apply to SOURCE channels - sinks don't need rebalancing
+        if flow_state != "source":
+            return None
+
+        # Strategy 1: Per-channel cost history
+        cost_history = self.database.get_channel_cost_history(channel_id)
+        cutoff = int(time.time()) - (self.REBALANCE_FLOOR_WINDOW_DAYS * 86400)
+        recent_costs = [c for c in cost_history if c.get('timestamp', 0) >= cutoff]
+
+        if len(recent_costs) >= self.REBALANCE_FLOOR_MIN_SAMPLES:
+            total_cost = sum(c.get('cost_sats', 0) for c in recent_costs)
+            total_volume = sum(c.get('amount_sats', 0) for c in recent_costs)
+
+            if total_volume > 0:
+                cost_ppm = (total_cost * 1_000_000) // total_volume
+                floor_ppm = int(cost_ppm * self.REBALANCE_FLOOR_MARGIN)
+                self.plugin.log(
+                    f"REBALANCE_FLOOR: {channel_id[:12]}... cost={cost_ppm}ppm "
+                    f"* {self.REBALANCE_FLOOR_MARGIN:.0%} = {floor_ppm}ppm "
+                    f"({len(recent_costs)} samples)",
+                    level='debug'
+                )
+                return floor_ppm
+
+        # Strategy 2: Fallback to per-peer history (for cold-start)
+        peer_history = self.database.get_historical_inbound_fee_ppm(
+            peer_id,
+            window_days=self.REBALANCE_FLOOR_WINDOW_DAYS,
+            min_samples=self.REBALANCE_FLOOR_MIN_SAMPLES
+        )
+
+        if peer_history and peer_history.get('confidence') in ('medium', 'high'):
+            cost_ppm = peer_history.get('avg_fee_ppm', 0)
+            if cost_ppm > 0:
+                floor_ppm = int(cost_ppm * self.REBALANCE_FLOOR_MARGIN)
+                self.plugin.log(
+                    f"REBALANCE_FLOOR (peer fallback): {channel_id[:12]}... "
+                    f"cost={cost_ppm}ppm * {self.REBALANCE_FLOOR_MARGIN:.0%} = {floor_ppm}ppm",
+                    level='debug'
+                )
+                return floor_ppm
+
+        return None
 
     def _get_flow_adjusted_ceiling(
         self,
@@ -3829,6 +3908,23 @@ class HillClimbingFeeController:
             )
             base_floor_ppm = balance_floor_ppm
 
+        # =====================================================================
+        # Issue #32: Rebalance Cost-Aware Fee Floor
+        # =====================================================================
+        # SOURCE channels should charge fees sufficient to recover rebalance costs.
+        # This prevents the scenario where a channel charges 80ppm but costs 100ppm
+        # to rebalance, guaranteeing losses on every forwarded sat.
+        rebalance_floor_ppm = self._get_rebalance_cost_floor(
+            channel_id, peer_id, flow_state
+        )
+        if rebalance_floor_ppm is not None and rebalance_floor_ppm > base_floor_ppm:
+            self.plugin.log(
+                f"REBALANCE_FLOOR: {channel_id[:12]}... floor raised from "
+                f"{base_floor_ppm} to {rebalance_floor_ppm} ppm (cost recovery)",
+                level='info'
+            )
+            base_floor_ppm = rebalance_floor_ppm
+
         base_ceiling_ppm = cfg.max_fee_ppm
 
         # =====================================================================
@@ -3841,22 +3937,23 @@ class HillClimbingFeeController:
         )
 
         # =====================================================================
-        # Issue #18 Fix: Balance Floor Priority
+        # Issue #18 Fix: Balance Floor Priority (extended for Issue #32)
         # =====================================================================
-        # Scarcity protection for drained channels takes priority over normal
-        # ceiling limits. If balance floor is active, ensure ceiling accommodates
-        # it. This prevents the floor/ceiling sanity check from clamping down
-        # the protective floor.
-        if balance_floor_ppm > cfg.min_fee_ppm:  # Balance floor is active
-            min_ceiling_for_balance = balance_floor_ppm + 100  # Allow room for hill climbing
-            if base_ceiling_ppm < min_ceiling_for_balance:
+        # Scarcity protection for drained channels and cost recovery for rebalanced
+        # channels takes priority over normal ceiling limits. If either floor is
+        # active, ensure ceiling accommodates it. This prevents the floor/ceiling
+        # sanity check from clamping down the protective floor.
+        effective_floor = max(balance_floor_ppm, rebalance_floor_ppm or 0)
+        if effective_floor > cfg.min_fee_ppm:  # A protective floor is active
+            min_ceiling_for_floor = effective_floor + 100  # Allow room for hill climbing
+            if base_ceiling_ppm < min_ceiling_for_floor:
                 self.plugin.log(
                     f"SCARCITY_PRIORITY: {channel_id[:12]}... raising ceiling from "
-                    f"{base_ceiling_ppm} to {min_ceiling_for_balance} ppm to accommodate "
-                    f"balance floor of {balance_floor_ppm} ppm",
+                    f"{base_ceiling_ppm} to {min_ceiling_for_floor} ppm to accommodate "
+                    f"effective floor of {effective_floor} ppm",
                     level='info'
                 )
-                base_ceiling_ppm = min_ceiling_for_balance
+                base_ceiling_ppm = min_ceiling_for_floor
 
         # =====================================================================
         # HIVE FEE INTELLIGENCE INTEGRATION
@@ -3892,14 +3989,14 @@ class HillClimbingFeeController:
             ceiling_ppm = int(base_ceiling_ppm * ceiling_multiplier)
 
             # Security: Ensure floor never exceeds ceiling
-            # Issue #18: When balance floor is active, raise ceiling instead of lowering floor
+            # Issue #18/#32: When protective floor is active, raise ceiling instead of lowering floor
             if floor_ppm >= ceiling_ppm:
-                if balance_floor_ppm > cfg.min_fee_ppm:
-                    # Balance floor is active - raise ceiling to protect scarce liquidity
+                if effective_floor > cfg.min_fee_ppm:
+                    # Protective floor is active - raise ceiling to preserve cost recovery
                     ceiling_ppm = floor_ppm + 10
                     self.plugin.log(
                         f"SCARCITY_GUARD: {channel_id[:12]}... ceiling raised to {ceiling_ppm} "
-                        f"to preserve balance floor of {balance_floor_ppm}",
+                        f"to preserve effective floor of {effective_floor}",
                         level='info'
                     )
                 else:
