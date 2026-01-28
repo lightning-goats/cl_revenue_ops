@@ -774,7 +774,7 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-hive-rebalance-tolerance',
     default='50',
-    description='Max sats allowed to lose when rebalancing TO a Hive member (Strategic CapEx)',
+    description='Max sats loss tolerance per rebalance to keep channels balanced and earning (default: 50)',
     opt_type='int'
 )
 

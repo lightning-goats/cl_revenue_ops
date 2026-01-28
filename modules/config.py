@@ -243,7 +243,7 @@ class Config:
     # v1.6.0 - Added hive_enabled for standalone/hive mode control
     hive_enabled: str = 'auto'         # "auto" = detect cl-hive, "true" = require hive, "false" = standalone
     hive_fee_ppm: int = 0              # The fee we charge fleet members (default 0)
-    hive_rebalance_tolerance: int = 50 # Max sats we are willing to LOSE to balance a friend
+    hive_rebalance_tolerance: int = 50 # Max sats loss allowed per rebalance to keep channels earning
     
     # Deferred (v1.4.0)
     enable_flow_asymmetry: bool = False    # Rare liquidity premium

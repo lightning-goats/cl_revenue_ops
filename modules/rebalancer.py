@@ -1613,12 +1613,16 @@ class EVRebalancer:
         weighted_opp_cost = primary_opp_cost
         spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
         
-        # This should always be positive since _select_source_candidates filters for it,
-        # but check anyway for safety
-        if spread_ppm <= 0: 
+        # Allow slightly negative spread up to configured tolerance.
+        # A depleted channel earns nothing — small loss on rebalance is worth it.
+        tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_sats, 1))
+        if spread_ppm < -tolerance_ppm:
             return None
-        
-        raw_budget_msat = (spread_ppm * amount_msat) // 1_000_000
+
+        # When spread is negative (within tolerance), budget is the tolerance amount
+        # we're willing to spend. When positive, budget is the spread itself.
+        effective_spread_ppm = max(1, spread_ppm) if spread_ppm > 0 else tolerance_ppm
+        raw_budget_msat = (effective_spread_ppm * amount_msat) // 1_000_000
         # ZERO-TOLERANCE: Avoid a zero-sats budget due to integer truncation.
         # We clamp to at least 1 sat (1000 msat). This is conservative: it makes EV slightly worse,
         # and ensures execution can enforce a non-zero fee cap.
@@ -1699,25 +1703,25 @@ class EVRebalancer:
             # - Thriving (0.75x): threshold becomes 133% -> require higher profit
             profit_threshold = int(profit_threshold / nnlb_multiplier)
 
+        # Allow negative profit (cost) up to tolerance to keep channels earning.
+        # A depleted channel earns nothing — small rebalance loss is worth it.
+        profit_threshold = max(profit_threshold, -(self.config.hive_rebalance_tolerance))
+
         is_hive_transfer = False
-        
         if self.policy_manager:
             dest_peer_id = dest_info.get("peer_id", "")
             if dest_peer_id:
                 policy = self.policy_manager.get_policy(dest_peer_id)
                 if policy.strategy == FeeStrategy.HIVE:
                     is_hive_transfer = True
-                    # Allow negative profit (cost) up to tolerance
-                    profit_threshold = -(self.config.hive_rebalance_tolerance)
-        
+
         # Check Profit against Dynamic Threshold
         if expected_profit < profit_threshold:
-            # Add debug logging to explain rejection
-            if is_hive_transfer:
-                self.plugin.log(
-                    f"HIVE REBALANCE SKIPPED: Cost too high. Profit {expected_profit} < Tolerance {-self.config.hive_rebalance_tolerance}",
-                    level='debug'
-                )
+            self.plugin.log(
+                f"REBALANCE SKIPPED: Profit {expected_profit} < Threshold {profit_threshold} "
+                f"(tolerance={self.config.hive_rebalance_tolerance})",
+                level='debug'
+            )
             return None
         
         # Log Success (Strategic override)
@@ -2092,14 +2096,10 @@ class EVRebalancer:
             # Calculate spread: what we earn minus what it costs
             spread_ppm = dest_outbound_fee_ppm - dest_inbound_fee_ppm - weighted_opp_cost
 
-            # For hive destinations, allow negative spread up to tolerance
-            # (hive channels are 0-fee, so rebalancing is much cheaper)
-            if is_hive_destination:
-                # Convert tolerance from sats to approximate ppm for comparison
-                tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_needed, 1))
-                min_spread = -tolerance_ppm
-            else:
-                min_spread = 0
+            # Allow slightly negative spread to keep channels balanced and earning.
+            # A depleted channel earns nothing — small loss on rebalance is worth it.
+            tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_needed, 1))
+            min_spread = -tolerance_ppm
 
             # Only include sources meeting spread threshold
             if spread_ppm < min_spread:
