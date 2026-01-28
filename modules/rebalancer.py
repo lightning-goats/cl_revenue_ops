@@ -1615,7 +1615,7 @@ class EVRebalancer:
         
         # Allow slightly negative spread up to configured tolerance.
         # A depleted channel earns nothing — small loss on rebalance is worth it.
-        tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_sats, 1))
+        tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_needed, 1))
         if spread_ppm < -tolerance_ppm:
             return None
 
