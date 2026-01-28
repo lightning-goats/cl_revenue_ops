@@ -3281,3 +3281,84 @@ class HiveFeeIntelligenceBridge:
         count = len(self._cache)
         self._cache.clear()
         return count
+
+    # =========================================================================
+    # SETTLEMENT INTEGRATION (Issue #42: Net Profit Settlement)
+    # =========================================================================
+
+    def report_period_costs(self, rebalance_costs_sats: int) -> bool:
+        """
+        Report rebalancing costs to cl-hive for net profit settlement.
+
+        This enables settlement calculations to use net profit (fees - costs)
+        instead of gross revenue, ensuring members who spend heavily on
+        rebalancing don't subsidize those who don't.
+
+        Should be called periodically (e.g., when reporting yield metrics)
+        to keep cl-hive updated with current period costs.
+
+        Example usage in fee cycle:
+            pnl = profitability_analyzer.get_pnl_summary(window_days=7)
+            hive_bridge.report_period_costs(pnl.get('rebalance_cost_sats', 0))
+
+        Args:
+            rebalance_costs_sats: Total rebalancing costs in sats for the period
+
+        Returns:
+            True if costs were accepted by cl-hive, False otherwise
+        """
+        if not self.is_available():
+            self._log("Cannot report period costs - cl-hive not available", level="debug")
+            return False
+
+        if rebalance_costs_sats < 0:
+            rebalance_costs_sats = 0
+
+        try:
+            result = self.plugin.rpc.call("hive-report-period-costs", {
+                "rebalance_costs_sats": rebalance_costs_sats
+            })
+            if result.get("error"):
+                self._log(f"Error reporting period costs: {result.get('error')}", level="warn")
+                return False
+
+            self._log(
+                f"Reported period costs to cl-hive: {rebalance_costs_sats} sats",
+                level="debug"
+            )
+            return True
+
+        except Exception as e:
+            self._log(f"Failed to report period costs: {e}", level="warn")
+            self._record_failure()
+            return False
+
+    def report_yield_and_costs(
+        self,
+        tlv_sats: int,
+        operating_costs_sats: int,
+        routing_revenue_sats: int,
+        rebalance_costs_sats: int,
+        period_days: int = 30
+    ) -> bool:
+        """
+        Report both yield metrics and settlement period costs to cl-hive.
+
+        Convenience method that combines report_yield_metrics() and
+        report_period_costs() for use in periodic reporting loops.
+
+        Args:
+            tlv_sats: Total Lightning Value (capacity under management)
+            operating_costs_sats: Total operating costs in period
+            routing_revenue_sats: Routing revenue in period
+            rebalance_costs_sats: Rebalance costs for settlement (may overlap with operating_costs)
+            period_days: Period length in days
+
+        Returns:
+            True if both reports succeeded
+        """
+        yield_ok = self.report_yield_metrics(
+            tlv_sats, operating_costs_sats, routing_revenue_sats, period_days
+        )
+        costs_ok = self.report_period_costs(rebalance_costs_sats)
+        return yield_ok and costs_ok
