@@ -2982,7 +2982,7 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Dict with MCF status or None if unavailable
         """
-        if not self._check_availability():
+        if not self.is_available():
             return None
 
         if self._circuit.is_open:
@@ -3008,7 +3008,7 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Dict with assignments or None if unavailable
         """
-        if not self._check_availability():
+        if not self.is_available():
             return None
 
         if self._circuit.is_open:
@@ -3044,7 +3044,7 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Dict with path recommendation or None if unavailable
         """
-        if not self._check_availability():
+        if not self.is_available():
             return None
 
         if self._circuit.is_open:
@@ -3089,7 +3089,7 @@ class HiveFeeIntelligenceBridge:
         Returns:
             True if report was accepted
         """
-        if not self._check_availability():
+        if not self.is_available():
             return False
 
         if self._circuit.is_open:
@@ -3150,7 +3150,7 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Claimed assignment dict or None if claim failed
         """
-        if not self._check_availability():
+        if not self.is_available():
             return None
 
         if self._circuit.is_open:

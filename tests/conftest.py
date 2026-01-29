@@ -160,3 +160,21 @@ def sample_channel_opened_payload(sample_peer_ids, sample_channel_id):
         "our_funding_sats": 2_000_000,
         "their_funding_sats": 0
     }
+
+
+@pytest.fixture
+def mock_hive_bridge(mock_plugin, mock_rpc):
+    """
+    Create a HiveFeeIntelligenceBridge with hive availability pre-set.
+
+    This properly sets both _hive_available and _availability_check_time
+    so that is_available() returns the cached value without doing a fresh check.
+    """
+    import time
+    from modules.hive_bridge import HiveFeeIntelligenceBridge
+
+    mock_plugin.rpc = mock_rpc
+    bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+    bridge._hive_available = True
+    bridge._availability_check_time = time.time()  # Set fresh timestamp
+    return bridge

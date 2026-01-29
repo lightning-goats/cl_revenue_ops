@@ -2320,9 +2320,16 @@ class EVRebalancer:
             )
             
             # --- CRITICAL BUG FIX: Ensure all values are simple types for SQLite ---
-            # Assertion guards: Fail-fast on empty/None channel IDs (HO-01)
-            assert candidate.from_channel, "from_channel cannot be empty"
-            assert candidate.to_channel, "to_channel cannot be empty"
+            # Validation: Return error on empty/None channel IDs (HO-01)
+            if not candidate.from_channel or not candidate.to_channel:
+                self.plugin.log(
+                    f"Invalid channel IDs: from={candidate.from_channel}, to={candidate.to_channel}",
+                    level='error'
+                )
+                return {
+                    "success": False,
+                    "error": "Invalid channel IDs - from_channel or to_channel is empty"
+                }
             
             db_from_channel = str(candidate.from_channel)
             db_to_channel = str(candidate.to_channel)

@@ -11,6 +11,7 @@ Tests:
 import pytest
 import sys
 import os
+import time
 from unittest.mock import MagicMock, patch, PropertyMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -343,6 +344,7 @@ class TestCoordinatedFeeRecommendation:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.query_coordinated_fee_recommendation(
             channel_id="123x1x0",
@@ -384,6 +386,7 @@ class TestRoutingOutcomeReporting:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.report_routing_outcome(
             channel_id="123x1x0",
@@ -407,6 +410,7 @@ class TestRoutingOutcomeReporting:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.report_routing_outcome(
             channel_id="123x1x0",
@@ -441,6 +445,7 @@ class TestDefenseStatus:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.query_defense_status(peer_id="02" + "a" * 64)
 
@@ -457,6 +462,7 @@ class TestDefenseStatus:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.broadcast_peer_warning(
             peer_id="02" + "a" * 64,
@@ -493,6 +499,7 @@ class TestVelocityPrediction:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.query_velocity_prediction(
             channel_id="123x1x0",
@@ -517,6 +524,7 @@ class TestVelocityPrediction:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.query_critical_velocity_channels(hours_threshold=24)
 
@@ -542,6 +550,7 @@ class TestFleetRebalancePath:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.query_fleet_rebalance_path(
             from_channel="123x1x0",
@@ -585,6 +594,7 @@ class TestFlowRecommendations:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.query_flow_recommendations()
 
@@ -616,6 +626,7 @@ class TestInternalCompetition:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.query_internal_competition()
 
@@ -636,6 +647,7 @@ class TestYieldMetrics:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.report_yield_metrics(
             tlv_sats=165000000,
@@ -661,6 +673,7 @@ class TestYieldMetrics:
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True
+        bridge._availability_check_time = time.time()
 
         result = bridge.query_yield_summary()
 
