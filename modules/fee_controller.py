@@ -169,28 +169,53 @@ class HistoricalResponseCurve:
         # Clamp to bounds
         return max(floor_ppm, min(ceiling_ppm, best_fee))
 
+    # Statistical threshold for regime change detection
+    REGIME_CHANGE_Z_THRESHOLD = 2.5  # Standard deviations from mean
+
     def detect_regime_change(self, current_revenue_rate: float) -> bool:
         """
         Detect if market regime has changed (invalidates historical data).
 
-        A regime change is detected if current revenue is significantly
-        different from recent historical average.
+        Uses statistical z-score test instead of hardcoded 3x threshold:
+        - Calculates mean and standard deviation of recent observations
+        - Detects regime change if current is > REGIME_CHANGE_Z_THRESHOLD
+          standard deviations from the mean
+
+        This is more robust because:
+        - Accounts for historical variability (volatile channels tolerate more)
+        - More sensitive for stable channels (tight band = easier to detect)
+        - Falls back to 3x ratio if insufficient variance data
+
+        Returns:
+            True if regime change detected
         """
         if len(self.observations) < 10:
             return False
 
         # Get recent observations (last 10)
         recent = self.observations[-10:]
-        avg_revenue = sum(o.revenue_rate for o in recent) / len(recent)
+        revenues = [o.revenue_rate for o in recent]
+        avg_revenue = sum(revenues) / len(revenues)
 
         if avg_revenue <= 0:
             return False
 
-        # Regime change if current is >3x or <0.33x the average
-        ratio = current_revenue_rate / avg_revenue
-        if ratio > 3.0 or ratio < 0.33:
-            self.regime_change_count += 1
-            return True
+        # Calculate standard deviation
+        variance = sum((r - avg_revenue) ** 2 for r in revenues) / len(revenues)
+        std_dev = math.sqrt(variance) if variance > 0 else 0
+
+        # Use z-score test if we have meaningful variance
+        if std_dev > 0.01:  # Minimum std to avoid division issues
+            z_score = abs(current_revenue_rate - avg_revenue) / std_dev
+            if z_score > self.REGIME_CHANGE_Z_THRESHOLD:
+                self.regime_change_count += 1
+                return True
+        else:
+            # Fallback to ratio test for very stable revenue (near-zero variance)
+            ratio = current_revenue_rate / avg_revenue
+            if ratio > 3.0 or ratio < 0.33:
+                self.regime_change_count += 1
+                return True
 
         return False
 
