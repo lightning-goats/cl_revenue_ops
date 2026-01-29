@@ -1908,14 +1908,16 @@ class EVRebalancer:
         return result
 
     def _get_route_fee_estimate(self, peer_id: str, amount_msat: int) -> Optional[int]:
+        if amount_msat <= 0:
+            return None
         try:
             route = self.plugin.rpc.getroute(id=peer_id, amount_msat=amount_msat, riskfactor=10, maxhops=6)
             if route.get("route"):
                 first_hop = route["route"][0].get("amount_msat", amount_msat)
-                if isinstance(first_hop, str): 
+                if isinstance(first_hop, str):
                     first_hop = int(first_hop.replace("msat", ""))
                 return int(((first_hop - amount_msat) / amount_msat) * 1_000_000)
-        except Exception: 
+        except Exception:
             pass
         return None
 
