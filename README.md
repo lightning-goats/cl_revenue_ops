@@ -181,6 +181,7 @@ revenue-ops-hive-enabled=auto   # Auto-detect (default)
 | Core Lightning | Required | v23.05+ |
 | Python 3.10+ | Required | |
 | **sling plugin** | **Required** | Rebalancing engine |
+| boltzcli + boltzd | Optional | Required only for `revenue-boltz-*` commands |
 | bookkeeper plugin | Recommended | Accurate cost tracking |
 | CLBoss | **Included** | Base node management (enabled by default in Docker) |
 | cl-hive | Optional | Fleet coordination |
@@ -216,8 +217,9 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 |---------|-------------|
 | `revenue-status` | Check plugin health and active background jobs |
 | `revenue-hive-status` | Check hive integration status and available features |
-| `revenue-config set <key> <value>` | Hot-swap configuration without restart |
+| `revenue-config <get|set|reset|list-mutable> [...]` | Runtime configuration management (view/update/reset mutable keys) |
 | `revenue-analyze` | Force immediate flow analysis |
+| `revenue-wake-all` | Wake all scheduler loops for immediate processing |
 
 ### Policy Management
 
@@ -235,6 +237,9 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 | `revenue-dashboard [window_days]` | Financial health overview with TLV, margins, ROC |
 | `revenue-report summary` | Net Worth, Operating Margin, channel counts |
 | `revenue-report peer <id>` | Deep dive into specific peer's profitability |
+| `revenue-report hive` | Hive fleet coordination and fee-intelligence summary |
+| `revenue-report policies` | Policy coverage and strategy distribution |
+| `revenue-report costs` | Cost breakdowns and estimated defaults |
 | `revenue-capacity-report` | Strategic advice for Splicing/Closing ("Winners & Losers") |
 | `revenue-history` | Lifetime P&L analysis including closure/splice costs |
 | `revenue-profitability` | Channel profitability rankings |
@@ -244,6 +249,7 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 | Command | Description |
 |---------|-------------|
 | `revenue-set-fee <scid> <ppm>` | Manually set fee for a channel |
+| `revenue-fee-anchor [window_days]` | Show fee anchors and flow-derived fee suggestions |
 | `revenue-fee-debug` | Debug fee calculation logic |
 
 ### Rebalancing
@@ -252,6 +258,33 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 |---------|-------------|
 | `revenue-rebalance [scid]` | Manually trigger a rebalance |
 | `revenue-rebalance-debug` | Debug rebalance calculation logic |
+| `revenue-clear-reservations` | Clear stale rebalance reservations from DB |
+
+### Portfolio & Risk
+
+| Command | Description |
+|---------|-------------|
+| `revenue-portfolio [risk_aversion]` | Full portfolio optimization output |
+| `revenue-portfolio-summary [risk_aversion]` | Compact allocation/risk summary |
+| `revenue-portfolio-rebalance [risk_aversion]` | Recommended reallocation actions |
+| `revenue-portfolio-correlations [min_correlation]` | Correlation and hedging analysis |
+
+### Boltz Swaps & Wallets
+
+| Command | Description |
+|---------|-------------|
+| `revenue-boltz-quote <amount_sats> [swap_type] [currency]` | Quote reverse/submarine swap fees (`currency` supports `btc`, `lbtc`, `both`) |
+| `revenue-boltz-loop-out <amount_sats> [address] [channel_id] [peer_id] [currency]` | Reverse swap (LN -> on-chain BTC/LBTC) |
+| `revenue-boltz-loop-in <amount_sats> [channel_id] [peer_id] [currency]` | Submarine swap (on-chain BTC/LBTC -> LN) |
+| `revenue-boltz-status <swap_id>` | Swap status from boltzd + local DB |
+| `revenue-boltz-history [limit]` | Local Boltz history with totals and budget view |
+| `revenue-boltz-budget` | Current swap budget usage (completed + reserved) |
+| `revenue-boltz-wallet` | boltzd wallet balances |
+| `revenue-boltz-deposit [currency]` | Get boltzd deposit address (`btc`/`lbtc`) |
+| `revenue-boltz-withdraw <destination> <amount_sats> [currency] [sat_per_vbyte] [sweep]` | Send funds from boltzd wallet |
+| `revenue-boltz-refund <swap_id> [destination]` | Refund failed submarine/chain swaps |
+| `revenue-boltz-claim <swap_ids> [destination]` | Manual claim for reverse/chain swaps |
+| `revenue-boltz-chainswap <amount_sats> [from_currency] [to_currency] [to_address]` | Chain swap BTC <-> LBTC |
 
 ### CLBoss Integration (Optional)
 
@@ -319,6 +352,18 @@ All options can be set in your CLN config file or via `revenue-config set`.
 
 Runtime config keys (`revenue-config set`): `revenue_boltz_auto`, `boltz_loop_in_max_sats`, `boltz_loop_in_daily_cap_sats`, `boltz_loop_in_min_confirmations`.
 
+### Boltz Swap Controls
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `revenue-ops-swap-daily-budget-sats` | `50000` | Max daily swap fee spend (sats) |
+| `revenue-ops-swap-max-fee-ppm` | `5000` | Max acceptable fee rate per swap |
+| `revenue-ops-swap-min-amount-sats` | `100000` | Minimum allowed swap size |
+| `revenue-ops-swap-max-amount-sats` | `10000000` | Maximum allowed swap size |
+| `revenue-ops-swap-currency` | `lbtc` | Preferred swap currency (`btc` or `lbtc`) |
+
+Runtime config keys (`revenue-config set`): `swap_daily_budget_sats`, `swap_max_fee_ppm`, `swap_min_amount_sats`, `swap_max_amount_sats`, `swap_currency`.
+
 ### Advanced Fee Settings
 
 | Option | Default | Description |
@@ -369,6 +414,7 @@ CLBoss provides automated channel management including peer selection, channel o
 |--------|---------|-------------|
 | `revenue-ops-rpc-timeout-seconds` | `15` | RPC call timeout |
 | `revenue-ops-rpc-circuit-breaker-seconds` | `60` | Circuit breaker cooldown |
+| `revenue-ops-reservation-timeout-hours` | `4` | Hours before stale rebalance reservations are auto-released |
 
 ## Quick Start
 
