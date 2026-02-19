@@ -1305,3 +1305,301 @@ def test_loop_out_btc_override_on_lbtc_config():
     args = create_call[0]
     assert args[0] == "createreverseswap"
     assert args[1] == "btc"
+
+
+# -----------------------------------------------------------------------
+# Audit fix: C3 - Wallet error handling in swap creation
+# -----------------------------------------------------------------------
+
+def test_loop_out_lbtc_wallet_error_returns_error():
+    """C3: If _ensure_lbtc_wallet fails during reverse swap, return error."""
+    manager, _ = _make_lbtc_manager()
+
+    # Quote succeeds, but wallet list will fail
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "quote":
+            return {"serviceFee": 125, "networkFee": 47}
+        if args[0] == "wallet":
+            raise RuntimeError("boltzd connection refused")
+        return {"id": "should-not-reach", "status": "created"}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+    manager._run_boltzcli_raw = MagicMock(side_effect=RuntimeError("boltzd connection refused"))
+
+    result = manager.loop_out(500000)
+
+    assert "error" in result
+    assert "LBTC wallet unavailable" in result["error"]
+
+
+def test_loop_in_lbtc_wallet_error_falls_back_to_btc():
+    """C3: If wallet operations fail during submarine swap, fallback to BTC."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet":
+            raise RuntimeError("boltzd connection refused")
+        if args[0] == "quote":
+            return {"serviceFee": 150, "networkFee": 302}
+        return {"id": "sub-fallback-err", "status": "created"}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+    manager._run_boltzcli_raw = MagicMock(side_effect=RuntimeError("boltzd connection refused"))
+
+    result = manager.loop_in(500000)
+
+    assert result["status"] == "created"
+    assert result["currency"] == "btc"
+    assert result.get("fallback") == "lbtc_insufficient_balance"
+
+
+# -----------------------------------------------------------------------
+# Audit fix: H1 - Fee margin in LBTC balance check
+# -----------------------------------------------------------------------
+
+def test_loop_in_lbtc_fee_margin_triggers_fallback():
+    """H1: Balance must cover amount + 2% fee margin, not just amount."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet":
+            # Balance is exactly the swap amount but not enough with 2% margin
+            return {"wallets": [{"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 500000}}]}
+        if args[0] == "quote":
+            return {"serviceFee": 150, "networkFee": 302}
+        return {"id": "sub-margin", "status": "created"}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.loop_in(500000)
+
+    # 500000 * 1.02 = 510000 > 500000 balance, so should fall back
+    assert result["currency"] == "btc"
+    assert result.get("fallback") == "lbtc_insufficient_balance"
+
+
+def test_loop_in_lbtc_sufficient_with_margin():
+    """Balance covers amount + 2% fee margin — no fallback."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet":
+            # 520000 > 510000 (500000 * 1.02)
+            return {"wallets": [{"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 520000}}]}
+        if args[0] == "quote":
+            return {"serviceFee": 100, "networkFee": 19}
+        return {"id": "sub-lbtc-ok", "status": "created"}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.loop_in(500000)
+
+    assert result["status"] == "created"
+    assert result["currency"] == "lbtc"
+
+
+# -----------------------------------------------------------------------
+# Chain swap (LBTC <-> BTC) tests
+# -----------------------------------------------------------------------
+
+def test_create_chain_swap_lbtc_to_btc():
+    """Chain swap from LBTC to BTC."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet":
+            return {"wallets": [{"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 1000000}}]}
+        return {"id": "chain-1", "status": "created", "serviceFee": 200, "networkFee": 100}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.create_chain_swap(500000, from_currency="lbtc", to_currency="btc")
+
+    assert result["status"] == "created"
+    assert result["swap_id"] == "chain-1"
+    assert result["from_currency"] == "lbtc"
+    assert result["to_currency"] == "btc"
+
+    # Verify createchainswap was called with correct args
+    for call in manager._run_boltzcli.call_args_list:
+        a = call[0]
+        if a[0] == "createchainswap":
+            assert "--from-wallet" in a
+            assert "--to-wallet" in a
+            break
+    else:
+        assert False, "createchainswap call not found"
+
+    # Verify DB record
+    row = manager.db._get_connection().execute(
+        "SELECT * FROM boltz_swaps WHERE id = 'chain-1'"
+    ).fetchone()
+    assert row is not None
+    assert row["swap_type"] == "chain"
+    assert row["currency"] == "lbtc->btc"
+
+
+def test_create_chain_swap_same_currency_rejected():
+    """Chain swap from BTC to BTC should be rejected."""
+    manager, _ = _make_manager()
+    result = manager.create_chain_swap(500000, from_currency="btc", to_currency="btc")
+    assert "error" in result
+    assert "itself" in result["error"]
+
+
+def test_create_chain_swap_insufficient_lbtc():
+    """Chain swap fails when LBTC balance < amount + 2% margin."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet":
+            return {"wallets": [{"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 100}}]}
+        return {}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.create_chain_swap(500000, from_currency="lbtc", to_currency="btc")
+
+    assert "error" in result
+    assert "balance" in result["error"].lower()
+
+
+def test_create_chain_swap_with_to_address():
+    """Chain swap with explicit destination address."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet":
+            return {"wallets": [{"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 1000000}}]}
+        return {"id": "chain-addr", "status": "created"}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.create_chain_swap(500000, to_address="bc1qtest")
+
+    assert result["status"] == "created"
+    for call in manager._run_boltzcli.call_args_list:
+        a = call[0]
+        if a[0] == "createchainswap":
+            assert "--to-address" in a
+            assert "bc1qtest" in a
+            break
+
+
+# -----------------------------------------------------------------------
+# Wallet send/receive tests
+# -----------------------------------------------------------------------
+
+def test_wallet_receive_lbtc():
+    """wallet_receive returns deposit address for LBTC wallet."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet" and args[1] == "list":
+            return {"wallets": [{"name": "liquid", "currency": "LBTC"}]}
+        if args[0] == "wallet" and args[1] == "receive":
+            return {"address": "lq1testaddr123"}
+        return {}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.wallet_receive(currency="lbtc")
+
+    assert result["currency"] == "lbtc"
+    assert result["wallet"] == "liquid"
+    assert result["result"]["address"] == "lq1testaddr123"
+
+
+def test_wallet_receive_wallet_error():
+    """wallet_receive returns error when LBTC wallet fails."""
+    manager, _ = _make_lbtc_manager()
+    manager._run_boltzcli = MagicMock(side_effect=RuntimeError("boltzd down"))
+    manager._run_boltzcli_raw = MagicMock(side_effect=RuntimeError("boltzd down"))
+
+    result = manager.wallet_receive()
+    assert "error" in result
+
+
+def test_wallet_send_lbtc():
+    """wallet_send sends from LBTC wallet."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet" and args[1] == "list":
+            return {"wallets": [{"name": "liquid", "currency": "LBTC"}]}
+        if args[0] == "wallet" and args[1] == "send":
+            return {"txid": "abc123"}
+        return {}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.wallet_send("lq1dest", 100000)
+
+    assert result["status"] == "sent"
+    assert result["amount_sats"] == 100000
+    assert result["currency"] == "lbtc"
+
+
+def test_wallet_send_with_sweep():
+    """wallet_send with sweep flag."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet" and args[1] == "list":
+            return {"wallets": [{"name": "liquid", "currency": "LBTC"}]}
+        if args[0] == "wallet" and args[1] == "send":
+            return {"txid": "sweep123"}
+        return {}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.wallet_send("lq1dest", 0, sweep=True)
+
+    assert result["status"] == "sent"
+    # Verify --sweep was in the command
+    for call in manager._run_boltzcli.call_args_list:
+        a = call[0]
+        if a[0] == "wallet" and a[1] == "send":
+            assert "--sweep" in a
+            break
+
+
+def test_wallet_send_error():
+    """wallet_send returns error on boltzcli failure."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "wallet" and args[1] == "list":
+            return {"wallets": [{"name": "liquid", "currency": "LBTC"}]}
+        if args[0] == "wallet" and args[1] == "send":
+            raise RuntimeError("insufficient funds")
+        return {}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.wallet_send("lq1dest", 100000)
+
+    assert "error" in result
+    assert "insufficient funds" in result["error"]

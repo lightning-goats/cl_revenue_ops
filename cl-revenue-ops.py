@@ -3579,6 +3579,87 @@ def revenue_boltz_claim(plugin: Plugin, swap_ids: list, destination: str = "wall
         return {"error": str(e)}
 
 
+@plugin.method("revenue-boltz-chainswap")
+def revenue_boltz_chainswap(
+    plugin: Plugin,
+    amount_sats: int,
+    from_currency: str = "lbtc",
+    to_currency: str = "btc",
+    to_address: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Execute a chain swap between BTC and LBTC via Boltz (no Lightning).
+
+    Primary use case: convert LBTC back to BTC when you want to exit Liquid.
+
+    Args:
+        amount_sats: Amount to swap in sats.
+        from_currency: Source currency ('btc' or 'lbtc'). Default: lbtc.
+        to_currency: Destination currency ('btc' or 'lbtc'). Default: btc.
+        to_address: Optional BTC/Liquid destination address (default: boltzd wallet).
+    """
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.create_chain_swap(
+            amount_sats,
+            from_currency=from_currency,
+            to_currency=to_currency,
+            to_address=to_address,
+        )
+    except Exception as e:
+        plugin.log(f"Boltz chain swap error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-withdraw")
+def revenue_boltz_withdraw(
+    plugin: Plugin,
+    destination: str,
+    amount_sats: int,
+    currency: str = "lbtc",
+    sat_per_vbyte: Optional[int] = None,
+    sweep: bool = False,
+) -> Dict[str, Any]:
+    """Withdraw funds from a boltzd wallet to an external address.
+
+    Args:
+        destination: Target address (BTC or Liquid address).
+        amount_sats: Amount in sats to send.
+        currency: Wallet to send from ('btc' or 'lbtc'). Default: lbtc.
+        sat_per_vbyte: Optional fee rate override.
+        sweep: If True, send entire wallet balance (ignores amount_sats).
+    """
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.wallet_send(
+            destination=destination,
+            amount_sats=amount_sats,
+            currency=currency,
+            sat_per_vbyte=sat_per_vbyte,
+            sweep=sweep,
+        )
+    except Exception as e:
+        plugin.log(f"Boltz withdraw error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-deposit")
+def revenue_boltz_deposit(plugin: Plugin, currency: str = "lbtc") -> Dict[str, Any]:
+    """Get a deposit address for a boltzd wallet.
+
+    Args:
+        currency: 'btc' or 'lbtc'. Default: lbtc.
+    """
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.wallet_receive(currency=currency)
+    except Exception as e:
+        plugin.log(f"Boltz deposit error: {e}", level='error')
+        return {"error": str(e)}
+
+
 @plugin.method("revenue-cleanup-closed")
 def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
     """

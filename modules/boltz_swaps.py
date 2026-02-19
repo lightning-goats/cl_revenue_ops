@@ -113,6 +113,211 @@ class BoltzSwapManager:
         """Get all boltzd wallet balances (BTC and LBTC)."""
         return self._run_boltzcli("wallet", "list")
 
+    def wallet_receive(self, currency: str = "lbtc") -> Dict[str, Any]:
+        """Get a deposit address for a boltzd wallet.
+
+        Args:
+            currency: 'btc' or 'lbtc'. Defaults to 'lbtc'.
+
+        Returns deposit address for receiving funds into the boltzd wallet.
+        """
+        cur = currency.lower() if currency else "lbtc"
+        if cur == "lbtc":
+            try:
+                wallet_name = self._ensure_lbtc_wallet()
+            except RuntimeError as e:
+                return {"error": f"LBTC wallet unavailable: {e}"}
+        else:
+            # BTC wallet name — boltzd typically uses a default
+            wallet_name = "default"
+
+        try:
+            result = self._run_boltzcli("wallet", "receive", wallet_name)
+        except RuntimeError as e:
+            return {"error": str(e)}
+
+        self._record_audit_event(
+            "wallet_receive_address",
+            f"Generated deposit address for {cur} wallet '{wallet_name}'",
+            details={"currency": cur, "wallet": wallet_name},
+        )
+        return {"currency": cur, "wallet": wallet_name, "result": result}
+
+    def wallet_send(
+        self,
+        destination: str,
+        amount_sats: int,
+        currency: str = "lbtc",
+        sat_per_vbyte: Optional[int] = None,
+        sweep: bool = False,
+    ) -> Dict[str, Any]:
+        """Send funds from a boltzd wallet to an external address.
+
+        Args:
+            destination: Target address (BTC or Liquid address).
+            amount_sats: Amount in sats to send (ignored if sweep=True).
+            currency: 'btc' or 'lbtc'. Defaults to 'lbtc'.
+            sat_per_vbyte: Optional fee rate override.
+            sweep: If True, send entire wallet balance.
+        """
+        cur = currency.lower() if currency else "lbtc"
+        if cur == "lbtc":
+            try:
+                wallet_name = self._ensure_lbtc_wallet()
+            except RuntimeError as e:
+                return {"error": f"LBTC wallet unavailable: {e}"}
+        else:
+            wallet_name = "default"
+
+        cmd_args = ["wallet", "send", wallet_name, destination, str(amount_sats)]
+        if sat_per_vbyte:
+            cmd_args.extend(["--sat-per-vbyte", str(sat_per_vbyte)])
+        if sweep:
+            cmd_args.append("--sweep")
+
+        try:
+            result = self._run_boltzcli(*cmd_args)
+        except RuntimeError as e:
+            self._record_audit_event(
+                "wallet_send_failed", str(e),
+                level="error",
+                details={"destination": destination, "amount_sats": amount_sats, "currency": cur},
+            )
+            return {"error": str(e)}
+
+        self._record_audit_event(
+            "wallet_send_initiated",
+            f"Wallet send: {amount_sats} sats ({cur}) to {destination}"
+            + (" [sweep]" if sweep else ""),
+            details={
+                "destination": destination,
+                "amount_sats": amount_sats,
+                "currency": cur,
+                "sweep": sweep,
+            },
+        )
+        return {"status": "sent", "currency": cur, "amount_sats": amount_sats, "destination": destination, "result": result}
+
+    def create_chain_swap(
+        self,
+        amount_sats: int,
+        from_currency: str = "lbtc",
+        to_currency: str = "btc",
+        to_address: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute a chain swap between BTC and LBTC via Boltz.
+
+        This converts between BTC and LBTC on-chain (no Lightning involved).
+        Primary use case: exit LBTC back to BTC when needed.
+
+        Args:
+            amount_sats: Amount to swap.
+            from_currency: Source currency ('btc' or 'lbtc').
+            to_currency: Destination currency ('btc' or 'lbtc').
+            to_address: Optional destination address (otherwise uses boltzd wallet).
+        """
+        from_cur = from_currency.lower()
+        to_cur = to_currency.lower()
+
+        if from_cur == to_cur:
+            return {"error": f"Cannot chain swap {from_cur} to itself"}
+        if from_cur not in ("btc", "lbtc") or to_cur not in ("btc", "lbtc"):
+            return {"error": f"Invalid currencies: {from_cur} -> {to_cur}"}
+
+        # Resolve wallet names
+        if from_cur == "lbtc":
+            try:
+                from_wallet = self._ensure_lbtc_wallet()
+            except RuntimeError as e:
+                return {"error": f"LBTC wallet unavailable: {e}"}
+            # Check balance (with fee margin)
+            balance = self._get_lbtc_balance(from_wallet)
+            required = int(amount_sats * 1.02)
+            if balance < required:
+                return {
+                    "error": f"LBTC wallet balance {balance} < {required} "
+                    f"(amount {amount_sats} + 2% fee margin)",
+                    "balance": balance,
+                }
+        else:
+            from_wallet = "default"
+
+        if to_cur == "lbtc":
+            try:
+                to_wallet = self._ensure_lbtc_wallet()
+            except RuntimeError as e:
+                return {"error": f"LBTC wallet unavailable: {e}"}
+        else:
+            to_wallet = "default"
+
+        # Build command: createchainswap <amount> --from-wallet <src> --to-wallet <dst>
+        cmd_args = [
+            "createchainswap", str(amount_sats),
+            "--from-wallet", from_wallet,
+            "--to-wallet", to_wallet,
+        ]
+        if to_address:
+            cmd_args.extend(["--to-address", to_address])
+
+        try:
+            result = self._run_boltzcli(*cmd_args)
+        except RuntimeError as e:
+            self._record_audit_event(
+                "chain_swap_failed", str(e),
+                level="error",
+                details={
+                    "amount_sats": amount_sats,
+                    "from": from_cur, "to": to_cur,
+                },
+            )
+            return {"error": str(e)}
+
+        swap_id = result.get("id", "")
+
+        # Record in DB as a chain swap
+        if swap_id:
+            rec = {
+                "id": swap_id,
+                "created_at": self._now_ts(),
+                "updated_at": self._now_ts(),
+                "swap_type": "chain",
+                "amount_sats": amount_sats,
+                "received_sats": 0,
+                "boltz_fee_sats": int(result.get("serviceFee", 0) or 0),
+                "network_fee_sats": int(result.get("networkFee", 0) or result.get("onchainFee", 0) or 0),
+                "total_fee_sats": 0,
+                "fee_ppm": 0,
+                "status": "created",
+                "error": None,
+                "target_channel_id": None,
+                "target_peer_id": None,
+                "currency": f"{from_cur}->{to_cur}",
+            }
+            rec["total_fee_sats"] = rec["boltz_fee_sats"] + rec["network_fee_sats"]
+            rec["fee_ppm"] = int(rec["total_fee_sats"] * 1_000_000 / amount_sats) if amount_sats else 0
+            rec["received_sats"] = max(0, amount_sats - rec["total_fee_sats"])
+            self._record_swap(rec)
+
+        self._record_audit_event(
+            "chain_swap_created",
+            f"Chain swap: {amount_sats} sats {from_cur} -> {to_cur}",
+            swap_id=swap_id,
+            details={
+                "amount_sats": amount_sats,
+                "from": from_cur, "to": to_cur,
+                "to_address": to_address,
+            },
+        )
+
+        return {
+            "status": "created",
+            "swap_id": swap_id,
+            "amount_sats": amount_sats,
+            "from_currency": from_cur,
+            "to_currency": to_cur,
+            "boltzd_response": result,
+        }
+
     # ------------------------------------------------------------------
     # boltzcli interface
     # ------------------------------------------------------------------
@@ -548,7 +753,15 @@ class BoltzSwapManager:
             cmd_args.append(address)
         elif cur == "lbtc":
             # Route to LBTC wallet when no explicit address
-            wallet_name = self._ensure_lbtc_wallet()
+            try:
+                wallet_name = self._ensure_lbtc_wallet()
+            except RuntimeError as e:
+                self._record_audit_event(
+                    "lbtc_wallet_error", f"Failed to ensure LBTC wallet: {e}",
+                    level="error",
+                    details={"amount_sats": amount_sats, "operation": "reverse_swap"},
+                )
+                return {"error": f"LBTC wallet unavailable: {e}"}
             cmd_args.extend(["--to-wallet", wallet_name])
         if channel_id:
             cmd_args.extend(["--chan-id", channel_id])
@@ -636,17 +849,34 @@ class BoltzSwapManager:
 
         # For LBTC, check wallet balance and auto-fallback if insufficient
         if cur == "lbtc":
-            wallet_name = self._ensure_lbtc_wallet()
-            balance = self._get_lbtc_balance(wallet_name)
-            if balance < amount_sats:
-                self._log(
-                    f"LBTC wallet balance {balance} < {amount_sats}, "
-                    f"falling back to BTC for submarine swap",
-                    level="warn",
+            try:
+                wallet_name = self._ensure_lbtc_wallet()
+                balance = self._get_lbtc_balance(wallet_name)
+            except RuntimeError as e:
+                self._record_audit_event(
+                    "lbtc_wallet_error", f"Failed to access LBTC wallet: {e}",
+                    level="error",
+                    details={"amount_sats": amount_sats, "operation": "submarine_swap"},
                 )
+                self._log(f"LBTC wallet error, falling back to BTC: {e}", level="warn")
                 cur = "btc"
                 wallet_name = None
+                balance = 0
                 fallback_used = True
+
+            if cur == "lbtc":
+                # Include 2% fee margin so swap doesn't fail mid-flight
+                required = int(amount_sats * 1.02)
+                if balance < required:
+                    self._log(
+                        f"LBTC wallet balance {balance} < {required} "
+                        f"(amount {amount_sats} + 2% fee margin), "
+                        f"falling back to BTC for submarine swap",
+                        level="warn",
+                    )
+                    cur = "btc"
+                    wallet_name = None
+                    fallback_used = True
 
         # Get quote for budget check (use actual currency after possible fallback)
         q = self.quote_submarine(amount_sats, currency=cur)
