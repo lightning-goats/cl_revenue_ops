@@ -839,6 +839,36 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-swap-daily-budget-sats',
+    default='50000',
+    description='Max daily spend on swap fees in sats (default: 50,000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-swap-max-fee-ppm',
+    default='5000',
+    description='Max acceptable fee rate for any single swap in PPM (default: 5,000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-swap-min-amount-sats',
+    default='100000',
+    description='Minimum swap amount in sats (default: 100,000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-swap-max-amount-sats',
+    default='10000000',
+    description='Maximum swap amount in sats (default: 10,000,000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-swap-currency',
+    default='lbtc',
+    description="Swap currency: 'btc' (on-chain) or 'lbtc' (Liquid, lower fees). Default: lbtc"
+)
+
+plugin.add_option(
     name='revenue-ops-proportional-budget',
     default='true',
     description='If true, scale daily budget based on 24h revenue (default: true)'
@@ -989,6 +1019,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         boltz_loop_in_max_sats=int(options['revenue-ops-boltz-loop-in-max-sats']),
         boltz_loop_in_daily_cap_sats=int(options['revenue-ops-boltz-loop-in-daily-cap-sats']),
         boltz_loop_in_min_confirmations=int(options['revenue-ops-boltz-loop-in-min-conf']),
+        swap_daily_budget_sats=int(options['revenue-ops-swap-daily-budget-sats']),
+        swap_max_fee_ppm=int(options['revenue-ops-swap-max-fee-ppm']),
+        swap_min_amount_sats=int(options['revenue-ops-swap-min-amount-sats']),
+        swap_max_amount_sats=int(options['revenue-ops-swap-max-amount-sats']),
+        swap_currency=options['revenue-ops-swap-currency'].lower(),
         enable_proportional_budget=options['revenue-ops-proportional-budget'].lower() == 'true',
         proportional_budget_pct=float(options['revenue-ops-proportional-budget-pct']),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
@@ -1512,6 +1547,38 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         )
 
     # =========================================================================
+    # SWAP MONITOR: Check pending Boltz swaps
+    # =========================================================================
+    def swap_monitor_loop():
+        """
+        Background loop to check pending Boltz swaps (every 5 minutes).
+
+        Catches swaps that complete asynchronously and records their costs
+        for P&L integration.
+        """
+        SWAP_MONITOR_INTERVAL = 300  # 5 minutes
+
+        # Initial delay: wait 2 minutes
+        if shutdown_event.wait(120):
+            return
+
+        while not shutdown_event.is_set():
+            try:
+                if boltz_swaps is not None:
+                    result = boltz_swaps.check_pending_swaps()
+                    if result.get("updated", 0) > 0:
+                        plugin.log(
+                            f"Swap monitor: checked={result['checked']}, "
+                            f"completed={result.get('completed', 0)}, "
+                            f"failed={result.get('failed', 0)}"
+                        )
+            except Exception as e:
+                plugin.log(f"Error in swap monitor: {e}", level='warn')
+
+            if shutdown_event.wait(SWAP_MONITOR_INTERVAL):
+                break
+
+    # =========================================================================
     # SIGNAL HANDLER: Clean Shutdown on `lightning-cli plugin stop`
     # =========================================================================
     def handle_shutdown_signal(signum, frame):
@@ -1578,6 +1645,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()
     threading.Thread(target=fee_adjustment_loop, daemon=True, name="fee-adjustment").start()
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
+    threading.Thread(target=swap_monitor_loop, daemon=True, name="swap-monitor").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
 
@@ -2909,7 +2977,7 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
             }
 
         elif report_type == "costs":
-            # cl-hive integration: Expose closure/splice costs for capacity planning
+            # cl-hive integration: Expose closure/splice/swap costs for capacity planning
             now = int(time.time())
             day_ago = now - 86400
             week_ago = now - (7 * 86400)
@@ -2925,6 +2993,17 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
             splice_costs_week = database.get_splice_costs_since(week_ago)
             splice_costs_month = database.get_splice_costs_since(month_ago)
             splice_costs_total = database.get_total_splice_costs()
+
+            # Swap costs (Boltz boltzcli integration)
+            try:
+                swap_costs_day = database.get_total_swap_costs(day_ago)
+                swap_costs_week = database.get_total_swap_costs(week_ago)
+                swap_costs_month = database.get_total_swap_costs(month_ago)
+                swap_costs_total = database.get_total_swap_costs(0)
+                swap_stats = database.get_swap_cost_stats(0)
+            except Exception:
+                swap_costs_day = swap_costs_week = swap_costs_month = swap_costs_total = 0
+                swap_stats = {}
 
             # Get splice summary for detailed breakdown
             splice_summary = database.get_splice_summary()
@@ -2951,6 +3030,13 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
                     "last_30d_sats": splice_costs_month,
                     "total_sats": splice_costs_total,
                     "summary": splice_summary
+                },
+                "swap_costs": {
+                    "last_24h_sats": swap_costs_day,
+                    "last_7d_sats": swap_costs_week,
+                    "last_30d_sats": swap_costs_month,
+                    "total_sats": swap_costs_total,
+                    "stats": swap_stats,
                 },
                 "estimated_defaults": estimated_costs,
                 "generated_at": now
@@ -3116,6 +3202,7 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
                 "rebalance_cost_sats": pnl.get("rebalance_cost_sats", 0),
                 "closure_cost_sats": pnl.get("closure_cost_sats", 0),
                 "splice_cost_sats": pnl.get("splice_cost_sats", 0),
+                "swap_cost_sats": pnl.get("swap_cost_sats", 0),
                 "volume_sats": pnl.get("volume_sats", 0),
                 "forward_count": pnl.get("forward_count", 0),
             },
@@ -3352,12 +3439,12 @@ def revenue_portfolio_correlations(
 
 
 @plugin.method("revenue-boltz-quote")
-def revenue_boltz_quote(plugin: Plugin, amount_sats: int) -> Dict[str, Any]:
-    """Get Boltz reverse swap pricing for a given amount."""
+def revenue_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reverse", currency: Optional[str] = None) -> Dict[str, Any]:
+    """Get Boltz swap fee quote. swap_type: 'reverse' or 'submarine'. currency: 'btc', 'lbtc', or 'both'."""
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
     try:
-        return boltz_swaps.quote(amount_sats)
+        return boltz_swaps.quote(amount_sats, swap_type=swap_type, currency=currency)
     except Exception as e:
         plugin.log(f"Boltz quote error: {e}", level='error')
         return {"error": str(e)}
@@ -3368,13 +3455,17 @@ def revenue_boltz_loop_out(
     plugin: Plugin,
     amount_sats: int,
     address: Optional[str] = None,
-    dry_run: bool = False
+    channel_id: Optional[str] = None,
+    peer_id: Optional[str] = None,
+    currency: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute a Boltz reverse swap (loop-out)."""
+    """Execute a Boltz reverse swap (loop-out: LN -> on-chain/LBTC). Uses boltzcli."""
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
     try:
-        return boltz_swaps.loop_out(amount_sats, address=address, dry_run=dry_run)
+        return boltz_swaps.loop_out(amount_sats, address=address,
+                                     channel_id=channel_id, peer_id=peer_id,
+                                     currency=currency)
     except Exception as e:
         plugin.log(f"Boltz loop-out error: {e}", level='error')
         return {"error": str(e)}
@@ -3385,15 +3476,15 @@ def revenue_boltz_loop_in(
     plugin: Plugin,
     amount_sats: int,
     channel_id: Optional[str] = None,
-    peer_id: Optional[str] = None
+    peer_id: Optional[str] = None,
+    currency: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute a Boltz submarine swap (loop-in)."""
+    """Execute a Boltz submarine swap (loop-in: on-chain/LBTC -> LN). Uses boltzcli."""
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
-    if channel_id and peer_id:
-        return {"error": "Provide either channel_id or peer_id, not both"}
     try:
-        return boltz_swaps.loop_in(amount_sats, channel_id=channel_id, peer_id=peer_id)
+        return boltz_swaps.loop_in(amount_sats, channel_id=channel_id,
+                                    peer_id=peer_id, currency=currency)
     except Exception as e:
         plugin.log(f"Boltz loop-in error: {e}", level='error')
         return {"error": str(e)}
@@ -3401,7 +3492,7 @@ def revenue_boltz_loop_in(
 
 @plugin.method("revenue-boltz-status")
 def revenue_boltz_status(plugin: Plugin, swap_id: str) -> Dict[str, Any]:
-    """Get status of a Boltz swap."""
+    """Get status of a Boltz swap from boltzd + local DB."""
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
     try:
@@ -3420,6 +3511,71 @@ def revenue_boltz_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
         return boltz_swaps.history(limit=limit)
     except Exception as e:
         plugin.log(f"Boltz history error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-budget")
+def revenue_boltz_budget(plugin: Plugin) -> Dict[str, Any]:
+    """Show daily swap budget usage (spent/remaining/cap)."""
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.get_budget_status()
+    except Exception as e:
+        plugin.log(f"Boltz budget error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-wallet")
+def revenue_boltz_wallet(plugin: Plugin) -> Dict[str, Any]:
+    """Show boltzd wallet balances (BTC and LBTC)."""
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.get_wallet_balances()
+    except Exception as e:
+        plugin.log(f"Boltz wallet error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-refund")
+def revenue_boltz_refund(plugin: Plugin, swap_id: str, destination: str = "wallet") -> Dict[str, Any]:
+    """Refund a failed submarine/chain swap to recover locked on-chain funds.
+
+    Use this when a submarine swap failed after locking on-chain BTC
+    (e.g., invoice.failedToPay, swap.expired). Funds are refunded after
+    timelock expiry.
+
+    Args:
+        swap_id: The boltzd swap ID to refund.
+        destination: 'wallet' (boltzd internal) or a BTC address. Default: wallet.
+    """
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.refund_swap(swap_id, destination=destination)
+    except Exception as e:
+        plugin.log(f"Boltz refund error: {e}", level='error')
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-claim")
+def revenue_boltz_claim(plugin: Plugin, swap_ids: list, destination: str = "wallet") -> Dict[str, Any]:
+    """Manually claim reverse/chain swaps that failed to auto-claim.
+
+    Use this when boltzd's automatic claim fails for reverse swaps
+    (e.g., boltzd crashed mid-claim, claim tx didn't confirm).
+
+    Args:
+        swap_ids: List of boltzd swap IDs to claim.
+        destination: 'wallet' (boltzd internal) or a BTC address. Default: wallet.
+    """
+    if boltz_swaps is None:
+        return {"error": "boltz_swaps not initialized"}
+    try:
+        return boltz_swaps.claim_swaps(swap_ids, destination=destination)
+    except Exception as e:
+        plugin.log(f"Boltz claim error: {e}", level='error')
         return {"error": str(e)}
 
 

@@ -1322,18 +1322,20 @@ class ChannelProfitabilityAnalyzer:
         # Convert revenue from msat to sats
         lifetime_revenue_sats = stats["total_revenue_msat"] // 1000
 
-        # Get costs (including closure and splice costs - Accounting v2.0)
+        # Get costs (including closure, splice, and swap costs)
         lifetime_opening_costs_sats = stats["total_opening_cost_sats"]
         lifetime_closure_costs_sats = stats.get("total_closure_cost_sats", 0)
         lifetime_splice_costs_sats = stats.get("total_splice_cost_sats", 0)
         lifetime_rebalance_costs_sats = stats["total_rebalance_cost_sats"]
+        lifetime_swap_costs_sats = stats.get("total_swap_cost_sats", 0)
 
-        # Calculate totals (now includes closure and splice costs)
+        # Calculate totals (includes closure, splice, and swap costs)
         lifetime_total_costs_sats = (
             lifetime_opening_costs_sats +
             lifetime_closure_costs_sats +
             lifetime_splice_costs_sats +
-            lifetime_rebalance_costs_sats
+            lifetime_rebalance_costs_sats +
+            lifetime_swap_costs_sats
         )
         lifetime_net_profit_sats = lifetime_revenue_sats - lifetime_total_costs_sats
 
@@ -1355,6 +1357,7 @@ class ChannelProfitabilityAnalyzer:
             "lifetime_closure_costs_sats": lifetime_closure_costs_sats,
             "lifetime_splice_costs_sats": lifetime_splice_costs_sats,
             "lifetime_rebalance_costs_sats": lifetime_rebalance_costs_sats,
+            "lifetime_swap_costs_sats": lifetime_swap_costs_sats,
             "lifetime_total_costs_sats": lifetime_total_costs_sats,
             "lifetime_net_profit_sats": lifetime_net_profit_sats,
             "lifetime_roi_percent": lifetime_roi_percent,
@@ -1395,13 +1398,17 @@ class ChannelProfitabilityAnalyzer:
         volume_sats = self.database.get_total_volume_since(since_timestamp)
         forward_count = self.database.get_total_forward_count_since(since_timestamp)
 
-        # Get OpEx components (Accounting v2.0: includes closure and splice costs)
+        # Get OpEx components (includes closure, splice, and swap costs)
         rebalance_cost_sats = self.database.get_total_rebalance_fees(since_timestamp)
         closure_cost_sats = self.database.get_closure_costs_since(since_timestamp)
         splice_cost_sats = self.database.get_splice_costs_since(since_timestamp)
+        try:
+            swap_cost_sats = self.database.get_total_swap_costs(since_timestamp)
+        except Exception:
+            swap_cost_sats = 0  # Table may not exist on older installs
 
         # Total OpEx
-        opex_sats = rebalance_cost_sats + closure_cost_sats + splice_cost_sats
+        opex_sats = rebalance_cost_sats + closure_cost_sats + splice_cost_sats + swap_cost_sats
 
         # Calculate net profit
         net_profit_sats = gross_revenue_sats - opex_sats
@@ -1420,6 +1427,7 @@ class ChannelProfitabilityAnalyzer:
             'rebalance_cost_sats': rebalance_cost_sats,
             'closure_cost_sats': closure_cost_sats,
             'splice_cost_sats': splice_cost_sats,
+            'swap_cost_sats': swap_cost_sats,
             'net_profit_sats': net_profit_sats,
             'operating_margin_pct': operating_margin_pct,
             'volume_sats': volume_sats,

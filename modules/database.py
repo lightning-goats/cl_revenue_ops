@@ -3301,6 +3301,15 @@ class Database:
         ).fetchone()
         total_splice_cost_sats = splice_row["total"] if splice_row else 0
 
+        # Total swap costs from swap_costs table (Boltz boltzcli integration)
+        try:
+            swap_row = conn.execute(
+                "SELECT COALESCE(SUM(cost_sats), 0) as total FROM swap_costs"
+            ).fetchone()
+            total_swap_cost_sats = swap_row["total"] if swap_row else 0
+        except Exception:
+            total_swap_cost_sats = 0  # Table may not exist on older installs
+
         # Current forward count from forwards table
         count_row = conn.execute(
             "SELECT COUNT(*) as total FROM forwards"
@@ -3322,6 +3331,7 @@ class Database:
             "total_opening_cost_sats": total_opening_cost_sats,
             "total_closure_cost_sats": total_closure_cost_sats,  # Accounting v2.0
             "total_splice_cost_sats": total_splice_cost_sats,  # Accounting v2.0
+            "total_swap_cost_sats": total_swap_cost_sats,  # Boltz swap costs
             "total_forwards": total_forwards
         }
     
@@ -3932,6 +3942,65 @@ class Database:
             "total_splice_in_sats": 0,
             "total_splice_out_sats": 0,
             "total_fees_sats": 0
+        }
+
+    # =========================================================================
+    # Swap Cost Tracking (Boltz boltzcli integration)
+    # =========================================================================
+
+    def record_swap_cost(
+        self,
+        swap_id: str,
+        channel_id: Optional[str],
+        peer_id: Optional[str],
+        cost_sats: int,
+        amount_sats: int,
+        swap_type: str,
+        timestamp: Optional[int] = None,
+    ) -> None:
+        """Record a swap cost for P&L tracking."""
+        conn = self._get_connection()
+        conn.execute(
+            """
+            INSERT INTO swap_costs
+            (swap_id, channel_id, peer_id, cost_sats, amount_sats, swap_type, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (swap_id, channel_id, peer_id, cost_sats, amount_sats,
+             swap_type, timestamp or int(time.time())),
+        )
+
+    def get_total_swap_costs(self, since_timestamp: int = 0) -> int:
+        """Get total swap costs since a timestamp (default: all time)."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(cost_sats), 0) as total FROM swap_costs WHERE timestamp >= ?",
+            (since_timestamp,),
+        ).fetchone()
+        return row["total"] if row else 0
+
+    def get_swap_cost_stats(self, since_timestamp: int = 0) -> Dict[str, Any]:
+        """Get swap cost statistics since a timestamp."""
+        conn = self._get_connection()
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) as count,
+                COALESCE(SUM(cost_sats), 0) as total_cost_sats,
+                COALESCE(AVG(cost_sats), 0) as avg_cost_sats,
+                COALESCE(SUM(CASE WHEN swap_type = 'reverse' THEN cost_sats ELSE 0 END), 0) as reverse_cost_sats,
+                COALESCE(SUM(CASE WHEN swap_type = 'submarine' THEN cost_sats ELSE 0 END), 0) as submarine_cost_sats,
+                COALESCE(SUM(CASE WHEN swap_type = 'reverse' THEN 1 ELSE 0 END), 0) as reverse_count,
+                COALESCE(SUM(CASE WHEN swap_type = 'submarine' THEN 1 ELSE 0 END), 0) as submarine_count
+            FROM swap_costs
+            WHERE timestamp >= ?
+            """,
+            (since_timestamp,),
+        ).fetchone()
+        return dict(row) if row else {
+            "count": 0, "total_cost_sats": 0, "avg_cost_sats": 0,
+            "reverse_cost_sats": 0, "submarine_cost_sats": 0,
+            "reverse_count": 0, "submarine_count": 0,
         }
 
     # =========================================================================
