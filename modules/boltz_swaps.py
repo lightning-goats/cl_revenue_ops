@@ -132,7 +132,7 @@ class BoltzSwapManager:
             wallet_name = "default"
 
         try:
-            result = self._run_boltzcli("wallet", "receive", wallet_name)
+            result = self._run_boltzcli_auto("wallet", "receive", wallet_name)
         except RuntimeError as e:
             return {"error": str(e)}
 
@@ -176,7 +176,7 @@ class BoltzSwapManager:
             cmd_args.append("--sweep")
 
         try:
-            result = self._run_boltzcli(*cmd_args)
+            result = self._run_boltzcli_auto(*cmd_args)
         except RuntimeError as e:
             self._record_audit_event(
                 "wallet_send_failed", str(e),
@@ -223,6 +223,24 @@ class BoltzSwapManager:
             return {"error": f"Cannot chain swap {from_cur} to itself"}
         if from_cur not in ("btc", "lbtc") or to_cur not in ("btc", "lbtc"):
             return {"error": f"Invalid currencies: {from_cur} -> {to_cur}"}
+
+        # Get quote for budget check
+        try:
+            q_args = ["quote", "--send", str(amount_sats),
+                      "--from", from_cur.upper(), "--to", to_cur.upper(), "chain"]
+            q_data = self._run_boltzcli(*q_args)
+            q = self._parse_quote(q_data, amount_sats, "chain")
+        except RuntimeError as e:
+            return {"error": f"Chain swap quote failed: {e}"}
+
+        budget_err = self._check_budget(q["total_fee_sats"], q["fee_ppm"], amount_sats)
+        if budget_err:
+            self._record_audit_event(
+                "chain_swap_budget_blocked", budget_err,
+                level="warn",
+                details={"amount_sats": amount_sats, "from": from_cur, "to": to_cur},
+            )
+            return {"error": budget_err, "budget": self.get_budget_status()}
 
         # Resolve wallet names
         if from_cur == "lbtc":
@@ -322,19 +340,29 @@ class BoltzSwapManager:
     # boltzcli interface
     # ------------------------------------------------------------------
 
+    # Wallet subcommands that accept --json (others like send/receive don't)
+    _WALLET_JSON_SUBCMDS = frozenset({"list", "balances", "transactions"})
+
     def _run_boltzcli(self, *args: str, timeout: int = 60) -> Dict[str, Any]:
         """
         Run a boltzcli command with --json flag and return parsed output.
 
         --json is a per-command flag in boltzcli v2.x, so it's inserted
-        after the command name (first arg), not as a global flag.
+        after the command/subcommand name, not as a global flag.
+
+        For wallet subcommands, --json goes after the subcommand name
+        (e.g., ``wallet list --json``), not after ``wallet``.
 
         Raises RuntimeError on non-zero exit or unparseable output.
         """
-        if args:
-            cmd = ["boltzcli", args[0], "--json", *args[1:]]
-        else:
+        if not args:
             cmd = ["boltzcli", "--json"]
+        elif (args[0] == "wallet" and len(args) > 1
+              and args[1] in self._WALLET_JSON_SUBCMDS):
+            # wallet subcommands: --json belongs to the subcommand
+            cmd = ["boltzcli", "wallet", args[1], "--json", *args[2:]]
+        else:
+            cmd = ["boltzcli", args[0], "--json", *args[1:]]
         try:
             result = subprocess.run(
                 cmd,
@@ -358,6 +386,24 @@ class BoltzSwapManager:
             return json.loads(stdout)
         except json.JSONDecodeError:
             raise RuntimeError(f"boltzcli returned non-JSON output: {stdout[:200]}")
+
+    def _run_boltzcli_auto(self, *args: str, timeout: int = 60) -> Dict[str, Any]:
+        """
+        Run boltzcli without --json and attempt to parse JSON from output.
+
+        Use this for commands that don't support --json but may still
+        return JSON natively (e.g., getinfo, wallet receive).
+        Falls back to {"raw_output": ...} if output isn't JSON.
+
+        Raises RuntimeError on non-zero exit.
+        """
+        raw = self._run_boltzcli_raw(*args, timeout=timeout)
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"raw_output": raw}
 
     def _run_boltzcli_raw(self, *args: str, timeout: int = 60) -> str:
         """
@@ -670,7 +716,7 @@ class BoltzSwapManager:
 
     def get_info(self) -> Dict[str, Any]:
         """Check boltzd connectivity."""
-        return self._run_boltzcli("getinfo")
+        return self._run_boltzcli_auto("getinfo")
 
     def quote_reverse(self, amount_sats: int, currency: Optional[str] = None) -> Dict[str, Any]:
         """Get reverse swap (loop-out) fee quote."""
@@ -1013,7 +1059,7 @@ class BoltzSwapManager:
                 local["error"] = remote_status
                 self._record_swap(local)
                 # Auto-refund if needed (fix #9)
-                if (local.get("swap_type") == "submarine"
+                if (local.get("swap_type") in ("submarine", "chain")
                         and self._is_refundable_status(remote_status)):
                     self._try_auto_refund(swap_id, remote_status)
             else:
@@ -1040,7 +1086,7 @@ class BoltzSwapManager:
         after on-chain lockup (invoice.failedToPay, swap.expired, transaction.lockupFailed).
         """
         try:
-            result = self._run_boltzcli("refundswap", swap_id, destination)
+            result = self._run_boltzcli_auto("refundswap", swap_id, destination)
         except RuntimeError as e:
             self._record_audit_event(
                 "refund_failed", str(e),
@@ -1080,7 +1126,7 @@ class BoltzSwapManager:
             return {"error": "No swap IDs provided"}
 
         try:
-            result = self._run_boltzcli("claimswaps", destination, *swap_ids)
+            result = self._run_boltzcli_auto("claimswaps", destination, *swap_ids)
         except RuntimeError as e:
             self._record_audit_event(
                 "manual_claim_failed", str(e),
@@ -1281,8 +1327,8 @@ class BoltzSwapManager:
                     details={"remote_status": remote_status},
                 )
                 failed += 1
-                # Auto-refund submarine swaps with locked funds (fix #9)
-                if (local.get("swap_type") == "submarine"
+                # Auto-refund submarine/chain swaps with locked funds (fix #9)
+                if (local.get("swap_type") in ("submarine", "chain")
                         and self._is_refundable_status(remote_status)):
                     self._try_auto_refund(swap_id, remote_status)
                     refund_attempts += 1

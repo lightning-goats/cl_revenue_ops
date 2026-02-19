@@ -445,31 +445,22 @@ def test_check_pending_swaps_auto_refund_submarine():
         VALUES ('sub-refund', ?, ?, 'submarine', 500000, 499500, 300, 200, 500, 1000, 'created')
     """, (now, now))
 
-    # listswaps shows invoice.failedToPay — a refundable state
-    call_count = {"n": 0}
-    def mock_boltzcli(*args, **kwargs):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            # listswaps response
-            return {
-                "reverseSwaps": [],
-                "swaps": [{"id": "sub-refund", "status": "invoice.failedToPay"}],
-            }
-        else:
-            # refundswap response
-            return {"id": "sub-refund", "status": "refunded"}
-    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+    # listswaps uses _run_boltzcli (with --json)
+    manager._run_boltzcli = MagicMock(return_value={
+        "reverseSwaps": [],
+        "swaps": [{"id": "sub-refund", "status": "invoice.failedToPay"}],
+    })
+    # refundswap uses _run_boltzcli_auto -> _run_boltzcli_raw
+    manager._run_boltzcli_raw = MagicMock(return_value='{"id": "sub-refund", "status": "refunded"}')
 
     result = manager.check_pending_swaps()
 
     assert result["failed"] == 1
     assert result["refund_attempts"] == 1
 
-    # Verify refundswap was called
-    refund_call = manager._run_boltzcli.call_args_list[1]
-    assert refund_call[0][0] == "refundswap"
-    assert refund_call[0][1] == "sub-refund"
-    assert refund_call[0][2] == "wallet"
+    # Verify refundswap was called via _run_boltzcli_raw
+    assert manager._run_boltzcli_raw.call_count == 1
+    assert manager._run_boltzcli_raw.call_args[0] == ("refundswap", "sub-refund", "wallet")
 
 
 def test_check_pending_swaps_no_refund_for_reverse():
@@ -702,12 +693,14 @@ def test_refund_swap():
         VALUES ('refund-1', ?, ?, 'submarine', 500000, 0, 300, 200, 500, 1000, 'failed', 'invoice.failedToPay')
     """, (now, now))
 
-    manager._run_boltzcli = MagicMock(return_value={"id": "refund-1", "status": "refunded"})
+    # refund_swap uses _run_boltzcli_auto -> _run_boltzcli_raw
+    manager._run_boltzcli_raw = MagicMock(return_value='{"id": "refund-1", "status": "refunded"}')
 
     result = manager.refund_swap("refund-1")
 
     assert result["status"] == "refund_initiated"
-    manager._run_boltzcli.assert_called_once_with("refundswap", "refund-1", "wallet")
+    assert manager._run_boltzcli_raw.call_count == 1
+    assert manager._run_boltzcli_raw.call_args[0] == ("refundswap", "refund-1", "wallet")
 
     # Verify local record updated
     row = conn.execute("SELECT status FROM boltz_swaps WHERE id = 'refund-1'").fetchone()
@@ -717,18 +710,18 @@ def test_refund_swap():
 def test_refund_swap_with_address():
     """refund_swap should accept a BTC address destination."""
     manager, _ = _make_manager()
-    manager._run_boltzcli = MagicMock(return_value={"status": "refunded"})
+    manager._run_boltzcli_raw = MagicMock(return_value='{"status": "refunded"}')
 
     result = manager.refund_swap("refund-addr", "bc1qtest")
 
-    manager._run_boltzcli.assert_called_once_with("refundswap", "refund-addr", "bc1qtest")
+    assert manager._run_boltzcli_raw.call_args[0] == ("refundswap", "refund-addr", "bc1qtest")
     assert result["status"] == "refund_initiated"
 
 
 def test_refund_swap_error():
     """refund_swap should return error when boltzcli fails."""
     manager, _ = _make_manager()
-    manager._run_boltzcli = MagicMock(side_effect=RuntimeError("timelock not expired"))
+    manager._run_boltzcli_raw = MagicMock(side_effect=RuntimeError("timelock not expired"))
 
     result = manager.refund_swap("refund-err")
 
@@ -739,21 +732,21 @@ def test_refund_swap_error():
 def test_claim_swaps():
     """Fix #1: claim_swaps should call boltzcli claimswaps."""
     manager, _ = _make_manager()
-    manager._run_boltzcli = MagicMock(return_value={"status": "claimed"})
+    manager._run_boltzcli_raw = MagicMock(return_value='{"status": "claimed"}')
 
     result = manager.claim_swaps(["claim-1", "claim-2"])
 
     assert result["status"] == "claim_initiated"
-    manager._run_boltzcli.assert_called_once_with("claimswaps", "wallet", "claim-1", "claim-2")
+    assert manager._run_boltzcli_raw.call_args[0] == ("claimswaps", "wallet", "claim-1", "claim-2")
 
 
 def test_claim_swaps_with_address():
     manager, _ = _make_manager()
-    manager._run_boltzcli = MagicMock(return_value={"status": "claimed"})
+    manager._run_boltzcli_raw = MagicMock(return_value='{"status": "claimed"}')
 
     result = manager.claim_swaps(["claim-1"], destination="bc1qtest")
 
-    manager._run_boltzcli.assert_called_once_with("claimswaps", "bc1qtest", "claim-1")
+    assert manager._run_boltzcli_raw.call_args[0] == ("claimswaps", "bc1qtest", "claim-1")
 
 
 def test_claim_swaps_empty_ids():
@@ -853,16 +846,27 @@ def test_swapinfo_failed_triggers_refund_for_submarine():
         VALUES ('sub-fail-info', ?, ?, 'submarine', 500000, 0, 300, 200, 500, 1000, 'created')
     """, (now, now))
 
-    # swapinfo returns refundable failure
-    manager._run_boltzcli_raw = MagicMock(return_value="Id: sub-fail-info\nStatus: invoice.failedToPay")
-    # refundswap call
-    manager._run_boltzcli = MagicMock(return_value={"status": "refunded"})
+    # swapinfo uses _run_boltzcli_raw (already correct — no --json)
+    # refundswap also uses _run_boltzcli_raw via _run_boltzcli_auto
+    # Both go through _run_boltzcli_raw, so mock it with sequential responses
+    call_count = {"n": 0}
+    def mock_raw(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # swapinfo response
+            return "Id: sub-fail-info\nStatus: invoice.failedToPay"
+        else:
+            # refundswap response
+            return '{"status": "refunded"}'
+    manager._run_boltzcli_raw = MagicMock(side_effect=mock_raw)
 
     result = manager.get_swap_info("sub-fail-info")
 
     assert result["local"]["status"] == "failed"
-    # refundswap should have been called
-    manager._run_boltzcli.assert_called_once_with("refundswap", "sub-fail-info", "wallet")
+    # refundswap should have been called via _run_boltzcli_raw
+    assert manager._run_boltzcli_raw.call_count == 2
+    refund_call = manager._run_boltzcli_raw.call_args_list[1]
+    assert refund_call[0] == ("refundswap", "sub-fail-info", "wallet")
 
 
 # -----------------------------------------------------------------------
@@ -1417,6 +1421,8 @@ def test_create_chain_swap_lbtc_to_btc():
     call_count = {"n": 0}
     def mock_boltzcli(*args, **kwargs):
         call_count["n"] += 1
+        if args[0] == "quote":
+            return {"boltzFee": 200, "networkFee": 100}
         if args[0] == "wallet":
             return {"wallets": [{"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 1000000}}]}
         return {"id": "chain-1", "status": "created", "serviceFee": 200, "networkFee": 100}
@@ -1464,6 +1470,8 @@ def test_create_chain_swap_insufficient_lbtc():
     call_count = {"n": 0}
     def mock_boltzcli(*args, **kwargs):
         call_count["n"] += 1
+        if args[0] == "quote":
+            return {"boltzFee": 200, "networkFee": 100}
         if args[0] == "wallet":
             return {"wallets": [{"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 100}}]}
         return {}
@@ -1483,6 +1491,8 @@ def test_create_chain_swap_with_to_address():
     call_count = {"n": 0}
     def mock_boltzcli(*args, **kwargs):
         call_count["n"] += 1
+        if args[0] == "quote":
+            return {"boltzFee": 200, "networkFee": 100}
         if args[0] == "wallet":
             return {"wallets": [{"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 1000000}}]}
         return {"id": "chain-addr", "status": "created"}
@@ -1508,16 +1518,12 @@ def test_wallet_receive_lbtc():
     """wallet_receive returns deposit address for LBTC wallet."""
     manager, _ = _make_lbtc_manager()
 
-    call_count = {"n": 0}
-    def mock_boltzcli(*args, **kwargs):
-        call_count["n"] += 1
-        if args[0] == "wallet" and args[1] == "list":
-            return {"wallets": [{"name": "liquid", "currency": "LBTC"}]}
-        if args[0] == "wallet" and args[1] == "receive":
-            return {"address": "lq1testaddr123"}
-        return {}
-
-    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+    # _ensure_lbtc_wallet uses _run_boltzcli("wallet", "list")
+    manager._run_boltzcli = MagicMock(return_value={
+        "wallets": [{"name": "liquid", "currency": "LBTC"}]
+    })
+    # wallet receive uses _run_boltzcli_auto -> _run_boltzcli_raw
+    manager._run_boltzcli_raw = MagicMock(return_value='{"address": "lq1testaddr123"}')
 
     result = manager.wallet_receive(currency="lbtc")
 
@@ -1540,16 +1546,12 @@ def test_wallet_send_lbtc():
     """wallet_send sends from LBTC wallet."""
     manager, _ = _make_lbtc_manager()
 
-    call_count = {"n": 0}
-    def mock_boltzcli(*args, **kwargs):
-        call_count["n"] += 1
-        if args[0] == "wallet" and args[1] == "list":
-            return {"wallets": [{"name": "liquid", "currency": "LBTC"}]}
-        if args[0] == "wallet" and args[1] == "send":
-            return {"txid": "abc123"}
-        return {}
-
-    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+    # _ensure_lbtc_wallet uses _run_boltzcli("wallet", "list")
+    manager._run_boltzcli = MagicMock(return_value={
+        "wallets": [{"name": "liquid", "currency": "LBTC"}]
+    })
+    # wallet send uses _run_boltzcli_auto -> _run_boltzcli_raw
+    manager._run_boltzcli_raw = MagicMock(return_value='{"txid": "abc123"}')
 
     result = manager.wallet_send("lq1dest", 100000)
 
@@ -1562,42 +1564,31 @@ def test_wallet_send_with_sweep():
     """wallet_send with sweep flag."""
     manager, _ = _make_lbtc_manager()
 
-    call_count = {"n": 0}
-    def mock_boltzcli(*args, **kwargs):
-        call_count["n"] += 1
-        if args[0] == "wallet" and args[1] == "list":
-            return {"wallets": [{"name": "liquid", "currency": "LBTC"}]}
-        if args[0] == "wallet" and args[1] == "send":
-            return {"txid": "sweep123"}
-        return {}
-
-    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+    # _ensure_lbtc_wallet uses _run_boltzcli("wallet", "list")
+    manager._run_boltzcli = MagicMock(return_value={
+        "wallets": [{"name": "liquid", "currency": "LBTC"}]
+    })
+    # wallet send uses _run_boltzcli_auto -> _run_boltzcli_raw
+    manager._run_boltzcli_raw = MagicMock(return_value='{"txid": "sweep123"}')
 
     result = manager.wallet_send("lq1dest", 0, sweep=True)
 
     assert result["status"] == "sent"
-    # Verify --sweep was in the command
-    for call in manager._run_boltzcli.call_args_list:
-        a = call[0]
-        if a[0] == "wallet" and a[1] == "send":
-            assert "--sweep" in a
-            break
+    # Verify --sweep was in the raw command
+    raw_call = manager._run_boltzcli_raw.call_args[0]
+    assert "--sweep" in raw_call
 
 
 def test_wallet_send_error():
     """wallet_send returns error on boltzcli failure."""
     manager, _ = _make_lbtc_manager()
 
-    call_count = {"n": 0}
-    def mock_boltzcli(*args, **kwargs):
-        call_count["n"] += 1
-        if args[0] == "wallet" and args[1] == "list":
-            return {"wallets": [{"name": "liquid", "currency": "LBTC"}]}
-        if args[0] == "wallet" and args[1] == "send":
-            raise RuntimeError("insufficient funds")
-        return {}
-
-    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+    # _ensure_lbtc_wallet uses _run_boltzcli("wallet", "list")
+    manager._run_boltzcli = MagicMock(return_value={
+        "wallets": [{"name": "liquid", "currency": "LBTC"}]
+    })
+    # wallet send uses _run_boltzcli_auto -> _run_boltzcli_raw
+    manager._run_boltzcli_raw = MagicMock(side_effect=RuntimeError("insufficient funds"))
 
     result = manager.wallet_send("lq1dest", 100000)
 
