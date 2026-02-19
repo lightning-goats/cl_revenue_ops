@@ -20,7 +20,8 @@ Tracks costs and swap state in SQLite for P&L integration.
 import time
 import json
 import subprocess
-from typing import Dict, Any, Optional, List
+from uuid import uuid4
+from typing import Dict, Any, Optional, List, Tuple
 
 
 class BoltzSwapManager:
@@ -28,13 +29,14 @@ class BoltzSwapManager:
     DEFAULT_SWAP_MAX_FEE_PPM = 5_000
     DEFAULT_SWAP_MIN_AMOUNT_SATS = 100_000
     DEFAULT_SWAP_MAX_AMOUNT_SATS = 10_000_000
+    DEFAULT_BUDGET_RESERVATION_TTL_SECS = 86_400
 
     def __init__(self, database, safe_plugin, config):
         self.db = database
         self.plugin = safe_plugin
         self.rpc = safe_plugin.rpc
         self.config = config
-        self._lbtc_wallet_name: Optional[str] = None  # Lazy-initialized
+        self._wallet_names: Dict[str, str] = {}  # currency -> wallet name cache
 
         self._ensure_tables()
 
@@ -67,6 +69,29 @@ class BoltzSwapManager:
     def _now_ts(self) -> int:
         return int(time.time())
 
+    def _cli_token(self, value: Any, field_name: str, allow_wallet_keyword: bool = False) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Validate an untrusted token passed to boltzcli.
+
+        Prevents option-style values (e.g. '--foo') and control/whitespace chars
+        that can alter CLI parsing semantics for positional parameters.
+        """
+        if not isinstance(value, str):
+            return None, f"{field_name} must be a string"
+
+        token = value.strip()
+        if not token:
+            return None, f"{field_name} cannot be empty"
+        if token.startswith("-"):
+            return None, f"{field_name} cannot start with '-'"
+        if any(ch.isspace() for ch in token):
+            return None, f"{field_name} cannot contain whitespace"
+        if any(ch in token for ch in ("\n", "\r", "\x00")):
+            return None, f"{field_name} contains invalid control characters"
+        if allow_wallet_keyword and token == "wallet":
+            return token, None
+        return token, None
+
     # ------------------------------------------------------------------
     # Currency & wallet helpers
     # ------------------------------------------------------------------
@@ -80,26 +105,38 @@ class BoltzSwapManager:
         raw = override if override else self._cfg_str("swap_currency", "lbtc")
         return raw.lower() if raw.lower() in ("btc", "lbtc") else "lbtc"
 
-    def _ensure_lbtc_wallet(self) -> str:
-        """Ensure an LBTC wallet exists in boltzd. Returns wallet name.
+    def _get_wallet_name(self, currency: str) -> str:
+        """Get the boltzd wallet name for a given currency.
 
-        Lazy-initialized on first LBTC swap to avoid startup failure
-        if boltzd is slow.
+        Discovers wallet names dynamically from ``wallet list`` and caches
+        them.  For LBTC, auto-creates the wallet if none exists.
+
+        Raises RuntimeError if no wallet is found (BTC) or creation fails (LBTC).
         """
-        if self._lbtc_wallet_name:
-            return self._lbtc_wallet_name
+        cur_upper = currency.upper()
+        if cur_upper in self._wallet_names:
+            return self._wallet_names[cur_upper]
 
         wallets = self._run_boltzcli("wallet", "list")
         for w in wallets.get("wallets", []):
-            if w.get("currency", "").upper() == "LBTC":
-                self._lbtc_wallet_name = w["name"]
-                return self._lbtc_wallet_name
+            if w.get("currency", "").upper() == cur_upper:
+                self._wallet_names[cur_upper] = w["name"]
+                return self._wallet_names[cur_upper]
 
-        # No LBTC wallet found — create one
-        self._run_boltzcli_raw("wallet", "create", "liquid", "LBTC")
-        self._log("Created LBTC wallet 'liquid' in boltzd")
-        self._lbtc_wallet_name = "liquid"
-        return self._lbtc_wallet_name
+        # No wallet found for this currency
+        if cur_upper == "LBTC":
+            # Auto-create LBTC wallet
+            self._run_boltzcli_raw("wallet", "create", "liquid", "LBTC")
+            self._log("Created LBTC wallet 'liquid' in boltzd")
+            self._wallet_names[cur_upper] = "liquid"
+            return "liquid"
+
+        raise RuntimeError(f"No {cur_upper} wallet found in boltzd")
+
+    # Backward-compatible alias
+    def _ensure_lbtc_wallet(self) -> str:
+        """Ensure an LBTC wallet exists in boltzd. Returns wallet name."""
+        return self._get_wallet_name("LBTC")
 
     def _get_lbtc_balance(self, wallet_name: str) -> int:
         """Get confirmed LBTC balance in sats."""
@@ -122,14 +159,10 @@ class BoltzSwapManager:
         Returns deposit address for receiving funds into the boltzd wallet.
         """
         cur = currency.lower() if currency else "lbtc"
-        if cur == "lbtc":
-            try:
-                wallet_name = self._ensure_lbtc_wallet()
-            except RuntimeError as e:
-                return {"error": f"LBTC wallet unavailable: {e}"}
-        else:
-            # BTC wallet name — boltzd typically uses a default
-            wallet_name = "default"
+        try:
+            wallet_name = self._get_wallet_name(cur)
+        except RuntimeError as e:
+            return {"error": f"{cur.upper()} wallet unavailable: {e}"}
 
         try:
             result = self._run_boltzcli_auto("wallet", "receive", wallet_name)
@@ -160,16 +193,21 @@ class BoltzSwapManager:
             sat_per_vbyte: Optional fee rate override.
             sweep: If True, send entire wallet balance.
         """
-        cur = currency.lower() if currency else "lbtc"
-        if cur == "lbtc":
-            try:
-                wallet_name = self._ensure_lbtc_wallet()
-            except RuntimeError as e:
-                return {"error": f"LBTC wallet unavailable: {e}"}
-        else:
-            wallet_name = "default"
+        destination_token, destination_err = self._cli_token(destination, "destination")
+        if destination_err:
+            return {"error": destination_err}
+        if not sweep and int(amount_sats) <= 0:
+            return {"error": "amount_sats must be > 0 unless sweep=true"}
+        if sat_per_vbyte is not None and int(sat_per_vbyte) <= 0:
+            return {"error": "sat_per_vbyte must be > 0"}
 
-        cmd_args = ["wallet", "send", wallet_name, destination, str(amount_sats)]
+        cur = currency.lower() if currency else "lbtc"
+        try:
+            wallet_name = self._get_wallet_name(cur)
+        except RuntimeError as e:
+            return {"error": f"{cur.upper()} wallet unavailable: {e}"}
+
+        cmd_args = ["wallet", "send", wallet_name, destination_token, str(amount_sats)]
         if sat_per_vbyte:
             cmd_args.extend(["--sat-per-vbyte", str(sat_per_vbyte)])
         if sweep:
@@ -181,22 +219,22 @@ class BoltzSwapManager:
             self._record_audit_event(
                 "wallet_send_failed", str(e),
                 level="error",
-                details={"destination": destination, "amount_sats": amount_sats, "currency": cur},
+                details={"destination": destination_token, "amount_sats": amount_sats, "currency": cur},
             )
             return {"error": str(e)}
 
         self._record_audit_event(
             "wallet_send_initiated",
-            f"Wallet send: {amount_sats} sats ({cur}) to {destination}"
+            f"Wallet send: {amount_sats} sats ({cur}) to {destination_token}"
             + (" [sweep]" if sweep else ""),
             details={
-                "destination": destination,
+                "destination": destination_token,
                 "amount_sats": amount_sats,
                 "currency": cur,
                 "sweep": sweep,
             },
         )
-        return {"status": "sent", "currency": cur, "amount_sats": amount_sats, "destination": destination, "result": result}
+        return {"status": "sent", "currency": cur, "amount_sats": amount_sats, "destination": destination_token, "result": result}
 
     def create_chain_swap(
         self,
@@ -223,6 +261,10 @@ class BoltzSwapManager:
             return {"error": f"Cannot chain swap {from_cur} to itself"}
         if from_cur not in ("btc", "lbtc") or to_cur not in ("btc", "lbtc"):
             return {"error": f"Invalid currencies: {from_cur} -> {to_cur}"}
+        if to_address:
+            to_address, address_err = self._cli_token(to_address, "to_address")
+            if address_err:
+                return {"error": address_err}
 
         # Get quote for budget check
         try:
@@ -233,7 +275,7 @@ class BoltzSwapManager:
         except RuntimeError as e:
             return {"error": f"Chain swap quote failed: {e}"}
 
-        budget_err = self._check_budget(q["total_fee_sats"], q["fee_ppm"], amount_sats)
+        reservation_id, budget_err = self._reserve_budget(q["total_fee_sats"], q["fee_ppm"], amount_sats)
         if budget_err:
             self._record_audit_event(
                 "chain_swap_budget_blocked", budget_err,
@@ -242,44 +284,44 @@ class BoltzSwapManager:
             )
             return {"error": budget_err, "budget": self.get_budget_status()}
 
-        # Resolve wallet names
+        # Resolve source wallet
+        try:
+            from_wallet = self._get_wallet_name(from_cur)
+        except RuntimeError as e:
+            self._release_budget_reservation(reservation_id, "chain_swap_wallet_unavailable")
+            return {"error": f"{from_cur.upper()} wallet unavailable: {e}"}
+
+        # Check source balance for LBTC (with fee margin)
         if from_cur == "lbtc":
-            try:
-                from_wallet = self._ensure_lbtc_wallet()
-            except RuntimeError as e:
-                return {"error": f"LBTC wallet unavailable: {e}"}
-            # Check balance (with fee margin)
             balance = self._get_lbtc_balance(from_wallet)
             required = int(amount_sats * 1.02)
             if balance < required:
+                self._release_budget_reservation(reservation_id, "chain_swap_insufficient_lbtc_balance")
                 return {
                     "error": f"LBTC wallet balance {balance} < {required} "
                     f"(amount {amount_sats} + 2% fee margin)",
                     "balance": balance,
                 }
-        else:
-            from_wallet = "default"
 
-        if to_cur == "lbtc":
-            try:
-                to_wallet = self._ensure_lbtc_wallet()
-            except RuntimeError as e:
-                return {"error": f"LBTC wallet unavailable: {e}"}
-        else:
-            to_wallet = "default"
-
-        # Build command: createchainswap <amount> --from-wallet <src> --to-wallet <dst>
+        # Build command — --to-wallet and --to-address are mutually exclusive
         cmd_args = [
             "createchainswap", str(amount_sats),
             "--from-wallet", from_wallet,
-            "--to-wallet", to_wallet,
         ]
         if to_address:
             cmd_args.extend(["--to-address", to_address])
+        else:
+            try:
+                to_wallet = self._get_wallet_name(to_cur)
+            except RuntimeError as e:
+                self._release_budget_reservation(reservation_id, "chain_swap_wallet_unavailable")
+                return {"error": f"{to_cur.upper()} wallet unavailable: {e}"}
+            cmd_args.extend(["--to-wallet", to_wallet])
 
         try:
             result = self._run_boltzcli(*cmd_args)
         except RuntimeError as e:
+            self._release_budget_reservation(reservation_id, "chain_swap_create_failed")
             self._record_audit_event(
                 "chain_swap_failed", str(e),
                 level="error",
@@ -291,6 +333,16 @@ class BoltzSwapManager:
             return {"error": str(e)}
 
         swap_id = result.get("id", "")
+        if not swap_id:
+            self._release_budget_reservation(reservation_id, "chain_swap_missing_id")
+            return {"error": f"No swap ID in response: {result}"}
+
+        fees = self._extract_fees_from_response(result, amount_sats, q)
+        self._attach_budget_reservation(
+            reservation_id,
+            swap_id,
+            max(q["total_fee_sats"], fees["total_fee_sats"]),
+        )
 
         # Record in DB as a chain swap
         if swap_id:
@@ -300,20 +352,17 @@ class BoltzSwapManager:
                 "updated_at": self._now_ts(),
                 "swap_type": "chain",
                 "amount_sats": amount_sats,
-                "received_sats": 0,
-                "boltz_fee_sats": int(result.get("serviceFee", 0) or 0),
-                "network_fee_sats": int(result.get("networkFee", 0) or result.get("onchainFee", 0) or 0),
-                "total_fee_sats": 0,
-                "fee_ppm": 0,
+                "received_sats": fees["received_sats"],
+                "boltz_fee_sats": fees["boltz_fee_sats"],
+                "network_fee_sats": fees["network_fee_sats"],
+                "total_fee_sats": fees["total_fee_sats"],
+                "fee_ppm": fees["fee_ppm"],
                 "status": "created",
                 "error": None,
                 "target_channel_id": None,
                 "target_peer_id": None,
                 "currency": f"{from_cur}->{to_cur}",
             }
-            rec["total_fee_sats"] = rec["boltz_fee_sats"] + rec["network_fee_sats"]
-            rec["fee_ppm"] = int(rec["total_fee_sats"] * 1_000_000 / amount_sats) if amount_sats else 0
-            rec["received_sats"] = max(0, amount_sats - rec["total_fee_sats"])
             self._record_swap(rec)
 
         self._record_audit_event(
@@ -433,17 +482,25 @@ class BoltzSwapManager:
     # Database schema
     # ------------------------------------------------------------------
 
+    def _table_exists(self, conn, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return bool(row)
+
     def _ensure_tables(self):
         conn = self.db._get_connection()
 
         # Rename old table if it exists (one-time migration)
-        try:
-            conn.execute("""
-                ALTER TABLE boltz_swaps RENAME TO boltz_swaps_v1
-            """)
-            self._log("Migrated old boltz_swaps table to boltz_swaps_v1")
-        except Exception:
-            pass  # Already migrated or table didn't exist
+        if self._table_exists(conn, "boltz_swaps") and not self._table_exists(conn, "boltz_swaps_v1"):
+            try:
+                conn.execute("""
+                    ALTER TABLE boltz_swaps RENAME TO boltz_swaps_v1
+                """)
+                self._log("Migrated old boltz_swaps table to boltz_swaps_v1")
+            except Exception:
+                pass
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS boltz_swaps (
@@ -508,6 +565,134 @@ class BoltzSwapManager:
             conn.execute("ALTER TABLE swap_costs ADD COLUMN currency TEXT NOT NULL DEFAULT 'btc'")
         except Exception:
             pass  # Column already exists
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS swap_budget_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                swap_id TEXT UNIQUE,
+                fee_sats INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                note TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_swap_budget_reservations_state ON swap_budget_reservations(state, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_swap_budget_reservations_swap_id ON swap_budget_reservations(swap_id)")
+
+        self._backfill_legacy_swaps(conn)
+
+    def _backfill_legacy_swaps(self, conn) -> None:
+        """
+        Copy legacy rows into the current swap schema so in-flight swaps
+        are still monitored after migration.
+        """
+        if not self._table_exists(conn, "boltz_swaps_v1"):
+            return
+
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(boltz_swaps_v1)").fetchall()
+        }
+        if "id" not in cols:
+            return
+
+        rows = conn.execute("SELECT * FROM boltz_swaps_v1").fetchall()
+        if not rows:
+            return
+
+        def _pick_int(data: Dict[str, Any], keys: List[str], default: int = 0) -> int:
+            for k in keys:
+                if k in data and data[k] is not None:
+                    try:
+                        return int(data[k])
+                    except Exception:
+                        continue
+            return default
+
+        swap_type_map = {
+            "loop_out": "reverse",
+            "loop-out": "reverse",
+            "loop_in": "submarine",
+            "loop-in": "submarine",
+            "loopin": "submarine",
+        }
+
+        migrated = 0
+        now = self._now_ts()
+
+        for row in rows:
+            data = dict(row)
+            swap_id = str(data.get("id", "")).strip()
+            if not swap_id:
+                continue
+
+            exists = conn.execute(
+                "SELECT 1 FROM boltz_swaps WHERE id = ?",
+                (swap_id,),
+            ).fetchone()
+            if exists:
+                continue
+
+            raw_type = str(data.get("swap_type", "") or "").lower()
+            swap_type = swap_type_map.get(raw_type, raw_type or "legacy")
+
+            amount_sats = _pick_int(data, ["amount_sats", "invoice_amount_sats", "onchain_amount_sats"], 0)
+            boltz_fee_sats = _pick_int(data, ["boltz_fee_sats"], 0)
+            network_fee_sats = _pick_int(
+                data,
+                ["network_fee_sats"],
+                _pick_int(data, ["miner_fee_lockup_sats"], 0) + _pick_int(data, ["miner_fee_claim_sats"], 0),
+            )
+            total_fee_sats = _pick_int(data, ["total_fee_sats", "total_cost_sats"], boltz_fee_sats + network_fee_sats)
+            if total_fee_sats <= 0 and (boltz_fee_sats or network_fee_sats):
+                total_fee_sats = boltz_fee_sats + network_fee_sats
+
+            fee_ppm = _pick_int(
+                data,
+                ["fee_ppm", "cost_ppm"],
+                int(total_fee_sats * 1_000_000 / amount_sats) if amount_sats > 0 else 0,
+            )
+            received_sats = _pick_int(data, ["received_sats"], max(0, amount_sats - total_fee_sats))
+
+            currency = str(data.get("currency", "") or "").lower()
+            if not currency:
+                address = str(data.get("address", "") or "").lower()
+                currency = "lbtc" if address.startswith("lq") else "btc"
+
+            created_at = _pick_int(data, ["created_at"], now)
+            updated_at = _pick_int(data, ["updated_at"], created_at)
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO boltz_swaps
+                (id, created_at, updated_at, swap_type, amount_sats, received_sats,
+                 boltz_fee_sats, network_fee_sats, total_fee_sats, fee_ppm, status,
+                 error, target_channel_id, target_peer_id, currency)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    swap_id,
+                    created_at,
+                    updated_at,
+                    swap_type,
+                    amount_sats,
+                    received_sats,
+                    boltz_fee_sats,
+                    network_fee_sats,
+                    total_fee_sats,
+                    fee_ppm,
+                    str(data.get("status", "created") or "created"),
+                    data.get("error"),
+                    data.get("target_channel_id"),
+                    data.get("target_peer_id"),
+                    currency,
+                ),
+            )
+            migrated += 1
+
+        if migrated:
+            self._log(f"Backfilled {migrated} legacy Boltz swap rows into current schema", level="warn")
 
     def _record_swap(self, rec: Dict[str, Any]):
         conn = self.db._get_connection()
@@ -584,25 +769,40 @@ class BoltzSwapManager:
     # Budget enforcement
     # ------------------------------------------------------------------
 
-    def _get_daily_swap_fee_spend(self) -> int:
-        """Sum of total_fee_sats for today's completed swaps."""
+    def _get_daily_completed_swap_fee_spend(self) -> int:
+        """Sum completed swap fees in the rolling 24h window."""
         conn = self.db._get_connection()
         since = self._now_ts() - 86400
         row = conn.execute(
             """
             SELECT COALESCE(SUM(total_fee_sats), 0) AS total
             FROM boltz_swaps
-            WHERE created_at >= ? AND status = 'completed'
+            WHERE updated_at >= ? AND status = 'completed'
             """,
             (since,),
         ).fetchone()
         return int(row["total"]) if row else 0
 
-    def _check_budget(self, quoted_fee_sats: int, fee_ppm: int, amount_sats: int) -> Optional[str]:
-        """
-        Check swap budget constraints. Returns error string if blocked, None if OK.
-        """
-        daily_budget = self._cfg_int("swap_daily_budget_sats", self.DEFAULT_SWAP_DAILY_BUDGET_SATS)
+    def _get_daily_reserved_swap_fee_spend(self) -> int:
+        """Sum active budget reservations in the rolling 24h window."""
+        conn = self.db._get_connection()
+        since = self._now_ts() - 86400
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(fee_sats), 0) AS total
+            FROM swap_budget_reservations
+            WHERE created_at >= ? AND state = 'active'
+            """,
+            (since,),
+        ).fetchone()
+        return int(row["total"]) if row else 0
+
+    def _get_daily_swap_fee_spend(self) -> int:
+        """Effective 24h spend = completed fees + active reservations."""
+        return self._get_daily_completed_swap_fee_spend() + self._get_daily_reserved_swap_fee_spend()
+
+    def _check_budget_limits(self, fee_ppm: int, amount_sats: int) -> Optional[str]:
+        """Validate static per-swap budget limits."""
         max_fee_ppm = self._cfg_int("swap_max_fee_ppm", self.DEFAULT_SWAP_MAX_FEE_PPM)
         min_amount = self._cfg_int("swap_min_amount_sats", self.DEFAULT_SWAP_MIN_AMOUNT_SATS)
         max_amount = self._cfg_int("swap_max_amount_sats", self.DEFAULT_SWAP_MAX_AMOUNT_SATS)
@@ -613,6 +813,17 @@ class BoltzSwapManager:
             return f"Amount {amount_sats} above maximum {max_amount} sats"
         if fee_ppm > max_fee_ppm:
             return f"Fee rate {fee_ppm} ppm exceeds maximum {max_fee_ppm} ppm"
+        return None
+
+    def _check_budget(self, quoted_fee_sats: int, fee_ppm: int, amount_sats: int) -> Optional[str]:
+        """
+        Check swap budget constraints. Returns error string if blocked, None if OK.
+        """
+        self._cleanup_stale_budget_reservations()
+        daily_budget = self._cfg_int("swap_daily_budget_sats", self.DEFAULT_SWAP_DAILY_BUDGET_SATS)
+        static_err = self._check_budget_limits(fee_ppm, amount_sats)
+        if static_err:
+            return static_err
 
         daily_spent = self._get_daily_swap_fee_spend()
         if daily_spent + quoted_fee_sats > daily_budget:
@@ -623,13 +834,192 @@ class BoltzSwapManager:
 
         return None
 
+    def _cleanup_stale_budget_reservations(self, ttl_seconds: Optional[int] = None) -> int:
+        """Release stale active reservations to avoid orphan budget locks."""
+        conn = self.db._get_connection()
+        ttl = int(ttl_seconds or self.DEFAULT_BUDGET_RESERVATION_TTL_SECS)
+        cutoff = self._now_ts() - max(1, ttl)
+        stale = conn.execute(
+            """
+            SELECT reservation_id
+            FROM swap_budget_reservations
+            WHERE state = 'active' AND created_at < ?
+            """,
+            (cutoff,),
+        ).fetchall()
+        if not stale:
+            return 0
+
+        now = self._now_ts()
+        conn.execute(
+            """
+            UPDATE swap_budget_reservations
+            SET state = 'released', updated_at = ?, note = 'stale_timeout'
+            WHERE state = 'active' AND created_at < ?
+            """,
+            (now, cutoff),
+        )
+        return len(stale)
+
+    def _reserve_budget(self, quoted_fee_sats: int, fee_ppm: int, amount_sats: int) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Atomically reserve daily budget before submitting a swap.
+        Returns (reservation_id, error).
+        """
+        static_err = self._check_budget_limits(fee_ppm, amount_sats)
+        if static_err:
+            return None, static_err
+
+        quoted_fee = max(0, int(quoted_fee_sats))
+        daily_budget = self._cfg_int("swap_daily_budget_sats", self.DEFAULT_SWAP_DAILY_BUDGET_SATS)
+        reservation_id = f"swap-rsv-{uuid4().hex}"
+        since = self._now_ts() - 86400
+        now = self._now_ts()
+
+        self._cleanup_stale_budget_reservations()
+        conn = self.db._get_connection()
+        savepoint_name: Optional[str] = None
+        try:
+            if getattr(conn, "in_transaction", False):
+                savepoint_name = f"swap_budget_{uuid4().hex[:12]}"
+                conn.execute(f"SAVEPOINT {savepoint_name}")
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            completed_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(total_fee_sats), 0) AS total
+                FROM boltz_swaps
+                WHERE updated_at >= ? AND status = 'completed'
+                """,
+                (since,),
+            ).fetchone()
+            reserved_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(fee_sats), 0) AS total
+                FROM swap_budget_reservations
+                WHERE created_at >= ? AND state = 'active'
+                """,
+                (since,),
+            ).fetchone()
+
+            completed = int(completed_row["total"]) if completed_row else 0
+            reserved = int(reserved_row["total"]) if reserved_row else 0
+            projected = completed + reserved + quoted_fee
+            if projected > daily_budget:
+                if savepoint_name:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                else:
+                    conn.execute("ROLLBACK")
+                return None, (
+                    f"Daily swap budget exceeded: {completed} (completed) + "
+                    f"{reserved} (reserved) + {quoted_fee} > {daily_budget} sats"
+                )
+
+            conn.execute(
+                """
+                INSERT INTO swap_budget_reservations
+                (reservation_id, swap_id, fee_sats, state, created_at, updated_at, note)
+                VALUES (?, NULL, ?, 'active', ?, ?, 'reserved_pre_create')
+                """,
+                (reservation_id, quoted_fee, now, now),
+            )
+            if savepoint_name:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+            else:
+                conn.execute("COMMIT")
+            return reservation_id, None
+        except Exception as e:
+            try:
+                if savepoint_name:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                else:
+                    conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            return None, f"Budget reservation failed: {e}"
+
+    def _attach_budget_reservation(self, reservation_id: Optional[str], swap_id: str, fee_sats: int) -> None:
+        """Attach a pre-create reservation to a concrete swap ID."""
+        if not reservation_id or not swap_id:
+            return
+        conn = self.db._get_connection()
+        now = self._now_ts()
+        conn.execute(
+            """
+            UPDATE swap_budget_reservations
+            SET swap_id = ?, fee_sats = ?, updated_at = ?, note = 'attached_to_swap'
+            WHERE reservation_id = ? AND state = 'active'
+            """,
+            (swap_id, max(0, int(fee_sats)), now, reservation_id),
+        )
+
+    def _release_budget_reservation(self, reservation_id: Optional[str], note: str) -> None:
+        """Release an active reservation by reservation ID."""
+        if not reservation_id:
+            return
+        conn = self.db._get_connection()
+        conn.execute(
+            """
+            UPDATE swap_budget_reservations
+            SET state = 'released', updated_at = ?, note = ?
+            WHERE reservation_id = ? AND state = 'active'
+            """,
+            (self._now_ts(), note, reservation_id),
+        )
+
+    def _finalize_budget_reservation_for_swap(self, swap_id: str, final_fee_sats: Optional[int] = None) -> None:
+        """Finalize reservation when swap reaches completed state."""
+        if not swap_id:
+            return
+        conn = self.db._get_connection()
+        now = self._now_ts()
+        if final_fee_sats is None:
+            conn.execute(
+                """
+                UPDATE swap_budget_reservations
+                SET state = 'finalized', updated_at = ?, note = 'swap_completed'
+                WHERE swap_id = ? AND state = 'active'
+                """,
+                (now, swap_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE swap_budget_reservations
+                SET state = 'finalized', fee_sats = ?, updated_at = ?, note = 'swap_completed'
+                WHERE swap_id = ? AND state = 'active'
+                """,
+                (max(0, int(final_fee_sats)), now, swap_id),
+            )
+
+    def _release_budget_reservation_for_swap(self, swap_id: str, note: str) -> None:
+        """Release reservation when swap fails/refunds before completion."""
+        if not swap_id:
+            return
+        conn = self.db._get_connection()
+        conn.execute(
+            """
+            UPDATE swap_budget_reservations
+            SET state = 'released', updated_at = ?, note = ?
+            WHERE swap_id = ? AND state = 'active'
+            """,
+            (self._now_ts(), note, swap_id),
+        )
+
     def get_budget_status(self) -> Dict[str, Any]:
         """Get current swap budget usage."""
+        self._cleanup_stale_budget_reservations()
         daily_budget = self._cfg_int("swap_daily_budget_sats", self.DEFAULT_SWAP_DAILY_BUDGET_SATS)
-        daily_spent = self._get_daily_swap_fee_spend()
+        completed_spent = self._get_daily_completed_swap_fee_spend()
+        reserved_spent = self._get_daily_reserved_swap_fee_spend()
+        daily_spent = completed_spent + reserved_spent
         return {
             "daily_budget_sats": daily_budget,
             "daily_spent_sats": daily_spent,
+            "daily_completed_sats": completed_spent,
+            "daily_reserved_sats": reserved_spent,
             "daily_remaining_sats": max(0, daily_budget - daily_spent),
             "max_fee_ppm": self._cfg_int("swap_max_fee_ppm", self.DEFAULT_SWAP_MAX_FEE_PPM),
             "min_amount_sats": self._cfg_int("swap_min_amount_sats", self.DEFAULT_SWAP_MIN_AMOUNT_SATS),
@@ -778,13 +1168,21 @@ class BoltzSwapManager:
         routed to the boltzd LBTC wallet (auto-created if needed).
         """
         cur = self._get_currency(currency)
+        if address:
+            address, address_err = self._cli_token(address, "address")
+            if address_err:
+                return {"error": address_err}
+        if channel_id:
+            channel_id, channel_err = self._cli_token(channel_id, "channel_id")
+            if channel_err:
+                return {"error": channel_err}
 
         # Get quote for budget check
         q = self.quote_reverse(amount_sats, currency=cur)
         if "error" in q:
             return q
 
-        budget_err = self._check_budget(q["total_fee_sats"], q["fee_ppm"], amount_sats)
+        reservation_id, budget_err = self._reserve_budget(q["total_fee_sats"], q["fee_ppm"], amount_sats)
         if budget_err:
             self._record_audit_event(
                 "reverse_swap_budget_blocked", budget_err,
@@ -802,6 +1200,7 @@ class BoltzSwapManager:
             try:
                 wallet_name = self._ensure_lbtc_wallet()
             except RuntimeError as e:
+                self._release_budget_reservation(reservation_id, "reverse_swap_lbtc_wallet_unavailable")
                 self._record_audit_event(
                     "lbtc_wallet_error", f"Failed to ensure LBTC wallet: {e}",
                     level="error",
@@ -815,6 +1214,7 @@ class BoltzSwapManager:
         try:
             result = self._run_boltzcli(*cmd_args)
         except RuntimeError as e:
+            self._release_budget_reservation(reservation_id, "reverse_swap_create_failed")
             self._record_audit_event(
                 "reverse_swap_failed", str(e),
                 level="error",
@@ -824,10 +1224,16 @@ class BoltzSwapManager:
 
         swap_id = result.get("id", "")
         if not swap_id:
+            self._release_budget_reservation(reservation_id, "reverse_swap_missing_id")
             return {"error": f"No swap ID in response: {result}"}
 
         # Extract actual fees from creation response, fall back to quote (fix #4)
         fees = self._extract_fees_from_response(result, amount_sats, q)
+        self._attach_budget_reservation(
+            reservation_id,
+            swap_id,
+            max(q["total_fee_sats"], fees["total_fee_sats"]),
+        )
 
         # Record swap
         rec = {
@@ -889,6 +1295,15 @@ class BoltzSwapManager:
         When currency is 'lbtc', spends from the boltzd LBTC wallet.
         If the LBTC wallet has insufficient balance, auto-falls back to BTC.
         """
+        if channel_id:
+            channel_id, channel_err = self._cli_token(channel_id, "channel_id")
+            if channel_err:
+                return {"error": channel_err}
+        if peer_id:
+            peer_id, peer_err = self._cli_token(peer_id, "peer_id")
+            if peer_err:
+                return {"error": peer_err}
+
         cur = self._get_currency(currency)
         wallet_name = None
         fallback_used = False
@@ -929,7 +1344,7 @@ class BoltzSwapManager:
         if "error" in q:
             return q
 
-        budget_err = self._check_budget(q["total_fee_sats"], q["fee_ppm"], amount_sats)
+        reservation_id, budget_err = self._reserve_budget(q["total_fee_sats"], q["fee_ppm"], amount_sats)
         if budget_err:
             self._record_audit_event(
                 "submarine_swap_budget_blocked", budget_err,
@@ -947,6 +1362,7 @@ class BoltzSwapManager:
         try:
             result = self._run_boltzcli(*cmd_args)
         except RuntimeError as e:
+            self._release_budget_reservation(reservation_id, "submarine_swap_create_failed")
             self._record_audit_event(
                 "submarine_swap_failed", str(e),
                 level="error",
@@ -956,10 +1372,16 @@ class BoltzSwapManager:
 
         swap_id = result.get("id", "")
         if not swap_id:
+            self._release_budget_reservation(reservation_id, "submarine_swap_missing_id")
             return {"error": f"No swap ID in response: {result}"}
 
         # Extract actual fees from creation response, fall back to quote (fix #4)
         fees = self._extract_fees_from_response(result, amount_sats, q)
+        self._attach_budget_reservation(
+            reservation_id,
+            swap_id,
+            max(q["total_fee_sats"], fees["total_fee_sats"]),
+        )
 
         # Record swap
         rec = {
@@ -1034,6 +1456,10 @@ class BoltzSwapManager:
 
         swapinfo does NOT support --json, so we use raw output and parse it.
         """
+        swap_id, swap_id_err = self._cli_token(swap_id, "swap_id")
+        if swap_id_err:
+            return {"error": swap_id_err}
+
         local = self._get_swap(swap_id)
 
         # swapinfo doesn't support --json — go straight to raw parsing (fix #5)
@@ -1052,12 +1478,14 @@ class BoltzSwapManager:
             if self._is_completed_status(remote_status):
                 local["status"] = "completed"
                 self._record_swap(local)
+                self._finalize_budget_reservation_for_swap(swap_id, final_fee_sats=local.get("total_fee_sats", 0))
                 # Record cost if not already recorded
                 self._maybe_record_completion_cost(local)
             elif self._is_failed_status(remote_status):
                 local["status"] = "failed"
                 local["error"] = remote_status
                 self._record_swap(local)
+                self._release_budget_reservation_for_swap(swap_id, "swap_failed")
                 # Auto-refund if needed (fix #9)
                 if (local.get("swap_type") in ("submarine", "chain")
                         and self._is_refundable_status(remote_status)):
@@ -1085,6 +1513,13 @@ class BoltzSwapManager:
         This is critical for recovering funds from submarine swaps that failed
         after on-chain lockup (invoice.failedToPay, swap.expired, transaction.lockupFailed).
         """
+        swap_id, swap_id_err = self._cli_token(swap_id, "swap_id")
+        if swap_id_err:
+            return {"error": swap_id_err}
+        destination, destination_err = self._cli_token(destination, "destination", allow_wallet_keyword=True)
+        if destination_err:
+            return {"error": destination_err}
+
         try:
             result = self._run_boltzcli_auto("refundswap", swap_id, destination)
         except RuntimeError as e:
@@ -1109,6 +1544,7 @@ class BoltzSwapManager:
             local["status"] = "refunded"
             local["updated_at"] = self._now_ts()
             self._record_swap(local)
+            self._release_budget_reservation_for_swap(swap_id, "swap_refunded")
 
         return {"status": "refund_initiated", "swap_id": swap_id, "result": result}
 
@@ -1122,6 +1558,23 @@ class BoltzSwapManager:
         Use this when boltzd's automatic claim fails (e.g., crash mid-claim,
         claim tx didn't confirm). The funds are in the HTLC and need active claiming.
         """
+        if isinstance(swap_ids, str):
+            swap_ids = [swap_ids]
+        elif not isinstance(swap_ids, (list, tuple, set)):
+            return {"error": "swap_ids must be a list of swap IDs"}
+
+        destination, destination_err = self._cli_token(destination, "destination", allow_wallet_keyword=True)
+        if destination_err:
+            return {"error": destination_err}
+
+        validated_ids: List[str] = []
+        for sid in list(swap_ids):
+            sid_token, sid_err = self._cli_token(sid, "swap_id")
+            if sid_err:
+                return {"error": sid_err}
+            validated_ids.append(sid_token)
+        swap_ids = validated_ids
+
         if not swap_ids:
             return {"error": "No swap IDs provided"}
 
@@ -1145,7 +1598,7 @@ class BoltzSwapManager:
 
         return {"status": "claim_initiated", "swap_ids": swap_ids, "result": result}
 
-    def _try_auto_refund(self, swap_id: str, failed_status: str) -> None:
+    def _try_auto_refund(self, swap_id: str, failed_status: str) -> bool:
         """Attempt automatic refund for a submarine swap with locked funds.
 
         Called when a submarine swap enters a refundable failure state.
@@ -1165,6 +1618,7 @@ class BoltzSwapManager:
                     swap_id=swap_id,
                     details={"failed_status": failed_status},
                 )
+                return True
             else:
                 # Refund may not be possible yet (timelock not expired).
                 # Will retry on next monitoring cycle.
@@ -1175,6 +1629,7 @@ class BoltzSwapManager:
                     level="warn",
                     details={"failed_status": failed_status, "error": result["error"]},
                 )
+                return False
         except Exception as e:
             self._record_audit_event(
                 "auto_refund_error",
@@ -1183,10 +1638,12 @@ class BoltzSwapManager:
                 level="error",
                 details={"failed_status": failed_status},
             )
+            return False
 
     def _maybe_record_completion_cost(self, local: Dict[str, Any]) -> None:
         """Record swap cost for P&L if not already recorded for this swap."""
         swap_id = local["id"]
+        self._finalize_budget_reservation_for_swap(swap_id, final_fee_sats=local.get("total_fee_sats", 0))
         conn = self.db._get_connection()
         existing = conn.execute(
             "SELECT 1 FROM swap_costs WHERE swap_id = ?", (swap_id,)
@@ -1264,7 +1721,22 @@ class BoltzSwapManager:
         """
         conn = self.db._get_connection()
         rows = conn.execute(
-            "SELECT * FROM boltz_swaps WHERE status NOT IN ('completed', 'failed', 'refunded')"
+            """
+            SELECT *
+            FROM boltz_swaps
+            WHERE status NOT IN ('completed', 'refunded')
+              AND (
+                status != 'failed'
+                OR (
+                  swap_type IN ('submarine', 'chain')
+                  AND LOWER(COALESCE(error, '')) IN (
+                    'invoice.failedtopay',
+                    'swap.expired',
+                    'transaction.lockupfailed'
+                  )
+                )
+              )
+            """
         ).fetchall()
         pending = [dict(r) for r in rows]
 
@@ -1298,7 +1770,21 @@ class BoltzSwapManager:
                 continue
 
             remote_status = remote.get("status", "")
-            if not remote_status or remote_status == local.get("status"):
+            if not remote_status:
+                continue
+
+            # Keep retrying auto-refund for failed swaps in refundable states.
+            # Failed swaps are intentionally included in the query above so
+            # timelock-dependent refunds can succeed in later monitor cycles.
+            if local.get("status") == "failed" and self._is_failed_status(remote_status):
+                if (local.get("swap_type") in ("submarine", "chain")
+                        and self._is_refundable_status(remote_status)):
+                    if self._try_auto_refund(swap_id, remote_status):
+                        updated += 1
+                    refund_attempts += 1
+                continue
+
+            if remote_status == local.get("status"):
                 continue
 
             local["updated_at"] = self._now_ts()
@@ -1306,6 +1792,7 @@ class BoltzSwapManager:
             if self._is_completed_status(remote_status):
                 local["status"] = "completed"
                 self._record_swap(local)
+                self._finalize_budget_reservation_for_swap(swap_id, final_fee_sats=local.get("total_fee_sats", 0))
                 # Record cost for P&L (idempotent)
                 self._maybe_record_completion_cost(local)
                 self._record_audit_event(
@@ -1319,6 +1806,7 @@ class BoltzSwapManager:
                 local["status"] = "failed"
                 local["error"] = remote_status
                 self._record_swap(local)
+                self._release_budget_reservation_for_swap(swap_id, "swap_failed")
                 self._record_audit_event(
                     "swap_failed",
                     f"Swap failed: {swap_id}",

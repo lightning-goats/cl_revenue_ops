@@ -2,6 +2,14 @@ import time
 from unittest.mock import MagicMock
 
 
+def _rpc_calls_for(mock_plugin, method: str):
+    """Return all rpc.call invocations for a given RPC method name."""
+    return [
+        c for c in mock_plugin.rpc.call.call_args_list
+        if c[0] and c[0][0] == method
+    ]
+
+
 def _candidate(
     *,
     source_candidates=None,
@@ -508,10 +516,9 @@ class TestSlingOnce:
         )
 
         assert result["success"] is True
-        mock_plugin.rpc.call.assert_called_once()
-        call_args = mock_plugin.rpc.call.call_args[0]
-        assert call_args[0] == "sling-once"
-        params = call_args[1]
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
         assert params["scid"] == "123x456x0"
         assert params["direction"] == "pull"
         assert params["amount"] == 100000
@@ -540,11 +547,13 @@ class TestSlingOnce:
         )
 
         assert result["success"] is True
-        call_args = mock_plugin.rpc.call.call_args[0][1]
-        assert call_args["scid"] == "123x456x0"
-        assert call_args["direction"] == "push"
-        assert call_args["candidates"] == ["111x222x0", "333x444x0"]
-        assert call_args["outppm"] == 200
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
+        assert params["scid"] == "123x456x0"
+        assert params["direction"] == "push"
+        assert params["candidates"] == ["111x222x0", "333x444x0"]
+        assert params["outppm"] == 200
 
     def test_execute_once_rounds_up_onceamount(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -560,8 +569,10 @@ class TestSlingOnce:
             scid="123x456x0", direction="pull",
             amount=100000, maxppm=500, onceamount=150000,
         )
-        call_args = mock_plugin.rpc.call.call_args[0][1]
-        assert call_args["onceamount"] == 200000
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
+        assert params["onceamount"] == 200000
 
     def test_execute_once_rpc_error(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -1096,7 +1107,9 @@ class TestSlingOnceNewParams:
 
         jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
 
-        params = mock_plugin.rpc.call.call_args[0][1]
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
         assert params["maxhops"] == 3
 
     def test_execute_once_explicit_maxhops_overrides_config(self, mock_plugin, mock_database):
@@ -1109,7 +1122,9 @@ class TestSlingOnceNewParams:
 
         jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500, maxhops=2)
 
-        params = mock_plugin.rpc.call.call_args[0][1]
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
         assert params["maxhops"] == 2
 
     def test_execute_once_passes_depletion_params(self, mock_plugin, mock_database):
@@ -1125,7 +1140,9 @@ class TestSlingOnceNewParams:
             depleteuptopercent=0.15, depleteuptoamount=50000,
         )
 
-        params = mock_plugin.rpc.call.call_args[0][1]
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
         assert params["depleteuptopercent"] == 0.15
         assert params["depleteuptoamount"] == 50000
 
@@ -1139,7 +1156,9 @@ class TestSlingOnceNewParams:
 
         jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
 
-        params = mock_plugin.rpc.call.call_args[0][1]
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
         assert "depleteuptopercent" not in params
         assert "depleteuptoamount" not in params
 
@@ -1153,7 +1172,9 @@ class TestSlingOnceNewParams:
 
         jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
 
-        params = mock_plugin.rpc.call.call_args[0][1]
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
         assert params["paralleljobs"] == 3
 
     def test_execute_once_omits_paralleljobs_when_one(self, mock_plugin, mock_database):
@@ -1166,7 +1187,9 @@ class TestSlingOnceNewParams:
 
         jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
 
-        params = mock_plugin.rpc.call.call_args[0][1]
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
         assert "paralleljobs" not in params
 
     def test_execute_once_no_target(self, mock_plugin, mock_database):
@@ -1180,7 +1203,9 @@ class TestSlingOnceNewParams:
 
         jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
 
-        params = mock_plugin.rpc.call.call_args[0][1]
+        sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
+        assert len(sling_once_calls) == 1
+        params = sling_once_calls[0][0][1]
         assert "target" not in params
 
 

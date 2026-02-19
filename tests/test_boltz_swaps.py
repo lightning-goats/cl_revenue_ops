@@ -8,7 +8,9 @@ from modules.boltz_swaps import BoltzSwapManager
 
 class _TestDB:
     def __init__(self):
-        self.conn = sqlite3.connect(":memory:")
+        # Match production DB behavior (autocommit mode) to avoid implicit
+        # long-lived transactions affecting reservation semantics.
+        self.conn = sqlite3.connect(":memory:", isolation_level=None)
         self.conn.row_factory = sqlite3.Row
 
     def _get_connection(self):
@@ -308,6 +310,111 @@ def test_budget_status():
     assert budget["daily_remaining_sats"] == 50000
 
 
+def test_daily_budget_uses_completion_time_not_creation_time():
+    manager, _ = _make_manager(config={
+        "swap_daily_budget_sats": 50000,
+        "swap_max_fee_ppm": 5000,
+        "swap_min_amount_sats": 100000,
+        "swap_max_amount_sats": 10000000,
+        "swap_currency": "btc",
+    })
+    conn = manager.db._get_connection()
+    now = manager._now_ts()
+    # Created long ago, but completed recently -> should count in daily spend.
+    conn.execute("""
+        INSERT INTO boltz_swaps (id, created_at, updated_at, swap_type,
+            amount_sats, received_sats, boltz_fee_sats, network_fee_sats,
+            total_fee_sats, fee_ppm, status)
+        VALUES ('old-created-new-complete', ?, ?, 'reverse', 500000, 499500, 300, 200, 500, 1000, 'completed')
+    """, (now - 172800, now - 10))
+
+    budget = manager.get_budget_status()
+    assert budget["daily_completed_sats"] == 500
+    assert budget["daily_spent_sats"] == 500
+
+
+def test_budget_reservation_blocks_second_swap_before_completion():
+    manager, _ = _make_manager(config={
+        "swap_daily_budget_sats": 500,
+        "swap_max_fee_ppm": 5000,
+        "swap_min_amount_sats": 100000,
+        "swap_max_amount_sats": 10000000,
+        "swap_currency": "btc",
+    })
+
+    call_count = {"n": 0}
+
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "quote":
+            return {"serviceFee": 200, "networkFee": 100}
+        return {"id": f"swap-{call_count['n']}", "status": "created"}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    first = manager.loop_out(500000)
+    second = manager.loop_out(500000)
+
+    assert first["status"] == "created"
+    assert "error" in second
+    assert "budget" in second["error"].lower()
+
+    conn = manager.db._get_connection()
+    row = conn.execute(
+        "SELECT state FROM swap_budget_reservations WHERE swap_id = ?",
+        (first["swap_id"],),
+    ).fetchone()
+    assert row is not None
+    assert row["state"] == "active"
+
+
+def test_completed_swap_finalizes_budget_reservation():
+    manager, _ = _make_manager()
+    _mock_boltzcli(manager, [
+        {"serviceFee": 200, "networkFee": 100},
+        {"id": "reserve-finalize-1", "status": "created"},
+    ])
+    created = manager.loop_out(500000)
+    assert created["status"] == "created"
+
+    manager._run_boltzcli_raw = MagicMock(
+        return_value="Id: reserve-finalize-1\nStatus: invoice.settled"
+    )
+    manager.status("reserve-finalize-1")
+
+    conn = manager.db._get_connection()
+    row = conn.execute(
+        "SELECT state FROM swap_budget_reservations WHERE swap_id = 'reserve-finalize-1'"
+    ).fetchone()
+    assert row is not None
+    assert row["state"] == "finalized"
+
+    budget = manager.get_budget_status()
+    assert budget["daily_reserved_sats"] == 0
+
+
+def test_failed_swap_releases_budget_reservation():
+    manager, _ = _make_manager()
+    _mock_boltzcli(manager, [
+        {"serviceFee": 200, "networkFee": 100},
+        {"id": "reserve-release-1", "status": "created"},
+    ])
+    created = manager.loop_out(500000)
+    assert created["status"] == "created"
+
+    manager._run_boltzcli_raw = MagicMock(
+        return_value="Id: reserve-release-1\nStatus: invoice.expired"
+    )
+    manager.status("reserve-release-1")
+
+    conn = manager.db._get_connection()
+    row = conn.execute(
+        "SELECT state FROM swap_budget_reservations WHERE swap_id = 'reserve-release-1'"
+    ).fetchone()
+    assert row is not None
+    assert row["state"] == "released"
+
+
 # -----------------------------------------------------------------------
 # Swap monitoring tests
 # -----------------------------------------------------------------------
@@ -487,6 +594,70 @@ def test_check_pending_swaps_no_refund_for_reverse():
     assert result["refund_attempts"] == 0  # No refund for reverse swaps
 
 
+def test_check_pending_swaps_retries_refund_for_failed_submarine():
+    """Failed refundable swaps remain monitored until refund succeeds."""
+    manager, _ = _make_manager()
+
+    conn = manager.db._get_connection()
+    now = manager._now_ts()
+    conn.execute("""
+        INSERT INTO boltz_swaps (id, created_at, updated_at, swap_type,
+            amount_sats, received_sats, boltz_fee_sats, network_fee_sats,
+            total_fee_sats, fee_ppm, status, error)
+        VALUES ('sub-refund-retry', ?, ?, 'submarine', 500000, 0, 300, 200, 500, 1000, 'failed', 'invoice.failedToPay')
+    """, (now, now))
+
+    manager._run_boltzcli = MagicMock(return_value={
+        "reverseSwaps": [],
+        "swaps": [{"id": "sub-refund-retry", "status": "invoice.failedToPay"}],
+    })
+
+    call_count = {"n": 0}
+
+    def mock_raw(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("timelock not expired")
+        return '{"status": "refunded"}'
+
+    manager._run_boltzcli_raw = MagicMock(side_effect=mock_raw)
+
+    first = manager.check_pending_swaps()
+    second = manager.check_pending_swaps()
+
+    assert first["refund_attempts"] == 1
+    assert second["refund_attempts"] == 1
+    assert second["updated"] == 1
+    assert manager._run_boltzcli_raw.call_count == 2
+
+    row = conn.execute(
+        "SELECT status FROM boltz_swaps WHERE id = 'sub-refund-retry'"
+    ).fetchone()
+    assert row["status"] == "refunded"
+
+
+def test_check_pending_swaps_skips_non_refundable_failed_rows():
+    """Only refundable failed swaps are re-polled for retry refunds."""
+    manager, _ = _make_manager()
+
+    conn = manager.db._get_connection()
+    now = manager._now_ts()
+    conn.execute("""
+        INSERT INTO boltz_swaps (id, created_at, updated_at, swap_type,
+            amount_sats, received_sats, boltz_fee_sats, network_fee_sats,
+            total_fee_sats, fee_ppm, status, error)
+        VALUES ('failed-no-retry', ?, ?, 'submarine', 500000, 0, 300, 200, 500, 1000, 'failed', 'transaction.refunded')
+    """, (now, now))
+
+    manager._run_boltzcli = MagicMock(return_value={"reverseSwaps": [], "swaps": []})
+
+    result = manager.check_pending_swaps()
+
+    assert result["checked"] == 0
+    assert result["updated"] == 0
+    manager._run_boltzcli.assert_not_called()
+
+
 # -----------------------------------------------------------------------
 # Swap cost recording tests
 # -----------------------------------------------------------------------
@@ -597,6 +768,59 @@ def test_old_table_migrated():
     # Old crypto columns should not be in new table
     assert "preimage" not in new_cols
     assert "claim_privkey" not in new_cols
+
+
+def test_legacy_rows_backfilled_and_monitored():
+    """Legacy actionable swaps are backfilled into new table and still monitored."""
+    db = _TestDB()
+    conn = db._get_connection()
+    now = int(1_700_000_000)
+
+    conn.execute("""
+        CREATE TABLE boltz_swaps (
+            id TEXT PRIMARY KEY,
+            created_at INTEGER,
+            updated_at INTEGER,
+            swap_type TEXT,
+            target_channel_id TEXT,
+            target_peer_id TEXT,
+            invoice_amount_sats INTEGER,
+            onchain_amount_sats INTEGER,
+            boltz_fee_sats INTEGER,
+            miner_fee_lockup_sats INTEGER,
+            miner_fee_claim_sats INTEGER,
+            total_cost_sats INTEGER,
+            cost_ppm INTEGER,
+            status TEXT,
+            error TEXT
+        )
+    """)
+    conn.execute("""
+        INSERT INTO boltz_swaps
+        VALUES ('legacy-live-1', ?, ?, 'loop_out', '123x1x0', NULL,
+                500000, 499500, 300, 100, 100, 500, 1000, 'created', NULL)
+    """, (now - 100, now - 100))
+
+    plugin = MagicMock()
+    plugin.rpc = MagicMock()
+
+    manager = BoltzSwapManager(db, plugin, config={"swap_daily_budget_sats": 50000, "swap_currency": "btc"})
+
+    # Verify backfill to current table happened
+    new_row = conn.execute(
+        "SELECT * FROM boltz_swaps WHERE id = 'legacy-live-1'"
+    ).fetchone()
+    assert new_row is not None
+    assert new_row["swap_type"] == "reverse"
+    assert new_row["status"] == "created"
+
+    # Monitor should still progress legacy-backed swap state
+    manager._run_boltzcli = MagicMock(return_value={
+        "reverseSwaps": [{"id": "legacy-live-1", "status": "invoice.settled"}],
+        "swaps": [],
+    })
+    result = manager.check_pending_swaps()
+    assert result["completed"] == 1
 
 
 def test_audit_log_recorded():
@@ -738,6 +962,23 @@ def test_claim_swaps():
 
     assert result["status"] == "claim_initiated"
     assert manager._run_boltzcli_raw.call_args[0] == ("claimswaps", "wallet", "claim-1", "claim-2")
+
+
+def test_claim_swaps_string_is_single_id():
+    """String input is normalized to a single swap ID, not split into characters."""
+    manager, _ = _make_manager()
+    manager._run_boltzcli_raw = MagicMock(return_value='{"status": "claimed"}')
+
+    result = manager.claim_swaps("claim-1")
+
+    assert result["status"] == "claim_initiated"
+    assert manager._run_boltzcli_raw.call_args[0] == ("claimswaps", "wallet", "claim-1")
+
+
+def test_claim_swaps_invalid_type():
+    manager, _ = _make_manager()
+    result = manager.claim_swaps(12345)
+    assert "error" in result
 
 
 def test_claim_swaps_with_address():
@@ -1014,7 +1255,7 @@ def test_ensure_lbtc_wallet_finds_existing():
     name = manager._ensure_lbtc_wallet()
 
     assert name == "my-liquid"
-    assert manager._lbtc_wallet_name == "my-liquid"
+    assert manager._wallet_names.get("LBTC") == "my-liquid"
 
 
 def test_ensure_lbtc_wallet_creates_new():
@@ -1034,7 +1275,7 @@ def test_ensure_lbtc_wallet_creates_new():
 def test_ensure_lbtc_wallet_caches():
     """_ensure_lbtc_wallet caches the result."""
     manager, _ = _make_lbtc_manager()
-    manager._lbtc_wallet_name = "cached-wallet"
+    manager._wallet_names["LBTC"] = "cached-wallet"
 
     name = manager._ensure_lbtc_wallet()
 
@@ -1424,7 +1665,10 @@ def test_create_chain_swap_lbtc_to_btc():
         if args[0] == "quote":
             return {"boltzFee": 200, "networkFee": 100}
         if args[0] == "wallet":
-            return {"wallets": [{"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 1000000}}]}
+            return {"wallets": [
+                {"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 1000000}},
+                {"name": "CLN", "currency": "BTC"},
+            ]}
         return {"id": "chain-1", "status": "created", "serviceFee": 200, "networkFee": 100}
 
     manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
@@ -1594,3 +1838,238 @@ def test_wallet_send_error():
 
     assert "error" in result
     assert "insufficient funds" in result["error"]
+
+
+def test_wallet_send_rejects_option_like_destination():
+    manager, _ = _make_manager()
+    manager._run_boltzcli_raw = MagicMock(return_value='{"txid": "abc"}')
+
+    result = manager.wallet_send("--sweep", 100000, currency="btc")
+
+    assert "error" in result
+    assert "cannot start with '-'" in result["error"]
+    manager._run_boltzcli_raw.assert_not_called()
+
+
+def test_loop_out_rejects_option_like_address():
+    manager, _ = _make_manager()
+    manager._run_boltzcli = MagicMock(return_value={"serviceFee": 200, "networkFee": 100})
+
+    result = manager.loop_out(500000, address="--to-wallet")
+
+    assert "error" in result
+    assert "cannot start with '-'" in result["error"]
+    manager._run_boltzcli.assert_not_called()
+
+
+def test_chain_swap_rejects_option_like_to_address():
+    manager, _ = _make_manager()
+    manager._run_boltzcli = MagicMock(return_value={"serviceFee": 200, "networkFee": 100})
+
+    result = manager.create_chain_swap(500000, from_currency="btc", to_currency="lbtc", to_address="--to-wallet")
+
+    assert "error" in result
+    assert "cannot start with '-'" in result["error"]
+    manager._run_boltzcli.assert_not_called()
+
+
+def test_refund_rejects_option_like_destination():
+    manager, _ = _make_manager()
+    manager._run_boltzcli_raw = MagicMock(return_value='{"status": "refunded"}')
+
+    result = manager.refund_swap("refund-1", destination="--wallet")
+
+    assert "error" in result
+    assert "cannot start with '-'" in result["error"]
+    manager._run_boltzcli_raw.assert_not_called()
+
+
+# -----------------------------------------------------------------------
+# Audit round 3: Dynamic wallet name discovery (C1)
+# -----------------------------------------------------------------------
+
+def test_get_wallet_name_btc_discovers_cln():
+    """C1: BTC wallet name is discovered dynamically, not hardcoded 'default'."""
+    manager, _ = _make_manager()
+    manager._run_boltzcli = MagicMock(return_value={
+        "wallets": [{"name": "CLN", "currency": "BTC"}]
+    })
+
+    name = manager._get_wallet_name("btc")
+
+    assert name == "CLN"
+    assert manager._wallet_names.get("BTC") == "CLN"
+
+
+def test_get_wallet_name_btc_missing_raises():
+    """C1: Missing BTC wallet raises RuntimeError (no auto-create for BTC)."""
+    manager, _ = _make_manager()
+    manager._run_boltzcli = MagicMock(return_value={"wallets": []})
+
+    try:
+        manager._get_wallet_name("btc")
+        assert False, "Should raise RuntimeError"
+    except RuntimeError as e:
+        assert "BTC" in str(e)
+
+
+def test_get_wallet_name_lbtc_auto_creates():
+    """LBTC wallet is auto-created if not found (unchanged behavior)."""
+    manager, _ = _make_lbtc_manager()
+    manager._run_boltzcli = MagicMock(return_value={
+        "wallets": [{"name": "CLN", "currency": "BTC"}]
+    })
+    manager._run_boltzcli_raw = MagicMock(return_value="Wallet created")
+
+    name = manager._get_wallet_name("lbtc")
+
+    assert name == "liquid"
+    manager._run_boltzcli_raw.assert_called_once_with("wallet", "create", "liquid", "LBTC")
+
+
+def test_get_wallet_name_caches():
+    """Wallet names are cached after first discovery."""
+    manager, _ = _make_manager()
+    manager._wallet_names["BTC"] = "cached-btc"
+
+    name = manager._get_wallet_name("btc")
+
+    assert name == "cached-btc"
+
+
+def test_wallet_receive_btc_uses_discovered_name():
+    """C1: wallet_receive for BTC uses dynamically discovered wallet name."""
+    manager, _ = _make_manager()
+
+    # _get_wallet_name uses _run_boltzcli("wallet", "list")
+    manager._run_boltzcli = MagicMock(return_value={
+        "wallets": [{"name": "CLN", "currency": "BTC"}]
+    })
+    # wallet receive uses _run_boltzcli_auto -> _run_boltzcli_raw
+    manager._run_boltzcli_raw = MagicMock(return_value='{"address": "bc1qtestaddr"}')
+
+    result = manager.wallet_receive(currency="btc")
+
+    assert result["currency"] == "btc"
+    assert result["wallet"] == "CLN"
+    # Verify the actual wallet name "CLN" was passed to receive
+    assert manager._run_boltzcli_raw.call_args[0] == ("wallet", "receive", "CLN")
+
+
+def test_wallet_send_btc_uses_discovered_name():
+    """C1: wallet_send for BTC uses dynamically discovered wallet name."""
+    manager, _ = _make_manager()
+
+    manager._run_boltzcli = MagicMock(return_value={
+        "wallets": [{"name": "CLN", "currency": "BTC"}]
+    })
+    manager._run_boltzcli_raw = MagicMock(return_value='{"txid": "btctx123"}')
+
+    result = manager.wallet_send("bc1qdest", 50000, currency="btc")
+
+    assert result["status"] == "sent"
+    assert result["currency"] == "btc"
+    # Verify "CLN" not "default" was used
+    raw_call = manager._run_boltzcli_raw.call_args[0]
+    assert "CLN" in raw_call
+
+
+def test_chain_swap_btc_uses_discovered_wallet_name():
+    """C1: chain swap uses discovered BTC wallet name, not 'default'."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "quote":
+            return {"boltzFee": 200, "networkFee": 100}
+        if args[0] == "wallet":
+            return {"wallets": [
+                {"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 1000000}},
+                {"name": "CLN", "currency": "BTC"},
+            ]}
+        return {"id": "chain-btc-name", "status": "created", "serviceFee": 200, "networkFee": 100}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.create_chain_swap(500000, from_currency="lbtc", to_currency="btc")
+
+    assert result["status"] == "created"
+    # Verify --to-wallet uses "CLN" not "default"
+    for call in manager._run_boltzcli.call_args_list:
+        a = call[0]
+        if a[0] == "createchainswap":
+            assert "--to-wallet" in a
+            assert "CLN" in a
+            assert "default" not in a
+            break
+    else:
+        assert False, "createchainswap call not found"
+
+
+# -----------------------------------------------------------------------
+# Audit round 3: --to-wallet / --to-address mutual exclusion (M1)
+# -----------------------------------------------------------------------
+
+def test_chain_swap_to_address_excludes_to_wallet():
+    """M1: When to_address is given, --to-wallet should NOT be present."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "quote":
+            return {"boltzFee": 200, "networkFee": 100}
+        if args[0] == "wallet":
+            return {"wallets": [
+                {"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 1000000}},
+                {"name": "CLN", "currency": "BTC"},
+            ]}
+        return {"id": "chain-addr-only", "status": "created"}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.create_chain_swap(500000, to_address="bc1qexternal")
+
+    assert result["status"] == "created"
+    for call in manager._run_boltzcli.call_args_list:
+        a = call[0]
+        if a[0] == "createchainswap":
+            assert "--to-address" in a
+            assert "bc1qexternal" in a
+            # Must NOT have --to-wallet when --to-address is given
+            assert "--to-wallet" not in a
+            break
+    else:
+        assert False, "createchainswap call not found"
+
+
+def test_chain_swap_no_address_uses_to_wallet():
+    """M1: When no to_address, --to-wallet is used."""
+    manager, _ = _make_lbtc_manager()
+
+    call_count = {"n": 0}
+    def mock_boltzcli(*args, **kwargs):
+        call_count["n"] += 1
+        if args[0] == "quote":
+            return {"boltzFee": 200, "networkFee": 100}
+        if args[0] == "wallet":
+            return {"wallets": [
+                {"name": "liquid", "currency": "LBTC", "balance": {"confirmed": 1000000}},
+                {"name": "CLN", "currency": "BTC"},
+            ]}
+        return {"id": "chain-wallet-only", "status": "created", "serviceFee": 200, "networkFee": 100}
+
+    manager._run_boltzcli = MagicMock(side_effect=mock_boltzcli)
+
+    result = manager.create_chain_swap(500000, from_currency="lbtc", to_currency="btc")
+
+    assert result["status"] == "created"
+    for call in manager._run_boltzcli.call_args_list:
+        a = call[0]
+        if a[0] == "createchainswap":
+            assert "--to-wallet" in a
+            assert "--to-address" not in a
+            break
+    else:
+        assert False, "createchainswap call not found"
