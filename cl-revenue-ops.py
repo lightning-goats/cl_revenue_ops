@@ -38,9 +38,6 @@ import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
-import multiprocessing
-import queue
-import uuid
 import traceback
 from pyln.client import Plugin, RpcError
 
@@ -253,504 +250,74 @@ class RPCTimeoutError(RpcError):
         super().__init__(method, {}, f"RPC timeout for method: {method}")
 
 
-class RPCBreakerOpen(RpcError):
-    """Exception raised when the circuit breaker is open for a method group."""
-    def __init__(self, group, until_ts):
-        self.group = group
-        self.until_ts = until_ts
-        until_str = datetime.fromtimestamp(until_ts).strftime('%H:%M:%S')
-        # Initialize RpcError with compatible fields
-        super().__init__(group, {}, f"RPC circuit breaker open for group '{group}' until {until_str}")
-
-
-class RpcBroker:
-    """
-    A hardened RPC pool that executes lightningd RPC calls in separate processes.
-
-    Why:
-    - pyln-client RPC can hang indefinitely on certain transport / plugin interactions.
-    - A thread timeout (ThreadPoolExecutor) does not stop a hung RPC call.
-    - By isolating RPC calls in subprocesses, we can terminate and restart workers
-      on timeout, guaranteeing bounded waiting for callers.
-
-    Design (Phase 2 — pool):
-    - N worker processes share one request queue and one response queue
-    - A dispatcher thread in the main process routes responses to per-request Events
-    - No call lock: callers block only on their own Event, not on each other
-    - On timeout: clean up the pending slot, raise TimeoutError (pool preserved)
-    - Dead workers are auto-respawned by the dispatcher's health check
-    """
-
-    def __init__(self, socket_path: str, plugin_instance: Plugin, pool_size: int = 3):
-        self.socket_path = socket_path
-        self._plugin = plugin_instance
-        self._pool_size = max(1, min(pool_size, 8))
-
-        # Use spawn for safety (avoid forking a process after threads have started).
-        self._ctx = multiprocessing.get_context("spawn")
-
-        self._workers: List[multiprocessing.Process] = []
-        self._req_q: Any = None
-        self._resp_q: Any = None
-
-        # Per-request response routing: req_id → {"event": Event, "resp": dict|None}
-        self._pending: Dict[str, dict] = {}
-        self._pending_lock = threading.Lock()
-
-        self._dispatcher: Optional[threading.Thread] = None
-        self._dispatcher_stop = threading.Event()
-
-        self._lifecycle_lock = threading.Lock()
-        self._last_restart_time = 0.0
-        self._last_pool_activity = time.time()  # Track when pool last produced a response
-
-        self.start()
-
-    @staticmethod
-    def _broker_main(socket_path: str, req_q, resp_q):
-        # NOTE: Runs in a separate process.
-        from pyln.client import LightningRpc, RpcError as _RpcError
-        import traceback as _traceback
-
-        rpc = LightningRpc(socket_path)
-
-        while True:
-            req = req_q.get()
-            if not req:
-                continue
-            if req.get("op") == "stop":
-                break
-
-            req_id = req.get("id")
-            kind = req.get("kind", "call")
-            method = req.get("method")
-            payload = req.get("payload")
-            args = req.get("args") or []
-            kwargs = req.get("kwargs") or {}
-
-            try:
-                if kind == "call":
-                    # Explicit rpc.call(method, payload_dict) — pass through
-                    result = rpc.call(method, payload)
-                else:
-                    # kind == "attr": reproduce rpc.method(*args, **kwargs)
-                    # using getattr to match pyln-client's natural calling
-                    # convention (handles positional args, __getattr__ wrappers).
-                    # Fall back to rpc.call() on TypeError for methods where
-                    # pyln-client has explicit signatures with different param
-                    # names (e.g. listnodes(node_id=) vs caller passing id=).
-                    try:
-                        result = getattr(rpc, method)(*args, **kwargs)
-                    except TypeError:
-                        if kwargs:
-                            result = rpc.call(method, kwargs)
-                        elif args:
-                            result = rpc.call(method, args[0] if len(args) == 1 else args)
-                        else:
-                            result = rpc.call(method, {})
-
-                resp_q.put({"id": req_id, "ok": True, "result": result})
-            except _RpcError as e:
-                # Serialize error details; caller reconstructs a compatible RpcError.
-                resp_q.put({
-                    "id": req_id,
-                    "ok": False,
-                    "error_type": "RpcError",
-                    "error": getattr(e, "error", None),
-                    "message": str(e),
-                })
-            except Exception as e:
-                resp_q.put({
-                    "id": req_id,
-                    "ok": False,
-                    "error_type": "Exception",
-                    "message": str(e),
-                    "traceback": _traceback.format_exc(),
-                })
-
-    def _dispatch_loop(self):
-        """Background thread: read resp_q, route to per-request Event slots."""
-        health_check_interval = 10.0  # seconds between worker health checks
-        last_health_check = time.time()
-
-        while not self._dispatcher_stop.is_set():
-            # Try to read a response (short timeout so we can check stop flag)
-            try:
-                resp = self._resp_q.get(timeout=1.0)
-            except (queue.Empty, OSError, AttributeError, TypeError):
-                # OSError can happen if queue is closed during shutdown
-                # AttributeError/TypeError when _resp_q becomes None during shutdown
-                resp = None
-
-            if resp is not None:
-                self._last_pool_activity = time.time()
-                req_id = resp.get("id")
-                if req_id:
-                    with self._pending_lock:
-                        slot = self._pending.get(req_id)
-                    if slot is not None:
-                        slot["resp"] = resp
-                        slot["event"].set()
-
-            # Periodic health check: respawn dead workers
-            now = time.time()
-            if now - last_health_check >= health_check_interval:
-                last_health_check = now
-                self._check_worker_health()
-
-    def _check_worker_health(self):
-        """Respawn dead workers; restart pool only if completely stalled."""
-        # Non-blocking acquire: avoids deadlock when stop() holds this lock
-        # while joining the dispatcher thread (which calls this method).
-        if not self._lifecycle_lock.acquire(blocking=False):
-            return
-        released = False
-        try:
-            if not self._req_q or self._dispatcher_stop.is_set():
-                return
-
-            # Respawn individually dead workers
-            for i, w in enumerate(self._workers):
-                if not w.is_alive():
-                    try:
-                        w.join(timeout=0.1)
-                    except Exception:
-                        pass
-                    new_w = self._ctx.Process(
-                        target=RpcBroker._broker_main,
-                        args=(self.socket_path, self._req_q, self._resp_q),
-                        daemon=True,
-                        name=f"rpc_pool_{i}",
-                    )
-                    new_w.start()
-                    self._workers[i] = new_w
-                    self._plugin.log(f"RPC pool: respawned dead worker {i}", level="warn")
-
-            # Last-resort stall detection: if no response has been produced
-            # in 3× the configured timeout AND there are pending requests,
-            # the entire pool may be wedged — restart it.
-            timeout = 15
-            if config:
-                timeout = config.rpc_timeout_seconds
-            stall_threshold = timeout * 3
-            with self._pending_lock:
-                has_pending = len(self._pending) > 0
-            if has_pending and (time.time() - self._last_pool_activity) > stall_threshold:
-                self._plugin.log(
-                    f"RPC pool stall detected: no response in {stall_threshold}s with pending requests",
-                    level="warn",
-                )
-                # Release lifecycle lock before restart (which acquires it)
-                self._lifecycle_lock.release()
-                released = True
-                self.restart("pool stall detected")
-        finally:
-            if not released:
-                self._lifecycle_lock.release()
-
-    def start(self):
-        with self._lifecycle_lock:
-            # Fresh queues each start to avoid stale messages after restarts.
-            self._req_q = self._ctx.Queue()
-            self._resp_q = self._ctx.Queue()
-
-            self._workers = []
-            for i in range(self._pool_size):
-                w = self._ctx.Process(
-                    target=RpcBroker._broker_main,
-                    args=(self.socket_path, self._req_q, self._resp_q),
-                    daemon=True,
-                    name=f"rpc_pool_{i}",
-                )
-                w.start()
-                self._workers.append(w)
-
-            # Start dispatcher thread to route responses
-            self._dispatcher_stop.clear()
-            self._dispatcher = threading.Thread(
-                target=self._dispatch_loop,
-                daemon=True,
-                name="rpc_pool_dispatcher",
-            )
-            self._dispatcher.start()
-
-    def stop(self):
-        with self._lifecycle_lock:
-            # Signal dispatcher to stop
-            self._dispatcher_stop.set()
-
-            # Send stop signal to each worker
-            for _ in self._workers:
-                try:
-                    if self._req_q:
-                        self._req_q.put_nowait({"op": "stop"})
-                except Exception:
-                    pass
-
-            # Terminate any still-alive workers
-            for w in self._workers:
-                try:
-                    if w.is_alive():
-                        w.terminate()
-                        w.join(timeout=1.0)
-                except Exception:
-                    pass
-
-            self._workers = []
-
-            # Wait for dispatcher to finish
-            if self._dispatcher and self._dispatcher.is_alive():
-                self._dispatcher.join(timeout=2.0)
-            self._dispatcher = None
-
-            self._req_q = None
-            self._resp_q = None
-
-            # Wake up any callers still waiting on pending slots
-            with self._pending_lock:
-                for slot in self._pending.values():
-                    slot["event"].set()
-                self._pending.clear()
-
-    def restart(self, reason: str):
-        # Thundering herd prevention: skip if restarted within last 5 seconds
-        now = time.time()
-        if now - self._last_restart_time < 5.0:
-            self._plugin.log(f"RPC pool restart skipped (cooldown): {reason}", level="info")
-            return
-        self._last_restart_time = now
-        self._plugin.log(f"RPC pool restart ({self._pool_size} workers): {reason}", level="warn")
-        self.stop()
-        self.start()
-
-    def request(self, *, kind: str, method: str, payload: Any = None,
-                args: Optional[List[Any]] = None, kwargs: Optional[Dict[str, Any]] = None,
-                timeout: int = 15):
-        """
-        Perform a single RPC request through the pool.
-
-        Any available worker picks up the request. The caller blocks only on
-        its own Event — other threads' requests proceed concurrently.
-
-        Raises:
-            TimeoutError: if no worker returns within timeout.
-            RpcError: reconstructed from worker error payload.
-        """
-        if not method:
-            raise RpcError("request", {}, "Empty RPC method")
-
-        req_id = uuid.uuid4().hex
-        slot = {"event": threading.Event(), "resp": None}
-
-        with self._pending_lock:
-            self._pending[req_id] = slot
-
-        req = {
-            "id": req_id,
-            "kind": kind,
-            "method": method,
-            "payload": payload,
-            "args": args or [],
-            "kwargs": kwargs or {},
-        }
-
-        try:
-            try:
-                if self._req_q is None:
-                    self.restart("pool not running")
-                self._req_q.put(req)
-            except (OSError, ValueError, AttributeError):
-                # Queue broken (e.g. during concurrent restart or TOCTOU on _req_q)
-                self.restart(f"queue error on {method}")
-                raise TimeoutError(f"RPC pool queue error on {method}")
-
-            # Block only this caller until its response arrives.
-            # On timeout: abandon this request (pending slot cleaned up in finally)
-            # but do NOT restart the pool — that kills every in-flight request.
-            # The stall detector in _check_worker_health() handles truly wedged pools.
-            if not slot["event"].wait(timeout=timeout):
-                self._plugin.log(
-                    f"RPC timeout after {timeout}s on {method} (request abandoned, pool preserved)",
-                    level="info",
-                )
-                raise TimeoutError(f"RPC pool timeout on {method}")
-
-            resp = slot["resp"]
-            if resp is None:
-                # Dispatcher was stopped (shutdown) before response arrived
-                raise TimeoutError(f"RPC pool shutdown during {method}")
-        finally:
-            with self._pending_lock:
-                self._pending.pop(req_id, None)
-
-        if resp.get("ok"):
-            return resp.get("result")
-
-        # Reconstruct a compatible RpcError in the main process.
-        if resp.get("traceback"):
-            self._plugin.log(
-                f"RPC pool exception in {method}: {resp.get('message')}\n{resp.get('traceback')}",
-                level="error"
-            )
-
-        err = resp.get("error")
-        msg = resp.get("message") or "RPC error"
-        raise RpcError(method, {} if payload is None else payload, err if err is not None else msg)
+class RPCBreakerOpen(RPCTimeoutError):
+    """Kept for backward compatibility — callers catch this alongside RPCTimeoutError."""
+    pass
 
 
 class ThreadSafeRpcProxy:
     """
-    A thread-safe proxy for the plugin's RPC interface with timeouts and circuit breakers.
+    Thread-safe RPC proxy using a ThreadPoolExecutor for timeout protection.
 
-    Phase 1 Hardening (revised):
-    - Bounded execution (RPC broker subprocess with hard timeouts)
-    - Circuit Breaker (group-based cooldowns)
-    - Broker restart on timeout (guarantees forward progress)
+    pyln-client opens a new Unix domain socket per call — it's inherently
+    thread-safe and supports unlimited concurrency. No subprocess pool needed.
+
+    Each call gets its own thread. If a call hangs past the timeout, the
+    caller gets an RPCTimeoutError immediately. The hung thread stays alive
+    (daemon, will eventually complete) but doesn't block anything else.
+
+    No circuit breaker: individual calls either succeed or fail on their own.
+    One slow call can't poison 60+ other RPC methods for 60 seconds.
     """
 
-    # Number of consecutive timeouts required before tripping the circuit breaker.
-    # A single timeout is transient (slow cycle, large gossip sync); only sustained
-    # failure should block the entire group.
-    BREAKER_TRIP_THRESHOLD = 3
-
-    def __init__(self, broker: RpcBroker, plugin_instance: Plugin):
-        self._broker = broker
+    def __init__(self, plugin_instance: Plugin):
+        from concurrent.futures import ThreadPoolExecutor
         self._plugin = plugin_instance
-        self._breakers: Dict[str, float] = {}
-        self._breaker_failures: Dict[str, int] = {}   # consecutive timeout count per group
-        self._log_history: Dict[Tuple[str, str], float] = {}
-
-    def _get_group(self, method_name: str) -> str:
-        """Determine method group for circuit breaking.
-
-        Groups isolate breaker state so a timeout in one group
-        doesn't block calls in another. Inter-plugin calls (hive-*,
-        revenue-*) get their own group to prevent a slow plugin
-        from blocking core lightningd RPC.
-        """
-        if method_name.startswith("sling-"):
-            return "sling"
-        if method_name.startswith("bkpr-"):
-            return "bkpr"
-        if method_name in ("hive-deposit-marker", "hive-record-routing-outcome"):
-            return "hive-routing"
-        if method_name.startswith("hive-"):
-            return "hive"
-        if method_name.startswith("revenue-"):
-            return "revenue"
-        if method_name == "listforwards":
-            return "listforwards"
-        return "general"
-
-    def _should_log(self, group: str, msg_type: str, cooldown: int = 60) -> bool:
-        """Rate-limit logs to once per cooldown window."""
-        now = time.time()
-        key = (group, msg_type)
-        if now - self._log_history.get(key, 0) > cooldown:
-            self._log_history[key] = now
-            return True
-        return False
+        self._rpc = plugin_instance.rpc
+        self._executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="rpc")
 
     def __getattr__(self, name):
-        # Internal attribute access
-        if name in ("_broker", "_plugin", "_breakers", "_breaker_failures",
-                    "_log_history", "call", "_get_group", "_should_log"):
+        if name in ("_plugin", "_rpc", "_executor", "call"):
             return super().__getattribute__(name)
 
-        # Expose a callable wrapper matching pyln-client's LightningRpc style.
+        fn = getattr(self._rpc, name)
+
         def wrapper(*args, **kwargs):
-            # For normal methods (listpeers, listchannels, plugin, etc), we treat this
-            # as an attribute call and let the broker execute getattr(rpc, name)(*args, **kwargs).
-            return self.call(name, list(args) if args else None, **kwargs)
+            timeout = 30
+            if config:
+                timeout = config.rpc_timeout_seconds
+            future = self._executor.submit(fn, *args, **kwargs)
+            try:
+                return future.result(timeout=timeout)
+            except TimeoutError:
+                self._plugin.log(f"RPC timeout after {timeout}s on {name}", level="warn")
+                raise RPCTimeoutError(name)
 
         return wrapper
 
     def call(self, method_name: str, payload: Any = None, **kwargs):
-        """
-        Thread-safe wrapper for RPC calls with timeout and circuit breaker.
-        """
-        group = self._get_group(method_name)
-        now = time.time()
-
-        # 1. Circuit Breaker
-        until = self._breakers.get(group, 0)
-        if until > now:
-            if self._should_log(group, "breaker_open"):
-                self._plugin.log(
-                    f"RPC Circuit Breaker OPEN for group '{group}' until "
-                    f"{datetime.fromtimestamp(until).strftime('%H:%M:%S')}. Skipping call.",
-                    level="warn",
-                )
-            raise RPCBreakerOpen(group, until)
-
-        # 2. Timeouts from config
-        timeout = 15
-        breaker_window = 60
+        timeout = 30
         if config:
             timeout = config.rpc_timeout_seconds
-            breaker_window = config.rpc_circuit_breaker_seconds
-
+        future = self._executor.submit(
+            self._rpc.call, method_name, payload if payload is not None else {},
+        )
         try:
-            # If payload is a list, this came from an attribute-style call like
-            # rpc.plugin("list") or rpc.listforwards(status="settled").
-            if isinstance(payload, list) or (payload is None and kwargs):
-                args = payload if isinstance(payload, list) else []
-                result = self._broker.request(
-                    kind="attr",
-                    method=method_name,
-                    args=args,
-                    kwargs=kwargs,
-                    timeout=timeout,
-                )
-            else:
-                # Otherwise treat it as generic rpc.call(method, payload_dict).
-                result = self._broker.request(
-                    kind="call",
-                    method=method_name,
-                    payload={} if payload is None else payload,
-                    timeout=timeout,
-                )
-
-            # Success — reset consecutive failure count for this group
-            if group in self._breaker_failures:
-                del self._breaker_failures[group]
-            return result
-
+            return future.result(timeout=timeout)
         except TimeoutError:
-            # Count consecutive timeouts — only trip breaker after threshold
-            count = self._breaker_failures.get(group, 0) + 1
-            self._breaker_failures[group] = count
-            if count >= self.BREAKER_TRIP_THRESHOLD:
-                self._breakers[group] = time.time() + breaker_window
-                self._breaker_failures[group] = 0
-                self._plugin.log(
-                    f"RPC TIMEOUT after {timeout}s on {method_name} "
-                    f"({count} consecutive). Group '{group}' breaker tripped for {breaker_window}s.",
-                    level="warn",
-                )
-            else:
-                self._plugin.log(
-                    f"RPC TIMEOUT after {timeout}s on {method_name} "
-                    f"({count}/{self.BREAKER_TRIP_THRESHOLD} before breaker trips).",
-                    level="info",
-                )
+            self._plugin.log(f"RPC timeout after {timeout}s on {method_name}", level="warn")
             raise RPCTimeoutError(method_name)
-        except RpcError:
-            raise
-        except Exception as e:
-            self._plugin.log(f"RPC ERROR on {method_name}: {e}", level="error")
-            raise
+
 
 class ThreadSafePluginProxy:
     """
     A proxy for the Plugin object that provides thread-safe resilient RPC access.
     """
 
-    def __init__(self, plugin_instance: Plugin, rpc_broker: RpcBroker):
+    def __init__(self, plugin_instance: Plugin):
         """Wrap the original plugin with a resilient RPC proxy."""
         self._plugin = plugin_instance
-        self._rpc_broker = rpc_broker
-        self.rpc = ThreadSafeRpcProxy(rpc_broker, plugin_instance)
+        self.rpc = ThreadSafeRpcProxy(plugin_instance)
 
     def log(self, message, level='info'):
         """Delegate logging to the original plugin."""
@@ -769,7 +336,6 @@ database: Optional[Database] = None
 config: Optional[Config] = None
 profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
 capacity_planner: Optional[CapacityPlanner] = None
-rpc_broker: Optional['RpcBroker'] = None  # RPC broker subprocess
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligence
@@ -1103,27 +669,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                f"dry_run={config.dry_run}")
     
     # Create thread-safe RPC proxy (Phase 5.5: High-Uptime Stability)
-    # All background threads share a single RPC connection - serialize access
-    # to prevent corruption from concurrent calls to lightningd
-
-    # Phase 1: RPC Broker (subprocess) + thread-safe proxy
-    rpc_socket_path = getattr(plugin.rpc, "socket_path", None)
-    if not rpc_socket_path:
-        # Best-effort derive from CLN init configuration if available.
-        ldir = configuration.get("lightning-dir") or configuration.get("lightning_dir")
-        rpcfile = configuration.get("rpc-file") or configuration.get("rpc_file")
-        if ldir and rpcfile:
-            rpc_socket_path = rpcfile if os.path.isabs(rpcfile) else os.path.join(ldir, rpcfile)
-
-    if not rpc_socket_path:
-        # Last-resort fallback (common default)
-        ldir = configuration.get("lightning-dir") or "~/.lightning"
-        rpc_socket_path = os.path.expanduser(os.path.join(ldir, "lightning-rpc"))
-
-    pool_size = config.rpc_pool_size if config else 3
-    rpc_broker = RpcBroker(str(rpc_socket_path), plugin, pool_size=pool_size)
-    safe_plugin = ThreadSafePluginProxy(plugin, rpc_broker)
-    plugin.log(f"RPC pool initialized (workers={pool_size}, socket={rpc_socket_path})", level="info")
+    # pyln-client opens a new Unix socket per call — thread-safe by design.
+    # ThreadSafeRpcProxy adds timeout protection via ThreadPoolExecutor.
+    safe_plugin = ThreadSafePluginProxy(plugin)
+    plugin.log("Thread-safe RPC proxy initialized", level="info")
 
     # =========================================================================
     # STARTUP DEPENDENCY CHECKS (Phase 4: Stability & Scaling)
@@ -1665,13 +1214,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             except Exception as e:
                 plugin.log(f"Error stopping rebalance jobs: {e}", level='warn')
         
-        # Stop RPC broker subprocess
-        if rpc_broker:
-            try:
-                rpc_broker.stop()
-            except Exception:
-                pass
-
         # MAJOR-11 FIX: Clean up database connections on shutdown
         if database:
             try:
