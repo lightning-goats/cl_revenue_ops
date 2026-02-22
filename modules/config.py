@@ -47,6 +47,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'htlc_congestion_threshold': float,
     'enable_reputation': bool,
     'enable_kelly': bool,
+    'kelly_bypass_for_fleet': bool,
     'enable_proportional_budget': bool,
     'proportional_budget_pct': float,
     'kelly_fraction': float,
@@ -292,6 +293,10 @@ class Config:
 
     # Kelly Criterion Position Sizing (Phase 4: Risk Management)
     enable_kelly: bool = True        # If True, scale rebalance budget by Kelly fraction
+    kelly_bypass_for_fleet: bool = True  # If True, skip Kelly for hive/fleet destinations
+                                          # Fleet paths are ~free (0 ppm internal), so Kelly's
+                                          # EV gate is counterproductive — it kills candidates
+                                          # before the fleet path optimizer can apply zero-fee routing.
     kelly_fraction: float = 0.6      # Multiplier for Kelly fraction (0.6 = "Half-Plus Kelly")
                                       # Full Kelly (1.0) maximizes growth but has high volatility
                                       # Half Kelly (0.5) reduces volatility drag significantly
@@ -600,6 +605,7 @@ class ConfigSnapshot:
 
     # Kelly Criterion Position Sizing
     enable_kelly: bool
+    kelly_bypass_for_fleet: bool
     kelly_fraction: float
     
     # Async Job Queue

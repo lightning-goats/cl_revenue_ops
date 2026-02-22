@@ -2405,7 +2405,13 @@ class EVRebalancer:
         #
         # Note: This applies to max_budget_sats (the fee cap for this trade), not
         # total routing capital. For daily budget management, see reserve_budget().
-        if self.config.enable_kelly:
+        # Bypass Kelly for fleet/hive destinations when enabled.
+        # Fleet paths use zero-fee internal channels, so Kelly's EV gate
+        # (which sizes budget based on routing fee risk) is counterproductive —
+        # it kills candidates before the fleet path optimizer can apply free routing.
+        skip_kelly = (is_hive_destination and self.config.kelly_bypass_for_fleet)
+
+        if self.config.enable_kelly and not skip_kelly:
             reputation = self.database.get_peer_reputation(dest_info.get("peer_id", ""))
             p = reputation.get('score', 0.5)  # Success probability
             cost_ppm = inbound_fee_ppm + weighted_opp_cost
@@ -2417,6 +2423,12 @@ class EVRebalancer:
                 return None  # Negative EV, reject
             max_budget_sats = int(max_budget_sats * kelly_safe)
             max_budget_msat = max_budget_sats * 1000
+        elif skip_kelly:
+            self.plugin.log(
+                f"KELLY_BYPASS: Skipping Kelly for hive destination {dest_channel[:12]}... "
+                f"(fleet path may provide zero-fee routing)",
+                level='info'
+            )
 
         if amount_msat > 0:
             # ZERO-TOLERANCE: Derive max routing fee from the sats budget for this chunk.

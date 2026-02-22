@@ -529,6 +529,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-kelly-bypass-fleet',
+    default='true',
+    description='If true, bypass Kelly Criterion for hive/fleet destinations where zero-fee internal paths exist (default: true)'
+)
+
+plugin.add_option(
     name='revenue-ops-kelly-fraction',
     default='0.5',
     description='Multiplier for Kelly fraction (default: 0.5 = Half Kelly). Full Kelly (1.0) maximizes growth but has high volatility.'
@@ -649,6 +655,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
         reputation_decay=float(options['revenue-ops-reputation-decay']),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
+        kelly_bypass_for_fleet=options['revenue-ops-kelly-bypass-fleet'].lower() == 'true',
         kelly_fraction=float(options['revenue-ops-kelly-fraction']),
         # Phase 7 options (v1.3.0)
         enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
