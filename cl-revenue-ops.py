@@ -299,6 +299,10 @@ class ThreadSafeRpcProxy:
         timeout = 30
         if config:
             timeout = config.rpc_timeout_seconds
+        # Cross-plugin RPCs (hive-*) relay through CLN and are inherently
+        # slower — give them 2x the normal timeout to avoid spurious failures.
+        if method_name.startswith("hive-"):
+            timeout *= 2
         future = self._executor.submit(
             self._rpc.call, method_name, payload if payload is not None else {},
         )
