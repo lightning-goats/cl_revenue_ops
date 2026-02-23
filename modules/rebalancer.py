@@ -3710,39 +3710,53 @@ class EVRebalancer:
         return result
 
     def _check_capital_controls(self, cfg: Optional[ConfigSnapshot] = None) -> bool:
-        """Check if capital controls allow rebalancing."""
+        """Check if capital controls allow rebalancing.
+
+        Reserve check (RPC-dependent) fails open on timeout — a transient
+        RPC issue should not block all rebalancing.  Budget check (DB-only)
+        always runs and fails closed.
+        """
         if cfg is None:
             cfg = self.config.snapshot()
         try:
-            listfunds = self.plugin.rpc.listfunds()
-            onchain_sats = 0
-            for output in listfunds.get("outputs", []):
-                if output.get("status") == "confirmed":
-                    amount_msat = output.get("amount_msat", 0)
-                    if isinstance(amount_msat, str): 
-                        amount_msat = int(amount_msat.replace("msat", ""))
-                    onchain_sats += amount_msat // 1000
-            
-            channel_spendable_sats = 0
-            for channel in listfunds.get("channels", []):
-                if channel.get("state") != "CHANNELD_NORMAL": 
-                    continue
-                our_amount_msat = channel.get("our_amount_msat", 0)
-                if isinstance(our_amount_msat, str): 
-                    our_amount_msat = int(our_amount_msat.replace("msat", ""))
-                spendable = our_amount_msat // 1000
-                if spendable > 0: 
-                    channel_spendable_sats += spendable
-            
-            total_reserve = onchain_sats + channel_spendable_sats
-            if total_reserve < cfg.min_wallet_reserve:
+            # --- Reserve check (needs listfunds RPC) ---
+            try:
+                listfunds = self.plugin.rpc.listfunds()
+                onchain_sats = 0
+                for output in listfunds.get("outputs", []):
+                    if output.get("status") == "confirmed":
+                        amount_msat = output.get("amount_msat", 0)
+                        if isinstance(amount_msat, str):
+                            amount_msat = int(amount_msat.replace("msat", ""))
+                        onchain_sats += amount_msat // 1000
+
+                channel_spendable_sats = 0
+                for channel in listfunds.get("channels", []):
+                    if channel.get("state") != "CHANNELD_NORMAL":
+                        continue
+                    our_amount_msat = channel.get("our_amount_msat", 0)
+                    if isinstance(our_amount_msat, str):
+                        our_amount_msat = int(our_amount_msat.replace("msat", ""))
+                    spendable = our_amount_msat // 1000
+                    if spendable > 0:
+                        channel_spendable_sats += spendable
+
+                total_reserve = onchain_sats + channel_spendable_sats
+                if total_reserve < cfg.min_wallet_reserve:
+                    self.plugin.log(
+                        f"CAPITAL CONTROL: Wallet reserve (confirmed on-chain + channel spendable) {total_reserve} < "
+                        f"{cfg.min_wallet_reserve}",
+                        level='warn'
+                    )
+                    return False
+            except RpcError:
+                # RPC timeout / failure — skip reserve check, still enforce budget
                 self.plugin.log(
-                    f"CAPITAL CONTROL: Wallet reserve (confirmed on-chain + channel spendable) {total_reserve} < "
-                    f"{cfg.min_wallet_reserve}",
+                    "Capital controls: listfunds RPC failed, skipping reserve check (budget still enforced)",
                     level='warn'
                 )
-                return False
 
+            # --- Budget check (DB-only, no RPC needed) ---
             # Calculate effective daily budget
             # If proportional budget enabled: max(fixed_floor, revenue_24h * percentage)
             effective_budget = cfg.daily_budget_sats
@@ -3759,16 +3773,16 @@ class EVRebalancer:
                     f"Effective budget: {effective_budget} sats (floor: {cfg.daily_budget_sats})",
                     level='debug'
                 )
-                
+
             fees_spent_24h = self.database.get_total_rebalance_fees(int(time.time()) - 86400)
             if fees_spent_24h >= effective_budget:
                 self.plugin.log(
                     f"CAPITAL CONTROL: Daily budget exceeded "
-                    f"({fees_spent_24h} >= {effective_budget})", 
+                    f"({fees_spent_24h} >= {effective_budget})",
                     level='warn'
                 )
                 return False
-                
+
             return True
         except Exception as e:
             self.plugin.log(f"Error checking capital controls: {e}", level='error')

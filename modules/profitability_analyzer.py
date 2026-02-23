@@ -23,7 +23,7 @@ from enum import Enum
 import time
 import threading
 
-from pyln.client import Plugin
+from pyln.client import Plugin, RpcError
 
 if TYPE_CHECKING:
     from .hive_bridge import HiveFeeIntelligenceBridge
@@ -1743,6 +1743,8 @@ class ChannelProfitabilityAnalyzer:
                 remote_balance_sats += (amount_msat - our_amount_msat) // 1000
                 channel_count += 1
 
+        except RpcError as e:
+            self.plugin.log(f"TLV: listfunds RPC unavailable, returning cached zeros: {e}", level='warn')
         except Exception as e:
             self.plugin.log(f"Error calculating TLV: {e}", level='error')
 
