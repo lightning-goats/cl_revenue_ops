@@ -17,6 +17,8 @@ loop-in, auto-fallback to BTC occurs.
 Tracks costs and swap state in SQLite for P&L integration.
 """
 
+import os
+import shutil
 import time
 import json
 import subprocess
@@ -31,14 +33,56 @@ class BoltzSwapManager:
     DEFAULT_SWAP_MAX_AMOUNT_SATS = 10_000_000
     DEFAULT_BUDGET_RESERVATION_TTL_SECS = 86_400
 
-    def __init__(self, database, safe_plugin, config):
+    # Common locations to search for boltzcli when not in PATH
+    _BOLTZCLI_SEARCH_PATHS = [
+        "/usr/local/bin/boltzcli",
+        "/usr/bin/boltzcli",
+        os.path.expanduser("~/bin/boltzcli"),
+        os.path.expanduser("~/.local/bin/boltzcli"),
+        "/opt/boltz/bin/boltzcli",
+    ]
+
+    def __init__(self, database, safe_plugin, config, boltzcli_path: Optional[str] = None):
         self.db = database
         self.plugin = safe_plugin
         self.rpc = safe_plugin.rpc
         self.config = config
         self._wallet_names: Dict[str, str] = {}  # currency -> wallet name cache
+        self._boltzcli_path = self._resolve_boltzcli(boltzcli_path)
 
         self._ensure_tables()
+
+    def _resolve_boltzcli(self, explicit_path: Optional[str] = None) -> str:
+        """Resolve the boltzcli binary path.
+
+        Priority:
+        1. Explicit path from config (revenue-ops-boltzcli-path)
+        2. shutil.which() (respects PATH)
+        3. Common installation directories
+        4. Falls back to 'boltzcli' (bare name, relies on PATH at call time)
+        """
+        # 1. Explicit config
+        if explicit_path:
+            if os.path.isfile(explicit_path) and os.access(explicit_path, os.X_OK):
+                self._log(f"Using configured boltzcli: {explicit_path}", level="debug")
+                return explicit_path
+            self._log(f"Configured boltzcli path not executable: {explicit_path}", level="warn")
+
+        # 2. PATH lookup
+        found = shutil.which("boltzcli")
+        if found:
+            self._log(f"Found boltzcli in PATH: {found}", level="debug")
+            return found
+
+        # 3. Common locations
+        for candidate in self._BOLTZCLI_SEARCH_PATHS:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                self._log(f"Found boltzcli at {candidate}", level="info")
+                return candidate
+
+        # 4. Fallback — will produce a clear error on first use
+        self._log("boltzcli not found; swap operations will fail until it is installed", level="warn")
+        return "boltzcli"
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -404,14 +448,15 @@ class BoltzSwapManager:
 
         Raises RuntimeError on non-zero exit or unparseable output.
         """
+        cli = self._boltzcli_path
         if not args:
-            cmd = ["boltzcli", "--json"]
+            cmd = [cli, "--json"]
         elif (args[0] == "wallet" and len(args) > 1
               and args[1] in self._WALLET_JSON_SUBCMDS):
             # wallet subcommands: --json belongs to the subcommand
-            cmd = ["boltzcli", "wallet", args[1], "--json", *args[2:]]
+            cmd = [cli, "wallet", args[1], "--json", *args[2:]]
         else:
-            cmd = ["boltzcli", args[0], "--json", *args[1:]]
+            cmd = [cli, args[0], "--json", *args[1:]]
         try:
             result = subprocess.run(
                 cmd,
@@ -420,7 +465,7 @@ class BoltzSwapManager:
                 text=True,
             )
         except FileNotFoundError:
-            raise RuntimeError("boltzcli not found in PATH")
+            raise RuntimeError(f"boltzcli not found at '{self._boltzcli_path}'")
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"boltzcli timed out after {timeout}s: {' '.join(cmd)}")
 
@@ -459,7 +504,7 @@ class BoltzSwapManager:
         Run boltzcli without --json and return raw stdout.
         Used for commands that may not support --json.
         """
-        cmd = ["boltzcli", *args]
+        cmd = [self._boltzcli_path, *args]
         try:
             result = subprocess.run(
                 cmd,
@@ -468,7 +513,7 @@ class BoltzSwapManager:
                 text=True,
             )
         except FileNotFoundError:
-            raise RuntimeError("boltzcli not found in PATH")
+            raise RuntimeError(f"boltzcli not found at '{self._boltzcli_path}'")
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"boltzcli timed out after {timeout}s: {' '.join(cmd)}")
 

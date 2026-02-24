@@ -34,6 +34,7 @@ import json
 import random
 import threading
 import signal
+import atexit
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
@@ -507,6 +508,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-boltzcli-path',
+    default='',
+    description='Path to boltzcli binary. Auto-detected if empty (default: auto)'
+)
+
+plugin.add_option(
     name='revenue-ops-swap-daily-budget-sats',
     default='50000',
     description='Max daily spend on swap fees in sats (default: 50,000)'
@@ -681,37 +688,40 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         Handle SIGTERM for graceful shutdown.
 
         CLN sends SIGTERM when `lightning-cli plugin stop cl-revenue-ops` is called.
-        This handler sets the shutdown_event, causing all background loops to exit
-        immediately instead of waiting for their sleep timers.
+        This handler ONLY sets the shutdown_event. All cleanup (executor shutdown,
+        job stopping, DB close) is done by background threads when they see the event,
+        avoiding deadlock risk from calling non-async-signal-safe functions in a handler.
         """
-        plugin.log("Received SIGTERM, initiating clean shutdown...", level='info')
         shutdown_event.set()
 
-        # L-12: Shutdown ThreadPoolExecutors
-        if rpc_proxy:
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+
+    # M-7/C-1/L-26: Cleanup runs via atexit (safe outside signal handler context)
+    def _shutdown_cleanup():
+        """Perform cleanup after shutdown_event is set. Runs via atexit."""
+        if safe_plugin and hasattr(safe_plugin, 'rpc'):
             try:
-                rpc_proxy._executor.shutdown(wait=False)
-                rpc_proxy._async_executor.shutdown(wait=False)
+                safe_plugin.rpc._executor.shutdown(wait=False)
+                safe_plugin.rpc._async_executor.shutdown(wait=False)
             except Exception:
                 pass
 
-        # Stop active rebalance jobs to prevent phantom spending
         if rebalancer and rebalancer.job_manager:
             try:
                 stopped = rebalancer.job_manager.stop_all_jobs(reason="plugin_shutdown")
                 if stopped > 0:
                     plugin.log(f"Stopped {stopped} active rebalance jobs", level='info')
-            except Exception as e:
-                plugin.log(f"Error stopping rebalance jobs: {e}", level='warn')
+            except Exception:
+                pass
 
-        # MAJOR-11 FIX: Clean up database connections on shutdown
         if database:
             try:
+                database.close_all_connections()
                 database.close_main_connection()
-            except Exception as e:
-                plugin.log(f"Error closing database: {e}", level='warn')
+            except Exception:
+                pass
 
-    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    atexit.register(_shutdown_cleanup)
 
     # Build configuration from options
     config = Config(
@@ -820,7 +830,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     database.initialize()
 
     # Boltz swaps manager
-    boltz_swaps = BoltzSwapManager(database, safe_plugin, config)
+    boltzcli_path = options.get('revenue-ops-boltzcli-path', '').strip()
+    boltz_swaps = BoltzSwapManager(database, safe_plugin, config,
+                                   boltzcli_path=boltzcli_path or None)
 
     # Issue #24: Clean up stale budget reservations on startup
     # Reservations from crashed jobs should be released immediately
@@ -4122,8 +4134,8 @@ def _notify_hive_of_closure(channel_id: str, peer_id: str, closer: str,
             except Exception:
                 pass
 
-        # Call cl-hive's channel-closed notification with full data
-        result = safe_plugin.rpc.call("hive-channel-closed", {
+        # M-9: Use fire_and_forget since return value is only for logging
+        safe_plugin.rpc.fire_and_forget("hive-channel-closed", {
             "peer_id": peer_id,
             "channel_id": channel_id,
             "closer": closer,
@@ -4141,15 +4153,12 @@ def _notify_hive_of_closure(channel_id: str, peer_id: str, closer: str,
             "profitability_score": profitability_score
         })
 
-        if result.get("action") == "notified_hive":
-            plugin.log(
-                f"Notified cl-hive of closure: {channel_id} by {closer} "
-                f"(pnl={net_pnl_sats}, forwards={forward_count})",
-                level='info'
-            )
-            return True
-
-        return False
+        plugin.log(
+            f"Notified cl-hive of closure: {channel_id} by {closer} "
+            f"(pnl={net_pnl_sats}, forwards={forward_count})",
+            level='info'
+        )
+        return True
 
     except Exception as e:
         # Log at warn level for visibility; include channel ID for debugging
@@ -4189,8 +4198,8 @@ def _notify_hive_of_open(channel_id: str, peer_id: str, opener: str,
         if not hive_availability_cache.is_available(safe_plugin.rpc):
             return False
 
-        # Call cl-hive's channel-opened notification
-        result = safe_plugin.rpc.call("hive-channel-opened", {
+        # M-9: Use fire_and_forget since return value is only for logging
+        safe_plugin.rpc.fire_and_forget("hive-channel-opened", {
             "peer_id": peer_id,
             "channel_id": channel_id,
             "opener": opener,
@@ -4199,14 +4208,11 @@ def _notify_hive_of_open(channel_id: str, peer_id: str, opener: str,
             "their_funding_sats": their_funding_sats
         })
 
-        if result.get("action") == "notified_hive":
-            plugin.log(
-                f"Notified cl-hive of channel open: {channel_id} with {peer_id[:16]}... ({opener})",
-                level='info'
-            )
-            return True
-
-        return False
+        plugin.log(
+            f"Notified cl-hive of channel open: {channel_id} with {peer_id[:16]}... ({opener})",
+            level='info'
+        )
+        return True
 
     except Exception as e:
         # Log at warn level for visibility; include channel ID for debugging
@@ -4240,24 +4246,13 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
         # Determine opener from old_state and cause
         # DUALOPEND states typically mean we initiated (dual-funded)
         # CHANNELD_AWAITING_LOCKIN typically means remote initiated
+        # M-8: Single RPC call for both opener detection and channel details
         opener = 'unknown'
         if cause == 'remote':
             opener = 'remote'
         elif cause == 'user':
             opener = 'local'
-        else:
-            # Try to determine from channel info
-            try:
-                channels = safe_plugin.rpc.call("listpeerchannels", {"id": peer_id})
-                for ch in channels.get('channels', []):
-                    scid = normalize_scid(ch.get('short_channel_id', ''))
-                    if scid == channel_id:
-                        opener = ch.get('opener', 'unknown')
-                        break
-            except Exception:
-                pass
 
-        # Get channel details
         capacity_sats = 0
         our_funding_sats = 0
         their_funding_sats = 0
@@ -4267,13 +4262,11 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
             for ch in channels.get('channels', []):
                 scid = normalize_scid(ch.get('short_channel_id', ''))
                 if scid == channel_id:
+                    if opener == 'unknown':
+                        opener = ch.get('opener', 'unknown')
                     capacity_sats = _parse_msat(ch.get('total_msat', 0)) // 1000
                     our_funding_sats = _parse_msat(ch.get('funding', {}).get('local_funds_msat', 0)) // 1000
                     their_funding_sats = _parse_msat(ch.get('funding', {}).get('remote_funds_msat', 0)) // 1000
-
-                    # Also get opener if we didn't determine it yet
-                    if opener == 'unknown':
-                        opener = ch.get('opener', 'unknown')
                     break
         except Exception as e:
             plugin.log(f"Failed to get channel details for {channel_id}: {e}", level='debug')

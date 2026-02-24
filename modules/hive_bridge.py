@@ -157,6 +157,11 @@ class HiveFeeIntelligenceBridge:
         self._availability_lock = threading.Lock()  # Prevent stampede on cache refresh
         self._init_complete = True  # Gate: False during plugin init, set True after
 
+        # M-1/M-2: Initialize routing intel and integration caches in __init__
+        self._routing_intel_cache: Dict[str, Any] = {}
+        self._integration_cache: Dict[str, Any] = {}
+        self._intel_cache_lock = threading.Lock()
+
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
         if self.plugin:
@@ -1602,8 +1607,9 @@ class HiveFeeIntelligenceBridge:
         """
         # Check cache first (keyed by "_routing_intel" + scid)
         cache_key = f"_routing_intel_{scid or 'all'}"
-        if use_cache and hasattr(self, '_routing_intel_cache'):
-            cached = self._routing_intel_cache.get(cache_key)
+        if use_cache:
+            with self._intel_cache_lock:
+                cached = self._routing_intel_cache.get(cache_key)
             if cached:
                 cache_age = time.time() - cached.get('_cache_time', 0)
                 cache_ttl = getattr(self, '_routing_intel_cache_ttl', 300)  # 5 min default
@@ -1612,11 +1618,11 @@ class HiveFeeIntelligenceBridge:
 
         if self._is_circuit_open() or not self.is_available():
             # Return stale cache if available
-            if hasattr(self, '_routing_intel_cache'):
+            # M-3: Return copy to avoid mutating cached data
+            with self._intel_cache_lock:
                 cached = self._routing_intel_cache.get(cache_key)
-                if cached:
-                    cached['_stale'] = True
-                    return cached
+            if cached:
+                return {**cached, '_stale': True}
             return None
 
         try:
@@ -1635,21 +1641,18 @@ class HiveFeeIntelligenceBridge:
 
             self._record_success()
 
-            # Cache the result
-            if not hasattr(self, '_routing_intel_cache'):
-                self._routing_intel_cache = {}
+            # Cache the result under lock
             result['_cache_time'] = time.time()
             result['_stale'] = False
-            self._routing_intel_cache[cache_key] = result
-
-            # Limit cache size
-            if len(self._routing_intel_cache) > 100:
-                # Remove oldest entries
-                oldest_key = min(
-                    self._routing_intel_cache.keys(),
-                    key=lambda k: self._routing_intel_cache[k].get('_cache_time', 0)
-                )
-                del self._routing_intel_cache[oldest_key]
+            with self._intel_cache_lock:
+                self._routing_intel_cache[cache_key] = result
+                # Limit cache size
+                if len(self._routing_intel_cache) > 100:
+                    oldest_key = min(
+                        self._routing_intel_cache.keys(),
+                        key=lambda k: self._routing_intel_cache[k].get('_cache_time', 0)
+                    )
+                    del self._routing_intel_cache[oldest_key]
 
             return result
 
@@ -1658,11 +1661,11 @@ class HiveFeeIntelligenceBridge:
             self._record_failure()
 
             # Return stale cache if available
-            if hasattr(self, '_routing_intel_cache'):
+            # M-3: Return copy to avoid mutating cached data
+            with self._intel_cache_lock:
                 cached = self._routing_intel_cache.get(cache_key)
-                if cached:
-                    cached['_stale'] = True
-                    return cached
+            if cached:
+                return {**cached, '_stale': True}
             return None
 
     def get_channel_routing_intelligence(self, scid: str) -> Optional[Dict[str, Any]]:
@@ -2388,7 +2391,8 @@ class HiveFeeIntelligenceBridge:
             # Method might not exist yet - fail gracefully
             self._log(f"Failed to report Kalman velocity: {e}", level="debug")
             self._record_failure()
-            return True  # Don't block on this
+            # M-24: Return False to indicate failure (callers should not block on this)
+            return False
 
     def query_kalman_velocity(
         self,
@@ -3677,8 +3681,9 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Number of entries cleared
         """
-        count = len(self._cache)
-        self._cache.clear()
+        with self._cache_lock:
+            count = len(self._cache)
+            self._cache.clear()
         return count
 
     # =========================================================================
@@ -3779,10 +3784,8 @@ class HiveFeeIntelligenceBridge:
 
     def _get_from_cache(self, cache_key: str, ttl: float) -> Optional[Dict[str, Any]]:
         """Get data from integration cache if fresh."""
-        if not hasattr(self, '_integration_cache'):
-            self._integration_cache = {}
-
-        cached = self._integration_cache.get(cache_key)
+        with self._intel_cache_lock:
+            cached = self._integration_cache.get(cache_key)
         if cached:
             age = time.time() - cached.get('_cache_time', 0)
             if age < ttl:
@@ -3791,22 +3794,19 @@ class HiveFeeIntelligenceBridge:
 
     def _set_in_cache(self, cache_key: str, data: Dict[str, Any]) -> None:
         """Store data in integration cache."""
-        if not hasattr(self, '_integration_cache'):
-            self._integration_cache = {}
+        with self._intel_cache_lock:
+            self._integration_cache[cache_key] = {
+                'data': data,
+                '_cache_time': time.time()
+            }
 
-        self._integration_cache[cache_key] = {
-            'data': data,
-            '_cache_time': time.time()
-        }
-
-        # Limit cache size
-        if len(self._integration_cache) > 200:
-            # Remove oldest entry
-            oldest_key = min(
-                self._integration_cache.keys(),
-                key=lambda k: self._integration_cache[k].get('_cache_time', 0)
-            )
-            del self._integration_cache[oldest_key]
+            # Limit cache size
+            if len(self._integration_cache) > 200:
+                oldest_key = min(
+                    self._integration_cache.keys(),
+                    key=lambda k: self._integration_cache[k].get('_cache_time', 0)
+                )
+                del self._integration_cache[oldest_key]
 
     def get_defense_status(self, scid: str = None) -> Optional[Dict[str, Any]]:
         """
@@ -4373,8 +4373,7 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Number of entries cleared
         """
-        if not hasattr(self, '_integration_cache'):
-            return 0
-        count = len(self._integration_cache)
-        self._integration_cache.clear()
+        with self._intel_cache_lock:
+            count = len(self._integration_cache)
+            self._integration_cache.clear()
         return count

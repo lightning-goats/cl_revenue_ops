@@ -376,9 +376,8 @@ class JobManager:
             for channel in listfunds.get("channels", []):
                 scid = channel.get("short_channel_id", "")
                 if self._normalize_scid(scid) == normalized:
-                    our_amount_msat = channel.get("our_amount_msat", 0)
-                    if isinstance(our_amount_msat, str):
-                        our_amount_msat = int(our_amount_msat.replace("msat", ""))
+                    # M-22: Use _parse_msat for consistent Millisatoshi handling
+                    our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
                     return our_amount_msat // 1000
         except Exception as e:
             self.plugin.log(f"Error getting channel balance: {e}", level='debug')
@@ -689,9 +688,10 @@ class JobManager:
             job_stats = sling_stats.get(job.scid, {})
 
             # ZERO-TOLERANCE: Abort if the job is spending at/above its msat budget.
-            fee_msat = job_stats.get("fee_total_msat", 0) or 0
+            # H-1: Use _parse_msat/_parse_sats to handle string "Nmsat" values
+            fee_msat = self._parse_msat(job_stats.get("fee_total_msat"))
             if not fee_msat:
-                fee_sats = job_stats.get("fee_total_sats", 0) or 0
+                fee_sats = self._parse_sats(job_stats.get("fee_total_sats"))
                 fee_msat = fee_sats * 1000 if fee_sats else 0
 
             if fee_msat and job.candidate and fee_msat > job.candidate.max_budget_msat:
@@ -752,10 +752,9 @@ class JobManager:
                 scid = channel.get("short_channel_id", "")
                 if not scid:
                     continue
-                our_amount_msat = channel.get("our_amount_msat", 0)
-                if isinstance(our_amount_msat, str):
-                    our_amount_msat = int(our_amount_msat.replace("msat", ""))
-                balances[self._normalize_scid(scid)] = int(our_amount_msat) // 1000
+                # M-22b: Use _parse_msat for consistent Millisatoshi handling
+                our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
+                balances[self._normalize_scid(scid)] = our_amount_msat // 1000
         except Exception as e:
             self.plugin.log(f"Error preloading channel balances: {e}", level='debug')
         return balances
@@ -942,9 +941,10 @@ class JobManager:
                             stats: Dict[str, Any]) -> None:
         """Handle a successfully completed job."""
         # Calculate actual fee paid (from sling stats if available)
-        fee_sats = stats.get("fee_total_sats", 0)
+        # H-1b: Use _parse_sats/_parse_msat to handle string "Nmsat" values
+        fee_sats = self._parse_sats(stats.get("fee_total_sats"))
         if not fee_sats:
-            fee_msat = stats.get("fee_total_msat", 0)
+            fee_msat = self._parse_msat(stats.get("fee_total_msat"))
             fee_sats = fee_msat // 1000 if fee_msat else 0
         if not fee_sats:
             # Per-scid detailed stats provide total_spent_sats
@@ -1118,7 +1118,8 @@ class JobManager:
             if isinstance(successes, dict):
                 fee_sats = self._parse_sats(successes.get("total_spent_sats"))
             if fee_sats == 0:
-                fee_msat = stats.get("fee_total_msat", 0)
+                # H-1c: Use _parse_msat to handle string "Nmsat" values
+                fee_msat = self._parse_msat(stats.get("fee_total_msat"))
                 fee_sats = fee_msat // 1000 if fee_msat else 0
             if fee_sats == 0 and amount_transferred > 0:
                 # Conservative estimate: half of max fee
@@ -2614,8 +2615,10 @@ class EVRebalancer:
         # Push amount: drain to 50% outbound ratio
         target_ratio = 0.50
         excess_sats = int((src_ratio - target_ratio) * capacity)
+        # M-15: Skip if excess is below minimum (avoid inflating small amounts)
+        if excess_sats < cfg.rebalance_min_amount:
+            return None
         amount = min(excess_sats, cfg.rebalance_max_amount)
-        amount = max(amount, cfg.rebalance_min_amount)
 
         src_peer_id = src_info.get("peer_id", "")
         src_fee = src_info.get("fee_ppm", 0)
@@ -2624,6 +2627,9 @@ class EVRebalancer:
         # For push, the "outbound fee" is what we earn when traffic flows in the
         # direction we're creating capacity for (the reverse direction)
         spread = src_fee - inbound_fee
+        # M-17: Negative spread means we'd lose money on this direction
+        if spread <= 0:
+            return None
         max_fee_ppm = max(1, int(spread * cfg.kelly_fraction))
         max_budget = int(amount * max_fee_ppm / 1_000_000)
 

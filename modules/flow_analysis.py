@@ -152,15 +152,17 @@ class KalmanFlowState:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "KalmanFlowState":
+        # M-19: Use `or` to guard against None values from DB migration columns
+        # (dict.get returns None when key exists but value is NULL, not the default)
         return cls(
-            flow_ratio=d.get("flow_ratio", 0.0),
-            flow_velocity=d.get("flow_velocity", 0.0),
-            variance_ratio=d.get("variance_ratio", KALMAN_INITIAL_VARIANCE),
-            variance_velocity=d.get("variance_velocity", KALMAN_INITIAL_VARIANCE),
-            covariance=d.get("covariance", 0.0),
-            last_update=d.get("last_update", 0),
-            innovation_variance=d.get("innovation_variance", 0.01),
-            last_innovation=d.get("last_innovation", 0.0)
+            flow_ratio=float(d.get("flow_ratio") or 0.0),
+            flow_velocity=float(d.get("flow_velocity") or 0.0),
+            variance_ratio=float(d.get("variance_ratio") or KALMAN_INITIAL_VARIANCE),
+            variance_velocity=float(d.get("variance_velocity") or KALMAN_INITIAL_VARIANCE),
+            covariance=float(d.get("covariance") or 0.0),
+            last_update=int(d.get("last_update") or 0),
+            innovation_variance=float(d.get("innovation_variance") or 0.01),
+            last_innovation=float(d.get("last_innovation") or 0.0)
         )
 
 
@@ -193,8 +195,8 @@ class KalmanFlowFilter:
         self.state = KalmanFlowState()
 
     def _has_nan(self) -> bool:
-        """Check if any state variable is NaN."""
-        return any(math.isnan(v) for v in (
+        """Check if any state variable is NaN or Inf."""
+        return any(not math.isfinite(v) for v in (
             self.state.flow_ratio, self.state.flow_velocity,
             self.state.variance_ratio, self.state.variance_velocity,
             self.state.covariance, self.state.innovation_variance,
@@ -251,7 +253,8 @@ class KalmanFlowFilter:
 
         # A * P * A' for A = [[1, dt], [0, 1]]
         new_p00 = p00 + 2 * dt_days * p01 + dt_days * dt_days * p11 + q_ratio * dt_days
-        new_p01 = p01 + dt_days * p11
+        # MA-10: Include cross-covariance process noise term
+        new_p01 = p01 + dt_days * p11 + q_velocity * dt_days * dt_days / 2.0
         new_p11 = p11 + q_velocity * dt_days
 
         self.state.variance_ratio = new_p00

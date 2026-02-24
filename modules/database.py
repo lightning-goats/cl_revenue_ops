@@ -69,8 +69,10 @@ class Database:
             sqlite3.Connection: Thread-local database connection
         """
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            # Ensure directory exists (guard against bare filename with no directory)
+            db_dir = os.path.dirname(self.db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
             
             # Create new connection for this thread
             self._local.conn = sqlite3.connect(
@@ -112,8 +114,9 @@ class Database:
         Should be called when a thread is about to exit or during shutdown.
         """
         if hasattr(self._local, 'conn') and self._local.conn is not None:
+            conn = self._local.conn
             try:
-                self._local.conn.close()
+                conn.close()
                 self.plugin.log(
                     f"Database: Closed thread-local connection (thread={threading.current_thread().name})",
                     level='debug'
@@ -122,6 +125,12 @@ class Database:
                 self.plugin.log(f"Error closing connection: {e}", level='debug')
             finally:
                 self._local.conn = None
+                # L-21: Remove from tracking list to prevent leaks
+                with self._thread_conn_lock:
+                    try:
+                        self._thread_connections.remove(conn)
+                    except ValueError:
+                        pass
 
     def close_all_connections(self) -> None:
         """

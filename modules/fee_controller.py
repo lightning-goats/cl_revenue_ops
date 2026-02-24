@@ -967,6 +967,13 @@ class ThompsonSamplingState:
         # L-6: Validate Beta distribution parameters (must be > 0 for betavariate)
         state.alphas = [max(0.01, a) for a in d.get("alphas", [1.0, 1.0, 2.0, 1.0, 1.0])]
         state.betas = [max(0.01, b) for b in d.get("betas", [1.0, 1.0, 1.0, 1.0, 1.0])]
+        # H-5: Ensure alphas/betas are exactly NUM_ARMS length (pad or truncate)
+        while len(state.alphas) < cls.NUM_ARMS:
+            state.alphas.append(1.0)
+        state.alphas = state.alphas[:cls.NUM_ARMS]
+        while len(state.betas) < cls.NUM_ARMS:
+            state.betas.append(1.0)
+        state.betas = state.betas[:cls.NUM_ARMS]
         state.current_arm = d.get("current_arm", 2)
         state.arm_start_time = d.get("arm_start_time", 0)
         state.cycles_completed = d.get("cycles_completed", 0)
@@ -1714,7 +1721,8 @@ class GaussianThompsonState:
             variance = max(self.MIN_STD ** 2, variance)
 
             # Posterior precision = prior precision + data precision
-            prior_precision = 1.0 / (self.prior_std_fee ** 2)
+            # M-14: Guard against zero/tiny prior_std_fee causing division overflow
+            prior_precision = 1.0 / max(self.MIN_STD ** 2, self.prior_std_fee ** 2)
             data_precision = total_weight / variance
             posterior_precision = prior_precision + data_precision
 
@@ -4288,7 +4296,7 @@ class HillClimbingFeeController:
         """
         # H-2: Non-blocking concurrency guard - only one fee adjustment cycle at a time
         if not self._state_lock.acquire(blocking=False):
-            self.plugin.log("Fee adjustment already in progress, skipping", level='debug')
+            self.plugin.log("Fee adjustment already in progress, skipping", level='info')
             return []
         try:
             return self._adjust_all_fees_inner()
@@ -5127,6 +5135,8 @@ class HillClimbingFeeController:
         # =====================================================================
 
         # Target Decision Block (The Alpha Sequence)
+        # M-10: Initialize decision_reason before any branch can use it
+        decision_reason = "unknown"
         base_new_fee = None  # For observability; set in Hill Climbing branch
         new_fee_ppm = 0
         target_found = False
@@ -5262,6 +5272,7 @@ class HillClimbingFeeController:
             elasticity_tracker = ts_state.get_elasticity_tracker()
 
             # Record observation for historical analysis
+            regime_already_checked = False
             if self.ENABLE_HISTORICAL_CURVE:
                 historical_curve.add_observation(
                     fee_ppm=current_fee_ppm,
@@ -5270,8 +5281,11 @@ class HillClimbingFeeController:
                 )
 
                 # Check for regime change
+                # M-12: Track whether we already checked regime to avoid double-detection below
+                regime_already_checked = False
                 if now - historical_curve.last_regime_check > self.REGIME_CHECK_INTERVAL:
                     historical_curve.last_regime_check = now
+                    regime_already_checked = True
                     if historical_curve.detect_regime_change(current_revenue_rate):
                         self.plugin.log(
                             f"THOMPSON: Regime change detected for {channel_id[:12]}... "
@@ -5380,7 +5394,8 @@ class HillClimbingFeeController:
                         )
 
                 # --- REGIME CHANGE DETECTION & COORDINATION ---
-                if self.ENABLE_HISTORICAL_CURVE:
+                # M-12: Skip if already checked above in the Thompson block
+                if self.ENABLE_HISTORICAL_CURVE and not regime_already_checked:
                     regime_changed = historical_curve.detect_regime_change(current_revenue_rate)
                     if regime_changed:
                         try:
@@ -6638,38 +6653,9 @@ class HillClimbingFeeController:
                 fee_ppm                        # feeppm
             )
 
-            # Issue #32: Verify fee was actually set (detect CLBOSS reversion or external changes)
-            # Small delay to allow gossip propagation, then verify
-            time.sleep(0.1)  # 100ms
-            try:
-                verify_channels = self._get_channels_info()
-                verify_info = verify_channels.get(channel_id, {})
-                actual_fee = verify_info.get("fee_proportional_millionths", -1)
-                if actual_fee != fee_ppm and actual_fee != -1:
-                    self.plugin.log(
-                        f"FEE CONFLICT: Fee for {channel_id[:16]}... was reverted "
-                        f"(wanted {fee_ppm}, got {actual_fee}). Re-unmanaging and retrying.",
-                        level='warn'
-                    )
-                    # Re-unmanage and retry once
-                    self.clboss.unmanage(peer_id, ClbossTags.FEE_AND_BALANCE)
-                    self.plugin.rpc.setchannel(channel_id, self.config.base_fee_msat, fee_ppm)
-
-                    # Issue #32: Verify retry succeeded
-                    time.sleep(0.1)
-                    verify_channels2 = self._get_channels_info()
-                    verify_info2 = verify_channels2.get(channel_id, {})
-                    final_fee = verify_info2.get("fee_proportional_millionths", -1)
-                    if final_fee != fee_ppm and final_fee != -1:
-                        result["message"] = (
-                            f"FEE CONFLICT UNRESOLVED: Wanted {fee_ppm} ppm, "
-                            f"got {final_fee} ppm after retry. External override active."
-                        )
-                        self.plugin.log(result["message"], level='error')
-                        return result  # Return with success=False
-            except Exception as verify_err:
-                self.plugin.log(f"Fee verification failed: {verify_err}", level='warn')
-                # Don't fail on verification errors - fee may have been set correctly
+            # M-13: Removed per-channel sleep+verify+retry loop from hot path.
+            # Fee verification is handled by the existing gossip refresh mechanism
+            # in the next adjustment cycle, which detects and corrects reverted fees.
 
             # Step 3: Record the change with explainability data
             self.database.record_fee_change(
@@ -7226,7 +7212,8 @@ class HillClimbingFeeController:
             if mean_fee <= 0:
                 return 0.0
 
-            variance = sum((f - mean_fee) ** 2 for f in fees) / len(fees)
+            # L-9: Use sample variance (Bessel correction) since len(fees) >= 5
+            variance = sum((f - mean_fee) ** 2 for f in fees) / (len(fees) - 1)
             std_dev = variance ** 0.5
 
             # Coefficient of variation

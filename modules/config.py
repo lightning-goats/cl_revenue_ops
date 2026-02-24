@@ -460,7 +460,7 @@ class Config:
                 if not (min_val <= typed_value <= max_val):
                     return  # Skip out-of-range override, keep default
             setattr(self, key, typed_value)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):
             pass  # Keep default if conversion fails
     
     def update_runtime(self, database: 'Database', key: str, value: str) -> Dict[str, Any]:
@@ -703,6 +703,10 @@ class ConfigSnapshot:
     hive_nnlb_auto_execute: bool = False
     hive_channel_ages_enabled: bool = True
     hive_channel_ages_cache_seconds: int = 3600
+
+    # M-27: xpay/askrene parameters (were missing from snapshot)
+    askrene_layer: str = 'xpay'
+    askrene_max_age_sec: int = 900
 
     # Version tracking
     version: int = 0
