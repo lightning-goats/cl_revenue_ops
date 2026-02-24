@@ -185,9 +185,11 @@ class KalmanFlowFilter:
     def __init__(self, state: Optional[KalmanFlowState] = None):
         """Initialize filter with optional existing state."""
         self.state = state or KalmanFlowState()
+        self._nan_recovery_count = 0
 
     def _reset_state(self) -> None:
         """Reset filter state to defaults (used on NaN/corruption recovery)."""
+        self._nan_recovery_count += 1
         self.state = KalmanFlowState()
 
     def _has_nan(self) -> bool:
@@ -232,7 +234,7 @@ class KalmanFlowFilter:
 
         # Bound state after prediction to physical range
         self.state.flow_ratio = max(-1.0, min(1.0, self.state.flow_ratio))
-        self.state.flow_velocity = max(-1.0, min(1.0, self.state.flow_velocity))
+        self.state.flow_velocity = max(MIN_VELOCITY, min(MAX_VELOCITY, self.state.flow_velocity))
 
         # Process noise adaptation based on volatility
         q_ratio = KALMAN_BASE_PROCESS_NOISE * volatility * KALMAN_VOLATILITY_SCALING
@@ -295,22 +297,26 @@ class KalmanFlowFilter:
         self.state.flow_ratio += k0 * innovation
         self.state.flow_velocity += k1 * innovation
 
-        # Covariance update: P = (I - K*H) * P
-        # Standard form with positive-definiteness clamps below
+        # M-6: Joseph form for numerical stability: P = (I - K*H) * P * (I - K*H)' + K * R * K'
+        # For H = [1, 0]:
         p00 = self.state.variance_ratio
         p01 = self.state.covariance
         p11 = self.state.variance_velocity
 
-        self.state.variance_ratio = (1 - k0) * p00
-        self.state.covariance = (1 - k0) * p01
-        self.state.variance_velocity = p11 - k1 * p01
+        new_p00 = (1 - k0) * p00 * (1 - k0) + k0 * k0 * r
+        new_p01 = (1 - k0) * p01 - k1 * (1 - k0) * p00 + k0 * k1 * r
+        new_p11 = p11 - k1 * p01 - k1 * (p01 - k1 * p00) + k1 * k1 * r
+
+        self.state.variance_ratio = new_p00
+        self.state.covariance = new_p01
+        self.state.variance_velocity = new_p11
 
         # Ensure covariance stays positive definite
         self._ensure_positive_definite()
 
         # Bound state to physical range
         self.state.flow_ratio = max(-1.0, min(1.0, self.state.flow_ratio))
-        self.state.flow_velocity = max(-1.0, min(1.0, self.state.flow_velocity))
+        self.state.flow_velocity = max(MIN_VELOCITY, min(MAX_VELOCITY, self.state.flow_velocity))
 
         # Store innovation for regime change detection
         self.state.last_innovation = innovation
@@ -608,6 +614,15 @@ class FlowAnalyzer:
 
         # Update step with observation
         innovation = kf.update(observed_ratio, confidence)
+
+        # L-25: Log warning on NaN recovery
+        if kf._nan_recovery_count > 0:
+            self.plugin.log(
+                f"KALMAN: NaN recovery triggered {kf._nan_recovery_count} time(s) "
+                f"for {channel_id[:12]}... — filter state was reset",
+                level='warn'
+            )
+            kf._nan_recovery_count = 0
 
         # Detect regime change
         regime_change = kf.is_regime_change(threshold=2.5)

@@ -25,6 +25,8 @@ import threading
 
 from pyln.client import Plugin, RpcError
 
+from .utils import parse_msat as _shared_parse_msat
+
 if TYPE_CHECKING:
     from .hive_bridge import HiveFeeIntelligenceBridge
 
@@ -387,28 +389,8 @@ class ChannelProfitabilityAnalyzer:
         self._bleeder_cache_time: float = 0
         
     def _parse_msat(self, msat_val: Any) -> int:
-        """
-        Safely convert msat values to integers.
-        Handles '1000msat' strings, raw integers, Millisatoshi objects, and plain numeric strings.
-        """
-        if msat_val is None:
-            return 0
-        if hasattr(msat_val, 'millisatoshis'):
-            return int(msat_val.millisatoshis)
-        if isinstance(msat_val, int):
-            return msat_val
-        if isinstance(msat_val, str):
-            # Strip suffix if present
-            if msat_val.endswith('msat'):
-                clean_val = msat_val[:-4]
-            else:
-                clean_val = msat_val
-                
-            try:
-                return int(clean_val)
-            except ValueError:
-                return 0
-        return 0
+        """L-18: Delegate to shared parse_msat in utils.py."""
+        return _shared_parse_msat(msat_val)
     
     def analyze_all_channels(self, force: bool = False) -> Dict[str, ChannelProfitability]:
         """

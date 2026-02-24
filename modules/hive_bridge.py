@@ -119,7 +119,7 @@ class HiveFeeIntelligenceBridge:
     and caching.
 
     Usage:
-        bridge = HiveFeeIntelligenceBridge(plugin, database)
+        bridge = HiveFeeIntelligenceBridge(plugin, database, config)
 
         # Check if cl-hive is available
         if bridge.is_available():
@@ -129,22 +129,26 @@ class HiveFeeIntelligenceBridge:
                 their_avg_fee = intel.get("avg_fee_charged", 0)
     """
 
-    def __init__(self, plugin, database):
+    def __init__(self, plugin, database, config=None):
         """
         Initialize the HiveFeeIntelligenceBridge.
 
         Args:
             plugin: Reference to the pyln Plugin (or ThreadSafePluginProxy)
             database: Database instance for state persistence (future use)
+            config: Config instance for fee bounds (optional)
         """
         self.plugin = plugin
         self.database = database
+        self.config = config
 
         # Cache: peer_id -> CachedProfile
         self._cache: Dict[str, CachedProfile] = {}
+        self._cache_lock = threading.RLock()  # RLock: _evict_oldest_cache_entries is called under lock from _set_cached
 
         # Circuit breaker state
         self._circuit = CircuitBreakerState()
+        self._circuit_lock = threading.Lock()
 
         # Availability cache: None = unknown, True/False = known
         self._hive_available: Optional[bool] = None
@@ -262,33 +266,36 @@ class HiveFeeIntelligenceBridge:
         Returns:
             True if circuit is open (should fail fast)
         """
-        if not self._circuit.is_open:
-            return False
+        with self._circuit_lock:
+            if not self._circuit.is_open:
+                return False
 
-        # Check if reset timeout has passed
-        if time.time() - self._circuit.last_failure > CIRCUIT_RESET_TIMEOUT:
-            self._circuit.is_open = False
-            self._circuit.failures = 0
-            self._log("Circuit breaker reset to CLOSED")
-            return False
+            # Check if reset timeout has passed
+            if time.time() - self._circuit.last_failure > CIRCUIT_RESET_TIMEOUT:
+                self._circuit.is_open = False
+                self._circuit.failures = 0
+                self._log("Circuit breaker reset to CLOSED")
+                return False
 
-        return True
+            return True
 
     def _record_success(self) -> None:
         """Record a successful RPC call."""
-        self._circuit.failures = 0
-        self._circuit.is_open = False
+        with self._circuit_lock:
+            self._circuit.failures = 0
+            self._circuit.is_open = False
 
     def _record_failure(self) -> None:
         """Record a failed RPC call."""
-        self._circuit.failures += 1
-        self._circuit.last_failure = time.time()
-        if self._circuit.failures >= CIRCUIT_FAILURES_THRESHOLD:
-            self._circuit.is_open = True
-            self._log(
-                f"Circuit breaker OPEN after {self._circuit.failures} failures",
-                level="warn"
-            )
+        with self._circuit_lock:
+            self._circuit.failures += 1
+            self._circuit.last_failure = time.time()
+            if self._circuit.failures >= CIRCUIT_FAILURES_THRESHOLD:
+                self._circuit.is_open = True
+                self._log(
+                    f"Circuit breaker OPEN after {self._circuit.failures} failures",
+                    level="warn"
+                )
 
     # =========================================================================
     # CACHE MANAGEMENT
@@ -305,20 +312,21 @@ class HiveFeeIntelligenceBridge:
             (data, is_fresh) tuple where data is the profile or None,
             and is_fresh indicates if data is within fresh TTL
         """
-        if peer_id not in self._cache:
-            return None, False
+        with self._cache_lock:
+            if peer_id not in self._cache:
+                return None, False
 
-        cached = self._cache[peer_id]
-        age = time.time() - cached.timestamp
+            cached = self._cache[peer_id]
+            age = time.time() - cached.timestamp
 
-        if age < CACHE_TTL_SECONDS:
-            return cached.data, True  # Fresh cache
-        elif age < STALE_CACHE_TTL_SECONDS:
-            return cached.data, False  # Stale but usable
-        else:
-            # Too old, remove from cache
-            del self._cache[peer_id]
-            return None, False
+            if age < CACHE_TTL_SECONDS:
+                return cached.data, True  # Fresh cache
+            elif age < STALE_CACHE_TTL_SECONDS:
+                return cached.data, False  # Stale but usable
+            else:
+                # Too old, remove from cache
+                del self._cache[peer_id]
+                return None, False
 
     def _set_cached(self, peer_id: str, data: Dict) -> None:
         """
@@ -327,14 +335,15 @@ class HiveFeeIntelligenceBridge:
         Enforces MAX_CACHE_ENTRIES limit by evicting oldest entries
         when cache is full.
         """
-        # Evict oldest entries if at capacity
-        if len(self._cache) >= MAX_CACHE_ENTRIES and peer_id not in self._cache:
-            self._evict_oldest_cache_entries(count=10)  # Evict 10 at a time
+        with self._cache_lock:
+            # Evict oldest entries if at capacity
+            if len(self._cache) >= MAX_CACHE_ENTRIES and peer_id not in self._cache:
+                self._evict_oldest_cache_entries(count=10)  # Evict 10 at a time
 
-        self._cache[peer_id] = CachedProfile(
-            data=data,
-            timestamp=time.time()
-        )
+            self._cache[peer_id] = CachedProfile(
+                data=data,
+                timestamp=time.time()
+            )
 
     def _evict_oldest_cache_entries(self, count: int = 10) -> None:
         """
@@ -343,20 +352,21 @@ class HiveFeeIntelligenceBridge:
         Args:
             count: Number of entries to evict
         """
-        if not self._cache:
-            return
+        with self._cache_lock:
+            if not self._cache:
+                return
 
-        # Sort by timestamp (oldest first)
-        sorted_entries = sorted(
-            self._cache.items(),
-            key=lambda x: x[1].timestamp
-        )
+            # Sort by timestamp (oldest first)
+            sorted_entries = sorted(
+                self._cache.items(),
+                key=lambda x: x[1].timestamp
+            )
 
-        # Remove oldest entries
-        for peer_id, _ in sorted_entries[:count]:
-            del self._cache[peer_id]
+            # Remove oldest entries
+            for peer_id, _ in sorted_entries[:count]:
+                del self._cache[peer_id]
 
-        self._log(f"Evicted {min(count, len(sorted_entries))} old cache entries", level="debug")
+            self._log(f"Evicted {min(count, len(sorted_entries))} old cache entries", level="debug")
 
     def cleanup_stale_cache(self) -> int:
         """
@@ -368,19 +378,20 @@ class HiveFeeIntelligenceBridge:
         Returns:
             Number of entries removed
         """
-        now = time.time()
-        stale_peers = [
-            peer_id for peer_id, cached in self._cache.items()
-            if (now - cached.timestamp) > STALE_CACHE_TTL_SECONDS
-        ]
+        with self._cache_lock:
+            now = time.time()
+            stale_peers = [
+                peer_id for peer_id, cached in self._cache.items()
+                if (now - cached.timestamp) > STALE_CACHE_TTL_SECONDS
+            ]
 
-        for peer_id in stale_peers:
-            del self._cache[peer_id]
+            for peer_id in stale_peers:
+                del self._cache[peer_id]
 
-        if stale_peers:
-            self._log(f"Cleaned up {len(stale_peers)} stale cache entries", level="debug")
+            if stale_peers:
+                self._log(f"Cleaned up {len(stale_peers)} stale cache entries", level="debug")
 
-        return len(stale_peers)
+            return len(stale_peers)
 
     def _stale_with_reduced_confidence(
         self,
@@ -1229,6 +1240,15 @@ class HiveFeeIntelligenceBridge:
                 )
                 return None
 
+            # M-18: Clamp recommended fee to configured bounds
+            if result and 'recommended_fee_ppm' in result:
+                min_fee = self.config.min_fee_ppm if self.config else 0
+                max_fee = self.config.max_fee_ppm if self.config else 100000
+                result['recommended_fee_ppm'] = max(
+                    min_fee,
+                    min(result['recommended_fee_ppm'], max_fee)
+                )
+
             self._record_success()
             return result
 
@@ -1355,6 +1375,10 @@ class HiveFeeIntelligenceBridge:
             if result.get("error"):
                 self._log(f"Defense status query error: {result.get('error')}", level="debug")
                 return None
+
+            # M-18: Clamp defensive_multiplier to safe range [0.1, 5.0]
+            if result and 'defensive_multiplier' in result:
+                result['defensive_multiplier'] = max(0.1, min(5.0, result['defensive_multiplier']))
 
             self._record_success()
             return result

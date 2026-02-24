@@ -48,6 +48,7 @@ from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
 from .policy_manager import PolicyManager, FeeStrategy
+from .utils import parse_msat
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -946,8 +947,9 @@ class ThompsonSamplingState:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ThompsonSamplingState":
         state = cls()
-        state.alphas = d.get("alphas", [1.0, 1.0, 2.0, 1.0, 1.0])
-        state.betas = d.get("betas", [1.0, 1.0, 1.0, 1.0, 1.0])
+        # L-6: Validate Beta distribution parameters (must be > 0 for betavariate)
+        state.alphas = [max(0.01, a) for a in d.get("alphas", [1.0, 1.0, 2.0, 1.0, 1.0])]
+        state.betas = [max(0.01, b) for b in d.get("betas", [1.0, 1.0, 1.0, 1.0, 1.0])]
         state.current_arm = d.get("current_arm", 2)
         state.arm_start_time = d.get("arm_start_time", 0)
         state.cycles_completed = d.get("cycles_completed", 0)
@@ -1933,7 +1935,7 @@ class AIMDDefenseState:
     - Bounded modifier range (0.5 to 1.5)
     """
     # AIMD parameters (tunable based on channel characteristics)
-    ADDITIVE_INCREASE_PPM = 5       # Add 5 ppm per success streak
+    # L-7: Removed dead ADDITIVE_INCREASE_PPM; increase is proportional (+0.02 modifier per success streak)
     MULTIPLICATIVE_DECREASE = 0.85  # Multiply by 0.85 on failure streak (15% drop)
 
     # Thresholds for triggering AIMD
@@ -3046,7 +3048,9 @@ class HillClimbingFeeController:
             reason=reason,
             set_at=time.time(),
         )
-        self._fee_anchors[channel_id] = anchor
+        # M-5: Protect _fee_anchors with _state_lock
+        with self._state_lock:
+            self._fee_anchors[channel_id] = anchor
         self.database.set_fee_anchor(
             channel_id, target_fee_ppm, base_weight, confidence, ttl_seconds, reason
         )
@@ -3085,9 +3089,13 @@ class HillClimbingFeeController:
     def list_fee_anchors(self) -> List[Dict[str, Any]]:
         """Public API: list all active fee anchors."""
         result = []
-        for cid, anchor in list(self._fee_anchors.items()):
+        # M-5: Protect _fee_anchors with _state_lock
+        with self._state_lock:
+            anchors_snapshot = list(self._fee_anchors.items())
+        for cid, anchor in anchors_snapshot:
             if anchor.is_expired():
-                del self._fee_anchors[cid]
+                with self._state_lock:
+                    self._fee_anchors.pop(cid, None)
                 continue
             result.append({
                 "channel_id": anchor.channel_id,
@@ -3104,15 +3112,18 @@ class HillClimbingFeeController:
 
     def clear_fee_anchor(self, channel_id: str) -> Dict[str, Any]:
         """Public API: remove fee anchor for a channel."""
-        if channel_id in self._fee_anchors:
-            del self._fee_anchors[channel_id]
+        # M-5: Protect _fee_anchors with _state_lock
+        with self._state_lock:
+            self._fee_anchors.pop(channel_id, None)
         self.database.delete_fee_anchor(channel_id)
         return {"status": "success", "channel_id": channel_id}
 
     def clear_all_fee_anchors(self) -> Dict[str, Any]:
         """Public API: remove all fee anchors."""
-        count = len(self._fee_anchors)
-        self._fee_anchors.clear()
+        # M-5: Protect _fee_anchors with _state_lock
+        with self._state_lock:
+            count = len(self._fee_anchors)
+            self._fee_anchors.clear()
         self.database.delete_all_fee_anchors()
         return {"status": "success", "cleared": count}
 
@@ -4332,6 +4343,17 @@ class HillClimbingFeeController:
         Returns:
             List of FeeAdjustment records for channels that were adjusted
         """
+        # H-2: Non-blocking concurrency guard - only one fee adjustment cycle at a time
+        if not self._state_lock.acquire(blocking=False):
+            self.plugin.log("Fee adjustment already in progress, skipping", level='debug')
+            return []
+        try:
+            return self._adjust_all_fees_inner()
+        finally:
+            self._state_lock.release()
+
+    def _adjust_all_fees_inner(self) -> List[FeeAdjustment]:
+        """Inner implementation of adjust_all_fees, called under _state_lock."""
         adjustments = []
 
         # Skip reason tracking for diagnostics
@@ -4987,7 +5009,7 @@ class HillClimbingFeeController:
 
         # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity", 1)
-        spendable = channel_info.get("spendable_msat", 0) // 1000
+        spendable = parse_msat(channel_info.get("spendable_msat", 0)) // 1000
         outbound_ratio = spendable / capacity if capacity > 0 else 0.5
         
         bucket = LiquidityBuckets.get_bucket(outbound_ratio)

@@ -844,6 +844,12 @@ class PortfolioOptimizer:
 
         Objective: max sum(w_i * r_i) - lambda * sum(w_i * w_j * cov_ij)
         """
+        # M-7: Normalize returns to prevent scale-dependent convergence
+        returns_scale = max(abs(r) for r in returns) if returns else 1.0
+        if returns_scale <= 0:
+            returns_scale = 1.0
+        normalized_returns = [r / returns_scale for r in returns]
+
         # Initialize with equal weights
         weights = [1.0 / n] * n
 
@@ -851,8 +857,8 @@ class PortfolioOptimizer:
             # Calculate gradient
             gradient = []
             for i in range(n):
-                # dE[R]/dw_i = r_i
-                grad_return = returns[i]
+                # dE[R]/dw_i = r_i (using normalized returns)
+                grad_return = normalized_returns[i]
 
                 # dVar/dw_i = 2 * sum(w_j * cov_ij)
                 grad_var = 2 * sum(weights[j] * cov_matrix[i][j] for j in range(n))
@@ -922,6 +928,14 @@ class PortfolioOptimizer:
                 break
 
             # Renormalize
+            total = sum(weights)
+            if total > 0:
+                weights = [w / total for w in weights]
+
+        # M-8: Final enforcement if iterative projection didn't converge
+        total = sum(weights)
+        if abs(total - 1.0) > 1e-6:
+            weights = [max(effective_min, min(effective_max, w)) for w in weights]
             total = sum(weights)
             if total > 0:
                 weights = [w / total for w in weights]
@@ -997,7 +1011,9 @@ class PortfolioOptimizer:
 
         # avg_correlation can be negative (hedged portfolio) — clamp to [-1, 1]
         avg_correlation = max(-1.0, min(1.0, avg_correlation))
-        systematic_risk = avg_correlation
+        # L-9: Clamp systematic risk to non-negative (negative correlation
+        # means diversification benefit, not negative systematic risk)
+        systematic_risk = max(0.0, avg_correlation)
         idiosyncratic_risk = 1.0 - systematic_risk
 
         # Improvement potential

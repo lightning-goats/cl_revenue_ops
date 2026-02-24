@@ -300,8 +300,8 @@ class TestPortfolioRiskDecomposition:
     would report 0% systematic / 100% idiosyncratic, hiding the hedging benefit.
     """
 
-    def test_negative_correlation_preserved(self):
-        """Negative avg_correlation should produce negative systematic_risk."""
+    def test_negative_correlation_clamped_to_zero(self):
+        """Negative avg_correlation should produce zero systematic_risk (L-9 clamp)."""
         from modules.portfolio_optimizer import PortfolioOptimizer
 
         optimizer = PortfolioOptimizer.__new__(PortfolioOptimizer)
@@ -330,11 +330,12 @@ class TestPortfolioRiskDecomposition:
             total_local_sats=1000000
         )
 
-        # systematic_risk should be negative (hedged)
-        assert summary.systematic_risk_pct < 0, \
-            f"Hedged portfolio should show negative systematic risk, got {summary.systematic_risk_pct}"
-        # idiosyncratic should be > 1.0 for hedged portfolios
-        assert summary.idiosyncratic_risk_pct > 1.0
+        # L-9: systematic_risk clamped to non-negative (negative correlation
+        # means diversification benefit, not negative systematic risk)
+        assert summary.systematic_risk_pct == 0.0, \
+            f"Hedged portfolio should show zero systematic risk, got {summary.systematic_risk_pct}"
+        # idiosyncratic should be 1.0 when systematic is clamped to 0
+        assert summary.idiosyncratic_risk_pct == 1.0
 
     def test_positive_correlation_still_works(self):
         """Positive avg_correlation should produce positive systematic_risk."""

@@ -91,7 +91,7 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
 
         assert res["success"] is False
         mock_database.reserve_budget.assert_called_once()
-        mock_database.release_budget_reservation.assert_called_once_with(456)
+        mock_database.release_budget_reservation.assert_called_once_with('456')
 
 
 class TestMultiSourceClbossUnmanage:

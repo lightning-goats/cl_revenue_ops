@@ -31,6 +31,7 @@ from .config import Config, ConfigSnapshot
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
 from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
+from .utils import parse_msat as _shared_parse_msat
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -236,7 +237,7 @@ class JobManager:
         peers = set()
         with self._jobs_lock:
             for job in self._active_jobs.values():
-                if job.candidate:
+                if job is not None and job.candidate:
                     peers.add(job.candidate.to_peer_id)
                     peers.add(job.candidate.primary_source_peer_id)
         return list(peers)
@@ -246,10 +247,17 @@ class JobManager:
         if not self.hive_bridge:
             return
         try:
-            peers = self.get_active_rebalancing_peers()
+            # L-1: Read both values under a single lock for consistency
+            with self._jobs_lock:
+                active = len(self._active_jobs) > 0
+                peers = set()
+                for job in self._active_jobs.values():
+                    if job is not None and job.candidate:
+                        peers.add(job.candidate.to_peer_id)
+                        peers.add(job.candidate.primary_source_peer_id)
             self.hive_bridge.update_rebalancing_activity(
-                rebalancing_active=len(self._active_jobs) > 0,
-                rebalancing_peers=peers
+                rebalancing_active=active,
+                rebalancing_peers=list(peers)
             )
         except Exception:
             pass  # Non-critical reporting, never crash
@@ -394,15 +402,16 @@ class JobManager:
             Dict with 'success' bool and 'message' or 'error'
         """
         normalized_scid = self._normalize_scid(candidate.to_channel)
-        
-        # Check if job already exists
-        if normalized_scid in self._active_jobs:
-            return {"success": False, "error": "Job already exists for this channel"}
-        
-        # Check slot availability
-        if self.active_job_count >= self.max_concurrent_jobs:
-            return {"success": False, "error": "No job slots available"}
-        
+
+        # H-1: Atomic check-and-reserve under lock to prevent TOCTOU race
+        with self._jobs_lock:
+            if normalized_scid in self._active_jobs:
+                return {"success": False, "error": "Job already exists for this channel"}
+            if len(self._active_jobs) >= self.max_concurrent_jobs:
+                return {"success": False, "error": "No job slots available"}
+            # Reserve slot with sentinel (None) immediately
+            self._active_jobs[normalized_scid] = None
+
         # Convert SCIDs to sling format (x-separated, e.g., 930866x2599x2)
         to_scid = self._to_sling_scid(candidate.to_channel)
         
@@ -515,7 +524,7 @@ class JobManager:
                 if "already running" not in str(e).lower():
                     self.plugin.log(f"sling-go warning: {e}", level='debug')
             
-            # Track the job with all source candidates
+            # Track the job with all source candidates (replace sentinel with real job)
             job = ActiveJob(
                 scid=to_scid,
                 scid_normalized=normalized_scid,
@@ -546,37 +555,46 @@ class JobManager:
             }
             
         except RpcError as e:
+            # H-1: Remove sentinel on failure
+            with self._jobs_lock:
+                self._active_jobs.pop(normalized_scid, None)
             error_msg = str(e)
             self.plugin.log(f"Failed to start sling-job: {error_msg}", level='warn')
             return {"success": False, "error": f"Sling RPC error: {error_msg}"}
         except Exception as e:
+            # H-1: Remove sentinel on failure
+            with self._jobs_lock:
+                self._active_jobs.pop(normalized_scid, None)
             self.plugin.log(f"Error starting sling-job: {e}", level='error')
             return {"success": False, "error": str(e)}
     
     def stop_job(self, channel_id: str, reason: str = "manual") -> bool:
         """
         Stop and delete a sling job.
-        
+
         Args:
             channel_id: Channel SCID (any format)
             reason: Why the job is being stopped (for logging)
-            
+
         Returns:
             True if job was stopped, False if not found or error
         """
         normalized = self._normalize_scid(channel_id)
-        job = self._active_jobs.get(normalized)
-        
-        if not job:
+
+        # L-3: Atomic pop under lock first, then do RPC calls with the removed job
+        with self._jobs_lock:
+            job = self._active_jobs.pop(normalized, None)
+
+        if not job or job is None:  # None = sentinel from start_job
             return False
-        
+
         try:
             # First stop the job gracefully
             try:
                 self.plugin.rpc.call("sling-stop", {"scid": job.scid})
             except RpcError:
                 pass  # May already be stopped
-            
+
             # Then delete it to prevent restart
             try:
                 self.plugin.rpc.call("sling-deletejob", {
@@ -585,15 +603,11 @@ class JobManager:
                 })
             except RpcError as e:
                 self.plugin.log(f"sling-deletejob warning: {e}", level='debug')
-            
+
             self.plugin.log(f"Stopped sling job {job.scid} (reason: {reason})")
-            
+
         except Exception as e:
             self.plugin.log(f"Error stopping job {job.scid}: {e}", level='warn')
-        
-        # Remove from tracking regardless
-        with self._jobs_lock:
-            self._active_jobs.pop(normalized, None)
 
         # Report updated rebalancing activity to fleet
         self._report_rebalancing_activity()
@@ -638,20 +652,20 @@ class JobManager:
                 self.plugin.log(f"Periodic exclusion sync error: {e}", level='debug')
             self._last_exclusion_sync = now
 
-        if not self._active_jobs:
+        # M-1: Snapshot active jobs under lock for thread-safe iteration
+        with self._jobs_lock:
+            jobs_snapshot = {k: v for k, v in self._active_jobs.items() if v is not None}
+
+        if not jobs_snapshot:
             return summary
-        
-        # Get sling stats for all jobs
-        sling_stats = self._get_sling_stats()
+
+        # Get sling stats for all jobs (using snapshot)
+        sling_stats = self._get_sling_stats(jobs_snapshot)
 
         # Hoist listfunds to avoid N+1 RPC calls (per-job balance checks).
         local_balances = self._get_local_balances_map()
-        
-        # Copy keys to avoid modifying dict during iteration
-        job_scids = list(self._active_jobs.keys())
-        
-        for normalized_scid in job_scids:
-            job = self._active_jobs.get(normalized_scid)
+
+        for normalized_scid, job in jobs_snapshot.items():
             if not job:
                 continue
                 
@@ -746,20 +760,8 @@ class JobManager:
         return balances
 
     def _parse_msat(self, v: Any) -> int:
-        if v is None:
-            return 0
-        if isinstance(v, str):
-            s = v.strip().lower()
-            if s.endswith("msat"):
-                s = s[:-4]
-            try:
-                return int(s)
-            except Exception:
-                return 0
-        try:
-            return int(v)
-        except Exception:
-            return 0
+        """L-18: Delegate to shared parse_msat in utils.py."""
+        return _shared_parse_msat(v)
 
     def _parse_sats(self, v: Any) -> int:
         if v is None:
@@ -864,18 +866,27 @@ class JobManager:
 
         return None
 
-    def _get_sling_stats(self) -> Dict[str, Dict[str, Any]]:
+    def _get_sling_stats(self, jobs_snapshot: Optional[Dict[str, 'ActiveJob']] = None) -> Dict[str, Dict[str, Any]]:
         """Query sling-stats for all active jobs, returning dict keyed by SCID.
 
         Preferred approach: per-job ``sling-stats scid=<scid> json=true``
         which returns a known schema with ``successes_in_time_window`` /
         ``failures_in_time_window`` nested dicts.  Falls back to the bulk
         ``sling-stats json=true`` call if per-scid queries fail.
+
+        Args:
+            jobs_snapshot: Optional pre-taken snapshot of active jobs. If None,
+                          takes a snapshot under lock.
         """
         stats: Dict[str, Dict[str, Any]] = {}
 
+        # M-1: Use provided snapshot or take one under lock
+        if jobs_snapshot is None:
+            with self._jobs_lock:
+                jobs_snapshot = {k: v for k, v in self._active_jobs.items() if v is not None}
+
         # Per-job detailed stats (preferred — returns known schema)
-        for normalized_scid, job in list(self._active_jobs.items()):
+        for normalized_scid, job in jobs_snapshot.items():
             try:
                 result = self.plugin.rpc.call("sling-stats", {
                     "scid": job.scid,
@@ -988,7 +999,8 @@ class JobManager:
                     self.source_failure_counts[primary_source] = 0.0
 
         # Mark budget reservation as spent (CRITICAL-01 fix)
-        self.database.mark_budget_spent(job.rebalance_id, fee_sats)
+        # H-4: Ensure reservation_id is str to match DB column type
+        self.database.mark_budget_spent(str(job.rebalance_id), fee_sats)
 
         # Report outcome to hive for fleet coordination (Phase 7)
         self._report_outcome_to_hive(job, success=True, cost_sats=fee_sats,
@@ -1025,7 +1037,8 @@ class JobManager:
                 self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
 
         # Release budget reservation (CRITICAL-01 fix)
-        self.database.release_budget_reservation(job.rebalance_id)
+        # H-4: Ensure reservation_id is str to match DB column type
+        self.database.release_budget_reservation(str(job.rebalance_id))
 
         # Report outcome to hive for fleet coordination (Phase 7)
         self._report_outcome_to_hive(job, success=False, cost_sats=0, amount_transferred=0,
@@ -1074,8 +1087,9 @@ class JobManager:
             except Exception:
                 pass
 
-        # Release budget reservation - job failed (CRITICAL-01 fix)
-        self.database.release_budget_reservation(job.rebalance_id)
+        # L-17: Budget was actually spent (overspent), mark as spent not released
+        # H-4: Ensure reservation_id is str to match DB column type
+        self.database.mark_budget_spent(str(job.rebalance_id), actual_cost_sats)
 
         # Report outcome to hive for fleet coordination (Phase 7)
         self._report_outcome_to_hive(job, success=False, cost_sats=actual_cost_sats,
@@ -1130,8 +1144,12 @@ class JobManager:
             )
             self.database.increment_failure_count(job.scid_normalized)
 
-        # Release budget reservation - job timed out (CRITICAL-01 fix)
-        self.database.release_budget_reservation(job.rebalance_id)
+        # M-15: Partial success spent real fees; only release if no progress
+        # H-4: Ensure reservation_id is str to match DB column type
+        if amount_transferred > 0:
+            self.database.mark_budget_spent(str(job.rebalance_id), fee_sats)
+        else:
+            self.database.release_budget_reservation(str(job.rebalance_id))
 
         # Report outcome to hive for fleet coordination (Phase 7)
         # Partial success is still reported as success to help fleet learning
@@ -1149,7 +1167,9 @@ class JobManager:
     def stop_all_jobs(self, reason: str = "shutdown") -> int:
         """Stop all active jobs. Returns count of jobs stopped."""
         count = 0
-        for scid in list(self._active_jobs.keys()):
+        with self._jobs_lock:
+            scids = list(self._active_jobs.keys())
+        for scid in scids:
             if self.stop_job(scid, reason=reason):
                 count += 1
         return count
@@ -1196,9 +1216,29 @@ class JobManager:
                     f"Startup Hygiene: Terminated {orphan_count} orphan sling jobs",
                     level='info'
                 )
-            
+
+            # M-14: Mark orphaned pending/pending_async DB records as failed.
+            # Records older than job timeout that are still pending are from crashed jobs.
+            try:
+                cutoff = int(time.time()) - self.job_timeout_seconds
+                conn = self.database._get_connection()
+                cursor = conn.execute("""
+                    UPDATE rebalance_history
+                    SET status = 'failed', error_message = 'orphaned_on_restart'
+                    WHERE status IN ('pending', 'pending_async')
+                      AND timestamp < ?
+                """, (cutoff,))
+                orphaned_db = cursor.rowcount
+                if orphaned_db > 0:
+                    self.plugin.log(
+                        f"Startup Hygiene: Marked {orphaned_db} orphaned DB rebalance records as failed",
+                        level='info'
+                    )
+            except Exception as e:
+                self.plugin.log(f"Startup Hygiene: DB orphan cleanup error: {e}", level='debug')
+
             return orphan_count
-            
+
         except RpcError as e:
             # sling-job might not be available or no jobs exist
             self.plugin.log(f"Startup Hygiene: Could not query sling jobs: {e}", level='debug')
@@ -1659,9 +1699,10 @@ class JobManager:
     
     def get_all_jobs_status(self) -> List[Dict[str, Any]]:
         """Get status info for all active jobs."""
-        # BUG FIX: Avoid calling get_job_status twice per channel
         result = []
-        for scid in list(self._active_jobs.keys()):
+        with self._jobs_lock:
+            scids = list(self._active_jobs.keys())
+        for scid in scids:
             status = self.get_job_status(scid)
             if status:
                 result.append(status)
@@ -1719,6 +1760,7 @@ class EVRebalancer:
         self.policy_manager = policy_manager
         self.hive_bridge = hive_bridge
         self._pending: Dict[str, int] = {}
+        self._pending_lock = threading.Lock()  # L-14: Protect _pending dict
         self._our_node_id: Optional[str] = None
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
 
@@ -3186,7 +3228,8 @@ class EVRebalancer:
         This plugin acts as the "Strategist" while sling workers handle execution.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
-        self._pending[candidate.to_channel] = int(time.time())
+        with self._pending_lock:
+            self._pending[candidate.to_channel] = int(time.time())
 
         # Thread-safe config snapshot for this execution
         cfg = self.config.snapshot()
@@ -3208,7 +3251,8 @@ class EVRebalancer:
                 )
                 result["message"] = f"Skipped due to fleet conflict: {reason}"
                 result["fleet_conflict"] = True
-                self._pending.pop(candidate.to_channel, None)
+                with self._pending_lock:
+                    self._pending.pop(candidate.to_channel, None)
                 return result
 
             # =====================================================================
@@ -3230,7 +3274,8 @@ class EVRebalancer:
                 )
                 result["message"] = "Skipped due to circular flow risk"
                 result["circular_flow_risk"] = True
-                self._pending.pop(candidate.to_channel, None)
+                with self._pending_lock:
+                    self._pending.pop(candidate.to_channel, None)
                 return result
 
             # =====================================================================
@@ -3329,7 +3374,8 @@ class EVRebalancer:
                             f"({candidate.from_channel[:12]} → {candidate.to_channel[:12]})",
                             level='info'
                         )
-                        self._pending.pop(candidate.to_channel, None)
+                        with self._pending_lock:
+                            self._pending.pop(candidate.to_channel, None)
                         return result
                 except Exception as e:
                     self.plugin.log(
@@ -3365,7 +3411,8 @@ class EVRebalancer:
                     f"Invalid channel IDs: from={candidate.from_channel}, to={candidate.to_channel}",
                     level='error'
                 )
-                self._pending.pop(candidate.to_channel, None)
+                with self._pending_lock:
+                    self._pending.pop(candidate.to_channel, None)
                 return {
                     "success": False,
                     "error": "Invalid channel IDs - from_channel or to_channel is empty"
@@ -3398,7 +3445,8 @@ class EVRebalancer:
                 self.database.update_rebalance_result(
                     rebalance_id, 'success', 0, candidate.expected_profit_sats
                 )
-                self._pending.pop(candidate.to_channel, None)
+                with self._pending_lock:
+                    self._pending.pop(candidate.to_channel, None)
                 return {"success": True, "message": "Dry run", "rebalance_id": rebalance_id}
 
             if enforce_budget:
@@ -3415,7 +3463,7 @@ class EVRebalancer:
                     effective_budget = max(cfg.daily_budget_sats, proportional_budget)
 
                 reserved, remaining = self.database.reserve_budget(
-                    reservation_id=rebalance_id,
+                    reservation_id=str(rebalance_id),
                     amount_sats=db_max_fee,
                     channel_id=db_to_channel,
                     budget_limit=effective_budget,
@@ -3435,7 +3483,8 @@ class EVRebalancer:
                         level='warn'
                     )
                     # Budget exhaustion is global; don't backoff a specific channel.
-                    self._pending.pop(candidate.to_channel, None)
+                    with self._pending_lock:
+                        self._pending.pop(candidate.to_channel, None)
                     return result
 
             # Async execution via JobManager (sling background jobs)
@@ -3444,7 +3493,8 @@ class EVRebalancer:
             if res.get("success"):
                 job_started = True
                 # Clean up pending entry - job is now tracked by JobManager
-                self._pending.pop(candidate.to_channel, None)
+                with self._pending_lock:
+                    self._pending.pop(candidate.to_channel, None)
                 # Update DB status to pending_async
                 self.database.update_rebalance_result(rebalance_id, 'pending_async')
                 result.update({
@@ -3464,7 +3514,7 @@ class EVRebalancer:
                 result["message"] = f"Failed: {error}"
                 self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
                 if reserved_budget:
-                    self.database.release_budget_reservation(rebalance_id)
+                    self.database.release_budget_reservation(str(rebalance_id))
 
         except Exception as e:
             result["message"] = str(e)
@@ -3478,11 +3528,12 @@ class EVRebalancer:
                     pass
             if reserved_budget and rebalance_id is not None and not job_started:
                 try:
-                    self.database.release_budget_reservation(rebalance_id)
+                    self.database.release_budget_reservation(str(rebalance_id))
                 except Exception:
                     pass
-            self._pending.pop(candidate.to_channel, None)
-        
+            with self._pending_lock:
+                self._pending.pop(candidate.to_channel, None)
+
         return result
 
     def diagnostic_rebalance(self, channel_id: str) -> Dict[str, Any]:
@@ -3806,16 +3857,18 @@ class EVRebalancer:
         if self.job_manager.has_active_job(channel_id):
             return True
             
-        pending_time = self._pending.get(channel_id, 0)
-        if pending_time == 0: 
+        with self._pending_lock:
+            pending_time = self._pending.get(channel_id, 0)
+        if pending_time == 0:
             return False
-        
+
         failure_count, _ = self.database.get_failure_count(channel_id)
         base_cooldown = 600
         cooldown = base_cooldown * (2 ** min(failure_count, 4))
-        
+
         if int(time.time()) - pending_time > cooldown:
-            self._pending.pop(channel_id, None)
+            with self._pending_lock:
+                self._pending.pop(channel_id, None)
             return False
         return True
     

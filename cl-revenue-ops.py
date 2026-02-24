@@ -286,10 +286,11 @@ class ThreadSafeRpcProxy:
         self._executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="rpc")
         self._async_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rpc_async")
         self._async_fail_count = 0
+        self._async_lock = threading.Lock()  # L-4: Protect _async_fail_count
 
     def __getattr__(self, name):
         if name in ("_plugin", "_rpc", "_executor", "_async_executor",
-                     "_async_fail_count", "call", "fire_and_forget"):
+                     "_async_fail_count", "_async_lock", "call", "fire_and_forget"):
             return super().__getattribute__(name)
 
         fn = getattr(self._rpc, name)
@@ -344,12 +345,16 @@ class ThreadSafeRpcProxy:
         def _run():
             try:
                 self._rpc.call(method_name, payload if payload is not None else {})
-                self._async_fail_count = 0
+                # L-4: Protect _async_fail_count with lock
+                with self._async_lock:
+                    self._async_fail_count = 0
             except Exception as e:
-                self._async_fail_count += 1
+                with self._async_lock:
+                    self._async_fail_count += 1
+                    count = self._async_fail_count
                 self._plugin.log(
                     f"fire_and_forget {method_name} failed "
-                    f"(streak={self._async_fail_count}): {e}", level="debug"
+                    f"(streak={count}): {e}", level="debug"
                 )
         self._async_executor.submit(_run)
 
@@ -668,7 +673,46 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, boltz_swaps
     
     plugin.log("Initializing cl-revenue-ops plugin...")
-    
+
+    # M-10: Register SIGTERM handler early, before component initialization.
+    # The handler checks `if rebalancer` and `if database` with None guards, so it's safe.
+    def handle_shutdown_signal(signum, frame):
+        """
+        Handle SIGTERM for graceful shutdown.
+
+        CLN sends SIGTERM when `lightning-cli plugin stop cl-revenue-ops` is called.
+        This handler sets the shutdown_event, causing all background loops to exit
+        immediately instead of waiting for their sleep timers.
+        """
+        plugin.log("Received SIGTERM, initiating clean shutdown...", level='info')
+        shutdown_event.set()
+
+        # L-12: Shutdown ThreadPoolExecutors
+        if rpc_proxy:
+            try:
+                rpc_proxy._executor.shutdown(wait=False)
+                rpc_proxy._async_executor.shutdown(wait=False)
+            except Exception:
+                pass
+
+        # Stop active rebalance jobs to prevent phantom spending
+        if rebalancer and rebalancer.job_manager:
+            try:
+                stopped = rebalancer.job_manager.stop_all_jobs(reason="plugin_shutdown")
+                if stopped > 0:
+                    plugin.log(f"Stopped {stopped} active rebalance jobs", level='info')
+            except Exception as e:
+                plugin.log(f"Error stopping rebalance jobs: {e}", level='warn')
+
+        # MAJOR-11 FIX: Clean up database connections on shutdown
+        if database:
+            try:
+                database.close_main_connection()
+            except Exception as e:
+                plugin.log(f"Error closing database: {e}", level='warn')
+
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+
     # Build configuration from options
     config = Config(
         db_path=os.path.expanduser(options['revenue-ops-db-path']),
@@ -903,7 +947,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # During plugin init, CLN holds a lock that blocks plugin-to-plugin
         # RPCs (like hive-status), so we can only check plugin("list") here.
         # Membership is verified lazily by background threads after init.
-        hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database)
+        hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database, config=config)
         hive_bridge._init_complete = False  # Block hive calls until init finishes
         hive_loaded = False
         max_attempts = 6
@@ -1244,38 +1288,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 break
 
     # =========================================================================
-    # SIGNAL HANDLER: Clean Shutdown on `lightning-cli plugin stop`
-    # =========================================================================
-    def handle_shutdown_signal(signum, frame):
-        """
-        Handle SIGTERM for graceful shutdown.
-        
-        CLN sends SIGTERM when `lightning-cli plugin stop cl-revenue-ops` is called.
-        This handler sets the shutdown_event, causing all background loops to exit
-        immediately instead of waiting for their sleep timers.
-        """
-        plugin.log("Received SIGTERM, initiating clean shutdown...", level='info')
-        shutdown_event.set()
-        
-        # Stop active rebalance jobs to prevent phantom spending
-        if rebalancer and rebalancer.job_manager:
-            try:
-                stopped = rebalancer.job_manager.stop_all_jobs(reason="plugin_shutdown")
-                if stopped > 0:
-                    plugin.log(f"Stopped {stopped} active rebalance jobs", level='info')
-            except Exception as e:
-                plugin.log(f"Error stopping rebalance jobs: {e}", level='warn')
-        
-        # MAJOR-11 FIX: Clean up database connections on shutdown
-        if database:
-            try:
-                database.close_main_connection()
-            except Exception as e:
-                plugin.log(f"Error closing database: {e}", level='warn')
-
-    signal.signal(signal.SIGTERM, handle_shutdown_signal)
-    
-    # =========================================================================
     # STARTUP HYGIENE: Clean up orphan jobs from previous runs
     # =========================================================================
     if rebalancer and config.sling_available:
@@ -1283,6 +1295,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             rebalancer.job_manager.cleanup_orphans()
         except Exception as e:
             plugin.log(f"Warning: Could not clean up orphan jobs: {e}", level='warn')
+
+        # M-11: Clean up stale budget reservations from crashed jobs
+        try:
+            database.cleanup_stale_reservations()
+        except Exception as e:
+            plugin.log(f"Warning: Could not clean up stale reservations: {e}", level='warn')
 
         # PHASE 6: Sync peer exclusions with sling on startup
         try:
@@ -1576,12 +1594,12 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
     try:
         listfunds = safe_plugin.rpc.listfunds()
         onchain_sats = sum(
-            (int(str(o.get("amount_msat", "0")).replace("msat", "")) // 1000)
+            (_parse_msat(o.get("amount_msat", 0)) // 1000)
             for o in listfunds.get("outputs", [])
             if o.get("status") == "confirmed"
         )
         channel_sats = sum(
-            (int(str(c.get("our_amount_msat", "0")).replace("msat", "")) // 1000)
+            (_parse_msat(c.get("our_amount_msat", 0)) // 1000)
             for c in listfunds.get("channels", [])
         )
         total_liquid = onchain_sats + channel_sats
@@ -1798,6 +1816,10 @@ def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[st
     if flow_analyzer is None:
         return {"error": "Plugin not fully initialized"}
 
+    # L-22: Validate SCID format if provided
+    if channel_id and not re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id):
+        return {"error": f"Invalid channel format: {channel_id}. Use SCID format (e.g., 123x456x789)."}
+
     if channel_id:
         result = flow_analyzer.analyze_channel(channel_id)
         return {"channel": channel_id, "analysis": result.to_dict() if result else None}
@@ -1981,7 +2003,12 @@ def revenue_rebalance(plugin: Plugin,
 
     if config and not config.sling_available:
         return {"error": "Rebalancing disabled: sling plugin not found. Install cln-sling to enable."}
-    
+
+    # L-21: Validate SCID format
+    for cid in (from_channel, to_channel):
+        if not re.match(r'^\d+[x:]\d+[x:]\d+$', cid):
+            return {"status": "error", "error": f"Invalid channel format for {cid}. Use SCID format (e.g., 123x456x789)."}
+
     # 1. Validation
     try:
         amount_sats = int(amount_sats)
@@ -2234,7 +2261,11 @@ def revenue_remanage(plugin: Plugin, peer_id: str, tag: Optional[str] = None) ->
     """
     if clboss_manager is None:
         return {"error": "Plugin not fully initialized"}
-    
+
+    # L-22: Validate peer_id format (66-char hex pubkey)
+    if not re.match(r'^[0-9a-fA-F]{66}$', peer_id):
+        return {"error": f"Invalid peer_id format: expected 66-character hex pubkey"}
+
     try:
         result = clboss_manager.remanage(peer_id, tag)
         return {"status": "success", "peer_id": peer_id, **result}
@@ -2409,6 +2440,9 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
         elif action == "get":
             if not peer_id:
                 return {"error": "Usage: revenue-policy get <peer_id>"}
+            # L-22: Validate peer_id format
+            if not re.match(r'^[0-9a-fA-F]{66}$', peer_id):
+                return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
             policy = policy_manager.get_policy(peer_id)
             return {"policy": policy.to_dict()}
         
@@ -2818,6 +2852,9 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
     if database is None:
         return {"error": "Database not initialized"}
 
+    # L-23: Clamp window_days to sane range
+    window_days = max(1, min(int(window_days), 365))
+
     try:
         # Get TLV (Total Liquidating Value)
         tlv_data = profitability_analyzer.get_tlv()
@@ -3170,6 +3207,8 @@ def revenue_boltz_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
     """Get Boltz swap history and cost summary."""
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
+    # L-23: Clamp limit to sane range
+    limit = max(1, min(int(limit), 1000))
     try:
         return boltz_swaps.history(limit=limit)
     except Exception as e:
@@ -4187,9 +4226,9 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
             for ch in channels.get('channels', []):
                 scid = normalize_scid(ch.get('short_channel_id', ''))
                 if scid == channel_id:
-                    capacity_sats = ch.get('total_msat', 0) // 1000
-                    our_funding_sats = ch.get('funding', {}).get('local_funds_msat', 0) // 1000
-                    their_funding_sats = ch.get('funding', {}).get('remote_funds_msat', 0) // 1000
+                    capacity_sats = _parse_msat(ch.get('total_msat', 0)) // 1000
+                    our_funding_sats = _parse_msat(ch.get('funding', {}).get('local_funds_msat', 0)) // 1000
+                    their_funding_sats = _parse_msat(ch.get('funding', {}).get('remote_funds_msat', 0)) // 1000
 
                     # Also get opener if we didn't determine it yet
                     if opener == 'unknown':
@@ -4359,7 +4398,7 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
                 closed = safe_plugin.rpc.call("listclosedchannels")
                 for ch in closed.get('closedchannels', []):
                     if normalize_scid(ch.get('short_channel_id', '')) == channel_id:
-                        capacity_sats = ch.get('total_msat', 0) // 1000
+                        capacity_sats = _parse_msat(ch.get('total_msat', 0)) // 1000
                         if not peer_id:
                             peer_id = ch.get('peer_id')
                         # CLN provides 'closer' field in listclosedchannels (v24.02+)
@@ -4465,7 +4504,7 @@ def _handle_splice_completion(channel_id: str, peer_id: Optional[str]) -> None:
                     for ch in peers.get('channels', []):
                         scid = normalize_scid(ch.get('short_channel_id', ''))
                         if scid == channel_id:
-                            new_capacity = ch.get('total_msat', 0) // 1000
+                            new_capacity = _parse_msat(ch.get('total_msat', 0)) // 1000
                             if not peer_id:
                                 peer_id = ch.get('peer_id')
                             break

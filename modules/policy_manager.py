@@ -21,6 +21,7 @@ Phase 9 Preparation: Provides API hooks for cl-hive integration.
 
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -191,6 +192,7 @@ class PolicyManager:
         # In-memory cache with write-through pattern (v2.0)
         self._cache: Dict[str, PeerPolicy] = {}
         self._cache_valid = False
+        self._cache_lock = threading.Lock()
 
         # v2.0: Policy change callbacks
         self._on_change_callbacks: List[Callable[[str, PeerPolicy], None]] = []
@@ -245,19 +247,20 @@ class PolicyManager:
         now = int(time.time())
         window_start = now - 60  # 1 minute window
 
-        # Get timestamps for this peer
-        timestamps = self._change_timestamps.get(peer_id, [])
+        with self._cache_lock:
+            # Get timestamps for this peer
+            timestamps = self._change_timestamps.get(peer_id, [])
 
-        # Prune old timestamps
-        timestamps = [ts for ts in timestamps if ts > window_start]
+            # Prune old timestamps
+            timestamps = [ts for ts in timestamps if ts > window_start]
 
-        if len(timestamps) >= MAX_POLICY_CHANGES_PER_MINUTE:
-            return False
+            if len(timestamps) >= MAX_POLICY_CHANGES_PER_MINUTE:
+                return False
 
-        # Record this change
-        timestamps.append(now)
-        self._change_timestamps[peer_id] = timestamps
-        return True
+            # Record this change
+            timestamps.append(now)
+            self._change_timestamps[peer_id] = timestamps
+            return True
     
     def _validate_peer_id(self, peer_id: str) -> None:
         """
@@ -274,8 +277,9 @@ class PolicyManager:
     
     def _invalidate_cache(self) -> None:
         """Invalidate the in-memory policy cache (full reload on next access)."""
-        self._cache.clear()
-        self._cache_valid = False
+        with self._cache_lock:
+            self._cache.clear()
+            self._cache_valid = False
 
     def _update_cache(self, peer_id: str, policy: PeerPolicy) -> None:
         """
@@ -283,32 +287,35 @@ class PolicyManager:
 
         More efficient than full invalidation for single-peer operations.
         """
-        self._cache[peer_id] = policy
-        # Cache remains valid since we updated it directly
+        with self._cache_lock:
+            self._cache[peer_id] = policy
+            # Cache remains valid since we updated it directly
 
     def _remove_from_cache(self, peer_id: str) -> None:
         """v2.0: Remove single peer from cache."""
-        if peer_id in self._cache:
-            del self._cache[peer_id]
+        with self._cache_lock:
+            if peer_id in self._cache:
+                del self._cache[peer_id]
 
     def _load_cache(self) -> None:
         """Load all policies into cache from database."""
-        if self._cache_valid:
-            return
+        with self._cache_lock:
+            if self._cache_valid:
+                return
 
-        conn = self.database._get_connection()
-        rows = conn.execute(
-            "SELECT * FROM peer_policies ORDER BY updated_at DESC"
-        ).fetchall()
+            conn = self.database._get_connection()
+            rows = conn.execute(
+                "SELECT * FROM peer_policies ORDER BY updated_at DESC"
+            ).fetchall()
 
-        self._cache.clear()
-        for row in rows:
-            policy = self._row_to_policy(row)
-            # v2.0: Skip expired policies during cache load
-            if not policy.is_expired():
-                self._cache[policy.peer_id] = policy
+            self._cache.clear()
+            for row in rows:
+                policy = self._row_to_policy(row)
+                # v2.0: Skip expired policies during cache load
+                if not policy.is_expired():
+                    self._cache[policy.peer_id] = policy
 
-        self._cache_valid = True
+            self._cache_valid = True
 
     def _row_to_policy(self, row) -> PeerPolicy:
         """Convert a database row to a PeerPolicy object."""
@@ -389,20 +396,24 @@ class PolicyManager:
         """
         # Check cache first
         self._load_cache()
-        if peer_id in self._cache:
-            policy = self._cache[peer_id]
-            # v2.0: Check expiry
-            if policy.is_expired():
-                self.plugin.log(
-                    f"PolicyManager: Policy for {peer_id[:12]}... expired, reverting to defaults",
-                    level='info'
-                )
-                # Remove expired policy from cache and DB
-                self._remove_from_cache(peer_id)
-                self._delete_expired_policy(peer_id)
-                # Fall through to return default
-            else:
-                return policy
+        expired = False
+        with self._cache_lock:
+            if peer_id in self._cache:
+                policy = self._cache[peer_id]
+                # v2.0: Check expiry
+                if policy.is_expired():
+                    self.plugin.log(
+                        f"PolicyManager: Policy for {peer_id[:12]}... expired, reverting to defaults",
+                        level='info'
+                    )
+                    # Remove expired policy from cache
+                    del self._cache[peer_id]
+                    expired = True
+                else:
+                    return policy
+        # Handle expired policy DB cleanup outside the lock
+        if expired:
+            self._delete_expired_policy(peer_id)
 
         # Return default policy with this peer_id
         return PeerPolicy(

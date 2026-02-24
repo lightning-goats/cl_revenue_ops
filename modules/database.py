@@ -669,6 +669,21 @@ class Database:
         # Prevent duplicate splice records when txid is known (Security: idempotency)
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_splice_costs_unique ON splice_costs(channel_id, txid) WHERE txid IS NOT NULL")
 
+        # L-16: Swap costs table (referenced by boltz_swaps.py and record_swap_cost)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS swap_costs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                swap_id TEXT NOT NULL,
+                channel_id TEXT,
+                peer_id TEXT,
+                cost_sats INTEGER NOT NULL,
+                amount_sats INTEGER NOT NULL DEFAULT 0,
+                swap_type TEXT,
+                timestamp INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_swap_costs_time ON swap_costs(timestamp)")
+
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
         try:
@@ -823,7 +838,7 @@ class Database:
                 confidence REAL NOT NULL DEFAULT 1.0,
                 ttl_seconds INTEGER NOT NULL DEFAULT 86400,
                 reason TEXT DEFAULT '',
-                set_at REAL NOT NULL
+                set_at INTEGER NOT NULL
             )
         """)
 
@@ -1492,8 +1507,8 @@ class Database:
         conn = self._get_connection()
         row = conn.execute("""
             SELECT COALESCE(SUM(actual_fee_sats), 0) as total_fees
-            FROM rebalance_history 
-            WHERE timestamp >= ? AND status = 'success' AND actual_fee_sats IS NOT NULL
+            FROM rebalance_history
+            WHERE timestamp >= ? AND status IN ('success', 'partial') AND actual_fee_sats IS NOT NULL
         """, (since_timestamp,)).fetchone()
         
         return row['total_fees'] if row else 0
@@ -1515,6 +1530,12 @@ class Database:
         conn = self._get_connection()
         since_day = (int(since_timestamp) // 86400) * 86400
 
+        # M-16: Fix day-boundary double-counting.
+        # Only count rolled-up days that DON'T overlap with raw forwards.
+        # daily_forwarding_stats: completed days only (date >= since_day AND date < today_start)
+        # forwards: recent data (timestamp >= since_timestamp) covers the current partial day.
+        today_start = (int(time.time()) // 86400) * 86400
+
         row = conn.execute("""
             SELECT
                 (
@@ -1525,9 +1546,9 @@ class Database:
                 (
                     SELECT COALESCE(SUM(total_fee_msat), 0)
                     FROM daily_forwarding_stats
-                    WHERE date >= ?
+                    WHERE date >= ? AND date < ?
                 ) AS total_fees_msat
-        """, (since_timestamp, since_day)).fetchone()
+        """, (since_timestamp, since_day, today_start)).fetchone()
 
         # Convert msat to sats
         return int((row['total_fees_msat'] or 0) // 1000) if row else 0
@@ -2077,7 +2098,7 @@ class Database:
             spent_row = conn.execute("""
                 SELECT COALESCE(SUM(actual_fee_sats), 0) as spent
                 FROM rebalance_history
-                WHERE timestamp >= ? AND status = 'success' AND actual_fee_sats IS NOT NULL
+                WHERE timestamp >= ? AND status IN ('success', 'partial') AND actual_fee_sats IS NOT NULL
             """, (since_timestamp,)).fetchone()
             actual_spent = spent_row['spent'] if spent_row else 0
 
@@ -4359,15 +4380,15 @@ class Database:
                 pass
             self.plugin.log(f"cleanup_old_data transaction failed: {e}", level='error')
 
-        # VACUUM to reclaim disk space after pruning
-        # SQLite DELETE only marks pages as free; VACUUM actually shrinks the file.
-        # This is safe to run from a background thread (blocking is acceptable).
+        # L-20: Use incremental_vacuum instead of full VACUUM to avoid blocking readers.
+        # Full VACUUM requires exclusive lock and copies the entire database.
+        # incremental_vacuum frees pages without blocking concurrent reads.
         if flow_count > 0 or forwards_count > 0:
             try:
-                conn.execute("VACUUM")
-                self.plugin.log("Database VACUUM completed to reclaim disk space")
+                conn.execute("PRAGMA incremental_vacuum(100)")
+                self.plugin.log("Database incremental_vacuum completed")
             except Exception as e:
-                self.plugin.log(f"VACUUM failed (non-fatal): {e}", level='warn')
+                self.plugin.log(f"incremental_vacuum failed (non-fatal): {e}", level='warn')
 
         if forwards_count > 0:
             self.plugin.log(
@@ -4521,23 +4542,24 @@ class Database:
     def set_config_override(self, key: str, value: str) -> int:
         """
         Set a config override with transactional safety.
-        
+
         Returns:
             New version number after update
         """
         conn = self._get_connection()
         now = int(time.time())
-        
-        # Get current max version
-        row = conn.execute("SELECT MAX(version) as max_v FROM config_overrides").fetchone()
-        new_version = (row['max_v'] or 0) + 1
-        
+
+        # M-13: Atomic version increment — single statement avoids TOCTOU race
         conn.execute("""
             INSERT OR REPLACE INTO config_overrides (key, value, version, updated_at)
-            VALUES (?, ?, ?, ?)
-        """, (key, value, new_version, now))
-        
-        return new_version
+            VALUES (?, ?,
+                    (SELECT COALESCE(MAX(version), 0) + 1 FROM config_overrides),
+                    ?)
+        """, (key, value, now))
+
+        # Read back the version
+        row = conn.execute("SELECT MAX(version) as max_v FROM config_overrides").fetchone()
+        return row['max_v'] or 0
 
     def get_all_config_overrides(self) -> Dict[str, str]:
         """Get all config overrides as a dictionary."""

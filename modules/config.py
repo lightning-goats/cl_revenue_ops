@@ -500,7 +500,17 @@ class Config:
             min_val, max_val = CONFIG_FIELD_RANGES[key]
             if not (min_val <= typed_value <= max_val):
                 return {"error": f"Value {typed_value} out of range [{min_val}, {max_val}] for {key}"}
-        
+
+        # 3b. VALIDATE: String enum check
+        STRING_ENUM_VALID_VALUES = {
+            'hive_enabled': ('auto', 'true', 'false'),
+            'swap_currency': ('btc', 'lbtc'),
+        }
+        if key in STRING_ENUM_VALID_VALUES:
+            if typed_value not in STRING_ENUM_VALID_VALUES[key]:
+                valid = ', '.join(STRING_ENUM_VALID_VALUES[key])
+                return {"error": f"Invalid value '{typed_value}' for {key}. Valid values: {valid}"}
+
         old_value = getattr(self, key)
         
         # 4. WRITE to database
@@ -678,19 +688,36 @@ class ConfigSnapshot:
     routing_intelligence_enabled: bool
     routing_intelligence_cache_seconds: int
 
+    # Comprehensive Hive Data Integration (v1.8.0)
+    hive_defense_status_enabled: bool = True
+    hive_defense_status_cache_seconds: int = 60
+    hive_peer_quality_enabled: bool = True
+    hive_peer_quality_cache_seconds: int = 300
+    hive_decision_history_enabled: bool = True
+    hive_decision_history_days: int = 30
+    hive_channel_flags_enabled: bool = True
+    hive_mcf_targets_enabled: bool = False
+    hive_mcf_targets_cache_seconds: int = 300
+    hive_nnlb_enabled: bool = False
+    hive_nnlb_min_amount: int = 50000
+    hive_nnlb_auto_execute: bool = False
+    hive_channel_ages_enabled: bool = True
+    hive_channel_ages_cache_seconds: int = 3600
+
     # Version tracking
     version: int = 0
     
     @classmethod
     def from_config(cls, config: 'Config') -> 'ConfigSnapshot':
         """Create snapshot from mutable Config. Auto-maps matching field names."""
-        field_names = {f.name for f in dataclasses.fields(cls)}
-        kwargs = {}
-        for f in dataclasses.fields(cls):
-            if f.name == 'version':
-                kwargs['version'] = config._version
-            elif hasattr(config, f.name):
-                kwargs[f.name] = getattr(config, f.name)
+        with config._lock:
+            field_names = {f.name for f in dataclasses.fields(cls)}
+            kwargs = {}
+            for f in dataclasses.fields(cls):
+                if f.name == 'version':
+                    kwargs['version'] = config._version
+                elif hasattr(config, f.name):
+                    kwargs[f.name] = getattr(config, f.name)
         return cls(**kwargs)
 
 
