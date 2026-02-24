@@ -268,16 +268,28 @@ class ThreadSafeRpcProxy:
 
     No circuit breaker: individual calls either succeed or fail on their own.
     One slow call can't poison 60+ other RPC methods for 60 seconds.
+
+    Hive report/broadcast/update calls use a separate 4-thread pool and are
+    dispatched fire-and-forget so a slow cl-hive can't starve the main pool
+    or block fee/rebalance loops.
     """
+
+    # Informational hive pushes — fire-and-forget via _async_executor.
+    # hive-report-mcf-completion is excluded: caller needs the response.
+    _HIVE_ASYNC_PREFIXES = ("hive-report-", "hive-broadcast-", "hive-update-")
+    _HIVE_ASYNC_EXCLUDE = ("hive-report-mcf-completion",)
 
     def __init__(self, plugin_instance: Plugin):
         from concurrent.futures import ThreadPoolExecutor
         self._plugin = plugin_instance
         self._rpc = plugin_instance.rpc
         self._executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="rpc")
+        self._async_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rpc_async")
+        self._async_fail_count = 0
 
     def __getattr__(self, name):
-        if name in ("_plugin", "_rpc", "_executor", "call"):
+        if name in ("_plugin", "_rpc", "_executor", "_async_executor",
+                     "_async_fail_count", "call", "fire_and_forget"):
             return super().__getattribute__(name)
 
         fn = getattr(self._rpc, name)
@@ -295,13 +307,14 @@ class ThreadSafeRpcProxy:
 
         return wrapper
 
-    # Hive report/broadcast/update calls are purely informational pushes.
-    # Dispatch them fire-and-forget so a slow cl-hive can't block our loops.
-    _HIVE_ASYNC_PREFIXES = ("hive-report-", "hive-broadcast-", "hive-update-")
+    def _is_fire_and_forget(self, method_name: str) -> bool:
+        if method_name in self._HIVE_ASYNC_EXCLUDE:
+            return False
+        return any(method_name.startswith(p) for p in self._HIVE_ASYNC_PREFIXES)
 
     def call(self, method_name: str, payload: Any = None, **kwargs):
-        # Fire-and-forget for informational hive pushes
-        if any(method_name.startswith(p) for p in self._HIVE_ASYNC_PREFIXES):
+        # Fire-and-forget for informational hive pushes (separate pool)
+        if self._is_fire_and_forget(method_name):
             self.fire_and_forget(method_name, payload)
             return {}
 
@@ -322,20 +335,23 @@ class ThreadSafeRpcProxy:
             raise RPCTimeoutError(method_name)
 
     def fire_and_forget(self, method_name: str, payload: Any = None):
-        """Submit an RPC call without waiting for the result.
+        """Submit an RPC call to the async pool without waiting.
 
-        Intended for informational report/broadcast calls where the caller
-        only needs to know the call was dispatched, not what it returned.
-        Errors are logged but never propagated.
+        Uses a separate 4-thread pool so hung hive calls can't starve
+        synchronous RPCs.  Tracks failures so the hive bridge circuit
+        breaker still has signal.
         """
         def _run():
             try:
                 self._rpc.call(method_name, payload if payload is not None else {})
+                self._async_fail_count = 0
             except Exception as e:
+                self._async_fail_count += 1
                 self._plugin.log(
-                    f"fire_and_forget {method_name} failed: {e}", level="debug"
+                    f"fire_and_forget {method_name} failed "
+                    f"(streak={self._async_fail_count}): {e}", level="debug"
                 )
-        self._executor.submit(_run)
+        self._async_executor.submit(_run)
 
 
 class ThreadSafePluginProxy:

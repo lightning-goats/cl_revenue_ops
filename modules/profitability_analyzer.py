@@ -1744,7 +1744,7 @@ class ChannelProfitabilityAnalyzer:
                 channel_count += 1
 
         except RpcError as e:
-            self.plugin.log(f"TLV: listfunds RPC unavailable, returning cached zeros: {e}", level='warn')
+            self.plugin.log(f"TLV: listfunds RPC unavailable, returning zeros: {e}", level='warn')
         except Exception as e:
             self.plugin.log(f"Error calculating TLV: {e}", level='error')
 

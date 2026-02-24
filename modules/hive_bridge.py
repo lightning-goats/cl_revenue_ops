@@ -740,9 +740,9 @@ class HiveFeeIntelligenceBridge:
                 return False
 
             self._log(
-                f"Health reported: score={result.get('health_score')}, "
-                f"tier={result.get('health_tier')}, "
-                f"multiplier={result.get('budget_multiplier')}"
+                f"Health reported: profitable={profitable_channels}, "
+                f"underwater={underwater_channels}, stagnant={stagnant_channels}, "
+                f"liquidity_score={liquidity_score}"
             )
             return True
 
@@ -871,8 +871,8 @@ class HiveFeeIntelligenceBridge:
                 return False
 
             self._log(
-                f"Liquidity state reported: depleted={result.get('depleted_count')}, "
-                f"saturated={result.get('saturated_count')}"
+                f"Liquidity state reported: depleted={len(depleted_channels or [])}, "
+                f"saturated={len(saturated_channels or [])}"
             )
             return True
 
