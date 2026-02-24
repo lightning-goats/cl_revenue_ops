@@ -104,8 +104,8 @@ class CapacityPlanner:
                     feat_int = int(features, 16)
                     if (feat_int & (1 << 62)) or (feat_int & (1 << 63)):
                         has_splice = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.plugin.log(f"Splice feature parse error for {peer_id[:12]}...: {e}", level='debug')
 
                 splice_map[peer_id] = has_splice
         except Exception as e:

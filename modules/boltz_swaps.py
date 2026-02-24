@@ -538,7 +538,8 @@ class BoltzSwapManager:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_boltz_audit_swap_created ON boltz_audit_log(swap_id, created_at)")
 
-        # swap_costs table for P&L integration
+        # DB-4: swap_costs table is also in database.py's initialize(); both use
+        # CREATE TABLE IF NOT EXISTS so whichever runs first creates it.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS swap_costs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -839,19 +840,9 @@ class BoltzSwapManager:
         conn = self.db._get_connection()
         ttl = int(ttl_seconds or self.DEFAULT_BUDGET_RESERVATION_TTL_SECS)
         cutoff = self._now_ts() - max(1, ttl)
-        stale = conn.execute(
-            """
-            SELECT reservation_id
-            FROM swap_budget_reservations
-            WHERE state = 'active' AND created_at < ?
-            """,
-            (cutoff,),
-        ).fetchall()
-        if not stale:
-            return 0
-
         now = self._now_ts()
-        conn.execute(
+        # EH-3: Atomic UPDATE instead of SELECT-then-UPDATE to avoid TOCTOU race
+        cursor = conn.execute(
             """
             UPDATE swap_budget_reservations
             SET state = 'released', updated_at = ?, note = 'stale_timeout'
@@ -859,7 +850,7 @@ class BoltzSwapManager:
             """,
             (now, cutoff),
         )
-        return len(stale)
+        return cursor.rowcount
 
     def _reserve_budget(self, quoted_fee_sats: int, fee_ppm: int, amount_sats: int) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -881,7 +872,10 @@ class BoltzSwapManager:
         savepoint_name: Optional[str] = None
         try:
             if getattr(conn, "in_transaction", False):
-                savepoint_name = f"swap_budget_{uuid4().hex[:12]}"
+                # SEC-6: Use sanitized hex-only name to prevent SQL injection
+                hex_suffix = uuid4().hex[:12]
+                savepoint_name = f"sp_{hex_suffix}"
+                # SAVEPOINT names cannot be parameterized; hex-only suffix is safe
                 conn.execute(f"SAVEPOINT {savepoint_name}")
             else:
                 conn.execute("BEGIN IMMEDIATE")
@@ -1567,6 +1561,10 @@ class BoltzSwapManager:
         if destination_err:
             return {"error": destination_err}
 
+        # SEC-8: Bound swap_ids list to prevent abuse
+        if len(list(swap_ids)) > 100:
+            return {"error": "Too many swap IDs (max 100)"}
+
         validated_ids: List[str] = []
         for sid in list(swap_ids):
             sid_token, sid_err = self._cli_token(sid, "swap_id")
@@ -1965,6 +1963,13 @@ class BoltzSwapManager:
 
         Read-only check — does NOT modify the current mnemonic.
         """
+        # SEC-9: Rate limit to max 1 call per 10 seconds
+        now = time.time()
+        last_verify = getattr(self, '_last_verify_backup_ts', 0.0)
+        if now - last_verify < 10.0:
+            return {"verified": False, "error": "Rate limited — try again in a few seconds"}
+        self._last_verify_backup_ts = now
+
         if not swap_mnemonic or not isinstance(swap_mnemonic, str):
             return {"verified": False, "error": "swap_mnemonic is required"}
 

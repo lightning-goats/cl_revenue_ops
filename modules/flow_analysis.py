@@ -786,9 +786,11 @@ class FlowAnalyzer:
         if mean_volume < 1000:  # Less than 1k sats average = low activity
             return BASE_EMA_DECAY
 
-        # Calculate standard deviation of net flow
+        # MA-7: Use sample variance (N-1 divisor) for unbiased estimate
         mean_net = sum(net_flows) / len(net_flows)
-        variance = sum((x - mean_net) ** 2 for x in net_flows) / len(net_flows)
+        if len(net_flows) < 2:
+            return BASE_EMA_DECAY
+        variance = sum((x - mean_net) ** 2 for x in net_flows) / (len(net_flows) - 1)
         std_dev = math.sqrt(variance) if variance > 0 else 0
 
         # Volatility ratio (normalized)

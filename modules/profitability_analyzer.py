@@ -374,6 +374,8 @@ class ChannelProfitabilityAnalyzer:
         self.hive_bridge = hive_bridge
 
         # Cache for profitability data (refreshed periodically)
+        # TS-7: Cache reads without lock are safe under CPython GIL (dict reads are atomic).
+        # Writes are protected by _analysis_lock to prevent concurrent analysis stampede.
         self._profitability_cache: Dict[str, ChannelProfitability] = {}
         self._cache_timestamp: int = 0
         self._cache_ttl: int = 300  # 5 minutes
@@ -385,6 +387,7 @@ class ChannelProfitabilityAnalyzer:
         self._health_report_interval: int = 300  # Report every 5 minutes max
 
         # Bleeder classification cache (avoids re-running full analysis per channel)
+        # TS-7: Same GIL-safety note: dict/None reads are atomic under CPython.
         self._bleeder_cache: Optional[Dict[str, 'BleederClassification']] = None
         self._bleeder_cache_time: float = 0
         

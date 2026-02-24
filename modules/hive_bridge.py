@@ -252,8 +252,10 @@ class HiveFeeIntelligenceBridge:
         Only called when we *want* a fresh probe (startup retries, explicit
         reset) — not on every call.
         """
-        self._hive_available = None
-        self._availability_check_time = 0
+        # TS-6: Protect shared state with availability lock
+        with self._availability_lock:
+            self._hive_available = None
+            self._availability_check_time = 0
 
     # =========================================================================
     # CIRCUIT BREAKER

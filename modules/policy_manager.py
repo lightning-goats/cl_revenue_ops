@@ -196,6 +196,7 @@ class PolicyManager:
 
         # v2.0: Policy change callbacks
         self._on_change_callbacks: List[Callable[[str, PeerPolicy], None]] = []
+        self._callback_lock = threading.Lock()  # TS-8: Protect callback list
 
         # v2.0: Rate limiting for policy changes (peer_id -> list of timestamps)
         self._change_timestamps: Dict[str, List[int]] = {}
@@ -214,18 +215,24 @@ class PolicyManager:
         Args:
             callback: Function taking (peer_id: str, policy: PeerPolicy)
         """
-        if callback not in self._on_change_callbacks:
-            self._on_change_callbacks.append(callback)
-            self.plugin.log(f"PolicyManager: Registered change callback", level='debug')
+        # TS-8: Protect callback list modifications
+        with self._callback_lock:
+            if callback not in self._on_change_callbacks:
+                self._on_change_callbacks.append(callback)
+                self.plugin.log(f"PolicyManager: Registered change callback", level='debug')
 
     def unregister_on_change(self, callback: Callable[[str, PeerPolicy], None]) -> None:
         """Remove a previously registered callback."""
-        if callback in self._on_change_callbacks:
-            self._on_change_callbacks.remove(callback)
+        with self._callback_lock:
+            if callback in self._on_change_callbacks:
+                self._on_change_callbacks.remove(callback)
 
     def _notify_change(self, peer_id: str, policy: PeerPolicy) -> None:
         """Invoke all registered callbacks for a policy change."""
-        for cb in self._on_change_callbacks:
+        # TS-8: Snapshot under lock, invoke outside lock to avoid deadlock
+        with self._callback_lock:
+            callbacks = list(self._on_change_callbacks)
+        for cb in callbacks:
             try:
                 cb(peer_id, policy)
             except Exception as e:
@@ -248,6 +255,14 @@ class PolicyManager:
         window_start = now - 60  # 1 minute window
 
         with self._cache_lock:
+            # SEC-4: Periodically clean up stale entries to bound memory growth
+            if len(self._change_timestamps) > 500:
+                self._change_timestamps = {
+                    pid: [ts for ts in tss if ts > window_start]
+                    for pid, tss in self._change_timestamps.items()
+                    if any(ts > window_start for ts in tss)
+                }
+
             # Get timestamps for this peer
             timestamps = self._change_timestamps.get(peer_id, [])
 
@@ -934,8 +949,8 @@ class PolicyManager:
                                 trend = "declining"
                             elif delta > 0.15:
                                 trend = "improving"
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.plugin.log(f"Bleeder trend query failed for {channel_id[:12]}...: {e}", level='debug')
 
                 # Determine suggestion type
                 if forward_count == ZOMBIE_FORWARD_THRESHOLD and net_pnl < 0:

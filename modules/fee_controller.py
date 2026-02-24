@@ -451,8 +451,10 @@ class HistoricalResponseCurve:
         if avg_revenue <= 0:
             return False
 
-        # Calculate standard deviation
-        variance = sum((r - avg_revenue) ** 2 for r in revenues) / len(revenues)
+        # MA-1: Use sample variance (N-1 divisor) for unbiased estimate
+        if len(revenues) < 2:
+            return False
+        variance = sum((r - avg_revenue) ** 2 for r in revenues) / (len(revenues) - 1)
         std_dev = math.sqrt(variance) if variance > 0 else 0
 
         # Use z-score test if we have meaningful variance
@@ -536,12 +538,22 @@ class HistoricalResponseCurve:
         if not fleet_observations:
             return
 
+        # SEC-5: Clamp fleet_weight and bound incoming values
+        fleet_weight = max(0.0, min(1.0, fleet_weight))
+        MAX_FLEET_FEE_PPM = 200_000  # 2x absolute max as sanity bound
+        MAX_FLEET_REVENUE = 100_000.0  # sats/hr sanity bound
+
         # Add fleet observations with reduced weight
         now = int(time.time())
         for obs in fleet_observations:
             fee = obs.get("fee_ppm", 0)
             revenue = obs.get("revenue_rate", 0)
             count = obs.get("count", 1)
+
+            # SEC-5: Clamp incoming fleet values to reasonable ranges
+            fee = max(0, min(int(fee), MAX_FLEET_FEE_PPM))
+            revenue = max(0.0, min(float(revenue), MAX_FLEET_REVENUE))
+            count = max(0, min(int(count), 10000))
 
             if fee > 0 and revenue >= 0:
                 # Add as synthetic observation with fleet weight
@@ -784,6 +796,11 @@ class ElasticityTracker:
         """
         if fleet_confidence < 0.3:
             return  # Fleet data not confident enough
+
+        # SEC-5: Clamp incoming fleet values to reasonable ranges
+        fleet_elasticity = max(-10.0, min(10.0, float(fleet_elasticity)))
+        fleet_confidence = max(0.0, min(1.0, float(fleet_confidence)))
+        fleet_weight = max(0.0, min(1.0, float(fleet_weight)))
 
         # Weight by relative confidence
         local_weight = self.confidence * (1 - fleet_weight)
@@ -1220,54 +1237,59 @@ class GaussianThompsonState:
         marker_count = intel.get('marker_count', 0)
         last_forward_age = intel.get('last_forward_age_hours')
 
+        # MA-3: Accumulate adjustments as floats and convert to int only at the end
+        # to avoid cascaded truncation error from repeated int() conversions.
+        mean_fee = float(self.prior_mean_fee)
+        std_fee = float(self.prior_std_fee)
+
         # Adjust prior mean based on pheromone level
         # Hot channels: shift prior mean higher (can sustain higher fees)
         # Cold channels: shift prior mean lower (needs competitive fees)
         if pheromone >= 2.0:
             # Hot channel: +15-25% fee adjustment based on strength
             pheromone_factor = min(0.25, 0.15 + (pheromone - 2.0) * 0.02)
-            self.prior_mean_fee = int(self.prior_mean_fee * (1 + pheromone_factor))
+            mean_fee *= (1 + pheromone_factor)
         elif pheromone >= 0.5:
             # Warm channel: +5-15% adjustment
             pheromone_factor = 0.05 + (pheromone - 0.5) * 0.067
-            self.prior_mean_fee = int(self.prior_mean_fee * (1 + pheromone_factor))
+            mean_fee *= (1 + pheromone_factor)
         elif pheromone < 0.1 and pheromone >= 0:
             # Cold channel: -10% (needs lower fees to attract flow)
-            self.prior_mean_fee = int(self.prior_mean_fee * 0.90)
+            mean_fee *= 0.90
 
         # Trend adjustments
         if trend == "rising":
             # Recent activity, confidence is higher
-            self.prior_std_fee = int(self.prior_std_fee * 0.85)
+            std_fee *= 0.85
         elif trend == "falling":
             # Decaying interest, increase uncertainty
-            self.prior_std_fee = int(self.prior_std_fee * 1.15)
+            std_fee *= 1.15
 
         # Corridor bonus: channels on proven routes get extra confidence
         if on_corridor:
             # Reduce uncertainty (exploit more)
-            self.prior_std_fee = int(self.prior_std_fee * 0.90)
+            std_fee *= 0.90
             # Slight fee premium for being on a working corridor
-            self.prior_mean_fee = int(self.prior_mean_fee * 1.05)
+            mean_fee *= 1.05
 
         # Marker count bonus: more markers = more confident data
         if marker_count >= 5:
-            self.prior_std_fee = int(self.prior_std_fee * 0.85)
+            std_fee *= 0.85
         elif marker_count >= 2:
-            self.prior_std_fee = int(self.prior_std_fee * 0.92)
+            std_fee *= 0.92
 
         # Recency factor: if last forward was recent, we have better data
         if last_forward_age is not None:
             if last_forward_age < 2:
                 # Very recent: high confidence
-                self.prior_std_fee = int(self.prior_std_fee * 0.90)
+                std_fee *= 0.90
             elif last_forward_age > 48:
                 # Stale data: increase uncertainty
-                self.prior_std_fee = int(self.prior_std_fee * 1.10)
+                std_fee *= 1.10
 
-        # Enforce bounds
-        self.prior_std_fee = max(self.MIN_STD, min(200, self.prior_std_fee))
-        self.prior_mean_fee = max(1, self.prior_mean_fee)
+        # Convert to int once at the end and enforce bounds
+        self.prior_std_fee = max(self.MIN_STD, min(200, int(std_fee)))
+        self.prior_mean_fee = max(1, int(mean_fee))
 
         # Update posterior to match adjusted prior
         self.posterior_mean = float(self.prior_mean_fee)
@@ -1450,7 +1472,8 @@ class GaussianThompsonState:
 
         # Weight based on revenue (higher revenue = more confidence)
         # and observation duration (longer = more confidence)
-        weight = min(1.0, hours / 6.0) * min(1.0, (revenue_rate + 1) / 100.0)
+        # MA-8: Use log scale to avoid saturation at 100 sats/hr on high-volume nodes
+        weight = min(1.0, hours / 6.0) * min(1.0, math.log1p(revenue_rate) / math.log1p(1000))
         weight = max(0.01, weight)  # Minimum weight
 
         # Add observation with time bucket (5-tuple)
@@ -2952,7 +2975,7 @@ class HillClimbingFeeController:
         self._thompson_migrated_channels: set = set()  # Dedup migration logs
 
         # Lock protecting state dict access across threads
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()  # TS-1: RLock for re-entrant access from set_channel_fee
 
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
@@ -3071,20 +3094,22 @@ class HillClimbingFeeController:
 
     def get_fee_anchor(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Public API: get fee anchor for a channel."""
-        anchor = self._fee_anchors.get(channel_id)
-        if anchor is None or anchor.is_expired():
-            return None
-        return {
-            "channel_id": anchor.channel_id,
-            "target_fee_ppm": anchor.target_fee_ppm,
-            "base_weight": anchor.base_weight,
-            "confidence": anchor.confidence,
-            "ttl_seconds": anchor.ttl_seconds,
-            "reason": anchor.reason,
-            "set_at": anchor.set_at,
-            "effective_weight": anchor.effective_weight(),
-            "remaining_seconds": max(0, anchor.ttl_seconds - (time.time() - anchor.set_at)),
-        }
+        # TS-2: Protect with _state_lock (consistent with list_fee_anchors)
+        with self._state_lock:
+            anchor = self._fee_anchors.get(channel_id)
+            if anchor is None or anchor.is_expired():
+                return None
+            return {
+                "channel_id": anchor.channel_id,
+                "target_fee_ppm": anchor.target_fee_ppm,
+                "base_weight": anchor.base_weight,
+                "confidence": anchor.confidence,
+                "ttl_seconds": anchor.ttl_seconds,
+                "reason": anchor.reason,
+                "set_at": anchor.set_at,
+                "effective_weight": anchor.effective_weight(),
+                "remaining_seconds": max(0, anchor.ttl_seconds - (time.time() - anchor.set_at)),
+            }
 
     def list_fee_anchors(self) -> List[Dict[str, Any]]:
         """Public API: list all active fee anchors."""
@@ -4286,45 +4311,43 @@ class HillClimbingFeeController:
         woken = 0
         now = int(time.time())
 
-        # Wake in-memory Hill Climbing states
+        # TS-3: All state mutations must be inside _state_lock
         with self._state_lock:
-            hc_items = list(self._hill_climb_states.items())
-            ts_items = list(self._thompson_aimd_states.items())
+            # Wake in-memory Hill Climbing states
+            for channel_id, state in list(self._hill_climb_states.items()):
+                if state.is_sleeping:
+                    state.is_sleeping = False
+                    state.sleep_until = 0
+                    state.stable_cycles = 0
+                    self._save_hill_climb_state(channel_id, state)
+                    woken += 1
 
-        for channel_id, state in hc_items:
-            if state.is_sleeping:
-                state.is_sleeping = False
-                state.sleep_until = 0
-                state.stable_cycles = 0
-                self._save_hill_climb_state(channel_id, state)
-                woken += 1
+            # Wake in-memory Thompson+AIMD states
+            for channel_id, ts_state in list(self._thompson_aimd_states.items()):
+                if ts_state.is_sleeping:
+                    ts_state.is_sleeping = False
+                    ts_state.sleep_until = 0
+                    ts_state.stable_cycles = 0
+                    self._save_thompson_aimd_state(channel_id, ts_state)
+                    woken += 1
 
-        # Wake in-memory Thompson+AIMD states
-        for channel_id, ts_state in ts_items:
-            if ts_state.is_sleeping:
-                ts_state.is_sleeping = False
-                ts_state.sleep_until = 0
-                ts_state.stable_cycles = 0
-                self._save_thompson_aimd_state(channel_id, ts_state)
-                woken += 1
-
-        # Also wake any sleeping channels in database not in memory
-        try:
-            db_states = self.database.get_all_fee_strategy_states()
-            for db_state in db_states:
-                channel_id = db_state.get("channel_id", "")
-                if channel_id and db_state.get("is_sleeping", 0):
-                    if channel_id not in self._hill_climb_states:
-                        # Load, wake, and save
-                        hc_state = self._get_hill_climb_state(channel_id)
-                        if hc_state.is_sleeping:
-                            hc_state.is_sleeping = False
-                            hc_state.sleep_until = 0
-                            hc_state.stable_cycles = 0
-                            self._save_hill_climb_state(channel_id, hc_state)
-                            woken += 1
-        except Exception as e:
-            self.plugin.log(f"Error waking database states: {e}", level='warning')
+            # Also wake any sleeping channels in database not in memory
+            try:
+                db_states = self.database.get_all_fee_strategy_states()
+                for db_state in db_states:
+                    channel_id = db_state.get("channel_id", "")
+                    if channel_id and db_state.get("is_sleeping", 0):
+                        if channel_id not in self._hill_climb_states:
+                            # Load, wake, and save
+                            hc_state = self._get_hill_climb_state(channel_id)
+                            if hc_state.is_sleeping:
+                                hc_state.is_sleeping = False
+                                hc_state.sleep_until = 0
+                                hc_state.stable_cycles = 0
+                                self._save_hill_climb_state(channel_id, hc_state)
+                                woken += 1
+            except Exception as e:
+                self.plugin.log(f"Error waking database states: {e}", level='warning')
 
         if woken > 0:
             self.plugin.log(
@@ -6634,26 +6657,28 @@ class HillClimbingFeeController:
             "message": ""
         }
 
+        # TS-1: Protect state mutations with _state_lock (RLock allows re-entrant calls)
         # BUG FIX: Wake sleeping channel on manual fee change
         # A manual override should reset the observation window
-        if manual and channel_id in self._hill_climb_states:
-            hc_state = self._hill_climb_states[channel_id]
-            if hc_state.is_sleeping:
-                hc_state.is_sleeping = False
-                hc_state.sleep_until = 0
-                hc_state.stable_cycles = 0
-                self._save_hill_climb_state(channel_id, hc_state)
-                self.plugin.log(
-                    f"MANUAL_WAKE: Channel {channel_id[:12]}... woken due to manual fee change",
-                    level='info'
-                )
-        if manual and channel_id in self._thompson_aimd_states:
-            ts_state = self._thompson_aimd_states[channel_id]
-            if ts_state.is_sleeping:
-                ts_state.is_sleeping = False
-                ts_state.sleep_until = 0
-                ts_state.stable_cycles = 0
-                self._save_thompson_aimd_state(channel_id, ts_state)
+        with self._state_lock:
+            if manual and channel_id in self._hill_climb_states:
+                hc_state = self._hill_climb_states[channel_id]
+                if hc_state.is_sleeping:
+                    hc_state.is_sleeping = False
+                    hc_state.sleep_until = 0
+                    hc_state.stable_cycles = 0
+                    self._save_hill_climb_state(channel_id, hc_state)
+                    self.plugin.log(
+                        f"MANUAL_WAKE: Channel {channel_id[:12]}... woken due to manual fee change",
+                        level='info'
+                    )
+            if manual and channel_id in self._thompson_aimd_states:
+                ts_state = self._thompson_aimd_states[channel_id]
+                if ts_state.is_sleeping:
+                    ts_state.is_sleeping = False
+                    ts_state.sleep_until = 0
+                    ts_state.stable_cycles = 0
+                    self._save_thompson_aimd_state(channel_id, ts_state)
 
         try:
             # Get channel info to find peer ID and current fee
@@ -6749,32 +6774,34 @@ class HillClimbingFeeController:
             )
             if should_sync_state:
                 now = int(time.time())
-                try:
-                    hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=fee_ppm)
-                    hc_state.is_sleeping = False
-                    hc_state.sleep_until = 0
-                    hc_state.stable_cycles = 0
-                    hc_state.last_fee_ppm = fee_ppm
-                    hc_state.last_broadcast_fee_ppm = fee_ppm
-                    hc_state.last_update = now
-                    hc_state.last_state = reason_code or "manual"
-                    self._save_hill_climb_state(channel_id, hc_state)
-                except Exception as e:
-                    self.plugin.log(f"STATE_SYNC: Failed to update hill state for {channel_id}: {e}", level="debug")
-
-                if self.ENABLE_THOMPSON_AIMD:
+                # TS-1: Protect state mutations with _state_lock
+                with self._state_lock:
                     try:
-                        ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=fee_ppm)
-                        ts_state.is_sleeping = False
-                        ts_state.sleep_until = 0
-                        ts_state.stable_cycles = 0
-                        ts_state.last_fee_ppm = fee_ppm
-                        ts_state.last_broadcast_fee_ppm = fee_ppm
-                        ts_state.last_update = now
-                        ts_state.last_state = reason_code or "manual"
-                        self._save_thompson_aimd_state(channel_id, ts_state)
+                        hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=fee_ppm)
+                        hc_state.is_sleeping = False
+                        hc_state.sleep_until = 0
+                        hc_state.stable_cycles = 0
+                        hc_state.last_fee_ppm = fee_ppm
+                        hc_state.last_broadcast_fee_ppm = fee_ppm
+                        hc_state.last_update = now
+                        hc_state.last_state = reason_code or "manual"
+                        self._save_hill_climb_state(channel_id, hc_state)
                     except Exception as e:
-                        self.plugin.log(f"STATE_SYNC: Failed to update Thompson state for {channel_id}: {e}", level="debug")
+                        self.plugin.log(f"STATE_SYNC: Failed to update hill state for {channel_id}: {e}", level="debug")
+
+                    if self.ENABLE_THOMPSON_AIMD:
+                        try:
+                            ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=fee_ppm)
+                            ts_state.is_sleeping = False
+                            ts_state.sleep_until = 0
+                            ts_state.stable_cycles = 0
+                            ts_state.last_fee_ppm = fee_ppm
+                            ts_state.last_broadcast_fee_ppm = fee_ppm
+                            ts_state.last_update = now
+                            ts_state.last_state = reason_code or "manual"
+                            self._save_thompson_aimd_state(channel_id, ts_state)
+                        except Exception as e:
+                            self.plugin.log(f"STATE_SYNC: Failed to update Thompson state for {channel_id}: {e}", level="debug")
             
             result["success"] = True
             result["old_fee_ppm"] = old_fee_ppm

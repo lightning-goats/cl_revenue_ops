@@ -53,6 +53,9 @@ class Database:
         self.plugin = plugin
         # Thread-local storage for connections (Phase 5.5: Database Thread Safety)
         self._local = threading.local()
+        # EH-6: Track all thread connections for shutdown cleanup
+        self._thread_connections: list = []
+        self._thread_conn_lock = threading.Lock()
         
     def _get_connection(self) -> sqlite3.Connection:
         """
@@ -90,6 +93,9 @@ class Database:
             self._local.conn.execute("PRAGMA busy_timeout=5000;")
             # Reasonable durability/performance tradeoff for WAL mode
             self._local.conn.execute("PRAGMA synchronous=NORMAL;")
+            # EH-6: Track connection for shutdown cleanup
+            with self._thread_conn_lock:
+                self._thread_connections.append(self._local.conn)
             self.plugin.log(
                 f"Database: Created new thread-local connection (thread={threading.current_thread().name})",
                 level='debug'
@@ -116,6 +122,24 @@ class Database:
                 self.plugin.log(f"Error closing connection: {e}", level='debug')
             finally:
                 self._local.conn = None
+
+    def close_all_connections(self) -> None:
+        """
+        EH-6: Close all known thread-local connections during shutdown.
+
+        Daemon threads don't run atexit handlers, so we track connections
+        and close them explicitly from the shutdown handler.
+        """
+        with self._thread_conn_lock:
+            connections = list(self._thread_connections)
+            self._thread_connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        # Also close this thread's connection
+        self.close_connection()
 
     def close_main_connection(self) -> None:
         """
@@ -1036,8 +1060,8 @@ class Database:
                 ks_cols = {row[1] for row in conn.execute("PRAGMA table_info(kalman_state)").fetchall()}
                 if 'last_innovation' not in ks_cols:
                     conn.execute("ALTER TABLE kalman_state ADD COLUMN last_innovation REAL DEFAULT 0.0")
-            except Exception:
-                pass
+            except Exception as e:
+                self.plugin.log(f"Kalman migration warning: {e}", level='debug')
 
         except Exception as e:
             self.plugin.log(f"DB migration warning: Kalman schema migration failed: {e}", level="warn")
@@ -1349,6 +1373,7 @@ class Database:
     
     def get_recent_fee_changes(self, limit: int = 10, channel_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get recent fee changes, optionally filtered by channel."""
+        limit = max(1, min(int(limit), 10000))  # SEC-10: Clamp limit
         conn = self._get_connection()
         
         if channel_id:
@@ -1433,6 +1458,7 @@ class Database:
     
     def get_recent_rebalances(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent rebalance attempts."""
+        limit = max(1, min(int(limit), 10000))  # SEC-10: Clamp limit
         conn = self._get_connection()
         rows = conn.execute("""
             SELECT * FROM rebalance_history 
@@ -1616,6 +1642,7 @@ class Database:
         Returns:
             List of snapshot dicts, most recent first
         """
+        limit = max(1, min(int(limit), 10000))  # SEC-10: Clamp limit
         conn = self._get_connection()
 
         rows = conn.execute("""
@@ -1669,6 +1696,12 @@ class Database:
         since = int(time.time()) - (window_days * 86400)
         since_day = (since // 86400) * 86400
 
+        # DB-1: Use today_start boundary to avoid double-counting.
+        # daily_forwarding_stats aggregates completed days; forwards has live data.
+        # Exclude the current partial day from daily_forwarding_stats since those
+        # forwards are still in the live forwards table.
+        today_start = (int(time.time()) // 86400) * 86400
+
         # Revenue from this channel (as outbound)
         rev_row = conn.execute("""
             SELECT
@@ -1680,7 +1713,7 @@ class Database:
                 (
                     SELECT COALESCE(SUM(total_fee_msat), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ? AND date >= ?
+                    WHERE channel_id = ? AND date >= ? AND date < ?
                 ) AS revenue_msat,
                 (
                     SELECT COALESCE(COUNT(*), 0)
@@ -1690,20 +1723,20 @@ class Database:
                 (
                     SELECT COALESCE(SUM(forward_count), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ? AND date >= ?
+                    WHERE channel_id = ? AND date >= ? AND date < ?
                 ) AS forward_count
         """, (
             channel_id, since,
-            channel_id, since_day,
+            channel_id, since_day, today_start,
             channel_id, since,
-            channel_id, since_day,
+            channel_id, since_day, today_start,
         )).fetchone()
 
-        # Rebalance costs for this channel
+        # Rebalance costs for this channel (DB-5: include partial success costs)
         cost_row = conn.execute("""
             SELECT COALESCE(SUM(actual_fee_sats), 0) as cost_sats
             FROM rebalance_history
-            WHERE to_channel = ? AND timestamp >= ? AND status = 'success'
+            WHERE to_channel = ? AND timestamp >= ? AND status IN ('success', 'partial')
         """, (channel_id, since)).fetchone()
 
         revenue_sats = (rev_row['revenue_msat'] // 1000) if rev_row else 0
@@ -1743,6 +1776,8 @@ class Database:
         conn = self._get_connection()
         since = int(time.time()) - (window_days * 86400)
         since_day = (since // 86400) * 86400
+        # DB-1: Exclude current partial day from daily stats to avoid double-counting
+        today_start = (int(time.time()) // 86400) * 86400
 
         # Get inbound contribution (where this channel was the entry point)
         inbound_row = conn.execute("""
@@ -1755,7 +1790,7 @@ class Database:
                 (
                     SELECT COALESCE(SUM(total_in_msat), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ? AND date >= ?
+                    WHERE channel_id = ? AND date >= ? AND date < ?
                 ) AS sourced_volume_msat,
                 (
                     SELECT COALESCE(SUM(fee_msat), 0)
@@ -1765,7 +1800,7 @@ class Database:
                 (
                     SELECT COALESCE(SUM(total_fee_msat), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ? AND date >= ?
+                    WHERE channel_id = ? AND date >= ? AND date < ?
                 ) AS sourced_fee_msat,
                 (
                     SELECT COALESCE(COUNT(*), 0)
@@ -1775,15 +1810,15 @@ class Database:
                 (
                     SELECT COALESCE(SUM(forward_count), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ? AND date >= ?
+                    WHERE channel_id = ? AND date >= ? AND date < ?
                 ) AS sourced_forward_count
         """, (
             channel_id, since,
-            channel_id, since_day,
+            channel_id, since_day, today_start,
             channel_id, since,
-            channel_id, since_day,
+            channel_id, since_day, today_start,
             channel_id, since,
-            channel_id, since_day,
+            channel_id, since_day, today_start,
         )).fetchone()
 
         sourced_volume_sats = (inbound_row['sourced_volume_msat'] // 1000) if inbound_row else 0
@@ -2292,7 +2327,7 @@ class Database:
         # Get spending and job counts from rebalance history
         stats = conn.execute("""
             SELECT
-                COALESCE(SUM(CASE WHEN status = 'success' THEN actual_fee_sats ELSE 0 END), 0) as total_spent,
+                COALESCE(SUM(CASE WHEN status IN ('success', 'partial') THEN actual_fee_sats ELSE 0 END), 0) as total_spent,
                 COUNT(*) as job_count,
                 COALESCE(SUM(CASE WHEN status IN ('success', 'failed', 'partial', 'timeout') THEN 1 ELSE 0 END), 0) as completed_count,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) as success_count,
@@ -2347,7 +2382,7 @@ class Database:
         spent_row = conn.execute("""
             SELECT COALESCE(SUM(actual_fee_sats), 0) as spent
             FROM rebalance_history
-            WHERE timestamp >= ? AND status = 'success' AND actual_fee_sats IS NOT NULL
+            WHERE timestamp >= ? AND status IN ('success', 'partial') AND actual_fee_sats IS NOT NULL
         """, (since_timestamp,)).fetchone()
 
         reserved_row = conn.execute("""
@@ -2736,6 +2771,13 @@ class Database:
             out_filter = f" AND out_channel IN ({placeholders})"
             params.extend(list(out_channels))
 
+        # DB-7: Build params explicitly instead of fragile slicing.
+        # The query needs interval_secs twice (for division and multiplication),
+        # then since_timestamp, then any out_channel filters.
+        query_params: List[Any] = [interval_secs, interval_secs, since_timestamp]
+        if out_channels:
+            query_params.extend(list(out_channels))
+
         rows = conn.execute(f"""
             SELECT
                 out_channel,
@@ -2746,7 +2788,7 @@ class Database:
             FROM forwards
             WHERE timestamp >= ? {out_filter}
             GROUP BY out_channel, bucket_ts
-        """, params[:1] + params[:1] + params[1:]).fetchall()
+        """, query_params).fetchall()
 
         result: List[Dict[str, Any]] = []
         for r in rows:
@@ -4372,6 +4414,18 @@ class Database:
             snapshot_cutoff = now - (365 * 86400)
             conn.execute("DELETE FROM financial_snapshots WHERE timestamp < ?", (snapshot_cutoff,))
 
+            # DB-3: BOLTZ TABLE CLEANUP: Prevent unbounded growth of swap logs
+            # Keep 90 days of swap history (same as audit logs)
+            try:
+                conn.execute("DELETE FROM boltz_swaps WHERE created_at < ?", (audit_cutoff,))
+                conn.execute("DELETE FROM boltz_audit_log WHERE timestamp < ?", (audit_cutoff,))
+                conn.execute(
+                    "DELETE FROM swap_budget_reservations WHERE created_at < ?",
+                    (audit_cutoff,)
+                )
+            except Exception:
+                pass  # Tables may not exist if Boltz not configured
+
             conn.execute("COMMIT")
         except Exception as e:
             try:
@@ -4633,7 +4687,7 @@ class Database:
             (channel_id, target_fee_ppm, base_weight, confidence, ttl_seconds, reason, set_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (channel_id, target_fee_ppm, base_weight, confidence,
-              ttl_seconds, reason, time.time()))
+              ttl_seconds, reason, int(time.time())))
 
     def get_fee_anchor(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Get the fee anchor for a channel, or None if not set/expired."""

@@ -844,11 +844,17 @@ class PortfolioOptimizer:
 
         Objective: max sum(w_i * r_i) - lambda * sum(w_i * w_j * cov_ij)
         """
-        # M-7: Normalize returns to prevent scale-dependent convergence
+        # MA-6: Normalize both returns AND covariance to match scales.
+        # This prevents the gradient from being dominated by one term.
         returns_scale = max(abs(r) for r in returns) if returns else 1.0
         if returns_scale <= 0:
             returns_scale = 1.0
         normalized_returns = [r / returns_scale for r in returns]
+        # Normalize covariance by returns_scale^2 to match normalized returns
+        normalized_cov = [
+            [cov_matrix[i][j] / (returns_scale * returns_scale) for j in range(n)]
+            for i in range(n)
+        ]
 
         # Initialize with equal weights
         weights = [1.0 / n] * n
@@ -860,8 +866,8 @@ class PortfolioOptimizer:
                 # dE[R]/dw_i = r_i (using normalized returns)
                 grad_return = normalized_returns[i]
 
-                # dVar/dw_i = 2 * sum(w_j * cov_ij)
-                grad_var = 2 * sum(weights[j] * cov_matrix[i][j] for j in range(n))
+                # dVar/dw_i = 2 * sum(w_j * cov_ij) (using normalized covariance)
+                grad_var = 2 * sum(weights[j] * normalized_cov[i][j] for j in range(n))
 
                 # Combined gradient (we're maximizing, so positive gradient = increase)
                 grad = grad_return - risk_aversion * grad_var

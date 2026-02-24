@@ -811,8 +811,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             
     except Exception as e:
         plugin.log(f"Error checking plugin dependencies: {e}", level='warn')
-        # Assume plugins are available if check fails
-        config.sling_available = True
+        # EH-10: Fail-closed — assume sling unavailable if check fails
+        config.sling_available = False
     
     
     # Initialize database
@@ -868,8 +868,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
         if start_time is not None:
             # Fetch from RPC - this is the ONLY listforwards call we make.
-            # CLN's listforwards doesn't support 'since' natively, so we filter client-side.
-            result = safe_plugin.rpc.listforwards(status="settled")
+            # EH-12: Limit to recent forwards to avoid unbounded memory usage on large nodes.
+            # CLN v23.08+ supports index-based pagination; fall back to full fetch if unavailable.
+            try:
+                result = safe_plugin.rpc.listforwards(status="settled", index="created", start=int(start_time))
+            except (TypeError, Exception):
+                # Older CLN or unsupported params — fall back to unfiltered
+                result = safe_plugin.rpc.listforwards(status="settled")
             forwards_to_insert = []
 
             for fwd in result.get("forwards", []):
@@ -923,7 +928,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log(f"Connection baseline: {connected_peers} connected peers, snapshotted {snapshot_count} new peers")
     except Exception as e:
         plugin.log(f"Error snapshotting peer connections: {e}", level='warn')
-        plugin.log(f"Traceback: {traceback.format_exc()}", level='warn')
+        plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')  # SEC-2: Stack traces at debug level
     
     # Initialize clboss manager (handles unmanage commands)
     clboss_manager = ClbossManager(safe_plugin, config)
@@ -965,7 +970,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             if attempt < max_attempts - 1:
                 wait = 3 if attempt < 2 else 5
                 plugin.log(f"Waiting for cl-hive (attempt {attempt + 1}/{max_attempts})...")
-                time.sleep(wait)
+                # EH-4: Use shutdown_event.wait() so init retry loop is interruptible
+                shutdown_event.wait(wait)
 
         if hive_loaded:
             # cl-hive is loaded — report hive mode for startup logging.
@@ -1181,7 +1187,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log(f"Startup snapshot: Recorded {snapshot_count} of {connected_count} connected peers")
         except Exception as e:
             plugin.log(f"Error in delayed snapshot: {e}", level='warn')
-            plugin.log(f"Traceback: {traceback.format_exc()}", level='warn')
+            plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')  # SEC-2: Stack traces at debug level
 
     def financial_snapshot_loop():
         """
@@ -1379,8 +1385,8 @@ def run_flow_analysis():
                         outbound_sats=metrics.sats_out
                     )
                     reported += 1
-                except Exception:
-                    pass  # Non-critical, don't block flow analysis
+                except Exception as e:
+                    plugin.log(f"Flow observation report failed for {channel_id[:12]}...: {e}", level='debug')
             if reported > 0:
                 plugin.log(f"Reported {reported} flow observations to cl-hive")
 
@@ -2943,6 +2949,9 @@ def revenue_portfolio(
         - hedging_opportunities: Negatively correlated pairs
         - concentration_risks: Highly correlated pairs
     """
+    # SEC-1: Validate and clamp parameters
+    risk_aversion = max(0.0, min(10.0, float(risk_aversion)))
+
     global database, safe_plugin
 
     if database is None:
@@ -3006,7 +3015,9 @@ def revenue_portfolio(
         }
 
     except Exception as e:
-        plugin.log(f"Error in portfolio analysis: {traceback.format_exc()}", level='error')
+        # SEC-2: Log exception message at error level, full trace at debug
+        plugin.log(f"Error in portfolio analysis: {e}", level='error')
+        plugin.log(f"Portfolio traceback: {traceback.format_exc()}", level='debug')
         return {"error": str(e)}
 
 
@@ -3050,6 +3061,9 @@ def revenue_portfolio_rebalance(
     Returns:
         List of rebalance recommendations with priority and amounts.
     """
+    # SEC-1: Validate and clamp parameters
+    max_recommendations = max(1, min(100, int(max_recommendations)))
+
     global database, safe_plugin
 
     if database is None:
@@ -3119,6 +3133,9 @@ def revenue_portfolio_correlations(
     Returns:
         Correlation pairs with relationship classification.
     """
+    # SEC-1: Validate and clamp parameters
+    min_correlation = max(-1.0, min(1.0, float(min_correlation)))
+
     result = revenue_portfolio(plugin, risk_aversion=1.0)
 
     if "error" in result:
@@ -3141,6 +3158,10 @@ def revenue_portfolio_correlations(
 @plugin.method("revenue-boltz-quote")
 def revenue_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reverse", currency: Optional[str] = None) -> Dict[str, Any]:
     """Get Boltz swap fee quote. swap_type: 'reverse' or 'submarine'. currency: 'btc', 'lbtc', or 'both'."""
+    # SEC-7: Validate amount bounds
+    amount_sats = int(amount_sats)
+    if amount_sats < 10000 or amount_sats > 50_000_000:
+        return {"error": f"amount_sats must be between 10,000 and 50,000,000 (got {amount_sats})"}
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
     try:
@@ -3160,6 +3181,10 @@ def revenue_boltz_loop_out(
     currency: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute a Boltz reverse swap (loop-out: LN -> on-chain/LBTC). Uses boltzcli."""
+    # SEC-7: Validate amount bounds
+    amount_sats = int(amount_sats)
+    if amount_sats < 10000 or amount_sats > 50_000_000:
+        return {"error": f"amount_sats must be between 10,000 and 50,000,000 (got {amount_sats})"}
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
     try:
@@ -3180,6 +3205,10 @@ def revenue_boltz_loop_in(
     currency: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute a Boltz submarine swap (loop-in: on-chain/LBTC -> LN). Uses boltzcli."""
+    # SEC-7: Validate amount bounds
+    amount_sats = int(amount_sats)
+    if amount_sats < 10000 or amount_sats > 50_000_000:
+        return {"error": f"amount_sats must be between 10,000 and 50,000,000 (got {amount_sats})"}
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
     try:
@@ -3299,6 +3328,10 @@ def revenue_boltz_chainswap(
         to_currency: Destination currency ('btc' or 'lbtc'). Default: btc.
         to_address: Optional BTC/Liquid destination address (default: boltzd wallet).
     """
+    # SEC-7: Validate amount bounds
+    amount_sats = int(amount_sats)
+    if amount_sats < 10000 or amount_sats > 50_000_000:
+        return {"error": f"amount_sats must be between 10,000 and 50,000,000 (got {amount_sats})"}
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
     try:
@@ -3363,16 +3396,24 @@ def revenue_boltz_deposit(plugin: Plugin, currency: str = "lbtc") -> Dict[str, A
 
 
 @plugin.method("revenue-boltz-backup")
-def revenue_boltz_backup(plugin: Plugin) -> Dict[str, Any]:
+def revenue_boltz_backup(plugin: Plugin, show_secret: bool = False) -> Dict[str, Any]:
     """Retrieve boltzd backup info: swap mnemonic, wallet list, pending swaps.
 
-    WARNING: Response contains the swap mnemonic in plaintext.
+    WARNING: Mnemonic is redacted by default. Pass show_secret=true to reveal.
     Wallet BIP39 credentials require manual interactive backup via boltzcli.
     """
     if boltz_swaps is None:
         return {"error": "boltz_swaps not initialized"}
     try:
-        return boltz_swaps.get_backup_info()
+        result = boltz_swaps.get_backup_info()
+        # SEC-3: Redact mnemonic unless explicitly requested
+        if not show_secret and result.get("swap_mnemonic"):
+            words = result["swap_mnemonic"].split()
+            if len(words) > 4:
+                result["swap_mnemonic"] = f"{words[0]} {words[1]} ... {words[-2]} {words[-1]} ({len(words)} words)"
+                result["swap_mnemonic_redacted"] = True
+                result["swap_mnemonic_hint"] = "Pass show_secret=true to reveal full mnemonic"
+        return result
     except Exception as e:
         plugin.log(f"Boltz backup error: {e}", level='error')
         return {"error": str(e)}

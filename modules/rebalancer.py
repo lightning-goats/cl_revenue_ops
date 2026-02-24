@@ -220,6 +220,7 @@ class JobManager:
         # AskRene integration (read-only): use constraints for preflight sizing + intelligence.
         self._askrene_cache_ts = 0
         self._askrene_cache: Dict[str, int] = {}  # short_channel_id_dir -> maximum_msat
+        self._askrene_lock = threading.Lock()  # TS-5: Protect cache access
         self.askrene_layer = getattr(config, 'askrene_layer', 'xpay')
         self.askrene_max_age_sec = getattr(config, 'askrene_max_age_sec', 900)
 
@@ -1102,11 +1103,12 @@ class JobManager:
     def _handle_job_timeout(self, job: ActiveJob) -> None:
         """Handle a timed-out job."""
         elapsed_hours = (int(time.time()) - job.start_time) / 3600
-        
+
         # Check if any progress was made
         current_balance = self._get_channel_local_balance(job.scid_normalized)
         amount_transferred = current_balance - job.initial_local_sats
-        
+        fee_sats = 0  # MA-9: Initialize before branching so it's always defined
+
         if amount_transferred > 0:
             # Partial success - try to get actual fee from sling stats
             job_stats = self._get_sling_stats()
@@ -1152,11 +1154,12 @@ class JobManager:
             self.database.release_budget_reservation(str(job.rebalance_id))
 
         # Report outcome to hive for fleet coordination (Phase 7)
+        # MA-9: Use computed fee_sats instead of hardcoded 0
         # Partial success is still reported as success to help fleet learning
         self._report_outcome_to_hive(
             job,
             success=(amount_transferred > 0),
-            cost_sats=0,  # Unknown actual fee on timeout
+            cost_sats=fee_sats,
             amount_transferred=amount_transferred,
             failure_reason="" if amount_transferred > 0 else "timeout"
         )
@@ -1389,8 +1392,10 @@ class JobManager:
         Uses a time-based cache to avoid hammering RPC.
         """
         now = int(time.time())
-        if self._askrene_cache_ts and (now - self._askrene_cache_ts) < 30:
-            return
+        # TS-5: Protect cache access with lock
+        with self._askrene_lock:
+            if self._askrene_cache_ts and (now - self._askrene_cache_ts) < 30:
+                return
         try:
             res = self.plugin.rpc.call("askrene-listlayers", {"layer": self.askrene_layer})
             layers = res.get("layers", [])
@@ -1410,8 +1415,9 @@ class JobManager:
                     # Keep the tightest constraint if multiple
                     if scid_dir not in cache or max_msat < cache[scid_dir]:
                         cache[scid_dir] = max_msat
-            self._askrene_cache = cache
-            self._askrene_cache_ts = now
+            with self._askrene_lock:
+                self._askrene_cache = cache
+                self._askrene_cache_ts = now
         except Exception:
             # Silent: AskRene is optional; sling will still function.
             return
@@ -1423,10 +1429,13 @@ class JobManager:
         so we take the minimum across both directions when present.
         """
         self._askrene_refresh_cache()
+        # TS-5: Read cache under lock
+        with self._askrene_lock:
+            cache_snapshot = dict(self._askrene_cache)
         best_msat = None
         for suffix in ("/0", "/1"):
             key = f"{sling_scid}{suffix}"
-            v = self._askrene_cache.get(key)
+            v = cache_snapshot.get(key)
             if v is None:
                 continue
             best_msat = v if best_msat is None else min(best_msat, v)
@@ -1675,7 +1684,9 @@ class JobManager:
     def get_job_status(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Get status info for a specific job."""
         normalized = self._normalize_scid(channel_id)
-        job = self._active_jobs.get(normalized)
+        # TS-4: Protect _active_jobs read with _jobs_lock
+        with self._jobs_lock:
+            job = self._active_jobs.get(normalized)
         
         if not job:
             return None
@@ -2469,13 +2480,15 @@ class EVRebalancer:
             reputation = self.database.get_peer_reputation(dest_info.get("peer_id", ""))
             p = reputation.get('score', 0.5)  # Success probability
             cost_ppm = inbound_fee_ppm + weighted_opp_cost
-            b = outbound_fee_ppm / cost_ppm if cost_ppm > 0 else float('inf')  # Odds
+            # MA-4: Avoid b=inf when cost_ppm=0 (free routing); use large finite value
+            b = outbound_fee_ppm / cost_ppm if cost_ppm > 0 else 100.0  # Odds
             kelly_f = p - (1 - p) / b if b > 0 else -1.0  # Raw Kelly fraction
             kelly_safe = min(kelly_f * self.config.kelly_fraction, 1.0)
 
             if kelly_safe <= 0:
                 return None  # Negative EV, reject
-            max_budget_sats = int(max_budget_sats * kelly_safe)
+            # MA-5: Ensure at least 1 sat budget when Kelly fraction is positive but small
+            max_budget_sats = max(1, int(max_budget_sats * kelly_safe))
             max_budget_msat = max_budget_sats * 1000
         elif skip_kelly:
             self.plugin.log(
