@@ -295,7 +295,16 @@ class ThreadSafeRpcProxy:
 
         return wrapper
 
+    # Hive report/broadcast/update calls are purely informational pushes.
+    # Dispatch them fire-and-forget so a slow cl-hive can't block our loops.
+    _HIVE_ASYNC_PREFIXES = ("hive-report-", "hive-broadcast-", "hive-update-")
+
     def call(self, method_name: str, payload: Any = None, **kwargs):
+        # Fire-and-forget for informational hive pushes
+        if any(method_name.startswith(p) for p in self._HIVE_ASYNC_PREFIXES):
+            self.fire_and_forget(method_name, payload)
+            return {}
+
         timeout = 30
         if config:
             timeout = config.rpc_timeout_seconds
@@ -311,6 +320,22 @@ class ThreadSafeRpcProxy:
         except TimeoutError:
             self._plugin.log(f"RPC timeout after {timeout}s on {method_name}", level="warn")
             raise RPCTimeoutError(method_name)
+
+    def fire_and_forget(self, method_name: str, payload: Any = None):
+        """Submit an RPC call without waiting for the result.
+
+        Intended for informational report/broadcast calls where the caller
+        only needs to know the call was dispatched, not what it returned.
+        Errors are logged but never propagated.
+        """
+        def _run():
+            try:
+                self._rpc.call(method_name, payload if payload is not None else {})
+            except Exception as e:
+                self._plugin.log(
+                    f"fire_and_forget {method_name} failed: {e}", level="debug"
+                )
+        self._executor.submit(_run)
 
 
 class ThreadSafePluginProxy:
