@@ -224,6 +224,7 @@ class JobManager:
 
         # Source reliability tracking
         self.source_failure_counts: Dict[str, float] = {}
+        self._source_failures_lock = threading.Lock()
         self.last_decay_time = time.time()
 
         # Periodic exclusion sync tracking
@@ -312,37 +313,42 @@ class JobManager:
             Number of stale entries pruned
         """
         pruned = 0
-        stale_keys = [k for k in self.source_failure_counts.keys() if k not in active_channel_ids]
-        for key in stale_keys:
-            del self.source_failure_counts[key]
-            pruned += 1
-        
+        with self._source_failures_lock:
+            stale_keys = [k for k in self.source_failure_counts.keys() if k not in active_channel_ids]
+            for key in stale_keys:
+                del self.source_failure_counts[key]
+                pruned += 1
+
         if pruned > 0:
             self.plugin.log(
                 f"GC: Pruned {pruned} stale source failure counts from closed channels",
                 level='debug'
             )
-        
+
         return pruned
     
     @property
     def active_job_count(self) -> int:
         """Returns the number of currently active jobs."""
-        return len(self._active_jobs)
-    
+        with self._jobs_lock:
+            return len(self._active_jobs)
+
     @property
     def active_channels(self) -> List[str]:
         """Returns list of channel SCIDs with active jobs."""
-        return list(self._active_jobs.keys())
-    
+        with self._jobs_lock:
+            return list(self._active_jobs.keys())
+
     def has_active_job(self, channel_id: str) -> bool:
         """Check if a channel has an active rebalance job."""
         normalized = self._normalize_scid(channel_id)
-        return normalized in self._active_jobs
-    
+        with self._jobs_lock:
+            return normalized in self._active_jobs
+
     def slots_available(self) -> int:
         """Returns number of available job slots."""
-        return max(0, self.max_concurrent_jobs - self.active_job_count)
+        with self._jobs_lock:
+            return max(0, self.max_concurrent_jobs - len(self._active_jobs))
     
     def _normalize_scid(self, scid: str) -> str:
         """Normalize SCID to consistent format (with 'x' separators)."""
@@ -616,10 +622,11 @@ class JobManager:
         
         # Periodic decay of failure counts (every hour)
         if now - self.last_decay_time > 3600:
-            for scid in list(self.source_failure_counts.keys()):
-                self.source_failure_counts[scid] *= 0.5
-                if self.source_failure_counts[scid] < 0.1:
-                    del self.source_failure_counts[scid]
+            with self._source_failures_lock:
+                for scid in list(self.source_failure_counts.keys()):
+                    self.source_failure_counts[scid] *= 0.5
+                    if self.source_failure_counts[scid] < 0.1:
+                        del self.source_failure_counts[scid]
             self.last_decay_time = now
 
         # Periodic exclusion sync (every 30 minutes)
@@ -975,9 +982,10 @@ class JobManager:
         # RELIABILITY: Reset failure count for the source channel since it delivered
         if job.candidate and job.candidate.source_candidates:
             primary_source = job.candidate.source_candidates[0]
-            if primary_source in self.source_failure_counts:
-                # Significant reduction (rewarding success)
-                self.source_failure_counts[primary_source] = 0.0
+            with self._source_failures_lock:
+                if primary_source in self.source_failure_counts:
+                    # Significant reduction (rewarding success)
+                    self.source_failure_counts[primary_source] = 0.0
 
         # Mark budget reservation as spent (CRITICAL-01 fix)
         self.database.mark_budget_spent(job.rebalance_id, fee_sats)
@@ -1013,7 +1021,8 @@ class JobManager:
         if job.candidate and job.candidate.source_candidates:
             # Penalize the primary source
             primary_source = job.candidate.source_candidates[0]
-            self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
+            with self._source_failures_lock:
+                self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
 
         # Release budget reservation (CRITICAL-01 fix)
         self.database.release_budget_reservation(job.rebalance_id)
@@ -1051,7 +1060,8 @@ class JobManager:
         # Penalize primary source reliability (it led us into an overspend scenario)
         if job.candidate and job.candidate.source_candidates:
             primary_source = job.candidate.source_candidates[0]
-            self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
+            with self._source_failures_lock:
+                self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
 
         # Record actual rebalance cost even on budget failure
         actual_cost_sats = (fee_msat + 999) // 1000
@@ -1537,17 +1547,18 @@ class JobManager:
 
             # Channels that should be excluded (high failure count)
             channels_to_exclude = set()
-            for scid, count in self.source_failure_counts.items():
-                if count >= 5.0:
-                    channels_to_exclude.add(self._to_sling_scid(scid))
-
-            # Channels to un-exclude (failure count decayed)
             channels_to_remove = set()
-            for scid in current_exclusions:
-                normalized = self._normalize_scid(scid)
-                count = self.source_failure_counts.get(normalized, 0)
-                if count < 2.0:
-                    channels_to_remove.add(scid)
+            with self._source_failures_lock:
+                for scid, count in self.source_failure_counts.items():
+                    if count >= 5.0:
+                        channels_to_exclude.add(self._to_sling_scid(scid))
+
+                # Channels to un-exclude (failure count decayed)
+                for scid in current_exclusions:
+                    normalized = self._normalize_scid(scid)
+                    count = self.source_failure_counts.get(normalized, 0)
+                    if count < 2.0:
+                        channels_to_remove.add(scid)
 
             # Add new exclusions
             for scid in channels_to_exclude:
@@ -1658,7 +1669,8 @@ class JobManager:
 
     def get_source_failure_count(self, channel_id: str) -> float:
         """Get the recent failure count for a source channel."""
-        return self.source_failure_counts.get(channel_id, 0.0)
+        with self._source_failures_lock:
+            return self.source_failure_counts.get(channel_id, 0.0)
 
 
 # =============================================================================
@@ -2029,7 +2041,7 @@ class EVRebalancer:
                         continue
                     # Must have source failure history (>3 failures) — this is the signal
                     # that pull-from-this-channel doesn't work well
-                    src_fail_count = self.job_manager.source_failure_counts.get(src_id, 0)
+                    src_fail_count = self.job_manager.get_source_failure_count(src_id)
                     if src_fail_count < 3:
                         continue
 

@@ -199,6 +199,15 @@ class KalmanFlowFilter:
             self.state.last_innovation
         ))
 
+    def _ensure_positive_definite(self) -> None:
+        """Ensure covariance matrix stays positive definite."""
+        self.state.variance_ratio = max(1e-6, self.state.variance_ratio)
+        self.state.variance_velocity = max(1e-6, self.state.variance_velocity)
+        det = self.state.variance_ratio * self.state.variance_velocity - self.state.covariance ** 2
+        if det <= 0:
+            max_cov = math.sqrt(self.state.variance_ratio * self.state.variance_velocity) * 0.9
+            self.state.covariance = max(-max_cov, min(max_cov, self.state.covariance))
+
     def predict(self, dt_days: float, volatility: float = 1.0) -> None:
         """
         Prediction step: Project state forward in time.
@@ -247,6 +256,9 @@ class KalmanFlowFilter:
         self.state.covariance = new_p01
         self.state.variance_velocity = new_p11
 
+        # Ensure covariance stays positive definite after prediction
+        self._ensure_positive_definite()
+
     def update(self, observed_ratio: float, confidence: float = 1.0) -> float:
         """
         Update step: Incorporate new observation.
@@ -294,15 +306,7 @@ class KalmanFlowFilter:
         self.state.variance_velocity = p11 - k1 * p01
 
         # Ensure covariance stays positive definite
-        self.state.variance_ratio = max(1e-6, self.state.variance_ratio)
-        self.state.variance_velocity = max(1e-6, self.state.variance_velocity)
-
-        # Ensure positive-definite: det(P) = var_ratio * var_velocity - cov^2 > 0
-        det = self.state.variance_ratio * self.state.variance_velocity - self.state.covariance ** 2
-        if det <= 0:
-            # Shrink covariance to restore positive-definiteness
-            max_cov = math.sqrt(self.state.variance_ratio * self.state.variance_velocity) * 0.9
-            self.state.covariance = max(-max_cov, min(max_cov, self.state.covariance))
+        self._ensure_positive_definite()
 
         # Bound state to physical range
         self.state.flow_ratio = max(-1.0, min(1.0, self.state.flow_ratio))

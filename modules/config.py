@@ -202,6 +202,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_min_profit': (0, 1000000),
     'rebalance_min_amount': (1000, 50000000),
     'rebalance_max_amount': (10000, 100000000),
+    'flow_window_days': (1, 365),
 }
 
 
