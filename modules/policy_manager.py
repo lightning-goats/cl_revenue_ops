@@ -1073,7 +1073,10 @@ class PolicyManager:
         for update in updates:
             peer_id = update.get('peer_id', '')
             self._validate_peer_id(peer_id)
-            self._check_rate_limit(peer_id)
+            if not self._check_rate_limit(peer_id):
+                raise RuntimeError(
+                    f"Rate limited: max {MAX_POLICY_CHANGES_PER_MINUTE} changes/minute for {peer_id[:12]}..."
+                )
 
             existing = self.get_policy(peer_id)
 

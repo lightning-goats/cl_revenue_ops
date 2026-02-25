@@ -4829,7 +4829,7 @@ class HillClimbingFeeController:
                     # No significant change - stay asleep, skip this adjustment cycle
                     self.plugin.log(
                         f"HYSTERESIS: Channel {channel_id[:12]}... sleeping "
-                        f"(wake in {(hc_state.sleep_until - now) // 60} min)",
+                        f"(wake in {(_sleep_until - now) // 60} min)",
                         level='debug'
                     )
                     return None
@@ -4946,7 +4946,10 @@ class HillClimbingFeeController:
         
         # Calculate REVENUE RATE (sats/hour) - this is our feedback signal
         # Revenue = Volume * Fee_PPM / 1_000_000
-        revenue_sats = (volume_since_sats * current_fee_ppm) // 1_000_000
+        # Use raw_chain_fee (actual on-chain fee), NOT current_fee_ppm (which may be
+        # inflated from 0 to min_fee_ppm). Using inflated fee creates phantom revenue
+        # that poisons the Thompson posterior with false positive signals.
+        revenue_sats = (volume_since_sats * raw_chain_fee) // 1_000_000
         raw_revenue_rate = revenue_sats / hours_elapsed if hours_elapsed > 0 else 0.0
 
         # Issue #28: Apply EMA smoothing to reduce fee volatility
@@ -7317,7 +7320,8 @@ class HillClimbingFeeController:
                         "spendable_msat": spendable_msat,
                         "receivable_msat": receivable_msat,
                         "fee_base_msat": fee_base,
-                        "fee_proportional_millionths": fee_ppm
+                        "fee_proportional_millionths": fee_ppm,
+                        "opener": channel.get("opener", "local"),
                     }
                     
         except RpcError as e:

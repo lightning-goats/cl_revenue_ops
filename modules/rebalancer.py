@@ -682,7 +682,10 @@ class JobManager:
             current_balance = local_balances.get(job.scid_normalized)
             if current_balance is None:
                 current_balance = self._get_channel_local_balance(job.scid_normalized)
-            balance_delta = current_balance - job.initial_local_sats
+            # For pull: positive delta = liquidity gained (success)
+            # For push: negative delta = liquidity drained (success), so flip sign
+            raw_delta = current_balance - job.initial_local_sats
+            balance_delta = -raw_delta if job.direction == "push" else raw_delta
             
             # Get job-specific stats from sling
             job_stats = sling_stats.get(job.scid, {})
@@ -1169,11 +1172,16 @@ class JobManager:
         self.stop_job(job.scid_normalized, reason="timeout")
     
     def stop_all_jobs(self, reason: str = "shutdown") -> int:
-        """Stop all active jobs. Returns count of jobs stopped."""
+        """Stop all active jobs and release their budget reservations. Returns count of jobs stopped."""
         count = 0
         with self._jobs_lock:
-            scids = list(self._active_jobs.keys())
-        for scid in scids:
+            jobs_snapshot = list(self._active_jobs.items())
+        for scid, job in jobs_snapshot:
+            # Release budget reservation before stopping (prevents orphaned reservations on shutdown)
+            try:
+                self.database.release_budget_reservation(str(job.rebalance_id))
+            except Exception:
+                pass
             if self.stop_job(scid, reason=reason):
                 count += 1
         return count
@@ -1782,7 +1790,11 @@ class EVRebalancer:
 
         # Initialize job manager for async execution (pass hive_bridge for outcome reporting)
         self.job_manager = JobManager(plugin, config, database, hive_bridge=hive_bridge)
-    
+
+    def _parse_msat(self, v: Any) -> int:
+        """Delegate to shared parse_msat in utils.py."""
+        return _shared_parse_msat(v)
+
     def _get_our_node_id(self) -> str:
         if self._our_node_id is None:
             try:
@@ -4057,12 +4069,12 @@ class EVRebalancer:
 
             try:
                 # Build a minimal sling job for the NNLB rebalance
-                result = self.execute_once(
-                    target_scid=sink_scid,
-                    source_scid=source_scid,
+                result = self.job_manager.execute_once(
+                    scid=sink_scid,
+                    direction="pull",
                     amount=amount,
                     maxppm=10,  # NNLB should be near-zero cost
-                    label=f"nnlb_auto_{sink_scid}"
+                    candidates=[source_scid]
                 )
                 if result and result.get("success"):
                     executed += 1

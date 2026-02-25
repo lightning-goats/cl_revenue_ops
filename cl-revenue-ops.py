@@ -895,9 +895,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     forwards_to_insert.append({
                         'in_channel': fwd.get("in_channel", ""),
                         'out_channel': fwd.get("out_channel", ""),
-                        'in_msat': fwd.get("in_msat", fwd.get("in_msatoshi", 0)),
-                        'out_msat': fwd.get("out_msat", fwd.get("out_msatoshi", 0)),
-                        'fee_msat': fwd.get("fee_msat", fwd.get("fee_msatoshi", 0)),
+                        'in_msat': _parse_msat(fwd.get("in_msat", fwd.get("in_msatoshi", 0))),
+                        'out_msat': _parse_msat(fwd.get("out_msat", fwd.get("out_msatoshi", 0))),
+                        'fee_msat': _parse_msat(fwd.get("fee_msat", fwd.get("fee_msatoshi", 0))),
                         'resolution_time': (fwd.get("resolved_time", 0) - received_time) if fwd.get("resolved_time") else 0,
                         'received_time': received_time,
                         'resolved_time': int(fwd.get("resolved_time", 0) or 0)
@@ -3696,10 +3696,10 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
             _scid_to_peer_cache.update(new_cache)
 
         return new_cache.get(scid_norm)
-    except RpcError as e:
+    except Exception as e:
         plugin.log(f"Error resolving SCID {scid} to peer: {e}", level='warn')
         return None
-        
+
 
 def _parse_msat(msat_val: Any) -> int:
     """
@@ -3898,8 +3898,11 @@ def on_channel_state_changed(plugin: Plugin, **kwargs):
     plugin.log(f"Channel state changed: {event}", level='debug')
 
     # Extract channel information
+    # CLN's channel_state_changed provides `channel_id` as a hex funding txid
+    # and `short_channel_id` as the SCID (e.g., "123x456x0"). We need the SCID
+    # for all downstream operations (DB lookups, fee setting, archiving).
     peer_id = event.get('peer_id')
-    channel_id = event.get('channel_id')
+    channel_id = event.get('short_channel_id') or event.get('channel_id')
     new_state = event.get('new_state', '')
     old_state = event.get('old_state', '')
     cause = event.get('cause', 'unknown')

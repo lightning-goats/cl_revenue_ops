@@ -1101,22 +1101,34 @@ class Database:
         conn = self._get_connection()
         now = int(time.time())
 
-        conn.execute("""
-            INSERT OR REPLACE INTO channel_states
-            (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at,
-             confidence, velocity, flow_multiplier, ema_decay, forward_count,
-             kalman_flow_ratio, kalman_velocity, kalman_uncertainty)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, now,
-              confidence, velocity, flow_multiplier, ema_decay, forward_count,
-              kalman_flow_ratio, kalman_velocity, kalman_uncertainty))
+        # Both writes must be atomic: if the history insert fails after the
+        # state upsert, we'd have state without a history trail.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO channel_states
+                (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at,
+                 confidence, velocity, flow_multiplier, ema_decay, forward_count,
+                 kalman_flow_ratio, kalman_velocity, kalman_uncertainty)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, now,
+                  confidence, velocity, flow_multiplier, ema_decay, forward_count,
+                  kalman_flow_ratio, kalman_velocity, kalman_uncertainty))
 
-        # Also record in history
-        conn.execute("""
-            INSERT INTO flow_history
-            (channel_id, timestamp, sats_in, sats_out, flow_ratio, state)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (channel_id, now, sats_in, sats_out, flow_ratio, state))
+            # Also record in history
+            conn.execute("""
+                INSERT INTO flow_history
+                (channel_id, timestamp, sats_in, sats_out, flow_ratio, state)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (channel_id, now, sats_in, sats_out, flow_ratio, state))
+
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
     
     def get_channel_state(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Get the current state of a channel."""
