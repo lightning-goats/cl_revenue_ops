@@ -256,6 +256,13 @@ class RPCBreakerOpen(RPCTimeoutError):
     pass
 
 
+class RPCOverloadedError(RPCTimeoutError):
+    """Raised when the RPC worker pool is saturated."""
+    def __init__(self, method):
+        self.method = method
+        RpcError.__init__(self, method, {}, f"RPC worker pool saturated for method: {method}")
+
+
 class ThreadSafeRpcProxy:
     """
     Thread-safe RPC proxy using a ThreadPoolExecutor for timeout protection.
@@ -263,22 +270,16 @@ class ThreadSafeRpcProxy:
     pyln-client opens a new Unix domain socket per call — it's inherently
     thread-safe and supports unlimited concurrency. No subprocess pool needed.
 
-    Each call gets its own thread. If a call hangs past the timeout, the
-    caller gets an RPCTimeoutError immediately. The hung thread stays alive
-    (daemon, will eventually complete) but doesn't block anything else.
+    Calls run in a bounded worker pool. If a call hangs past the timeout, the
+    caller gets an RPCTimeoutError immediately. The underlying worker may still
+    finish later, so submissions are also backpressured with bounded queues.
 
     No circuit breaker: individual calls either succeed or fail on their own.
     One slow call can't poison 60+ other RPC methods for 60 seconds.
 
-    Hive report/broadcast/update calls use a separate 4-thread pool and are
-    dispatched fire-and-forget so a slow cl-hive can't starve the main pool
-    or block fee/rebalance loops.
+    Explicit fire-and-forget calls use a separate 4-thread pool so slow
+    informational hive pushes can't starve the main pool.
     """
-
-    # Informational hive pushes — fire-and-forget via _async_executor.
-    # hive-report-mcf-completion is excluded: caller needs the response.
-    _HIVE_ASYNC_PREFIXES = ("hive-report-", "hive-broadcast-", "hive-update-")
-    _HIVE_ASYNC_EXCLUDE = ("hive-report-mcf-completion",)
 
     def __init__(self, plugin_instance: Plugin):
         from concurrent.futures import ThreadPoolExecutor
@@ -290,12 +291,19 @@ class ThreadSafeRpcProxy:
         self._rpc = plugin_instance.rpc
         self._executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="rpc")
         self._async_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rpc_async")
+        # Bound queued submissions so timed-out/hung calls can't accumulate an
+        # unbounded work queue and exhaust memory over time.
+        self._main_submit_slots = threading.Semaphore(16 + 32)   # workers + bounded queue
+        self._async_submit_slots = threading.Semaphore(4 + 64)   # explicit async pushes only
         self._async_fail_count = 0
         self._async_lock = threading.Lock()  # L-4: Protect _async_fail_count
 
     def __getattr__(self, name):
         if name in ("_plugin", "_rpc", "_executor", "_async_executor",
-                     "_async_fail_count", "_async_lock", "call", "fire_and_forget"):
+                     "_main_submit_slots", "_async_submit_slots",
+                     "_async_fail_count", "_async_lock",
+                     "_submit_main", "_submit_async",
+                     "call", "fire_and_forget"):
             return super().__getattribute__(name)
 
         fn = getattr(self._rpc, name)
@@ -304,7 +312,7 @@ class ThreadSafeRpcProxy:
             timeout = 30
             if config:
                 timeout = config.rpc_timeout_seconds
-            future = self._executor.submit(fn, *args, **kwargs)
+            future = self._submit_main(fn, name, timeout, *args, **kwargs)
             try:
                 return future.result(timeout=timeout)
             except (TimeoutError, self._FuturesTimeoutError):
@@ -313,17 +321,41 @@ class ThreadSafeRpcProxy:
 
         return wrapper
 
-    def _is_fire_and_forget(self, method_name: str) -> bool:
-        if method_name in self._HIVE_ASYNC_EXCLUDE:
+    def _submit_main(self, fn, method_name: str, timeout: int, *args, **kwargs):
+        acquire_timeout = min(max(float(timeout), 0.1), 1.0)
+        if not self._main_submit_slots.acquire(timeout=acquire_timeout):
+            self._plugin.log(
+                f"RPC pool saturated on {method_name} (submission queue full)",
+                level="warn"
+            )
+            raise RPCOverloadedError(method_name)
+        try:
+            future = self._executor.submit(fn, *args, **kwargs)
+        except Exception:
+            self._main_submit_slots.release()
+            raise
+        future.add_done_callback(lambda _f: self._main_submit_slots.release())
+        return future
+
+    def _submit_async(self, fn, method_name: str):
+        if not self._async_submit_slots.acquire(blocking=False):
+            with self._async_lock:
+                self._async_fail_count += 1
+                count = self._async_fail_count
+            self._plugin.log(
+                f"fire_and_forget {method_name} dropped (async queue full, streak={count})",
+                level="warn"
+            )
             return False
-        return any(method_name.startswith(p) for p in self._HIVE_ASYNC_PREFIXES)
+        try:
+            future = self._async_executor.submit(fn)
+        except Exception:
+            self._async_submit_slots.release()
+            raise
+        future.add_done_callback(lambda _f: self._async_submit_slots.release())
+        return True
 
     def call(self, method_name: str, payload: Any = None, **kwargs):
-        # Fire-and-forget for informational hive pushes (separate pool)
-        if self._is_fire_and_forget(method_name):
-            self.fire_and_forget(method_name, payload)
-            return {}
-
         timeout = 30
         if config:
             timeout = config.rpc_timeout_seconds
@@ -331,8 +363,12 @@ class ThreadSafeRpcProxy:
         # slower — give them 2x the normal timeout to avoid spurious failures.
         if method_name.startswith("hive-"):
             timeout *= 2
-        future = self._executor.submit(
-            self._rpc.call, method_name, payload if payload is not None else {},
+        future = self._submit_main(
+            self._rpc.call,
+            method_name,
+            timeout,
+            method_name,
+            payload if payload is not None else {},
         )
         try:
             return future.result(timeout=timeout)
@@ -361,7 +397,7 @@ class ThreadSafeRpcProxy:
                     f"fire_and_forget {method_name} failed "
                     f"(streak={count}): {e}", level="debug"
                 )
-        self._async_executor.submit(_run)
+        return self._submit_async(_run, method_name)
 
 
 class ThreadSafePluginProxy:
@@ -692,11 +728,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         Handle SIGTERM for graceful shutdown.
 
         CLN sends SIGTERM when `lightning-cli plugin stop cl-revenue-ops` is called.
-        This handler ONLY sets the shutdown_event. All cleanup (executor shutdown,
-        job stopping, DB close) is done by background threads when they see the event,
-        avoiding deadlock risk from calling non-async-signal-safe functions in a handler.
+        Set the shutdown event and exit the process so Python runs atexit
+        cleanup handlers. We avoid doing heavyweight cleanup in the signal
+        handler itself.
         """
         shutdown_event.set()
+        raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
 
@@ -1971,15 +2008,27 @@ def revenue_fee_anchor(plugin: Plugin,
         if not (re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id) or len(channel_id) == 66):
             return {"status": "error", "error": "Invalid channel_id format"}
 
-        ttl_seconds = int(ttl_hours) * 3600
+        try:
+            ttl_seconds = int(ttl_hours) * 3600
+        except (ValueError, TypeError):
+            return {"status": "error", "error": "ttl_hours must be an integer"}
         if ttl_seconds < 1 or ttl_seconds > 604800:
             return {"status": "error", "error": "ttl must be between 1 second and 7 days"}
+
+        try:
+            base_weight = float(base_weight)
+        except (ValueError, TypeError):
+            return {"status": "error", "error": "base_weight must be a number"}
+        try:
+            confidence = float(confidence)
+        except (ValueError, TypeError):
+            return {"status": "error", "error": "confidence must be a number"}
 
         return fee_controller.set_fee_anchor(
             channel_id=channel_id,
             target_fee_ppm=target_fee_ppm,
-            base_weight=float(base_weight),
-            confidence=float(confidence),
+            base_weight=base_weight,
+            confidence=confidence,
             ttl_seconds=ttl_seconds,
             reason=reason,
         )
@@ -3716,6 +3765,88 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
         return None
 
 
+def _looks_like_scid(value: Any) -> bool:
+    """Return True if a value looks like a short_channel_id."""
+    return isinstance(value, str) and bool(re.match(r'^\d+[x:]\d+[x:]\d+$', value))
+
+
+def _resolve_event_channel_scid(event: Dict[str, Any]) -> Optional[str]:
+    """
+    Resolve a channel_state_changed event to a short_channel_id (SCID).
+
+    CLN may provide `channel_id` as a funding txid hex string while downstream
+    accounting code requires a SCID. We try lightweight RPC resolution when the
+    event lacks `short_channel_id`.
+    """
+    short_scid = event.get('short_channel_id')
+    if _looks_like_scid(short_scid):
+        return normalize_scid(short_scid)
+
+    raw_channel_id = event.get('channel_id')
+    if _looks_like_scid(raw_channel_id):
+        return normalize_scid(raw_channel_id)
+
+    if not isinstance(raw_channel_id, str) or safe_plugin is None:
+        return None
+
+    raw_channel_id_lc = raw_channel_id.lower()
+    peer_id = event.get('peer_id')
+
+    def _match_scid_from_channels(channels: List[Dict[str, Any]]) -> Optional[str]:
+        for ch in channels:
+            if not isinstance(ch, dict):
+                continue
+            scid = ch.get('short_channel_id')
+            if not _looks_like_scid(scid):
+                continue
+            candidates = [
+                ch.get('channel_id'),
+                ch.get('funding_txid'),
+                ch.get('txid'),
+            ]
+            for candidate in candidates:
+                if isinstance(candidate, str) and candidate.lower() == raw_channel_id_lc:
+                    return normalize_scid(scid)
+        return None
+
+    # Try open channels first (likely for ONCHAIN/FUNDING_SPEND_SEEN transitions)
+    peer_payloads = []
+    if isinstance(peer_id, str) and len(peer_id) == 66:
+        peer_payloads.append({"id": peer_id})
+    peer_payloads.append({})
+
+    for payload in peer_payloads:
+        try:
+            channels = safe_plugin.rpc.call("listpeerchannels", payload).get("channels", [])
+            scid = _match_scid_from_channels(channels)
+            if scid:
+                return scid
+        except Exception:
+            continue
+
+    # Fallback for CLOSED events where the channel may already be gone
+    try:
+        closed = safe_plugin.rpc.call("listclosedchannels").get("closedchannels", [])
+        for ch in closed:
+            if not isinstance(ch, dict):
+                continue
+            scid = ch.get('short_channel_id')
+            if not _looks_like_scid(scid):
+                continue
+            candidates = [
+                ch.get('channel_id'),
+                ch.get('funding_txid'),
+                ch.get('txid'),
+            ]
+            for candidate in candidates:
+                if isinstance(candidate, str) and candidate.lower() == raw_channel_id_lc:
+                    return normalize_scid(scid)
+    except Exception:
+        pass
+
+    return None
+
+
 def _parse_msat(msat_val: Any) -> int:
     """
     Safely convert msat values to integers.
@@ -3920,17 +4051,24 @@ def on_channel_state_changed(plugin: Plugin, **kwargs):
     # and `short_channel_id` as the SCID (e.g., "123x456x0"). We need the SCID
     # for all downstream operations (DB lookups, fee setting, archiving).
     peer_id = event.get('peer_id')
-    channel_id = event.get('short_channel_id') or event.get('channel_id')
+    raw_channel_id = event.get('short_channel_id') or event.get('channel_id')
     new_state = event.get('new_state', '')
     old_state = event.get('old_state', '')
     cause = event.get('cause', 'unknown')
 
-    if not channel_id:
+    if not raw_channel_id:
         plugin.log(f"Channel state change - no channel_id in event: {event}", level='warn')
         return
 
-    # Normalize channel_id format
-    channel_id = normalize_scid(channel_id)
+    # Resolve to SCID (events may provide funding txid in `channel_id`)
+    channel_id = _resolve_event_channel_scid(event)
+    if not channel_id:
+        plugin.log(
+            f"Channel state change - could not resolve SCID from event channel_id={raw_channel_id!r}; "
+            f"skipping accounting for state={new_state}",
+            level='warn'
+        )
+        return
 
     # =========================================================================
     # Channel Open Detection (Hive Integration)
