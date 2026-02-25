@@ -109,25 +109,6 @@
 # RECOMMENDATION: 5-15% depending on risk tolerance
 #revenue-ops-proportional-budget-pct=0.10
 
-# --- Boltz Loop-In Auto-Funding ---
-# Automatically fund newly created loop-in swaps from the CLN on-chain wallet.
-# Safety rails:
-# - Per-swap max amount
-# - 24h aggregate cap
-# - Minimum source UTXO confirmations
-
-# Kill-switch for automatic loop-in funding
-#revenue-boltz-auto=true
-
-# Maximum sats per auto-funded loop-in
-#revenue-ops-boltz-loop-in-max-sats=10000000
-
-# Maximum total sats auto-funded over rolling 24h
-#revenue-ops-boltz-loop-in-daily-cap-sats=25000000
-
-# Minimum confirmations for UTXOs selected by CLN withdraw
-#revenue-ops-boltz-loop-in-min-conf=1
-
 # ============================================================================
 # RISK MANAGEMENT (Kelly Criterion)
 # ============================================================================

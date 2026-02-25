@@ -181,7 +181,6 @@ revenue-ops-hive-enabled=auto   # Auto-detect (default)
 | Core Lightning | Required | v23.05+ |
 | Python 3.10+ | Required | |
 | **sling plugin** | **Required** | Rebalancing engine |
-| boltzcli + boltzd | Optional | Required only for `revenue-boltz-*` commands |
 | bookkeeper plugin | Recommended | Accurate cost tracking |
 | CLBoss | **Included** | Base node management (enabled by default in Docker) |
 | cl-hive | Optional | Fleet coordination |
@@ -269,23 +268,6 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 | `revenue-portfolio-rebalance [risk_aversion]` | Recommended reallocation actions |
 | `revenue-portfolio-correlations [min_correlation]` | Correlation and hedging analysis |
 
-### Boltz Swaps & Wallets
-
-| Command | Description |
-|---------|-------------|
-| `revenue-boltz-quote <amount_sats> [swap_type] [currency]` | Quote reverse/submarine swap fees (`currency` supports `btc`, `lbtc`, `both`) |
-| `revenue-boltz-loop-out <amount_sats> [address] [channel_id] [peer_id] [currency]` | Reverse swap (LN -> on-chain BTC/LBTC) |
-| `revenue-boltz-loop-in <amount_sats> [channel_id] [peer_id] [currency]` | Submarine swap (on-chain BTC/LBTC -> LN) |
-| `revenue-boltz-status <swap_id>` | Swap status from boltzd + local DB |
-| `revenue-boltz-history [limit]` | Local Boltz history with totals and budget view |
-| `revenue-boltz-budget` | Current swap budget usage (completed + reserved) |
-| `revenue-boltz-wallet` | boltzd wallet balances |
-| `revenue-boltz-deposit [currency]` | Get boltzd deposit address (`btc`/`lbtc`) |
-| `revenue-boltz-withdraw <destination> <amount_sats> [currency] [sat_per_vbyte] [sweep]` | Send funds from boltzd wallet |
-| `revenue-boltz-refund <swap_id> [destination]` | Refund failed submarine/chain swaps |
-| `revenue-boltz-claim <swap_ids> [destination]` | Manual claim for reverse/chain swaps |
-| `revenue-boltz-chainswap <amount_sats> [from_currency] [to_currency] [to_address]` | Chain swap BTC <-> LBTC |
-
 ### CLBoss Integration (Optional)
 
 | Command | Description |
@@ -340,29 +322,6 @@ All options can be set in your CLN config file or via `revenue-config set`.
 | `revenue-ops-min-wallet-reserve` | `1000000` | Minimum reserve to maintain (sats) |
 | `revenue-ops-proportional-budget` | `true` | Scale budget based on revenue |
 | `revenue-ops-proportional-budget-pct` | `0.30` | Percentage of revenue for budget |
-
-### Boltz Loop-In Auto-Funding
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `revenue-boltz-auto` | `true` | Kill-switch for automatic CLN wallet funding of loop-ins |
-| `revenue-ops-boltz-loop-in-max-sats` | `10000000` | Per-swap auto-funding ceiling (sats) |
-| `revenue-ops-boltz-loop-in-daily-cap-sats` | `25000000` | 24h auto-funding cap (sats) |
-| `revenue-ops-boltz-loop-in-min-conf` | `1` | Minimum confirmations for UTXOs used by auto-funding |
-
-Runtime config keys (`revenue-config set`): `revenue_boltz_auto`, `boltz_loop_in_max_sats`, `boltz_loop_in_daily_cap_sats`, `boltz_loop_in_min_confirmations`.
-
-### Boltz Swap Controls
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `revenue-ops-swap-daily-budget-sats` | `50000` | Max daily swap fee spend (sats) |
-| `revenue-ops-swap-max-fee-ppm` | `5000` | Max acceptable fee rate per swap |
-| `revenue-ops-swap-min-amount-sats` | `100000` | Minimum allowed swap size |
-| `revenue-ops-swap-max-amount-sats` | `10000000` | Maximum allowed swap size |
-| `revenue-ops-swap-currency` | `lbtc` | Preferred swap currency (`btc` or `lbtc`) |
-
-Runtime config keys (`revenue-config set`): `swap_daily_budget_sats`, `swap_max_fee_ppm`, `swap_min_amount_sats`, `swap_max_amount_sats`, `swap_currency`.
 
 ### Advanced Fee Settings
 

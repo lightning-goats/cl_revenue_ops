@@ -34,14 +34,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'max_fee_ppm': int,
     'daily_budget_sats': int,
     'min_wallet_reserve': int,
-    'revenue_boltz_auto': bool,
-    'boltz_loop_in_max_sats': int,
-    'boltz_loop_in_daily_cap_sats': int,
-    'boltz_loop_in_min_confirmations': int,
-    'swap_daily_budget_sats': int,
-    'swap_max_fee_ppm': int,
-    'swap_min_amount_sats': int,
-    'swap_max_amount_sats': int,
     'low_liquidity_threshold': float,
     'high_liquidity_threshold': float,
     'htlc_congestion_threshold': float,
@@ -122,8 +114,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hive_nnlb_auto_execute': bool,
     'hive_channel_ages_enabled': bool,
     'hive_channel_ages_cache_seconds': int,
-    # Boltz swap currency
-    'swap_currency': str,
     # Fields present in CONFIG_FIELD_RANGES that need type registration
     'base_fee_msat': int,
     'flow_window_days': int,
@@ -143,13 +133,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'max_fee_ppm': (1, 100000),
     'daily_budget_sats': (0, 10000000),
     'min_wallet_reserve': (0, 100000000),
-    'boltz_loop_in_max_sats': (25000, 100000000),
-    'boltz_loop_in_daily_cap_sats': (25000, 250000000),
-    'boltz_loop_in_min_confirmations': (1, 100),
-    'swap_daily_budget_sats': (0, 1000000),
-    'swap_max_fee_ppm': (100, 50000),
-    'swap_min_amount_sats': (10000, 100000000),
-    'swap_max_amount_sats': (10000, 100000000),
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
     'htlc_congestion_threshold': (0.0, 1.0),
@@ -201,7 +184,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hive_mcf_targets_cache_seconds': (60, 1800),      # 1 min to 30 min
     'hive_nnlb_min_amount': (10000, 10000000),         # 10k to 10M sats
     'hive_channel_ages_cache_seconds': (300, 86400),   # 5 min to 24 hours
-    # swap_currency: validated in boltz_swaps.py (string enum, not numeric range)
     # Additional range validations
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
@@ -271,19 +253,6 @@ class Config:
     daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period (fixed floor)
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
 
-    # Boltz loop-in auto-funding safety controls (legacy, kept for backward compat)
-    revenue_boltz_auto: bool = True                 # Kill-switch for automatic loop-in funding
-    boltz_loop_in_max_sats: int = 10_000_000        # Per-swap max auto-funded amount
-    boltz_loop_in_daily_cap_sats: int = 25_000_000  # 24h aggregate auto-funding cap
-    boltz_loop_in_min_confirmations: int = 1        # CLN wallet UTXO minconf for withdraw
-
-    # Boltz swap budget controls (boltzcli integration)
-    swap_daily_budget_sats: int = 50_000            # Max daily spend on swap fees
-    swap_max_fee_ppm: int = 5_000                   # Max acceptable fee rate for any single swap
-    swap_min_amount_sats: int = 100_000             # Minimum swap amount
-    swap_max_amount_sats: int = 10_000_000          # Maximum swap amount
-    swap_currency: str = 'lbtc'                       # 'btc' or 'lbtc' (Liquid, lower fees)
-    
     # Revenue-Proportional Budget (Phase 7: Dynamic Budget Scaling)
     enable_proportional_budget: bool = True   # Scale daily budget based on revenue (Issue #22)
     proportional_budget_pct: float = 0.30     # Budget = max(daily_budget_sats, revenue_24h * pct)
@@ -515,7 +484,6 @@ class Config:
         # 3b. VALIDATE: String enum check
         STRING_ENUM_VALID_VALUES = {
             'hive_enabled': ('auto', 'true', 'false'),
-            'swap_currency': ('btc', 'lbtc'),
         }
         if key in STRING_ENUM_VALID_VALUES:
             if typed_value not in STRING_ENUM_VALID_VALUES[key]:
@@ -605,16 +573,7 @@ class ConfigSnapshot:
     # Global Capital Controls
     daily_budget_sats: int
     min_wallet_reserve: int
-    revenue_boltz_auto: bool
-    boltz_loop_in_max_sats: int
-    boltz_loop_in_daily_cap_sats: int
-    boltz_loop_in_min_confirmations: int
-    swap_daily_budget_sats: int
-    swap_max_fee_ppm: int
-    swap_min_amount_sats: int
-    swap_max_amount_sats: int
-    swap_currency: str
-    
+
     # Revenue-Proportional Budget
     enable_proportional_budget: bool
     proportional_budget_pct: float

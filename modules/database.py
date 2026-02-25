@@ -554,38 +554,6 @@ class Database:
             )
         """)
 
-        # Boltz swap tracking (loop-outs)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS boltz_swaps (
-                id TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                node_id TEXT,
-                swap_type TEXT NOT NULL DEFAULT 'loop_out',
-                target_channel_id TEXT,
-                target_peer_id TEXT,
-                bolt11_invoice TEXT,
-                invoice_amount_sats INTEGER NOT NULL,
-                onchain_amount_sats INTEGER NOT NULL,
-                boltz_fee_pct REAL NOT NULL,
-                boltz_fee_sats INTEGER NOT NULL,
-                miner_fee_lockup_sats INTEGER NOT NULL,
-                miner_fee_claim_sats INTEGER NOT NULL,
-                total_cost_sats INTEGER NOT NULL,
-                cost_ppm INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                preimage_hash TEXT NOT NULL,
-                preimage TEXT,
-                claim_privkey TEXT,
-                claim_pubkey TEXT,
-                address TEXT,
-                timeout_block INTEGER,
-                lockup_txid TEXT,
-                claim_txid TEXT,
-                error TEXT
-            )
-        """)
-
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
@@ -726,21 +694,6 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_splice_costs_time ON splice_costs(timestamp)")
         # Prevent duplicate splice records when txid is known (Security: idempotency)
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_splice_costs_unique ON splice_costs(channel_id, txid) WHERE txid IS NOT NULL")
-
-        # L-16: Swap costs table (referenced by boltz_swaps.py and record_swap_cost)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS swap_costs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                swap_id TEXT NOT NULL,
-                channel_id TEXT,
-                peer_id TEXT,
-                cost_sats INTEGER NOT NULL,
-                amount_sats INTEGER NOT NULL DEFAULT 0,
-                swap_type TEXT,
-                timestamp INTEGER NOT NULL
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_swap_costs_time ON swap_costs(timestamp)")
 
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
@@ -3421,15 +3374,6 @@ class Database:
         ).fetchone()
         total_splice_cost_sats = splice_row["total"] if splice_row else 0
 
-        # Total swap costs from swap_costs table (Boltz boltzcli integration)
-        try:
-            swap_row = conn.execute(
-                "SELECT COALESCE(SUM(cost_sats), 0) as total FROM swap_costs"
-            ).fetchone()
-            total_swap_cost_sats = swap_row["total"] if swap_row else 0
-        except Exception:
-            total_swap_cost_sats = 0  # Table may not exist on older installs
-
         # Current forward count from forwards table
         count_row = conn.execute(
             "SELECT COUNT(*) as total FROM forwards"
@@ -3451,7 +3395,6 @@ class Database:
             "total_opening_cost_sats": total_opening_cost_sats,
             "total_closure_cost_sats": total_closure_cost_sats,  # Accounting v2.0
             "total_splice_cost_sats": total_splice_cost_sats,  # Accounting v2.0
-            "total_swap_cost_sats": total_swap_cost_sats,  # Boltz swap costs
             "total_forwards": total_forwards
         }
     
@@ -4065,65 +4008,6 @@ class Database:
         }
 
     # =========================================================================
-    # Swap Cost Tracking (Boltz boltzcli integration)
-    # =========================================================================
-
-    def record_swap_cost(
-        self,
-        swap_id: str,
-        channel_id: Optional[str],
-        peer_id: Optional[str],
-        cost_sats: int,
-        amount_sats: int,
-        swap_type: str,
-        timestamp: Optional[int] = None,
-    ) -> None:
-        """Record a swap cost for P&L tracking."""
-        conn = self._get_connection()
-        conn.execute(
-            """
-            INSERT INTO swap_costs
-            (swap_id, channel_id, peer_id, cost_sats, amount_sats, swap_type, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (swap_id, channel_id, peer_id, cost_sats, amount_sats,
-             swap_type, timestamp or int(time.time())),
-        )
-
-    def get_total_swap_costs(self, since_timestamp: int = 0) -> int:
-        """Get total swap costs since a timestamp (default: all time)."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT COALESCE(SUM(cost_sats), 0) as total FROM swap_costs WHERE timestamp >= ?",
-            (since_timestamp,),
-        ).fetchone()
-        return row["total"] if row else 0
-
-    def get_swap_cost_stats(self, since_timestamp: int = 0) -> Dict[str, Any]:
-        """Get swap cost statistics since a timestamp."""
-        conn = self._get_connection()
-        row = conn.execute(
-            """
-            SELECT
-                COUNT(*) as count,
-                COALESCE(SUM(cost_sats), 0) as total_cost_sats,
-                COALESCE(AVG(cost_sats), 0) as avg_cost_sats,
-                COALESCE(SUM(CASE WHEN swap_type = 'reverse' THEN cost_sats ELSE 0 END), 0) as reverse_cost_sats,
-                COALESCE(SUM(CASE WHEN swap_type = 'submarine' THEN cost_sats ELSE 0 END), 0) as submarine_cost_sats,
-                COALESCE(SUM(CASE WHEN swap_type = 'reverse' THEN 1 ELSE 0 END), 0) as reverse_count,
-                COALESCE(SUM(CASE WHEN swap_type = 'submarine' THEN 1 ELSE 0 END), 0) as submarine_count
-            FROM swap_costs
-            WHERE timestamp >= ?
-            """,
-            (since_timestamp,),
-        ).fetchone()
-        return dict(row) if row else {
-            "count": 0, "total_cost_sats": 0, "avg_cost_sats": 0,
-            "reverse_cost_sats": 0, "submarine_cost_sats": 0,
-            "reverse_count": 0, "submarine_count": 0,
-        }
-
-    # =========================================================================
     # Channel Failure Tracking Methods (Persistent Backoff)
     # =========================================================================
 
@@ -4481,18 +4365,6 @@ class Database:
             # SNAPSHOT CLEANUP: Keep 1 year of financial snapshots for trend analysis
             snapshot_cutoff = now - (365 * 86400)
             conn.execute("DELETE FROM financial_snapshots WHERE timestamp < ?", (snapshot_cutoff,))
-
-            # DB-3: BOLTZ TABLE CLEANUP: Prevent unbounded growth of swap logs
-            # Keep 90 days of swap history (same as audit logs)
-            try:
-                conn.execute("DELETE FROM boltz_swaps WHERE created_at < ?", (audit_cutoff,))
-                conn.execute("DELETE FROM boltz_audit_log WHERE timestamp < ?", (audit_cutoff,))
-                conn.execute(
-                    "DELETE FROM swap_budget_reservations WHERE created_at < ?",
-                    (audit_cutoff,)
-                )
-            except Exception:
-                pass  # Tables may not exist if Boltz not configured
 
             conn.execute("COMMIT")
         except Exception as e:
