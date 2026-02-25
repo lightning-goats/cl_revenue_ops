@@ -6322,12 +6322,15 @@ class HillClimbingFeeController:
                              (not target_found and hc_state.last_state == "CONGESTION")
 
         if not significant_change:
-            # HYSTERESIS: Skip RPC, update internal target, but PAUSE observation window
+            # HYSTERESIS: Skip RPC, update internal target but reset observation timer.
+            # We MUST reset last_update because the fee/revenue data for this window
+            # has already been consumed by Thompson/AIMD posterior updates above.
+            # Not resetting would cause double-counting on the next cycle.
             hc_state.last_fee_ppm = new_fee_ppm
             hc_state.last_revenue_rate = current_revenue_rate
             hc_state.trend_direction = new_direction
             hc_state.step_ppm = step_ppm
-            # IMPORTANT: Do NOT update hc_state.last_update here (Observation Pause)
+            hc_state.last_update = now
             self._save_hill_climb_state(channel_id, hc_state)
             
             self.plugin.log(
@@ -6337,13 +6340,17 @@ class HillClimbingFeeController:
             )
 
             # Persist Thompson state changes too (posterior updates, AIMD outcomes, etc).
+            # IMPORTANT: We MUST update last_update here because the Thompson posterior
+            # was already updated with the current observation window's data (at the
+            # update_posterior call above). If we don't reset the timer, the next cycle
+            # would re-use the same accumulated volume/revenue, double-counting observations.
             if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
                 try:
                     ts_state = self._thompson_aimd_states[channel_id]
                     ts_state.last_fee_ppm = new_fee_ppm
                     ts_state.last_revenue_rate = current_revenue_rate
                     ts_state.last_state = decision_reason
-                    # IMPORTANT: Do NOT update ts_state.last_update here (Observation Pause)
+                    ts_state.last_update = now
                     self._save_thompson_aimd_state(channel_id, ts_state)
                 except Exception as e:
                     self.plugin.log(

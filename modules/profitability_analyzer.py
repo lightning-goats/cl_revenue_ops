@@ -783,8 +783,8 @@ class ChannelProfitabilityAnalyzer:
         )
         
         # Invalidate cache for this channel
-        if channel_id in self._profitability_cache:
-            del self._profitability_cache[channel_id]
+        # dict.pop() is atomic under CPython GIL; no lock needed for single-key removal
+        self._profitability_cache.pop(channel_id, None)
     
     def record_channel_open_cost(self, channel_id: str, peer_id: str,
                                   open_cost_sats: int, capacity_sats: int):
@@ -855,7 +855,7 @@ class ChannelProfitabilityAnalyzer:
 
         # Remove closed channels from cache
         for channel_id in closed_ids:
-            del self._profitability_cache[channel_id]
+            self._profitability_cache.pop(channel_id, None)
 
         if closed_ids:
             self.plugin.log(
@@ -1637,8 +1637,10 @@ class ChannelProfitabilityAnalyzer:
         """
         now = time.time()
         if self._bleeder_cache is None or now - self._bleeder_cache_time > 300:
-            self._bleeder_cache = {c.channel_id: c for c in self.identify_bleeders_v2()}
-            self._bleeder_cache_time = now
+            # Build new cache, then swap timestamp first to prevent concurrent rebuilds
+            new_cache = {c.channel_id: c for c in self.identify_bleeders_v2()}
+            self._bleeder_cache_time = now  # Set time first so other threads see "fresh"
+            self._bleeder_cache = new_cache
         return self._bleeder_cache.get(channel_id)
 
     def calculate_roc(self, window_days: int = 30) -> Dict[str, Any]:

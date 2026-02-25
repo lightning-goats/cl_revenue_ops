@@ -112,10 +112,10 @@ class ClbossManager:
                 self._clboss_check_time = time.time()
                 self.plugin.log("clboss not available - commands will be skipped (will retry in 5 min)")
                 return False
-            # Other RPC errors might mean clboss is there but had an issue
-            self._clboss_available = True
-            self._clboss_check_time = time.time()
-            return True
+            # Other RPC errors - clboss may be present but had a transient issue.
+            # Don't cache True; leave uncached so we retry next time.
+            self.plugin.log(f"clboss RPC error (will retry): {e}", level='debug')
+            return self._clboss_available if self._clboss_available is not None else False
         except Exception as e:
             self.plugin.log(f"Error checking clboss availability: {e}", level='warn')
             self._clboss_available = False
@@ -307,19 +307,27 @@ class ClbossManager:
                 # or we could split it. CLN RPC usually handles comma-sep strings.
                 tags_to_process = [tag]
             
+            succeeded_tags = []
+            failed_tags = []
             for t in tags_to_process:
                 try:
                     self.plugin.rpc.call(
                         "clboss-manage",
                         [peer_id, t]  # positional: nodeid, tags
                     )
+                    succeeded_tags.append(t)
                 except RpcError as e:
-                    # Ignore errors for individual tags
+                    failed_tags.append(t)
                     self.plugin.log(f"Could not remanage {t} for {peer_id}: {e}", level='debug')
-            
-            result["success"] = True
-            result["message"] = f"Re-enabled clboss management for {peer_id}"
-            self.plugin.log(f"Remanaged peer {peer_id[:16]}... to clboss")
+
+            result["success"] = len(succeeded_tags) > 0
+            if failed_tags and succeeded_tags:
+                result["message"] = f"Partially remanaged {peer_id}: {len(succeeded_tags)} ok, {len(failed_tags)} failed"
+            elif failed_tags:
+                result["message"] = f"Failed to remanage any tags for {peer_id}"
+            else:
+                result["message"] = f"Re-enabled clboss management for {peer_id}"
+            self.plugin.log(f"Remanaged peer {peer_id[:16]}...: {len(succeeded_tags)} ok, {len(failed_tags)} failed")
             
         except Exception as e:
             result["success"] = False

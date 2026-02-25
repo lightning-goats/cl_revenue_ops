@@ -530,11 +530,12 @@ class HiveFeeIntelligenceBridge:
             List of fee intelligence profiles
         """
         if self._is_circuit_open() or not self.is_available():
-            # Return cached profiles
-            return [
-                cached.data for cached in self._cache.values()
-                if (time.time() - cached.timestamp) < STALE_CACHE_TTL_SECONDS
-            ]
+            # Return cached profiles (hold lock during iteration)
+            with self._cache_lock:
+                return [
+                    cached.data for cached in self._cache.values()
+                    if (time.time() - cached.timestamp) < STALE_CACHE_TTL_SECONDS
+                ]
 
         try:
             result = self.plugin.rpc.call("hive-fee-intel-query", {

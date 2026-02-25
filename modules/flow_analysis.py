@@ -251,9 +251,11 @@ class KalmanFlowFilter:
         p01 = self.state.covariance
         p11 = self.state.variance_velocity
 
-        # A * P * A' for A = [[1, dt], [0, 1]]
-        new_p00 = p00 + 2 * dt_days * p01 + dt_days * dt_days * p11 + q_ratio * dt_days
-        # MA-10: Include cross-covariance process noise term
+        # A * P * A' + Q for A = [[1, dt], [0, 1]]
+        # Q matrix from piecewise-constant acceleration noise:
+        #   Q = [[q_r*dt + q_v*dt^3/3, q_v*dt^2/2], [q_v*dt^2/2, q_v*dt]]
+        # This ensures Q is positive semi-definite for all dt values.
+        new_p00 = p00 + 2 * dt_days * p01 + dt_days * dt_days * p11 + q_ratio * dt_days + q_velocity * dt_days * dt_days * dt_days / 3.0
         new_p01 = p01 + dt_days * p11 + q_velocity * dt_days * dt_days / 2.0
         new_p11 = p11 + q_velocity * dt_days
 

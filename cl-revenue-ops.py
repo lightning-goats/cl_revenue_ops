@@ -1099,9 +1099,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             except Exception as e:
                 plugin.log(f"Error in flow analysis: {e}", level='error')
             
-            # Calculate +/- 20% jitter
-            jitter_seconds = int(config.flow_interval * 0.2)
-            sleep_time = config.flow_interval + random.randint(-jitter_seconds, jitter_seconds)
+            # Calculate +/- 20% jitter (minimum 60s to prevent busy loop)
+            interval = max(60, config.flow_interval)
+            jitter_seconds = int(interval * 0.2)
+            sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Flow analysis sleeping for {sleep_time}s")
             
             # Interruptible sleep: wait for timeout OR shutdown signal
@@ -1126,9 +1127,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             except Exception as e:
                 plugin.log(f"Error in fee adjustment: {e}", level='error')
 
-            # Calculate +/- 20% jitter
-            jitter_seconds = int(config.fee_interval * 0.2)
-            sleep_time = config.fee_interval + random.randint(-jitter_seconds, jitter_seconds)
+            # Calculate +/- 20% jitter (minimum 60s to prevent busy loop)
+            interval = max(60, config.fee_interval)
+            jitter_seconds = int(interval * 0.2)
+            sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Fee adjustment sleeping for {sleep_time}s")
 
             # Interruptible sleep: wait for timeout OR shutdown signal
@@ -1157,9 +1159,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             except Exception as e:
                 plugin.log(f"Error in rebalance check: {e}", level='error')
             
-            # Calculate +/- 20% jitter
-            jitter_seconds = int(config.rebalance_interval * 0.2)
-            sleep_time = config.rebalance_interval + random.randint(-jitter_seconds, jitter_seconds)
+            # Calculate +/- 20% jitter (minimum 60s to prevent busy loop)
+            interval = max(60, config.rebalance_interval)
+            jitter_seconds = int(interval * 0.2)
+            sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Rebalance check sleeping for {sleep_time}s")
             
             # Interruptible sleep: wait for timeout OR shutdown signal
@@ -2052,11 +2055,14 @@ def revenue_rebalance(plugin: Plugin,
         result = rebalancer.manual_rebalance(from_channel, to_channel, amount_sats, max_fee_sats, force=force)
         # Check if manual_rebalance returned an error dict
         if "error" in result:
-            return {"status": "error", **result}
+            result_copy = {k: v for k, v in result.items() if k != "status"}
+            return {"status": "error", **result_copy}
         # Check the success field from execute_rebalance
         if result.get("success") is False:
-            return {"status": "error", **result}
-        return {"status": "success", **result}
+            result_copy = {k: v for k, v in result.items() if k != "status"}
+            return {"status": "error", **result_copy}
+        result_copy = {k: v for k, v in result.items() if k != "status"}
+        return {"status": "success", **result_copy}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -2994,15 +3000,14 @@ def revenue_portfolio(
             out_channels=out_scids
         )
 
-        # Get Kalman flow states if available
+        # Get Kalman flow states from the dedicated kalman_state table
         flow_states = {}
         try:
-            states = database.get_all_channel_states()
-            for state in states:
-                if state.get("kalman_state"):
-                    import json
-                    ks = json.loads(state["kalman_state"])
-                    flow_states[state["channel_id"]] = ks
+            kalman_rows = database.get_all_kalman_states()
+            for ks in kalman_rows:
+                cid = ks.get("channel_id")
+                if cid:
+                    flow_states[cid] = ks
         except Exception:
             pass
 
@@ -4602,7 +4607,7 @@ def _get_splice_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any
             plugin.log(f"Security: Invalid events structure from bookkeeper for splice {channel_id}", level='warn')
             return None
 
-        for event in reversed(all_events):  # Process oldest to newest
+        for event in all_events:  # Process oldest to newest
             # Security: Type check each event is a dict
             if not isinstance(event, dict):
                 continue

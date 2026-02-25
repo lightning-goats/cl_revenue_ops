@@ -95,6 +95,9 @@ class Database:
             self._local.conn.execute("PRAGMA busy_timeout=5000;")
             # Reasonable durability/performance tradeoff for WAL mode
             self._local.conn.execute("PRAGMA synchronous=NORMAL;")
+            # Enable incremental auto-vacuum so PRAGMA incremental_vacuum works.
+            # Only takes effect on a fresh (empty) database; harmless no-op otherwise.
+            self._local.conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
             # EH-6: Track connection for shutdown cleanup
             with self._thread_conn_lock:
                 self._thread_connections.append(self._local.conn)
@@ -572,6 +575,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connection_history_peer_time ON peer_connection_history(peer_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_time ON mempool_fee_history(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_history_time ON rebalance_history(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_history_to_channel ON rebalance_history(to_channel, timestamp)")
         
         # Composite index for get_volume_since optimization (TODO #17)
         # Fee Controller queries by out_channel + timestamp every 30min

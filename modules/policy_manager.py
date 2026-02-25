@@ -723,7 +723,8 @@ class PolicyManager:
             List of non-expired PeerPolicy objects
         """
         self._load_cache()
-        return [p for p in self._cache.values() if not p.is_expired()]
+        with self._cache_lock:
+            return [p for p in self._cache.values() if not p.is_expired()]
     
     # =========================================================================
     # Tag Management
@@ -785,7 +786,8 @@ class PolicyManager:
             List of non-expired PeerPolicy objects with the tag
         """
         self._load_cache()
-        return [p for p in self._cache.values() if p.has_tag(tag) and not p.is_expired()]
+        with self._cache_lock:
+            return [p for p in self._cache.values() if p.has_tag(tag) and not p.is_expired()]
 
     def get_peers_by_strategy(self, strategy: FeeStrategy) -> List[PeerPolicy]:
         """
@@ -798,7 +800,8 @@ class PolicyManager:
             List of non-expired PeerPolicy objects with that strategy
         """
         self._load_cache()
-        return [p for p in self._cache.values() if p.strategy == strategy and not p.is_expired()]
+        with self._cache_lock:
+            return [p for p in self._cache.values() if p.strategy == strategy and not p.is_expired()]
     
     # =========================================================================
     # Convenience Methods for Logic Cores
@@ -1065,11 +1068,12 @@ class PolicyManager:
         results = []
         now = int(time.time())
 
-        # Validate all updates first (fail fast)
+        # Validate all updates first (fail fast), including rate limits
         validated = []
         for update in updates:
             peer_id = update.get('peer_id', '')
             self._validate_peer_id(peer_id)
+            self._check_rate_limit(peer_id)
 
             existing = self.get_policy(peer_id)
 

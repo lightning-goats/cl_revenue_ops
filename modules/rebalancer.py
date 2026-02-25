@@ -3202,13 +3202,8 @@ class EVRebalancer:
                 if not scid:
                     continue
                 
-                our_amount_msat = channel.get("our_amount_msat", 0)
-                if isinstance(our_amount_msat, str):
-                    our_amount_msat = int(our_amount_msat.replace("msat", ""))
-                
-                amount_msat = channel.get("amount_msat", 0)
-                if isinstance(amount_msat, str):
-                    amount_msat = int(amount_msat.replace("msat", ""))
+                our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
+                amount_msat = self._parse_msat(channel.get("amount_msat", 0))
                 
                 info = peer_info.get(scid, {})
                 channels[scid] = {
@@ -3816,9 +3811,7 @@ class EVRebalancer:
                 for channel in listfunds.get("channels", []):
                     if channel.get("state") != "CHANNELD_NORMAL":
                         continue
-                    our_amount_msat = channel.get("our_amount_msat", 0)
-                    if isinstance(our_amount_msat, str):
-                        our_amount_msat = int(our_amount_msat.replace("msat", ""))
+                    our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
                     spendable = our_amount_msat // 1000
                     if spendable > 0:
                         channel_spendable_sats += spendable
@@ -4063,14 +4056,23 @@ class EVRebalancer:
                 continue
 
             try:
-                # Create a minimal candidate for the rebalance
-                # This is a simplified version - real implementation would
-                # build a proper RebalanceCandidate
-                self.plugin.log(
-                    f"NNLB AUTO: Executing {source_scid} -> {sink_scid} for {amount} sats",
-                    level='info'
+                # Build a minimal sling job for the NNLB rebalance
+                result = self.execute_once(
+                    target_scid=sink_scid,
+                    source_scid=source_scid,
+                    amount=amount,
+                    maxppm=10,  # NNLB should be near-zero cost
+                    label=f"nnlb_auto_{sink_scid}"
                 )
-                executed += 1
+                if result and result.get("success"):
+                    executed += 1
+                    self.plugin.log(
+                        f"NNLB AUTO: Started {source_scid} -> {sink_scid} for {amount} sats",
+                        level='info'
+                    )
+                else:
+                    err_msg = result.get("error", "unknown") if result else "no result"
+                    errors.append(f"{sink_scid}: {err_msg}")
 
             except Exception as e:
                 errors.append(f"{sink_scid}: {e}")

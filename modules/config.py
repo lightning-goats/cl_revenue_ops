@@ -511,21 +511,22 @@ class Config:
                 valid = ', '.join(STRING_ENUM_VALID_VALUES[key])
                 return {"error": f"Invalid value '{typed_value}' for {key}. Valid values: {valid}"}
 
-        old_value = getattr(self, key)
-        
-        # 4. WRITE to database
-        new_version = database.set_config_override(key, value)
-        
-        # 5. READ-BACK verification (prevents Ghost Config - CRITICAL-03)
-        read_back = database.get_config_override(key)
-        if read_back != value:
-            return {"error": "Database write verification failed (Ghost Config prevention)"}
-        
-        # 6. UPDATE in-memory (atomic under lock)
+        # 4-6. WRITE + VERIFY + UPDATE under lock to prevent TOCTOU races
         with self._lock:
+            old_value = getattr(self, key)
+
+            # 4. WRITE to database
+            new_version = database.set_config_override(key, value)
+
+            # 5. READ-BACK verification (prevents Ghost Config - CRITICAL-03)
+            read_back = database.get_config_override(key)
+            if read_back != value:
+                return {"error": "Database write verification failed (Ghost Config prevention)"}
+
+            # 6. UPDATE in-memory
             setattr(self, key, typed_value)
             self._version = new_version
-        
+
         return {
             "status": "success",
             "key": key,
@@ -715,7 +716,6 @@ class ConfigSnapshot:
     def from_config(cls, config: 'Config') -> 'ConfigSnapshot':
         """Create snapshot from mutable Config. Auto-maps matching field names."""
         with config._lock:
-            field_names = {f.name for f in dataclasses.fields(cls)}
             kwargs = {}
             for f in dataclasses.fields(cls):
                 if f.name == 'version':
