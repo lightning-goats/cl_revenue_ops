@@ -971,6 +971,9 @@ class FlowAnalyzer:
                 if stored_id and stored_id not in active_channel_ids:
                     peer_id = stored.get("peer_id")
                     self.database.remove_closed_channel_data(stored_id, peer_id)
+                    # Also remove in-memory Kalman filter to prevent unbounded growth
+                    with self._kalman_lock:
+                        self._kalman_filters.pop(stored_id, None)
                     stale_count += 1
             if stale_count > 0:
                 self.plugin.log(
@@ -1299,7 +1302,7 @@ class FlowAnalyzer:
 
             # Track most recent forward timestamp (day 0 has newest data)
             if age == 0 and bucket_count > 0:
-                last_forward_ts = bucket.get('last_ts', 0)
+                last_forward_ts = bucket.get('last_ts', 0) or 0
 
             total_weight += weight
 

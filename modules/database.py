@@ -142,6 +142,15 @@ class Database:
         Daemon threads don't run atexit handlers, so we track connections
         and close them explicitly from the shutdown handler.
         """
+        # Checkpoint WAL BEFORE closing connections so that the main database
+        # file is up-to-date and the WAL doesn't grow across restarts.
+        if hasattr(self._local, 'conn') and self._local.conn is not None:
+            try:
+                self._local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                self.plugin.log("Database: Shutdown checkpoint complete", level='info')
+            except Exception as e:
+                self.plugin.log(f"Error during shutdown checkpoint: {e}", level='warn')
+
         with self._thread_conn_lock:
             connections = list(self._thread_connections)
             self._thread_connections.clear()
@@ -231,6 +240,12 @@ class Database:
                 level='warn'
             )
             return 0
+        if isinstance(fee_sats, float) and (math.isnan(fee_sats) or math.isinf(fee_sats)):
+            self.plugin.log(
+                f"Security: Non-finite {field_name} value {fee_sats}, defaulting to 0",
+                level='warn'
+            )
+            return 0
         fee_sats = int(fee_sats)
         if fee_sats < 0:
             self.plugin.log(
@@ -260,6 +275,12 @@ class Database:
         if not isinstance(amount_sats, (int, float)):
             self.plugin.log(
                 f"Security: Invalid {field_name} type {type(amount_sats)}, defaulting to 0",
+                level='warn'
+            )
+            return 0
+        if isinstance(amount_sats, float) and (math.isnan(amount_sats) or math.isinf(amount_sats)):
+            self.plugin.log(
+                f"Security: Non-finite {field_name} value {amount_sats}, defaulting to 0",
                 level='warn'
             )
             return 0
@@ -2587,6 +2608,8 @@ class Database:
             Bulk insert forwards from RPC hydration.
 
             Phase 2: Idempotent insert using INSERT OR IGNORE under a UNIQUE index.
+            Wrapped in a single transaction for performance (10-100x faster than
+            autocommit per-row on large forward sets).
 
             Args:
                 forwards: List of dicts with keys:
@@ -2600,35 +2623,44 @@ class Database:
             conn = self._get_connection()
             inserted = 0
 
-            for fwd in forwards:
-                try:
-                    in_chan = normalize_scid(fwd.get('in_channel', '') or '')
-                    out_chan = normalize_scid(fwd.get('out_channel', '') or '')
-                    ts = int(fwd.get('received_time', 0) or 0)
-                    rt = int(fwd.get('resolved_time', 0) or 0)
-                    res_dur = float(fwd.get('resolution_time', 0) or 0)
-                    if rt <= 0 and res_dur and ts:
-                        rt = ts + int(res_dur)
+            conn.execute("BEGIN")
+            try:
+                for fwd in forwards:
+                    try:
+                        in_chan = normalize_scid(fwd.get('in_channel', '') or '')
+                        out_chan = normalize_scid(fwd.get('out_channel', '') or '')
+                        ts = int(fwd.get('received_time', 0) or 0)
+                        rt = int(fwd.get('resolved_time', 0) or 0)
+                        res_dur = float(fwd.get('resolution_time', 0) or 0)
+                        if rt <= 0 and res_dur and ts:
+                            rt = ts + int(res_dur)
 
-                    cur = conn.execute("""
-                        INSERT OR IGNORE INTO forwards
-                        (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        in_chan,
-                        out_chan,
-                        int(fwd.get('in_msat', 0) or 0),
-                        int(fwd.get('out_msat', 0) or 0),
-                        int(fwd.get('fee_msat', 0) or 0),
-                        res_dur,
-                        ts,
-                        rt
-                    ))
-                    # sqlite3 cursor.rowcount is 1 for inserted, 0 for ignored
-                    if getattr(cur, "rowcount", 0) == 1:
-                        inserted += 1
-                except Exception as e:
-                    self.plugin.log(f"bulk_insert_forwards: skipped invalid record: {e}", level='debug')
+                        cur = conn.execute("""
+                            INSERT OR IGNORE INTO forwards
+                            (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            in_chan,
+                            out_chan,
+                            int(fwd.get('in_msat', 0) or 0),
+                            int(fwd.get('out_msat', 0) or 0),
+                            int(fwd.get('fee_msat', 0) or 0),
+                            res_dur,
+                            ts,
+                            rt
+                        ))
+                        # sqlite3 cursor.rowcount is 1 for inserted, 0 for ignored
+                        if getattr(cur, "rowcount", 0) == 1:
+                            inserted += 1
+                    except Exception as e:
+                        self.plugin.log(f"bulk_insert_forwards: skipped invalid record: {e}", level='debug')
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
 
             return inserted
 
@@ -4303,21 +4335,32 @@ class Database:
             decay_factor: Multiplier to apply to counts (e.g., 0.98)
         """
         conn = self._get_connection()
-        
-        # Apply decay to both success and failure counts
-        # Using CAST to INTEGER naturally floors the result
-        conn.execute("""
-            UPDATE peer_reputation 
-            SET success_count = CAST(success_count * ? AS INTEGER),
-                failure_count = CAST(failure_count * ? AS INTEGER)
-        """, (decay_factor, decay_factor))
-        
-        # Optionally clean up peers that have decayed to (0, 0)
-        # This prevents the table from growing indefinitely with stale entries
-        conn.execute("""
-            DELETE FROM peer_reputation 
-            WHERE success_count = 0 AND failure_count = 0
-        """)
+
+        # Wrap in transaction so a concurrent update_peer_reputation between
+        # the UPDATE and DELETE cannot have its fresh data immediately deleted.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Apply decay to both success and failure counts
+            # Using CAST to INTEGER naturally floors the result
+            conn.execute("""
+                UPDATE peer_reputation
+                SET success_count = CAST(success_count * ? AS INTEGER),
+                    failure_count = CAST(failure_count * ? AS INTEGER)
+            """, (decay_factor, decay_factor))
+
+            # Clean up peers that have decayed to (0, 0)
+            # This prevents the table from growing indefinitely with stale entries
+            conn.execute("""
+                DELETE FROM peer_reputation
+                WHERE success_count = 0 AND failure_count = 0
+            """)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
     
     # =========================================================================
     # Cleanup Methods

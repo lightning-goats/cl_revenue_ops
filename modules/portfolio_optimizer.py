@@ -447,7 +447,7 @@ class PortfolioOptimizer:
                     success_rate = cost_data['success_rate'] if cost_data['success_rate'] > 0 else 1.0
                     cost_variance_contribution = (cost_per_hour ** 2) * (1.0 / success_rate - 1.0)
                     stat.variance += cost_variance_contribution
-                    stat.std_dev = math.sqrt(stat.variance) if stat.variance > 0 else 0.0
+                    stat.std_dev = math.sqrt(max(stat.variance, MIN_VARIANCE))
             except Exception:
                 pass  # Non-fatal — proceed with unadjusted stats
 
@@ -1022,8 +1022,13 @@ class PortfolioOptimizer:
         systematic_risk = max(0.0, avg_correlation)
         idiosyncratic_risk = 1.0 - systematic_risk
 
-        # Improvement potential
-        improvement = (optimal_sharpe - current_sharpe) / current_sharpe if current_sharpe > 0 else 0.0
+        # Improvement potential (guard against near-zero current_sharpe producing astronomical values)
+        if current_sharpe > 0:
+            improvement = (optimal_sharpe - current_sharpe) / current_sharpe
+            if not math.isfinite(improvement):
+                improvement = 0.0
+        else:
+            improvement = 0.0
 
         return PortfolioSummary(
             total_liquidity_sats=total_local_sats,

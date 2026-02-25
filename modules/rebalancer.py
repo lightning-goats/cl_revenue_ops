@@ -934,7 +934,7 @@ class JobManager:
             return True
         
         # Check for high consecutive failure count
-        consecutive_failures = stats.get("consecutive_failures", 0)
+        consecutive_failures = self._parse_sats(stats.get("consecutive_failures", 0))
         if consecutive_failures >= 10:
             return True
         
@@ -1108,8 +1108,10 @@ class JobManager:
         elapsed_hours = (int(time.time()) - job.start_time) / 3600
 
         # Check if any progress was made
+        # For push: negative delta = liquidity drained (success), so flip sign
         current_balance = self._get_channel_local_balance(job.scid_normalized)
-        amount_transferred = current_balance - job.initial_local_sats
+        raw_delta = current_balance - job.initial_local_sats
+        amount_transferred = -raw_delta if job.direction == "push" else raw_delta
         fee_sats = 0  # MA-9: Initialize before branching so it's always defined
 
         if amount_transferred > 0:
@@ -1175,7 +1177,7 @@ class JobManager:
         """Stop all active jobs and release their budget reservations. Returns count of jobs stopped."""
         count = 0
         with self._jobs_lock:
-            jobs_snapshot = list(self._active_jobs.items())
+            jobs_snapshot = [(k, v) for k, v in self._active_jobs.items() if v is not None]
         for scid, job in jobs_snapshot:
             # Release budget reservation before stopping (prevents orphaned reservations on shutdown)
             try:
@@ -1346,16 +1348,16 @@ class JobManager:
                 if isinstance(st, list) and st:
                     st = st[0]
                 if isinstance(st, dict):
-                    # Preferred: explicit totals
-                    fee_sats = int(st.get("fee_total_sats") or 0)
+                    # Preferred: explicit totals (use safe parsers for sling string values)
+                    fee_sats = self._parse_sats(st.get("fee_total_sats"))
                     if not fee_sats:
-                        fee_msat = int(st.get("fee_total_msat") or 0)
+                        fee_msat = self._parse_msat(st.get("fee_total_msat"))
                         fee_sats = fee_msat // 1000 if fee_msat else 0
                     # Fallback: weighted avg fee ppm
                     if fee_sats == 0:
                         w_feeppm = st.get("w_feeppm")
                         if w_feeppm is not None and amount > 0:
-                            fee_sats = int((amount * int(w_feeppm) + 999_999) // 1_000_000)
+                            fee_sats = int((amount * self._parse_sats(w_feeppm) + 999_999) // 1_000_000)
             except Exception:
                 pass
 
@@ -1366,8 +1368,8 @@ class JobManager:
             # clear job registry and retry once.
             if "already a job for that scid running" in err.lower():
                 try:
-                    self.plugin.log(f"Sling job lock detected for {sling_scid}. Clearing sling jobs and retrying once.", level='warn')
-                    self.plugin.rpc.call("sling-deletejob", {"job": "all"})
+                    self.plugin.log(f"Sling job lock detected for {sling_scid}. Clearing that job and retrying once.", level='warn')
+                    self.plugin.rpc.call("sling-deletejob", {"job": sling_scid})
                     result = self.plugin.rpc.call("sling-once", params)
                     # best-effort fee calc on retry as well
                     fee_sats = 0
@@ -1376,14 +1378,14 @@ class JobManager:
                         if isinstance(st, list) and st:
                             st = st[0]
                         if isinstance(st, dict):
-                            fee_sats = int(st.get("fee_total_sats") or 0)
+                            fee_sats = self._parse_sats(st.get("fee_total_sats"))
                             if not fee_sats:
-                                fee_msat = int(st.get("fee_total_msat") or 0)
+                                fee_msat = self._parse_msat(st.get("fee_total_msat"))
                                 fee_sats = fee_msat // 1000 if fee_msat else 0
                             if fee_sats == 0:
                                 w_feeppm = st.get("w_feeppm")
                                 if w_feeppm is not None and amount > 0:
-                                    fee_sats = int((amount * int(w_feeppm) + 999_999) // 1_000_000)
+                                    fee_sats = int((amount * self._parse_sats(w_feeppm) + 999_999) // 1_000_000)
                     except Exception:
                         pass
                     return {"success": True, "message": "sling-once completed (after deletejob)", "raw": result, "actual_fee_sats": fee_sats}
@@ -1883,15 +1885,16 @@ class EVRebalancer:
         if not health:
             return DEFAULT_BUDGET_MULTIPLIER
 
-        # Cache result
-        self._cached_health = health
-        self._health_cache_time = now
-
         tier = health.get("health_tier", "stable")
         multiplier = NNLB_BUDGET_MULTIPLIERS.get(tier, DEFAULT_BUDGET_MULTIPLIER)
 
         # Clamp to bounds
         multiplier = max(MIN_BUDGET_MULTIPLIER, min(MAX_BUDGET_MULTIPLIER, multiplier))
+
+        # Cache the computed multiplier (not just the raw health dict)
+        health["budget_multiplier"] = multiplier
+        self._cached_health = health
+        self._health_cache_time = now
 
         self.plugin.log(
             f"NNLB: Our health tier={tier}, budget_multiplier={multiplier:.2f}",
@@ -2517,7 +2520,14 @@ class EVRebalancer:
             budget_ppm = (max_budget_msat * 1_000_000) // amount_msat if amount_msat > 0 else 0
 
             # Optional heuristic upper bound, but ALWAYS clamp to the sats-budget-derived ppm.
-            heuristic_ppm = inbound_fee_ppm + (spread_ppm // 2)
+            # When spread_ppm is negative (hive tolerance exemption), the heuristic
+            # would produce a sub-1 ppm cap, making the route unexecutable. In that
+            # case, defer to the budget-derived cap which already accounts for the
+            # tolerance-based budget.
+            if spread_ppm >= 0:
+                heuristic_ppm = inbound_fee_ppm + (spread_ppm // 2)
+            else:
+                heuristic_ppm = budget_ppm
             max_fee_ppm = max(1, min(heuristic_ppm, budget_ppm)) if budget_ppm > 0 else 0
         else:
             max_fee_ppm = 0
@@ -2851,7 +2861,7 @@ class EVRebalancer:
                 first_hop = route["route"][0].get("amount_msat", amount_msat)
                 if isinstance(first_hop, str):
                     first_hop = int(first_hop.replace("msat", ""))
-                return int(((first_hop - amount_msat) / amount_msat) * 1_000_000)
+                return max(0, int(((first_hop - amount_msat) / amount_msat) * 1_000_000))
         except Exception:
             pass
         return None

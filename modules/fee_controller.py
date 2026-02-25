@@ -6307,6 +6307,30 @@ class HillClimbingFeeController:
             min_change = max(5, current_fee_ppm * 0.03)
             
         if fee_change < min_change and not is_congested:
+            # CRITICAL: Reset observation timer so the next cycle doesn't
+            # double-count the current window's data.  Thompson posteriors,
+            # AIMD outcomes, demand baselines, and elasticity trackers were
+            # already updated above using this window's accumulated
+            # volume/revenue.  Not resetting last_update causes the same
+            # observations to be re-ingested on every subsequent cycle that
+            # also falls below the Alpha Guard threshold.
+            hc_state.last_revenue_rate = current_revenue_rate
+            hc_state.last_fee_ppm = current_fee_ppm
+            hc_state.last_update = now
+            self._save_hill_climb_state(channel_id, hc_state)
+
+            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+                try:
+                    ts_state = self._thompson_aimd_states[channel_id]
+                    ts_state.last_revenue_rate = current_revenue_rate
+                    ts_state.last_fee_ppm = current_fee_ppm
+                    ts_state.last_update = now
+                    self._save_thompson_aimd_state(channel_id, ts_state)
+                except Exception as e:
+                    self.plugin.log(
+                        f"ALPHA_GUARD: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
+                        level='debug'
+                    )
             return None
         
         # =====================================================================
@@ -6543,6 +6567,27 @@ class HillClimbingFeeController:
                 reason_code=fee_reason_code,
                 heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None
             )
+
+        # RPC failed: fee was NOT changed on-chain, but Thompson posteriors and
+        # AIMD state were already updated with this observation window's data.
+        # Reset observation timer to prevent double-counting on next cycle.
+        hc_state.last_revenue_rate = current_revenue_rate
+        hc_state.last_fee_ppm = current_fee_ppm
+        hc_state.last_update = now
+        self._save_hill_climb_state(channel_id, hc_state)
+
+        if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+            try:
+                ts_state = self._thompson_aimd_states[channel_id]
+                ts_state.last_revenue_rate = current_revenue_rate
+                ts_state.last_fee_ppm = current_fee_ppm
+                ts_state.last_update = now
+                self._save_thompson_aimd_state(channel_id, ts_state)
+            except Exception as e:
+                self.plugin.log(
+                    f"RPC_FAIL_STATE: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
+                    level='debug'
+                )
 
         return None
     

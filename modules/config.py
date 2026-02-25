@@ -124,6 +124,17 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hive_channel_ages_cache_seconds': int,
     # Boltz swap currency
     'swap_currency': str,
+    # Fields present in CONFIG_FIELD_RANGES that need type registration
+    'base_fee_msat': int,
+    'flow_window_days': int,
+    'estimated_open_cost_sats': int,
+    'clboss_unmanage_duration_hours': int,
+    'target_flow': int,
+    'source_threshold': float,
+    'sink_threshold': float,
+    'rebalancer_plugin': str,
+    'enable_flow_asymmetry': bool,
+    'enable_peer_sync': bool,
 }
 
 # Range constraints for numeric fields

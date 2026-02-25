@@ -3637,21 +3637,29 @@ class HiveFeeIntelligenceBridge:
         """
         now = time.time()
 
-        # Count fresh vs stale cache entries
+        # Count fresh vs stale cache entries (under lock to avoid RuntimeError
+        # from concurrent dict mutation)
         fresh_count = 0
         stale_count = 0
-        for cached in self._cache.values():
-            age = now - cached.timestamp
-            if age < CACHE_TTL_SECONDS:
-                fresh_count += 1
-            elif age < STALE_CACHE_TTL_SECONDS:
-                stale_count += 1
+        with self._cache_lock:
+            cache_size = len(self._cache)
+            for cached in list(self._cache.values()):
+                age = now - cached.timestamp
+                if age < CACHE_TTL_SECONDS:
+                    fresh_count += 1
+                elif age < STALE_CACHE_TTL_SECONDS:
+                    stale_count += 1
+
+        # Read circuit breaker state under its lock for consistency
+        with self._circuit_lock:
+            circuit_open = self._circuit.is_open
+            circuit_failures = self._circuit.failures
 
         status = {
             "hive_available": self._hive_available,
-            "circuit_breaker_open": self._circuit.is_open,
-            "circuit_failures": self._circuit.failures,
-            "cache_entries": len(self._cache),
+            "circuit_breaker_open": circuit_open,
+            "circuit_failures": circuit_failures,
+            "cache_entries": cache_size,
             "cache_fresh": fresh_count,
             "cache_stale": stale_count,
             "last_availability_check": int(self._availability_check_time),

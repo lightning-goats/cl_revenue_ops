@@ -282,6 +282,10 @@ class ThreadSafeRpcProxy:
 
     def __init__(self, plugin_instance: Plugin):
         from concurrent.futures import ThreadPoolExecutor
+        # Python 3.10: concurrent.futures.TimeoutError does NOT inherit from
+        # builtins.TimeoutError.  Fixed in 3.11+.  Capture both for compat.
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+        self._FuturesTimeoutError = FuturesTimeoutError
         self._plugin = plugin_instance
         self._rpc = plugin_instance.rpc
         self._executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="rpc")
@@ -303,7 +307,7 @@ class ThreadSafeRpcProxy:
             future = self._executor.submit(fn, *args, **kwargs)
             try:
                 return future.result(timeout=timeout)
-            except TimeoutError:
+            except (TimeoutError, self._FuturesTimeoutError):
                 self._plugin.log(f"RPC timeout after {timeout}s on {name}", level="warn")
                 raise RPCTimeoutError(name)
 
@@ -332,7 +336,7 @@ class ThreadSafeRpcProxy:
         )
         try:
             return future.result(timeout=timeout)
-        except TimeoutError:
+        except (TimeoutError, self._FuturesTimeoutError):
             self._plugin.log(f"RPC timeout after {timeout}s on {method_name}", level="warn")
             raise RPCTimeoutError(method_name)
 
@@ -882,11 +886,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             # Fetch from RPC - this is the ONLY listforwards call we make.
             # EH-12: Limit to recent forwards to avoid unbounded memory usage on large nodes.
             # CLN v23.08+ supports index-based pagination; fall back to full fetch if unavailable.
+            # CLN's listforwards `start` param expects a created_index (sequential
+            # counter), NOT a Unix timestamp.  Passing a timestamp silently returns
+            # zero results on any node with < 1.7 billion forwards.  Use unfiltered
+            # fetch and rely on the post-filter at received_time > start_time below.
             try:
-                result = safe_plugin.rpc.listforwards(status="settled", index="created", start=int(start_time))
-            except (TypeError, Exception):
-                # Older CLN or unsupported params — fall back to unfiltered
                 result = safe_plugin.rpc.listforwards(status="settled")
+            except Exception:
+                result = {"forwards": []}
             forwards_to_insert = []
 
             for fwd in result.get("forwards", []):
@@ -2473,7 +2480,9 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
         elif action == "set":
             if not peer_id:
                 return {"error": "Usage: revenue-policy set <peer_id> [strategy=X] [rebalance=X] [fee_ppm=N]"}
-            
+            if not re.match(r'^[0-9a-fA-F]{66}$', peer_id):
+                return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
+
             # Set policy with provided options
             policy = policy_manager.set_policy(
                 peer_id=peer_id,
@@ -2491,6 +2500,8 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
         elif action == "delete":
             if not peer_id:
                 return {"error": "Usage: revenue-policy delete <peer_id>"}
+            if not re.match(r'^[0-9a-fA-F]{66}$', peer_id):
+                return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
             deleted = policy_manager.delete_policy(peer_id)
             if deleted:
                 return {
@@ -2503,6 +2514,8 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
         elif action == "tag":
             if not peer_id or not tag:
                 return {"error": "Usage: revenue-policy tag <peer_id> <tag>"}
+            if not re.match(r'^[0-9a-fA-F]{66}$', peer_id):
+                return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
             policy = policy_manager.add_tag(peer_id, tag)
             return {
                 "status": "success",
@@ -2513,6 +2526,8 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
         elif action == "untag":
             if not peer_id or not tag:
                 return {"error": "Usage: revenue-policy untag <peer_id> <tag>"}
+            if not re.match(r'^[0-9a-fA-F]{66}$', peer_id):
+                return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
             policy = policy_manager.remove_tag(peer_id, tag)
             return {
                 "status": "success",
@@ -3732,7 +3747,10 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
         if peer_id:
             if status == "settled":
                 database.update_peer_reputation(peer_id, is_success=True)
-            elif status in ("failed", "local_failed"):
+            elif status == "failed":
+                # Only penalize in_channel peer on downstream failure, NOT
+                # local_failed (which means OUR node rejected the forward,
+                # e.g. insufficient outbound balance — the sender did nothing wrong).
                 database.update_peer_reputation(peer_id, is_success=False)
 
                 # Report failure to cl-hive for pheromone evaporation (Yield Optimization Phase 2)

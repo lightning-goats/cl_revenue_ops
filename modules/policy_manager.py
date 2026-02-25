@@ -1209,10 +1209,11 @@ class PolicyManager:
 
         deleted_count = cursor.rowcount
 
-        # Update cache
+        # Update cache and notify subscribers so they switch to default strategy
         for row in expired_rows:
             peer_id = row['peer_id']
             self._remove_from_cache(peer_id)
+            self._notify_change(peer_id, self.get_policy(peer_id))
 
         if deleted_count > 0:
             self.plugin.log(
