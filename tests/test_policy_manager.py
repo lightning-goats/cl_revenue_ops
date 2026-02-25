@@ -340,6 +340,42 @@ class TestPeerPolicyDataclass:
         assert policy.fee_ppm_target is None
         assert policy.tags == []
 
+    def test_peer_policy_fee_multiplier_bounds_clamped(self, sample_peer_ids):
+        """PeerPolicy clamps multiplier bounds to global safety range."""
+        policy = PeerPolicy(
+            peer_id=sample_peer_ids[0],
+            strategy=FeeStrategy.DYNAMIC,
+            fee_ppm_target=500,
+            fee_multiplier_min=0.01,
+            fee_multiplier_max=99.0,
+        )
+
+        min_mult, max_mult = policy.get_fee_multiplier_bounds()
+
+        assert min_mult >= 0.1
+        assert max_mult <= 5.0
+        assert min_mult <= max_mult
+
+
+class TestFeeAutobandPolicy:
+    """Test fee autoband storage in policy manager."""
+
+    def test_set_policy_persists_fee_autoband_multipliers(self, mock_database, mock_plugin, sample_peer_ids):
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        pm.set_policy(
+            sample_peer_ids[0],
+            strategy="dynamic",
+            fee_ppm_target=500,
+            fee_multiplier_min=1.0,
+            fee_multiplier_max=2.0,
+        )
+
+        policy = pm.get_policy(sample_peer_ids[0])
+        assert policy.fee_ppm_target == 500
+        assert policy.fee_multiplier_min == 1.0
+        assert policy.fee_multiplier_max == 2.0
+
 
 class TestValidation:
     """Test input validation."""

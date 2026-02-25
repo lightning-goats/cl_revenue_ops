@@ -5084,6 +5084,43 @@ class HillClimbingFeeController:
             )
 
         # =====================================================================
+        # Per-Peer Dynamic Fee Autoband (Policy-Driven)
+        # =====================================================================
+        # Autoband constrains dynamic pricing to a range derived from:
+        #   fee_ppm_target * fee_multiplier_min/max
+        # Example: 500-1000 ppm band => target=500, min=1.0, max=2.0
+        #
+        # If the autoband conflicts with a protective floor (e.g. scarcity / cost
+        # recovery), safety wins and the ceiling is lifted to the floor.
+        # =====================================================================
+        band_min_ppm, band_max_ppm = self._get_dynamic_policy_fee_autoband_ppm(peer_id)
+        if band_min_ppm is not None or band_max_ppm is not None:
+            old_floor_ppm = base_floor_ppm
+            old_ceiling_ppm = base_ceiling_ppm
+
+            if band_min_ppm is not None:
+                base_floor_ppm = max(base_floor_ppm, band_min_ppm)
+            if band_max_ppm is not None:
+                base_ceiling_ppm = min(base_ceiling_ppm, band_max_ppm)
+
+            if base_floor_ppm > base_ceiling_ppm:
+                self.plugin.log(
+                    f"POLICY_AUTOBAND_CONFLICT: {channel_id[:12]}... "
+                    f"band={band_min_ppm or '-'}-{band_max_ppm or '-'} ppm conflicts with "
+                    f"safety floor {base_floor_ppm} ppm; preserving floor.",
+                    level='warn'
+                )
+                base_ceiling_ppm = base_floor_ppm
+            elif old_floor_ppm != base_floor_ppm or old_ceiling_ppm != base_ceiling_ppm:
+                self.plugin.log(
+                    f"POLICY_AUTOBAND: {channel_id[:12]}... "
+                    f"floor={old_floor_ppm}->{base_floor_ppm}, "
+                    f"ceiling={old_ceiling_ppm}->{base_ceiling_ppm}, "
+                    f"band={band_min_ppm or '-'}-{band_max_ppm or '-'} ppm",
+                    level='debug'
+                )
+
+        # =====================================================================
         # IMPROVEMENT #1: Apply Multipliers to Bounds (Not Fee Directly)
         # =====================================================================
         # Instead of: new_fee = base_fee * liquidity_mult * prof_mult
@@ -6590,6 +6627,37 @@ class HillClimbingFeeController:
                 )
 
         return None
+
+    def _get_dynamic_policy_fee_autoband_ppm(self, peer_id: str) -> Tuple[Optional[int], Optional[int]]:
+        """Return (min_ppm, max_ppm) autoband for a DYNAMIC peer policy, if configured."""
+        if not self.policy_manager:
+            return (None, None)
+
+        try:
+            policy = self.policy_manager.get_policy(peer_id)
+        except Exception:
+            return (None, None)
+
+        if policy.strategy != FeeStrategy.DYNAMIC or policy.fee_ppm_target is None:
+            return (None, None)
+
+        if policy.fee_multiplier_min is None and policy.fee_multiplier_max is None:
+            return (None, None)
+
+        # Enforce global multiplier safety bounds while preserving explicit-only endpoints.
+        eff_min_mult, eff_max_mult = policy.get_fee_multiplier_bounds()
+        band_min_ppm = None
+        band_max_ppm = None
+
+        if policy.fee_multiplier_min is not None:
+            band_min_ppm = max(1, int(round(policy.fee_ppm_target * eff_min_mult)))
+        if policy.fee_multiplier_max is not None:
+            band_max_ppm = max(1, int(round(policy.fee_ppm_target * eff_max_mult)))
+
+        if band_min_ppm is not None and band_max_ppm is not None and band_min_ppm > band_max_ppm:
+            band_min_ppm, band_max_ppm = band_max_ppm, band_min_ppm
+
+        return (band_min_ppm, band_max_ppm)
     
     def set_channel_fee(self, channel_id: str, fee_ppm: int,
                        reason: str = "manual", manual: bool = False,
@@ -6909,6 +6977,20 @@ class HillClimbingFeeController:
             else:
                 # Fallback: use the configured prior mean, clamped to bounds
                 initial_fee = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, 200))
+
+            band_min_ppm, band_max_ppm = self._get_dynamic_policy_fee_autoband_ppm(peer_id)
+            if band_min_ppm is not None or band_max_ppm is not None:
+                original_initial_fee = initial_fee
+                if band_min_ppm is not None:
+                    initial_fee = max(initial_fee, band_min_ppm)
+                if band_max_ppm is not None:
+                    initial_fee = min(initial_fee, band_max_ppm)
+                if initial_fee != original_initial_fee:
+                    self.plugin.log(
+                        f"INITIAL_FEE_AUTOBAND: {scid[:16]}... {original_initial_fee}->{initial_fee} ppm "
+                        f"(band={band_min_ppm or '-'}-{band_max_ppm or '-'} ppm)",
+                        level='info'
+                    )
 
             self.plugin.log(
                 f"INITIAL_FEE: {scid[:16]}... -> {initial_fee} PPM "

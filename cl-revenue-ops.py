@@ -2351,7 +2351,11 @@ def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
 @plugin.method("revenue-policy")
 def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
                    strategy: str = None, rebalance: str = None,
-                   fee_ppm: int = None, tag: str = None, **kwargs) -> Dict[str, Any]:
+                   fee_ppm: int = None, tag: str = None,
+                   fee_multiplier_min: float = None,
+                   fee_multiplier_max: float = None,
+                   expires_in_hours: int = None,
+                   **kwargs) -> Dict[str, Any]:
     """
     Manage peer-level fee and rebalance policies (v1.4 API).
 
@@ -2369,6 +2373,9 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
       strategy=dynamic|static|hive|passive   Fee control strategy
       rebalance=enabled|disabled|source_only|sink_only   Rebalance mode
       fee_ppm=N   Target fee for static strategy (required if strategy=static)
+      fee_multiplier_min=X.Y   Dynamic fee autoband floor multiplier (uses fee_ppm_target as anchor)
+      fee_multiplier_max=X.Y   Dynamic fee autoband ceiling multiplier (uses fee_ppm_target as anchor)
+      expires_in_hours=N       Optional auto-expiry for policy (revert to defaults)
 
     Strategies:
       dynamic  - Hill Climbing + Scarcity Pricing (default)
@@ -2423,12 +2430,45 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
             if not re.match(r'^[0-9a-fA-F]{66}$', peer_id):
                 return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
 
+            def _parse_optional_float(value, field_name: str) -> Optional[float]:
+                if value is None:
+                    return None
+                if isinstance(value, str):
+                    s = value.strip().lower()
+                    if s in ('', 'null', 'none'):
+                        return None
+                    value = s
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid {field_name}: expected float")
+
+            def _parse_optional_int(value, field_name: str) -> Optional[int]:
+                if value is None:
+                    return None
+                if isinstance(value, str):
+                    s = value.strip().lower()
+                    if s in ('', 'null', 'none'):
+                        return None
+                    value = s
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid {field_name}: expected integer")
+
+            mult_min_arg = fee_multiplier_min if fee_multiplier_min is not None else kwargs.get('fee_multiplier_min')
+            mult_max_arg = fee_multiplier_max if fee_multiplier_max is not None else kwargs.get('fee_multiplier_max')
+            expires_arg = expires_in_hours if expires_in_hours is not None else kwargs.get('expires_in_hours')
+
             # Set policy with provided options
             policy = policy_manager.set_policy(
                 peer_id=peer_id,
                 strategy=strategy,
                 rebalance_mode=rebalance,
-                fee_ppm_target=fee_ppm
+                fee_ppm_target=fee_ppm,
+                fee_multiplier_min=_parse_optional_float(mult_min_arg, 'fee_multiplier_min'),
+                fee_multiplier_max=_parse_optional_float(mult_max_arg, 'fee_multiplier_max'),
+                expires_in_hours=_parse_optional_int(expires_arg, 'expires_in_hours')
             )
             
             return {
