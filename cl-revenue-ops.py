@@ -53,6 +53,7 @@ from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
 from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
 from modules.hive_bridge import HiveFeeIntelligenceBridge
+from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.utils import normalize_scid, parse_msat
 
 
@@ -429,6 +430,9 @@ capacity_planner: Optional[CapacityPlanner] = None
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligence
+boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
+_boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
+_boltz_balance_lock = threading.Lock()
 
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
@@ -640,6 +644,67 @@ plugin.add_option(
 )
 
 
+plugin.add_option(
+    name='revenue-ops-boltz-enabled',
+    default='false',
+    description='Enable Boltz CLI integration for revenue-boltz-* RPCs (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-cli-path',
+    default='/usr/local/bin/boltzcli',
+    description='Path to boltzcli binary (default: /usr/local/bin/boltzcli)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-datadir',
+    default='/var/lib/boltz',
+    description='Boltz data dir for boltzd client auth (default: /var/lib/boltz)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-use-sudo',
+    default='false',
+    description='Run boltzcli via sudo -n -u <user> (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-sudo-user',
+    default='boltz',
+    description='User for sudo boltzcli execution when enabled (default: boltz)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-timeout-seconds',
+    default='60',
+    description='boltzcli command timeout in seconds (default: 60)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-daily-budget-sats',
+    default='3000',
+    description='Daily Boltz swap fee budget used by revenue-boltz loop methods (default: 3000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-enforce-budget',
+    default='true',
+    description='If true, reject Boltz swaps when estimated fee exceeds remaining daily budget (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-btc-wallet',
+    default='CLN',
+    description='Preferred boltzd BTC wallet name (default: CLN)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-lbtc-wallet',
+    default='LOOP-LBTC',
+    description='Preferred boltzd LBTC wallet name (default: LOOP-LBTC)'
+)
+
+
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
@@ -655,7 +720,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge
+    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, boltz_manager
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -749,6 +814,33 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # ThreadSafeRpcProxy adds timeout protection via ThreadPoolExecutor.
     safe_plugin = ThreadSafePluginProxy(plugin)
     plugin.log("Thread-safe RPC proxy initialized", level="info")
+
+    # Optional Boltz CLI integration (manual quotes/swaps, wallet ops).
+    try:
+        boltz_cfg = BoltzCliConfig(
+            enabled=options.get('revenue-ops-boltz-enabled', 'false').lower() == 'true',
+            cli_path=options.get('revenue-ops-boltz-cli-path', '/usr/local/bin/boltzcli'),
+            datadir=options.get('revenue-ops-boltz-datadir', '/var/lib/boltz'),
+            use_sudo=options.get('revenue-ops-boltz-use-sudo', 'false').lower() == 'true',
+            sudo_user=options.get('revenue-ops-boltz-sudo-user', 'boltz'),
+            timeout_seconds=int(options.get('revenue-ops-boltz-timeout-seconds', '60')),
+            daily_budget_sats=int(options.get('revenue-ops-boltz-daily-budget-sats', '3000')),
+            enforce_budget=options.get('revenue-ops-boltz-enforce-budget', 'true').lower() == 'true',
+            btc_wallet=options.get('revenue-ops-boltz-btc-wallet', 'CLN'),
+            lbtc_wallet=options.get('revenue-ops-boltz-lbtc-wallet', 'LOOP-LBTC'),
+        )
+        boltz_manager = BoltzCliManager(safe_plugin, safe_plugin.rpc, boltz_cfg)
+        if boltz_cfg.enabled:
+            plugin.log(
+                f"Boltz CLI integration enabled (datadir={boltz_cfg.datadir}, "
+                f"sudo={boltz_cfg.use_sudo}, budget={boltz_cfg.daily_budget_sats} sats/day)",
+                level='info'
+            )
+        else:
+            plugin.log("Boltz CLI integration disabled (set revenue-ops-boltz-enabled=true to enable)", level='debug')
+    except Exception as e:
+        boltz_manager = None
+        plugin.log(f"Warning: Failed to initialize Boltz CLI integration: {e}", level='warn')
 
     # =========================================================================
     # STARTUP DEPENDENCY CHECKS (Phase 4: Stability & Scaling)
@@ -4454,6 +4546,656 @@ def _get_splice_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any
     except Exception as e:
         plugin.log(f"Bookkeeper query failed for splice on {channel_id}: {e}", level='debug')
         return None
+
+
+# =============================================================================
+# BOLTZ CLI INTEGRATION (optional)
+# =============================================================================
+
+def _require_boltz_manager() -> BoltzCliManager:
+    if boltz_manager is None:
+        raise BoltzCliError("Boltz CLI integration not initialized")
+    return boltz_manager
+
+
+@plugin.method("revenue-boltz-quote")
+def revenue_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reverse", currency: str = None) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().quote(amount_sats=amount_sats, swap_type=swap_type, currency=currency)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-loop-out")
+def revenue_boltz_loop_out(plugin: Plugin, amount_sats: int, address: str = None, channel_id: str = None,
+                           peer_id: str = None, currency: str = None) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().loop_out(
+            amount_sats=amount_sats, address=address, channel_id=channel_id, peer_id=peer_id, currency=currency
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-loop-in")
+def revenue_boltz_loop_in(plugin: Plugin, amount_sats: int, channel_id: str = None,
+                          peer_id: str = None, currency: str = None) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().loop_in(
+            amount_sats=amount_sats, channel_id=channel_id, peer_id=peer_id, currency=currency
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-status")
+def revenue_boltz_status(plugin: Plugin, swap_id: str) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().swap_status(swap_id)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-history")
+def revenue_boltz_history(plugin: Plugin, limit: int = None) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().swap_history(limit=limit)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-budget")
+def revenue_boltz_budget(plugin: Plugin) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().budget()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-wallet")
+def revenue_boltz_wallet(plugin: Plugin) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().wallet_balances()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-refund")
+def revenue_boltz_refund(plugin: Plugin, swap_id: str, destination: str = None) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().refund(swap_id=swap_id, destination=destination)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-claim")
+def revenue_boltz_claim(plugin: Plugin, swap_ids: List[str], destination: str = None) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().claim(swap_ids=swap_ids, destination=destination)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-chainswap")
+def revenue_boltz_chainswap(plugin: Plugin, amount_sats: int, from_currency: str = None,
+                            to_currency: str = None, to_address: str = None) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().chainswap(
+            amount_sats=amount_sats, from_currency=from_currency, to_currency=to_currency, to_address=to_address
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-withdraw")
+def revenue_boltz_withdraw(plugin: Plugin, amount_sats: int = None, destination: str = None, currency: str = None,
+                           sat_per_vbyte: int = None, sweep: bool = False) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().withdraw(
+            amount_sats=amount_sats, destination=destination, currency=currency,
+            sat_per_vbyte=sat_per_vbyte, sweep=sweep
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-deposit")
+def revenue_boltz_deposit(plugin: Plugin, currency: str = None) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().deposit_address(currency=currency)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-backup")
+def revenue_boltz_backup(plugin: Plugin) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().backup()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-backup-verify")
+def revenue_boltz_backup_verify(plugin: Plugin, swap_mnemonic: str) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().backup_verify(swap_mnemonic=swap_mnemonic)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
+def _boltz_balance_pct_from_channel_info(channel_info: Dict[str, Any]) -> float:
+    capacity = int(channel_info.get("capacity", 0) or 0)
+    spendable_msat = parse_msat(channel_info.get("spendable_msat", 0))
+    local_sats = spendable_msat // 1000
+    if capacity <= 0:
+        return 50.0
+    return max(0.0, min(100.0, (100.0 * local_sats) / capacity))
+
+
+def _boltz_pending_swap_count() -> int:
+    """Best-effort count of active/pending manual swaps to avoid overlap."""
+    try:
+        history = _require_boltz_manager().swap_history(limit=200)
+        swaps = history.get("swaps", []) if isinstance(history, dict) else []
+        pending = 0
+        for sw in swaps:
+            if not isinstance(sw, dict):
+                continue
+            state = str(sw.get("state") or "").lower()
+            status = str(sw.get("status") or "").lower()
+            txt = f"{state} {status}"
+            done = any(x in txt for x in ("success", "completed", "claimed", "failed", "refunded", "expired", "cancel"))
+            active = any(x in txt for x in ("pending", "created", "mempool", "transaction", "lockup", "invoice", "claim"))
+            if active and not done:
+                pending += 1
+        return pending
+    except Exception:
+        return 0
+
+
+def _boltz_direction_allowed_by_policy(peer_id: str, direction: str) -> Tuple[bool, str]:
+    """direction: loop_in (fill local) or loop_out (drain local)."""
+    if policy_manager is None:
+        return True, "no_policy_manager"
+    try:
+        pol = policy_manager.get_policy(peer_id)
+    except Exception as e:
+        return False, f"policy_lookup_failed: {e}"
+
+    if pol.strategy == FeeStrategy.PASSIVE:
+        return False, "policy_passive"
+
+    mode = pol.rebalance_mode
+    if direction == "loop_in":
+        if mode in (RebalanceMode.ENABLED, RebalanceMode.SINK_ONLY):
+            return True, mode.value
+        return False, f"policy_rebalance_mode={mode.value}"
+    if direction == "loop_out":
+        if mode in (RebalanceMode.ENABLED, RebalanceMode.SOURCE_ONLY):
+            return True, mode.value
+        return False, f"policy_rebalance_mode={mode.value}"
+    return False, "unknown_direction"
+
+
+def _boltz_channel_daily_contribution_estimate_sats(prof) -> float:
+    if not prof:
+        return 0.0
+    try:
+        total = float(getattr(prof.revenue, "total_contribution_sats", 0) or 0)
+        days_open = int(getattr(prof, "days_open", 0) or 0)
+        # Conservative normalization: use up to 30 days if channel is older.
+        days = max(1, min(days_open, 30))
+        return total / days
+    except Exception:
+        return 0.0
+
+
+def _build_boltz_balance_plan(
+    *,
+    low_trigger_pct: float = 40.0,
+    low_target_pct: float = 55.0,
+    high_trigger_pct: float = 80.0,
+    high_target_pct: float = 60.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_000_000,
+    max_candidates: int = 20,
+    only_peer_id: Optional[str] = None,
+    only_channel_id: Optional[str] = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    loop_out_currency: str = "LBTC",
+    loop_in_currency: str = "LBTC",
+) -> Dict[str, Any]:
+    if fee_controller is None or database is None:
+        return {"error": "Plugin not initialized"}
+
+    bm = _require_boltz_manager()
+
+    channels = fee_controller._get_channels_info()
+    if not channels:
+        return {"error": "No normal channels available"}
+
+    # Refresh profitability cache on demand.
+    if profitability_analyzer is not None:
+        try:
+            profitability_analyzer.analyze_all_channels()
+        except Exception as e:
+            plugin.log(f"BOLTZ_BALANCE: profitability refresh failed: {e}", level='warn')
+
+    state_rows = {str(r.get("channel_id")): r for r in database.get_all_channel_states()}
+
+    budget_status = bm.budget()
+    pending_swaps = _boltz_pending_swap_count()
+
+    candidates: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+
+    for channel_id, ch in channels.items():
+        peer_id = str(ch.get("peer_id") or "")
+        if only_channel_id and str(channel_id).replace(':', 'x') != str(only_channel_id).replace(':', 'x'):
+            continue
+        if only_peer_id and peer_id != only_peer_id:
+            continue
+
+        capacity_sats = int(ch.get("capacity", 0) or 0)
+        if capacity_sats <= 0:
+            skipped.append({"channel_id": channel_id, "peer_id": peer_id, "reason": "zero_capacity"})
+            continue
+
+        local_pct = _boltz_balance_pct_from_channel_info(ch)
+        local_sats = parse_msat(ch.get("spendable_msat", 0)) // 1000
+        receivable_sats = parse_msat(ch.get("receivable_msat", 0)) // 1000
+        state_row = state_rows.get(channel_id, {})
+        flow_state = str(state_row.get("state") or "unknown")
+
+        prof = profitability_analyzer.get_profitability(channel_id) if profitability_analyzer is not None else None
+        marginal_roi = float(getattr(prof, "marginal_roi", 0.0) or 0.0) if prof else None
+        prof_class = getattr(getattr(prof, "classification", None), "value", None)
+        daily_contrib_est = _boltz_channel_daily_contribution_estimate_sats(prof)
+
+        if require_profitable:
+            if prof is None:
+                skipped.append({"channel_id": channel_id, "peer_id": peer_id, "reason": "no_profitability_data"})
+                continue
+            if marginal_roi is None or marginal_roi < float(min_marginal_roi):
+                skipped.append({
+                    "channel_id": channel_id,
+                    "peer_id": peer_id,
+                    "reason": "below_marginal_roi_threshold",
+                    "marginal_roi": marginal_roi,
+                    "min_marginal_roi": min_marginal_roi,
+                })
+                continue
+
+        direction = None
+        target_pct = None
+        target_currency = None
+        severity = 0.0
+
+        if local_pct < low_trigger_pct:
+            direction = "loop_in"
+            target_pct = low_target_pct
+            target_currency = loop_in_currency
+            severity = max(0.0, (low_trigger_pct - local_pct) / max(low_trigger_pct, 1.0))
+        elif local_pct > high_trigger_pct:
+            direction = "loop_out"
+            target_pct = high_target_pct
+            target_currency = loop_out_currency
+            severity = max(0.0, (local_pct - high_trigger_pct) / max(100.0 - high_trigger_pct, 1.0))
+        else:
+            continue
+
+        allowed, policy_reason = _boltz_direction_allowed_by_policy(peer_id, direction)
+        if not allowed:
+            skipped.append({"channel_id": channel_id, "peer_id": peer_id, "reason": policy_reason, "direction": direction})
+            continue
+
+        target_local_sats = int(capacity_sats * (float(target_pct) / 100.0))
+        if direction == "loop_in":
+            raw_amount = max(0, target_local_sats - local_sats)
+        else:
+            raw_amount = max(0, local_sats - target_local_sats)
+
+        amount_sats = max(int(min_amount_sats), min(int(max_amount_sats), int(raw_amount))) if raw_amount > 0 else 0
+        if amount_sats < int(min_amount_sats):
+            skipped.append({
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "reason": "below_min_amount",
+                "raw_amount_sats": raw_amount,
+                "min_amount_sats": int(min_amount_sats),
+                "direction": direction,
+            })
+            continue
+
+        try:
+            quote_resp = bm.quote(
+                amount_sats=amount_sats,
+                swap_type=("submarine" if direction == "loop_in" else "reverse"),
+                currency=target_currency,
+            )
+            estimated_fee_sats = int(quote_resp.get("estimated_total_fee_sats", 0) or 0)
+        except Exception as e:
+            skipped.append({
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "direction": direction,
+                "reason": f"quote_failed: {e}",
+            })
+            continue
+
+        # Conservative expected uplift model (heuristic): daily contribution * imbalance severity * horizon.
+        # This is intentionally cautious and is only used as a profit guard/ranking signal.
+        severity_factor = max(0.1, min(1.0, severity))
+        expected_gross_uplift_sats = int(max(0.0, daily_contrib_est) * float(expected_horizon_days) * severity_factor)
+        required_profit_threshold_sats = int(round(estimated_fee_sats * float(profit_margin_factor)))
+        passes_profit_guard = (expected_gross_uplift_sats >= required_profit_threshold_sats) if require_profitable else True
+        expected_net_sats = expected_gross_uplift_sats - estimated_fee_sats
+
+        # Additional guard for loop-in with no channel pinning support.
+        non_pinned_penalty = 0.7 if direction == "loop_in" else 1.0
+        risk_adjusted_net_sats = int(expected_net_sats * non_pinned_penalty)
+        if require_profitable and direction == "loop_in":
+            # Make loop-in more conservative because it cannot be channel-pinned with current boltzcli.
+            passes_profit_guard = passes_profit_guard and (risk_adjusted_net_sats > 0)
+
+        candidate = {
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "direction": direction,
+            "trigger_threshold_pct": low_trigger_pct if direction == "loop_in" else high_trigger_pct,
+            "target_pct": target_pct,
+            "local_balance_pct": round(local_pct, 2),
+            "capacity_sats": capacity_sats,
+            "local_sats": local_sats,
+            "remote_sats": receivable_sats,
+            "amount_sats": amount_sats,
+            "raw_amount_sats": raw_amount,
+            "flow_state": flow_state,
+            "policy_gate": policy_reason,
+            "profitability": None if prof is None else {
+                "classification": prof_class,
+                "net_profit_sats": getattr(prof, "net_profit_sats", None),
+                "roi_percent": getattr(prof, "roi_percent", None),
+                "marginal_roi_percent": round(getattr(prof, "marginal_roi_percent", 0.0), 2),
+                "is_operationally_profitable": bool(getattr(prof, "is_operationally_profitable", False)),
+                "daily_contribution_estimate_sats": int(daily_contrib_est),
+            },
+            "economics": {
+                "estimated_swap_fee_sats": estimated_fee_sats,
+                "expected_gross_uplift_sats": expected_gross_uplift_sats,
+                "expected_net_sats": expected_net_sats,
+                "risk_adjusted_net_sats": risk_adjusted_net_sats,
+                "profit_margin_factor": profit_margin_factor,
+                "passes_profit_guard": bool(passes_profit_guard),
+                "loop_in_non_pinnable": direction == "loop_in",
+            },
+            "quote": quote_resp,
+            "score": {
+                "severity": round(severity, 4),
+                "daily_contribution_estimate_sats": int(daily_contrib_est),
+                "risk_adjusted_net_sats": risk_adjusted_net_sats,
+            }
+        }
+        candidates.append(candidate)
+
+    # Sort by profit-safe first, then best estimated net, then severity.
+    candidates.sort(
+        key=lambda c: (
+            1 if c.get("economics", {}).get("passes_profit_guard") else 0,
+            int(c.get("economics", {}).get("risk_adjusted_net_sats", 0) or 0),
+            float(c.get("score", {}).get("severity", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "generated_at": int(time.time()),
+        "budget": budget_status,
+        "pending_swap_count": pending_swaps,
+        "thresholds": {
+            "low_trigger_pct": low_trigger_pct,
+            "low_target_pct": low_target_pct,
+            "high_trigger_pct": high_trigger_pct,
+            "high_target_pct": high_target_pct,
+            "min_amount_sats": int(min_amount_sats),
+            "max_amount_sats": int(max_amount_sats),
+            "profit_margin_factor": float(profit_margin_factor),
+            "expected_horizon_days": float(expected_horizon_days),
+            "require_profitable": bool(require_profitable),
+            "min_marginal_roi": float(min_marginal_roi),
+            "loop_in_currency": str(loop_in_currency).upper(),
+            "loop_out_currency": str(loop_out_currency).upper(),
+        },
+        "recommendations": candidates[: max(0, int(max_candidates))],
+        "total_candidates": len(candidates),
+        "skipped_count": len(skipped),
+        "skipped_examples": skipped[:20],
+    }
+
+
+@plugin.method("revenue-boltz-balance-recommendations")
+def revenue_boltz_balance_recommendations(
+    plugin: Plugin,
+    low_trigger_pct: float = 40.0,
+    low_target_pct: float = 55.0,
+    high_trigger_pct: float = 80.0,
+    high_target_pct: float = 60.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_000_000,
+    max_candidates: int = 20,
+    only_peer_id: str = None,
+    only_channel_id: str = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    loop_in_currency: str = "LBTC",
+    loop_out_currency: str = "LBTC",
+) -> Dict[str, Any]:
+    """Recommend profit-constrained Boltz loop-in/out actions by channel balance."""
+    try:
+        return _build_boltz_balance_plan(
+            low_trigger_pct=low_trigger_pct,
+            low_target_pct=low_target_pct,
+            high_trigger_pct=high_trigger_pct,
+            high_target_pct=high_target_pct,
+            min_amount_sats=min_amount_sats,
+            max_amount_sats=max_amount_sats,
+            max_candidates=max_candidates,
+            only_peer_id=only_peer_id,
+            only_channel_id=only_channel_id,
+            require_profitable=require_profitable,
+            min_marginal_roi=min_marginal_roi,
+            profit_margin_factor=profit_margin_factor,
+            expected_horizon_days=expected_horizon_days,
+            loop_in_currency=loop_in_currency,
+            loop_out_currency=loop_out_currency,
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-balance-cycle")
+def revenue_boltz_balance_cycle(
+    plugin: Plugin,
+    dry_run: bool = True,
+    max_actions: int = 1,
+    low_trigger_pct: float = 40.0,
+    low_target_pct: float = 55.0,
+    high_trigger_pct: float = 80.0,
+    high_target_pct: float = 60.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_000_000,
+    only_peer_id: str = None,
+    only_channel_id: str = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    cooldown_hours: float = 4.0,
+    allow_concurrent_swaps: bool = False,
+    loop_in_currency: str = "LBTC",
+    loop_out_currency: str = "LBTC",
+) -> Dict[str, Any]:
+    """Execute a profit-constrained Boltz balance cycle (loop-in/loop-out) with budget + cooldown guards."""
+    try:
+        plan = _build_boltz_balance_plan(
+            low_trigger_pct=low_trigger_pct,
+            low_target_pct=low_target_pct,
+            high_trigger_pct=high_trigger_pct,
+            high_target_pct=high_target_pct,
+            min_amount_sats=min_amount_sats,
+            max_amount_sats=max_amount_sats,
+            max_candidates=max(max(5, int(max_actions) * 5), 20),
+            only_peer_id=only_peer_id,
+            only_channel_id=only_channel_id,
+            require_profitable=require_profitable,
+            min_marginal_roi=min_marginal_roi,
+            profit_margin_factor=profit_margin_factor,
+            expected_horizon_days=expected_horizon_days,
+            loop_in_currency=loop_in_currency,
+            loop_out_currency=loop_out_currency,
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+    if "error" in plan:
+        return plan
+
+    pending_swaps = int(plan.get("pending_swap_count", 0) or 0)
+    if pending_swaps > 0 and not allow_concurrent_swaps:
+        return {
+            "status": "blocked",
+            "reason": f"{pending_swaps} pending Boltz swap(s) detected",
+            "plan": plan,
+            "executed": [],
+            "skipped": [],
+        }
+
+    recommendations = list(plan.get("recommendations", []))
+    budget = plan.get("budget", {}) if isinstance(plan.get("budget"), dict) else {}
+    remaining_budget = int(budget.get("remaining_24h_sats_estimate", 0) or 0)
+    cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
+
+    executed: List[Dict[str, Any]] = []
+    skipped_exec: List[Dict[str, Any]] = []
+    now = int(time.time())
+
+    for rec in recommendations:
+        if len(executed) >= max(0, int(max_actions)):
+            break
+
+        ch_id = str(rec.get("channel_id") or "")
+        peer_id = str(rec.get("peer_id") or "")
+        direction = str(rec.get("direction") or "")
+        amount_sats = int(rec.get("amount_sats", 0) or 0)
+        econ = rec.get("economics", {}) if isinstance(rec.get("economics"), dict) else {}
+        est_fee = int(econ.get("estimated_swap_fee_sats", 0) or 0)
+
+        if not econ.get("passes_profit_guard", False):
+            skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id, "reason": "profit_guard_failed", "recommendation": rec})
+            continue
+        if est_fee > remaining_budget:
+            skipped_exec.append({
+                "channel_id": ch_id,
+                "peer_id": peer_id,
+                "reason": "insufficient_remaining_budget",
+                "estimated_fee_sats": est_fee,
+                "remaining_budget_sats": remaining_budget,
+                "recommendation": rec,
+            })
+            continue
+
+        with _boltz_balance_lock:
+            last_ts = int(_boltz_balance_last_action.get(ch_id, 0) or 0)
+        if cooldown_seconds > 0 and last_ts > 0 and (now - last_ts) < cooldown_seconds:
+            skipped_exec.append({
+                "channel_id": ch_id,
+                "peer_id": peer_id,
+                "reason": "cooldown_active",
+                "cooldown_remaining_sec": cooldown_seconds - (now - last_ts),
+                "recommendation": rec,
+            })
+            continue
+
+        if dry_run:
+            executed.append({
+                "status": "would_execute",
+                "direction": direction,
+                "channel_id": ch_id,
+                "peer_id": peer_id,
+                "amount_sats": amount_sats,
+                "estimated_fee_sats": est_fee,
+                "recommendation": rec,
+            })
+            remaining_budget = max(0, remaining_budget - est_fee)
+            continue
+
+        try:
+            bm = _require_boltz_manager()
+            if direction == "loop_in":
+                res = bm.loop_in(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=loop_in_currency)
+            elif direction == "loop_out":
+                res = bm.loop_out(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=loop_out_currency)
+            else:
+                raise BoltzCliError(f"Unknown direction: {direction}")
+
+            # Treat accepted/rejected separately.
+            status = str(res.get("status") or "")
+            if status in ("accepted", "rejected"):
+                executed.append({
+                    "status": status,
+                    "direction": direction,
+                    "channel_id": ch_id,
+                    "peer_id": peer_id,
+                    "amount_sats": amount_sats,
+                    "estimated_fee_sats": est_fee,
+                    "result": res,
+                    "recommendation": rec,
+                })
+                if status == "accepted":
+                    with _boltz_balance_lock:
+                        _boltz_balance_last_action[ch_id] = int(time.time())
+                    remaining_budget = max(0, remaining_budget - est_fee)
+                else:
+                    skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id, "reason": "execution_rejected", "result": res})
+            else:
+                executed.append({
+                    "status": "unknown",
+                    "direction": direction,
+                    "channel_id": ch_id,
+                    "peer_id": peer_id,
+                    "amount_sats": amount_sats,
+                    "estimated_fee_sats": est_fee,
+                    "result": res,
+                    "recommendation": rec,
+                })
+        except Exception as e:
+            skipped_exec.append({
+                "channel_id": ch_id,
+                "peer_id": peer_id,
+                "reason": f"execution_failed: {e}",
+                "recommendation": rec,
+            })
+
+    return {
+        "status": "dry_run" if dry_run else "executed",
+        "executed_count": len(executed),
+        "skipped_count": len(skipped_exec),
+        "remaining_budget_sats_estimate_after_cycle": remaining_budget,
+        "executed": executed,
+        "skipped": skipped_exec,
+        "plan": plan,
+        "notes": [
+            "loop-out is channel-pinnable via boltzcli --chan-id",
+            "loop-in (submarine) is not channel-pinnable on boltzcli v2.11.0; target channel/peer is a planning hint and should be verified post-swap",
+            "profit guard uses a conservative heuristic expected-uplift estimate based on recent channel contribution and imbalance severity",
+        ],
+    }
 
 
 # =============================================================================
