@@ -2763,19 +2763,51 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         peer_forced = bool(dest_peer_id and dest_peer_id in override_peers)
         if str(dest_flow_state) != 'source' and not peer_forced:
             return {'enabled': True, 'eligible': False, 'reason': 'not_source'}
-        if not prof and not peer_forced:
+        marginal_roi = float(getattr(prof, 'marginal_roi', 0.0) or 0.0)
+        daily_contrib_est = self._estimate_daily_channel_contribution(prof)
+
+        # Peer-history hot/profit inheritance: use recently closed channels to the same peer
+        # so replacement channels are protected without waiting for local history to build.
+        inherited = None
+        inherited_active = False
+        try:
+            if self.database is not None and dest_peer_id:
+                inherited = self.database.get_peer_closed_channel_profit_summary(
+                    dest_peer_id, lookback_days=30, limit=5
+                )
+                recency_sec = int(time.time()) - int((inherited or {}).get('most_recent_closed_at') or 0)
+                channel_is_new = (prof is None) or (int(getattr(prof, 'days_open', 0) or 0) <= 1)
+                inherited_daily = int((inherited or {}).get('daily_revenue_est_sats', 0) or 0)
+                inherited_roi = float((inherited or {}).get('marginal_roi_proxy', 0.0) or 0.0)
+                inherited_remote_closes = int((inherited or {}).get('remote_close_count', 0) or 0)
+                inherited_active = bool(
+                    channel_is_new and
+                    int((inherited or {}).get('count', 0) or 0) > 0 and
+                    0 <= recency_sec <= (14 * 86400) and
+                    (inherited_daily > 0 or inherited_roi > 0 or inherited_remote_closes > 0)
+                )
+                if inherited_active:
+                    # Use inherited profitability signal when current channel is too new.
+                    daily_contrib_est = max(daily_contrib_est, inherited_daily)
+                    marginal_roi = max(marginal_roi, inherited_roi)
+        except Exception as e:
+            self.plugin.log(f"Hot-channel inheritance lookup failed for {dest_peer_id[:16]}...: {e}", level='debug')
+
+        if not prof and not peer_forced and not inherited_active:
             return {'enabled': True, 'eligible': False, 'reason': 'no_profitability'}
 
-        marginal_roi = float(getattr(prof, 'marginal_roi', 0.0) or 0.0)
-        if velocity < float(getattr(cfg, 'hot_channel_protection_min_velocity', 0.20) or 0.20) and not peer_forced:
+        if inherited_active:
+            # New replacement channels may not have flow-window state yet; seed velocity to threshold floor.
+            velocity = max(velocity, float(getattr(cfg, 'hot_channel_protection_min_velocity', 0.20) or 0.20))
+
+        if velocity < float(getattr(cfg, 'hot_channel_protection_min_velocity', 0.20) or 0.20) and not (peer_forced or inherited_active):
             return {'enabled': True, 'eligible': False, 'reason': 'velocity_below_threshold', 'velocity': velocity, 'marginal_roi': marginal_roi}
-        if marginal_roi < float(getattr(cfg, 'hot_channel_protection_min_marginal_roi', 0.20) or 0.20) and not peer_forced:
+        if marginal_roi < float(getattr(cfg, 'hot_channel_protection_min_marginal_roi', 0.20) or 0.20) and not (peer_forced or inherited_active):
             return {'enabled': True, 'eligible': False, 'reason': 'roi_below_threshold', 'velocity': velocity, 'marginal_roi': marginal_roi}
 
-        daily_contrib_est = self._estimate_daily_channel_contribution(prof)
-        if daily_contrib_est <= 0 and not peer_forced:
+        if daily_contrib_est <= 0 and not (peer_forced or inherited_active):
             return {'enabled': True, 'eligible': False, 'reason': 'no_daily_contribution', 'velocity': velocity, 'marginal_roi': marginal_roi}
-        if daily_contrib_est <= 0 and peer_forced:
+        if daily_contrib_est <= 0 and (peer_forced or inherited_active):
             daily_contrib_est = 1000.0  # conservative floor for explicit operator override
 
         vel_thr = max(0.0001, float(getattr(cfg, 'hot_channel_protection_min_velocity', 0.20) or 0.20))
@@ -2787,6 +2819,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         score = max(0.0, min(1.0, 0.35*velocity_score + 0.30*roi_score + 0.20*contrib_score + 0.15*depletion_score))
         if peer_forced:
             score = max(score, 0.70)
+        elif inherited_active:
+            score = max(score, 0.60)
 
         profit_budget_pct = float(getattr(cfg, 'hot_channel_protection_profit_budget_pct', 0.75) or 0.75)
         channel_profit_budget_sats = int(max(0.0, daily_contrib_est) * max(0.0, min(1.0, profit_budget_pct)))
@@ -2803,9 +2837,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         return {
             'enabled': True,
             'eligible': True,
-            'reason': 'hot_source_profitable_forced' if peer_forced else 'hot_source_profitable',
+            'reason': (
+                'hot_source_profitable_forced'
+                if peer_forced else
+                ('hot_source_profitable_inherited' if inherited_active else 'hot_source_profitable')
+            ),
             'score': round(score, 4),
             'peer_forced': bool(peer_forced),
+            'peer_history_inherited': bool(inherited_active),
+            'peer_history_summary': inherited if isinstance(inherited, dict) and inherited_active else None,
             'dest_peer_id': dest_peer_id,
             'velocity': velocity,
             'marginal_roi': marginal_roi,

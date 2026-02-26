@@ -3947,6 +3947,68 @@ class Database:
             "avg_days_open": 0
         }
 
+    def get_peer_closed_channel_profit_summary(
+        self,
+        peer_id: str,
+        lookback_days: int = 30,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Summarize recent closed-channel profitability for a peer.
+
+        This supports "hot/profit inheritance" when a peer replaces/closes a
+        channel and the new channel has little history yet.
+        """
+        if not peer_id:
+            return {"peer_id": "", "count": 0}
+
+        lookback_days = max(1, min(int(lookback_days or 30), 365))
+        limit = max(1, min(int(limit or 5), 20))
+        cutoff = int(time.time()) - (lookback_days * 86400)
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT *
+            FROM closed_channels
+            WHERE peer_id = ? AND closed_at >= ?
+            ORDER BY closed_at DESC
+            LIMIT ?
+        """, (peer_id, cutoff, limit)).fetchall()
+        items = [dict(r) for r in rows]
+        if not items:
+            return {"peer_id": str(peer_id), "count": 0, "lookback_days": lookback_days}
+
+        total_revenue = sum(int(i.get("total_revenue_sats", 0) or 0) for i in items)
+        total_rebal_cost = sum(int(i.get("total_rebalance_cost_sats", 0) or 0) for i in items)
+        total_net = sum(int(i.get("net_pnl_sats", 0) or 0) for i in items)
+        total_days = sum(max(0, int(i.get("days_open", 0) or 0)) for i in items)
+        total_forwards = sum(max(0, int(i.get("forward_count", 0) or 0)) for i in items)
+        remote_close_count = sum(1 for i in items if str(i.get("closer", "unknown")) == "remote")
+        most_recent_closed_at = max(int(i.get("closed_at", 0) or 0) for i in items)
+
+        effective_days = max(1, total_days)
+        daily_revenue_est_sats = int(total_revenue / effective_days)
+        daily_net_est_sats = int(total_net / effective_days)
+        if total_rebal_cost <= 0:
+            marginal_roi_proxy = 1.0 if total_revenue > 0 else 0.0
+        else:
+            marginal_roi_proxy = (total_revenue - total_rebal_cost) / max(1, total_rebal_cost)
+
+        return {
+            "peer_id": str(peer_id),
+            "count": len(items),
+            "lookback_days": lookback_days,
+            "total_revenue_sats": total_revenue,
+            "total_rebalance_cost_sats": total_rebal_cost,
+            "total_net_pnl_sats": total_net,
+            "total_days_open": total_days,
+            "total_forward_count": total_forwards,
+            "daily_revenue_est_sats": daily_revenue_est_sats,
+            "daily_net_est_sats": daily_net_est_sats,
+            "marginal_roi_proxy": float(marginal_roi_proxy),
+            "remote_close_count": remote_close_count,
+            "most_recent_closed_at": most_recent_closed_at,
+        }
+
     def remove_closed_channel_data(self, channel_id: str, peer_id: Optional[str] = None) -> Dict[str, int]:
         """
         Remove a closed channel from active tracking tables.
