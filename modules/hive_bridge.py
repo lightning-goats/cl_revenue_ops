@@ -106,6 +106,32 @@ class CachedProfile:
     timestamp: float
 
 
+@dataclass(frozen=True)
+class RpcMethodPolicy:
+    """Reliability policy for a class of Hive bridge RPC calls."""
+    name: str
+    retries: int = 0
+    backoff_seconds: float = 0.0
+    use_breaker: bool = True
+    async_preferred: bool = False
+    count_failures: bool = True
+
+
+@dataclass
+class RpcPolicyStats:
+    """Operational counters for one policy class."""
+    calls: int = 0
+    success: int = 0
+    failures: int = 0
+    retries: int = 0
+    short_circuit: int = 0
+    unavailable: int = 0
+    async_queued: int = 0
+    async_dropped: int = 0
+    last_error: Optional[str] = None
+    last_error_at: int = 0
+
+
 # =============================================================================
 # HIVE FEE INTELLIGENCE BRIDGE
 # =============================================================================
@@ -143,6 +169,14 @@ class HiveFeeIntelligenceBridge:
         self.config = config
         self._circuit_breaker_enabled = bool(getattr(config, 'hive_bridge_circuit_breaker_enabled', False))
         self._circuit_reset_timeout = int(getattr(config, 'rpc_circuit_breaker_seconds', CIRCUIT_RESET_TIMEOUT) or CIRCUIT_RESET_TIMEOUT)
+        self._rpc_policies: Dict[str, RpcMethodPolicy] = {
+            # Optional reads should fail fast and allow cache fallback.
+            "optional_read": RpcMethodPolicy(name="optional_read", retries=0, backoff_seconds=0.0, use_breaker=True, async_preferred=False, count_failures=True),
+            # Critical writes can retry briefly; breaker is per-policy when enabled.
+            "critical_write": RpcMethodPolicy(name="critical_write", retries=1, backoff_seconds=0.25, use_breaker=True, async_preferred=False, count_failures=True),
+            # Telemetry should be async/droppable and never poison breaker state.
+            "telemetry": RpcMethodPolicy(name="telemetry", retries=0, backoff_seconds=0.0, use_breaker=False, async_preferred=True, count_failures=False),
+        }
 
         # Cache: peer_id -> CachedProfile
         self._cache: Dict[str, CachedProfile] = {}
@@ -151,6 +185,10 @@ class HiveFeeIntelligenceBridge:
         # Circuit breaker state
         self._circuit = CircuitBreakerState()
         self._circuit_lock = threading.Lock()
+        self._policy_circuits: Dict[str, CircuitBreakerState] = {
+            name: CircuitBreakerState() for name in self._rpc_policies.keys()
+        }
+        self._policy_circuit_lock = threading.Lock()
 
         # Availability cache: None = unknown, True/False = known
         self._hive_available: Optional[bool] = None
@@ -163,6 +201,10 @@ class HiveFeeIntelligenceBridge:
         self._routing_intel_cache: Dict[str, Any] = {}
         self._integration_cache: Dict[str, Any] = {}
         self._intel_cache_lock = threading.Lock()
+        self._rpc_policy_stats: Dict[str, RpcPolicyStats] = {
+            name: RpcPolicyStats() for name in self._rpc_policies.keys()
+        }
+        self._rpc_policy_stats_lock = threading.Lock()
 
         # Coalesce non-critical settlement cost telemetry to avoid blocking on
         # cl-hive fee gossip lock contention and prevent noisy bridge breaker trips.
@@ -319,6 +361,138 @@ class HiveFeeIntelligenceBridge:
                     f"Circuit breaker OPEN after {self._circuit.failures} failures",
                     level="warn"
                 )
+
+    def _is_policy_circuit_open(self, policy_name: str) -> bool:
+        """Per-policy breaker check (disabled when global bridge breaker is disabled)."""
+        if not self._circuit_breaker_enabled:
+            return False
+        with self._policy_circuit_lock:
+            state = self._policy_circuits.get(policy_name)
+            if state is None or not state.is_open:
+                return False
+            if time.time() - state.last_failure > self._circuit_reset_timeout:
+                state.is_open = False
+                state.failures = 0
+                self._log(f"Policy circuit breaker reset to CLOSED ({policy_name})", level="debug")
+                return False
+            return True
+
+    def _record_policy_success(self, policy_name: str) -> None:
+        if not self._circuit_breaker_enabled:
+            return
+        with self._policy_circuit_lock:
+            state = self._policy_circuits.get(policy_name)
+            if state is None:
+                return
+            state.failures = 0
+            state.is_open = False
+
+    def _record_policy_failure(self, policy_name: str) -> None:
+        if not self._circuit_breaker_enabled:
+            return
+        with self._policy_circuit_lock:
+            state = self._policy_circuits.get(policy_name)
+            if state is None:
+                return
+            state.failures += 1
+            state.last_failure = time.time()
+            if state.failures >= CIRCUIT_FAILURES_THRESHOLD:
+                state.is_open = True
+                self._log(
+                    f"Policy circuit breaker OPEN after {state.failures} failures ({policy_name})",
+                    level="warn",
+                )
+
+    def _policy_stats_inc(self, policy_name: str, field: str, value: int = 1) -> None:
+        with self._rpc_policy_stats_lock:
+            stats = self._rpc_policy_stats.get(policy_name)
+            if not stats:
+                return
+            setattr(stats, field, int(getattr(stats, field, 0) or 0) + value)
+
+    def _policy_stats_error(self, policy_name: str, err: Any) -> None:
+        with self._rpc_policy_stats_lock:
+            stats = self._rpc_policy_stats.get(policy_name)
+            if not stats:
+                return
+            stats.failures = int(stats.failures or 0) + 1
+            stats.last_error = str(err)
+            stats.last_error_at = int(time.time())
+
+    def _rpc_call_with_policy(
+        self,
+        method_name: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        policy_key: str,
+        require_available: bool = True,
+        count_error_response_failure: bool = True,
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Execute a Hive RPC using a method-class policy.
+
+        Returns:
+            (ok, result, error_reason)
+        """
+        policy = self._rpc_policies.get(policy_key) or self._rpc_policies["optional_read"]
+        self._policy_stats_inc(policy.name, "calls")
+
+        if require_available and not self.is_available():
+            self._policy_stats_inc(policy.name, "unavailable")
+            return False, None, "unavailable"
+
+        if policy.use_breaker and self._is_policy_circuit_open(policy.name):
+            self._policy_stats_inc(policy.name, "short_circuit")
+            return False, None, "policy_circuit_open"
+
+        rpc = self.plugin.rpc
+        if policy.async_preferred:
+            fire_and_forget = getattr(rpc, "fire_and_forget", None)
+            if callable(fire_and_forget):
+                queued = bool(fire_and_forget(method_name, payload if payload is not None else {}))
+                if queued:
+                    self._policy_stats_inc(policy.name, "async_queued")
+                    # Async queue success should not manipulate breaker state.
+                    return True, {"queued": True}, None
+                self._policy_stats_inc(policy.name, "async_dropped")
+                return False, None, "async_queue_full"
+
+        attempts = max(1, policy.retries + 1)
+        last_err: Optional[str] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                result = rpc.call(method_name, payload if payload is not None else {})
+                if isinstance(result, dict) and result.get("error"):
+                    last_err = str(result.get("error"))
+                    if count_error_response_failure and policy.count_failures:
+                        self._policy_stats_error(policy.name, last_err)
+                        if policy.use_breaker:
+                            self._record_policy_failure(policy.name)
+                    if attempt < attempts:
+                        self._policy_stats_inc(policy.name, "retries")
+                        if policy.backoff_seconds > 0:
+                            time.sleep(policy.backoff_seconds * attempt)
+                        continue
+                    return False, result, f"rpc_error:{last_err}"
+
+                self._policy_stats_inc(policy.name, "success")
+                if policy.use_breaker:
+                    self._record_policy_success(policy.name)
+                return True, result if isinstance(result, dict) else {"result": result}, None
+            except Exception as e:
+                last_err = str(e)
+                if policy.count_failures:
+                    self._policy_stats_error(policy.name, e)
+                    if policy.use_breaker:
+                        self._record_policy_failure(policy.name)
+                if attempt < attempts:
+                    self._policy_stats_inc(policy.name, "retries")
+                    if policy.backoff_seconds > 0:
+                        time.sleep(policy.backoff_seconds * attempt)
+                    continue
+                return False, None, f"exception:{last_err}"
+
+        return False, None, f"unknown:{last_err or 'unknown'}"
 
     # =========================================================================
     # CACHE MANAGEMENT
@@ -503,38 +677,33 @@ class HiveFeeIntelligenceBridge:
                 return self._stale_with_reduced_confidence(cached_data, age)
             return None
 
-        # Query cl-hive
-        try:
-            result = self.plugin.rpc.call("hive-fee-intel-query", {
-                "peer_id": peer_id,
-                "action": "query"
-            })
-
-            # Check for error response
-            if result.get("error"):
-                if result.get("error") == "no_data":
-                    # No data for this peer - not a failure
-                    return None
-                self._log(f"Query error: {result.get('error')}", level="debug")
-                self._record_failure()
-                if cached_data and cache_entry:
-                    age = time.time() - cache_timestamp
-                    return self._stale_with_reduced_confidence(cached_data, age)
-                return None
-
-            # Success - cache and return
-            self._set_cached(peer_id, result)
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query fee intelligence: {e}", level="debug")
-            self._record_failure()
-
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-fee-intel-query",
+            {"peer_id": peer_id, "action": "query"},
+            policy_key="optional_read",
+            require_available=False,  # already checked above
+            count_error_response_failure=False,  # "no_data" is expected and benign
+        )
+        if not ok:
+            if err and not err.startswith("rpc_error:no_data"):
+                self._log(f"Failed to query fee intelligence: {err}", level="debug")
             if cached_data and cache_entry:
                 age = time.time() - cache_timestamp
                 return self._stale_with_reduced_confidence(cached_data, age)
             return None
+
+        assert result is not None
+        if result.get("error"):
+            if result.get("error") == "no_data":
+                return None
+            self._log(f"Query error: {result.get('error')}", level="debug")
+            if cached_data and cache_entry:
+                age = time.time() - cache_timestamp
+                return self._stale_with_reduced_confidence(cached_data, age)
+            return None
+
+        self._set_cached(peer_id, result)
+        return result
 
     def query_all_profiles(self) -> List[Dict[str, Any]]:
         """
@@ -553,30 +722,29 @@ class HiveFeeIntelligenceBridge:
                     if (time.time() - cached.timestamp) < STALE_CACHE_TTL_SECONDS
                 ]
 
-        try:
-            result = self.plugin.rpc.call("hive-fee-intel-query", {
-                "action": "list"
-            })
-
-            if result.get("error"):
-                self._record_failure()
-                return []
-
-            profiles = result.get("peers", [])
-
-            # Cache all profiles
-            for profile in profiles:
-                peer_id = profile.get("peer_id")
-                if peer_id:
-                    self._set_cached(peer_id, profile)
-
-            self._record_success()
-            return profiles
-
-        except Exception as e:
-            self._log(f"Failed to query all profiles: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-fee-intel-query",
+            {"action": "list"},
+            policy_key="optional_read",
+            require_available=False,  # already checked above
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query all profiles: {err}", level="debug")
             return []
+
+        if result.get("error"):
+            return []
+
+        profiles = result.get("peers", [])
+
+        # Cache all profiles
+        for profile in profiles:
+            peer_id = profile.get("peer_id")
+            if peer_id:
+                self._set_cached(peer_id, profile)
+
+        return profiles
 
     # =========================================================================
     # PHASE 2: OBSERVATION REPORTING (Bidirectional Integration)
@@ -2861,25 +3029,25 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open():
             return False
 
-        try:
-            result = self.plugin.rpc.call("hive-report-yield-metrics", {
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-yield-metrics",
+            {
                 "tlv_sats": tlv_sats,
                 "operating_costs_sats": operating_costs_sats,
                 "routing_revenue_sats": routing_revenue_sats,
                 "period_days": period_days
-            })
-
-            if result.get("error"):
-                self._log(f"Yield metrics report error: {result.get('error')}", level="debug")
-                return False
-
-            return True
-
-        except Exception as e:
-            self._log(f"Failed to report yield metrics: {e}", level="debug")
-            self._record_failure()
-            # Return False — callers should not believe metrics were reported
+            },
+            policy_key="critical_write",
+            require_available=False,  # checked above
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to report yield metrics: {err}", level="debug")
             return False
+        if result.get("error"):
+            self._log(f"Yield metrics report error: {result.get('error')}", level="debug")
+            return False
+        return True
 
     def query_yield_summary(self) -> Optional[Dict[str, Any]]:
         """
@@ -2899,20 +3067,20 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-yield-summary", {})
-
-            if result.get("error"):
-                self._log(f"Yield summary query error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query yield summary: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-yield-summary",
+            {},
+            policy_key="optional_read",
+            require_available=False,  # checked above
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query yield summary: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Yield summary query error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     # =========================================================================
     # ANTICIPATORY LIQUIDITY (Phase 7.1)
@@ -3682,6 +3850,35 @@ class HiveFeeIntelligenceBridge:
             "last_availability_check": int(self._availability_check_time),
             "membership": None
         }
+        with self._rpc_policy_stats_lock:
+            status["rpc_policy_stats"] = {
+                name: {
+                    "calls": stats.calls,
+                    "success": stats.success,
+                    "failures": stats.failures,
+                    "retries": stats.retries,
+                    "short_circuit": stats.short_circuit,
+                    "unavailable": stats.unavailable,
+                    "async_queued": stats.async_queued,
+                    "async_dropped": stats.async_dropped,
+                    "last_error": stats.last_error,
+                    "last_error_at": stats.last_error_at,
+                }
+                for name, stats in self._rpc_policy_stats.items()
+            }
+        with self._policy_circuit_lock:
+            status["rpc_policy_breakers"] = {
+                name: {
+                    "enabled": bool(
+                        self._circuit_breaker_enabled and
+                        (self._rpc_policies.get(name).use_breaker if self._rpc_policies.get(name) else False)
+                    ),
+                    "open": state.is_open if self._circuit_breaker_enabled else False,
+                    "failures": state.failures,
+                    "last_failure": int(state.last_failure or 0),
+                }
+                for name, state in self._policy_circuits.items()
+            }
 
         # If hive is available, get membership details
         if self._hive_available:
@@ -3749,29 +3946,23 @@ class HiveFeeIntelligenceBridge:
             self._last_reported_period_costs_sats = rebalance_costs_sats
             self._last_period_costs_report_time = now
 
-        payload = {"rebalance_costs_sats": rebalance_costs_sats}
-        try:
-            rpc = self.plugin.rpc
-            fire_and_forget = getattr(rpc, "fire_and_forget", None)
-            if callable(fire_and_forget):
-                queued = bool(fire_and_forget("hive-report-period-costs", payload))
-                if not queued:
-                    self._log(
-                        "Period cost report dropped (async RPC queue full)",
-                        level="debug",
-                    )
-                return queued
-
-            # Fallback for older RPC proxies: short synchronous call, but never
-            # count failures against the hive bridge circuit breaker.
-            result = rpc.call("hive-report-period-costs", payload)
-            if isinstance(result, dict) and result.get("error"):
-                self._log(f"Error reporting period costs: {result.get('error')}", level="debug")
-                return False
-            return True
-        except Exception as e:
-            self._log(f"Failed to report period costs (non-critical): {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-period-costs",
+            {"rebalance_costs_sats": rebalance_costs_sats},
+            policy_key="telemetry",
+            require_available=False,  # checked above
+            count_error_response_failure=False,
+        )
+        if not ok:
+            if err == "async_queue_full":
+                self._log("Period cost report dropped (async RPC queue full)", level="debug")
+            elif err:
+                self._log(f"Failed to report period costs (non-critical): {err}", level="debug")
             return False
+        if isinstance(result, dict) and result.get("error"):
+            self._log(f"Error reporting period costs: {result.get('error')}", level="debug")
+            return False
+        return True
 
     def report_yield_and_costs(
         self,
