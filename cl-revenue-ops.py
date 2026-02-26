@@ -1913,7 +1913,14 @@ def revenue_hive_status(plugin: Plugin) -> Dict[str, Any]:
 
 
 @plugin.method("revenue-rebalance-debug")
-def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
+def revenue_rebalance_debug(
+    plugin: Plugin,
+    channel_id: str = None,
+    peer_id: str = None,
+    summary_only: bool = False,
+    include_hot_markers: bool = True,
+    max_candidates: int = 0,
+) -> Dict[str, Any]:
     """
     Diagnostic command to understand why rebalancing may not be happening.
 
@@ -1923,20 +1930,51 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
     - Source channels (potential sources)
     - Why candidates are rejected
 
+    Optional filters for lighter responses:
+    - channel_id=<scid>
+    - peer_id=<pubkey>
+    - summary_only=true
+    - include_hot_markers=false
+    - max_candidates=<n>
+
     Usage: lightning-cli revenue-rebalance-debug
     """
     if rebalancer is None:
         return {"error": "Rebalancer not initialized"}
 
+    filter_channel_id = str(channel_id or "").strip()
+    filter_peer_id = str(peer_id or "").strip().lower()
+    summary_only = bool(summary_only)
+    include_hot_markers = bool(include_hot_markers) and not summary_only
+    max_candidates = max(0, int(max_candidates or 0))
+
     result = {
         "sling_available": config.sling_available if config else False,
         "dry_run": config.dry_run if config else False,
+        "filters": {
+            "channel_id": filter_channel_id or None,
+            "peer_id": filter_peer_id or None,
+            "summary_only": summary_only,
+            "include_hot_markers": include_hot_markers,
+            "max_candidates": max_candidates or None,
+        },
         "capital_controls": {},
         "thresholds": {},
         "channels": {
             "depleted": [],
             "source": [],
-            "active_jobs": []
+            "active_jobs": [],
+            "counts": {
+                "considered": 0,
+                "depleted": 0,
+                "source": 0,
+                "active_jobs": 0,
+            },
+            "truncated": {
+                "depleted": 0,
+                "source": 0,
+                "active_jobs": 0,
+            }
         },
         "rejection_reasons": []
     }
@@ -1945,7 +1983,6 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
         result["rejection_reasons"].append("Sling plugin not available - rebalancing disabled")
         return result
 
-    # Get thresholds
     cfg = config.snapshot()
     result["thresholds"] = {
         "low_liquidity_threshold": cfg.low_liquidity_threshold,
@@ -1967,7 +2004,6 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
         )
         total_liquid = onchain_sats + channel_sats
 
-        # Get detailed spending info (Issue #23 + #24)
         spend_info = database.get_daily_rebalance_spend() if database else {}
         daily_spent = spend_info.get('total_spent_sats', 0)
         daily_reserved = spend_info.get('total_reserved_sats', 0)
@@ -1993,8 +2029,8 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             "budget_floor_sats": total_budget.get("daily_budget_floor_sats", cfg.daily_budget_sats),
             "profit_based_budget_sats": total_budget.get("profit_based_budget_sats"),
             "profit_pct_effective": total_budget.get("profit_pct_effective"),
-            "daily_spent_sats": daily_spent,          # rebalance-only (legacy field)
-            "daily_reserved_sats": daily_reserved,    # rebalance-only (legacy field)
+            "daily_spent_sats": daily_spent,
+            "daily_reserved_sats": daily_reserved,
             "boltz_spent_sats": boltz_spent,
             "boltz_reserved_sats": boltz_reserved,
             "total_liquidity_spent_sats": total_liquidity_spent,
@@ -2027,87 +2063,131 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
     except Exception as e:
         result["capital_controls"]["error"] = str(e)
 
-    # Get channel analysis
+    # Get channel analysis (request-local caching + optional filtering for performance)
     try:
         channels = rebalancer._get_channels_with_balances()
         active_channels = set(rebalancer.job_manager.active_channels)
+
+        state_lookup = {}
+        if database is not None:
+            try:
+                state_lookup = {
+                    (s.get("channel_id") or ""): s
+                    for s in (database.get_all_channel_states() or [])
+                    if (s.get("channel_id") or "")
+                }
+            except Exception:
+                state_lookup = {}
+
+        profitability_analyzer = getattr(rebalancer, "_profitability_analyzer", None) if include_hot_markers else None
+        compute_hot = getattr(rebalancer, "_compute_hot_channel_protection", None) if include_hot_markers else None
+        hot_profile_cache: Dict[str, Dict[str, Any]] = {}
+        prof_cache: Dict[str, Any] = {}
+
+        def _append_channel(bucket: str, item: Dict[str, Any]) -> None:
+            counts = result["channels"]["counts"]
+            trunc = result["channels"]["truncated"]
+            counts[bucket] = int(counts.get(bucket, 0) or 0) + 1
+            if summary_only:
+                return
+            if max_candidates > 0 and len(result["channels"][bucket]) >= max_candidates:
+                trunc[bucket] = int(trunc.get(bucket, 0) or 0) + 1
+                return
+            result["channels"][bucket].append(item)
 
         for cid, info in channels.items():
             capacity = info.get("capacity", 0)
             if capacity == 0:
                 continue
 
-            spendable = info.get("spendable_sats", 0)
-            ratio = spendable / capacity
-            fee_ppm = info.get("fee_ppm", 0)
-            peer_id_full = info.get("peer_id", "") or ""
-            peer_id = peer_id_full[:16]
+            peer_id_full = str(info.get("peer_id", "") or "")
+            if filter_channel_id and cid != filter_channel_id:
+                continue
+            if filter_peer_id and peer_id_full.lower() != filter_peer_id:
+                continue
 
-            state = database.get_channel_state(cid) if database else {}
+            spendable = info.get("spendable_sats", 0)
+            ratio = spendable / capacity if capacity else 0.0
+            fee_ppm = info.get("fee_ppm", 0)
+            peer_id_short = peer_id_full[:16]
+
+            state = state_lookup.get(cid) or (database.get_channel_state(cid) if database else {}) or {}
             flow_state = state.get("state", "unknown") if state else "unknown"
 
-            hot_profile: Dict[str, Any] = {}
-            try:
-                velocity = 0.0
-                if capacity > 0 and state:
-                    sats_in = float(state.get("sats_in", 0) or 0)
-                    sats_out = float(state.get("sats_out", 0) or 0)
-                    velocity = (sats_in + sats_out) / max(float(capacity), 1.0) / max(float(getattr(cfg, "flow_window_days", 7) or 7), 1.0)
-
-                prof = None
-                profitability_analyzer = getattr(rebalancer, "_profitability_analyzer", None)
-                if profitability_analyzer is not None:
-                    try:
-                        prof = profitability_analyzer.analyze_channel(cid)
-                    except Exception:
-                        prof = None
-
-                compute_hot = getattr(rebalancer, "_compute_hot_channel_protection", None)
-                if callable(compute_hot):
-                    hot_profile = compute_hot(
-                        dest_channel=cid,
-                        dest_peer_id=peer_id_full,
-                        dest_flow_state=flow_state,
-                        dest_ratio=ratio,
-                        velocity=velocity,
-                        prof=prof,
-                        cfg=cfg,
-                    ) or {}
-            except Exception as e:
-                hot_profile = {"enabled": False, "eligible": False, "reason": f"debug_hot_profile_error:{e}"}
+            result["channels"]["counts"]["considered"] = int(result["channels"]["counts"].get("considered", 0) or 0) + 1
 
             channel_info = {
                 "scid": cid[:20],
-                "peer": peer_id,
+                "peer": peer_id_short,
+                "peer_id": peer_id_full if (filter_peer_id or filter_channel_id) else None,
                 "local_pct": round(ratio * 100, 1),
                 "fee_ppm": fee_ppm,
                 "flow_state": flow_state,
-                "hot_channel_protection": bool(hot_profile.get("eligible", False)),
-                "hot_channel_protection_enabled": bool(hot_profile.get("enabled", False)),
-                "hot_channel_protection_reason": hot_profile.get("reason"),
-                "hot_channel_protection_score": round(float(hot_profile.get("score", 0.0) or 0.0), 4),
-                "hot_channel_protection_peer_override": bool(hot_profile.get("peer_forced", False)),
-                "profit_budget_override_sats": int(hot_profile.get("channel_profit_budget_sats", 0) or 0),
-                "hot_recommended_cooldown_hours": hot_profile.get("recommended_cooldown_hours"),
-                "hot_chunk_multiplier": hot_profile.get("chunk_multiplier"),
             }
+            if channel_info.get("peer_id") is None:
+                channel_info.pop("peer_id", None)
+
+            if include_hot_markers:
+                hot_profile = hot_profile_cache.get(cid)
+                if hot_profile is None:
+                    try:
+                        velocity = 0.0
+                        if capacity > 0 and state:
+                            sats_in = float(state.get("sats_in", 0) or 0)
+                            sats_out = float(state.get("sats_out", 0) or 0)
+                            velocity = (sats_in + sats_out) / max(float(capacity), 1.0) / max(float(getattr(cfg, "flow_window_days", 7) or 7), 1.0)
+
+                        prof = prof_cache.get(cid, None)
+                        if cid not in prof_cache and profitability_analyzer is not None:
+                            try:
+                                prof = profitability_analyzer.analyze_channel(cid)
+                            except Exception:
+                                prof = None
+                            prof_cache[cid] = prof
+
+                        if callable(compute_hot):
+                            hot_profile = compute_hot(
+                                dest_channel=cid,
+                                dest_peer_id=peer_id_full,
+                                dest_flow_state=flow_state,
+                                dest_ratio=ratio,
+                                velocity=velocity,
+                                prof=prof,
+                                cfg=cfg,
+                            ) or {}
+                        else:
+                            hot_profile = {}
+                    except Exception as e:
+                        hot_profile = {"enabled": False, "eligible": False, "reason": f"debug_hot_profile_error:{e}"}
+                    hot_profile_cache[cid] = hot_profile
+
+                channel_info.update({
+                    "hot_channel_protection": bool(hot_profile.get("eligible", False)),
+                    "hot_channel_protection_enabled": bool(hot_profile.get("enabled", False)),
+                    "hot_channel_protection_reason": hot_profile.get("reason"),
+                    "hot_channel_protection_score": round(float(hot_profile.get("score", 0.0) or 0.0), 4),
+                    "hot_channel_protection_peer_override": bool(hot_profile.get("peer_forced", False)),
+                    "profit_budget_override_sats": int(hot_profile.get("channel_profit_budget_sats", 0) or 0),
+                    "hot_recommended_cooldown_hours": hot_profile.get("recommended_cooldown_hours"),
+                    "hot_chunk_multiplier": hot_profile.get("chunk_multiplier"),
+                })
 
             if cid in active_channels:
-                result["channels"]["active_jobs"].append(channel_info)
+                _append_channel("active_jobs", channel_info)
             elif ratio < cfg.low_liquidity_threshold:
                 channel_info["reason"] = "low local balance"
                 if flow_state == "sink":
                     channel_info["skip_reason"] = "SINK - filling naturally"
-                result["channels"]["depleted"].append(channel_info)
+                _append_channel("depleted", channel_info)
             elif ratio > cfg.high_liquidity_threshold:
                 channel_info["reason"] = "high local balance"
-                result["channels"]["source"].append(channel_info)
+                _append_channel("source", channel_info)
 
-        if not result["channels"]["depleted"]:
+        if result["channels"]["counts"]["depleted"] == 0:
             result["rejection_reasons"].append(
                 f"No depleted channels (none below {cfg.low_liquidity_threshold*100}% local balance)"
             )
-        if not result["channels"]["source"]:
+        if result["channels"]["counts"]["source"] == 0:
             result["rejection_reasons"].append(
                 f"No source channels (none above {cfg.high_liquidity_threshold*100}% local balance)"
             )
