@@ -448,7 +448,8 @@ class HistoricalResponseCurve:
         revenues = [o.revenue_rate for o in recent]
         avg_revenue = sum(revenues) / len(revenues)
 
-        if avg_revenue <= 0:
+        # N1 FIX: Guard against near-zero avg_revenue that would cause unstable division
+        if avg_revenue < 1e-6:
             return False
 
         # MA-1: Use sample variance (N-1 divisor) for unbiased estimate

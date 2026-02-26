@@ -559,11 +559,9 @@ class PolicyManager:
         """
         self._validate_peer_id(peer_id)
 
-        # v2.0: Rate limiting
-        if not self._check_rate_limit(peer_id):
-            raise RuntimeError(
-                f"Rate limited: max {MAX_POLICY_CHANGES_PER_MINUTE} changes/minute for {peer_id[:12]}..."
-            )
+        # B2 FIX: Rate limit check moved after validation but before DB write.
+        # Previously it was here, which incremented the counter even when
+        # validation below would reject the request.
 
         # Get existing policy or default
         existing = self.get_policy(peer_id)
@@ -628,6 +626,13 @@ class PolicyManager:
                 new_expires_at = int(time.time()) + (expires_in_hours * 3600)
 
         now = int(time.time())
+
+        # B2 FIX: Rate limit check after validation, before DB write.
+        # This ensures the counter only increments for valid, committed changes.
+        if not self._check_rate_limit(peer_id):
+            raise RuntimeError(
+                f"Rate limited: max {MAX_POLICY_CHANGES_PER_MINUTE} changes/minute for {peer_id[:12]}..."
+            )
 
         # Persist to database (v2.0: includes new columns)
         conn = self.database._get_connection()

@@ -95,6 +95,8 @@ class Database:
             self._local.conn.execute("PRAGMA busy_timeout=5000;")
             # Reasonable durability/performance tradeoff for WAL mode
             self._local.conn.execute("PRAGMA synchronous=NORMAL;")
+            # D3 FIX: Enforce foreign key constraints (defined but previously unenforced)
+            self._local.conn.execute("PRAGMA foreign_keys=ON;")
             # Enable incremental auto-vacuum so PRAGMA incremental_vacuum works.
             # Only takes effect on a fresh (empty) database; harmless no-op otherwise.
             self._local.conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
@@ -917,51 +919,61 @@ class Database:
         - Deduplicates existing rows prior to enforcing uniqueness
         - Creates a UNIQUE index so INSERT OR IGNORE can safely skip duplicates
         """
+        # D4 FIX: Wrap migration in transaction for atomicity
         try:
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(forwards)").fetchall()]
-            if "resolved_time" not in cols:
-                self.plugin.log("DB migration: adding forwards.resolved_time column", level="info")
-                conn.execute("ALTER TABLE forwards ADD COLUMN resolved_time INTEGER")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(forwards)").fetchall()]
+                if "resolved_time" not in cols:
+                    self.plugin.log("DB migration: adding forwards.resolved_time column", level="info")
+                    conn.execute("ALTER TABLE forwards ADD COLUMN resolved_time INTEGER")
 
-            # Backfill resolved_time where missing/zero (best-effort).
-            # resolution_time is stored as REAL seconds; round down to int seconds for stable keying.
-            conn.execute("""
-                UPDATE forwards
-                SET resolved_time = COALESCE(resolved_time, 0)
-                WHERE resolved_time IS NULL
-            """)
-            conn.execute("""
-                UPDATE forwards
-                SET resolved_time = timestamp + CAST(resolution_time AS INTEGER)
-                WHERE (resolved_time IS NULL OR resolved_time = 0)
-                  AND resolution_time IS NOT NULL
-                  AND resolution_time > 0
-            """)
+                # Backfill resolved_time where missing/zero (best-effort).
+                # resolution_time is stored as REAL seconds; round down to int seconds for stable keying.
+                conn.execute("""
+                    UPDATE forwards
+                    SET resolved_time = COALESCE(resolved_time, 0)
+                    WHERE resolved_time IS NULL
+                """)
+                conn.execute("""
+                    UPDATE forwards
+                    SET resolved_time = timestamp + CAST(resolution_time AS INTEGER)
+                    WHERE (resolved_time IS NULL OR resolved_time = 0)
+                      AND resolution_time IS NOT NULL
+                      AND resolution_time > 0
+                """)
 
-            # Deduplicate rows before adding a UNIQUE index (keep earliest id).
-            # Key includes resolved_time to reduce collision risk within the same second.
-            self.plugin.log("DB migration: deduplicating forwards table (if needed)", level="debug")
-            conn.execute("""
-                DELETE FROM forwards
-                WHERE id NOT IN (
-                    SELECT MIN(id)
-                    FROM forwards
-                    GROUP BY
-                        in_channel, out_channel, in_msat, out_msat, fee_msat, timestamp,
-                        COALESCE(resolved_time, 0)
-                )
-            """)
+                # Deduplicate rows before adding a UNIQUE index (keep earliest id).
+                # Key includes resolved_time to reduce collision risk within the same second.
+                self.plugin.log("DB migration: deduplicating forwards table (if needed)", level="debug")
+                conn.execute("""
+                    DELETE FROM forwards
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM forwards
+                        GROUP BY
+                            in_channel, out_channel, in_msat, out_msat, fee_msat, timestamp,
+                            COALESCE(resolved_time, 0)
+                    )
+                """)
 
-            # Enforce idempotency: duplicates become no-ops.
-            conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_forwards_unique
-                ON forwards(in_channel, out_channel, in_msat, out_msat, fee_msat, timestamp, resolved_time)
-            """)
+                # Enforce idempotency: duplicates become no-ops.
+                conn.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_forwards_unique
+                    ON forwards(in_channel, out_channel, in_msat, out_msat, fee_msat, timestamp, resolved_time)
+                """)
 
-            # Helpful indexes for per-channel lookups (keeps queries fast as forwards grow)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_in_time ON forwards(in_channel, timestamp)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_out_time ON forwards(out_channel, timestamp)")
+                # Helpful indexes for per-channel lookups (keeps queries fast as forwards grow)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_in_time ON forwards(in_channel, timestamp)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_out_time ON forwards(out_channel, timestamp)")
 
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
         except Exception as e:
             # Non-fatal: plugin can still run, but may double-dip without uniqueness.
             self.plugin.log(f"DB migration warning: forwards schema migration failed: {e}", level="warn")
@@ -2775,7 +2787,7 @@ class Database:
             conn = self._get_connection()
             inserted = 0
 
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             try:
                 for fwd in forwards:
                     try:

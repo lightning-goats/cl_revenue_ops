@@ -3410,8 +3410,12 @@ class HiveFeeIntelligenceBridge:
         adjusted_fee = adjustment.get("adjusted_fee_ppm", current_fee)
         adj_pct = adjustment.get("adjustment_pct", 0)
 
-        # Only recommend if change is meaningful (>5%)
-        fee_diff_pct = abs(adjusted_fee - current_fee) / max(current_fee, 1) * 100
+        # Only recommend if change is meaningful (>5% or >5 PPM for zero-fee channels)
+        # N2 FIX: Use absolute diff for zero-fee channels where percentage is meaningless
+        if current_fee == 0:
+            fee_diff_pct = 100.0 if adjusted_fee > 0 else 0.0
+        else:
+            fee_diff_pct = abs(adjusted_fee - current_fee) / current_fee * 100
         if fee_diff_pct < 5:
             result["reason"] = f"Adjustment too small ({fee_diff_pct:.1f}%)"
             return result

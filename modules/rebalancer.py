@@ -3119,8 +3119,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             route = self.plugin.rpc.getroute(id=peer_id, amount_msat=amount_msat, riskfactor=10, maxhops=6)
             if route.get("route"):
                 first_hop = route["route"][0].get("amount_msat", amount_msat)
-                if isinstance(first_hop, str):
-                    first_hop = int(first_hop.replace("msat", ""))
+                first_hop = self._parse_msat(first_hop) if not isinstance(first_hop, int) else first_hop
                 return max(0, int(((first_hop - amount_msat) / amount_msat) * 1_000_000))
         except Exception:
             pass
@@ -4111,8 +4110,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 for output in listfunds.get("outputs", []):
                     if output.get("status") == "confirmed":
                         amount_msat = output.get("amount_msat", 0)
-                        if isinstance(amount_msat, str):
-                            amount_msat = int(amount_msat.replace("msat", ""))
+                        amount_msat = self._parse_msat(amount_msat)
                         onchain_sats += amount_msat // 1000
 
                 channel_spendable_sats = 0

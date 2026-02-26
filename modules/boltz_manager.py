@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,6 +45,9 @@ class BoltzCliManager:
         self.cfg = config
         self._swap_journal_file = os.path.join(self.cfg.datadir, "cl_revenue_ops_swap_journal.json")
         self._ignored_external_swaps_file = os.path.join(self.cfg.datadir, "cl_revenue_ops_ignored_external_swaps.json")
+        # B1/B3 FIX: Serialize file-based load-modify-save to prevent lost updates
+        self._journal_lock = threading.Lock()
+        self._ignored_swaps_lock = threading.Lock()
         # Optional callback set by cl-revenue-ops plugin to provide non-Boltz liquidity costs
         # (e.g. market rebalance spend/reservations) for unified budget accounting.
         self.external_liquidity_cost_provider = None
@@ -833,6 +837,11 @@ class BoltzCliManager:
         return out
 
     def manage_external_pay_ignores(self, action: str = "list", swap_id: Optional[str] = None, note: Optional[str] = None) -> Dict[str, Any]:
+        # B3 FIX: Serialize load-modify-save to prevent lost updates
+        with self._ignored_swaps_lock:
+            return self._manage_external_pay_ignores_locked(action, swap_id, note)
+
+    def _manage_external_pay_ignores_locked(self, action: str = "list", swap_id: Optional[str] = None, note: Optional[str] = None) -> Dict[str, Any]:
         act = str(action or "list").strip().lower()
         ignores = self._load_ignored_external_swaps()
         now = int(time.time())
@@ -894,6 +903,11 @@ class BoltzCliManager:
         return {"status": "success", "action": "add", "swap_id": sid, "ignore": rec, "swap": sw}
 
     def _record_swap_result(self, payload: Any, *, source: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        # B1 FIX: Serialize load-modify-save to prevent lost updates from concurrent threads
+        with self._journal_lock:
+            self._record_swap_result_locked(payload, source=source, metadata=metadata)
+
+    def _record_swap_result_locked(self, payload: Any, *, source: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         now = int(time.time())
         entries = self._load_swap_journal()
         by_id = {str(e.get("id")): e for e in entries if e.get("id")}
