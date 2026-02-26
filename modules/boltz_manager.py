@@ -791,6 +791,47 @@ class BoltzCliManager:
         out["ignored_external_swap_meta"] = dict(rec)
         return out
 
+    def _load_swap_journal_index(self) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for rec in self._load_swap_journal():
+            if not isinstance(rec, dict):
+                continue
+            sid = str(rec.get("id") or "").strip()
+            if not sid:
+                continue
+            out[sid] = dict(rec)
+        return out
+
+    @staticmethod
+    def _annotate_journal_swap(entry: Optional[Dict[str, Any]], journal_index: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(entry, dict):
+            return entry
+        sid = str(entry.get("id") or "").strip()
+        if not sid:
+            return entry
+        rec = journal_index.get(sid)
+        if not rec:
+            return entry
+        out = dict(entry)
+        # Expose a small set of common fields directly and preserve full journal metadata nested.
+        for k in (
+            "source",
+            "peer_id",
+            "requested_channel_ids",
+            "requested_first_hop_peer_id",
+            "requested_first_hop_channel_id",
+            "routing_mode",
+            "cln_payment_status",
+            "cln_payment_error",
+            "cln_pay_lookup",
+            "cln_pay_summary",
+            "recorded_at",
+        ):
+            if rec.get(k) is not None and out.get(k) is None:
+                out[k] = rec.get(k)
+        out["journal_meta"] = dict(rec)
+        return out
+
     def manage_external_pay_ignores(self, action: str = "list", swap_id: Optional[str] = None, note: Optional[str] = None) -> Dict[str, Any]:
         act = str(action or "list").strip().lower()
         ignores = self._load_ignored_external_swaps()
@@ -1141,6 +1182,39 @@ class BoltzCliManager:
             outer_status = "accepted"
             if isinstance(cln_payment, dict) and cln_payment.get("status") in ("timeout", "error"):
                 outer_status = str(cln_payment.get("status"))
+            try:
+                pay_summary = None
+                if isinstance(cln_payment, dict):
+                    pay_summary = {
+                        "status": cln_payment.get("status"),
+                        "preferred_peer_id": cln_payment.get("preferred_peer_id"),
+                        "preferred_channel_id": cln_payment.get("preferred_channel_id"),
+                        "exclude_count": cln_payment.get("exclude_count"),
+                        "warnings": cln_payment.get("warnings"),
+                    }
+                    if cln_payment.get("pay_error"):
+                        pay_summary["pay_error"] = cln_payment.get("pay_error")
+                self._record_swap_result(
+                    result,
+                    source="loop_out_external_pay",
+                    metadata={
+                        "peer_id": resolved_peer,
+                        "requested_channel_ids": [resolved_channel] if resolved_channel else None,
+                        "requested_first_hop_peer_id": resolved_peer,
+                        "requested_first_hop_channel_id": resolved_channel,
+                        "routing_mode": "external_pay_first_hop_pinned",
+                        "cln_payment_status": (cln_payment.get("status") if isinstance(cln_payment, dict) else None),
+                        "cln_payment_error": (cln_payment.get("pay_error") if isinstance(cln_payment, dict) else None),
+                        "cln_pay_lookup": (cln_payment.get("pay_lookup") if isinstance(cln_payment, dict) else None),
+                        "cln_pay_summary": pay_summary,
+                    },
+                )
+                if isinstance(status_probe, dict):
+                    self._record_swap_result(result, source="loop_out_external_pay_status_probe", metadata={
+                        "status_probe": status_probe,
+                    })
+            except Exception:
+                pass
             return {
                 "status": outer_status,
 
@@ -1265,9 +1339,11 @@ class BoltzCliManager:
         except Exception:
             swapinfo_json = None
         ignores = self._load_ignored_external_swaps()
-        annotated_swapinfo = self._annotate_ignored_swap(swapinfo_entry, ignores)
-        annotated_list = self._annotate_ignored_swap(list_match, ignores)
+        journal_index = self._load_swap_journal_index()
+        annotated_swapinfo = self._annotate_journal_swap(self._annotate_ignored_swap(swapinfo_entry, ignores), journal_index)
+        annotated_list = self._annotate_journal_swap(self._annotate_ignored_swap(list_match, ignores), journal_index)
         ignore_meta = ignores.get(swap_id)
+        journal_meta = journal_index.get(swap_id)
         return {
             "swap_id": swap_id,
             "swapinfo_raw": raw,
@@ -1275,12 +1351,15 @@ class BoltzCliManager:
             "listswaps_entry": annotated_list,
             "ignored_external_swap": bool(ignore_meta),
             "ignored_external_swap_meta": ignore_meta,
+            "journal_meta": journal_meta,
         }
 
     def swap_history(self, limit: Optional[int] = None) -> Dict[str, Any]:
         data = self._listswaps_json()
         swaps = self._extract_swap_list(data)
         swaps = self._augment_with_swap_journal(swaps, limit_hint=limit)
+        journal_index = self._load_swap_journal_index()
+        swaps = [self._annotate_journal_swap(s, journal_index) for s in swaps]
         ignores = self._load_ignored_external_swaps()
         swaps = [self._annotate_ignored_swap(s, ignores) for s in swaps]
         # sort newest first (best effort)

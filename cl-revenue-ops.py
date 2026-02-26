@@ -5200,7 +5200,8 @@ def _boltz_pending_swap_count() -> int:
             state = str(sw.get("state") or "").lower()
             status = str(sw.get("status") or "").lower()
             txt = f"{state} {status}"
-            done = any(x in txt for x in ("success", "completed", "claimed", "failed", "refunded", "expired", "cancel"))
+            # Treat explicit error states as terminal even if status text remains "swap.created".
+            done = any(x in txt for x in ("success", "completed", "claimed", "failed", "refunded", "expired", "cancel", "error"))
             active = any(x in txt for x in ("pending", "created", "mempool", "transaction", "lockup", "invoice", "claim"))
             if active and not done:
                 pending += 1
