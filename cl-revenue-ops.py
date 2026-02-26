@@ -520,6 +520,30 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-total-cost-budget-mode',
+    default='fixed',
+    description="Unified spend gate mode for all liquidity costs: 'fixed' or 'profit_pct' (default: fixed)"
+)
+
+plugin.add_option(
+    name='revenue-ops-total-cost-budget-profit-pct',
+    default='0.30',
+    description='When total-cost budget mode=profit_pct, use this fraction of net profit as spend budget (default: 0.30)'
+)
+
+plugin.add_option(
+    name='revenue-ops-total-cost-budget-profit-pct-cap',
+    default='0.75',
+    description='Safety cap for total-cost profit percentage (default: 0.75 = 75%)'
+)
+
+plugin.add_option(
+    name='revenue-ops-total-cost-budget-window-hours',
+    default='24',
+    description='Window for unified spend budget accounting and profit-based budget calculation (default: 24h)'
+)
+
+plugin.add_option(
     name='revenue-ops-min-wallet-reserve',
     default='1000000',
     description='Minimum total funds (on-chain + off-chain) to keep in reserve (default: 1,000,000)'
@@ -781,6 +805,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         clboss_enabled=options['revenue-ops-clboss-enabled'].lower() == 'true',
         rebalancer_plugin=options['revenue-ops-rebalancer'],
         daily_budget_sats=int(options['revenue-ops-daily-budget-sats']),
+        total_cost_budget_mode=options.get('revenue-ops-total-cost-budget-mode', 'fixed').lower(),
+        total_cost_budget_profit_pct=float(options.get('revenue-ops-total-cost-budget-profit-pct', '0.30')),
+        total_cost_budget_profit_pct_cap=float(options.get('revenue-ops-total-cost-budget-profit-pct-cap', '0.75')),
+        total_cost_budget_window_hours=int(options.get('revenue-ops-total-cost-budget-window-hours', '24')),
         min_wallet_reserve=int(options['revenue-ops-min-wallet-reserve']),
         enable_proportional_budget=options['revenue-ops-proportional-budget'].lower() == 'true',
         proportional_budget_pct=float(options['revenue-ops-proportional-budget-pct']),
@@ -1096,9 +1124,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # - Rebalancer sees Boltz spend as external liquidity cost
     # - Boltz manager sees rebalance spend/reservations as external liquidity cost
     if rebalancer is not None:
-        rebalancer.external_liquidity_cost_provider = _boltz_liquidity_cost_components
+        rebalancer.external_liquidity_cost_provider = _non_rebalance_liquidity_cost_components
+        rebalancer.global_budget_limit_provider = _total_cost_budget_limit_provider
     if boltz_manager is not None:
-        boltz_manager.external_liquidity_cost_provider = _rebalance_liquidity_cost_components
+        boltz_manager.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
+        boltz_manager.global_budget_limit_provider = _total_cost_budget_limit_provider
 
     # =========================================================================
     # Hive Settlement / Yield Reporting (Issue #42)
@@ -1664,13 +1694,14 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
         daily_spent = spend_info.get('total_spent_sats', 0)
         daily_reserved = spend_info.get('total_reserved_sats', 0)
         stale_count = spend_info.get('stale_reservations', 0)
-        daily_budget = cfg.daily_budget_sats
+        total_budget = _total_cost_budget_status()
+        daily_budget = int(total_budget.get("effective_budget_sats", cfg.daily_budget_sats) or cfg.daily_budget_sats)
         boltz_costs = _boltz_liquidity_cost_components()
         boltz_spent = int(boltz_costs.get("spent_24h_sats", 0) or 0)
         boltz_reserved = int(boltz_costs.get("reserved_24h_sats", 0) or 0)
-        total_liquidity_spent = int(daily_spent) + boltz_spent
-        total_liquidity_reserved = int(daily_reserved) + boltz_reserved
-        budget_remaining = daily_budget - total_liquidity_spent - total_liquidity_reserved
+        total_liquidity_spent = int(total_budget.get("actual_spent_sats", int(daily_spent) + boltz_spent) or 0)
+        total_liquidity_reserved = int(total_budget.get("reserved_sats", int(daily_reserved) + boltz_reserved) or 0)
+        budget_remaining = int(total_budget.get("remaining_sats", daily_budget - total_liquidity_spent - total_liquidity_reserved) or 0)
 
         result["capital_controls"] = {
             "onchain_sats": onchain_sats,
@@ -1679,12 +1710,21 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             "wallet_reserve_sats": cfg.min_wallet_reserve,
             "reserve_ok": total_liquid >= cfg.min_wallet_reserve,
             "daily_budget_sats": daily_budget,
+            "budget_mode": total_budget.get("mode", "fixed"),
+            "budget_window_hours": total_budget.get("window_hours", 24),
+            "budget_floor_sats": total_budget.get("daily_budget_floor_sats", cfg.daily_budget_sats),
+            "profit_based_budget_sats": total_budget.get("profit_based_budget_sats"),
+            "profit_pct_effective": total_budget.get("profit_pct_effective"),
             "daily_spent_sats": daily_spent,          # rebalance-only (legacy field)
             "daily_reserved_sats": daily_reserved,    # rebalance-only (legacy field)
             "boltz_spent_sats": boltz_spent,
             "boltz_reserved_sats": boltz_reserved,
             "total_liquidity_spent_sats": total_liquidity_spent,
             "total_liquidity_reserved_sats": total_liquidity_reserved,
+            "total_liquidity_breakdown": {
+                "actual_spent_by_category": total_budget.get("actual_spent_by_category", {}),
+                "reserved_by_category": total_budget.get("reserved_by_category", {}),
+            },
             "stale_reservations": stale_count,
             "budget_remaining_sats": budget_remaining,
             "budget_ok": budget_remaining > 0,
@@ -4575,6 +4615,119 @@ def _require_boltz_manager() -> BoltzCliManager:
     return boltz_manager
 
 
+@plugin.method("revenue-total-cost-budget")
+def revenue_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[str, Any]:
+    """Unified budget status across rebalances, Boltz, and on-chain liquidity costs."""
+    try:
+        return _total_cost_budget_status(window_hours=window_hours)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-spend-ledger")
+def revenue_spend_ledger(plugin: Plugin, window_hours: int = 24) -> Dict[str, Any]:
+    """Summary of generic spend ledger events/reservations (for opens/closes/splices/etc.)."""
+    if database is None:
+        return {"error": "Database not initialized"}
+    try:
+        return database.get_spend_ledger_summary(window_hours=int(window_hours))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-spend-reserve")
+def revenue_spend_reserve(
+    plugin: Plugin,
+    reservation_id: str,
+    category: str,
+    amount_sats: int,
+    subcategory: str = None,
+    reference_id: str = None,
+    channel_id: str = None,
+    metadata_json: str = None,
+) -> Dict[str, Any]:
+    """Reserve spend in the generic ledger, enforcing the unified total-cost budget first."""
+    if database is None:
+        return {"error": "Database not initialized"}
+    try:
+        amount_sats = int(amount_sats)
+        if amount_sats <= 0:
+            return {"error": "amount_sats must be > 0"}
+        budget = _total_cost_budget_status()
+        if "error" in budget:
+            return budget
+        remaining = int(budget.get("remaining_sats", 0) or 0)
+        if amount_sats > remaining:
+            return {
+                "status": "rejected",
+                "reason": "insufficient_unified_budget",
+                "requested_sats": amount_sats,
+                "remaining_sats": remaining,
+                "budget": budget,
+            }
+        metadata = None
+        if metadata_json:
+            try:
+                metadata = json.loads(metadata_json)
+            except Exception:
+                metadata = {"raw": metadata_json}
+        ok = database.reserve_spend(
+            reservation_id=str(reservation_id),
+            amount_sats=amount_sats,
+            category=str(category),
+            subcategory=subcategory,
+            reference_id=reference_id,
+            channel_id=channel_id,
+            metadata=metadata,
+        )
+        if not ok:
+            return {"status": "error", "error": "Failed to reserve spend"}
+        return {
+            "status": "success",
+            "reservation_id": str(reservation_id),
+            "category": str(category),
+            "amount_sats": amount_sats,
+            "budget_before": budget,
+            "budget_after_estimate": _total_cost_budget_status(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-spend-release")
+def revenue_spend_release(plugin: Plugin, reservation_id: str) -> Dict[str, Any]:
+    if database is None:
+        return {"error": "Database not initialized"}
+    try:
+        ok = database.release_spend_reservation(str(reservation_id))
+        return {"status": "success" if ok else "not_found", "reservation_id": str(reservation_id)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-spend-settle")
+def revenue_spend_settle(
+    plugin: Plugin,
+    reservation_id: str,
+    actual_spent_sats: int = None,
+    source: str = None,
+    record_event: bool = False,
+) -> Dict[str, Any]:
+    """Mark a reservation spent and optionally record a generic spend event."""
+    if database is None:
+        return {"error": "Database not initialized"}
+    try:
+        ok = database.mark_spend_reservation_spent(
+            reservation_id=str(reservation_id),
+            actual_spent_sats=(None if actual_spent_sats is None else int(actual_spent_sats)),
+            source=source,
+            record_event=bool(record_event),
+        )
+        return {"status": "success" if ok else "not_found", "reservation_id": str(reservation_id)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @plugin.method("revenue-boltz-quote")
 def revenue_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reverse", currency: str = None) -> Dict[str, Any]:
     try:
@@ -4756,18 +4909,26 @@ def _rebalance_liquidity_cost_components(window_hours: int = 24) -> Dict[str, An
         }
 
 
-def _boltz_liquidity_cost_components() -> Dict[str, Any]:
-    """Boltz swap spend for unified liquidity-cost accounting (reserved currently 0)."""
+def _boltz_liquidity_cost_components(window_hours: int = 24) -> Dict[str, Any]:
+    """Boltz swap spend component only (no external costs, no unified budget recursion)."""
     if boltz_manager is None:
         return {"source": "boltz", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
     try:
-        budget = boltz_manager.budget()
+        if hasattr(boltz_manager, "get_boltz_cost_components"):
+            comps = boltz_manager.get_boltz_cost_components(window_hours=window_hours)
+        else:
+            budget = boltz_manager.budget()
+            comps = {
+                "spent_24h_sats": int(budget.get("boltz_spent_24h_sats_estimate", budget.get("spent_24h_sats_estimate", 0)) or 0),
+                "reserved_24h_sats": 0,
+                "counted_swaps": int(budget.get("counted_swaps", 0) or 0),
+            }
         return {
             "source": "boltz",
             "available": True,
-            "spent_24h_sats": int(budget.get("boltz_spent_24h_sats_estimate", budget.get("spent_24h_sats_estimate", 0)) or 0),
-            "reserved_24h_sats": 0,
-            "counted_swaps": int(budget.get("counted_swaps", 0) or 0),
+            "spent_24h_sats": int(comps.get("spent_24h_sats", 0) or 0),
+            "reserved_24h_sats": int(comps.get("reserved_24h_sats", 0) or 0),
+            "counted_swaps": int(comps.get("counted_swaps", 0) or 0),
         }
     except Exception as e:
         return {
@@ -4777,6 +4938,149 @@ def _boltz_liquidity_cost_components() -> Dict[str, Any]:
             "spent_24h_sats": 0,
             "reserved_24h_sats": 0,
         }
+
+
+def _normalize_total_cost_budget_mode(mode: Optional[str]) -> str:
+    m = str(mode or "fixed").strip().lower()
+    return "profit_pct" if m in ("profit", "profit_pct", "profit-percent", "percentage") else "fixed"
+
+
+def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, Any]:
+    """Unified budget status across rebalances, Boltz swaps, and on-chain liquidity ops."""
+    if config is None or database is None:
+        return {"error": "Plugin not initialized"}
+
+    cfg = config.snapshot() if hasattr(config, "snapshot") else config
+    wh = int(window_hours or getattr(cfg, "total_cost_budget_window_hours", 24) or 24)
+    wh = max(1, min(168, wh))
+    now = int(time.time())
+    since = now - (wh * 3600)
+
+    # Best-effort cleanup for generic spend reservations (e.g. channel open/splice
+    # reservations) so accepted actions that aren't explicitly settled do not block
+    # budget forever. Uses max(reservation_timeout_hours, window_hours).
+    try:
+        stale_hours = max(int(getattr(cfg, "reservation_timeout_hours", 4) or 4), wh)
+        database.cleanup_stale_spend_reservations(max_age_seconds=stale_hours * 3600)
+    except Exception:
+        pass
+
+    # Actual cost components (canonical data sources)
+    rebalance = _rebalance_liquidity_cost_components(window_hours=wh)
+    boltz = _boltz_liquidity_cost_components(window_hours=wh)
+    generic_ledger = database.get_spend_ledger_summary(window_hours=wh) if database else {
+        "spent_24h_sats": 0, "reserved_24h_sats": 0, "spent_by_category": {}, "reserved_by_category": {}
+    }
+    revenue_sats = int(database.get_total_routing_revenue(since)) if database else 0
+    open_cost_sats = int(database.get_opening_costs_since(since)) if database else 0
+    closure_cost_sats = int(database.get_closure_costs_since(since)) if database else 0
+    splice_cost_sats = int(database.get_splice_costs_since(since)) if database else 0
+
+    actual_by_category = {
+        "rebalance": int(rebalance.get("spent_24h_sats", 0) or 0),
+        "boltz": int(boltz.get("spent_24h_sats", 0) or 0),
+        "open": open_cost_sats,
+        "close": closure_cost_sats,
+        "splice": splice_cost_sats,
+        "ledger": int(generic_ledger.get("spent_24h_sats", 0) or 0),
+    }
+    reserved_by_category = {
+        "rebalance": int(rebalance.get("reserved_24h_sats", 0) or 0),
+        "boltz": int(boltz.get("reserved_24h_sats", 0) or 0),
+        "ledger": int(generic_ledger.get("reserved_24h_sats", 0) or 0),
+    }
+
+    actual_total = sum(max(0, int(v or 0)) for v in actual_by_category.values())
+    reserved_total = sum(max(0, int(v or 0)) for v in reserved_by_category.values())
+
+    mode = _normalize_total_cost_budget_mode(getattr(cfg, "total_cost_budget_mode", "fixed"))
+    fixed_floor = max(0, int(getattr(cfg, "daily_budget_sats", 0) or 0))
+    pct_cfg = float(getattr(cfg, "total_cost_budget_profit_pct", 0.30) or 0.30)
+    pct_cap = float(getattr(cfg, "total_cost_budget_profit_pct_cap", 0.75) or 0.75)
+    pct_effective = max(0.0, min(pct_cfg, pct_cap, 1.0))
+    net_profit_sats = int(revenue_sats - actual_total)
+    profit_based_budget_sats = int(max(0, net_profit_sats) * pct_effective)
+
+    if mode == "profit_pct":
+        # Keep the fixed budget as a floor for resilience/recovery.
+        effective_budget_sats = max(fixed_floor, profit_based_budget_sats)
+    else:
+        effective_budget_sats = fixed_floor
+
+    remaining_sats = max(0, int(effective_budget_sats) - actual_total - reserved_total)
+
+    return {
+        "source": "total_cost_budget",
+        "window_hours": wh,
+        "since_timestamp": since,
+        "mode": mode,
+        "daily_budget_floor_sats": fixed_floor,
+        "profit_pct_requested": pct_cfg,
+        "profit_pct_cap": pct_cap,
+        "profit_pct_effective": pct_effective,
+        "profit_based_budget_sats": profit_based_budget_sats,
+        "effective_budget_sats": int(effective_budget_sats),
+        "revenue_sats": revenue_sats,
+        "actual_spent_sats": actual_total,
+        "reserved_sats": reserved_total,
+        "remaining_sats": remaining_sats,
+        "net_profit_sats_after_costs": net_profit_sats,
+        "actual_spent_by_category": actual_by_category,
+        "reserved_by_category": reserved_by_category,
+        "components": {
+            "rebalance": rebalance,
+            "boltz": boltz,
+            "generic_ledger": generic_ledger,
+            "open_cost_sats": open_cost_sats,
+            "closure_cost_sats": closure_cost_sats,
+            "splice_cost_sats": splice_cost_sats,
+        },
+    }
+
+
+def _total_cost_budget_limit_provider() -> Dict[str, Any]:
+    status = _total_cost_budget_status()
+    if "error" in status:
+        # Fall back to fixed budget floor if unavailable.
+        floor = int(getattr(config, "daily_budget_sats", 0) or 0) if config is not None else 0
+        return {"source": "fallback", "effective_budget_sats": max(0, floor)}
+    return {
+        "source": "total_cost_budget",
+        "effective_budget_sats": int(status.get("effective_budget_sats", 0) or 0),
+        "mode": status.get("mode"),
+        "window_hours": status.get("window_hours"),
+        "remaining_sats": status.get("remaining_sats"),
+    }
+
+
+def _non_rebalance_liquidity_cost_components(window_hours: Optional[int] = None) -> Dict[str, Any]:
+    status = _total_cost_budget_status(window_hours=window_hours)
+    if "error" in status:
+        return {"source": "non_rebalance_total_costs", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
+    actual = status.get("actual_spent_by_category", {}) if isinstance(status.get("actual_spent_by_category"), dict) else {}
+    reserved = status.get("reserved_by_category", {}) if isinstance(status.get("reserved_by_category"), dict) else {}
+    return {
+        "source": "non_rebalance_total_costs",
+        "available": True,
+        "spent_24h_sats": max(0, int(status.get("actual_spent_sats", 0) or 0) - int(actual.get("rebalance", 0) or 0)),
+        "reserved_24h_sats": max(0, int(status.get("reserved_sats", 0) or 0) - int(reserved.get("rebalance", 0) or 0)),
+        "window_hours": int(status.get("window_hours", 24) or 24),
+    }
+
+
+def _non_boltz_liquidity_cost_components(window_hours: Optional[int] = None) -> Dict[str, Any]:
+    status = _total_cost_budget_status(window_hours=window_hours)
+    if "error" in status:
+        return {"source": "non_boltz_total_costs", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
+    actual = status.get("actual_spent_by_category", {}) if isinstance(status.get("actual_spent_by_category"), dict) else {}
+    reserved = status.get("reserved_by_category", {}) if isinstance(status.get("reserved_by_category"), dict) else {}
+    return {
+        "source": "non_boltz_total_costs",
+        "available": True,
+        "spent_24h_sats": max(0, int(status.get("actual_spent_sats", 0) or 0) - int(actual.get("boltz", 0) or 0)),
+        "reserved_24h_sats": max(0, int(status.get("reserved_sats", 0) or 0) - int(reserved.get("boltz", 0) or 0)),
+        "window_hours": int(status.get("window_hours", 24) or 24),
+    }
 
 
 def _boltz_direction_allowed_by_policy(peer_id: str, direction: str) -> Tuple[bool, str]:

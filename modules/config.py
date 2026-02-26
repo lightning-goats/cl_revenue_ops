@@ -33,6 +33,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'min_fee_ppm': int,
     'max_fee_ppm': int,
     'daily_budget_sats': int,
+    'total_cost_budget_mode': str,
+    'total_cost_budget_profit_pct': float,
+    'total_cost_budget_profit_pct_cap': float,
+    'total_cost_budget_window_hours': int,
     'min_wallet_reserve': int,
     'low_liquidity_threshold': float,
     'high_liquidity_threshold': float,
@@ -132,6 +136,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
     'max_fee_ppm': (1, 100000),
     'daily_budget_sats': (0, 10000000),
+    'total_cost_budget_profit_pct': (0.0, 1.0),
+    'total_cost_budget_profit_pct_cap': (0.0, 1.0),
+    'total_cost_budget_window_hours': (1, 168),
     'min_wallet_reserve': (0, 100000000),
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
@@ -251,6 +258,10 @@ class Config:
     
     # Global Capital Controls
     daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period (fixed floor)
+    total_cost_budget_mode: str = 'fixed'  # 'fixed' or 'profit_pct' (global liquidity spend gate)
+    total_cost_budget_profit_pct: float = 0.30  # Percent of net profit allocated to spend budget when mode=profit_pct
+    total_cost_budget_profit_pct_cap: float = 0.75  # Hard cap for pct input (operator guard)
+    total_cost_budget_window_hours: int = 24  # Window for profit-based budget calculation
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
 
     # Revenue-Proportional Budget (Phase 7: Dynamic Budget Scaling)
@@ -572,6 +583,10 @@ class ConfigSnapshot:
     
     # Global Capital Controls
     daily_budget_sats: int
+    total_cost_budget_mode: str
+    total_cost_budget_profit_pct: float
+    total_cost_budget_profit_pct_cap: float
+    total_cost_budget_window_hours: int
     min_wallet_reserve: int
 
     # Revenue-Proportional Budget

@@ -1792,6 +1792,8 @@ class EVRebalancer:
         # Optional callback injected by cl-revenue-ops to report external liquidity
         # costs (e.g. Boltz swap fees) for unified budget gating.
         self.external_liquidity_cost_provider = None
+        # Optional callback injected by cl-revenue-ops to provide unified total-cost budget limit.
+        self.global_budget_limit_provider = None
 
         # Initialize job manager for async execution (pass hive_bridge for outcome reporting)
         self.job_manager = JobManager(plugin, config, database, hive_bridge=hive_bridge)
@@ -1815,6 +1817,22 @@ class EVRebalancer:
         except Exception as e:
             self.plugin.log(f"External liquidity cost provider failed: {e}", level='warn')
             return {"spent_24h_sats": 0, "reserved_24h_sats": 0}
+
+    def _get_global_budget_limit(self, cfg: Optional[ConfigSnapshot] = None) -> int:
+        provider = getattr(self, "global_budget_limit_provider", None)
+        if callable(provider):
+            try:
+                data = provider()
+                if isinstance(data, dict):
+                    if "effective_budget_sats" in data:
+                        return max(0, int(data.get("effective_budget_sats", 0) or 0))
+                    if "budget_sats" in data:
+                        return max(0, int(data.get("budget_sats", 0) or 0))
+                if isinstance(data, (int, float, str)):
+                    return max(0, int(float(data)))
+            except Exception as e:
+                self.plugin.log(f"Global budget limit provider failed: {e}", level='warn')
+        return max(0, int((cfg or self.config.snapshot()).daily_budget_sats))
 
     def _get_our_node_id(self) -> str:
         if self._our_node_id is None:
@@ -3508,7 +3526,8 @@ class EVRebalancer:
                 # CRITICAL-01 FIX: Atomic budget reservation
                 # Reserve budget BEFORE starting the job to prevent concurrent overspend.
                 now = int(time.time())
-                since_24h = now - 86400
+                budget_window_hours = max(1, int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24))
+                since_24h = now - (budget_window_hours * 3600)
 
                 # Calculate effective budget (same logic as _check_capital_controls)
                 effective_budget = cfg.daily_budget_sats
@@ -3516,6 +3535,7 @@ class EVRebalancer:
                     revenue_24h = self.database.get_total_routing_revenue(since_24h)
                     proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
                     effective_budget = max(cfg.daily_budget_sats, proportional_budget)
+                effective_budget = self._get_global_budget_limit(cfg)
 
                 ext_costs = self._get_external_liquidity_costs()
                 ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
@@ -3902,8 +3922,10 @@ class EVRebalancer:
                     f"Effective budget: {effective_budget} sats (floor: {cfg.daily_budget_sats})",
                     level='debug'
                 )
+            effective_budget = self._get_global_budget_limit(cfg)
 
-            fees_spent_24h = self.database.get_total_rebalance_fees(int(time.time()) - 86400)
+            budget_window_hours = max(1, int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24))
+            fees_spent_24h = self.database.get_total_rebalance_fees(int(time.time()) - (budget_window_hours * 3600))
             ext_costs = self._get_external_liquidity_costs()
             ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
             ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)

@@ -46,6 +46,8 @@ class BoltzCliManager:
         # Optional callback set by cl-revenue-ops plugin to provide non-Boltz liquidity costs
         # (e.g. market rebalance spend/reservations) for unified budget accounting.
         self.external_liquidity_cost_provider = None
+        # Optional callback returning unified budget limit info for all liquidity costs.
+        self.global_budget_limit_provider = None
 
     # ---------------------------------------------------------------------
     # Core command execution helpers
@@ -343,6 +345,71 @@ class BoltzCliManager:
             **{k: v for k, v in data.items() if k not in ("source", "spent_24h_sats", "reserved_24h_sats")},
         }
 
+    def _get_global_budget_limit(self) -> Dict[str, Any]:
+        provider = getattr(self, "global_budget_limit_provider", None)
+        if not callable(provider):
+            return {"budget_sats": max(0, int(self.cfg.daily_budget_sats)), "source": "boltz_cfg"}
+        try:
+            data = provider()
+            if isinstance(data, dict):
+                if "effective_budget_sats" in data:
+                    return {
+                        "budget_sats": max(0, self._parse_int(data.get("effective_budget_sats"), self.cfg.daily_budget_sats)),
+                        "source": str(data.get("source") or "provider"),
+                        **{k: v for k, v in data.items() if k != "effective_budget_sats"},
+                    }
+                if "budget_sats" in data:
+                    return {
+                        "budget_sats": max(0, self._parse_int(data.get("budget_sats"), self.cfg.daily_budget_sats)),
+                        "source": str(data.get("source") or "provider"),
+                        **{k: v for k, v in data.items() if k != "budget_sats"},
+                    }
+            if isinstance(data, (int, float, str)):
+                return {"budget_sats": max(0, self._parse_int(data, self.cfg.daily_budget_sats)), "source": "provider_scalar"}
+        except Exception as e:
+            self.plugin.log(f"BOLTZ: global budget limit provider failed: {e}", level="warn")
+        return {"budget_sats": max(0, int(self.cfg.daily_budget_sats)), "source": "boltz_cfg_fallback"}
+
+    def get_boltz_cost_components(self, window_hours: int = 24) -> Dict[str, Any]:
+        """Boltz-only spend component summary (no external costs, no unified budget math)."""
+        swaps_json = self._listswaps_json(manual_only=True)
+        swaps = self._extract_swap_list(swaps_json)
+        swaps = self._augment_with_swap_journal(swaps, limit_hint=50)
+        now = int(time.time())
+        window_hours = max(1, min(168, int(window_hours or 24)))
+        cutoff = now - (window_hours * 3600)
+
+        boltz_spent = 0
+        counted: List[Dict[str, Any]] = []
+        unknown_ts = 0
+        for s in swaps:
+            ts = self._swap_created_ts(s)
+            if ts is None:
+                unknown_ts += 1
+                continue
+            if ts < cutoff:
+                continue
+            if not self._is_completed_swap(s):
+                continue
+            fee_sats = self._estimate_swap_fee_sats(s)
+            boltz_spent += max(0, fee_sats)
+            counted.append({
+                "id": s.get("id"),
+                "created_at": ts,
+                "fee_sats_estimate": fee_sats,
+                "state": s.get("state"),
+                "status": s.get("status"),
+            })
+        return {
+            "spent_24h_sats": boltz_spent,
+            "reserved_24h_sats": 0,
+            "counted_swaps": len(counted),
+            "skipped_without_timestamp": unknown_ts,
+            "counted_details": counted[:20],
+            "window_seconds": window_hours * 3600,
+            "source": "boltz",
+        }
+
     def _swap_entry_error_text(self, swap: Optional[Dict[str, Any]]) -> str:
         if not isinstance(swap, dict):
             return ""
@@ -455,34 +522,12 @@ class BoltzCliManager:
     # Budget helpers
     # ---------------------------------------------------------------------
     def get_budget_status(self) -> Dict[str, Any]:
-        budget = max(0, int(self.cfg.daily_budget_sats))
-        swaps_json = self._listswaps_json(manual_only=True)
-        swaps = self._extract_swap_list(swaps_json)
-        swaps = self._augment_with_swap_journal(swaps, limit_hint=50)
-        now = int(time.time())
-        cutoff = now - 86400
-
-        boltz_spent = 0
-        counted: List[Dict[str, Any]] = []
-        unknown_ts = 0
-        for s in swaps:
-            ts = self._swap_created_ts(s)
-            if ts is None:
-                unknown_ts += 1
-                continue
-            if ts < cutoff:
-                continue
-            if not self._is_completed_swap(s):
-                continue
-            fee_sats = self._estimate_swap_fee_sats(s)
-            boltz_spent += max(0, fee_sats)
-            counted.append({
-                "id": s.get("id"),
-                "created_at": ts,
-                "fee_sats_estimate": fee_sats,
-                "state": s.get("state"),
-                "status": s.get("status"),
-            })
+        budget_info = self._get_global_budget_limit()
+        budget = max(0, self._parse_int(budget_info.get("budget_sats"), self.cfg.daily_budget_sats))
+        local = self.get_boltz_cost_components(window_hours=24)
+        boltz_spent = max(0, self._parse_int(local.get("spent_24h_sats"), 0))
+        counted = list(local.get("counted_details", [])) if isinstance(local.get("counted_details"), list) else []
+        unknown_ts = max(0, self._parse_int(local.get("skipped_without_timestamp"), 0))
 
         external = self._get_external_liquidity_costs()
         external_spent = max(0, self._parse_int(external.get("spent_24h_sats"), 0))
@@ -502,6 +547,8 @@ class BoltzCliManager:
             "boltz_spent_24h_sats_estimate": boltz_spent,
             "boltz_remaining_24h_sats_estimate": boltz_remaining,
             "external_liquidity_costs": external,
+            "budget_source": budget_info.get("source"),
+            "budget_info": budget_info,
             "counted_swaps": len(counted),
             "skipped_without_timestamp": unknown_ts,
             "enforce_budget": bool(self.cfg.enforce_budget),

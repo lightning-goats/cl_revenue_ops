@@ -611,6 +611,41 @@ class Database:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_budget_reservations_status ON budget_reservations(status, reserved_at)")
 
+        # Generic spend reservations/events for unified total-cost budget gating.
+        # Used by actions outside the rebalance engine (e.g. channel open/close/splice proposals)
+        # to reserve and optionally record spend against the same budget envelope.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS spend_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                subcategory TEXT,
+                reserved_sats INTEGER NOT NULL,
+                reserved_at INTEGER NOT NULL,
+                reference_id TEXT,
+                channel_id TEXT,
+                status TEXT NOT NULL DEFAULT 'active',  -- 'active', 'spent', 'released'
+                metadata_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_reservations_status ON spend_reservations(status, reserved_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_reservations_category ON spend_reservations(category, reserved_at)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS spend_events (
+                event_id TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                subcategory TEXT,
+                amount_sats INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL,
+                reference_id TEXT,
+                channel_id TEXT,
+                source TEXT,
+                metadata_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_events_time ON spend_events(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_events_category ON spend_events(category, timestamp)")
+
         # Phase 8: Financial Snapshots for P&L Dashboard
         # Records daily node state for TLV tracking and trend analysis
         conn.execute("""
@@ -2299,6 +2334,153 @@ class Database:
             "released_sats": total_sats
         }
 
+    # =========================================================================
+    # Generic Spend Ledger (Unified Budget Gating for all spending categories)
+    # =========================================================================
+
+    def reserve_spend(self, reservation_id: str, amount_sats: int, category: str,
+                     subcategory: Optional[str] = None, reference_id: Optional[str] = None,
+                     channel_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Create a generic spend reservation (best-effort, caller enforces budget)."""
+        conn = self._get_connection()
+        now = int(time.time())
+        amount = self._sanitize_fee(amount_sats, "reserved_sats")
+        if amount <= 0:
+            return False
+        rid = str(reservation_id or "").strip()
+        if not rid:
+            return False
+        cat = str(category or "").strip().lower()
+        if not cat:
+            return False
+        meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO spend_reservations
+                (reservation_id, category, subcategory, reserved_sats, reserved_at, reference_id, channel_id, status, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
+            """, (rid, cat, subcategory, amount, now, reference_id, channel_id, meta_json))
+            return True
+        except Exception as e:
+            self.plugin.log(f"Spend reservation failed: {e}", level='error')
+            return False
+
+    def release_spend_reservation(self, reservation_id: str) -> bool:
+        conn = self._get_connection()
+        cursor = conn.execute("""
+            UPDATE spend_reservations
+            SET status = 'released'
+            WHERE reservation_id = ? AND status = 'active'
+        """, (str(reservation_id),))
+        return cursor.rowcount > 0
+
+    def mark_spend_reservation_spent(self, reservation_id: str, actual_spent_sats: Optional[int] = None,
+                                     source: Optional[str] = None, record_event: bool = False) -> bool:
+        """Mark reservation spent; optionally also record a spend event."""
+        conn = self._get_connection()
+        rid = str(reservation_id or "").strip()
+        if not rid:
+            return False
+        row = conn.execute("""
+            SELECT * FROM spend_reservations WHERE reservation_id = ?
+        """, (rid,)).fetchone()
+        if not row:
+            return False
+        cursor = conn.execute("""
+            UPDATE spend_reservations
+            SET status = 'spent'
+            WHERE reservation_id = ? AND status = 'active'
+        """, (rid,))
+        changed = cursor.rowcount > 0
+        if changed and record_event:
+            amount = self._sanitize_fee(actual_spent_sats if actual_spent_sats is not None else row["reserved_sats"], "actual_spent_sats")
+            self.record_spend_event(
+                event_id=f"resv:{rid}",
+                category=row["category"],
+                amount_sats=amount,
+                subcategory=row["subcategory"],
+                reference_id=row["reference_id"],
+                channel_id=row["channel_id"],
+                source=source or "reservation_settlement",
+                metadata={"reservation_id": rid},
+            )
+        return changed
+
+    def record_spend_event(self, event_id: str, category: str, amount_sats: int,
+                          subcategory: Optional[str] = None, timestamp: Optional[int] = None,
+                          reference_id: Optional[str] = None, channel_id: Optional[str] = None,
+                          source: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Record a generic spend event for categories not covered by canonical tables."""
+        conn = self._get_connection()
+        eid = str(event_id or "").strip()
+        cat = str(category or "").strip().lower()
+        if not eid or not cat:
+            return False
+        ts = int(timestamp or time.time())
+        amount = self._sanitize_fee(amount_sats, "amount_sats")
+        meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO spend_events
+                (event_id, category, subcategory, amount_sats, timestamp, reference_id, channel_id, source, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (eid, cat, subcategory, amount, ts, reference_id, channel_id, source, meta_json))
+            return True
+        except Exception as e:
+            self.plugin.log(f"Record spend event failed: {e}", level='error')
+            return False
+
+    def cleanup_stale_spend_reservations(self, max_age_seconds: int = 86400) -> int:
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        cursor = conn.execute("""
+            UPDATE spend_reservations
+            SET status = 'released'
+            WHERE status = 'active' AND reserved_at < ?
+        """, (cutoff,))
+        return cursor.rowcount
+
+    def get_spend_ledger_summary(self, window_hours: int = 24) -> Dict[str, Any]:
+        """Summarize generic spend ledger events + reservations for unified budget accounting."""
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (int(window_hours) * 3600)
+
+        spent_row = conn.execute("""
+            SELECT COALESCE(SUM(amount_sats), 0) AS total_spent
+            FROM spend_events
+            WHERE timestamp >= ?
+        """, (cutoff,)).fetchone()
+
+        reserved_row = conn.execute("""
+            SELECT COALESCE(SUM(reserved_sats), 0) AS total_reserved
+            FROM spend_reservations
+            WHERE status = 'active' AND reserved_at >= ?
+        """, (cutoff,)).fetchone()
+
+        by_cat_events = conn.execute("""
+            SELECT category, COALESCE(SUM(amount_sats), 0) AS total
+            FROM spend_events
+            WHERE timestamp >= ?
+            GROUP BY category
+        """, (cutoff,)).fetchall()
+        by_cat_resv = conn.execute("""
+            SELECT category, COALESCE(SUM(reserved_sats), 0) AS total
+            FROM spend_reservations
+            WHERE status = 'active' AND reserved_at >= ?
+            GROUP BY category
+        """, (cutoff,)).fetchall()
+
+        spent_by_category = {str(r["category"]): int(r["total"] or 0) for r in by_cat_events}
+        reserved_by_category = {str(r["category"]): int(r["total"] or 0) for r in by_cat_resv}
+
+        return {
+            "window_hours": int(window_hours),
+            "spent_24h_sats": int((spent_row["total_spent"] if spent_row else 0) or 0),
+            "reserved_24h_sats": int((reserved_row["total_reserved"] if reserved_row else 0) or 0),
+            "spent_by_category": spent_by_category,
+            "reserved_by_category": reserved_by_category,
+        }
+
     def get_daily_rebalance_spend(self, window_hours: int = 24) -> Dict[str, Any]:
         """
         Get rebalance spending summary for the specified window (Issue #23).
@@ -3574,6 +3756,24 @@ class Database:
             FROM channel_closure_costs
         """).fetchone()
 
+        return row["total"] if row else 0
+
+    def get_opening_costs_since(self, since_timestamp: int) -> int:
+        """
+        Get channel opening costs since a specific timestamp.
+
+        Args:
+            since_timestamp: Unix timestamp to query from
+
+        Returns:
+            Total channel open costs in sats since the timestamp
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(open_cost_sats), 0) as total
+            FROM channel_costs
+            WHERE opened_at >= ?
+        """, (since_timestamp,)).fetchone()
         return row["total"] if row else 0
 
     def get_closure_costs_since(self, since_timestamp: int) -> int:
