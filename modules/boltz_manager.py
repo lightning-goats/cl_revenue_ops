@@ -704,6 +704,31 @@ class BoltzCliManager:
             if chan_ids and self._contains_chanids_cln_error(result):
                 warnings.append("CLN boltz backend rejected chanIds in JSON result; retried reverse swap without channel pinning")
                 result = self._run_json(_build_args(include_chanids=False), timeout=max(self.cfg.timeout_seconds, 120))
+            elif chan_ids:
+                # Some CLN/Boltz versions accept create-reverse-swap first, then surface the chanIds rejection asynchronously in swapinfo.
+                primary_created = self._primary_swap_entry(result)
+                created_id = str((primary_created or {}).get("id") or "").strip()
+                if created_id and not self._is_error_swap(primary_created):
+                    probe_timeout = max(self.cfg.timeout_seconds, 120)
+                    for _ in range(3):
+                        try:
+                            probe = self._run_json(["swapinfo", created_id], timeout=probe_timeout)
+                        except Exception:
+                            probe = None
+                        if isinstance(probe, dict):
+                            try:
+                                self._record_swap_result(probe, source="loop_out_probe")
+                            except Exception:
+                                pass
+                            if self._contains_chanids_cln_error(probe):
+                                warnings.append("CLN boltz backend rejected chanIds asynchronously; retried reverse swap without channel pinning")
+                                result = self._run_json(_build_args(include_chanids=False), timeout=probe_timeout)
+                                break
+                            probe_primary = self._primary_swap_entry(probe)
+                            if probe_primary and not self._is_error_swap(probe_primary):
+                                # No async rejection observed yet; avoid extra blocking if swap is proceeding normally.
+                                break
+                        time.sleep(0.5)
         except BoltzCliError as e:
             msg = str(e)
             if chan_ids and "chanIds are not supported for cln" in msg:
