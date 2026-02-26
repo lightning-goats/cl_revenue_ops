@@ -5202,8 +5202,8 @@ class HillClimbingFeeController:
                         ceiling_ppm, current_revenue_rate, weight_scale=0.3
                     )
                     self._save_thompson_aimd_state(channel_id, ts_state_synth)
-                except Exception:
-                    pass  # Synthetic injection is best-effort
+                except Exception as e:
+                    self.plugin.log(f"Synthetic Thompson state injection failed for {channel_id[:12]}...: {e}", level='debug')
 
         # Priority 2: Zero-Fee Probe Logic (Jumpstarting)
         if not target_found and is_under_probe:
@@ -5224,9 +5224,8 @@ class HillClimbingFeeController:
                 # Leaving channels at 0 fee until the next cycle can leak revenue.
                 try:
                     self.database.clear_channel_probe(channel_id)
-                except Exception:
-                    # Probe flag is best-effort; failure shouldn't block fee correction.
-                    pass
+                except Exception as e:
+                    self.plugin.log(f"Failed to clear channel probe for {channel_id[:12]}...: {e}", level='debug')
 
                 new_fee_ppm = max(floor_ppm, cfg.min_fee_ppm)
                 decision_reason = "ZERO_FEE_PROBE_SUCCESS"
@@ -5254,8 +5253,8 @@ class HillClimbingFeeController:
                             new_fee_ppm, probe_revenue, weight_scale=0.2
                         )
                         self._save_thompson_aimd_state(channel_id, ts_state_synth)
-                    except Exception:
-                        pass  # Synthetic injection is best-effort
+                    except Exception as e:
+                        self.plugin.log(f"Synthetic Thompson state injection (probe success) failed for {channel_id[:12]}...: {e}", level='debug')
             else:
                 # Still probing: force 0 PPM
                 new_fee_ppm = 0
@@ -5276,8 +5275,8 @@ class HillClimbingFeeController:
                             0, 0.0, weight_scale=0.1
                         )
                         self._save_thompson_aimd_state(channel_id, ts_state_synth)
-                    except Exception:
-                        pass  # Synthetic injection is best-effort
+                    except Exception as e:
+                        self.plugin.log(f"Synthetic Thompson state injection (probe active) failed for {channel_id[:12]}...: {e}", level='debug')
 
         # Priority 4: Fee Discovery Algorithm
         # =====================================================================

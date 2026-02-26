@@ -1152,10 +1152,10 @@ class Database:
         except Exception:
             try:
                 conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                self.plugin.log(f"ROLLBACK failed in update_channel_state: {rb_err}", level='error')
             raise
-    
+
     def get_channel_state(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Get the current state of a channel."""
         conn = self._get_connection()
@@ -2218,8 +2218,8 @@ class Database:
         except Exception as e:
             try:
                 conn.execute("ROLLBACK")
-            except Exception:
-                pass  # Rollback failed - original exception is more important
+            except Exception as rb_err:
+                self.plugin.log(f"ROLLBACK failed in reserve_budget: {rb_err}", level='error')
             self.plugin.log(f"Budget reservation failed: {e}", level='error')
             return (False, 0)
 
@@ -2810,8 +2810,8 @@ class Database:
             except Exception:
                 try:
                     conn.execute("ROLLBACK")
-                except Exception:
-                    pass
+                except Exception as rb_err:
+                    self.plugin.log(f"ROLLBACK failed in bulk_insert_forwards: {rb_err}", level='error')
                 raise
 
             return inserted
@@ -4521,10 +4521,10 @@ class Database:
         except Exception:
             try:
                 conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                self.plugin.log(f"ROLLBACK failed in apply_reputation_decay: {rb_err}", level='error')
             raise
-    
+
     # =========================================================================
     # Cleanup Methods
     # =========================================================================

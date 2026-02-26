@@ -272,8 +272,8 @@ class JobManager:
                 rebalancing_active=active,
                 rebalancing_peers=list(peers)
             )
-        except Exception:
-            pass  # Non-critical reporting, never crash
+        except Exception as e:
+            self.plugin.log(f"Hive rebalancing activity update failed: {e}", level='debug')
 
     def _report_outcome_to_hive(self, job: ActiveJob, success: bool, cost_sats: int,
                                  amount_transferred: int = 0, failure_reason: str = "") -> None:
@@ -1100,8 +1100,8 @@ class JobManager:
                 self.database.record_rebalance_cost(
                     job.scid_normalized, dest_peer_id,
                     actual_cost_sats, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                self.plugin.log(f"Failed to record rebalance cost: {e}", level='debug')
 
         # L-17: Budget was actually spent (overspent), mark as spent not released
         # H-4: Ensure reservation_id is str to match DB column type
@@ -1194,8 +1194,8 @@ class JobManager:
             # Release budget reservation before stopping (prevents orphaned reservations on shutdown)
             try:
                 self.database.release_budget_reservation(str(job.rebalance_id))
-            except Exception:
-                pass
+            except Exception as e:
+                self.plugin.log(f"Failed to release budget reservation during stop_all: {e}", level='debug')
             if self.stop_job(scid, reason=reason):
                 count += 1
         return count
@@ -1515,8 +1515,8 @@ class JobManager:
                             severity = warning.get("severity", 0)
                             if peer_id and severity >= 0.7:
                                 peers_to_exclude.add(peer_id)
-                except Exception:
-                    pass  # Non-fatal
+                except Exception as e:
+                    self.plugin.log(f"Failed to fetch hive defense warnings: {e}", level='debug')
 
             # Add new exclusions to sling
             for peer_id in peers_to_exclude:
@@ -2028,8 +2028,8 @@ class EVRebalancer:
                             need_type = need.get("need_type", "")
                             if member_id:
                                 self._fleet_mutual_benefit.setdefault(member_id, set()).add(need_type)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.plugin.log(f"Failed to fetch fleet liquidity needs: {e}", level='debug')
 
             # Get set of channels with active jobs
             active_channels = set(self.job_manager.active_channels)
@@ -3103,9 +3103,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                                 level='debug'
                             )
                             break
-            except Exception: 
-                pass
-        
+            except Exception as e:
+                self.plugin.log(f"Failed to query gossip for last-hop fee: {e}", level='debug')
+
         # Cache the result (even if None, to avoid re-querying)
         if hasattr(self, '_fee_cache'):
             self._fee_cache[cache_key] = result
@@ -3442,8 +3442,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         try:
             for p in self.plugin.rpc.listpeers().get("peers", []):
                 status[p.get("id")] = {"connected": p.get("connected", False)}
-        except Exception: 
-            pass
+        except Exception as e:
+            self.plugin.log(f"Failed to get peer connection status: {e}", level='debug')
         return status
 
     def _get_channels_with_balances(self) -> Dict[str, Dict[str, Any]]:
@@ -3846,13 +3846,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     self.database.update_rebalance_result(
                         rebalance_id, 'failed', error_message=str(e)
                     )
-                except Exception:
-                    pass
+                except Exception as db_err:
+                    self.plugin.log(f"Failed to record rebalance failure: {db_err}", level='debug')
             if reserved_budget and rebalance_id is not None and not job_started:
                 try:
                     self.database.release_budget_reservation(str(rebalance_id))
-                except Exception:
-                    pass
+                except Exception as db_err:
+                    self.plugin.log(f"Failed to release budget reservation: {db_err}", level='debug')
             with self._pending_lock:
                 self._pending.pop(candidate.to_channel, None)
 
@@ -4078,8 +4078,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         amount_sats=amount_sats,
                         timestamp=int(time.time())
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.plugin.log(f"Failed to record rebalance cost for {to_channel}: {e}", level='debug')
             result = {"success": True, "message": once_result.get("message", "completed"), "actual_fee_sats": fee_sats}
         else:
             self.database.update_rebalance_result(

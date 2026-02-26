@@ -457,6 +457,7 @@ _scid_to_peer_cache: Dict[str, str] = {}
 _scid_cache_last_cleared: float = 0.0
 _SCID_CACHE_TTL_SECONDS: int = 3600  # Clear cache every hour
 _scid_cache_lock = threading.Lock()
+_scid_cache_fetch_lock = threading.Lock()  # M-2: Serializes cache-miss RPC calls
 
 
 # =============================================================================
@@ -924,64 +925,92 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Build configuration from options. Filter kwargs against the imported Config
     # dataclass fields so partial deployments (new main file + older modules/config.py)
     # don't crash during init. Unknown fields are dropped with a warning.
+    def _safe_int(key, default=0):
+        """Parse option as int with descriptive error on failure."""
+        try:
+            return int(options[key])
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid integer for config '{key}': {options.get(key)!r}") from e
+
+    def _safe_float(key, default=0.0):
+        """Parse option as float with descriptive error on failure."""
+        try:
+            return float(options[key]) if key in options else float(options.get(key, default))
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid float for config '{key}': {options.get(key)!r}") from e
+
+    def _safe_int_opt(key, default=0):
+        """Parse optional option as int with descriptive error on failure."""
+        try:
+            return int(options.get(key, default))
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid integer for config '{key}': {options.get(key)!r}") from e
+
+    def _safe_float_opt(key, default=0.0):
+        """Parse optional option as float with descriptive error on failure."""
+        try:
+            return float(options.get(key, default))
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid float for config '{key}': {options.get(key)!r}") from e
+
     config_kwargs = dict(
         db_path=os.path.expanduser(options['revenue-ops-db-path']),
-        flow_interval=int(options['revenue-ops-flow-interval']),
-        fee_interval=int(options['revenue-ops-fee-interval']),
-        rebalance_interval=int(options['revenue-ops-rebalance-interval']),
+        flow_interval=_safe_int('revenue-ops-flow-interval'),
+        fee_interval=_safe_int('revenue-ops-fee-interval'),
+        rebalance_interval=_safe_int('revenue-ops-rebalance-interval'),
         hot_channel_protection_enabled=options.get('revenue-ops-hot-channel-protection-enabled', 'true').lower() == 'true',
         hot_channel_protection_override_peers=str(options.get('revenue-ops-hot-channel-protection-override-peers', '') or ''),
-        hot_channel_protection_min_velocity=float(options.get('revenue-ops-hot-channel-protection-min-velocity', '0.20')),
-        hot_channel_protection_min_marginal_roi=float(options.get('revenue-ops-hot-channel-protection-min-marginal-roi', '0.20')),
-        hot_channel_protection_profit_budget_pct=float(options.get('revenue-ops-hot-channel-protection-profit-budget-pct', '0.75')),
-        hot_channel_protection_max_chunk_multiplier=float(options.get('revenue-ops-hot-channel-protection-max-chunk-multiplier', '4.0')),
-        hot_channel_protection_min_cooldown_hours=float(options.get('revenue-ops-hot-channel-protection-min-cooldown-hours', '1.0')),
+        hot_channel_protection_min_velocity=_safe_float_opt('revenue-ops-hot-channel-protection-min-velocity', '0.20'),
+        hot_channel_protection_min_marginal_roi=_safe_float_opt('revenue-ops-hot-channel-protection-min-marginal-roi', '0.20'),
+        hot_channel_protection_profit_budget_pct=_safe_float_opt('revenue-ops-hot-channel-protection-profit-budget-pct', '0.75'),
+        hot_channel_protection_max_chunk_multiplier=_safe_float_opt('revenue-ops-hot-channel-protection-max-chunk-multiplier', '4.0'),
+        hot_channel_protection_min_cooldown_hours=_safe_float_opt('revenue-ops-hot-channel-protection-min-cooldown-hours', '1.0'),
         boltz_auto_cycle_enabled=options.get('revenue-ops-boltz-auto-cycle-enabled', 'true').lower() == 'true',
-        boltz_auto_cycle_interval_minutes=int(options.get('revenue-ops-boltz-auto-cycle-interval-minutes', '15')),
-        boltz_auto_cycle_max_actions=int(options.get('revenue-ops-boltz-auto-cycle-max-actions', '1')),
-        boltz_auto_cycle_startup_delay_seconds=int(options.get('revenue-ops-boltz-auto-cycle-startup-delay-seconds', '120')),
+        boltz_auto_cycle_interval_minutes=_safe_int_opt('revenue-ops-boltz-auto-cycle-interval-minutes', '15'),
+        boltz_auto_cycle_max_actions=_safe_int_opt('revenue-ops-boltz-auto-cycle-max-actions', '1'),
+        boltz_auto_cycle_startup_delay_seconds=_safe_int_opt('revenue-ops-boltz-auto-cycle-startup-delay-seconds', '120'),
         expansion_treasury_enabled=options.get('revenue-ops-expansion-treasury-enabled', 'false').lower() == 'true',
-        expansion_treasury_onchain_target_sats=int(options.get('revenue-ops-expansion-treasury-onchain-target-sats', '5000000')),
-        expansion_treasury_min_deficit_sats=int(options.get('revenue-ops-expansion-treasury-min-deficit-sats', '250000')),
+        expansion_treasury_onchain_target_sats=_safe_int_opt('revenue-ops-expansion-treasury-onchain-target-sats', '5000000'),
+        expansion_treasury_min_deficit_sats=_safe_int_opt('revenue-ops-expansion-treasury-min-deficit-sats', '250000'),
         expansion_treasury_preferred_currency=str(options.get('revenue-ops-expansion-treasury-preferred-currency', 'BTC') or 'BTC').upper(),
-        expansion_treasury_max_actions=int(options.get('revenue-ops-expansion-treasury-max-actions', '1')),
-        expansion_treasury_min_source_local_pct=float(options.get('revenue-ops-expansion-treasury-min-source-local-pct', '80.0')),
+        expansion_treasury_max_actions=_safe_int_opt('revenue-ops-expansion-treasury-max-actions', '1'),
+        expansion_treasury_min_source_local_pct=_safe_float_opt('revenue-ops-expansion-treasury-min-source-local-pct', '80.0'),
         expansion_treasury_exclude_protected=options.get('revenue-ops-expansion-treasury-exclude-protected', 'true').lower() == 'true',
-        target_flow=int(options['revenue-ops-target-flow']),
-        min_fee_ppm=int(options['revenue-ops-min-fee-ppm']),
-        max_fee_ppm=int(options['revenue-ops-max-fee-ppm']),
-        rebalance_min_profit=int(options['revenue-ops-rebalance-min-profit']),
-        flow_window_days=int(options['revenue-ops-flow-window-days']),
+        target_flow=_safe_int('revenue-ops-target-flow'),
+        min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
+        max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
+        rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
+        flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         clboss_enabled=options['revenue-ops-clboss-enabled'].lower() == 'true',
         rebalancer_plugin=options['revenue-ops-rebalancer'],
-        daily_budget_sats=int(options['revenue-ops-daily-budget-sats']),
+        daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
         total_cost_budget_mode=options.get('revenue-ops-total-cost-budget-mode', 'fixed').lower(),
-        total_cost_budget_profit_pct=float(options.get('revenue-ops-total-cost-budget-profit-pct', '0.30')),
-        total_cost_budget_profit_pct_cap=float(options.get('revenue-ops-total-cost-budget-profit-pct-cap', '0.75')),
-        total_cost_budget_window_hours=int(options.get('revenue-ops-total-cost-budget-window-hours', '24')),
-        min_wallet_reserve=int(options['revenue-ops-min-wallet-reserve']),
+        total_cost_budget_profit_pct=_safe_float_opt('revenue-ops-total-cost-budget-profit-pct', '0.30'),
+        total_cost_budget_profit_pct_cap=_safe_float_opt('revenue-ops-total-cost-budget-profit-pct-cap', '0.75'),
+        total_cost_budget_window_hours=_safe_int_opt('revenue-ops-total-cost-budget-window-hours', '24'),
+        min_wallet_reserve=_safe_int('revenue-ops-min-wallet-reserve'),
         enable_proportional_budget=options['revenue-ops-proportional-budget'].lower() == 'true',
-        proportional_budget_pct=float(options['revenue-ops-proportional-budget-pct']),
+        proportional_budget_pct=_safe_float('revenue-ops-proportional-budget-pct'),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
-        htlc_congestion_threshold=float(options['revenue-ops-htlc-congestion-threshold']),
+        htlc_congestion_threshold=_safe_float('revenue-ops-htlc-congestion-threshold'),
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
-        reputation_decay=float(options['revenue-ops-reputation-decay']),
+        reputation_decay=_safe_float('revenue-ops-reputation-decay'),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
         kelly_bypass_for_fleet=options['revenue-ops-kelly-bypass-fleet'].lower() == 'true',
-        kelly_fraction=float(options['revenue-ops-kelly-fraction']),
+        kelly_fraction=_safe_float('revenue-ops-kelly-fraction'),
         # Phase 7 options (v1.3.0)
         enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
-        vegas_decay_rate=float(options['revenue-ops-vegas-decay']),
+        vegas_decay_rate=_safe_float('revenue-ops-vegas-decay'),
         enable_scarcity_pricing=options['revenue-ops-scarcity-pricing'].lower() == 'true',
-        scarcity_threshold=float(options['revenue-ops-scarcity-threshold']),
-        rpc_timeout_seconds=int(options['revenue-ops-rpc-timeout-seconds']),
-        rpc_circuit_breaker_seconds=int(options['revenue-ops-rpc-circuit-breaker-seconds']),
+        scarcity_threshold=_safe_float('revenue-ops-scarcity-threshold'),
+        rpc_timeout_seconds=_safe_int('revenue-ops-rpc-timeout-seconds'),
+        rpc_circuit_breaker_seconds=_safe_int('revenue-ops-rpc-circuit-breaker-seconds'),
         hive_bridge_circuit_breaker_enabled=options.get('revenue-ops-hive-bridge-circuit-breaker-enabled', 'false').lower() == 'true',
-        reservation_timeout_hours=int(options['revenue-ops-reservation-timeout-hours']),
+        reservation_timeout_hours=_safe_int('revenue-ops-reservation-timeout-hours'),
         # Phase 9: Hive Integration (cl-hive fleet coordination)
         hive_enabled=options['revenue-ops-hive-enabled'].lower(),
-        hive_fee_ppm=int(options['revenue-ops-hive-fee-ppm']),
-        hive_rebalance_tolerance=int(options['revenue-ops-hive-rebalance-tolerance'])
+        hive_fee_ppm=_safe_int('revenue-ops-hive-fee-ppm'),
+        hive_rebalance_tolerance=_safe_int('revenue-ops-hive-rebalance-tolerance')
     )
     try:
         config_fields = {f.name for f in dataclasses.fields(Config)}
@@ -1133,9 +1162,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             # counter), NOT a Unix timestamp.  Passing a timestamp silently returns
             # zero results on any node with < 1.7 billion forwards.  Use unfiltered
             # fetch and rely on the post-filter at received_time > start_time below.
+            # M-7 FIX: Cap hydration window to prevent unbounded memory on high-volume nodes.
+            max_hydration_days = max(config.flow_window_days + 1, 15)
+            hydration_floor = now - (max_hydration_days * 86400)
+            start_time = max(start_time, hydration_floor)
             try:
                 result = safe_plugin.rpc.listforwards(status="settled")
-            except Exception:
+            except Exception as e:
+                plugin.log(f"Warning: listforwards RPC failed during hydration: {e}. "
+                           f"Flow analysis will use existing database data only.", level='warn')
                 result = {"forwards": []}
             forwards_to_insert = []
 
@@ -1357,9 +1392,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 plugin.log(f"RPC degraded in flow analysis: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
                 plugin.log(f"Error in flow analysis: {e}", level='error')
-            
-            # Calculate +/- 20% jitter (minimum 60s to prevent busy loop)
-            interval = max(60, config.flow_interval)
+
+            # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
+            cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+            interval = max(60, cfg_snap.flow_interval)
             jitter_seconds = int(interval * 0.2)
             sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Flow analysis sleeping for {sleep_time}s")
@@ -1386,8 +1422,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             except Exception as e:
                 plugin.log(f"Error in fee adjustment: {e}", level='error')
 
-            # Calculate +/- 20% jitter (minimum 60s to prevent busy loop)
-            interval = max(60, config.fee_interval)
+            # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
+            cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+            interval = max(60, cfg_snap.fee_interval)
             jitter_seconds = int(interval * 0.2)
             sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Fee adjustment sleeping for {sleep_time}s")
@@ -1417,9 +1454,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 plugin.log(f"RPC degraded in rebalance check: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
                 plugin.log(f"Error in rebalance check: {e}", level='error')
-            
-            # Calculate +/- 20% jitter (minimum 60s to prevent busy loop)
-            interval = max(60, config.rebalance_interval)
+
+            # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
+            cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+            interval = max(60, cfg_snap.rebalance_interval)
             jitter_seconds = int(interval * 0.2)
             sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
             plugin.log(f"Rebalance check sleeping for {sleep_time}s")
@@ -1456,21 +1494,22 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             _boltz_auto_cycle_mark_state(last_result=result, last_error=None)
             return result
 
+        # L-1 FIX: Guard lock release with acquired flag to prevent RuntimeError
         acquired = _boltz_auto_cycle_run_lock.acquire(blocking=False)
         if not acquired:
             result = {'status': 'skipped', 'reason': 'auto-cycle already running', 'trigger': trigger}
             _boltz_auto_cycle_mark_state(last_result=result)
             return result
 
-        started = int(time.time())
-        start_monotonic = time.monotonic()
-        _boltz_auto_cycle_mark_state(
-            running=True,
-            last_trigger=trigger,
-            last_started_ts=started,
-            last_error=None,
-        )
         try:
+            started = int(time.time())
+            start_monotonic = time.monotonic()
+            _boltz_auto_cycle_mark_state(
+                running=True,
+                last_trigger=trigger,
+                last_started_ts=started,
+                last_error=None,
+            )
             max_actions = max(1, int(getattr(cfg, 'boltz_auto_cycle_max_actions', 1) if cfg else 1))
             result = revenue_boltz_balance_cycle(
                 plugin=plugin,
@@ -4011,23 +4050,30 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
         if scid_norm in _scid_to_peer_cache:
             return _scid_to_peer_cache[scid_norm]
 
-    # Cache miss - RPC call outside lock
-    try:
-        result = safe_plugin.rpc.listpeerchannels()
-        new_cache = {}
-        for channel in result.get("channels", []):
-            channel_scid = channel.get("short_channel_id") or channel.get("channel_id")
-            peer_id = channel.get("peer_id")
-            if channel_scid and peer_id:
-                new_cache[normalize_scid(channel_scid)] = peer_id
-
+    # Cache miss - RPC call outside cache lock
+    # M-2 FIX: Serialize cache-miss fetches so only one thread makes the RPC call
+    with _scid_cache_fetch_lock:
+        # Re-check cache: another thread may have populated it while we waited
         with _scid_cache_lock:
-            _scid_to_peer_cache.update(new_cache)
+            if scid_norm in _scid_to_peer_cache:
+                return _scid_to_peer_cache[scid_norm]
 
-        return new_cache.get(scid_norm)
-    except Exception as e:
-        plugin.log(f"Error resolving SCID {scid} to peer: {e}", level='warn')
-        return None
+        try:
+            result = safe_plugin.rpc.listpeerchannels()
+            new_cache = {}
+            for channel in result.get("channels", []):
+                channel_scid = channel.get("short_channel_id") or channel.get("channel_id")
+                peer_id = channel.get("peer_id")
+                if channel_scid and peer_id:
+                    new_cache[normalize_scid(channel_scid)] = peer_id
+
+            with _scid_cache_lock:
+                _scid_to_peer_cache.update(new_cache)
+
+            return new_cache.get(scid_norm)
+        except Exception as e:
+            plugin.log(f"Error resolving SCID {scid} to peer: {e}", level='warn')
+            return None
 
 
 def _looks_like_scid(value: Any) -> bool:
@@ -6252,17 +6298,18 @@ def revenue_boltz_balance_cycle(
         except Exception:
             rec_cooldown_seconds = cooldown_seconds
 
+        # H-5 FIX: Keep lock held during cooldown decision to prevent TOCTOU race
         with _boltz_balance_lock:
             last_ts = int(_boltz_balance_last_action.get(ch_id, 0) or 0)
-        if rec_cooldown_seconds > 0 and last_ts > 0 and (now - last_ts) < rec_cooldown_seconds:
-            skipped_exec.append({
-                "channel_id": ch_id,
-                "peer_id": peer_id,
-                "reason": "cooldown_active",
-                "cooldown_remaining_sec": rec_cooldown_seconds - (now - last_ts),
-                "recommendation": rec,
-            })
-            continue
+            if rec_cooldown_seconds > 0 and last_ts > 0 and (now - last_ts) < rec_cooldown_seconds:
+                skipped_exec.append({
+                    "channel_id": ch_id,
+                    "peer_id": peer_id,
+                    "reason": "cooldown_active",
+                    "cooldown_remaining_sec": rec_cooldown_seconds - (now - last_ts),
+                    "recommendation": rec,
+                })
+                continue
 
         if dry_run:
             executed.append({
