@@ -230,6 +230,157 @@ class BoltzCliManager:
                 scids.append(scid)
         return scids
 
+    def _resolve_first_hop_target(self, *, channel_id: Optional[str] = None, peer_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str], List[str]]:
+        """Resolve a preferred first-hop peer/channel from local channels.
+
+        Returns (peer_id, channel_id, warnings). The channel is best-effort exact only if we have a
+        unique channel to the preferred peer; CLN `pay` excludes are used to force the first hop by peer.
+        """
+        target_scid = (str(channel_id).replace(':', 'x') if channel_id else None)
+        warnings: List[str] = []
+        try:
+            result = self.rpc.call("listpeerchannels")
+        except Exception as e:
+            raise BoltzCliError(f"listpeerchannels failed while resolving first-hop target: {e}")
+        channels = result.get("channels", []) if isinstance(result, dict) else []
+
+        resolved_peer = str(peer_id).strip() if peer_id else None
+        resolved_scid = target_scid
+        if target_scid:
+            match = None
+            for ch in channels:
+                scid = str(ch.get("short_channel_id") or "").replace(':', 'x')
+                if scid != target_scid:
+                    continue
+                if str(ch.get("state") or "") != "CHANNELD_NORMAL":
+                    continue
+                match = ch
+                break
+            if not match:
+                raise BoltzCliError(f"Preferred first-hop channel not found/normal: {target_scid}")
+            ch_peer = str(match.get("peer_id") or "").strip()
+            if resolved_peer and ch_peer and ch_peer != resolved_peer:
+                raise BoltzCliError(f"channel_id {target_scid} belongs to {ch_peer[:12]}..., not requested peer {resolved_peer[:12]}...")
+            resolved_peer = ch_peer or resolved_peer
+            resolved_scid = target_scid
+
+        if not resolved_peer:
+            raise BoltzCliError("external routed reverse swap requires channel_id or peer_id")
+
+        same_peer_normals = []
+        for ch in channels:
+            if str(ch.get("state") or "") != "CHANNELD_NORMAL":
+                continue
+            if str(ch.get("peer_id") or "") != resolved_peer:
+                continue
+            scid = str(ch.get("short_channel_id") or "").replace(':', 'x')
+            if scid:
+                same_peer_normals.append(scid)
+        if resolved_scid and len(same_peer_normals) > 1:
+            warnings.append("multiple normal channels to preferred peer; first hop pinned to peer, exact channel best-effort")
+        elif not resolved_scid and len(same_peer_normals) == 1:
+            resolved_scid = same_peer_normals[0]
+        return resolved_peer, resolved_scid, warnings
+
+    def _build_first_hop_excludes(self, preferred_peer_id: str, preferred_channel_id: Optional[str] = None) -> Tuple[List[str], List[str]]:
+        """Build CLN `pay` exclude list to force the first hop via preferred peer.
+
+        We exclude all other directly connected peers (node-id excludes). If there are multiple channels
+        to the preferred peer and a preferred channel is specified, exclude the alternate channels by SCID
+        in both directions (best effort; CLN accepts scid/direction excludes).
+        """
+        warnings: List[str] = []
+        try:
+            result = self.rpc.call("listpeerchannels")
+        except Exception as e:
+            raise BoltzCliError(f"listpeerchannels failed while building excludes: {e}")
+        channels = result.get("channels", []) if isinstance(result, dict) else []
+
+        exclude: List[str] = []
+        seen_peers = set()
+        preferred_scid = (str(preferred_channel_id).replace(':', 'x') if preferred_channel_id else None)
+        alt_same_peer: List[str] = []
+
+        for ch in channels:
+            if str(ch.get("state") or "") != "CHANNELD_NORMAL":
+                continue
+            peer = str(ch.get("peer_id") or "").strip()
+            if not peer:
+                continue
+            scid = str(ch.get("short_channel_id") or "").replace(':', 'x')
+            if peer == preferred_peer_id:
+                if preferred_scid and scid and scid != preferred_scid:
+                    alt_same_peer.append(scid)
+                continue
+            if peer not in seen_peers:
+                exclude.append(peer)
+                seen_peers.add(peer)
+
+        if alt_same_peer:
+            for scid in alt_same_peer:
+                exclude.append(f"{scid}/0")
+                exclude.append(f"{scid}/1")
+            warnings.append(f"excluded {len(alt_same_peer)} alternate channel(s) to preferred peer")
+
+        return exclude, warnings
+
+    def _extract_reverse_swap_invoice(self, payload: Any) -> Optional[str]:
+        """Best-effort extract the LN invoice that must be paid for an external reverse swap."""
+        def _scan(obj: Any, depth: int = 0) -> Optional[str]:
+            if depth > 4:
+                return None
+            if isinstance(obj, dict):
+                for key in ("invoice", "swapInvoice", "payInvoice", "invoiceToPay"):
+                    v = obj.get(key)
+                    if isinstance(v, str) and v.strip().lower().startswith("ln"):
+                        return v.strip()
+                for v in obj.values():
+                    found = _scan(v, depth + 1)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for v in obj:
+                    found = _scan(v, depth + 1)
+                    if found:
+                        return found
+            return None
+        return _scan(payload)
+
+    def _pay_invoice_via_first_hop(self, invoice: str, *, preferred_peer_id: str, preferred_channel_id: Optional[str] = None,
+                                   retry_for: int = 120) -> Dict[str, Any]:
+        if not invoice or not str(invoice).lower().startswith("ln"):
+            raise BoltzCliError("Invalid bolt11 invoice for external reverse swap payment")
+        decode = None
+        try:
+            decode = self.rpc.call("decodepay", {"bolt11": invoice})
+        except Exception:
+            try:
+                decode = self.rpc.call("decodepay", {"invoice": invoice})
+            except Exception as e:
+                raise BoltzCliError(f"decodepay failed for external reverse swap invoice: {e}")
+
+        exclude, warnings = self._build_first_hop_excludes(preferred_peer_id, preferred_channel_id)
+        pay_params: Dict[str, Any] = {"bolt11": invoice}
+        if exclude:
+            pay_params["exclude"] = exclude
+        if retry_for is not None:
+            try:
+                pay_params["retry_for"] = max(1, int(retry_for))
+            except Exception:
+                pass
+
+        pay_result = self.rpc.call("pay", pay_params)
+        return {
+            "status": "submitted",
+            "preferred_peer_id": preferred_peer_id,
+            "preferred_channel_id": preferred_channel_id,
+            "exclude_count": len(exclude),
+            "exclude": exclude,
+            "warnings": warnings,
+            "decodepay": decode,
+            "pay_result": pay_result,
+        }
+
     def _normalize_swap_entry(self, entry: Dict[str, Any], *, wrapper_key: Optional[str] = None) -> Dict[str, Any]:
         """Flatten nested swap entries from boltzcli listswaps/swapinfo outputs."""
         if not isinstance(entry, dict):
@@ -727,14 +878,94 @@ class BoltzCliManager:
                 "budget": budget_check["budget"],
             }
 
+        target_channel_id = (str(channel_id).replace(':', 'x') if channel_id else None)
+        target_peer_id = str(peer_id).strip() if peer_id else None
         chan_ids: List[str] = []
-        if channel_id:
-            chan_ids.append(str(channel_id).replace(':', 'x'))
-        elif peer_id:
-            chan_ids.extend(self._resolve_peer_channel_ids(peer_id))
+        if target_channel_id:
+            chan_ids.append(target_channel_id)
+        elif target_peer_id:
+            chan_ids.extend(self._resolve_peer_channel_ids(target_peer_id))
+
         warnings: List[str] = []
         wallet_name = None if address else self._resolve_wallet_name(target_cur)
         reverse_chanids_supported = self._detect_reverse_chanids_support()
+
+        # CLN backends that reject reverse chanIds can still be routed through a desired first hop by
+        # creating the reverse swap with --external-pay and then paying the invoice from CLN while
+        # excluding all other local peers.
+        use_external_routed = bool(target_channel_id or target_peer_id) and (reverse_chanids_supported is False)
+        if use_external_routed:
+            resolved_peer, resolved_channel, target_warnings = self._resolve_first_hop_target(
+                channel_id=target_channel_id,
+                peer_id=target_peer_id,
+            )
+            warnings.extend(target_warnings)
+            warnings.append(
+                "CLN boltz backend does not support reverse-swap chanIds; using external-pay with CLN first-hop constrained payment"
+            )
+            cmd: List[str] = ["createreverseswap", "--json", "--external-pay"]
+            if address:
+                pass
+            else:
+                cmd.extend(["--to-wallet", str(wallet_name)])
+            cmd.extend([self._swap_cli_currency(target_cur, target_cur), str(amount_sats)])
+            if address:
+                cmd.append(address)
+
+            result = self._run_json(cmd, timeout=max(self.cfg.timeout_seconds, 120))
+            self._record_swap_result(
+                result,
+                source="loop_out_external_create",
+                metadata={"peer_id": resolved_peer, "requested_channel_ids": [resolved_channel] if resolved_channel else None},
+            )
+            invoice = self._extract_reverse_swap_invoice(result)
+            if not invoice:
+                return {
+                    "status": "error",
+                    "error": "reverse swap created but no invoice was found in boltz response for external-pay",
+                    "swap_type": "reverse",
+                    "amount_sats": amount_sats,
+                    "settlement_currency": target_cur,
+                    "channel_ids": [resolved_channel] if resolved_channel else [],
+                    "peer_id": resolved_peer,
+                    "address": address,
+                    "quote": quote,
+                    "budget_check": budget_check,
+                    "warnings": warnings,
+                    "result": result,
+                }
+            cln_payment = self._pay_invoice_via_first_hop(
+                invoice,
+                preferred_peer_id=resolved_peer,
+                preferred_channel_id=resolved_channel,
+                retry_for=120,
+            )
+            primary = self._primary_swap_entry(result)
+            created_id = str((primary or {}).get("id") or "").strip()
+            status_probe = None
+            if created_id:
+                try:
+                    time.sleep(0.5)
+                    status_probe = self.swap_status(created_id)
+                except Exception as e:
+                    warnings.append(f"swap status probe failed after external-pay submit: {e}")
+            return {
+                "status": "accepted",
+                "swap_type": "reverse",
+                "amount_sats": amount_sats,
+                "settlement_currency": target_cur,
+                "channel_ids": [resolved_channel] if resolved_channel else [],
+                "peer_id": resolved_peer,
+                "address": address,
+                "quote": quote,
+                "budget_check": budget_check,
+                "warnings": warnings,
+                "routing_mode": "external_pay_first_hop_pinned",
+                "cln_payment": cln_payment,
+                "result": result,
+                "status_probe": status_probe,
+            }
+
         include_chanids_initial = bool(chan_ids) and (reverse_chanids_supported is not False)
         if chan_ids and not include_chanids_initial:
             warnings.append("CLN boltz backend does not support reverse-swap chanIds; submitted without channel pinning")
@@ -797,7 +1028,7 @@ class BoltzCliManager:
         self._record_swap_result(
             result,
             source="loop_out",
-            metadata={"peer_id": peer_id, "requested_channel_ids": chan_ids or None},
+            metadata={"peer_id": target_peer_id, "requested_channel_ids": chan_ids or None},
         )
         primary = self._primary_swap_entry(result)
         status = "accepted"
@@ -809,7 +1040,7 @@ class BoltzCliManager:
             "amount_sats": amount_sats,
             "settlement_currency": target_cur,
             "channel_ids": chan_ids,
-            "peer_id": peer_id,
+            "peer_id": target_peer_id,
             "address": address,
             "quote": quote,
             "budget_check": budget_check,
