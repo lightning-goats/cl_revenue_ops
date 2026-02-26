@@ -1092,6 +1092,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hive_bridge=hive_bridge
     )
     rebalancer.set_profitability_analyzer(profitability_analyzer)
+    # Unified liquidity-cost accounting:
+    # - Rebalancer sees Boltz spend as external liquidity cost
+    # - Boltz manager sees rebalance spend/reservations as external liquidity cost
+    if rebalancer is not None:
+        rebalancer.external_liquidity_cost_provider = _boltz_liquidity_cost_components
+    if boltz_manager is not None:
+        boltz_manager.external_liquidity_cost_provider = _rebalance_liquidity_cost_components
 
     # =========================================================================
     # Hive Settlement / Yield Reporting (Issue #42)
@@ -1658,7 +1665,12 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
         daily_reserved = spend_info.get('total_reserved_sats', 0)
         stale_count = spend_info.get('stale_reservations', 0)
         daily_budget = cfg.daily_budget_sats
-        budget_remaining = daily_budget - daily_spent - daily_reserved
+        boltz_costs = _boltz_liquidity_cost_components()
+        boltz_spent = int(boltz_costs.get("spent_24h_sats", 0) or 0)
+        boltz_reserved = int(boltz_costs.get("reserved_24h_sats", 0) or 0)
+        total_liquidity_spent = int(daily_spent) + boltz_spent
+        total_liquidity_reserved = int(daily_reserved) + boltz_reserved
+        budget_remaining = daily_budget - total_liquidity_spent - total_liquidity_reserved
 
         result["capital_controls"] = {
             "onchain_sats": onchain_sats,
@@ -1667,8 +1679,12 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             "wallet_reserve_sats": cfg.min_wallet_reserve,
             "reserve_ok": total_liquid >= cfg.min_wallet_reserve,
             "daily_budget_sats": daily_budget,
-            "daily_spent_sats": daily_spent,
-            "daily_reserved_sats": daily_reserved,
+            "daily_spent_sats": daily_spent,          # rebalance-only (legacy field)
+            "daily_reserved_sats": daily_reserved,    # rebalance-only (legacy field)
+            "boltz_spent_sats": boltz_spent,
+            "boltz_reserved_sats": boltz_reserved,
+            "total_liquidity_spent_sats": total_liquidity_spent,
+            "total_liquidity_reserved_sats": total_liquidity_reserved,
             "stale_reservations": stale_count,
             "budget_remaining_sats": budget_remaining,
             "budget_ok": budget_remaining > 0,
@@ -1683,7 +1699,8 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             )
         if budget_remaining <= 0:
             result["rejection_reasons"].append(
-                f"Daily budget exhausted: spent {daily_spent} + reserved {daily_reserved} of {daily_budget}"
+                f"Unified liquidity budget exhausted: rebalance {daily_spent}+{daily_reserved}, "
+                f"boltz {boltz_spent}+{boltz_reserved}, budget {daily_budget}"
             )
         if stale_count > 0:
             result["rejection_reasons"].append(
@@ -4712,6 +4729,54 @@ def _boltz_pending_swap_count() -> int:
         return pending
     except Exception:
         return 0
+
+
+def _rebalance_liquidity_cost_components(window_hours: int = 24) -> Dict[str, Any]:
+    """Rebalance spend/reservations for unified liquidity-cost accounting."""
+    if database is None:
+        return {"source": "rebalance", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
+    try:
+        spend = database.get_daily_rebalance_spend(window_hours=window_hours)
+        return {
+            "source": "rebalance",
+            "available": True,
+            "window_hours": window_hours,
+            "spent_24h_sats": int(spend.get("total_spent_sats", 0) or 0),
+            "reserved_24h_sats": int(spend.get("total_reserved_sats", 0) or 0),
+            "job_count": int(spend.get("job_count", 0) or 0),
+            "success_count": int(spend.get("success_count", 0) or 0),
+        }
+    except Exception as e:
+        return {
+            "source": "rebalance",
+            "available": False,
+            "error": str(e),
+            "spent_24h_sats": 0,
+            "reserved_24h_sats": 0,
+        }
+
+
+def _boltz_liquidity_cost_components() -> Dict[str, Any]:
+    """Boltz swap spend for unified liquidity-cost accounting (reserved currently 0)."""
+    if boltz_manager is None:
+        return {"source": "boltz", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
+    try:
+        budget = boltz_manager.budget()
+        return {
+            "source": "boltz",
+            "available": True,
+            "spent_24h_sats": int(budget.get("boltz_spent_24h_sats_estimate", budget.get("spent_24h_sats_estimate", 0)) or 0),
+            "reserved_24h_sats": 0,
+            "counted_swaps": int(budget.get("counted_swaps", 0) or 0),
+        }
+    except Exception as e:
+        return {
+            "source": "boltz",
+            "available": False,
+            "error": str(e),
+            "spent_24h_sats": 0,
+            "reserved_24h_sats": 0,
+        }
 
 
 def _boltz_direction_allowed_by_policy(peer_id: str, direction: str) -> Tuple[bool, str]:

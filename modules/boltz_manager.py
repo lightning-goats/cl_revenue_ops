@@ -43,6 +43,9 @@ class BoltzCliManager:
         self.rpc = rpc
         self.cfg = config
         self._swap_journal_file = os.path.join(self.cfg.datadir, "cl_revenue_ops_swap_journal.json")
+        # Optional callback set by cl-revenue-ops plugin to provide non-Boltz liquidity costs
+        # (e.g. market rebalance spend/reservations) for unified budget accounting.
+        self.external_liquidity_cost_provider = None
 
     # ---------------------------------------------------------------------
     # Core command execution helpers
@@ -309,6 +312,37 @@ class BoltzCliManager:
         st = self._swap_status_text(swap)
         return any(token in st for token in ("success", "completed", "claimed", "done"))
 
+    def _get_external_liquidity_costs(self) -> Dict[str, Any]:
+        provider = getattr(self, "external_liquidity_cost_provider", None)
+        if not callable(provider):
+            return {
+                "source": "none",
+                "spent_24h_sats": 0,
+                "reserved_24h_sats": 0,
+            }
+        try:
+            data = provider()
+        except Exception as e:
+            self.plugin.log(f"BOLTZ: external liquidity cost provider failed: {e}", level="warn")
+            return {
+                "source": "provider_error",
+                "error": str(e),
+                "spent_24h_sats": 0,
+                "reserved_24h_sats": 0,
+            }
+        if not isinstance(data, dict):
+            return {
+                "source": "provider_invalid",
+                "spent_24h_sats": 0,
+                "reserved_24h_sats": 0,
+            }
+        return {
+            "source": str(data.get("source") or "external"),
+            "spent_24h_sats": max(0, self._parse_int(data.get("spent_24h_sats"), 0)),
+            "reserved_24h_sats": max(0, self._parse_int(data.get("reserved_24h_sats"), 0)),
+            **{k: v for k, v in data.items() if k not in ("source", "spent_24h_sats", "reserved_24h_sats")},
+        }
+
     def _swap_entry_error_text(self, swap: Optional[Dict[str, Any]]) -> str:
         if not isinstance(swap, dict):
             return ""
@@ -428,7 +462,7 @@ class BoltzCliManager:
         now = int(time.time())
         cutoff = now - 86400
 
-        spent = 0
+        boltz_spent = 0
         counted: List[Dict[str, Any]] = []
         unknown_ts = 0
         for s in swaps:
@@ -441,7 +475,7 @@ class BoltzCliManager:
             if not self._is_completed_swap(s):
                 continue
             fee_sats = self._estimate_swap_fee_sats(s)
-            spent += max(0, fee_sats)
+            boltz_spent += max(0, fee_sats)
             counted.append({
                 "id": s.get("id"),
                 "created_at": ts,
@@ -450,11 +484,24 @@ class BoltzCliManager:
                 "status": s.get("status"),
             })
 
-        remaining = max(0, budget - spent)
+        external = self._get_external_liquidity_costs()
+        external_spent = max(0, self._parse_int(external.get("spent_24h_sats"), 0))
+        external_reserved = max(0, self._parse_int(external.get("reserved_24h_sats"), 0))
+        total_spent = boltz_spent + external_spent
+        total_reserved = external_reserved  # Boltz swaps currently do not reserve budget
+
+        boltz_remaining = max(0, budget - boltz_spent)
+        remaining = max(0, budget - total_spent - total_reserved)
         return {
             "daily_budget_sats": budget,
-            "spent_24h_sats_estimate": spent,
+            # Unified liquidity-cost accounting used for gating swaps.
+            "spent_24h_sats_estimate": total_spent,
             "remaining_24h_sats_estimate": remaining,
+            "reserved_24h_sats_estimate": total_reserved,
+            # Component breakdowns preserved for visibility and debugging.
+            "boltz_spent_24h_sats_estimate": boltz_spent,
+            "boltz_remaining_24h_sats_estimate": boltz_remaining,
+            "external_liquidity_costs": external,
             "counted_swaps": len(counted),
             "skipped_without_timestamp": unknown_ts,
             "enforce_budget": bool(self.cfg.enforce_budget),

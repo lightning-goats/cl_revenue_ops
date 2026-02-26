@@ -1789,6 +1789,9 @@ class EVRebalancer:
         # NNLB health caching
         self._cached_health: Optional[Dict] = None
         self._health_cache_time: float = 0
+        # Optional callback injected by cl-revenue-ops to report external liquidity
+        # costs (e.g. Boltz swap fees) for unified budget gating.
+        self.external_liquidity_cost_provider = None
 
         # Initialize job manager for async execution (pass hive_bridge for outcome reporting)
         self.job_manager = JobManager(plugin, config, database, hive_bridge=hive_bridge)
@@ -1796,6 +1799,22 @@ class EVRebalancer:
     def _parse_msat(self, v: Any) -> int:
         """Delegate to shared parse_msat in utils.py."""
         return _shared_parse_msat(v)
+
+    def _get_external_liquidity_costs(self) -> Dict[str, int]:
+        provider = getattr(self, "external_liquidity_cost_provider", None)
+        if not callable(provider):
+            return {"spent_24h_sats": 0, "reserved_24h_sats": 0}
+        try:
+            data = provider()
+            if not isinstance(data, dict):
+                return {"spent_24h_sats": 0, "reserved_24h_sats": 0}
+            return {
+                "spent_24h_sats": max(0, int(data.get("spent_24h_sats", 0) or 0)),
+                "reserved_24h_sats": max(0, int(data.get("reserved_24h_sats", 0) or 0)),
+            }
+        except Exception as e:
+            self.plugin.log(f"External liquidity cost provider failed: {e}", level='warn')
+            return {"spent_24h_sats": 0, "reserved_24h_sats": 0}
 
     def _get_our_node_id(self) -> str:
         if self._our_node_id is None:
@@ -3498,11 +3517,16 @@ class EVRebalancer:
                     proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
                     effective_budget = max(cfg.daily_budget_sats, proportional_budget)
 
+                ext_costs = self._get_external_liquidity_costs()
+                ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
+                ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)
+                rebalance_budget_limit = max(0, effective_budget - ext_spent - ext_reserved)
+
                 reserved, remaining = self.database.reserve_budget(
                     reservation_id=str(rebalance_id),
                     amount_sats=db_max_fee,
                     channel_id=db_to_channel,
-                    budget_limit=effective_budget,
+                    budget_limit=rebalance_budget_limit,
                     since_timestamp=since_24h
                 )
                 reserved_budget = bool(reserved)
@@ -3510,12 +3534,20 @@ class EVRebalancer:
                 if not reserved_budget:
                     self.database.update_rebalance_result(
                         rebalance_id, 'failed',
-                        error_message=f"Budget exhausted: {remaining} sats remaining of {effective_budget}"
+                        error_message=(
+                            f"Unified liquidity budget exhausted: {remaining} sats remaining for rebalances "
+                            f"after external costs ({ext_spent} spent + {ext_reserved} reserved) "
+                            f"of total {effective_budget}"
+                        )
                     )
-                    result["message"] = f"Budget exhausted: only {remaining} sats remaining"
+                    result["message"] = (
+                        f"Unified liquidity budget exhausted: only {remaining} sats available "
+                        f"for rebalances after external costs"
+                    )
                     self.plugin.log(
                         f"CAPITAL CONTROL: Budget reservation failed for {db_to_channel}. "
-                        f"Remaining: {remaining} sats",
+                        f"Remaining for rebalances: {remaining} sats "
+                        f"(external costs: spent={ext_spent}, reserved={ext_reserved}, total_budget={effective_budget})",
                         level='warn'
                     )
                     # Budget exhaustion is global; don't backoff a specific channel.
@@ -3872,10 +3904,15 @@ class EVRebalancer:
                 )
 
             fees_spent_24h = self.database.get_total_rebalance_fees(int(time.time()) - 86400)
-            if fees_spent_24h >= effective_budget:
+            ext_costs = self._get_external_liquidity_costs()
+            ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
+            ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)
+            total_liquidity_committed = fees_spent_24h + ext_spent + ext_reserved
+            if total_liquidity_committed >= effective_budget:
                 self.plugin.log(
-                    f"CAPITAL CONTROL: Daily budget exceeded "
-                    f"({fees_spent_24h} >= {effective_budget})",
+                    f"CAPITAL CONTROL: Unified liquidity budget exceeded "
+                    f"(rebalance_fees={fees_spent_24h} + external_spent={ext_spent} + "
+                    f"external_reserved={ext_reserved} = {total_liquidity_committed} >= {effective_budget})",
                     level='warn'
                 )
                 return False
