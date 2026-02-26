@@ -186,15 +186,59 @@ class BoltzCliManager:
                 scids.append(scid)
         return scids
 
+    def _normalize_swap_entry(self, entry: Dict[str, Any], *, wrapper_key: Optional[str] = None) -> Dict[str, Any]:
+        """Flatten nested swap entries from boltzcli listswaps/swapinfo outputs."""
+        if not isinstance(entry, dict):
+            return {}
+        out = dict(entry)
+        if wrapper_key and wrapper_key not in out:
+            out["_swap_wrapper"] = wrapper_key
+        # Normalize common nested shapes emitted by boltzcli (swap/reverseSwap/chainSwap/channelCreation)
+        for k in ("swap", "reverseSwap", "chainSwap", "channelCreation"):
+            nested = out.get(k)
+            if isinstance(nested, dict) and nested.get("id"):
+                merged = dict(out)
+                merged.pop(k, None)
+                # Preserve wrapper metadata while letting nested fields take precedence.
+                merged.update(nested)
+                merged["_swap_wrapper"] = k
+                return merged
+        return out
+
     def _extract_swap_list(self, swaps_json: Any) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
         if isinstance(swaps_json, dict):
-            if isinstance(swaps_json.get('swaps'), list):
-                return [s for s in swaps_json.get('swaps', []) if isinstance(s, dict)]
-            if isinstance(swaps_json.get('list'), list):
-                return [s for s in swaps_json.get('list', []) if isinstance(s, dict)]
-        if isinstance(swaps_json, list):
-            return [s for s in swaps_json if isinstance(s, dict)]
-        return []
+            # Common flat list keys.
+            for key in ('swaps', 'list'):
+                val = swaps_json.get(key)
+                if isinstance(val, list):
+                    items.extend(self._normalize_swap_entry(s) for s in val if isinstance(s, dict))
+            # Some boltzcli versions split by type.
+            for key in ('reverseSwaps', 'submarineSwaps', 'chainSwaps', 'channelCreations'):
+                val = swaps_json.get(key)
+                if isinstance(val, list):
+                    items.extend(self._normalize_swap_entry(s, wrapper_key=key) for s in val if isinstance(s, dict))
+            # Some outputs contain one nested object (e.g. swapinfo-like payload).
+            for key in ('swap', 'reverseSwap', 'chainSwap', 'channelCreation'):
+                val = swaps_json.get(key)
+                if isinstance(val, dict) and val.get('id'):
+                    items.append(self._normalize_swap_entry({key: val}, wrapper_key=key))
+        elif isinstance(swaps_json, list):
+            items.extend(self._normalize_swap_entry(s) for s in swaps_json if isinstance(s, dict))
+
+        # Deduplicate by id while preserving first-seen ordering.
+        dedup: List[Dict[str, Any]] = []
+        seen = set()
+        for it in items:
+            if not isinstance(it, dict) or not it:
+                continue
+            sid = str(it.get('id') or '')
+            key = sid or json.dumps(it, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(it)
+        return dedup
 
     def _listswaps_json(self, *, manual_only: bool = False, pending_only: bool = False) -> Any:
         """Best-effort listswaps wrapper with flag compatibility fallbacks.
@@ -444,7 +488,26 @@ class BoltzCliManager:
         if address:
             args.append(address)
 
-        result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 120))
+        warnings: List[str] = []
+        try:
+            result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 120))
+        except BoltzCliError as e:
+            msg = str(e)
+            if chan_ids and "chanIds are not supported for cln" in msg:
+                # CLN backends may reject chanIds even though boltzcli accepts the flag.
+                retry_args: List[str] = ["createreverseswap", "--json"]
+                if address:
+                    pass
+                else:
+                    wallet_name = self._resolve_wallet_name(target_cur)
+                    retry_args.extend(["--to-wallet", wallet_name])
+                retry_args.extend([self._swap_cli_currency(target_cur, target_cur), str(amount_sats)])
+                if address:
+                    retry_args.append(address)
+                warnings.append("CLN boltz backend rejected chanIds; retried reverse swap without channel pinning")
+                result = self._run_json(retry_args, timeout=max(self.cfg.timeout_seconds, 120))
+            else:
+                raise
         return {
             "status": "accepted",
             "swap_type": "reverse",
@@ -455,6 +518,7 @@ class BoltzCliManager:
             "address": address,
             "quote": quote,
             "budget_check": budget_check,
+            "warnings": warnings,
             "result": result,
         }
 
@@ -471,9 +535,19 @@ class BoltzCliManager:
                     break
         except Exception:
             list_json = None
+        swapinfo_json = None
+        swapinfo_entry = None
+        try:
+            swapinfo_json = json.loads(raw)
+            extracted = self._extract_swap_list(swapinfo_json)
+            if extracted:
+                swapinfo_entry = extracted[0]
+        except Exception:
+            swapinfo_json = None
         return {
             "swap_id": swap_id,
             "swapinfo_raw": raw,
+            "swapinfo_entry": swapinfo_entry,
             "listswaps_entry": list_match,
         }
 
