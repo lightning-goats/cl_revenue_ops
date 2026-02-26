@@ -42,6 +42,7 @@ class BoltzCliManager:
         self.plugin = plugin
         self.rpc = rpc
         self.cfg = config
+        self._swap_journal_file = os.path.join(self.cfg.datadir, "cl_revenue_ops_swap_journal.json")
 
     # ---------------------------------------------------------------------
     # Core command execution helpers
@@ -308,6 +309,114 @@ class BoltzCliManager:
         st = self._swap_status_text(swap)
         return any(token in st for token in ("success", "completed", "claimed", "done"))
 
+    def _swap_entry_error_text(self, swap: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(swap, dict):
+            return ""
+        return str(swap.get("error") or "").strip()
+
+    def _is_error_swap(self, swap: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(swap, dict):
+            return False
+        if self._swap_entry_error_text(swap):
+            return True
+        st = str(swap.get("state") or "").strip().upper()
+        return st in ("ERROR", "FAILED")
+
+    def _contains_chanids_cln_error(self, payload: Any) -> bool:
+        needle = "chanids are not supported for cln"
+        if isinstance(payload, dict):
+            if needle in str(payload.get("error") or "").lower():
+                return True
+            for s in self._extract_swap_list(payload):
+                if needle in self._swap_entry_error_text(s).lower():
+                    return True
+        return False
+
+    def _primary_swap_entry(self, payload: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(payload, dict):
+            extracted = self._extract_swap_list(payload)
+            if extracted:
+                return extracted[0]
+            if payload.get("id"):
+                return self._normalize_swap_entry(payload)
+        return None
+
+    def _load_swap_journal(self) -> List[Dict[str, Any]]:
+        try:
+            with open(self._swap_journal_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [x for x in data if isinstance(x, dict)]
+        except Exception:
+            return []
+        return []
+
+    def _save_swap_journal(self, entries: List[Dict[str, Any]]) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._swap_journal_file), exist_ok=True)
+            tmp = self._swap_journal_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(entries[-200:], f, sort_keys=True)
+            os.replace(tmp, self._swap_journal_file)
+        except Exception as e:
+            self.plugin.log(f"BOLTZ: failed to write swap journal: {e}", level="warn")
+
+    def _record_swap_result(self, payload: Any, *, source: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        now = int(time.time())
+        entries = self._load_swap_journal()
+        by_id = {str(e.get("id")): e for e in entries if e.get("id")}
+        for s in self._extract_swap_list(payload):
+            sid = str(s.get("id") or "").strip()
+            if not sid:
+                continue
+            rec = by_id.get(sid, {"id": sid})
+            rec.update({
+                "id": sid,
+                "recorded_at": now,
+                "source": source,
+            })
+            st = self._swap_created_ts(s)
+            if st:
+                rec["created_at"] = st
+            if metadata:
+                rec.update({k: v for k, v in metadata.items() if v is not None})
+            by_id[sid] = rec
+        if by_id:
+            merged = list(by_id.values())
+            merged.sort(key=lambda x: int(x.get("recorded_at") or 0))
+            self._save_swap_journal(merged)
+
+    def _augment_with_swap_journal(self, swaps: List[Dict[str, Any]], *, limit_hint: Optional[int] = None) -> List[Dict[str, Any]]:
+        existing = {str(s.get("id") or "") for s in swaps if isinstance(s, dict)}
+        journal = self._load_swap_journal()
+        if not journal:
+            return swaps
+        journal.sort(key=lambda x: int(x.get("recorded_at") or 0), reverse=True)
+        max_fetch = max(10, (int(limit_hint) * 3) if limit_hint else 40)
+        added = 0
+        for rec in journal:
+            if added >= max_fetch:
+                break
+            sid = str(rec.get("id") or "").strip()
+            if not sid or sid in existing:
+                continue
+            try:
+                info = self._run_json(["swapinfo", sid], timeout=max(self.cfg.timeout_seconds, 120))
+            except Exception:
+                continue
+            extracted = self._extract_swap_list(info)
+            if not extracted:
+                continue
+            s = extracted[0]
+            if not self._swap_created_ts(s):
+                ts = self._parse_timestamp(rec.get("created_at") or rec.get("recorded_at"))
+                if ts:
+                    s["createdAt"] = ts
+            swaps.append(s)
+            existing.add(sid)
+            added += 1
+        return swaps
+
     # ---------------------------------------------------------------------
     # Budget helpers
     # ---------------------------------------------------------------------
@@ -315,6 +424,7 @@ class BoltzCliManager:
         budget = max(0, int(self.cfg.daily_budget_sats))
         swaps_json = self._listswaps_json(manual_only=True)
         swaps = self._extract_swap_list(swaps_json)
+        swaps = self._augment_with_swap_journal(swaps, limit_hint=50)
         now = int(time.time())
         cutoff = now - 86400
 
@@ -436,6 +546,11 @@ class BoltzCliManager:
 
         args = ["createswap", "--json", "--from-wallet", wallet_name, self._swap_cli_currency(source_cur, source_cur), str(amount_sats)]
         result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 120))
+        self._record_swap_result(
+            result,
+            source="loop_in",
+            metadata={"trigger_channel_id": channel_id, "trigger_peer_id": peer_id},
+        )
 
         return {
             "status": "accepted",
@@ -468,48 +583,52 @@ class BoltzCliManager:
                 "budget": budget_check["budget"],
             }
 
-        args: List[str] = ["createreverseswap", "--json"]
         chan_ids: List[str] = []
         if channel_id:
             chan_ids.append(str(channel_id).replace(':', 'x'))
         elif peer_id:
             chan_ids.extend(self._resolve_peer_channel_ids(peer_id))
-        for scid in chan_ids:
-            args.extend(["--chan-id", scid])
-
-        if address:
-            # address is positional after amount
-            pass
-        else:
-            wallet_name = self._resolve_wallet_name(target_cur)
-            args.extend(["--to-wallet", wallet_name])
-
-        args.extend([self._swap_cli_currency(target_cur, target_cur), str(amount_sats)])
-        if address:
-            args.append(address)
-
         warnings: List[str] = []
+        wallet_name = None if address else self._resolve_wallet_name(target_cur)
+
+        def _build_args(include_chanids: bool) -> List[str]:
+            cmd: List[str] = ["createreverseswap", "--json"]
+            if include_chanids:
+                for scid in chan_ids:
+                    cmd.extend(["--chan-id", scid])
+            if address:
+                pass
+            else:
+                cmd.extend(["--to-wallet", str(wallet_name)])
+            cmd.extend([self._swap_cli_currency(target_cur, target_cur), str(amount_sats)])
+            if address:
+                cmd.append(address)
+            return cmd
+
         try:
-            result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 120))
+            result = self._run_json(_build_args(include_chanids=True), timeout=max(self.cfg.timeout_seconds, 120))
+            if chan_ids and self._contains_chanids_cln_error(result):
+                warnings.append("CLN boltz backend rejected chanIds in JSON result; retried reverse swap without channel pinning")
+                result = self._run_json(_build_args(include_chanids=False), timeout=max(self.cfg.timeout_seconds, 120))
         except BoltzCliError as e:
             msg = str(e)
             if chan_ids and "chanIds are not supported for cln" in msg:
                 # CLN backends may reject chanIds even though boltzcli accepts the flag.
-                retry_args: List[str] = ["createreverseswap", "--json"]
-                if address:
-                    pass
-                else:
-                    wallet_name = self._resolve_wallet_name(target_cur)
-                    retry_args.extend(["--to-wallet", wallet_name])
-                retry_args.extend([self._swap_cli_currency(target_cur, target_cur), str(amount_sats)])
-                if address:
-                    retry_args.append(address)
                 warnings.append("CLN boltz backend rejected chanIds; retried reverse swap without channel pinning")
-                result = self._run_json(retry_args, timeout=max(self.cfg.timeout_seconds, 120))
+                result = self._run_json(_build_args(include_chanids=False), timeout=max(self.cfg.timeout_seconds, 120))
             else:
                 raise
+        self._record_swap_result(
+            result,
+            source="loop_out",
+            metadata={"peer_id": peer_id, "requested_channel_ids": chan_ids or None},
+        )
+        primary = self._primary_swap_entry(result)
+        status = "accepted"
+        if self._is_error_swap(primary):
+            status = "error"
         return {
-            "status": "accepted",
+            "status": status,
             "swap_type": "reverse",
             "amount_sats": amount_sats,
             "settlement_currency": target_cur,
@@ -542,6 +661,7 @@ class BoltzCliManager:
             extracted = self._extract_swap_list(swapinfo_json)
             if extracted:
                 swapinfo_entry = extracted[0]
+                self._record_swap_result({"swaps": extracted}, source="swap_status_lookup")
         except Exception:
             swapinfo_json = None
         return {
@@ -552,8 +672,9 @@ class BoltzCliManager:
         }
 
     def swap_history(self, limit: Optional[int] = None) -> Dict[str, Any]:
-        data = self._run_json(["listswaps", "--json"])
+        data = self._listswaps_json()
         swaps = self._extract_swap_list(data)
+        swaps = self._augment_with_swap_journal(swaps, limit_hint=limit)
         # sort newest first (best effort)
         swaps.sort(key=lambda s: self._swap_created_ts(s) or 0, reverse=True)
         if limit is not None:
@@ -614,6 +735,7 @@ class BoltzCliManager:
             args.extend(["--to-wallet", self._resolve_wallet_name(to_cur)])
         args.append(str(amount_sats))
         result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 180))
+        self._record_swap_result(result, source="chainswap")
         return {
             "status": "accepted",
             "amount_sats": amount_sats,
