@@ -98,6 +98,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Phase 1: Operational Hardening
     'rpc_timeout_seconds': int,
     'rpc_circuit_breaker_seconds': int,
+    'hive_bridge_circuit_breaker_enabled': bool,
     'rpc_pool_size': int,
     'reservation_timeout_hours': int,
     # Issue #28: Revenue rate smoothing
@@ -313,6 +314,7 @@ class Config:
     # Phase 1: Operational Hardening
     rpc_timeout_seconds: int = 15
     rpc_circuit_breaker_seconds: int = 60
+    hive_bridge_circuit_breaker_enabled: bool = False  # Global hive bridge circuit breaker (disabled by default)
     rpc_pool_size: int = 5             # Number of RPC worker processes (Phase 2)
     reservation_timeout_hours: int = 4  # Hours before stale budget reservations auto-release
     
@@ -700,6 +702,7 @@ class ConfigSnapshot:
     # Phase 1: Operational Hardening
     rpc_timeout_seconds: int
     rpc_circuit_breaker_seconds: int
+    hive_bridge_circuit_breaker_enabled: bool
     rpc_pool_size: int
     reservation_timeout_hours: int
 

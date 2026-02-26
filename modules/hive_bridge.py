@@ -141,6 +141,8 @@ class HiveFeeIntelligenceBridge:
         self.plugin = plugin
         self.database = database
         self.config = config
+        self._circuit_breaker_enabled = bool(getattr(config, 'hive_bridge_circuit_breaker_enabled', False))
+        self._circuit_reset_timeout = int(getattr(config, 'rpc_circuit_breaker_seconds', CIRCUIT_RESET_TIMEOUT) or CIRCUIT_RESET_TIMEOUT)
 
         # Cache: peer_id -> CachedProfile
         self._cache: Dict[str, CachedProfile] = {}
@@ -280,12 +282,15 @@ class HiveFeeIntelligenceBridge:
         Returns:
             True if circuit is open (should fail fast)
         """
+        if not self._circuit_breaker_enabled:
+            return False
+
         with self._circuit_lock:
             if not self._circuit.is_open:
                 return False
 
             # Check if reset timeout has passed
-            if time.time() - self._circuit.last_failure > CIRCUIT_RESET_TIMEOUT:
+            if time.time() - self._circuit.last_failure > self._circuit_reset_timeout:
                 self._circuit.is_open = False
                 self._circuit.failures = 0
                 self._log("Circuit breaker reset to CLOSED")
@@ -295,12 +300,16 @@ class HiveFeeIntelligenceBridge:
 
     def _record_success(self) -> None:
         """Record a successful RPC call."""
+        if not self._circuit_breaker_enabled:
+            return
         with self._circuit_lock:
             self._circuit.failures = 0
             self._circuit.is_open = False
 
     def _record_failure(self) -> None:
         """Record a failed RPC call."""
+        if not self._circuit_breaker_enabled:
+            return
         with self._circuit_lock:
             self._circuit.failures += 1
             self._circuit.last_failure = time.time()
@@ -3664,7 +3673,8 @@ class HiveFeeIntelligenceBridge:
 
         status = {
             "hive_available": self._hive_available,
-            "circuit_breaker_open": circuit_open,
+            "circuit_breaker_enabled": self._circuit_breaker_enabled,
+            "circuit_breaker_open": circuit_open if self._circuit_breaker_enabled else False,
             "circuit_failures": circuit_failures,
             "cache_entries": cache_size,
             "cache_fresh": fresh_count,

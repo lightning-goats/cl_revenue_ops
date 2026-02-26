@@ -677,6 +677,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-hive-bridge-circuit-breaker-enabled',
+    default='false',
+    description='Enable global cl-hive bridge circuit breaker (default: false; timeouts/backpressure still apply)'
+)
+
+plugin.add_option(
     name='revenue-ops-reservation-timeout-hours',
     default='4',
     description='Hours before stale budget reservations are auto-released (default: 4)',
@@ -970,6 +976,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         scarcity_threshold=float(options['revenue-ops-scarcity-threshold']),
         rpc_timeout_seconds=int(options['revenue-ops-rpc-timeout-seconds']),
         rpc_circuit_breaker_seconds=int(options['revenue-ops-rpc-circuit-breaker-seconds']),
+        hive_bridge_circuit_breaker_enabled=options.get('revenue-ops-hive-bridge-circuit-breaker-enabled', 'false').lower() == 'true',
         reservation_timeout_hours=int(options['revenue-ops-reservation-timeout-hours']),
         # Phase 9: Hive Integration (cl-hive fleet coordination)
         hive_enabled=options['revenue-ops-hive-enabled'].lower(),
