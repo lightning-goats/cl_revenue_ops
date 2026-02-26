@@ -235,6 +235,14 @@ class Config:
     flow_interval: int = 3600      # 1 hour
     fee_interval: int = 600        # 10 minutes
     rebalance_interval: int = 900  # 15 minutes
+    # Hot-channel protection (Sling aggressiveness for fast-draining, high-profit channels)
+    hot_channel_protection_enabled: bool = True
+    hot_channel_protection_override_peers: str = ''  # CSV fallback; DB override table preferred
+    hot_channel_protection_min_velocity: float = 0.20
+    hot_channel_protection_min_marginal_roi: float = 0.20
+    hot_channel_protection_profit_budget_pct: float = 0.75
+    hot_channel_protection_max_chunk_multiplier: float = 4.0
+    hot_channel_protection_min_cooldown_hours: float = 1.0
     boltz_auto_cycle_enabled: bool = True   # Run profit-gated Boltz auto-balance cycle in background
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
@@ -728,7 +736,12 @@ class ConfigSnapshot:
     
     @classmethod
     def from_config(cls, config: 'Config') -> 'ConfigSnapshot':
-        """Create snapshot from mutable Config. Auto-maps matching field names."""
+        """Create snapshot from mutable Config. Auto-maps matching field names.
+
+        Backward-compatibility: if ConfigSnapshot gains new fields before the mutable
+        Config dataclass is updated in a partial deployment, fall back to the snapshot
+        field's declared default/default_factory instead of raising TypeError.
+        """
         with config._lock:
             kwargs = {}
             for f in dataclasses.fields(cls):
@@ -736,6 +749,10 @@ class ConfigSnapshot:
                     kwargs['version'] = config._version
                 elif hasattr(config, f.name):
                     kwargs[f.name] = getattr(config, f.name)
+                elif f.default is not dataclasses.MISSING:
+                    kwargs[f.name] = f.default
+                elif getattr(f, 'default_factory', dataclasses.MISSING) is not dataclasses.MISSING:
+                    kwargs[f.name] = f.default_factory()
         return cls(**kwargs)
 
 
