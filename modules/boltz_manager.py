@@ -370,6 +370,26 @@ class BoltzCliManager:
             return None
         return _scan(decode)
 
+    def _lookup_pays_for_invoice(self, invoice: str) -> Dict[str, Any]:
+        """Best-effort CLN pay lookup for a bolt11 invoice after timeouts/errors."""
+        out: Dict[str, Any] = {"available": False, "matches": []}
+        try:
+            res = self.rpc.call("listpays", {"bolt11": invoice})
+            pays = res.get("pays", []) if isinstance(res, dict) else []
+            out = {"available": True, "source": "listpays", "matches": pays}
+            if pays:
+                return out
+        except Exception as e:
+            out = {"available": False, "error": str(e), "source": "listpays"}
+        try:
+            res2 = self.rpc.call("listpays")
+            pays2 = res2.get("pays", []) if isinstance(res2, dict) else []
+            matches = [p for p in pays2 if isinstance(p, dict) and str(p.get("bolt11") or "") == str(invoice)]
+            return {"available": True, "source": "listpays_scan", "matches": matches}
+        except Exception as e2:
+            out["scan_error"] = str(e2)
+            return out
+
     def _pay_invoice_via_first_hop(self, invoice: str, *, preferred_peer_id: str, preferred_channel_id: Optional[str] = None,
                                    retry_for: int = 120) -> Dict[str, Any]:
         if not invoice or not str(invoice).lower().startswith("ln"):
@@ -410,16 +430,33 @@ class BoltzCliManager:
             except Exception:
                 pass
 
-        pay_result = self.rpc.call("pay", pay_params)
+        try:
+            pay_result = self.rpc.call("pay", pay_params)
+            status = "submitted"
+            pay_error = None
+            pay_lookup = None
+        except Exception as e:
+            pay_result = None
+            pay_error = str(e)
+            pay_lookup = self._lookup_pays_for_invoice(invoice)
+            # CLN pay can outlive the plugin RPC timeout; preserve context instead of failing hard.
+            if "timeout" in pay_error.lower():
+                status = "timeout"
+                warnings.append("CLN pay RPC timed out; payment may still be in progress or completed")
+            else:
+                status = "error"
         return {
-            "status": "submitted",
+            "status": status,
             "preferred_peer_id": preferred_peer_id,
             "preferred_channel_id": preferred_channel_id,
             "exclude_count": len(exclude),
             "exclude": exclude,
             "warnings": warnings,
             "decodepay": decode,
+            "pay_params": pay_params,
             "pay_result": pay_result,
+            "pay_error": pay_error,
+            "pay_lookup": pay_lookup,
         }
 
     def _normalize_swap_entry(self, entry: Dict[str, Any], *, wrapper_key: Optional[str] = None) -> Dict[str, Any]:
@@ -990,8 +1027,12 @@ class BoltzCliManager:
                     status_probe = self.swap_status(created_id)
                 except Exception as e:
                     warnings.append(f"swap status probe failed after external-pay submit: {e}")
+            outer_status = "accepted"
+            if isinstance(cln_payment, dict) and cln_payment.get("status") in ("timeout", "error"):
+                outer_status = str(cln_payment.get("status"))
             return {
-                "status": "accepted",
+                "status": outer_status,
+
                 "swap_type": "reverse",
                 "amount_sats": amount_sats,
                 "settlement_currency": target_cur,
