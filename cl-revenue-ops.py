@@ -433,6 +433,21 @@ hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligen
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
+_boltz_auto_cycle_run_lock = threading.Lock()
+_boltz_auto_cycle_state_lock = threading.Lock()
+_boltz_auto_cycle_state: Dict[str, Any] = {
+    'enabled': False,
+    'thread_started': False,
+    'running': False,
+    'next_run_ts': None,
+    'last_trigger': None,
+    'last_started_ts': None,
+    'last_finished_ts': None,
+    'last_duration_ms': None,
+    'last_result': None,
+    'last_error': None,
+    'consecutive_errors': 0,
+}
 
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
@@ -728,6 +743,30 @@ plugin.add_option(
     description='Preferred boltzd LBTC wallet name (default: LOOP-LBTC)'
 )
 
+plugin.add_option(
+    name='revenue-ops-boltz-auto-cycle-enabled',
+    default='true',
+    description='Enable in-plugin periodic profit-gated Boltz balance cycles (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-auto-cycle-interval-minutes',
+    default='15',
+    description='Minutes between scheduled Boltz auto-balance cycles (default: 15)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-auto-cycle-max-actions',
+    default='1',
+    description='Maximum Boltz actions per scheduled auto-cycle (default: 1)'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-auto-cycle-startup-delay-seconds',
+    default='120',
+    description='Startup delay before first Boltz auto-cycle run (default: 120)'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -797,6 +836,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_interval=int(options['revenue-ops-flow-interval']),
         fee_interval=int(options['revenue-ops-fee-interval']),
         rebalance_interval=int(options['revenue-ops-rebalance-interval']),
+        boltz_auto_cycle_enabled=options.get('revenue-ops-boltz-auto-cycle-enabled', 'true').lower() == 'true',
+        boltz_auto_cycle_interval_minutes=int(options.get('revenue-ops-boltz-auto-cycle-interval-minutes', '15')),
+        boltz_auto_cycle_max_actions=int(options.get('revenue-ops-boltz-auto-cycle-max-actions', '1')),
+        boltz_auto_cycle_startup_delay_seconds=int(options.get('revenue-ops-boltz-auto-cycle-startup-delay-seconds', '120')),
         target_flow=int(options['revenue-ops-target-flow']),
         min_fee_ppm=int(options['revenue-ops-min-fee-ppm']),
         max_fee_ppm=int(options['revenue-ops-max-fee-ppm']),
@@ -1267,6 +1310,128 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 plugin.log("Rebalance check loop stopping due to shutdown signal")
                 break
     
+    def _boltz_auto_cycle_mark_state(**updates):
+        with _boltz_auto_cycle_state_lock:
+            _boltz_auto_cycle_state.update(updates)
+
+    def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> Dict[str, Any]:
+        """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight)."""
+        if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
+            result = {
+                'status': 'disabled',
+                'reason': 'boltz integration disabled',
+                'trigger': trigger,
+            }
+            _boltz_auto_cycle_mark_state(last_result=result, last_error=None, enabled=False)
+            return result
+
+        cfg = config.snapshot() if config else None
+        enabled = bool(getattr(cfg, 'boltz_auto_cycle_enabled', True)) if cfg else True
+        _boltz_auto_cycle_mark_state(enabled=enabled)
+        if not enabled and not force:
+            result = {
+                'status': 'disabled',
+                'reason': 'boltz auto-cycle disabled by config',
+                'trigger': trigger,
+            }
+            _boltz_auto_cycle_mark_state(last_result=result, last_error=None)
+            return result
+
+        acquired = _boltz_auto_cycle_run_lock.acquire(blocking=False)
+        if not acquired:
+            result = {'status': 'skipped', 'reason': 'auto-cycle already running', 'trigger': trigger}
+            _boltz_auto_cycle_mark_state(last_result=result)
+            return result
+
+        started = int(time.time())
+        start_monotonic = time.monotonic()
+        _boltz_auto_cycle_mark_state(
+            running=True,
+            last_trigger=trigger,
+            last_started_ts=started,
+            last_error=None,
+        )
+        try:
+            max_actions = max(1, int(getattr(cfg, 'boltz_auto_cycle_max_actions', 1) if cfg else 1))
+            result = revenue_boltz_balance_cycle(
+                plugin=plugin,
+                dry_run=False,
+                max_actions=max_actions,
+                allow_concurrent_swaps=False,
+                loop_in_currency='LBTC',
+                loop_out_currency='LBTC',
+            )
+            status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
+            if isinstance(result, dict) and 'error' in result:
+                with _boltz_auto_cycle_state_lock:
+                    _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
+                _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
+            else:
+                _boltz_auto_cycle_mark_state(last_error=None)
+                with _boltz_auto_cycle_state_lock:
+                    _boltz_auto_cycle_state['consecutive_errors'] = 0
+            return result if isinstance(result, dict) else {'status': status, 'result': result}
+        except Exception as e:
+            with _boltz_auto_cycle_state_lock:
+                _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
+            _boltz_auto_cycle_mark_state(last_error=str(e))
+            raise
+        finally:
+            finished = int(time.time())
+            duration_ms = int((time.monotonic() - start_monotonic) * 1000)
+            with _boltz_auto_cycle_state_lock:
+                _boltz_auto_cycle_state['running'] = False
+                _boltz_auto_cycle_state['last_finished_ts'] = finished
+                _boltz_auto_cycle_state['last_duration_ms'] = duration_ms
+                # Preserve last_result if set by success/skip/disabled path, otherwise leave as-is.
+            _boltz_auto_cycle_run_lock.release()
+
+    def boltz_auto_cycle_loop():
+        """Background loop for profit-gated Boltz auto-balance cycles."""
+        if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
+            _boltz_auto_cycle_mark_state(enabled=False, thread_started=False, next_run_ts=None)
+            plugin.log("Boltz auto-cycle loop disabled: Boltz CLI integration not enabled", level='debug')
+            return
+
+        _boltz_auto_cycle_mark_state(enabled=bool(getattr(config, 'boltz_auto_cycle_enabled', True)), thread_started=True)
+
+        startup_delay = max(0, int(getattr(config, 'boltz_auto_cycle_startup_delay_seconds', 120) or 0))
+        if startup_delay > 0:
+            _boltz_auto_cycle_mark_state(next_run_ts=int(time.time()) + startup_delay)
+            if shutdown_event.wait(startup_delay):
+                plugin.log("Boltz auto-cycle loop cancelled during startup delay")
+                _boltz_auto_cycle_mark_state(next_run_ts=None)
+                return
+
+        while not shutdown_event.is_set():
+            enabled = bool(getattr(config, 'boltz_auto_cycle_enabled', True))
+            _boltz_auto_cycle_mark_state(enabled=enabled)
+
+            if enabled:
+                try:
+                    result = _run_boltz_auto_cycle_once(trigger='scheduler')
+                    _boltz_auto_cycle_mark_state(last_result=result)
+                    summary = ''
+                    if isinstance(result, dict):
+                        summary = f"status={result.get('status')} executed={result.get('executed_count', 0)} skipped={result.get('skipped_count', 0)}"
+                    plugin.log(f"Boltz auto-cycle completed ({summary})", level='debug')
+                except Exception as e:
+                    plugin.log(f"Error in Boltz auto-cycle: {e}", level='warn')
+                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+            else:
+                _boltz_auto_cycle_mark_state(last_result={'status': 'disabled', 'reason': 'boltz auto-cycle disabled by config', 'trigger': 'scheduler'})
+
+            interval_min = max(1, int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15) or 15))
+            interval_sec = interval_min * 60
+            jitter = max(0, int(interval_sec * 0.1))
+            sleep_time = interval_sec + (random.randint(-jitter, jitter) if jitter > 0 else 0)
+            _boltz_auto_cycle_mark_state(next_run_ts=int(time.time()) + max(1, sleep_time))
+            if shutdown_event.wait(max(1, sleep_time)):
+                plugin.log("Boltz auto-cycle loop stopping due to shutdown signal")
+                break
+
+        _boltz_auto_cycle_mark_state(next_run_ts=None, running=False)
+
     def snapshot_peers_delayed():
         """
         One-time delayed snapshot of connected peers.
@@ -1409,6 +1574,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
+    threading.Thread(target=boltz_auto_cycle_loop, daemon=True, name="boltz-auto-cycle").start()
 
     # Signal that init is complete — hive bridge can now make plugin-to-plugin
     # RPCs safely (CLN releases its lock after init returns).
@@ -5384,6 +5550,34 @@ def revenue_boltz_balance_recommendations(
             loop_in_currency=loop_in_currency,
             loop_out_currency=loop_out_currency,
         )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-auto-cycle-status")
+def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
+    """Return scheduler status for the in-plugin Boltz auto-cycle."""
+    with _boltz_auto_cycle_state_lock:
+        state = dict(_boltz_auto_cycle_state)
+    state.update({
+        "boltz_enabled": bool(boltz_manager and getattr(boltz_manager, 'enabled', False)),
+        "config": {
+            "boltz_auto_cycle_enabled": bool(getattr(config, 'boltz_auto_cycle_enabled', True)) if config else None,
+            "boltz_auto_cycle_interval_minutes": int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15)) if config else None,
+            "boltz_auto_cycle_max_actions": int(getattr(config, 'boltz_auto_cycle_max_actions', 1)) if config else None,
+            "boltz_auto_cycle_startup_delay_seconds": int(getattr(config, 'boltz_auto_cycle_startup_delay_seconds', 120)) if config else None,
+        },
+    })
+    return state
+
+
+@plugin.method("revenue-boltz-auto-cycle-run-now")
+def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False) -> Dict[str, Any]:
+    """Trigger one immediate Boltz auto-cycle run using scheduler settings."""
+    try:
+        result = _run_boltz_auto_cycle_once(trigger="manual", force=bool(force))
+        _boltz_auto_cycle_mark_state(last_result=result)
+        return result
     except Exception as e:
         return {"error": str(e)}
 

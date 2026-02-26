@@ -37,6 +37,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'total_cost_budget_profit_pct': float,
     'total_cost_budget_profit_pct_cap': float,
     'total_cost_budget_window_hours': int,
+    'boltz_auto_cycle_enabled': bool,
+    'boltz_auto_cycle_interval_minutes': int,
+    'boltz_auto_cycle_max_actions': int,
+    'boltz_auto_cycle_startup_delay_seconds': int,
     'min_wallet_reserve': int,
     'low_liquidity_threshold': float,
     'high_liquidity_threshold': float,
@@ -139,6 +143,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'total_cost_budget_profit_pct': (0.0, 1.0),
     'total_cost_budget_profit_pct_cap': (0.0, 1.0),
     'total_cost_budget_window_hours': (1, 168),
+    'boltz_auto_cycle_interval_minutes': (1, 1440),
+    'boltz_auto_cycle_max_actions': (1, 10),
+    'boltz_auto_cycle_startup_delay_seconds': (0, 3600),
     'min_wallet_reserve': (0, 100000000),
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
@@ -221,6 +228,10 @@ class Config:
     flow_interval: int = 3600      # 1 hour
     fee_interval: int = 600        # 10 minutes
     rebalance_interval: int = 900  # 15 minutes
+    boltz_auto_cycle_enabled: bool = True   # Run profit-gated Boltz auto-balance cycle in background
+    boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
+    boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
+    boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
     
     # Flow analysis parameters
     target_flow: int = 100000      # Target sats routed per day per channel
@@ -547,6 +558,10 @@ class ConfigSnapshot:
     flow_interval: int
     fee_interval: int
     rebalance_interval: int
+    boltz_auto_cycle_enabled: bool
+    boltz_auto_cycle_interval_minutes: int
+    boltz_auto_cycle_max_actions: int
+    boltz_auto_cycle_startup_delay_seconds: int
     
     # Flow analysis parameters
     target_flow: int
