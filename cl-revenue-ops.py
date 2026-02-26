@@ -1991,17 +1991,56 @@ def revenue_rebalance_debug(plugin: Plugin) -> Dict[str, Any]:
             spendable = info.get("spendable_sats", 0)
             ratio = spendable / capacity
             fee_ppm = info.get("fee_ppm", 0)
-            peer_id = info.get("peer_id", "")[:16]
+            peer_id_full = info.get("peer_id", "") or ""
+            peer_id = peer_id_full[:16]
 
             state = database.get_channel_state(cid) if database else {}
             flow_state = state.get("state", "unknown") if state else "unknown"
+
+            hot_profile: Dict[str, Any] = {}
+            try:
+                velocity = 0.0
+                if capacity > 0 and state:
+                    sats_in = float(state.get("sats_in", 0) or 0)
+                    sats_out = float(state.get("sats_out", 0) or 0)
+                    velocity = (sats_in + sats_out) / max(float(capacity), 1.0) / max(float(getattr(cfg, "flow_window_days", 7) or 7), 1.0)
+
+                prof = None
+                profitability_analyzer = getattr(rebalancer, "_profitability_analyzer", None)
+                if profitability_analyzer is not None:
+                    try:
+                        prof = profitability_analyzer.analyze_channel(cid)
+                    except Exception:
+                        prof = None
+
+                compute_hot = getattr(rebalancer, "_compute_hot_channel_protection", None)
+                if callable(compute_hot):
+                    hot_profile = compute_hot(
+                        dest_channel=cid,
+                        dest_peer_id=peer_id_full,
+                        dest_flow_state=flow_state,
+                        dest_ratio=ratio,
+                        velocity=velocity,
+                        prof=prof,
+                        cfg=cfg,
+                    ) or {}
+            except Exception as e:
+                hot_profile = {"enabled": False, "eligible": False, "reason": f"debug_hot_profile_error:{e}"}
 
             channel_info = {
                 "scid": cid[:20],
                 "peer": peer_id,
                 "local_pct": round(ratio * 100, 1),
                 "fee_ppm": fee_ppm,
-                "flow_state": flow_state
+                "flow_state": flow_state,
+                "hot_channel_protection": bool(hot_profile.get("eligible", False)),
+                "hot_channel_protection_enabled": bool(hot_profile.get("enabled", False)),
+                "hot_channel_protection_reason": hot_profile.get("reason"),
+                "hot_channel_protection_score": round(float(hot_profile.get("score", 0.0) or 0.0), 4),
+                "hot_channel_protection_peer_override": bool(hot_profile.get("peer_forced", False)),
+                "profit_budget_override_sats": int(hot_profile.get("channel_profit_budget_sats", 0) or 0),
+                "hot_recommended_cooldown_hours": hot_profile.get("recommended_cooldown_hours"),
+                "hot_chunk_multiplier": hot_profile.get("chunk_multiplier"),
             }
 
             if cid in active_channels:
