@@ -2131,6 +2131,8 @@ def revenue_rebalance_debug(
 
             result["channels"]["counts"]["considered"] = int(result["channels"]["counts"].get("considered", 0) or 0) + 1
 
+            effective_low_threshold = float(hot_override_depletion_thresholds.get(peer_id_full, cfg.low_liquidity_threshold))
+
             channel_info = {
                 "scid": cid[:20],
                 "peer": peer_id_short,
@@ -2138,6 +2140,7 @@ def revenue_rebalance_debug(
                 "local_pct": round(ratio * 100, 1),
                 "fee_ppm": fee_ppm,
                 "flow_state": flow_state,
+                "effective_low_liquidity_threshold_pct": round(effective_low_threshold * 100, 1),
             }
             if channel_info.get("peer_id") is None:
                 channel_info.pop("peer_id", None)
