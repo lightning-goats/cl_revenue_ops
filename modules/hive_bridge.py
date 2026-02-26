@@ -779,37 +779,31 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        if self._is_circuit_open():
-            return False
+        # Calculate revenue rate
+        revenue_sats = (volume_sats * our_fee_ppm) // 1_000_000
+        revenue_rate = revenue_sats / period_hours if period_hours > 0 else 0
 
-        try:
-            # Calculate revenue rate
-            revenue_sats = (volume_sats * our_fee_ppm) // 1_000_000
-            revenue_rate = revenue_sats / period_hours if period_hours > 0 else 0
-
-            result = self.plugin.rpc.call("hive-report-fee-observation", {
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-fee-observation",
+            {
                 "peer_id": peer_id,
                 "our_fee_ppm": our_fee_ppm,
                 "their_fee_ppm": their_fee_ppm,
                 "volume_sats": volume_sats,
                 "forward_count": forward_count,
                 "period_hours": period_hours,
-                "revenue_rate": revenue_rate
-            })
-
-            if result.get("error"):
-                self._log(
-                    f"Observation report error: {result.get('error')}",
-                    level="debug"
-                )
-                return False
-
-            return True
-
-        except Exception as e:
-            self._log(f"Failed to report observation: {e}", level="debug")
-            self._record_failure()
+                "revenue_rate": revenue_rate,
+            },
+            policy_key="telemetry",
+        )
+        if not ok:
+            if err not in ("async_queue_full",):
+                self._log(f"Failed to report observation: {err}", level="debug")
             return False
+        if result and result.get("error"):
+            self._log(f"Observation report error: {result.get('error')}", level="debug")
+            return False
+        return True
 
     # =========================================================================
     # NNLB HEALTH QUERIES (Phase 1 - NNLB-Aware Rebalancing)
@@ -840,24 +834,21 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            params = {"action": "query"}
-            if member_id:
-                params["member_id"] = member_id
+        params = {"action": "query"}
+        if member_id:
+            params["member_id"] = member_id
 
-            result = self.plugin.rpc.call("hive-member-health", params)
-
-            if result.get("error"):
-                self._log(f"Health query error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query member health: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-member-health", params, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query member health: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Health query error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def query_fleet_health(self) -> Optional[Dict[str, Any]]:
         """
@@ -878,23 +869,20 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-member-health", {
-                "member_id": "all",
-                "action": "aggregate"
-            })
-
-            if result.get("error"):
-                self._log(f"Fleet health query error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query fleet health: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-member-health",
+            {"member_id": "all", "action": "aggregate"},
+            policy_key="optional_read",
+            require_available=False,
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query fleet health: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Fleet health query error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def report_health_update(
         self,
@@ -925,34 +913,33 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        try:
-            params = {
-                "profitable_channels": profitable_channels,
-                "underwater_channels": underwater_channels,
-                "stagnant_channels": stagnant_channels,
-                "revenue_trend": revenue_trend,
-                "liquidity_score": liquidity_score
-            }
-            if total_channels is not None:
-                params["total_channels"] = total_channels
+        params = {
+            "profitable_channels": profitable_channels,
+            "underwater_channels": underwater_channels,
+            "stagnant_channels": stagnant_channels,
+            "revenue_trend": revenue_trend,
+            "liquidity_score": liquidity_score,
+        }
+        if total_channels is not None:
+            params["total_channels"] = total_channels
 
-            result = self.plugin.rpc.call("hive-report-health", params)
-
-            if result.get("error"):
-                self._log(f"Health report error: {result.get('error')}", level="debug")
-                return False
-
-            self._log(
-                f"Health reported: profitable={profitable_channels}, "
-                f"underwater={underwater_channels}, stagnant={stagnant_channels}, "
-                f"liquidity_score={liquidity_score}"
-            )
-            return True
-
-        except Exception as e:
-            self._log(f"Failed to report health: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-health", params, policy_key="telemetry"
+        )
+        if not ok:
+            if err not in ("async_queue_full",):
+                self._log(f"Failed to report health: {err}", level="debug")
             return False
+        if result and result.get("error"):
+            self._log(f"Health report error: {result.get('error')}", level="debug")
+            return False
+
+        self._log(
+            f"Health reported: profitable={profitable_channels}, "
+            f"underwater={underwater_channels}, stagnant={stagnant_channels}, "
+            f"liquidity_score={liquidity_score}"
+        )
+        return True
 
     # =========================================================================
     # PHASE 2: LIQUIDITY INTELLIGENCE SHARING
@@ -982,22 +969,17 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-liquidity-state", {
-                "action": "status"
-            })
-
-            if result.get("error"):
-                self._log(f"Liquidity state query error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query liquidity state: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-liquidity-state", {"action": "status"}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query liquidity state: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Liquidity state query error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def query_fleet_liquidity_needs(self) -> List[Dict[str, Any]]:
         """
@@ -1013,22 +995,17 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return []
 
-        try:
-            result = self.plugin.rpc.call("hive-liquidity-state", {
-                "action": "needs"
-            })
-
-            if result.get("error"):
-                self._log(f"Fleet needs query error: {result.get('error')}", level="debug")
-                return []
-
-            self._record_success()
-            return result.get("fleet_needs", [])
-
-        except Exception as e:
-            self._log(f"Failed to query fleet needs: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-liquidity-state", {"action": "needs"}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query fleet needs: {err}", level="debug")
             return []
+        if result.get("error"):
+            self._log(f"Fleet needs query error: {result.get('error')}", level="debug")
+            return []
+        return result.get("fleet_needs", [])
 
     def report_liquidity_state(
         self,
@@ -1057,32 +1034,31 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        try:
-            payload = {
-                "depleted_channels": depleted_channels,
-                "saturated_channels": saturated_channels,
-                "rebalancing_active": rebalancing_active,
-                "rebalancing_peers": rebalancing_peers or []
-            }
-            if liquidity_needs:
-                payload["liquidity_needs"] = liquidity_needs[:10]
+        payload = {
+            "depleted_channels": depleted_channels,
+            "saturated_channels": saturated_channels,
+            "rebalancing_active": rebalancing_active,
+            "rebalancing_peers": rebalancing_peers or [],
+        }
+        if liquidity_needs:
+            payload["liquidity_needs"] = liquidity_needs[:10]
 
-            result = self.plugin.rpc.call("hive-report-liquidity-state", payload)
-
-            if result.get("error"):
-                self._log(f"Liquidity state report error: {result.get('error')}", level="debug")
-                return False
-
-            self._log(
-                f"Liquidity state reported: depleted={len(depleted_channels or [])}, "
-                f"saturated={len(saturated_channels or [])}"
-            )
-            return True
-
-        except Exception as e:
-            self._log(f"Failed to report liquidity state: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-liquidity-state", payload, policy_key="telemetry"
+        )
+        if not ok:
+            if err not in ("async_queue_full",):
+                self._log(f"Failed to report liquidity state: {err}", level="debug")
             return False
+        if result and result.get("error"):
+            self._log(f"Liquidity state report error: {result.get('error')}", level="debug")
+            return False
+
+        self._log(
+            f"Liquidity state reported: depleted={len(depleted_channels or [])}, "
+            f"saturated={len(saturated_channels or [])}"
+        )
+        return True
 
     def update_rebalancing_activity(
         self,
@@ -1105,25 +1081,22 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        try:
-            result = self.plugin.rpc.call("hive-update-rebalancing-activity", {
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-update-rebalancing-activity",
+            {
                 "rebalancing_active": rebalancing_active,
-                "rebalancing_peers": rebalancing_peers or []
-            })
-
-            if result.get("error"):
-                self._log(
-                    f"Rebalancing activity update error: {result.get('error')}",
-                    level="debug"
-                )
-                return False
-
-            return True
-
-        except Exception as e:
-            self._log(f"Failed to update rebalancing activity: {e}", level="debug")
-            # Non-critical — don't trip circuit breaker
+                "rebalancing_peers": rebalancing_peers or [],
+            },
+            policy_key="telemetry",
+        )
+        if not ok:
+            if err not in ("async_queue_full",):
+                self._log(f"Failed to update rebalancing activity: {err}", level="debug")
             return False
+        if result and result.get("error"):
+            self._log(f"Rebalancing activity update error: {result.get('error')}", level="debug")
+            return False
+        return True
 
     def check_rebalance_conflict(self, peer_id: str) -> Dict[str, Any]:
         """
@@ -1146,22 +1119,17 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return {"conflict": False, "reason": "hive_unavailable"}
 
-        try:
-            result = self.plugin.rpc.call("hive-check-rebalance-conflict", {
-                "peer_id": peer_id
-            })
-
-            if result.get("error"):
-                self._log(f"Conflict check error: {result.get('error')}", level="debug")
-                return {"conflict": False, "reason": "check_failed"}
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to check rebalance conflict: {e}", level="debug")
-            self._record_failure()
-            return {"conflict": False, "reason": "exception"}
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-check-rebalance-conflict", {"peer_id": peer_id}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to check rebalance conflict: {err}", level="debug")
+            return {"conflict": False, "reason": "exception" if err and err.startswith('exception:') else "check_failed"}
+        if result.get("error"):
+            self._log(f"Conflict check error: {result.get('error')}", level="debug")
+            return {"conflict": False, "reason": "check_failed"}
+        return result
 
     def query_circular_flow_status(self) -> Dict[str, Any]:
         """
@@ -1173,14 +1141,14 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return {}
 
-        try:
-            result = self.plugin.rpc.call("hive-circular-flow-status", {})
-            self._record_success()
-            return result or {}
-        except Exception as e:
-            self._log(f"Failed to query circular flow status: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-circular-flow-status", {}, policy_key="optional_read", require_available=False
+        )
+        if not ok:
+            if err:
+                self._log(f"Failed to query circular flow status: {err}", level="debug")
             return {}
+        return (result or {}) if isinstance(result, dict) else {}
 
     def check_circular_flow_risk(
         self,
@@ -1412,42 +1380,33 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            params = {
-                "channel_id": channel_id,
-                "current_fee": current_fee,
-                "local_balance_pct": local_balance_pct
-            }
-            if source:
-                params["source"] = source
-            if destination:
-                params["destination"] = destination
+        params = {
+            "channel_id": channel_id,
+            "current_fee": current_fee,
+            "local_balance_pct": local_balance_pct
+        }
+        if source:
+            params["source"] = source
+        if destination:
+            params["destination"] = destination
 
-            result = self.plugin.rpc.call("hive-coord-fee-recommendation", params)
-
-            if result.get("error"):
-                self._log(
-                    f"Coordinated fee recommendation error: {result.get('error')}",
-                    level="debug"
-                )
-                return None
-
-            # M-18: Clamp recommended fee to configured bounds
-            if result and 'recommended_fee_ppm' in result:
-                min_fee = self.config.min_fee_ppm if self.config else 0
-                max_fee = self.config.max_fee_ppm if self.config else 100000
-                result['recommended_fee_ppm'] = max(
-                    min_fee,
-                    min(result['recommended_fee_ppm'], max_fee)
-                )
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query coordinated fee recommendation: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-coord-fee-recommendation", params, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query coordinated fee recommendation: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Coordinated fee recommendation error: {result.get('error')}", level="debug")
+            return None
+
+        # M-18: Clamp recommended fee to configured bounds
+        if 'recommended_fee_ppm' in result:
+            min_fee = self.config.min_fee_ppm if self.config else 0
+            max_fee = self.config.max_fee_ppm if self.config else 100000
+            result['recommended_fee_ppm'] = max(min_fee, min(result['recommended_fee_ppm'], max_fee))
+        return result
 
     def report_routing_outcome(
         self,
@@ -1482,46 +1441,37 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        if self._is_circuit_open():
+        params = {
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "fee_ppm": fee_ppm,
+            "success": success,
+            "amount_sats": amount_sats,
+        }
+        if source:
+            params["source"] = source
+        if destination:
+            params["destination"] = destination
+
+        # Use deposit-marker RPC if source/destination provided,
+        # otherwise use record-routing-outcome which handles pheromone updates.
+        method = "hive-deposit-marker" if (source and destination) else "hive-record-routing-outcome"
+        payload = params if (source and destination) else {
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "fee_ppm": fee_ppm,
+            "success": success,
+            "amount_sats": amount_sats,
+        }
+        ok, result, err = self._rpc_call_with_policy(method, payload, policy_key="telemetry")
+        if not ok:
+            if err not in ("async_queue_full",):
+                self._log(f"Failed to report routing outcome: {err}", level="debug")
             return False
-
-        try:
-            params = {
-                "channel_id": channel_id,
-                "peer_id": peer_id,
-                "fee_ppm": fee_ppm,
-                "success": success,
-                "amount_sats": amount_sats
-            }
-            if source:
-                params["source"] = source
-            if destination:
-                params["destination"] = destination
-
-            # Use deposit-marker RPC if source/destination provided,
-            # otherwise use record-routing-outcome which handles pheromone
-            # updates without requiring source/destination
-            if source and destination:
-                result = self.plugin.rpc.call("hive-deposit-marker", params)
-            else:
-                result = self.plugin.rpc.call("hive-record-routing-outcome", {
-                    "channel_id": channel_id,
-                    "peer_id": peer_id,
-                    "fee_ppm": fee_ppm,
-                    "success": success,
-                    "amount_sats": amount_sats
-                })
-
-            if result.get("error"):
-                self._log(f"Routing outcome report error: {result.get('error')}", level="debug")
-                return False
-
-            return True
-
-        except Exception as e:
-            self._log(f"Failed to report routing outcome: {e}", level="debug")
-            self._record_failure()
+        if result and result.get("error"):
+            self._log(f"Routing outcome report error: {result.get('error')}", level="debug")
             return False
+        return True
 
     def query_defense_status(self, peer_id: str = None) -> Optional[Dict[str, Any]]:
         """
@@ -1557,28 +1507,24 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            params = {}
-            if peer_id:
-                params["peer_id"] = peer_id
+        params = {}
+        if peer_id:
+            params["peer_id"] = peer_id
 
-            result = self.plugin.rpc.call("hive-defense-status", params)
-
-            if result.get("error"):
-                self._log(f"Defense status query error: {result.get('error')}", level="debug")
-                return None
-
-            # M-18: Clamp defensive_multiplier to safe range [0.1, 5.0]
-            if result and 'defensive_multiplier' in result:
-                result['defensive_multiplier'] = max(0.1, min(5.0, result['defensive_multiplier']))
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query defense status: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-defense-status", params, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query defense status: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Defense status query error: {result.get('error')}", level="debug")
+            return None
+
+        if 'defensive_multiplier' in result:
+            result['defensive_multiplier'] = max(0.1, min(5.0, result['defensive_multiplier']))
+        return result
 
     def broadcast_peer_warning(
         self,
@@ -1606,34 +1552,24 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        if self._is_circuit_open():
+        params = {"peer_id": peer_id, "threat_type": threat_type, "severity": severity}
+        if evidence:
+            params["evidence"] = evidence
+
+        ok, result, err = self._rpc_call_with_policy("hive-broadcast-warning", params, policy_key="telemetry")
+        if not ok:
+            if err not in ("async_queue_full",):
+                self._log(f"Failed to broadcast warning: {err}", level="debug")
+            return False
+        if result and result.get("error"):
+            self._log(f"Warning broadcast error: {result.get('error')}", level="debug")
             return False
 
-        try:
-            params = {
-                "peer_id": peer_id,
-                "threat_type": threat_type,
-                "severity": severity
-            }
-            if evidence:
-                params["evidence"] = evidence
-
-            result = self.plugin.rpc.call("hive-broadcast-warning", params)
-
-            if result.get("error"):
-                self._log(f"Warning broadcast error: {result.get('error')}", level="debug")
-                return False
-
-            self._log(
-                f"Warning broadcasted: peer={peer_id[:12]}... type={threat_type} "
-                f"severity={severity:.2f}",
-                level="info"
-            )
-            return True
-
-        except Exception as e:
-            self._log(f"Failed to broadcast warning: {e}", level="debug")
-            return False
+        self._log(
+            f"Warning broadcasted: peer={peer_id[:12]}... type={threat_type} severity={severity:.2f}",
+            level="info"
+        )
+        return True
 
     def broadcast_fee_observation(
         self,
@@ -1668,48 +1604,39 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        if self._is_circuit_open():
-            return False
-
         # Rate limit: don't flood hive with observations
         # Only broadcast discoveries, not every observation
         if discovery_type == "observation" and confidence < 0.7:
             return False
 
-        try:
-            params = {
-                "peer_id": peer_id,
-                "fee_ppm": fee_ppm,
-                "revenue_rate": revenue_rate,
-                "confidence": confidence,
-                "discovery_type": discovery_type,
-                "timestamp": int(time.time())
-            }
-            if metadata:
-                params["metadata"] = metadata
+        params = {
+            "peer_id": peer_id,
+            "fee_ppm": fee_ppm,
+            "revenue_rate": revenue_rate,
+            "confidence": confidence,
+            "discovery_type": discovery_type,
+            "timestamp": int(time.time())
+        }
+        if metadata:
+            params["metadata"] = metadata
 
-            result = self.plugin.rpc.call("hive-broadcast-fee-observation", params)
-
-            if result.get("error"):
-                self._log(
-                    f"Fee observation broadcast error: {result.get('error')}",
-                    level="debug"
-                )
-                return False
-
-            self._log(
-                f"Fee observation broadcasted: peer={peer_id[:12]}... "
-                f"fee={fee_ppm}ppm revenue={revenue_rate:.1f}sats/hr "
-                f"type={discovery_type} conf={confidence:.2f}",
-                level="info"
-            )
-            return True
-
-        except Exception as e:
-            # Don't record failure for non-existent RPC (graceful degradation)
-            if "Unknown command" not in str(e):
-                self._log(f"Failed to broadcast fee observation: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-broadcast-fee-observation", params, policy_key="telemetry"
+        )
+        if not ok:
+            if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
+                self._log(f"Failed to broadcast fee observation: {err}", level="debug")
             return False
+        if result and result.get("error"):
+            self._log(f"Fee observation broadcast error: {result.get('error')}", level="debug")
+            return False
+
+        self._log(
+            f"Fee observation broadcasted: peer={peer_id[:12]}... fee={fee_ppm}ppm "
+            f"revenue={revenue_rate:.1f}sats/hr type={discovery_type} conf={confidence:.2f}",
+            level="info"
+        )
+        return True
 
     def query_fee_coordination_status(self) -> Optional[Dict[str, Any]]:
         """
@@ -1735,20 +1662,17 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-fee-coordination-status", {})
-
-            if result.get("error"):
-                self._log(f"Fee coordination status error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query fee coordination status: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-fee-coordination-status", {}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query fee coordination status: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Fee coordination status error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     # =========================================================================
     # ROUTING INTELLIGENCE INTEGRATION
@@ -1810,48 +1734,41 @@ class HiveFeeIntelligenceBridge:
                 return {**cached, '_stale': True}
             return None
 
-        try:
-            params = {}
-            if scid:
-                params["scid"] = scid
+        params = {}
+        if scid:
+            params["scid"] = scid
 
-            result = self.plugin.rpc.call("hive-get-routing-intelligence", params)
-
-            if result.get("error"):
-                self._log(
-                    f"Routing intelligence query error: {result.get('error')}",
-                    level="debug"
-                )
-                return None
-
-            self._record_success()
-
-            # Cache the result under lock
-            result['_cache_time'] = time.time()
-            result['_stale'] = False
-            with self._intel_cache_lock:
-                self._routing_intel_cache[cache_key] = result
-                # Limit cache size
-                if len(self._routing_intel_cache) > 100:
-                    oldest_key = min(
-                        self._routing_intel_cache.keys(),
-                        key=lambda k: self._routing_intel_cache[k].get('_cache_time', 0)
-                    )
-                    del self._routing_intel_cache[oldest_key]
-
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query routing intelligence: {e}", level="debug")
-            self._record_failure()
-
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-get-routing-intelligence", params, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query routing intelligence: {err}", level="debug")
             # Return stale cache if available
-            # M-3: Return copy to avoid mutating cached data
             with self._intel_cache_lock:
                 cached = self._routing_intel_cache.get(cache_key)
             if cached:
                 return {**cached, '_stale': True}
             return None
+
+        if result.get("error"):
+            self._log(f"Routing intelligence query error: {result.get('error')}", level="debug")
+            return None
+
+        # Cache the result under lock
+        result['_cache_time'] = time.time()
+        result['_stale'] = False
+        with self._intel_cache_lock:
+            self._routing_intel_cache[cache_key] = result
+            # Limit cache size
+            if len(self._routing_intel_cache) > 100:
+                oldest_key = min(
+                    self._routing_intel_cache.keys(),
+                    key=lambda k: self._routing_intel_cache[k].get('_cache_time', 0)
+                )
+                del self._routing_intel_cache[oldest_key]
+
+        return result
 
     def get_channel_routing_intelligence(self, scid: str) -> Optional[Dict[str, Any]]:
         """
@@ -1912,39 +1829,35 @@ class HiveFeeIntelligenceBridge:
         Returns:
             True if broadcasted successfully
         """
-        if not self.is_available() or self._is_circuit_open():
+        if not self.is_available():
             return False
 
         # Only broadcast high-confidence elasticity
         if confidence < 0.5:
             return False
 
-        try:
-            params = {
-                "peer_id": peer_id,
-                "elasticity": elasticity,
-                "confidence": confidence,
-                "sample_count": sample_count,
-                "timestamp": int(time.time())
-            }
+        params = {
+            "peer_id": peer_id,
+            "elasticity": elasticity,
+            "confidence": confidence,
+            "sample_count": sample_count,
+            "timestamp": int(time.time())
+        }
 
-            result = self.plugin.rpc.call("hive-broadcast-elasticity", params)
-
-            if result.get("error"):
-                self._log(f"Elasticity broadcast error: {result.get('error')}", level="debug")
-                return False
-
-            self._log(
-                f"Elasticity broadcasted: peer={peer_id[:12]}... "
-                f"elasticity={elasticity:.2f} conf={confidence:.2f}",
-                level="debug"
-            )
-            return True
-
-        except Exception as e:
-            if "Unknown command" not in str(e):
-                self._log(f"Failed to broadcast elasticity: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy("hive-broadcast-elasticity", params, policy_key="telemetry")
+        if not ok:
+            if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
+                self._log(f"Failed to broadcast elasticity: {err}", level="debug")
             return False
+        if result and result.get("error"):
+            self._log(f"Elasticity broadcast error: {result.get('error')}", level="debug")
+            return False
+
+        self._log(
+            f"Elasticity broadcasted: peer={peer_id[:12]}... elasticity={elasticity:.2f} conf={confidence:.2f}",
+            level="debug"
+        )
+        return True
 
     def query_fleet_elasticity(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -1970,19 +1883,16 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available() or self._is_circuit_open():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-query-elasticity", {"peer_id": peer_id})
-
-            if result.get("error"):
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            if "Unknown command" not in str(e):
-                self._log(f"Failed to query fleet elasticity: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-query-elasticity", {"peer_id": peer_id}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err and "unknown" not in err.lower():
+                self._log(f"Failed to query fleet elasticity: {err}", level="debug")
             return None
+        if result.get("error"):
+            return None
+        return result
 
     # =========================================================================
     # P2 Integration: Historical Response Curve Aggregation
@@ -2010,33 +1920,29 @@ class HiveFeeIntelligenceBridge:
         Returns:
             True if broadcasted successfully
         """
-        if not self.is_available() or self._is_circuit_open():
+        if not self.is_available():
             return False
 
         # Only broadcast meaningful observations
         if forward_count < 1 or revenue_rate < 1.0:
             return False
 
-        try:
-            params = {
-                "peer_id": peer_id,
-                "fee_ppm": fee_ppm,
-                "revenue_rate": revenue_rate,
-                "forward_count": forward_count,
-                "timestamp": int(time.time())
-            }
+        params = {
+            "peer_id": peer_id,
+            "fee_ppm": fee_ppm,
+            "revenue_rate": revenue_rate,
+            "forward_count": forward_count,
+            "timestamp": int(time.time())
+        }
 
-            result = self.plugin.rpc.call("hive-broadcast-curve-observation", params)
-
-            if result.get("error"):
-                return False
-
-            return True
-
-        except Exception as e:
-            if "Unknown command" not in str(e):
-                self._log(f"Failed to broadcast curve observation: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy("hive-broadcast-curve-observation", params, policy_key="telemetry")
+        if not ok:
+            if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
+                self._log(f"Failed to broadcast curve observation: {err}", level="debug")
             return False
+        if result and result.get("error"):
+            return False
+        return True
 
     def query_aggregated_curve(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -2064,19 +1970,16 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available() or self._is_circuit_open():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-query-aggregated-curve", {"peer_id": peer_id})
-
-            if result.get("error"):
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            if "Unknown command" not in str(e):
-                self._log(f"Failed to query aggregated curve: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-query-aggregated-curve", {"peer_id": peer_id}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err and "unknown" not in err.lower():
+                self._log(f"Failed to query aggregated curve: {err}", level="debug")
             return None
+        if result.get("error"):
+            return None
+        return result
 
     # =========================================================================
     # P2 Integration: Regime Change Coordination
@@ -2106,36 +2009,32 @@ class HiveFeeIntelligenceBridge:
         Returns:
             True if broadcasted successfully
         """
-        if not self.is_available() or self._is_circuit_open():
+        if not self.is_available():
             return False
 
-        try:
-            params = {
-                "peer_id": peer_id,
-                "change_type": change_type,
-                "old_regime": old_regime,
-                "new_regime": new_regime,
-                "timestamp": int(time.time())
-            }
-            if evidence:
-                params["evidence"] = evidence
+        params = {
+            "peer_id": peer_id,
+            "change_type": change_type,
+            "old_regime": old_regime,
+            "new_regime": new_regime,
+            "timestamp": int(time.time())
+        }
+        if evidence:
+            params["evidence"] = evidence
 
-            result = self.plugin.rpc.call("hive-broadcast-regime-change", params)
-
-            if result.get("error"):
-                return False
-
-            self._log(
-                f"Regime change broadcasted: peer={peer_id[:12]}... "
-                f"type={change_type} {old_regime}->{new_regime}",
-                level="info"
-            )
-            return True
-
-        except Exception as e:
-            if "Unknown command" not in str(e):
-                self._log(f"Failed to broadcast regime change: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy("hive-broadcast-regime-change", params, policy_key="telemetry")
+        if not ok:
+            if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
+                self._log(f"Failed to broadcast regime change: {err}", level="debug")
             return False
+        if result and result.get("error"):
+            return False
+
+        self._log(
+            f"Regime change broadcasted: peer={peer_id[:12]}... type={change_type} {old_regime}->{new_regime}",
+            level="info"
+        )
+        return True
 
     def query_fleet_regime_status(self, peer_id: str = None) -> Optional[Dict[str, Any]]:
         """
@@ -2170,23 +2069,20 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available() or self._is_circuit_open():
             return None
 
-        try:
-            params = {}
-            if peer_id:
-                params["peer_id"] = peer_id
+        params = {}
+        if peer_id:
+            params["peer_id"] = peer_id
 
-            result = self.plugin.rpc.call("hive-query-regime-status", params)
-
-            if result.get("error"):
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            if "Unknown command" not in str(e):
-                self._log(f"Failed to query fleet regime status: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-query-regime-status", params, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err and "unknown" not in err.lower():
+                self._log(f"Failed to query fleet regime status: {err}", level="debug")
             return None
+        if result.get("error"):
+            return None
+        return result
 
     # =========================================================================
     # P2 Integration: Thompson Posterior Sharing
@@ -2216,34 +2112,30 @@ class HiveFeeIntelligenceBridge:
         Returns:
             True if shared successfully
         """
-        if not self.is_available() or self._is_circuit_open():
+        if not self.is_available():
             return False
 
         # Only share if we have meaningful data
         if observation_count < 5:
             return False
 
-        try:
-            params = {
-                "peer_id": peer_id,
-                "posterior_mean": posterior_mean,
-                "posterior_std": posterior_std,
-                "observation_count": observation_count,
-                "corridor_role": corridor_role,
-                "timestamp": int(time.time())
-            }
+        params = {
+            "peer_id": peer_id,
+            "posterior_mean": posterior_mean,
+            "posterior_std": posterior_std,
+            "observation_count": observation_count,
+            "corridor_role": corridor_role,
+            "timestamp": int(time.time())
+        }
 
-            result = self.plugin.rpc.call("hive-share-posterior", params)
-
-            if result.get("error"):
-                return False
-
-            return True
-
-        except Exception as e:
-            if "Unknown command" not in str(e):
-                self._log(f"Failed to share posterior: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy("hive-share-posterior", params, policy_key="telemetry")
+        if not ok:
+            if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
+                self._log(f"Failed to share posterior: {err}", level="debug")
             return False
+        if result and result.get("error"):
+            return False
+        return True
 
     def query_fleet_posteriors(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -2277,19 +2169,16 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available() or self._is_circuit_open():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-query-posteriors", {"peer_id": peer_id})
-
-            if result.get("error"):
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            if "Unknown command" not in str(e):
-                self._log(f"Failed to query fleet posteriors: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-query-posteriors", {"peer_id": peer_id}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err and "unknown" not in err.lower():
+                self._log(f"Failed to query fleet posteriors: {err}", level="debug")
             return None
+        if result.get("error"):
+            return None
+        return result
 
     # =========================================================================
     # YIELD OPTIMIZATION PHASE 3: COST REDUCTION (PREDICTIVE REBALANCING)
@@ -2330,23 +2219,20 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-velocity-prediction", {
-                "channel_id": channel_id,
-                "hours": hours
-            })
-
-            if result.get("error"):
-                self._log(f"Velocity prediction error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query velocity prediction: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-velocity-prediction",
+            {"channel_id": channel_id, "hours": hours},
+            policy_key="optional_read",
+            require_available=False,
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query velocity prediction: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Velocity prediction error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def query_critical_velocity_channels(
         self,
@@ -2367,22 +2253,20 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return []
 
-        try:
-            result = self.plugin.rpc.call("hive-critical-velocity", {
-                "threshold_hours": hours_threshold
-            })
-
-            if result.get("error"):
-                self._log(f"Critical velocity query error: {result.get('error')}", level="debug")
-                return []
-
-            self._record_success()
-            return result.get("channels", [])
-
-        except Exception as e:
-            self._log(f"Failed to query critical velocity: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-critical-velocity",
+            {"threshold_hours": hours_threshold},
+            policy_key="optional_read",
+            require_available=False,
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query critical velocity: {err}", level="debug")
             return []
+        if result.get("error"):
+            self._log(f"Critical velocity query error: {result.get('error')}", level="debug")
+            return []
+        return result.get("channels", [])
 
     def query_fleet_rebalance_path(
         self,
@@ -2415,27 +2299,22 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-fleet-rebalance-path", {
-                "from_channel": from_channel,
-                "to_channel": to_channel,
-                "amount_sats": amount_sats
-            })
-
-            if result.get("error"):
-                # This might not be implemented yet - that's OK
-                if "unknown" in str(result.get("error")).lower():
-                    return None
-                self._log(f"Fleet path query error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            # Method might not exist yet - fail gracefully
-            self._log(f"Failed to query fleet rebalance path: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-fleet-rebalance-path",
+            {"from_channel": from_channel, "to_channel": to_channel, "amount_sats": amount_sats},
+            policy_key="optional_read",
+            require_available=False,
+        )
+        if not ok or result is None:
+            if err and "unknown" not in err.lower():
+                self._log(f"Failed to query fleet rebalance path: {err}", level="debug")
             return None
+        if result.get("error"):
+            if "unknown" in str(result.get("error")).lower():
+                return None
+            self._log(f"Fleet path query error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def execute_circular_rebalance(
         self,
@@ -2469,39 +2348,28 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            params = {
-                "from_channel": from_channel,
-                "to_channel": to_channel,
-                "amount_sats": amount_sats,
-                "dry_run": False
-            }
-            if via_members:
-                params["via_members"] = via_members
+        params = {
+            "from_channel": from_channel,
+            "to_channel": to_channel,
+            "amount_sats": amount_sats,
+            "dry_run": False,
+        }
+        if via_members:
+            params["via_members"] = via_members
 
-            result = self.plugin.rpc.call(
-                "hive-execute-circular-rebalance", params
-            )
-
-            if result.get("error"):
-                if "unknown" in str(result.get("error")).lower():
-                    return None
-                self._log(
-                    f"Circular rebalance error: {result.get('error')}",
-                    level="debug"
-                )
-                self._record_failure()
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(
-                f"Failed to execute circular rebalance: {e}", level="debug"
-            )
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-execute-circular-rebalance", params, policy_key="critical_write", require_available=False
+        )
+        if not ok or result is None:
+            if err and "unknown" not in err.lower():
+                self._log(f"Failed to execute circular rebalance: {err}", level="debug")
             return None
+        if result.get("error"):
+            if "unknown" in str(result.get("error")).lower():
+                return None
+            self._log(f"Circular rebalance error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def report_kalman_velocity(
         self,
@@ -2535,9 +2403,6 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        if self._is_circuit_open():
-            return False
-
         # Validate parameters to prevent invalid data propagation
         if not (0.0 <= confidence <= 1.0):
             self._log(f"Invalid confidence value {confidence}, clamping to [0,1]", level="debug")
@@ -2551,33 +2416,31 @@ class HiveFeeIntelligenceBridge:
             self._log(f"Invalid uncertainty value {uncertainty}, using abs", level="debug")
             uncertainty = abs(uncertainty)
 
-        try:
-            result = self.plugin.rpc.call("hive-report-kalman-velocity", {
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-kalman-velocity",
+            {
                 "channel_id": channel_id,
                 "peer_id": peer_id,
                 "velocity_pct_per_hour": velocity_pct_per_hour,
                 "uncertainty": uncertainty,
                 "flow_ratio": flow_ratio,
                 "confidence": confidence,
-                "is_regime_change": is_regime_change
-            })
-
-            if result.get("error"):
-                # Method might not be implemented yet - that's OK
-                if "unknown" in str(result.get("error")).lower():
-                    return True  # Silently succeed if not implemented
-                self._log(f"Kalman velocity report error: {result.get('error')}", level="debug")
-                return False
-
-            self._record_success()
-            return True
-
-        except Exception as e:
-            # Method might not exist yet - fail gracefully
-            self._log(f"Failed to report Kalman velocity: {e}", level="debug")
-            self._record_failure()
+                "is_regime_change": is_regime_change,
+            },
+            policy_key="telemetry",
+        )
+        if not ok:
+            if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
+                self._log(f"Failed to report Kalman velocity: {err}", level="debug")
             # M-24: Return False to indicate failure (callers should not block on this)
             return False
+        if result and result.get("error"):
+            # Method might not be implemented yet - that's OK
+            if "unknown" in str(result.get("error")).lower():
+                return True
+            self._log(f"Kalman velocity report error: {result.get('error')}", level="debug")
+            return False
+        return True
 
     def query_kalman_velocity(
         self,
@@ -2607,23 +2470,22 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-query-kalman-velocity", {
-                "channel_id": channel_id
-            })
-
-            if result.get("error"):
-                if "unknown" in str(result.get("error")).lower():
-                    return None
-                self._log(f"Kalman velocity query error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query Kalman velocity: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-query-kalman-velocity",
+            {"channel_id": channel_id},
+            policy_key="optional_read",
+            require_available=False,
+        )
+        if not ok or result is None:
+            if err and "unknown" not in err.lower():
+                self._log(f"Failed to query Kalman velocity: {err}", level="debug")
             return None
+        if result.get("error"):
+            if "unknown" in str(result.get("error")).lower():
+                return None
+            self._log(f"Kalman velocity query error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def report_rebalance_outcome(
         self,
@@ -2655,36 +2517,31 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        if self._is_circuit_open():
-            return False
+        payload = {
+            "from_channel": from_channel,
+            "to_channel": to_channel,
+            "amount_sats": amount_sats,
+            "cost_sats": cost_sats,
+            "success": success,
+            "via_fleet": via_fleet,
+        }
+        if failure_reason:
+            payload["failure_reason"] = failure_reason
 
-        try:
-            payload = {
-                "from_channel": from_channel,
-                "to_channel": to_channel,
-                "amount_sats": amount_sats,
-                "cost_sats": cost_sats,
-                "success": success,
-                "via_fleet": via_fleet
-            }
-            if failure_reason:
-                payload["failure_reason"] = failure_reason
-            result = self.plugin.rpc.call("hive-report-rebalance-outcome", payload)
-
-            if result.get("error"):
-                # This might not be implemented yet - that's OK
-                if "unknown" in str(result.get("error")).lower():
-                    return True  # Silently succeed if not implemented
-                self._log(f"Rebalance outcome report error: {result.get('error')}", level="debug")
-                return False
-
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-rebalance-outcome", payload, policy_key="telemetry"
+        )
+        if not ok:
+            # Don't block on this telemetry path.
+            if err not in ("async_queue_full",) and err and "unknown" not in err.lower():
+                self._log(f"Failed to report rebalance outcome: {err}", level="debug")
             return True
-
-        except Exception as e:
-            # Method might not exist yet - fail gracefully
-            self._log(f"Failed to report rebalance outcome: {e}", level="debug")
-            self._record_failure()
-            return True  # Don't block on this
+        if result and result.get("error"):
+            if "unknown" in str(result.get("error")).lower():
+                return True
+            self._log(f"Rebalance outcome report error: {result.get('error')}", level="debug")
+            return False
+        return True
 
     def report_cost_trends(
         self,
@@ -2699,22 +2556,23 @@ class HiveFeeIntelligenceBridge:
         Args:
             channel_costs: List of {channel_id, avg_cost_ppm, success_rate, sample_count}
         """
-        if not self.is_available() or self._is_circuit_open():
+        if not self.is_available():
             return False
 
-        try:
-            result = self.plugin.rpc.call("hive-report-cost-trends", {
-                "costs": channel_costs[:50]  # Bounded to top 50
-            })
-            if result.get("error"):
-                if "unknown" in str(result.get("error")).lower():
-                    return True  # Not implemented yet
-                return False
-            return True
-        except Exception as e:
-            self._log(f"Failed to report cost trends: {e}", level="debug")
-            self._record_failure()
-            return True  # Non-fatal
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-cost-trends",
+            {"costs": channel_costs[:50]},  # Bounded to top 50
+            policy_key="telemetry",
+        )
+        if not ok:
+            if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
+                self._log(f"Failed to report cost trends: {err}", level="debug")
+            return True  # Non-fatal telemetry path
+        if result and result.get("error"):
+            if "unknown" in str(result.get("error")).lower():
+                return True
+            return False
+        return True
 
     # =========================================================================
     # YIELD OPTIMIZATION PHASE 5: STRATEGIC POSITIONING (PHYSARUM)
@@ -2771,26 +2629,23 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            params = {}
-            if channel_id:
-                params["channel_id"] = channel_id
+        params = {}
+        if channel_id:
+            params["channel_id"] = channel_id
 
-            result = self.plugin.rpc.call("hive-flow-recommendations", params)
-
-            if result.get("error"):
-                # This might not be implemented yet
-                if "unknown" in str(result.get("error")).lower():
-                    return None
-                self._log(f"Flow recommendations error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query flow recommendations: {e}", level="debug")
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-flow-recommendations", params, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err and "unknown" not in err.lower():
+                self._log(f"Failed to query flow recommendations: {err}", level="debug")
             return None
+        if result.get("error"):
+            if "unknown" in str(result.get("error")).lower():
+                return None
+            self._log(f"Flow recommendations error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def report_flow_intensity(
         self,
@@ -2820,32 +2675,28 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        if self._is_circuit_open():
-            return False
-
-        try:
-            result = self.plugin.rpc.call("hive-report-flow-intensity", {
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-flow-intensity",
+            {
                 "channel_id": channel_id,
                 "peer_id": peer_id,
                 "capacity_sats": capacity_sats,
                 "volume_7d_sats": volume_7d_sats,
                 "revenue_7d_sats": revenue_7d_sats,
-                "forward_count_7d": forward_count_7d
-            })
-
-            if result.get("error"):
-                # This might not be implemented yet
-                if "unknown" in str(result.get("error")).lower():
-                    return True  # Silently succeed
-                self._log(f"Flow intensity report error: {result.get('error')}", level="debug")
-                return False
-
-            return True
-
-        except Exception as e:
-            self._log(f"Failed to report flow intensity: {e}", level="debug")
-            self._record_failure()
+                "forward_count_7d": forward_count_7d,
+            },
+            policy_key="telemetry",
+        )
+        if not ok:
+            if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
+                self._log(f"Failed to report flow intensity: {err}", level="debug")
             return True  # Don't block on this
+        if result and result.get("error"):
+            if "unknown" in str(result.get("error")).lower():
+                return True
+            self._log(f"Flow intensity report error: {result.get('error')}", level="debug")
+            return False
+        return True
 
     def query_internal_competition(self) -> Optional[Dict[str, Any]]:
         """
@@ -2874,20 +2725,17 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-internal-competition", {})
-
-            if result.get("error"):
-                self._log(f"Internal competition query error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query internal competition: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-internal-competition", {}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query internal competition: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Internal competition query error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def query_pheromone_level(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -2912,44 +2760,41 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-pheromone-levels", {
-                "channel_id": channel_id
-            })
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-pheromone-levels", {"channel_id": channel_id}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query pheromone level: {err}", level="debug")
+            return None
+        if result.get("error"):
+            return None
 
-            if result.get("error"):
-                return None
-
-            # Extract relevant data for this channel
-            # Prefer list format under "pheromone_levels" key
-            levels = result.get("pheromone_levels", [])
-            for level_data in levels:
-                if level_data.get("channel_id") == channel_id:
-                    self._record_success()
-                    return {
-                        "channel_id": channel_id,
-                        "level": level_data.get("level", 0),
-                        "above_threshold": level_data.get("above_threshold", False)
-                    }
-
-            # Fallback: handle flat dict response (legacy cl-hive format)
-            if result.get("channel_id") == channel_id:
+        # Extract relevant data for this channel
+        # Prefer list format under "pheromone_levels" key
+        levels = result.get("pheromone_levels", [])
+        for level_data in levels:
+            if level_data.get("channel_id") == channel_id:
                 self._record_success()
                 return {
                     "channel_id": channel_id,
-                    "level": result.get("pheromone_level", result.get("level", 0)),
-                    "above_threshold": result.get("above_exploit_threshold",
-                                                  result.get("above_threshold", False))
+                    "level": level_data.get("level", 0),
+                    "above_threshold": level_data.get("above_threshold", False)
                 }
 
-            # Channel exists but no pheromone data yet
+        # Fallback: handle flat dict response (legacy cl-hive format)
+        if result.get("channel_id") == channel_id:
             self._record_success()
-            return {"channel_id": channel_id, "level": 0, "above_threshold": False}
+            return {
+                "channel_id": channel_id,
+                "level": result.get("pheromone_level", result.get("level", 0)),
+                "above_threshold": result.get("above_exploit_threshold",
+                                              result.get("above_threshold", False))
+            }
 
-        except Exception as e:
-            self._log(f"Failed to query pheromone level: {e}", level="debug")
-            self._record_failure()
-            return None
+        # Channel exists but no pheromone data yet
+        self._record_success()
+        return {"channel_id": channel_id, "level": 0, "above_threshold": False}
 
     def check_internal_competition_for_peer(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -2973,31 +2818,30 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-internal-competition", {})
-
-            if result.get("error"):
-                return None
-
-            # Check if this peer is in any competing routes
-            competing_routes = result.get("competing_routes", [])
-            for route in competing_routes:
-                if route.get("destination") == peer_id or route.get("source") == peer_id:
-                    self._record_success()
-                    return {
-                        "is_competing": True,
-                        "competing_members": route.get("competing_members", []),
-                        "member_count": route.get("member_count", 0),
-                        "recommendation": route.get("recommendation", "coordinate_fees")
-                    }
-
-            self._record_success()
-            return {"is_competing": False}
-
-        except Exception as e:
-            self._log(f"Failed to check internal competition: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-internal-competition", {}, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to check internal competition: {err}", level="debug")
             return None
+        if result.get("error"):
+            return None
+
+        # Check if this peer is in any competing routes
+        competing_routes = result.get("competing_routes", [])
+        for route in competing_routes:
+            if route.get("destination") == peer_id or route.get("source") == peer_id:
+                self._record_success()
+                return {
+                    "is_competing": True,
+                    "competing_members": route.get("competing_members", []),
+                    "member_count": route.get("member_count", 0),
+                    "recommendation": route.get("recommendation", "coordinate_fees")
+                }
+
+        self._record_success()
+        return {"is_competing": False}
 
     # =========================================================================
     # YIELD OPTIMIZATION: YIELD METRICS REPORTING
@@ -3123,30 +2967,25 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            result = self.plugin.rpc.call("hive-predict-liquidity", {
-                "channel_id": channel_id,
-                "hours_ahead": hours_ahead
-            })
-
-            if result.get("error"):
-                # No data is not a failure
-                if result.get("error") == "no_data":
-                    return None
-                self._log(f"Prediction query error: {result.get('error')}", level="debug")
-                return None
-
-            # Handle "no_forecast" status (insufficient data, not an error)
-            if result.get("status") == "no_forecast":
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query anticipatory prediction: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-predict-liquidity",
+            {"channel_id": channel_id, "hours_ahead": hours_ahead},
+            policy_key="optional_read",
+            require_available=False,
+            count_error_response_failure=False,
+        )
+        if not ok or result is None:
+            if err and not err.startswith("rpc_error:no_data"):
+                self._log(f"Failed to query anticipatory prediction: {err}", level="debug")
             return None
+        if result.get("error"):
+            if result.get("error") == "no_data":
+                return None
+            self._log(f"Prediction query error: {result.get('error')}", level="debug")
+            return None
+        if result.get("status") == "no_forecast":
+            return None
+        return result
 
     def query_all_anticipatory_predictions(
         self,
@@ -3169,23 +3008,20 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return []
 
-        try:
-            result = self.plugin.rpc.call("hive-anticipatory-predictions", {
-                "hours_ahead": hours_ahead,
-                "min_risk": min_risk
-            })
-
-            if result.get("error"):
-                self._log(f"All predictions query error: {result.get('error')}", level="debug")
-                return []
-
-            self._record_success()
-            return result.get("forecasts", [])
-
-        except Exception as e:
-            self._log(f"Failed to query all predictions: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-anticipatory-predictions",
+            {"hours_ahead": hours_ahead, "min_risk": min_risk},
+            policy_key="optional_read",
+            require_available=False,
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query all predictions: {err}", level="debug")
             return []
+        if result.get("error"):
+            self._log(f"All predictions query error: {result.get('error')}", level="debug")
+            return []
+        return result.get("forecasts", [])
 
     def query_temporal_patterns(
         self,
@@ -3220,24 +3056,21 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
-        try:
-            params = {}
-            if channel_id:
-                params["channel_id"] = channel_id
+        params = {}
+        if channel_id:
+            params["channel_id"] = channel_id
 
-            result = self.plugin.rpc.call("hive-detect-patterns", params)
-
-            if result.get("error"):
-                self._log(f"Patterns query error: {result.get('error')}", level="debug")
-                return None
-
-            self._record_success()
-            return result
-
-        except Exception as e:
-            self._log(f"Failed to query temporal patterns: {e}", level="debug")
-            self._record_failure()
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-detect-patterns", params, policy_key="optional_read", require_available=False
+        )
+        if not ok or result is None:
+            if err:
+                self._log(f"Failed to query temporal patterns: {err}", level="debug")
             return None
+        if result.get("error"):
+            self._log(f"Patterns query error: {result.get('error')}", level="debug")
+            return None
+        return result
 
     def report_flow_observation(
         self,
@@ -3264,30 +3097,23 @@ class HiveFeeIntelligenceBridge:
         if not self.is_available():
             return False
 
-        if self._is_circuit_open():
+        params = {
+            "channel_id": channel_id,
+            "inbound_sats": inbound_sats,
+            "outbound_sats": outbound_sats
+        }
+        if timestamp:
+            params["timestamp"] = timestamp
+
+        ok, result, err = self._rpc_call_with_policy("hive-record-flow", params, policy_key="telemetry")
+        if not ok:
+            if err not in ("async_queue_full",):
+                self._log(f"Failed to report flow observation: {err}", level="debug")
             return False
-
-        try:
-            params = {
-                "channel_id": channel_id,
-                "inbound_sats": inbound_sats,
-                "outbound_sats": outbound_sats
-            }
-            if timestamp:
-                params["timestamp"] = timestamp
-
-            result = self.plugin.rpc.call("hive-record-flow", params)
-
-            if result.get("error"):
-                self._log(f"Flow report error: {result.get('error')}", level="debug")
-                return False
-
-            return True
-
-        except Exception as e:
-            self._log(f"Failed to report flow observation: {e}", level="debug")
-            self._record_failure()
+        if result and result.get("error"):
+            self._log(f"Flow report error: {result.get('error')}", level="debug")
             return False
+        return True
 
     def should_preemptive_rebalance(
         self,
