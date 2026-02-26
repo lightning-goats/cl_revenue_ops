@@ -162,6 +162,13 @@ class HiveFeeIntelligenceBridge:
         self._integration_cache: Dict[str, Any] = {}
         self._intel_cache_lock = threading.Lock()
 
+        # Coalesce non-critical settlement cost telemetry to avoid blocking on
+        # cl-hive fee gossip lock contention and prevent noisy bridge breaker trips.
+        self._period_costs_report_lock = threading.Lock()
+        self._last_reported_period_costs_sats: Optional[int] = None
+        self._last_period_costs_report_time: float = 0.0
+        self._period_costs_report_min_interval: float = 30.0
+
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
         if self.plugin:
@@ -3703,22 +3710,15 @@ class HiveFeeIntelligenceBridge:
         """
         Report rebalancing costs to cl-hive for net profit settlement.
 
-        This enables settlement calculations to use net profit (fees - costs)
-        instead of gross revenue, ensuring members who spend heavily on
-        rebalancing don't subsidize those who don't.
-
-        Should be called periodically (e.g., when reporting yield metrics)
-        to keep cl-hive updated with current period costs.
-
-        Example usage in fee cycle:
-            pnl = profitability_analyzer.get_pnl_summary(window_days=7)
-            hive_bridge.report_period_costs(pnl.get('rebalance_cost_sats', 0))
+        This is non-critical telemetry. We intentionally avoid a blocking RPC
+        round-trip so lock contention in cl-hive fee gossip paths cannot stall
+        cl-revenue-ops or trip the hive bridge circuit breaker.
 
         Args:
             rebalance_costs_sats: Total rebalancing costs in sats for the period
 
         Returns:
-            True if costs were accepted by cl-hive, False otherwise
+            True if the report was queued (or recently coalesced), False if not.
         """
         if not self.is_available():
             self._log("Cannot report period costs - cl-hive not available", level="debug")
@@ -3727,23 +3727,40 @@ class HiveFeeIntelligenceBridge:
         if rebalance_costs_sats < 0:
             rebalance_costs_sats = 0
 
+        now = time.time()
+        with self._period_costs_report_lock:
+            # Coalesce duplicate values on a short interval; this call may be
+            # made frequently from fee/yield loops and does not need exact ack.
+            if (
+                self._last_reported_period_costs_sats == rebalance_costs_sats
+                and (now - self._last_period_costs_report_time) < self._period_costs_report_min_interval
+            ):
+                return True
+            self._last_reported_period_costs_sats = rebalance_costs_sats
+            self._last_period_costs_report_time = now
+
+        payload = {"rebalance_costs_sats": rebalance_costs_sats}
         try:
-            result = self.plugin.rpc.call("hive-report-period-costs", {
-                "rebalance_costs_sats": rebalance_costs_sats
-            })
-            if result.get("error"):
-                self._log(f"Error reporting period costs: {result.get('error')}", level="warn")
+            rpc = self.plugin.rpc
+            fire_and_forget = getattr(rpc, "fire_and_forget", None)
+            if callable(fire_and_forget):
+                queued = bool(fire_and_forget("hive-report-period-costs", payload))
+                if not queued:
+                    self._log(
+                        "Period cost report dropped (async RPC queue full)",
+                        level="debug",
+                    )
+                return queued
+
+            # Fallback for older RPC proxies: short synchronous call, but never
+            # count failures against the hive bridge circuit breaker.
+            result = rpc.call("hive-report-period-costs", payload)
+            if isinstance(result, dict) and result.get("error"):
+                self._log(f"Error reporting period costs: {result.get('error')}", level="debug")
                 return False
-
-            self._log(
-                f"Reported period costs to cl-hive: {rebalance_costs_sats} sats",
-                level="debug"
-            )
             return True
-
         except Exception as e:
-            self._log(f"Failed to report period costs: {e}", level="warn")
-            self._record_failure()
+            self._log(f"Failed to report period costs (non-critical): {e}", level="debug")
             return False
 
     def report_yield_and_costs(
