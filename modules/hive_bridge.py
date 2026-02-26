@@ -1250,7 +1250,20 @@ class HiveFeeIntelligenceBridge:
             if channel_id:
                 params["channel_id"] = channel_id
 
-            result = self.plugin.rpc.call("hive-splice-check", params)
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-splice-check",
+                params,
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                self._log(f"Splice safety check failed: {err}", level="debug")
+                return {
+                    "safe": True,
+                    "safety_level": "safe",
+                    "reason": f"Check failed: {err}",
+                    "can_proceed": True
+                }
 
             if result.get("error"):
                 self._log(f"Splice check error: {result.get('error')}", level="debug")
@@ -1263,7 +1276,6 @@ class HiveFeeIntelligenceBridge:
                 }
 
             safety = result.get("safety", "safe")
-            self._record_success()
 
             return {
                 "safe": safety == "safe",
@@ -1278,8 +1290,7 @@ class HiveFeeIntelligenceBridge:
             }
 
         except Exception as e:
-            self._log(f"Splice safety check failed: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Splice safety check failed (unexpected): {e}", level="debug")
             # Fail open - allow local decision
             return {
                 "safe": True,
@@ -1314,9 +1325,18 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call("hive-splice-recommendations", {
-                "peer_id": peer_id
-            })
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-splice-recommendations",
+                {"peer_id": peer_id},
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                self._log(
+                    f"Failed to get splice recommendations: {err}",
+                    level="debug"
+                )
+                return None
 
             if result.get("error"):
                 self._log(
@@ -1325,12 +1345,10 @@ class HiveFeeIntelligenceBridge:
                 )
                 return None
 
-            self._record_success()
             return result
 
         except Exception as e:
-            self._log(f"Failed to get splice recommendations: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to get splice recommendations (unexpected): {e}", level="debug")
             return None
 
     # =========================================================================
@@ -3224,10 +3242,16 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call("hive-time-fee-adjustment", {
-                "channel_id": channel_id,
-                "base_fee": base_fee
-            })
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-time-fee-adjustment",
+                {"channel_id": channel_id, "base_fee": base_fee},
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query time fee adjustment: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"Time fee query error: {result.get('error')}", level="debug")
@@ -3236,8 +3260,7 @@ class HiveFeeIntelligenceBridge:
             return result
 
         except Exception as e:
-            self._log(f"Failed to query time fee adjustment: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query time fee adjustment (unexpected): {e}", level="debug")
             return None
 
     def query_time_fee_status(self) -> Optional[Dict[str, Any]]:
@@ -3268,7 +3291,16 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call("hive-time-fee-status", {})
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-time-fee-status",
+                {},
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query time fee status: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"Time fee status error: {result.get('error')}", level="debug")
@@ -3277,8 +3309,7 @@ class HiveFeeIntelligenceBridge:
             return result
 
         except Exception as e:
-            self._log(f"Failed to query time fee status: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query time fee status (unexpected): {e}", level="debug")
             return None
 
     def query_channel_peak_hours(
@@ -3311,9 +3342,16 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call("hive-time-peak-hours", {
-                "channel_id": channel_id
-            })
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-time-peak-hours",
+                {"channel_id": channel_id},
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query peak hours: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"Peak hours query error: {result.get('error')}", level="debug")
@@ -3322,8 +3360,7 @@ class HiveFeeIntelligenceBridge:
             return result.get("peak_hours", [])
 
         except Exception as e:
-            self._log(f"Failed to query peak hours: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query peak hours (unexpected): {e}", level="debug")
             return None
 
     def should_use_time_adjusted_fee(
@@ -3418,13 +3455,19 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call("hive-mcf-status")
-            self._record_success()
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-mcf-status",
+                {},
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                self._log(f"Error querying MCF status: {err}", level="debug")
+                return None
             return result
 
         except Exception as e:
-            self._record_failure()
-            self._log(f"Error querying MCF status: {e}", level="debug")
+            self._log(f"Error querying MCF status (unexpected): {e}", level="debug")
             return None
 
     def query_mcf_assignment(self) -> Optional[Dict[str, Any]]:
@@ -3441,13 +3484,19 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call("hive-mcf-assignments")
-            self._record_success()
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-mcf-assignments",
+                {},
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                self._log(f"Error querying MCF assignments: {err}", level="debug")
+                return None
             return result
 
         except Exception as e:
-            self._record_failure()
-            self._log(f"Error querying MCF assignments: {e}", level="debug")
+            self._log(f"Error querying MCF assignments (unexpected): {e}", level="debug")
             return None
 
     def query_mcf_optimized_path(
@@ -3474,17 +3523,23 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call("hive-mcf-optimized-path", {
-                "from_channel": from_channel,
-                "to_channel": to_channel,
-                "amount_sats": amount_sats
-            })
-            self._record_success()
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-mcf-optimized-path",
+                {
+                    "from_channel": from_channel,
+                    "to_channel": to_channel,
+                    "amount_sats": amount_sats,
+                },
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                self._log(f"Error querying MCF optimized path: {err}", level="debug")
+                return None
             return result
 
         except Exception as e:
-            self._record_failure()
-            self._log(f"Error querying MCF optimized path: {e}", level="debug")
+            self._log(f"Error querying MCF optimized path (unexpected): {e}", level="debug")
             return None
 
     def report_mcf_completion(
@@ -3516,19 +3571,25 @@ class HiveFeeIntelligenceBridge:
 
         try:
             # Report via RPC (cl-hive will broadcast to fleet)
-            result = self.plugin.rpc.call("hive-report-mcf-completion", {
-                "assignment_id": assignment_id,
-                "success": success,
-                "actual_amount_sats": actual_amount_sats,
-                "actual_cost_sats": actual_cost_sats,
-                "failure_reason": failure_reason
-            })
-            self._record_success()
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-report-mcf-completion",
+                {
+                    "assignment_id": assignment_id,
+                    "success": success,
+                    "actual_amount_sats": actual_amount_sats,
+                    "actual_cost_sats": actual_cost_sats,
+                    "failure_reason": failure_reason,
+                },
+                policy_key="critical_write",
+                require_available=False,
+            )
+            if not ok or result is None:
+                self._log(f"Error reporting MCF completion: {err}", level="debug")
+                return False
             return result.get("success", False)
 
         except Exception as e:
-            self._record_failure()
-            self._log(f"Error reporting MCF completion: {e}", level="debug")
+            self._log(f"Error reporting MCF completion (unexpected): {e}", level="debug")
             return False
 
     def get_pending_mcf_assignment(self) -> Optional[Dict[str, Any]]:
@@ -3572,22 +3633,23 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            if assignment_id:
-                result = self.plugin.rpc.call("hive-claim-mcf-assignment", {
-                    "assignment_id": assignment_id
-                })
-            else:
-                result = self.plugin.rpc.call("hive-claim-mcf-assignment")
-
-            self._record_success()
+            payload = {"assignment_id": assignment_id} if assignment_id else {}
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-claim-mcf-assignment",
+                payload,
+                policy_key="critical_write",
+                require_available=False,
+            )
+            if not ok or result is None:
+                self._log(f"Error claiming MCF assignment: {err}", level="debug")
+                return None
 
             if result.get("success"):
                 return result.get("assignment")
             return None
 
         except Exception as e:
-            self._record_failure()
-            self._log(f"Error claiming MCF assignment: {e}", level="debug")
+            self._log(f"Error claiming MCF assignment (unexpected): {e}", level="debug")
             return None
 
     def should_use_mcf_path(
@@ -3709,7 +3771,15 @@ class HiveFeeIntelligenceBridge:
         # If hive is available, get membership details
         if self._hive_available:
             try:
-                hive_status = self.plugin.rpc.call("hive-status")
+                ok, hive_status, err = self._rpc_call_with_policy(
+                    "hive-status",
+                    {},
+                    policy_key="optional_read",
+                    require_available=False,
+                    count_error_response_failure=False,
+                )
+                if not ok or hive_status is None:
+                    raise RuntimeError(err or "hive-status unavailable")
                 membership = hive_status.get("membership", {})
                 status["membership"] = {
                     "tier": membership.get("tier"),
@@ -3899,19 +3969,26 @@ class HiveFeeIntelligenceBridge:
             if scid:
                 params["scid"] = scid
 
-            result = self.plugin.rpc.call("hive-get-defense-status", params)
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-get-defense-status",
+                params,
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query defense status: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"Defense status query error: {result.get('error')}", level="debug")
                 return None
 
-            self._record_success()
             self._set_in_cache(cache_key, result)
             return result
 
         except Exception as e:
-            self._log(f"Failed to query defense status: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query defense status (unexpected): {e}", level="debug")
             return None
 
     def get_channel_defense_status(self, scid: str) -> Optional[Dict[str, Any]]:
@@ -3975,19 +4052,26 @@ class HiveFeeIntelligenceBridge:
             if peer_id:
                 params["peer_id"] = peer_id
 
-            result = self.plugin.rpc.call("hive-get-peer-quality", params)
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-get-peer-quality",
+                params,
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query peer quality: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"Peer quality query error: {result.get('error')}", level="debug")
                 return None
 
-            self._record_success()
             self._set_in_cache(cache_key, result)
             return result
 
         except Exception as e:
-            self._log(f"Failed to query peer quality: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query peer quality (unexpected): {e}", level="debug")
             return None
 
     def get_single_peer_quality(self, peer_id: str) -> Optional[Dict[str, Any]]:
@@ -4063,19 +4147,26 @@ class HiveFeeIntelligenceBridge:
             if scid:
                 params["scid"] = scid
 
-            result = self.plugin.rpc.call("hive-get-fee-change-outcomes", params)
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-get-fee-change-outcomes",
+                params,
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query fee change outcomes: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"Fee outcomes query error: {result.get('error')}", level="debug")
                 return None
 
-            self._record_success()
             self._set_in_cache(cache_key, result)
             return result
 
         except Exception as e:
-            self._log(f"Failed to query fee change outcomes: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query fee change outcomes (unexpected): {e}", level="debug")
             return None
 
     def get_channel_flags(self, scid: str = None) -> Optional[Dict[str, Any]]:
@@ -4114,19 +4205,26 @@ class HiveFeeIntelligenceBridge:
             if scid:
                 params["scid"] = scid
 
-            result = self.plugin.rpc.call("hive-get-channel-flags", params)
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-get-channel-flags",
+                params,
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query channel flags: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"Channel flags query error: {result.get('error')}", level="debug")
                 return None
 
-            self._record_success()
             self._set_in_cache(cache_key, result)
             return result
 
         except Exception as e:
-            self._log(f"Failed to query channel flags: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query channel flags (unexpected): {e}", level="debug")
             return None
 
     def get_single_channel_flags(self, scid: str) -> Optional[Dict[str, Any]]:
@@ -4177,19 +4275,26 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call("hive-get-mcf-targets", {})
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-get-mcf-targets",
+                {},
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query MCF targets: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"MCF targets query error: {result.get('error')}", level="debug")
                 return None
 
-            self._record_success()
             self._set_in_cache(cache_key, result)
             return result
 
         except Exception as e:
-            self._log(f"Failed to query MCF targets: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query MCF targets (unexpected): {e}", level="debug")
             return None
 
     def get_nnlb_opportunities(self, min_amount: int = 50000) -> Optional[Dict[str, Any]]:
@@ -4226,21 +4331,26 @@ class HiveFeeIntelligenceBridge:
             return None
 
         try:
-            result = self.plugin.rpc.call("hive-get-nnlb-opportunities", {
-                "min_amount": min_amount
-            })
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-get-nnlb-opportunities",
+                {"min_amount": min_amount},
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query NNLB opportunities: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"NNLB opportunities query error: {result.get('error')}", level="debug")
                 return None
 
-            self._record_success()
             self._set_in_cache(cache_key, result)
             return result
 
         except Exception as e:
-            self._log(f"Failed to query NNLB opportunities: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query NNLB opportunities (unexpected): {e}", level="debug")
             return None
 
     def get_channel_ages(self, scid: str = None) -> Optional[Dict[str, Any]]:
@@ -4280,19 +4390,26 @@ class HiveFeeIntelligenceBridge:
             if scid:
                 params["scid"] = scid
 
-            result = self.plugin.rpc.call("hive-get-channel-ages", params)
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-get-channel-ages",
+                params,
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query channel ages: {err}", level="debug")
+                return None
 
             if result.get("error"):
                 self._log(f"Channel ages query error: {result.get('error')}", level="debug")
                 return None
 
-            self._record_success()
             self._set_in_cache(cache_key, result)
             return result
 
         except Exception as e:
-            self._log(f"Failed to query channel ages: {e}", level="debug")
-            self._record_failure()
+            self._log(f"Failed to query channel ages (unexpected): {e}", level="debug")
             return None
 
     def get_single_channel_age(self, scid: str) -> Optional[Dict[str, Any]]:
