@@ -2084,6 +2084,21 @@ def revenue_rebalance_debug(
         hot_profile_cache: Dict[str, Dict[str, Any]] = {}
         prof_cache: Dict[str, Any] = {}
 
+        hot_override_depletion_thresholds: Dict[str, float] = {}
+        if database is not None:
+            try:
+                for r in (database.list_hot_channel_protection_override_peers() or []):
+                    pid = str(r.get("peer_id") or "").strip()
+                    pct = r.get("min_depletion_trigger_pct")
+                    try:
+                        pct_f = float(pct) if pct is not None else None
+                    except Exception:
+                        pct_f = None
+                    if pid and pct_f is not None and 0.0 < pct_f <= 100.0:
+                        hot_override_depletion_thresholds[pid] = pct_f / 100.0
+            except Exception:
+                hot_override_depletion_thresholds = {}
+
         def _append_channel(bucket: str, item: Dict[str, Any]) -> None:
             counts = result["channels"]["counts"]
             trunc = result["channels"]["truncated"]
@@ -2167,6 +2182,7 @@ def revenue_rebalance_debug(
                     "hot_channel_protection_reason": hot_profile.get("reason"),
                     "hot_channel_protection_score": round(float(hot_profile.get("score", 0.0) or 0.0), 4),
                     "hot_channel_protection_peer_override": bool(hot_profile.get("peer_forced", False)),
+                    "hot_channel_protection_peer_depletion_trigger_pct": hot_profile.get("peer_override_min_depletion_trigger_pct"),
                     "profit_budget_override_sats": int(hot_profile.get("channel_profit_budget_sats", 0) or 0),
                     "hot_recommended_cooldown_hours": hot_profile.get("recommended_cooldown_hours"),
                     "hot_chunk_multiplier": hot_profile.get("chunk_multiplier"),
@@ -2174,7 +2190,7 @@ def revenue_rebalance_debug(
 
             if cid in active_channels:
                 _append_channel("active_jobs", channel_info)
-            elif ratio < cfg.low_liquidity_threshold:
+            elif ratio < effective_low_threshold:
                 channel_info["reason"] = "low local balance"
                 if flow_state == "sink":
                     channel_info["skip_reason"] = "SINK - filling naturally"
@@ -3294,12 +3310,12 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
 
 
 @plugin.method("revenue-hot-channel-protection-peers")
-def revenue_hot_channel_protection_peers(plugin: Plugin, action: str = "list", peer_id: str = None, note: str = None) -> Dict[str, Any]:
+def revenue_hot_channel_protection_peers(plugin: Plugin, action: str = "list", peer_id: str = None, note: str = None, min_depletion_trigger_pct: float = None) -> Dict[str, Any]:
     """Manage persistent peer overrides for hot-channel protection.
 
     Actions:
       list
-      add <peer_id> [note]
+      add <peer_id> [note] [min_depletion_trigger_pct]
       remove <peer_id>
       clear
     """
@@ -3314,9 +3330,9 @@ def revenue_hot_channel_protection_peers(plugin: Plugin, action: str = "list", p
 
         if action == "add":
             if not peer_id:
-                return {"error": "Usage: revenue-hot-channel-protection-peers add <peer_id> [note]"}
-            database.add_hot_channel_protection_override_peer(str(peer_id), note or "")
-            plugin.log(f"HOT CHANNEL OVERRIDE: added peer {peer_id}", level='info')
+                return {"error": "Usage: revenue-hot-channel-protection-peers add <peer_id> [note] [min_depletion_trigger_pct]"}
+            database.add_hot_channel_protection_override_peer(str(peer_id), note or "", min_depletion_trigger_pct=min_depletion_trigger_pct)
+            plugin.log(f"HOT CHANNEL OVERRIDE: added peer {peer_id}" + (f" depletion_trigger={float(min_depletion_trigger_pct):.1f}%" if min_depletion_trigger_pct is not None else ""), level='info')
             rows = database.list_hot_channel_protection_override_peers()
             return {"status": "success", "action": "add", "peer_id": str(peer_id), "count": len(rows), "peers": rows}
 

@@ -2036,7 +2036,22 @@ class EVRebalancer:
             
             depleted_channels = []
             source_channels = []
-            
+
+            hot_override_depletion_thresholds = {}  # peer_id -> ratio threshold override
+            try:
+                if self.database is not None:
+                    for r in (self.database.list_hot_channel_protection_override_peers() or []):
+                        pid = str(r.get('peer_id') or '').strip()
+                        pct = r.get('min_depletion_trigger_pct')
+                        try:
+                            pct_f = float(pct) if pct is not None else None
+                        except Exception:
+                            pct_f = None
+                        if pid and pct_f is not None and 0.0 < pct_f <= 100.0:
+                            hot_override_depletion_thresholds[pid] = pct_f / 100.0
+            except Exception as e:
+                self.plugin.log(f"Hot-channel override depletion threshold lookup failed: {e}", level='debug')
+
             for raw_channel_id, info in channels.items():
                 channel_id = raw_channel_id.replace(':', 'x')
                 capacity = info.get("capacity", 0)
@@ -2068,10 +2083,12 @@ class EVRebalancer:
                     source_channels.append((channel_id, info, outbound_ratio))
                     self.plugin.log(f"STAGNANT AWAKENING: {channel_id[:12]}... is idle (turnover {turnover:.4f}). Adding to source pool.", level='debug')
                 
-                elif outbound_ratio < cfg.low_liquidity_threshold:
-                    depleted_channels.append((channel_id, info, outbound_ratio))
-                elif outbound_ratio > cfg.high_liquidity_threshold:
-                    source_channels.append((channel_id, info, outbound_ratio))
+                else:
+                    effective_low_threshold = float(hot_override_depletion_thresholds.get(peer_id, cfg.low_liquidity_threshold))
+                    if outbound_ratio < effective_low_threshold:
+                        depleted_channels.append((channel_id, info, outbound_ratio))
+                    elif outbound_ratio > cfg.high_liquidity_threshold:
+                        source_channels.append((channel_id, info, outbound_ratio))
             
             if not depleted_channels or not source_channels:
                 return candidates
@@ -2754,10 +2771,22 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             return {'enabled': False, 'eligible': False, 'reason': 'disabled'}
         override_peers_raw = str(getattr(cfg, 'hot_channel_protection_override_peers', '') or '')
         override_peers = {p.strip() for p in override_peers_raw.split(',') if p.strip()}
+        override_min_depletion_trigger_pct = None
         try:
             if self.database is not None:
                 db_override_rows = self.database.list_hot_channel_protection_override_peers()
-                override_peers.update(str(r.get('peer_id') or '').strip() for r in db_override_rows if str(r.get('peer_id') or '').strip())
+                for r in (db_override_rows or []):
+                    pid = str(r.get('peer_id') or '').strip()
+                    if pid:
+                        override_peers.add(pid)
+                    if dest_peer_id and pid == dest_peer_id:
+                        try:
+                            pct = r.get('min_depletion_trigger_pct')
+                            pctf = float(pct) if pct is not None else None
+                            if pctf is not None and 0.0 < pctf <= 100.0:
+                                override_min_depletion_trigger_pct = pctf
+                        except Exception:
+                            pass
         except Exception as e:
             self.plugin.log(f"Hot-channel override peer lookup failed: {e}", level='debug')
         peer_forced = bool(dest_peer_id and dest_peer_id in override_peers)
@@ -2844,6 +2873,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             ),
             'score': round(score, 4),
             'peer_forced': bool(peer_forced),
+            'peer_override_min_depletion_trigger_pct': override_min_depletion_trigger_pct,
             'peer_history_inherited': bool(inherited_active),
             'peer_history_summary': inherited if isinstance(inherited, dict) and inherited_active else None,
             'dest_peer_id': dest_peer_id,

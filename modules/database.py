@@ -539,10 +539,16 @@ class Database:
             CREATE TABLE IF NOT EXISTS hot_channel_protection_overrides (
                 peer_id TEXT PRIMARY KEY,
                 added_at INTEGER NOT NULL,
-                note TEXT
+                note TEXT,
+                min_depletion_trigger_pct REAL
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hot_channel_protection_overrides_added_at ON hot_channel_protection_overrides(added_at)")
+        try:
+            conn.execute("ALTER TABLE hot_channel_protection_overrides ADD COLUMN min_depletion_trigger_pct REAL")
+            self.plugin.log("Added min_depletion_trigger_pct column to hot_channel_protection_overrides")
+        except sqlite3.OperationalError:
+            pass
 
         # Config overrides table (Phase 7: Dynamic Runtime Configuration)
         # Stores operator overrides that persist across restarts
@@ -4802,18 +4808,21 @@ class Database:
         """List peers explicitly forced into hot-channel protection."""
         conn = self._get_connection()
         rows = conn.execute(
-            "SELECT peer_id, added_at, note FROM hot_channel_protection_overrides ORDER BY added_at ASC"
+            "SELECT peer_id, added_at, note, min_depletion_trigger_pct FROM hot_channel_protection_overrides ORDER BY added_at ASC"
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def add_hot_channel_protection_override_peer(self, peer_id: str, note: str = '') -> bool:
+    def add_hot_channel_protection_override_peer(self, peer_id: str, note: str = '', min_depletion_trigger_pct: Optional[float] = None) -> bool:
         """Add/update a peer override for hot-channel protection."""
         if not self._validate_peer_id(peer_id):
             raise ValueError(f"Invalid peer_id: {peer_id}")
         conn = self._get_connection()
+        trigger_pct = None if min_depletion_trigger_pct is None else float(min_depletion_trigger_pct)
+        if trigger_pct is not None and not (0.0 < trigger_pct <= 100.0):
+            raise ValueError("min_depletion_trigger_pct must be between 0 and 100")
         conn.execute(
-            "INSERT OR REPLACE INTO hot_channel_protection_overrides (peer_id, added_at, note) VALUES (?, ?, ?)",
-            (peer_id, int(time.time()), str(note or ''))
+            "INSERT OR REPLACE INTO hot_channel_protection_overrides (peer_id, added_at, note, min_depletion_trigger_pct) VALUES (?, ?, ?, ?)",
+            (peer_id, int(time.time()), str(note or ''), trigger_pct)
         )
         return True
 
