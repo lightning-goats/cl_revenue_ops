@@ -691,6 +691,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-hot-channel-protection-override-peers',
+    default='',
+    description='CSV peer pubkeys to force hot-channel protection (default: empty)'
+)
+
+plugin.add_option(
     name='revenue-ops-hot-channel-protection-min-velocity',
     default='0.20',
     description='Minimum daily turnover ratio to qualify for hot-channel protection (default: 0.20)'
@@ -876,6 +882,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         fee_interval=int(options['revenue-ops-fee-interval']),
         rebalance_interval=int(options['revenue-ops-rebalance-interval']),
         hot_channel_protection_enabled=options.get('revenue-ops-hot-channel-protection-enabled', 'true').lower() == 'true',
+        hot_channel_protection_override_peers=str(options.get('revenue-ops-hot-channel-protection-override-peers', '') or ''),
         hot_channel_protection_min_velocity=float(options.get('revenue-ops-hot-channel-protection-min-velocity', '0.20')),
         hot_channel_protection_min_marginal_roi=float(options.get('revenue-ops-hot-channel-protection-min-marginal-roi', '0.20')),
         hot_channel_protection_profit_budget_pct=float(options.get('revenue-ops-hot-channel-protection-profit-budget-pct', '0.75')),
@@ -3116,6 +3123,53 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
     
     except Exception as e:
         return {"status": "error", "error": f"Report generation failed: {e}"}
+
+
+@plugin.method("revenue-hot-channel-protection-peers")
+def revenue_hot_channel_protection_peers(plugin: Plugin, action: str = "list", peer_id: str = None, note: str = None) -> Dict[str, Any]:
+    """Manage persistent peer overrides for hot-channel protection.
+
+    Actions:
+      list
+      add <peer_id> [note]
+      remove <peer_id>
+      clear
+    """
+    if database is None:
+        return {"error": "Plugin not initialized"}
+
+    action = str(action or "list").lower()
+    try:
+        if action == "list":
+            rows = database.list_hot_channel_protection_override_peers()
+            return {"status": "success", "count": len(rows), "peers": rows}
+
+        if action == "add":
+            if not peer_id:
+                return {"error": "Usage: revenue-hot-channel-protection-peers add <peer_id> [note]"}
+            database.add_hot_channel_protection_override_peer(str(peer_id), note or "")
+            plugin.log(f"HOT CHANNEL OVERRIDE: added peer {peer_id}", level='info')
+            rows = database.list_hot_channel_protection_override_peers()
+            return {"status": "success", "action": "add", "peer_id": str(peer_id), "count": len(rows), "peers": rows}
+
+        if action == "remove":
+            if not peer_id:
+                return {"error": "Usage: revenue-hot-channel-protection-peers remove <peer_id>"}
+            removed = database.remove_hot_channel_protection_override_peer(str(peer_id))
+            rows = database.list_hot_channel_protection_override_peers()
+            return {"status": "success", "action": "remove", "peer_id": str(peer_id), "removed": bool(removed), "count": len(rows), "peers": rows}
+
+        if action == "clear":
+            rows = database.list_hot_channel_protection_override_peers()
+            removed = 0
+            for r in rows:
+                if database.remove_hot_channel_protection_override_peer(str(r.get('peer_id') or '')):
+                    removed += 1
+            return {"status": "success", "action": "clear", "removed": removed, "count": 0, "peers": []}
+
+        return {"error": f"Unknown action: {action}. Use list|add|remove|clear"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @plugin.method("revenue-config")

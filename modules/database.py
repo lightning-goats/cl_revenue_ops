@@ -533,6 +533,17 @@ class Database:
             )
         """)
         
+        # Hot-channel protection peer overrides (operator-managed)
+        # Peers in this table are always eligible for hot-channel protection logic.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hot_channel_protection_overrides (
+                peer_id TEXT PRIMARY KEY,
+                added_at INTEGER NOT NULL,
+                note TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hot_channel_protection_overrides_added_at ON hot_channel_protection_overrides(added_at)")
+
         # Config overrides table (Phase 7: Dynamic Runtime Configuration)
         # Stores operator overrides that persist across restarts
         conn.execute("""
@@ -4721,6 +4732,38 @@ class Database:
         uptime_pct = (total_connected_time / actual_duration) * 100.0
         return min(100.0, max(0.0, uptime_pct))
     
+    # =========================================================================
+    # Hot-Channel Protection Peer Overrides (operator-managed persistent set)
+    # =========================================================================
+
+    def list_hot_channel_protection_override_peers(self) -> List[Dict[str, Any]]:
+        """List peers explicitly forced into hot-channel protection."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT peer_id, added_at, note FROM hot_channel_protection_overrides ORDER BY added_at ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_hot_channel_protection_override_peer(self, peer_id: str, note: str = '') -> bool:
+        """Add/update a peer override for hot-channel protection."""
+        if not self._validate_peer_id(peer_id):
+            raise ValueError(f"Invalid peer_id: {peer_id}")
+        conn = self._get_connection()
+        conn.execute(
+            "INSERT OR REPLACE INTO hot_channel_protection_overrides (peer_id, added_at, note) VALUES (?, ?, ?)",
+            (peer_id, int(time.time()), str(note or ''))
+        )
+        return True
+
+    def remove_hot_channel_protection_override_peer(self, peer_id: str) -> bool:
+        """Remove a peer override. Returns True if removed."""
+        conn = self._get_connection()
+        cur = conn.execute(
+            "DELETE FROM hot_channel_protection_overrides WHERE peer_id = ?",
+            (peer_id,)
+        )
+        return cur.rowcount > 0
+
     # =========================================================================
     # Config Overrides Methods (Phase 7: Dynamic Runtime Configuration)
     # =========================================================================

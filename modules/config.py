@@ -38,6 +38,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'total_cost_budget_profit_pct_cap': float,
     'total_cost_budget_window_hours': int,
     'hot_channel_protection_enabled': bool,
+    'hot_channel_protection_override_peers': str,
     'hot_channel_protection_min_velocity': float,
     'hot_channel_protection_min_marginal_roi': float,
     'hot_channel_protection_profit_budget_pct': float,
@@ -565,6 +566,7 @@ class ConfigSnapshot:
     fee_interval: int
     rebalance_interval: int
     hot_channel_protection_enabled: bool
+    hot_channel_protection_override_peers: str
     hot_channel_protection_min_velocity: float
     hot_channel_protection_min_marginal_roi: float
     hot_channel_protection_profit_budget_pct: float

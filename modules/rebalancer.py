@@ -2352,6 +2352,7 @@ class EVRebalancer:
 
         hot_profile = self._compute_hot_channel_protection(
             dest_channel=dest_channel,
+            dest_peer_id=dest_info.get('peer_id', ''),
             dest_flow_state=dest_flow_state,
             dest_ratio=dest_ratio,
             velocity=velocity,
@@ -2746,25 +2747,36 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         except Exception:
             return 0.0
 
-    def _compute_hot_channel_protection(self, *, dest_channel: str, dest_flow_state: str, dest_ratio: float,
+    def _compute_hot_channel_protection(self, *, dest_channel: str, dest_peer_id: str, dest_flow_state: str, dest_ratio: float,
                                         velocity: float, prof: Optional[Any], cfg: Optional[ConfigSnapshot] = None) -> Dict[str, Any]:
         cfg = cfg or self.config.snapshot()
         if not getattr(cfg, 'hot_channel_protection_enabled', False):
             return {'enabled': False, 'eligible': False, 'reason': 'disabled'}
-        if str(dest_flow_state) != 'source':
+        override_peers_raw = str(getattr(cfg, 'hot_channel_protection_override_peers', '') or '')
+        override_peers = {p.strip() for p in override_peers_raw.split(',') if p.strip()}
+        try:
+            if self.database is not None:
+                db_override_rows = self.database.list_hot_channel_protection_override_peers()
+                override_peers.update(str(r.get('peer_id') or '').strip() for r in db_override_rows if str(r.get('peer_id') or '').strip())
+        except Exception as e:
+            self.plugin.log(f"Hot-channel override peer lookup failed: {e}", level='debug')
+        peer_forced = bool(dest_peer_id and dest_peer_id in override_peers)
+        if str(dest_flow_state) != 'source' and not peer_forced:
             return {'enabled': True, 'eligible': False, 'reason': 'not_source'}
-        if not prof:
+        if not prof and not peer_forced:
             return {'enabled': True, 'eligible': False, 'reason': 'no_profitability'}
 
         marginal_roi = float(getattr(prof, 'marginal_roi', 0.0) or 0.0)
-        if velocity < float(getattr(cfg, 'hot_channel_protection_min_velocity', 0.20) or 0.20):
+        if velocity < float(getattr(cfg, 'hot_channel_protection_min_velocity', 0.20) or 0.20) and not peer_forced:
             return {'enabled': True, 'eligible': False, 'reason': 'velocity_below_threshold', 'velocity': velocity, 'marginal_roi': marginal_roi}
-        if marginal_roi < float(getattr(cfg, 'hot_channel_protection_min_marginal_roi', 0.20) or 0.20):
+        if marginal_roi < float(getattr(cfg, 'hot_channel_protection_min_marginal_roi', 0.20) or 0.20) and not peer_forced:
             return {'enabled': True, 'eligible': False, 'reason': 'roi_below_threshold', 'velocity': velocity, 'marginal_roi': marginal_roi}
 
         daily_contrib_est = self._estimate_daily_channel_contribution(prof)
-        if daily_contrib_est <= 0:
+        if daily_contrib_est <= 0 and not peer_forced:
             return {'enabled': True, 'eligible': False, 'reason': 'no_daily_contribution', 'velocity': velocity, 'marginal_roi': marginal_roi}
+        if daily_contrib_est <= 0 and peer_forced:
+            daily_contrib_est = 1000.0  # conservative floor for explicit operator override
 
         vel_thr = max(0.0001, float(getattr(cfg, 'hot_channel_protection_min_velocity', 0.20) or 0.20))
         roi_thr = max(0.0001, float(getattr(cfg, 'hot_channel_protection_min_marginal_roi', 0.20) or 0.20))
@@ -2773,6 +2785,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         contrib_score = max(0.0, min(1.0, daily_contrib_est / 5000.0))
         depletion_score = max(0.0, min(1.0, (0.50 - float(dest_ratio)) / 0.50))
         score = max(0.0, min(1.0, 0.35*velocity_score + 0.30*roi_score + 0.20*contrib_score + 0.15*depletion_score))
+        if peer_forced:
+            score = max(score, 0.70)
 
         profit_budget_pct = float(getattr(cfg, 'hot_channel_protection_profit_budget_pct', 0.75) or 0.75)
         channel_profit_budget_sats = int(max(0.0, daily_contrib_est) * max(0.0, min(1.0, profit_budget_pct)))
@@ -2789,8 +2803,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         return {
             'enabled': True,
             'eligible': True,
-            'reason': 'hot_source_profitable',
+            'reason': 'hot_source_profitable_forced' if peer_forced else 'hot_source_profitable',
             'score': round(score, 4),
+            'peer_forced': bool(peer_forced),
+            'dest_peer_id': dest_peer_id,
             'velocity': velocity,
             'marginal_roi': marginal_roi,
             'daily_contribution_est_sats': int(daily_contrib_est),
