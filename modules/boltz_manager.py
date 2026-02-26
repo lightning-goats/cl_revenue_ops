@@ -346,6 +346,30 @@ class BoltzCliManager:
             return None
         return _scan(payload)
 
+    def _decodepay_payee_pubkey(self, decode: Any) -> Optional[str]:
+        """Extract payee pubkey from CLN decodepay output (best effort)."""
+        def _scan(obj: Any, depth: int = 0) -> Optional[str]:
+            if depth > 4:
+                return None
+            if isinstance(obj, dict):
+                for key in ("payee", "payee_id", "destination", "nodeid", "payeeNodeKey"):
+                    v = obj.get(key)
+                    if isinstance(v, str):
+                        s = v.strip().lower()
+                        if len(s) == 66 and all(c in '0123456789abcdef' for c in s):
+                            return s
+                for v in obj.values():
+                    found = _scan(v, depth + 1)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for v in obj:
+                    found = _scan(v, depth + 1)
+                    if found:
+                        return found
+            return None
+        return _scan(decode)
+
     def _pay_invoice_via_first_hop(self, invoice: str, *, preferred_peer_id: str, preferred_channel_id: Optional[str] = None,
                                    retry_for: int = 120) -> Dict[str, Any]:
         if not invoice or not str(invoice).lower().startswith("ln"):
@@ -360,6 +384,23 @@ class BoltzCliManager:
                 raise BoltzCliError(f"decodepay failed for external reverse swap invoice: {e}")
 
         exclude, warnings = self._build_first_hop_excludes(preferred_peer_id, preferred_channel_id)
+        payee_pubkey = self._decodepay_payee_pubkey(decode)
+        if payee_pubkey:
+            if payee_pubkey in exclude:
+                # Do not node-exclude the destination; if it is a direct peer, exclude only our direct edge(s)
+                # so the route can still terminate at the payee via the preferred first hop.
+                exclude = [e for e in exclude if e != payee_pubkey]
+                warnings.append("removed payee pubkey from exclude set to permit route termination")
+                if payee_pubkey != preferred_peer_id:
+                    try:
+                        direct_scids = self._resolve_peer_channel_ids(payee_pubkey)
+                    except Exception:
+                        direct_scids = []
+                    if direct_scids:
+                        for scid in direct_scids:
+                            exclude.append(f"{scid}/0")
+                            exclude.append(f"{scid}/1")
+                        warnings.append(f"excluded {len(direct_scids)} direct payee channel(s) instead of payee node")
         pay_params: Dict[str, Any] = {"bolt11": invoice}
         if exclude:
             pay_params["exclude"] = exclude
