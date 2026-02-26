@@ -36,6 +36,7 @@ import threading
 import signal
 import atexit
 import re
+import dataclasses
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -866,8 +867,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     atexit.register(_shutdown_cleanup)
 
-    # Build configuration from options
-    config = Config(
+    # Build configuration from options. Filter kwargs against the imported Config
+    # dataclass fields so partial deployments (new main file + older modules/config.py)
+    # don't crash during init. Unknown fields are dropped with a warning.
+    config_kwargs = dict(
         db_path=os.path.expanduser(options['revenue-ops-db-path']),
         flow_interval=int(options['revenue-ops-flow-interval']),
         fee_interval=int(options['revenue-ops-fee-interval']),
@@ -917,6 +920,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hive_fee_ppm=int(options['revenue-ops-hive-fee-ppm']),
         hive_rebalance_tolerance=int(options['revenue-ops-hive-rebalance-tolerance'])
     )
+    try:
+        config_fields = {f.name for f in dataclasses.fields(Config)}
+    except Exception:
+        config_fields = set(config_kwargs.keys())
+    dropped = [k for k in config_kwargs.keys() if k not in config_fields]
+    if dropped:
+        plugin.log(
+            f"Config compatibility: dropping unsupported Config fields during init: {', '.join(sorted(dropped))}",
+            level='warn'
+        )
+    config = Config(**{k: v for k, v in config_kwargs.items() if k in config_fields})
     
     plugin.log(f"Configuration loaded: target_flow={config.target_flow}, "
                f"fee_range=[{config.min_fee_ppm}, {config.max_fee_ppm}], "
