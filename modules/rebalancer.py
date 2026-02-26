@@ -2653,6 +2653,26 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             max_fee_ppm = max(1, min(heuristic_ppm, budget_ppm)) if budget_ppm > 0 else 0
         else:
             max_fee_ppm = 0
+
+        # Hot-channel protection safety guard: do not allow protected emergency fills
+        # to pay unbounded route fees. This is a hard execution ceiling even if the
+        # profit-budget override would otherwise permit a larger sats budget.
+        if max_fee_ppm > 0 and hot_profile.get('eligible'):
+            protected_fee_cap_ppm = int(getattr(cfg, 'hot_channel_protection_max_rebalance_fee_ppm', 2000) or 0)
+            if protected_fee_cap_ppm > 0 and max_fee_ppm > protected_fee_cap_ppm:
+                self.plugin.log(
+                    f"HOT CHANNEL PROTECTION: Capping max_fee_ppm for {dest_channel[:12]}... "
+                    f"{max_fee_ppm} -> {protected_fee_cap_ppm}",
+                    level='info'
+                )
+                max_fee_ppm = protected_fee_cap_ppm
+                # Keep the sats-budget consistent with the capped ppm so reservations and EV use
+                # the true executable ceiling (conservative rounding up to sats).
+                if amount_msat > 0:
+                    capped_budget_msat = max(1, (amount_msat * max_fee_ppm) // 1_000_000)
+                    if capped_budget_msat < max_budget_msat:
+                        max_budget_msat = capped_budget_msat
+                        max_budget_sats = max(1, (max_budget_msat + 999) // 1000)
             
         if max_fee_ppm <= 0: 
             return None

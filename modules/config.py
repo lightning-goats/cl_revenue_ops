@@ -44,6 +44,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hot_channel_protection_profit_budget_pct': float,
     'hot_channel_protection_max_chunk_multiplier': float,
     'hot_channel_protection_min_cooldown_hours': float,
+    'hot_channel_protection_max_rebalance_fee_ppm': int,
     'boltz_auto_cycle_enabled': bool,
     'boltz_auto_cycle_interval_minutes': int,
     'boltz_auto_cycle_max_actions': int,
@@ -251,6 +252,7 @@ class Config:
     hot_channel_protection_profit_budget_pct: float = 0.75
     hot_channel_protection_max_chunk_multiplier: float = 4.0
     hot_channel_protection_min_cooldown_hours: float = 1.0
+    hot_channel_protection_max_rebalance_fee_ppm: int = 2000
     boltz_auto_cycle_enabled: bool = True   # Run profit-gated Boltz auto-balance cycle in background
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
@@ -598,6 +600,7 @@ class ConfigSnapshot:
     hot_channel_protection_profit_budget_pct: float
     hot_channel_protection_max_chunk_multiplier: float
     hot_channel_protection_min_cooldown_hours: float
+    hot_channel_protection_max_rebalance_fee_ppm: int
     boltz_auto_cycle_enabled: bool
     boltz_auto_cycle_interval_minutes: int
     boltz_auto_cycle_max_actions: int

@@ -1585,7 +1585,9 @@ class Database:
         Get the total rebalancing fees spent since a given timestamp.
         
         Used for Global Capital Controls to enforce daily budget limits.
-        Sums actual_fee_sats from successful rebalances since the timestamp.
+        Uses the rebalance_costs table as the source of truth because async Sling
+        jobs may record costs there even when rebalance_history.actual_fee_sats is
+        missing or delayed.
         
         Args:
             since_timestamp: Unix timestamp to start summing from
@@ -1595,9 +1597,9 @@ class Database:
         """
         conn = self._get_connection()
         row = conn.execute("""
-            SELECT COALESCE(SUM(actual_fee_sats), 0) as total_fees
-            FROM rebalance_history
-            WHERE timestamp >= ? AND status IN ('success', 'partial') AND actual_fee_sats IS NOT NULL
+            SELECT COALESCE(SUM(cost_sats), 0) as total_fees
+            FROM rebalance_costs
+            WHERE timestamp >= ?
         """, (since_timestamp,)).fetchone()
         
         return row['total_fees'] if row else 0
@@ -2534,15 +2536,21 @@ class Database:
         conn = self._get_connection()
         cutoff = int(time.time()) - (window_hours * 3600)
 
-        # Get spending and job counts from rebalance history
+        # Get job counts from rebalance history (status lifecycle source of truth)
         stats = conn.execute("""
             SELECT
-                COALESCE(SUM(CASE WHEN status IN ('success', 'partial') THEN actual_fee_sats ELSE 0 END), 0) as total_spent,
                 COUNT(*) as job_count,
                 COALESCE(SUM(CASE WHEN status IN ('success', 'failed', 'partial', 'timeout') THEN 1 ELSE 0 END), 0) as completed_count,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) as success_count,
                 COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed_count
             FROM rebalance_history
+            WHERE timestamp >= ?
+        """, (cutoff,)).fetchone()
+
+        # Get actual spend from rebalance_costs (source of truth for fee accounting)
+        spent_row = conn.execute("""
+            SELECT COALESCE(SUM(cost_sats), 0) as total_spent
+            FROM rebalance_costs
             WHERE timestamp >= ?
         """, (cutoff,)).fetchone()
 
@@ -2556,7 +2564,7 @@ class Database:
         # Get stale reservation count (Issue #24)
         stale_count = self.count_stale_reservations()
 
-        total_spent = stats['total_spent'] if stats else 0
+        total_spent = spent_row['total_spent'] if spent_row else 0
         job_count = stats['job_count'] if stats else 0
         completed_count = stats['completed_count'] if stats else 0
         success_count = stats['success_count'] if stats else 0
@@ -2568,6 +2576,7 @@ class Database:
 
         return {
             'total_spent_sats': total_spent,
+            'spend_source': 'rebalance_costs',
             'total_reserved_sats': total_reserved,
             'job_count': job_count,
             'success_count': success_count,
@@ -2590,9 +2599,9 @@ class Database:
         conn = self._get_connection()
 
         spent_row = conn.execute("""
-            SELECT COALESCE(SUM(actual_fee_sats), 0) as spent
-            FROM rebalance_history
-            WHERE timestamp >= ? AND status IN ('success', 'partial') AND actual_fee_sats IS NOT NULL
+            SELECT COALESCE(SUM(cost_sats), 0) as spent
+            FROM rebalance_costs
+            WHERE timestamp >= ?
         """, (since_timestamp,)).fetchone()
 
         reserved_row = conn.execute("""

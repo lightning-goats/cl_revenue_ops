@@ -734,6 +734,13 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-hot-channel-protection-max-rebalance-fee-ppm',
+    default='2000',
+    description='Hard max routing fee ppm for protected hot-channel Sling rebalances (default: 2000)',
+    opt_type='int'
+)
+
+plugin.add_option(
     name='revenue-ops-boltz-enabled',
     default='false',
     description='Enable Boltz CLI integration for revenue-boltz-* RPCs (default: false)'
@@ -965,6 +972,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hot_channel_protection_profit_budget_pct=_safe_float_opt('revenue-ops-hot-channel-protection-profit-budget-pct', '0.75'),
         hot_channel_protection_max_chunk_multiplier=_safe_float_opt('revenue-ops-hot-channel-protection-max-chunk-multiplier', '4.0'),
         hot_channel_protection_min_cooldown_hours=_safe_float_opt('revenue-ops-hot-channel-protection-min-cooldown-hours', '1.0'),
+        hot_channel_protection_max_rebalance_fee_ppm=_safe_int_opt('revenue-ops-hot-channel-protection-max-rebalance-fee-ppm', '2000'),
         boltz_auto_cycle_enabled=options.get('revenue-ops-boltz-auto-cycle-enabled', 'true').lower() == 'true',
         boltz_auto_cycle_interval_minutes=_safe_int_opt('revenue-ops-boltz-auto-cycle-interval-minutes', '15'),
         boltz_auto_cycle_max_actions=_safe_int_opt('revenue-ops-boltz-auto-cycle-max-actions', '1'),
