@@ -43,6 +43,7 @@ class BoltzCliManager:
         self.rpc = rpc
         self.cfg = config
         self._swap_journal_file = os.path.join(self.cfg.datadir, "cl_revenue_ops_swap_journal.json")
+        self._ignored_external_swaps_file = os.path.join(self.cfg.datadir, "cl_revenue_ops_ignored_external_swaps.json")
         # Optional callback set by cl-revenue-ops plugin to provide non-Boltz liquidity costs
         # (e.g. market rebalance spend/reservations) for unified budget accounting.
         self.external_liquidity_cost_provider = None
@@ -482,7 +483,7 @@ class BoltzCliManager:
         items: List[Dict[str, Any]] = []
         if isinstance(swaps_json, dict):
             # Common flat list keys.
-            for key in ('swaps', 'list'):
+            for key in ('swaps', 'list', 'allSwaps'):
                 val = swaps_json.get(key)
                 if isinstance(val, list):
                     items.extend(self._normalize_swap_entry(s) for s in val if isinstance(s, dict))
@@ -740,6 +741,116 @@ class BoltzCliManager:
             os.replace(tmp, self._swap_journal_file)
         except Exception as e:
             self.plugin.log(f"BOLTZ: failed to write swap journal: {e}", level="warn")
+
+    def _load_ignored_external_swaps(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            with open(self._ignored_external_swaps_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                out = {}
+                for k, v in data.items():
+                    if isinstance(v, dict):
+                        out[str(k)] = dict(v)
+                return out
+            if isinstance(data, list):
+                out = {}
+                for rec in data:
+                    if not isinstance(rec, dict):
+                        continue
+                    sid = str(rec.get("id") or "").strip()
+                    if sid:
+                        out[sid] = dict(rec)
+                return out
+        except Exception:
+            return {}
+        return {}
+
+    def _save_ignored_external_swaps(self, entries: Dict[str, Dict[str, Any]]) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._ignored_external_swaps_file), exist_ok=True)
+            tmp = self._ignored_external_swaps_file + ".tmp"
+            serial = dict(sorted(((str(k), v) for k, v in entries.items() if isinstance(v, dict)), key=lambda kv: str(kv[0])))
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(serial, f, sort_keys=True)
+            os.replace(tmp, self._ignored_external_swaps_file)
+        except Exception as e:
+            self.plugin.log(f"BOLTZ: failed to write ignored external swaps file: {e}", level="warn")
+
+    @staticmethod
+    def _annotate_ignored_swap(entry: Optional[Dict[str, Any]], ignored: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(entry, dict):
+            return entry
+        sid = str(entry.get("id") or "").strip()
+        if not sid:
+            return entry
+        rec = ignored.get(sid)
+        if not rec:
+            return entry
+        out = dict(entry)
+        out["ignored_external_swap"] = True
+        out["ignored_external_swap_meta"] = dict(rec)
+        return out
+
+    def manage_external_pay_ignores(self, action: str = "list", swap_id: Optional[str] = None, note: Optional[str] = None) -> Dict[str, Any]:
+        act = str(action or "list").strip().lower()
+        ignores = self._load_ignored_external_swaps()
+        now = int(time.time())
+        if act == "list":
+            items = []
+            for sid, rec in ignores.items():
+                item = dict(rec)
+                item.setdefault("id", sid)
+                try:
+                    st = self.swap_status(sid)
+                    item["swap_status"] = st.get("swapinfo_entry") or st.get("listswaps_entry")
+                except Exception as e:
+                    item["status_error"] = str(e)
+                items.append(item)
+            items.sort(key=lambda x: int(x.get("added_at") or 0), reverse=True)
+            return {"status": "success", "action": "list", "ignores": items, "count": len(items)}
+        if act == "clear":
+            cleared = len(ignores)
+            self._save_ignored_external_swaps({})
+            return {"status": "success", "action": "clear", "cleared": cleared}
+        sid = str(swap_id or "").strip()
+        if not sid:
+            raise BoltzCliError("swap_id is required for action add/remove")
+        if act == "remove":
+            existed = sid in ignores
+            if existed:
+                ignores.pop(sid, None)
+                self._save_ignored_external_swaps(ignores)
+            return {"status": "success", "action": "remove", "swap_id": sid, "removed": bool(existed)}
+        if act != "add":
+            raise BoltzCliError("action must be list, add, remove, or clear")
+        st = self.swap_status(sid)
+        sw = st.get("swapinfo_entry") or st.get("listswaps_entry")
+        if not isinstance(sw, dict):
+            raise BoltzCliError(f"swap {sid} not found")
+        is_external = bool(sw.get("externalPay"))
+        wrapper = str(sw.get("_swap_wrapper") or "")
+        state = str(sw.get("state") or "")
+        status_txt = str(sw.get("status") or "")
+        if not is_external:
+            raise BoltzCliError("Only external-pay swaps can be ignored")
+        if wrapper not in ("reverseSwap", "") and str(sw.get("type") or "").upper() != "REVERSE":
+            raise BoltzCliError("Only reverse swaps can be ignored")
+        rec = dict(ignores.get(sid) or {})
+        rec.update({
+            "id": sid,
+            "added_at": int(rec.get("added_at") or now),
+            "updated_at": now,
+            "note": (str(note).strip() if note is not None else rec.get("note")),
+            "state_at_add": state,
+            "status_at_add": status_txt,
+            "externalPay": True,
+        })
+        created = self._parse_timestamp(sw.get("createdAt"))
+        if created:
+            rec["created_at"] = created
+        ignores[sid] = rec
+        self._save_ignored_external_swaps(ignores)
+        return {"status": "success", "action": "add", "swap_id": sid, "ignore": rec, "swap": sw}
 
     def _record_swap_result(self, payload: Any, *, source: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         now = int(time.time())
@@ -1153,17 +1264,25 @@ class BoltzCliManager:
                 self._record_swap_result({"swaps": extracted}, source="swap_status_lookup")
         except Exception:
             swapinfo_json = None
+        ignores = self._load_ignored_external_swaps()
+        annotated_swapinfo = self._annotate_ignored_swap(swapinfo_entry, ignores)
+        annotated_list = self._annotate_ignored_swap(list_match, ignores)
+        ignore_meta = ignores.get(swap_id)
         return {
             "swap_id": swap_id,
             "swapinfo_raw": raw,
-            "swapinfo_entry": swapinfo_entry,
-            "listswaps_entry": list_match,
+            "swapinfo_entry": annotated_swapinfo,
+            "listswaps_entry": annotated_list,
+            "ignored_external_swap": bool(ignore_meta),
+            "ignored_external_swap_meta": ignore_meta,
         }
 
     def swap_history(self, limit: Optional[int] = None) -> Dict[str, Any]:
         data = self._listswaps_json()
         swaps = self._extract_swap_list(data)
         swaps = self._augment_with_swap_journal(swaps, limit_hint=limit)
+        ignores = self._load_ignored_external_swaps()
+        swaps = [self._annotate_ignored_swap(s, ignores) for s in swaps]
         # sort newest first (best effort)
         swaps.sort(key=lambda s: self._swap_created_ts(s) or 0, reverse=True)
         if limit is not None:

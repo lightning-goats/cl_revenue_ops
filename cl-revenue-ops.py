@@ -5089,6 +5089,14 @@ def revenue_boltz_history(plugin: Plugin, limit: int = None) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+@plugin.method("revenue-boltz-external-pay-ignores")
+def revenue_boltz_external_pay_ignores(plugin: Plugin, action: str = "list", swap_id: str = None, note: str = None) -> Dict[str, Any]:
+    try:
+        return _require_boltz_manager().manage_external_pay_ignores(action=action, swap_id=swap_id, note=note)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @plugin.method("revenue-boltz-budget")
 def revenue_boltz_budget(plugin: Plugin) -> Dict[str, Any]:
     try:
@@ -5186,6 +5194,8 @@ def _boltz_pending_swap_count() -> int:
         pending = 0
         for sw in swaps:
             if not isinstance(sw, dict):
+                continue
+            if bool(sw.get("ignored_external_swap")):
                 continue
             state = str(sw.get("state") or "").lower()
             status = str(sw.get("status") or "").lower()
