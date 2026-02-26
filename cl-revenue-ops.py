@@ -5286,6 +5286,92 @@ def _boltz_channel_daily_contribution_estimate_sats(prof) -> float:
         return 0.0
 
 
+def _boltz_dynamic_channel_tuning(*,
+    local_pct: float,
+    low_trigger_pct: float,
+    low_target_pct: float,
+    high_trigger_pct: float,
+    high_target_pct: float,
+    flow_state: str,
+    daily_contrib_est: float,
+    marginal_roi: Optional[float],
+    state_row: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Derive per-channel dynamic thresholds/sizing hints for Boltz balancing.
+
+    Purpose: protect hot, fast-draining channels (e.g. LOOP) by refilling earlier and
+    more deeply while preserving profit/budget guards.
+    """
+    state_row = state_row or {}
+
+    # Normalize profitability and velocity signals into 0..1 scores.
+    roi = float(marginal_roi or 0.0)
+    # roi is typically fraction (e.g. 0.1 = 10%); clamp aggressively for safety.
+    roi_score = max(0.0, min(1.0, roi / 0.25))  # full score at ~25% marginal ROI
+
+    daily_contrib = max(0.0, float(daily_contrib_est or 0.0))
+    contrib_score = max(0.0, min(1.0, daily_contrib / 5000.0))  # full score at 5k sats/day
+
+    kalman_ratio = float(state_row.get('kalman_flow_ratio', state_row.get('flow_ratio', 0.0)) or 0.0)
+    kalman_velocity = float(state_row.get('kalman_velocity', state_row.get('velocity', 0.0)) or 0.0)
+
+    # SOURCE channels (draining local) are the key loop-in protection case.
+    source_signal = 1.0 if str(flow_state).lower() == 'source' else 0.0
+    source_signal = max(source_signal, max(0.0, min(1.0, kalman_ratio)))
+
+    # Positive velocity means source-ness increasing (more urgently draining) in this model.
+    drain_accel_score = max(0.0, min(1.0, kalman_velocity / 0.05))  # saturate at ~0.05/day
+
+    # Low local balance also contributes to urgency before the static threshold is crossed.
+    depletion_score = max(0.0, min(1.0, (60.0 - float(local_pct)) / 40.0))
+
+    hotness_score = max(0.0, min(1.0, 0.55 * contrib_score + 0.45 * roi_score))
+    drain_score = max(0.0, min(1.0, 0.50 * source_signal + 0.30 * drain_accel_score + 0.20 * depletion_score))
+    protection_score = max(0.0, min(1.0, 0.60 * hotness_score + 0.40 * drain_score))
+
+    # Dynamic loop-in behavior: trigger earlier and refill deeper for high-score channels.
+    trigger_boost = 20.0 * protection_score      # up to +20pp (40 -> 60)
+    target_boost = 15.0 * protection_score       # up to +15pp (55 -> 70)
+    amount_multiplier = 1.0 + (2.0 * protection_score)  # up to 3x amount cap
+    cooldown_multiplier = 1.0 - (0.75 * protection_score)  # down to 25% of base cooldown
+
+    eff_low_trigger = min(70.0, max(float(low_trigger_pct), float(low_trigger_pct) + trigger_boost))
+    # keep target at least 10pp above trigger, bounded for safety
+    eff_low_target = min(85.0, max(float(low_target_pct), eff_low_trigger + 10.0, float(low_target_pct) + target_boost))
+
+    # Loop-out can also become mildly more assertive for hot profitable channels (harvest excess),
+    # but keep it conservative relative to loop-in protection.
+    out_adjust = 5.0 * max(0.0, min(1.0, hotness_score))
+    eff_high_trigger = max(60.0, min(float(high_trigger_pct), float(high_trigger_pct) - out_adjust))
+    eff_high_target = min(float(high_target_pct) + out_adjust, float(high_target_pct) + 5.0)
+
+    return {
+        'hotness_score': round(hotness_score, 4),
+        'drain_score': round(drain_score, 4),
+        'protection_score': round(protection_score, 4),
+        'dynamic_thresholds': {
+            'low_trigger_pct': round(eff_low_trigger, 2),
+            'low_target_pct': round(eff_low_target, 2),
+            'high_trigger_pct': round(eff_high_trigger, 2),
+            'high_target_pct': round(eff_high_target, 2),
+        },
+        'execution_hints': {
+            'amount_cap_multiplier': round(amount_multiplier, 3),
+            'cooldown_multiplier': round(max(0.25, cooldown_multiplier), 3),
+            'prioritize_channel_protection': protection_score >= 0.6,
+        },
+        'signals': {
+            'contrib_score': round(contrib_score, 4),
+            'roi_score': round(roi_score, 4),
+            'source_signal': round(source_signal, 4),
+            'drain_accel_score': round(drain_accel_score, 4),
+            'depletion_score': round(depletion_score, 4),
+            'kalman_flow_ratio': round(kalman_ratio, 4),
+            'kalman_velocity': round(kalman_velocity, 6),
+        },
+    }
+
+
 def _build_boltz_balance_plan(
     *,
     low_trigger_pct: float = 40.0,
@@ -5365,21 +5451,39 @@ def _build_boltz_balance_plan(
                 })
                 continue
 
+        tuning = _boltz_dynamic_channel_tuning(
+            local_pct=local_pct,
+            low_trigger_pct=low_trigger_pct,
+            low_target_pct=low_target_pct,
+            high_trigger_pct=high_trigger_pct,
+            high_target_pct=high_target_pct,
+            flow_state=flow_state,
+            daily_contrib_est=daily_contrib_est,
+            marginal_roi=marginal_roi,
+            state_row=state_row,
+        )
+        dyn = tuning.get("dynamic_thresholds", {}) if isinstance(tuning, dict) else {}
+        hints = tuning.get("execution_hints", {}) if isinstance(tuning, dict) else {}
+        eff_low_trigger_pct = float(dyn.get("low_trigger_pct", low_trigger_pct) or low_trigger_pct)
+        eff_low_target_pct = float(dyn.get("low_target_pct", low_target_pct) or low_target_pct)
+        eff_high_trigger_pct = float(dyn.get("high_trigger_pct", high_trigger_pct) or high_trigger_pct)
+        eff_high_target_pct = float(dyn.get("high_target_pct", high_target_pct) or high_target_pct)
+
         direction = None
         target_pct = None
         target_currency = None
         severity = 0.0
 
-        if local_pct < low_trigger_pct:
+        if local_pct < eff_low_trigger_pct:
             direction = "loop_in"
-            target_pct = low_target_pct
+            target_pct = eff_low_target_pct
             target_currency = loop_in_currency
-            severity = max(0.0, (low_trigger_pct - local_pct) / max(low_trigger_pct, 1.0))
-        elif local_pct > high_trigger_pct:
+            severity = max(0.0, (eff_low_trigger_pct - local_pct) / max(eff_low_trigger_pct, 1.0))
+        elif local_pct > eff_high_trigger_pct:
             direction = "loop_out"
-            target_pct = high_target_pct
+            target_pct = eff_high_target_pct
             target_currency = loop_out_currency
-            severity = max(0.0, (local_pct - high_trigger_pct) / max(100.0 - high_trigger_pct, 1.0))
+            severity = max(0.0, (local_pct - eff_high_trigger_pct) / max(100.0 - eff_high_trigger_pct, 1.0))
         else:
             continue
 
@@ -5394,7 +5498,14 @@ def _build_boltz_balance_plan(
         else:
             raw_amount = max(0, local_sats - target_local_sats)
 
-        amount_sats = max(int(min_amount_sats), min(int(max_amount_sats), int(raw_amount))) if raw_amount > 0 else 0
+        dynamic_amount_cap = int(max_amount_sats)
+        try:
+            dynamic_amount_cap = int(max(int(max_amount_sats), int(int(max_amount_sats) * float(hints.get("amount_cap_multiplier", 1.0) or 1.0))))
+        except Exception:
+            dynamic_amount_cap = int(max_amount_sats)
+        # Safety caps: never exceed 25% of channel capacity or 5M sats in one Boltz action.
+        dynamic_amount_cap = min(dynamic_amount_cap, max(1, int(capacity_sats * 0.25)), 5_000_000)
+        amount_sats = max(int(min_amount_sats), min(int(dynamic_amount_cap), int(raw_amount))) if raw_amount > 0 else 0
         if amount_sats < int(min_amount_sats):
             skipped.append({
                 "channel_id": channel_id,
@@ -5441,8 +5552,14 @@ def _build_boltz_balance_plan(
             "channel_id": channel_id,
             "peer_id": peer_id,
             "direction": direction,
-            "trigger_threshold_pct": low_trigger_pct if direction == "loop_in" else high_trigger_pct,
+            "trigger_threshold_pct": eff_low_trigger_pct if direction == "loop_in" else eff_high_trigger_pct,
             "target_pct": target_pct,
+            "dynamic_tuning": tuning,
+            "execution_hints": {
+                **(hints if isinstance(hints, dict) else {}),
+                "dynamic_amount_cap_sats": int(dynamic_amount_cap),
+                "recommended_cooldown_hours": round(max(0.5, 4.0 * float((hints or {}).get("cooldown_multiplier", 1.0) or 1.0)), 2),
+            },
             "local_balance_pct": round(local_pct, 2),
             "capacity_sats": capacity_sats,
             "local_sats": local_sats,
@@ -5482,6 +5599,7 @@ def _build_boltz_balance_plan(
         key=lambda c: (
             1 if c.get("economics", {}).get("passes_profit_guard") else 0,
             int(c.get("economics", {}).get("risk_adjusted_net_sats", 0) or 0),
+            float(c.get("dynamic_tuning", {}).get("protection_score", 0.0) or 0.0),
             float(c.get("score", {}).get("severity", 0.0) or 0.0),
         ),
         reverse=True,
@@ -5673,14 +5791,23 @@ def revenue_boltz_balance_cycle(
             })
             continue
 
+        rec_hints = rec.get("execution_hints", {}) if isinstance(rec.get("execution_hints"), dict) else {}
+        rec_cooldown_hours = rec_hints.get("recommended_cooldown_hours")
+        rec_cooldown_seconds = cooldown_seconds
+        try:
+            if rec_cooldown_hours is not None:
+                rec_cooldown_seconds = max(0, int(float(rec_cooldown_hours) * 3600))
+        except Exception:
+            rec_cooldown_seconds = cooldown_seconds
+
         with _boltz_balance_lock:
             last_ts = int(_boltz_balance_last_action.get(ch_id, 0) or 0)
-        if cooldown_seconds > 0 and last_ts > 0 and (now - last_ts) < cooldown_seconds:
+        if rec_cooldown_seconds > 0 and last_ts > 0 and (now - last_ts) < rec_cooldown_seconds:
             skipped_exec.append({
                 "channel_id": ch_id,
                 "peer_id": peer_id,
                 "reason": "cooldown_active",
-                "cooldown_remaining_sec": cooldown_seconds - (now - last_ts),
+                "cooldown_remaining_sec": rec_cooldown_seconds - (now - last_ts),
                 "recommendation": rec,
             })
             continue
@@ -5757,6 +5884,7 @@ def revenue_boltz_balance_cycle(
             "loop-out is channel-pinnable via boltzcli --chan-id",
             "loop-in (submarine) is not channel-pinnable on boltzcli v2.11.0; target channel/peer is a planning hint and should be verified post-swap",
             "profit guard uses a conservative heuristic expected-uplift estimate based on recent channel contribution and imbalance severity",
+            "dynamic channel protection tuning raises loop-in trigger/target, amount cap, and cadence for fast-draining high-profit channels",
         ],
     }
 
