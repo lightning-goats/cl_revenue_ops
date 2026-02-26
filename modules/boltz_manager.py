@@ -48,6 +48,8 @@ class BoltzCliManager:
         self.external_liquidity_cost_provider = None
         # Optional callback returning unified budget limit info for all liquidity costs.
         self.global_budget_limit_provider = None
+        # Capability cache: some CLN+boltzd combinations reject reverse-swap chanIds.
+        self._reverse_chanids_supported: Optional[bool] = None
 
     # ---------------------------------------------------------------------
     # Core command execution helpers
@@ -94,6 +96,37 @@ class BoltzCliManager:
             return json.loads(out)
         except json.JSONDecodeError as e:
             raise BoltzCliError(f"Invalid JSON from boltzcli: {e}: {out[:300]}")
+
+    def _detect_reverse_chanids_support(self) -> Optional[bool]:
+        """Best-effort capability probe for reverse-swap --chan-id support.
+
+        CLN backends on some boltzd versions reject chanIds for reverse swaps.
+        Cache the result so we avoid one failed attempt on every loop-out.
+        """
+        if self._reverse_chanids_supported is not None:
+            return self._reverse_chanids_supported
+        try:
+            info = self._run_json(["getinfo"], timeout=max(self.cfg.timeout_seconds, 30))
+        except Exception:
+            return self._reverse_chanids_supported
+        node_hint = ""
+        if isinstance(info, dict):
+            for k in ("node", "Node", "lightningNode"):
+                v = info.get(k)
+                if isinstance(v, str) and v.strip():
+                    node_hint = v.strip()
+                    break
+            if not node_hint:
+                node_hint = json.dumps(info, sort_keys=True)
+        else:
+            node_hint = str(info)
+        if "cln" in node_hint.lower():
+            self._reverse_chanids_supported = False
+            try:
+                self.plugin.log("BOLTZ: reverse-swap chanIds disabled for CLN backend", level="info")
+            except Exception:
+                pass
+        return self._reverse_chanids_supported
 
     # ---------------------------------------------------------------------
     # Parsing helpers
@@ -684,6 +717,10 @@ class BoltzCliManager:
             chan_ids.extend(self._resolve_peer_channel_ids(peer_id))
         warnings: List[str] = []
         wallet_name = None if address else self._resolve_wallet_name(target_cur)
+        reverse_chanids_supported = self._detect_reverse_chanids_support()
+        include_chanids_initial = bool(chan_ids) and (reverse_chanids_supported is not False)
+        if chan_ids and not include_chanids_initial:
+            warnings.append("CLN boltz backend does not support reverse-swap chanIds; submitted without channel pinning")
 
         def _build_args(include_chanids: bool) -> List[str]:
             cmd: List[str] = ["createreverseswap", "--json"]
@@ -700,11 +737,12 @@ class BoltzCliManager:
             return cmd
 
         try:
-            result = self._run_json(_build_args(include_chanids=True), timeout=max(self.cfg.timeout_seconds, 120))
+            result = self._run_json(_build_args(include_chanids=include_chanids_initial), timeout=max(self.cfg.timeout_seconds, 120))
             if chan_ids and self._contains_chanids_cln_error(result):
+                self._reverse_chanids_supported = False
                 warnings.append("CLN boltz backend rejected chanIds in JSON result; retried reverse swap without channel pinning")
                 result = self._run_json(_build_args(include_chanids=False), timeout=max(self.cfg.timeout_seconds, 120))
-            elif chan_ids:
+            elif chan_ids and include_chanids_initial:
                 # Some CLN/Boltz versions accept create-reverse-swap first, then surface the chanIds rejection asynchronously in swapinfo.
                 primary_created = self._primary_swap_entry(result)
                 created_id = str((primary_created or {}).get("id") or "").strip()
@@ -721,6 +759,7 @@ class BoltzCliManager:
                             except Exception:
                                 pass
                             if self._contains_chanids_cln_error(probe):
+                                self._reverse_chanids_supported = False
                                 warnings.append("CLN boltz backend rejected chanIds asynchronously; retried reverse swap without channel pinning")
                                 result = self._run_json(_build_args(include_chanids=False), timeout=probe_timeout)
                                 break
@@ -733,6 +772,7 @@ class BoltzCliManager:
             msg = str(e)
             if chan_ids and "chanIds are not supported for cln" in msg:
                 # CLN backends may reject chanIds even though boltzcli accepts the flag.
+                self._reverse_chanids_supported = False
                 warnings.append("CLN boltz backend rejected chanIds; retried reverse swap without channel pinning")
                 result = self._run_json(_build_args(include_chanids=False), timeout=max(self.cfg.timeout_seconds, 120))
             else:
