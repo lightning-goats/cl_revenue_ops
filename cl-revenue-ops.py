@@ -684,6 +684,42 @@ plugin.add_option(
 
 
 plugin.add_option(
+    name='revenue-ops-hot-channel-protection-enabled',
+    default='true',
+    description='Enable aggressive Sling protection for fast-draining high-profit channels (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-hot-channel-protection-min-velocity',
+    default='0.20',
+    description='Minimum daily turnover ratio to qualify for hot-channel protection (default: 0.20)'
+)
+
+plugin.add_option(
+    name='revenue-ops-hot-channel-protection-min-marginal-roi',
+    default='0.20',
+    description='Minimum marginal ROI (decimal) for hot-channel protection (default: 0.20)'
+)
+
+plugin.add_option(
+    name='revenue-ops-hot-channel-protection-profit-budget-pct',
+    default='0.75',
+    description='Max fraction of daily channel contribution spendable on protective rebalancing (default: 0.75)'
+)
+
+plugin.add_option(
+    name='revenue-ops-hot-channel-protection-max-chunk-multiplier',
+    default='4.0',
+    description='Max multiplier on sling chunk size for hot-channel protection (default: 4.0)'
+)
+
+plugin.add_option(
+    name='revenue-ops-hot-channel-protection-min-cooldown-hours',
+    default='1.0',
+    description='Minimum cooldown hours for protected hot channels (default: 1.0)'
+)
+
+plugin.add_option(
     name='revenue-ops-boltz-enabled',
     default='false',
     description='Enable Boltz CLI integration for revenue-boltz-* RPCs (default: false)'
@@ -836,6 +872,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_interval=int(options['revenue-ops-flow-interval']),
         fee_interval=int(options['revenue-ops-fee-interval']),
         rebalance_interval=int(options['revenue-ops-rebalance-interval']),
+        hot_channel_protection_enabled=options.get('revenue-ops-hot-channel-protection-enabled', 'true').lower() == 'true',
+        hot_channel_protection_min_velocity=float(options.get('revenue-ops-hot-channel-protection-min-velocity', '0.20')),
+        hot_channel_protection_min_marginal_roi=float(options.get('revenue-ops-hot-channel-protection-min-marginal-roi', '0.20')),
+        hot_channel_protection_profit_budget_pct=float(options.get('revenue-ops-hot-channel-protection-profit-budget-pct', '0.75')),
+        hot_channel_protection_max_chunk_multiplier=float(options.get('revenue-ops-hot-channel-protection-max-chunk-multiplier', '4.0')),
+        hot_channel_protection_min_cooldown_hours=float(options.get('revenue-ops-hot-channel-protection-min-cooldown-hours', '1.0')),
         boltz_auto_cycle_enabled=options.get('revenue-ops-boltz-auto-cycle-enabled', 'true').lower() == 'true',
         boltz_auto_cycle_interval_minutes=int(options.get('revenue-ops-boltz-auto-cycle-interval-minutes', '15')),
         boltz_auto_cycle_max_actions=int(options.get('revenue-ops-boltz-auto-cycle-max-actions', '1')),

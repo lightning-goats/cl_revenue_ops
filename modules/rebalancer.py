@@ -104,6 +104,13 @@ class RebalanceCandidate:
     dest_turnover_rate: float
     source_turnover_rate: float  # Turnover rate of the primary source
 
+    # Dynamic hot-channel protection metadata (optional)
+    hot_channel_protection: bool = False
+    hot_channel_protection_score: float = 0.0
+    dynamic_budget_override_sats: int = 0  # Candidate-specific rebalance budget cap (24h)
+    dynamic_channel_profit_budget_sats: int = 0  # Derived from channel contribution * pct
+    recommended_cooldown_hours: float = 0.0
+
     # Explainability fields
     reason_code: str = RebalanceReasonCode.EV_POSITIVE.value  # Why this rebalance was approved
     bleeder_status: str = "none"  # 'hard', 'soft', or 'none'
@@ -152,7 +159,12 @@ class RebalanceCandidate:
             "num_source_candidates": len(self.source_candidates),
             "reason_code": self.reason_code,
             "bleeder_status": self.bleeder_status,
-            "direction": self.direction
+            "direction": self.direction,
+            "hot_channel_protection": self.hot_channel_protection,
+            "hot_channel_protection_score": round(self.hot_channel_protection_score, 4),
+            "dynamic_budget_override_sats": self.dynamic_budget_override_sats,
+            "dynamic_channel_profit_budget_sats": self.dynamic_channel_profit_budget_sats,
+            "recommended_cooldown_hours": round(self.recommended_cooldown_hours, 2) if self.recommended_cooldown_hours else 0.0
         }
 
 
@@ -2112,15 +2124,22 @@ class EVRebalancer:
                     continue
                 
                 last_rebalance = self.database.get_last_rebalance_time(dest_id)
-                if last_rebalance:
-                    cooldown = self.config.rebalance_cooldown_hours * 3600
-                    if int(time.time()) - last_rebalance < cooldown: 
-                        continue
-                
+
                 candidate = self._analyze_rebalance_ev(
                     dest_id, dest_info, dest_ratio, source_channels, peer_status, cfg=cfg
                 )
                 if candidate:
+                    if last_rebalance:
+                        cd_hours = float(getattr(candidate, 'recommended_cooldown_hours', 0.0) or 0.0)
+                        if cd_hours <= 0:
+                            cd_hours = float(self.config.rebalance_cooldown_hours)
+                        cooldown = int(max(0.0, cd_hours) * 3600)
+                        if cooldown > 0 and int(time.time()) - last_rebalance < cooldown:
+                            self.plugin.log(
+                                f"REBAL_SKIP: {dest_id[:12]}... [skip_cooldown] hot_cd={cd_hours:.2f}h",
+                                level='debug'
+                            )
+                            continue
                     candidates.append(candidate)
                     
                     # Stop if we have enough candidates to fill available slots
@@ -2331,6 +2350,15 @@ class EVRebalancer:
         # Get channel age for grace period
         channel_age_days = self._get_channel_age_days(dest_channel, dest_info)
 
+        hot_profile = self._compute_hot_channel_protection(
+            dest_channel=dest_channel,
+            dest_flow_state=dest_flow_state,
+            dest_ratio=dest_ratio,
+            velocity=velocity,
+            prof=locals().get('prof'),
+            cfg=cfg,
+        )
+
         # Apply velocity gate
         velocity_adjusted_target_ratio = target_ratio
         velocity_gate_reason = None
@@ -2355,6 +2383,17 @@ class EVRebalancer:
 
         # Use velocity-adjusted target ratio
         target_ratio = velocity_adjusted_target_ratio
+
+        # HOT CHANNEL PROTECTION: For fast-draining high-profit source channels,
+        # refill earlier/deeper to reduce remote-close risk from depletion.
+        if hot_profile.get('eligible') and dest_flow_state == 'source':
+            boost = float(hot_profile.get('target_ratio_boost', 0.0) or 0.0)
+            target_ratio = min(0.95, max(target_ratio, target_ratio + boost))
+            self.plugin.log(
+                f"HOT CHANNEL PROTECTION: {dest_channel[:12]}... score={hot_profile.get('score', 0.0):.2f} \
+target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('marginal_roi', 0.0) or 0.0):.2f}",
+                level='info'
+            )
 
         # =====================================================================
         # HOTFIX 0.1: Destination Sizing Guard
@@ -2427,7 +2466,15 @@ class EVRebalancer:
 
         # ZERO-TOLERANCE: Evaluate EV on the actual execution unit (one chunk).
         # This matches the "stop after first success" execution model.
-        rebalance_amount = min(desired_amount, self.config.sling_chunk_size_sats)
+        dynamic_chunk_cap = int(self.config.sling_chunk_size_sats)
+        if hot_profile.get('eligible'):
+            try:
+                dynamic_chunk_cap = int(self.config.sling_chunk_size_sats * float(hot_profile.get('chunk_multiplier', 1.0) or 1.0))
+            except Exception:
+                dynamic_chunk_cap = int(self.config.sling_chunk_size_sats)
+        # Safety: keep per-action size bounded.
+        dynamic_chunk_cap = max(self.config.rebalance_min_amount, min(dynamic_chunk_cap, self.config.rebalance_max_amount, max(1, capacity // 4)))
+        rebalance_amount = min(desired_amount, dynamic_chunk_cap)
         amount_msat = rebalance_amount * 1000
         
         # BROADCAST FEE ALIGNMENT (Phase 5.5): Use confirmed broadcast fee for EV
@@ -2550,6 +2597,26 @@ class EVRebalancer:
                 level='info'
             )
 
+        # HOT CHANNEL PROTECTION: budget override tied to channel profitability.
+        hot_budget_override_sats = 0
+        hot_channel_profit_budget_sats = 0
+        hot_score = 0.0
+        hot_cooldown_hours = 0.0
+        if hot_profile.get('eligible'):
+            hot_channel_profit_budget_sats = int(hot_profile.get('channel_profit_budget_sats', 0) or 0)
+            hot_score = float(hot_profile.get('score', 0.0) or 0.0)
+            hot_cooldown_hours = float(hot_profile.get('recommended_cooldown_hours', 0.0) or 0.0)
+            # Lift per-trade fee cap up to the per-channel daily profit budget, with a hard routing-fee sanity cap.
+            per_trade_hot_cap = min(hot_channel_profit_budget_sats, max(1, int((rebalance_amount * 5000) / 1_000_000)))
+            if per_trade_hot_cap > max_budget_sats:
+                self.plugin.log(
+                    f"HOT CHANNEL PROTECTION: Raising fee budget for {dest_channel[:12]}... {max_budget_sats} -> {per_trade_hot_cap} sats",
+                    level='info'
+                )
+                max_budget_sats = per_trade_hot_cap
+                max_budget_msat = max_budget_sats * 1000
+            hot_budget_override_sats = max(0, hot_channel_profit_budget_sats)
+
         if amount_msat > 0:
             # ZERO-TOLERANCE: Derive max routing fee from the sats budget for this chunk.
             # Our EV math subtracts max_budget_sats as a worst-case routing cost, so we must
@@ -2649,6 +2716,11 @@ class EVRebalancer:
             reason_code=RebalanceReasonCode.EV_POSITIVE.value,
             bleeder_status=dest_bleeder_status,
             source_candidate_peer_ids=[info.get("peer_id", "") for _, info, _, _ in source_candidates],
+            hot_channel_protection=bool(hot_profile.get('eligible')),
+            hot_channel_protection_score=float(hot_score),
+            dynamic_budget_override_sats=int(hot_budget_override_sats),
+            dynamic_channel_profit_budget_sats=int(hot_channel_profit_budget_sats),
+            recommended_cooldown_hours=float(hot_cooldown_hours),
         )
 
     def _calculate_turnover_rate(self, channel_id: str, capacity: int) -> float:
@@ -2662,6 +2734,71 @@ class EVRebalancer:
             return max(0.0001, min(1.0, volume / capacity))
         except Exception: 
             return 0.05
+
+    def _estimate_daily_channel_contribution(self, prof: Optional[Any]) -> float:
+        if not prof:
+            return 0.0
+        try:
+            total = float(getattr(getattr(prof, 'revenue', None), 'total_contribution_sats', 0) or 0)
+            days_open = int(getattr(prof, 'days_open', 0) or 0)
+            days = max(1, min(days_open, 30))
+            return max(0.0, total / days)
+        except Exception:
+            return 0.0
+
+    def _compute_hot_channel_protection(self, *, dest_channel: str, dest_flow_state: str, dest_ratio: float,
+                                        velocity: float, prof: Optional[Any], cfg: Optional[ConfigSnapshot] = None) -> Dict[str, Any]:
+        cfg = cfg or self.config.snapshot()
+        if not getattr(cfg, 'hot_channel_protection_enabled', False):
+            return {'enabled': False, 'eligible': False, 'reason': 'disabled'}
+        if str(dest_flow_state) != 'source':
+            return {'enabled': True, 'eligible': False, 'reason': 'not_source'}
+        if not prof:
+            return {'enabled': True, 'eligible': False, 'reason': 'no_profitability'}
+
+        marginal_roi = float(getattr(prof, 'marginal_roi', 0.0) or 0.0)
+        if velocity < float(getattr(cfg, 'hot_channel_protection_min_velocity', 0.20) or 0.20):
+            return {'enabled': True, 'eligible': False, 'reason': 'velocity_below_threshold', 'velocity': velocity, 'marginal_roi': marginal_roi}
+        if marginal_roi < float(getattr(cfg, 'hot_channel_protection_min_marginal_roi', 0.20) or 0.20):
+            return {'enabled': True, 'eligible': False, 'reason': 'roi_below_threshold', 'velocity': velocity, 'marginal_roi': marginal_roi}
+
+        daily_contrib_est = self._estimate_daily_channel_contribution(prof)
+        if daily_contrib_est <= 0:
+            return {'enabled': True, 'eligible': False, 'reason': 'no_daily_contribution', 'velocity': velocity, 'marginal_roi': marginal_roi}
+
+        vel_thr = max(0.0001, float(getattr(cfg, 'hot_channel_protection_min_velocity', 0.20) or 0.20))
+        roi_thr = max(0.0001, float(getattr(cfg, 'hot_channel_protection_min_marginal_roi', 0.20) or 0.20))
+        velocity_score = max(0.0, min(1.0, (velocity - vel_thr) / max(vel_thr, 0.05)))
+        roi_score = max(0.0, min(1.0, (marginal_roi - roi_thr) / max(roi_thr, 0.20)))
+        contrib_score = max(0.0, min(1.0, daily_contrib_est / 5000.0))
+        depletion_score = max(0.0, min(1.0, (0.50 - float(dest_ratio)) / 0.50))
+        score = max(0.0, min(1.0, 0.35*velocity_score + 0.30*roi_score + 0.20*contrib_score + 0.15*depletion_score))
+
+        profit_budget_pct = float(getattr(cfg, 'hot_channel_protection_profit_budget_pct', 0.75) or 0.75)
+        channel_profit_budget_sats = int(max(0.0, daily_contrib_est) * max(0.0, min(1.0, profit_budget_pct)))
+
+        max_chunk_mult = max(1.0, float(getattr(cfg, 'hot_channel_protection_max_chunk_multiplier', 4.0) or 4.0))
+        chunk_multiplier = 1.0 + ((max_chunk_mult - 1.0) * score)
+
+        base_cd = float(getattr(cfg, 'rebalance_cooldown_hours', 24) or 24)
+        min_cd = max(0.0, float(getattr(cfg, 'hot_channel_protection_min_cooldown_hours', 1.0) or 1.0))
+        recommended_cooldown_hours = max(min_cd, base_cd * (1.0 - 0.85 * score))
+
+        target_ratio_boost = 0.10 * score  # can raise source target from 85% to ~95%
+
+        return {
+            'enabled': True,
+            'eligible': True,
+            'reason': 'hot_source_profitable',
+            'score': round(score, 4),
+            'velocity': velocity,
+            'marginal_roi': marginal_roi,
+            'daily_contribution_est_sats': int(daily_contrib_est),
+            'channel_profit_budget_sats': max(0, channel_profit_budget_sats),
+            'chunk_multiplier': round(chunk_multiplier, 3),
+            'recommended_cooldown_hours': round(recommended_cooldown_hours, 2),
+            'target_ratio_boost': round(target_ratio_boost, 4),
+        }
 
     def _estimate_push_ev(self, src_channel: str, src_info: Dict,
                           src_ratio: float, dest_scids: List[str]) -> Optional[RebalanceCandidate]:
@@ -3541,6 +3678,17 @@ class EVRebalancer:
                 ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
                 ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)
                 rebalance_budget_limit = max(0, effective_budget - ext_spent - ext_reserved)
+                hot_override_limit = int(getattr(candidate, 'dynamic_budget_override_sats', 0) or 0)
+                if hot_override_limit > 0:
+                    # Candidate-specific protection budget can exceed the standard daily cap.
+                    protected_limit = max(0, hot_override_limit - ext_spent - ext_reserved)
+                    if protected_limit > rebalance_budget_limit:
+                        self.plugin.log(
+                            f"HOT CHANNEL PROTECTION: Using protected rebalance budget limit {protected_limit} sats \
+(global remaining {rebalance_budget_limit}, channel_profit_budget={hot_override_limit}) for {db_to_channel}",
+                            level='info'
+                        )
+                        rebalance_budget_limit = protected_limit
 
                 reserved, remaining = self.database.reserve_budget(
                     reservation_id=str(rebalance_id),
@@ -3931,6 +4079,15 @@ class EVRebalancer:
             ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)
             total_liquidity_committed = fees_spent_24h + ext_spent + ext_reserved
             if total_liquidity_committed >= effective_budget:
+                if getattr(cfg, 'hot_channel_protection_enabled', False):
+                    self.plugin.log(
+                        f"CAPITAL CONTROL: Unified liquidity budget exceeded "
+                        f"(rebalance_fees={fees_spent_24h} + external_spent={ext_spent} + "
+                        f"external_reserved={ext_reserved} = {total_liquidity_committed} >= {effective_budget}) "
+                        f"but hot-channel protection is enabled; continuing candidate scan for protected channels",
+                        level='warn'
+                    )
+                    return True
                 self.plugin.log(
                     f"CAPITAL CONTROL: Unified liquidity budget exceeded "
                     f"(rebalance_fees={fees_spent_24h} + external_spent={ext_spent} + "

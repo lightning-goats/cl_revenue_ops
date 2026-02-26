@@ -37,6 +37,12 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'total_cost_budget_profit_pct': float,
     'total_cost_budget_profit_pct_cap': float,
     'total_cost_budget_window_hours': int,
+    'hot_channel_protection_enabled': bool,
+    'hot_channel_protection_min_velocity': float,
+    'hot_channel_protection_min_marginal_roi': float,
+    'hot_channel_protection_profit_budget_pct': float,
+    'hot_channel_protection_max_chunk_multiplier': float,
+    'hot_channel_protection_min_cooldown_hours': float,
     'boltz_auto_cycle_enabled': bool,
     'boltz_auto_cycle_interval_minutes': int,
     'boltz_auto_cycle_max_actions': int,
@@ -558,6 +564,12 @@ class ConfigSnapshot:
     flow_interval: int
     fee_interval: int
     rebalance_interval: int
+    hot_channel_protection_enabled: bool
+    hot_channel_protection_min_velocity: float
+    hot_channel_protection_min_marginal_roi: float
+    hot_channel_protection_profit_budget_pct: float
+    hot_channel_protection_max_chunk_multiplier: float
+    hot_channel_protection_min_cooldown_hours: float
     boltz_auto_cycle_enabled: bool
     boltz_auto_cycle_interval_minutes: int
     boltz_auto_cycle_max_actions: int
