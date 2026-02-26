@@ -810,6 +810,48 @@ plugin.add_option(
     description='Startup delay before first Boltz auto-cycle run (default: 120)'
 )
 
+plugin.add_option(
+    name='revenue-ops-expansion-treasury-enabled',
+    default='false',
+    description='Enable expansion treasury mode (reverse-swap excess LN to on-chain for opens/splices) (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-expansion-treasury-onchain-target-sats',
+    default='5000000',
+    description='Target confirmed on-chain reserve in sats for expansion treasury mode (default: 5000000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-expansion-treasury-min-deficit-sats',
+    default='250000',
+    description='Minimum on-chain reserve deficit before treasury swaps are attempted (default: 250000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-expansion-treasury-preferred-currency',
+    default='BTC',
+    description='Preferred Boltz reverse-swap output currency for expansion treasury (BTC or LBTC; default: BTC)'
+)
+
+plugin.add_option(
+    name='revenue-ops-expansion-treasury-max-actions',
+    default='1',
+    description='Max treasury reverse swaps per treasury cycle (default: 1)'
+)
+
+plugin.add_option(
+    name='revenue-ops-expansion-treasury-min-source-local-pct',
+    default='80.0',
+    description='Minimum local balance percent to consider a channel as treasury harvest source (default: 80.0)'
+)
+
+plugin.add_option(
+    name='revenue-ops-expansion-treasury-exclude-protected',
+    default='true',
+    description='Exclude hot/protected channels from treasury harvesting (default: true)'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -892,6 +934,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         boltz_auto_cycle_interval_minutes=int(options.get('revenue-ops-boltz-auto-cycle-interval-minutes', '15')),
         boltz_auto_cycle_max_actions=int(options.get('revenue-ops-boltz-auto-cycle-max-actions', '1')),
         boltz_auto_cycle_startup_delay_seconds=int(options.get('revenue-ops-boltz-auto-cycle-startup-delay-seconds', '120')),
+        expansion_treasury_enabled=options.get('revenue-ops-expansion-treasury-enabled', 'false').lower() == 'true',
+        expansion_treasury_onchain_target_sats=int(options.get('revenue-ops-expansion-treasury-onchain-target-sats', '5000000')),
+        expansion_treasury_min_deficit_sats=int(options.get('revenue-ops-expansion-treasury-min-deficit-sats', '250000')),
+        expansion_treasury_preferred_currency=str(options.get('revenue-ops-expansion-treasury-preferred-currency', 'BTC') or 'BTC').upper(),
+        expansion_treasury_max_actions=int(options.get('revenue-ops-expansion-treasury-max-actions', '1')),
+        expansion_treasury_min_source_local_pct=float(options.get('revenue-ops-expansion-treasury-min-source-local-pct', '80.0')),
+        expansion_treasury_exclude_protected=options.get('revenue-ops-expansion-treasury-exclude-protected', 'true').lower() == 'true',
         target_flow=int(options['revenue-ops-target-flow']),
         min_fee_ppm=int(options['revenue-ops-min-fee-ppm']),
         max_fee_ppm=int(options['revenue-ops-max-fee-ppm']),
@@ -5532,6 +5581,128 @@ def _boltz_dynamic_channel_tuning(*,
     }
 
 
+def _get_confirmed_onchain_sats() -> int:
+    """Return confirmed on-chain wallet outputs in sats from CLN listfunds."""
+    try:
+        lf = safe_plugin.rpc.listfunds()
+    except Exception:
+        return 0
+    outputs = lf.get("outputs", []) if isinstance(lf, dict) else []
+    total = 0
+    for o in outputs:
+        if str(o.get("status") or "") != "confirmed":
+            continue
+        total += _parse_msat(o.get("amount_msat", 0)) // 1000
+    return int(total)
+
+
+def _filter_boltz_treasury_recommendations(plan: Dict[str, Any], *, deficit_sats: int, exclude_protected: bool = True) -> Dict[str, Any]:
+    """Filter a balance plan down to treasury-appropriate reverse swaps."""
+    recs = list(plan.get("recommendations", [])) if isinstance(plan, dict) else []
+    filtered = []
+    skipped = []
+    remaining_target = max(0, int(deficit_sats))
+    for rec in recs:
+        direction = str(rec.get("direction") or "")
+        if direction != "loop_out":
+            skipped.append({"channel_id": rec.get("channel_id"), "reason": "not_loop_out"})
+            continue
+        tuning = rec.get("dynamic_tuning", {}) if isinstance(rec.get("dynamic_tuning"), dict) else {}
+        hints = rec.get("execution_hints", {}) if isinstance(rec.get("execution_hints"), dict) else {}
+        if exclude_protected and (bool(hints.get("prioritize_channel_protection")) or float(tuning.get("protection_score", 0.0) or 0.0) >= 0.6):
+            skipped.append({
+                "channel_id": rec.get("channel_id"),
+                "peer_id": rec.get("peer_id"),
+                "reason": "protected_or_hot_channel",
+                "protection_score": tuning.get("protection_score"),
+            })
+            continue
+        amt = int(rec.get("amount_sats", 0) or 0)
+        if remaining_target > 0 and amt > remaining_target:
+            rec = dict(rec)
+            rec["treasury_target_cap_sats"] = int(remaining_target)
+            rec["treasury_amount_exceeds_deficit"] = True
+        filtered.append(rec)
+    out = dict(plan)
+    out["recommendations"] = filtered
+    out["total_candidates"] = len(filtered)
+    examples = list(plan.get("skipped_examples", [])) if isinstance(plan.get("skipped_examples"), list) else []
+    out["skipped_examples"] = (examples + skipped)[:20]
+    out["skipped_count"] = int(plan.get("skipped_count", 0) or 0) + len(skipped)
+    return out
+
+
+def _build_boltz_expansion_treasury_plan(
+    *,
+    onchain_target_sats: int,
+    min_deficit_sats: int = 250_000,
+    preferred_currency: str = "BTC",
+    max_actions: int = 1,
+    min_source_local_pct: float = 80.0,
+    exclude_protected: bool = True,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    max_amount_sats: int = 1_500_000,
+    min_amount_sats: int = 100_000,
+) -> Dict[str, Any]:
+    bm = _require_boltz_manager()
+    onchain_confirmed_sats = _get_confirmed_onchain_sats()
+    target = max(0, int(onchain_target_sats))
+    deficit = max(0, target - onchain_confirmed_sats)
+
+    treasury = {
+        "enabled": bool(getattr(config, "expansion_treasury_enabled", False)) if config else False,
+        "onchain_confirmed_sats": onchain_confirmed_sats,
+        "onchain_target_sats": target,
+        "deficit_sats": deficit,
+        "min_deficit_sats": int(min_deficit_sats),
+        "preferred_currency": str(preferred_currency).upper(),
+        "exclude_protected": bool(exclude_protected),
+        "max_actions": int(max_actions),
+        "min_source_local_pct": float(min_source_local_pct),
+    }
+
+    if deficit < int(min_deficit_sats):
+        return {
+            "generated_at": int(time.time()),
+            "treasury": treasury,
+            "status": "at_target",
+            "reason": "onchain_reserve_deficit_below_minimum",
+            "recommendations": [],
+            "total_candidates": 0,
+            "skipped_count": 0,
+            "skipped_examples": [],
+            "budget": bm.budget(),
+            "pending_swap_count": _boltz_pending_swap_count(),
+        }
+
+    max_amt = max(int(min_amount_sats), min(int(max_amount_sats), int(max(deficit, min_amount_sats))))
+    base_plan = _build_boltz_balance_plan(
+        low_trigger_pct=0.0,
+        low_target_pct=50.0,
+        high_trigger_pct=float(min_source_local_pct),
+        high_target_pct=max(50.0, float(min_source_local_pct) - 20.0),
+        min_amount_sats=int(min_amount_sats),
+        max_amount_sats=max_amt,
+        max_candidates=max(10, int(max_actions) * 8),
+        require_profitable=bool(require_profitable),
+        min_marginal_roi=float(min_marginal_roi),
+        profit_margin_factor=float(profit_margin_factor),
+        expected_horizon_days=float(expected_horizon_days),
+        loop_out_currency=str(preferred_currency).upper(),
+        loop_in_currency="LBTC",
+    )
+    if "error" in base_plan:
+        base_plan["treasury"] = treasury
+        return base_plan
+    filtered = _filter_boltz_treasury_recommendations(base_plan, deficit_sats=deficit, exclude_protected=bool(exclude_protected))
+    filtered["treasury"] = treasury
+    filtered["status"] = "ok"
+    return filtered
+
+
 def _build_boltz_balance_plan(
     *,
     low_trigger_pct: float = 40.0,
@@ -6047,6 +6218,209 @@ def revenue_boltz_balance_cycle(
             "loop-in (submarine) is not channel-pinnable on boltzcli v2.11.0; target channel/peer is a planning hint and should be verified post-swap",
             "profit guard uses a conservative heuristic expected-uplift estimate based on recent channel contribution and imbalance severity",
             "dynamic channel protection tuning raises loop-in trigger/target, amount cap, and cadence for fast-draining high-profit channels",
+        ],
+    }
+
+
+@plugin.method("revenue-boltz-expansion-treasury-status")
+def revenue_boltz_expansion_treasury_status(plugin: Plugin) -> Dict[str, Any]:
+    """Show expansion treasury reserve target status and current on-chain reserve."""
+    try:
+        bm = _require_boltz_manager()
+        cfg = config.snapshot() if config else None
+        preferred = str(getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC').upper()
+        target = int(getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000)
+        min_deficit = int(getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000)
+        deficit = max(0, target - _get_confirmed_onchain_sats())
+        return {
+            'enabled': bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False,
+            'onchain_confirmed_sats': _get_confirmed_onchain_sats(),
+            'onchain_target_sats': target,
+            'deficit_sats': deficit,
+            'min_deficit_sats': min_deficit,
+            'needs_harvest': bool(deficit >= min_deficit),
+            'preferred_currency': preferred,
+            'budget': bm.budget(),
+            'pending_swap_count': _boltz_pending_swap_count(),
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
+
+@plugin.method("revenue-boltz-expansion-treasury-recommendations")
+def revenue_boltz_expansion_treasury_recommendations(
+    plugin: Plugin,
+    onchain_target_sats: int = None,
+    min_deficit_sats: int = None,
+    preferred_currency: str = None,
+    max_actions: int = None,
+    min_source_local_pct: float = None,
+    exclude_protected: bool = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_500_000,
+) -> Dict[str, Any]:
+    """Recommend reverse swaps to build on-chain expansion treasury funds."""
+    try:
+        cfg = config.snapshot() if config else None
+        return _build_boltz_expansion_treasury_plan(
+            onchain_target_sats=int(onchain_target_sats if onchain_target_sats is not None else (getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000)),
+            min_deficit_sats=int(min_deficit_sats if min_deficit_sats is not None else (getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000)),
+            preferred_currency=str(preferred_currency if preferred_currency is not None else (getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC')).upper(),
+            max_actions=int(max_actions if max_actions is not None else (getattr(cfg, 'expansion_treasury_max_actions', 1) if cfg else 1)),
+            min_source_local_pct=float(min_source_local_pct if min_source_local_pct is not None else (getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0)),
+            exclude_protected=bool(exclude_protected if exclude_protected is not None else (getattr(cfg, 'expansion_treasury_exclude_protected', True) if cfg else True)),
+            require_profitable=bool(require_profitable),
+            min_marginal_roi=float(min_marginal_roi),
+            profit_margin_factor=float(profit_margin_factor),
+            expected_horizon_days=float(expected_horizon_days),
+            min_amount_sats=int(min_amount_sats),
+            max_amount_sats=int(max_amount_sats),
+        )
+    except Exception as e:
+        return {'error': str(e)}
+
+
+@plugin.method("revenue-boltz-expansion-treasury-cycle")
+def revenue_boltz_expansion_treasury_cycle(
+    plugin: Plugin,
+    dry_run: bool = True,
+    max_actions: int = None,
+    onchain_target_sats: int = None,
+    min_deficit_sats: int = None,
+    preferred_currency: str = None,
+    min_source_local_pct: float = None,
+    exclude_protected: bool = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_500_000,
+    cooldown_hours: float = 4.0,
+    allow_concurrent_swaps: bool = False,
+) -> Dict[str, Any]:
+    """Run a treasury-funding reverse-swap cycle (LN -> on-chain) for expansion reserve."""
+    cfg = config.snapshot() if config else None
+    try:
+        plan = _build_boltz_expansion_treasury_plan(
+            onchain_target_sats=int(onchain_target_sats if onchain_target_sats is not None else (getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000)),
+            min_deficit_sats=int(min_deficit_sats if min_deficit_sats is not None else (getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000)),
+            preferred_currency=str(preferred_currency if preferred_currency is not None else (getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC')).upper(),
+            max_actions=int(max_actions if max_actions is not None else (getattr(cfg, 'expansion_treasury_max_actions', 1) if cfg else 1)),
+            min_source_local_pct=float(min_source_local_pct if min_source_local_pct is not None else (getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0)),
+            exclude_protected=bool(exclude_protected if exclude_protected is not None else (getattr(cfg, 'expansion_treasury_exclude_protected', True) if cfg else True)),
+            require_profitable=bool(require_profitable),
+            min_marginal_roi=float(min_marginal_roi),
+            profit_margin_factor=float(profit_margin_factor),
+            expected_horizon_days=float(expected_horizon_days),
+            min_amount_sats=int(min_amount_sats),
+            max_amount_sats=int(max_amount_sats),
+        )
+    except Exception as e:
+        return {'error': str(e)}
+
+    if 'error' in plan:
+        return plan
+    if str(plan.get('status') or '') == 'at_target':
+        return {'status': 'at_target', 'plan': plan, 'executed': [], 'skipped': []}
+
+    pending_swaps = int(plan.get('pending_swap_count', 0) or 0)
+    if pending_swaps > 0 and not allow_concurrent_swaps:
+        return {
+            'status': 'blocked',
+            'reason': f'{pending_swaps} pending Boltz swap(s) detected',
+            'plan': plan,
+            'executed': [],
+            'skipped': [],
+        }
+
+    recs = list(plan.get('recommendations', []))
+    budget = plan.get('budget', {}) if isinstance(plan.get('budget'), dict) else {}
+    remaining_budget = int(budget.get('remaining_24h_sats_estimate', 0) or 0)
+    cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
+    target_deficit_remaining = int(((plan.get('treasury') or {}).get('deficit_sats', 0) if isinstance(plan.get('treasury'), dict) else 0) or 0)
+    max_exec = max(1, int(max_actions if max_actions is not None else (getattr(cfg, 'expansion_treasury_max_actions', 1) if cfg else 1)))
+
+    executed = []
+    skipped_exec = []
+    now = int(time.time())
+
+    for rec in recs:
+        if len(executed) >= max_exec:
+            break
+        if target_deficit_remaining <= 0:
+            break
+
+        ch_id = str(rec.get('channel_id') or '')
+        peer_id = str(rec.get('peer_id') or '')
+        direction = str(rec.get('direction') or '')
+        amount_sats = int(rec.get('amount_sats', 0) or 0)
+        econ = rec.get('economics', {}) if isinstance(rec.get('economics'), dict) else {}
+        est_fee = int(econ.get('estimated_swap_fee_sats', 0) or 0)
+        quote = rec.get('quote', {}) if isinstance(rec.get('quote'), dict) else {}
+        est_receive = int(quote.get('receiveAmount') or quote.get('receive_amount_sats') or amount_sats or 0)
+
+        if direction != 'loop_out':
+            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'not_loop_out'})
+            continue
+        if not econ.get('passes_profit_guard', False):
+            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'profit_guard_failed', 'recommendation': rec})
+            continue
+        if est_fee > remaining_budget:
+            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'insufficient_remaining_budget', 'estimated_fee_sats': est_fee, 'remaining_budget_sats': remaining_budget, 'recommendation': rec})
+            continue
+
+        rec_hints = rec.get('execution_hints', {}) if isinstance(rec.get('execution_hints'), dict) else {}
+        try:
+            rec_cd = int(float(rec_hints.get('recommended_cooldown_hours', cooldown_hours) or cooldown_hours) * 3600)
+        except Exception:
+            rec_cd = cooldown_seconds
+        with _boltz_balance_lock:
+            last_ts = int(_boltz_balance_last_action.get(ch_id, 0) or 0)
+        if rec_cd > 0 and last_ts > 0 and (now - last_ts) < rec_cd:
+            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'cooldown_active', 'cooldown_remaining_sec': rec_cd - (now - last_ts), 'recommendation': rec})
+            continue
+
+        if dry_run:
+            executed.append({'status': 'would_execute', 'direction': direction, 'channel_id': ch_id, 'peer_id': peer_id, 'amount_sats': amount_sats, 'estimated_fee_sats': est_fee, 'estimated_receive_onchain_sats': est_receive, 'recommendation': rec})
+            remaining_budget = max(0, remaining_budget - est_fee)
+            target_deficit_remaining = max(0, target_deficit_remaining - est_receive)
+            continue
+
+        try:
+            bm = _require_boltz_manager()
+            res = bm.loop_out(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=str(((plan.get('treasury') or {}).get('preferred_currency', 'BTC'))).upper())
+            status = str(res.get('status') or '')
+            payload = {'status': status or 'unknown', 'direction': direction, 'channel_id': ch_id, 'peer_id': peer_id, 'amount_sats': amount_sats, 'estimated_fee_sats': est_fee, 'estimated_receive_onchain_sats': est_receive, 'result': res, 'recommendation': rec}
+            executed.append(payload)
+            if status == 'accepted':
+                with _boltz_balance_lock:
+                    _boltz_balance_last_action[ch_id] = int(time.time())
+                remaining_budget = max(0, remaining_budget - est_fee)
+                target_deficit_remaining = max(0, target_deficit_remaining - est_receive)
+            elif status == 'rejected':
+                skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'execution_rejected', 'result': res})
+        except Exception as e:
+            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': f'execution_failed: {e}', 'recommendation': rec})
+
+    return {
+        'status': 'dry_run' if dry_run else 'executed',
+        'mode': 'expansion_treasury',
+        'executed_count': len(executed),
+        'skipped_count': len(skipped_exec),
+        'remaining_budget_sats_estimate_after_cycle': remaining_budget,
+        'remaining_treasury_deficit_sats_estimate_after_cycle': target_deficit_remaining,
+        'executed': executed,
+        'skipped': skipped_exec,
+        'plan': plan,
+        'notes': [
+            'Treasury mode only executes reverse swaps (LN -> BTC/LBTC) to build on-chain expansion reserve',
+            'Protected hot channels can be excluded to avoid harvesting liquidity from critical routing channels',
+            'Reverse swaps on CLN are not channel-pinnable via chanIds; exact path control uses external-pay + first-hop constrained CLN pay when available',
         ],
     }
 

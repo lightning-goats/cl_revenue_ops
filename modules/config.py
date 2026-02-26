@@ -48,6 +48,13 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'boltz_auto_cycle_interval_minutes': int,
     'boltz_auto_cycle_max_actions': int,
     'boltz_auto_cycle_startup_delay_seconds': int,
+    'expansion_treasury_enabled': bool,
+    'expansion_treasury_onchain_target_sats': int,
+    'expansion_treasury_min_deficit_sats': int,
+    'expansion_treasury_preferred_currency': str,
+    'expansion_treasury_max_actions': int,
+    'expansion_treasury_min_source_local_pct': float,
+    'expansion_treasury_exclude_protected': bool,
     'min_wallet_reserve': int,
     'low_liquidity_threshold': float,
     'high_liquidity_threshold': float,
@@ -247,6 +254,14 @@ class Config:
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
     boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
+    # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens/splices)
+    expansion_treasury_enabled: bool = False
+    expansion_treasury_onchain_target_sats: int = 5_000_000
+    expansion_treasury_min_deficit_sats: int = 250_000
+    expansion_treasury_preferred_currency: str = 'BTC'
+    expansion_treasury_max_actions: int = 1
+    expansion_treasury_min_source_local_pct: float = 80.0
+    expansion_treasury_exclude_protected: bool = True
     
     # Flow analysis parameters
     target_flow: int = 100000      # Target sats routed per day per channel
@@ -521,6 +536,7 @@ class Config:
         # 3b. VALIDATE: String enum check
         STRING_ENUM_VALID_VALUES = {
             'hive_enabled': ('auto', 'true', 'false'),
+            'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
         }
         if key in STRING_ENUM_VALID_VALUES:
             if typed_value not in STRING_ENUM_VALID_VALUES[key]:
@@ -584,6 +600,13 @@ class ConfigSnapshot:
     boltz_auto_cycle_interval_minutes: int
     boltz_auto_cycle_max_actions: int
     boltz_auto_cycle_startup_delay_seconds: int
+    expansion_treasury_enabled: bool
+    expansion_treasury_onchain_target_sats: int
+    expansion_treasury_min_deficit_sats: int
+    expansion_treasury_preferred_currency: str
+    expansion_treasury_max_actions: int
+    expansion_treasury_min_source_local_pct: float
+    expansion_treasury_exclude_protected: bool
     
     # Flow analysis parameters
     target_flow: int
