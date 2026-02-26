@@ -5654,7 +5654,9 @@ def _build_boltz_balance_plan(
             dynamic_amount_cap = int(max_amount_sats)
         # Safety caps: never exceed 25% of channel capacity or 5M sats in one Boltz action.
         dynamic_amount_cap = min(dynamic_amount_cap, max(1, int(capacity_sats * 0.25)), 5_000_000)
-        amount_sats = max(int(min_amount_sats), min(int(dynamic_amount_cap), int(raw_amount))) if raw_amount > 0 else 0
+        amount_sats = 0
+        if raw_amount > 0:
+            amount_sats = min(int(dynamic_amount_cap), int(raw_amount))
         if amount_sats < int(min_amount_sats):
             skipped.append({
                 "channel_id": channel_id,

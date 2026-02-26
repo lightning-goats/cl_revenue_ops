@@ -51,6 +51,11 @@ class BoltzCliManager:
         # Capability cache: some CLN+boltzd combinations reject reverse-swap chanIds.
         self._reverse_chanids_supported: Optional[bool] = None
 
+    @property
+    def enabled(self) -> bool:
+        """Compatibility property for callers that check boltz_manager.enabled."""
+        return bool(getattr(self.cfg, "enabled", False))
+
     # ---------------------------------------------------------------------
     # Core command execution helpers
     # ---------------------------------------------------------------------
@@ -340,6 +345,17 @@ class BoltzCliManager:
                 return ts
         return None
 
+    def _swap_completed_ts(self, swap: Dict[str, Any]) -> Optional[int]:
+        """Best-effort completion timestamp for budget windowing.
+
+        Prefer update timestamps for completed swaps, then fall back to creation time.
+        """
+        for key in ("updatedAt", "updated_at", "createdAt", "created_at"):
+            ts = self._parse_timestamp(swap.get(key))
+            if ts:
+                return ts
+        return None
+
     def _swap_status_text(self, swap: Dict[str, Any]) -> str:
         return str(swap.get('state') or swap.get('status') or '').lower()
 
@@ -416,7 +432,7 @@ class BoltzCliManager:
         counted: List[Dict[str, Any]] = []
         unknown_ts = 0
         for s in swaps:
-            ts = self._swap_created_ts(s)
+            ts = self._swap_completed_ts(s)
             if ts is None:
                 unknown_ts += 1
                 continue
@@ -428,7 +444,8 @@ class BoltzCliManager:
             boltz_spent += max(0, fee_sats)
             counted.append({
                 "id": s.get("id"),
-                "created_at": ts,
+                "created_at": self._swap_created_ts(s),
+                "counted_timestamp": ts,
                 "fee_sats_estimate": fee_sats,
                 "state": s.get("state"),
                 "status": s.get("status"),
