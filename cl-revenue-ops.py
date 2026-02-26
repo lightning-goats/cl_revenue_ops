@@ -2099,6 +2099,8 @@ def revenue_rebalance_debug(
             except Exception:
                 hot_override_depletion_thresholds = {}
 
+        effective_low_thresholds_seen_pct: set[float] = set()
+
         def _append_channel(bucket: str, item: Dict[str, Any]) -> None:
             counts = result["channels"]["counts"]
             trunc = result["channels"]["truncated"]
@@ -2132,6 +2134,7 @@ def revenue_rebalance_debug(
             result["channels"]["counts"]["considered"] = int(result["channels"]["counts"].get("considered", 0) or 0) + 1
 
             effective_low_threshold = float(hot_override_depletion_thresholds.get(peer_id_full, cfg.low_liquidity_threshold))
+            effective_low_thresholds_seen_pct.add(round(effective_low_threshold * 100, 1))
 
             channel_info = {
                 "scid": cid[:20],
@@ -2203,9 +2206,19 @@ def revenue_rebalance_debug(
                 _append_channel("source", channel_info)
 
         if result["channels"]["counts"]["depleted"] == 0:
-            result["rejection_reasons"].append(
-                f"No depleted channels (none below {cfg.low_liquidity_threshold*100}% local balance)"
-            )
+            if (filter_channel_id or filter_peer_id) and effective_low_thresholds_seen_pct:
+                thresholds_sorted = sorted(effective_low_thresholds_seen_pct)
+                if len(thresholds_sorted) == 1:
+                    threshold_txt = f"{thresholds_sorted[0]}%"
+                else:
+                    threshold_txt = f"{thresholds_sorted[0]}%-{thresholds_sorted[-1]}%"
+                result["rejection_reasons"].append(
+                    f"No depleted channels (none below effective filtered threshold {threshold_txt} local balance)"
+                )
+            else:
+                result["rejection_reasons"].append(
+                    f"No depleted channels (none below {cfg.low_liquidity_threshold*100}% local balance)"
+                )
         if result["channels"]["counts"]["source"] == 0:
             result["rejection_reasons"].append(
                 f"No source channels (none above {cfg.high_liquidity_threshold*100}% local balance)"
