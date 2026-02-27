@@ -1499,9 +1499,9 @@ class JobManager:
                 self._policy_manager_ref = policy_manager
                 try:
                     from .policy_manager import RebalanceMode
-                    for peer_id, policy in policy_manager.get_all_policies().items():
+                    for policy in policy_manager.get_all_policies():
                         if policy.rebalance_mode == RebalanceMode.DISABLED:
-                            peers_to_exclude.add(peer_id)
+                            peers_to_exclude.add(policy.peer_id)
                 except Exception as e:
                     self.plugin.log(f"Could not get policies for exclusion sync: {e}", level='debug')
 
@@ -2553,6 +2553,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # For non-hive peers we require non-negative spread to avoid consistent leakage.
         if is_hive_destination:
             tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(rebalance_amount, 1))
+            tolerance_ppm = min(tolerance_ppm, self.config.max_fee_ppm)
             if spread_ppm < -tolerance_ppm:
                 return None
         else:
@@ -3098,6 +3099,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             base_msat = int(peer_fee_info.get("base_msat", 0) or 0)
             # Convert base fee to ppm-equivalent at amount_msat
             base_ppm = int((base_msat * 1_000_000) // max(int(amount_msat or 0), 1))
+            base_ppm = min(base_ppm, 1_000_000)  # Cap base fee PPM-equivalent to 100%
             result = ppm + base_ppm
             self.plugin.log(
                 f"LAST_HOP_FEE [{peer_id[:12]}...]: Using actual peer fee {result} PPM "
@@ -3334,6 +3336,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # For non-hive peers we require non-negative spread to avoid consistent leakage.
             if is_hive_destination:
                 tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_needed, 1))
+                tolerance_ppm = min(tolerance_ppm, self.config.max_fee_ppm)
                 min_spread = -tolerance_ppm
             else:
                 min_spread = 0
@@ -3777,7 +3780,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     revenue_24h = self.database.get_total_routing_revenue(since_24h)
                     proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
                     effective_budget = max(cfg.daily_budget_sats, proportional_budget)
-                effective_budget = self._get_global_budget_limit(cfg)
+                # Only override with global provider if one is configured;
+                # otherwise preserve the proportional budget calculated above.
+                if getattr(self, "global_budget_limit_provider", None) is not None:
+                    effective_budget = self._get_global_budget_limit(cfg)
 
                 ext_costs = self._get_external_liquidity_costs()
                 ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
@@ -4174,7 +4180,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     f"Effective budget: {effective_budget} sats (floor: {cfg.daily_budget_sats})",
                     level='debug'
                 )
-            effective_budget = self._get_global_budget_limit(cfg)
+            # Only override with global provider if one is configured;
+            # otherwise preserve the proportional budget calculated above.
+            if getattr(self, "global_budget_limit_provider", None) is not None:
+                effective_budget = self._get_global_budget_limit(cfg)
 
             budget_window_hours = max(1, int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24))
             fees_spent_24h = self.database.get_total_rebalance_fees(int(time.time()) - (budget_window_hours * 3600))

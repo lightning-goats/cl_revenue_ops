@@ -1147,18 +1147,24 @@ class PolicyManager:
                 tags, mult_min, mult_max, expires_at
             ))
 
-        # Execute batch insert
+        # Execute batch insert atomically
         conn = self.database._get_connection()
-        conn.executemany("""
-            INSERT OR REPLACE INTO peer_policies
-                (peer_id, strategy, rebalance_mode, fee_ppm_target, tags, updated_at,
-                 fee_multiplier_min, fee_multiplier_max, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            (peer_id, strategy.value, mode.value, fee_ppm, json.dumps(tags), now,
-             mult_min, mult_max, expires_at)
-            for peer_id, strategy, mode, fee_ppm, tags, mult_min, mult_max, expires_at in validated
-        ])
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany("""
+                INSERT OR REPLACE INTO peer_policies
+                    (peer_id, strategy, rebalance_mode, fee_ppm_target, tags, updated_at,
+                     fee_multiplier_min, fee_multiplier_max, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                (peer_id, strategy.value, mode.value, fee_ppm, json.dumps(tags), now,
+                 mult_min, mult_max, expires_at)
+                for peer_id, strategy, mode, fee_ppm, tags, mult_min, mult_max, expires_at in validated
+            ])
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
         # Build results and update cache
         for peer_id, strategy, mode, fee_ppm, tags, mult_min, mult_max, expires_at in validated:

@@ -3722,6 +3722,7 @@ class Database:
         """
         try:
             conn = self._get_connection()
+            additional_fees = self._sanitize_fee(additional_fees, "additional_fees")
 
             if additional_fees > 0:
                 conn.execute("""
@@ -3877,6 +3878,20 @@ class Database:
         """
         try:
             conn = self._get_connection()
+
+            # Input validation (consistent with record_channel_closure)
+            capacity_sats = self._sanitize_amount(capacity_sats, "capacity_sats")
+            open_cost_sats = self._sanitize_fee(open_cost_sats, "open_cost_sats")
+            closure_cost_sats = self._sanitize_fee(closure_cost_sats, "closure_cost_sats")
+            total_revenue_sats = self._sanitize_amount(total_revenue_sats, "total_revenue_sats")
+            total_rebalance_cost_sats = self._sanitize_fee(total_rebalance_cost_sats, "total_rebalance_cost_sats")
+            forward_count = max(0, int(forward_count or 0))
+            _VALID_CLOSE_TYPES = ('mutual', 'unilateral', 'force', 'onchain', 'unknown')
+            if close_type not in _VALID_CLOSE_TYPES:
+                close_type = 'unknown'
+            _VALID_CLOSERS = ('local', 'remote', 'mutual', 'unknown')
+            if closer not in _VALID_CLOSERS:
+                closer = 'unknown'
 
             # Calculate derived values
             days_open = ((closed_at - opened_at) // 86400) if opened_at else 0
@@ -4673,6 +4688,7 @@ class Database:
             except Exception:
                 pass
             self.plugin.log(f"cleanup_old_data transaction failed: {e}", level='error')
+            return  # Skip vacuum and stats logging on failure
 
         # L-20: Use incremental_vacuum instead of full VACUUM to avoid blocking readers.
         # Full VACUUM requires exclusive lock and copies the entire database.

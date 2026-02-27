@@ -5428,8 +5428,9 @@ def _boltz_pending_swap_count() -> int:
             if active and not done:
                 pending += 1
         return pending
-    except Exception:
-        return 0
+    except Exception as exc:
+        _log(f"boltz: pending swap count check failed, assuming 1 pending: {exc}", "warn")
+        return 1  # Fail closed: assume a swap is pending to prevent overlap
 
 
 def _rebalance_liquidity_cost_components(window_hours: int = 24) -> Dict[str, Any]:
@@ -5510,8 +5511,8 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     try:
         stale_hours = max(int(getattr(cfg, "reservation_timeout_hours", 4) or 4), wh)
         database.cleanup_stale_spend_reservations(max_age_seconds=stale_hours * 3600)
-    except Exception:
-        pass
+    except Exception as exc:
+        _log(f"cleanup_stale_spend_reservations failed: {exc}", "debug")
 
     # Actual cost components (canonical data sources)
     rebalance = _rebalance_liquidity_cost_components(window_hours=wh)

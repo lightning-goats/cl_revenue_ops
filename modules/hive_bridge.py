@@ -660,9 +660,10 @@ class HiveFeeIntelligenceBridge:
             return cached_data
 
         # If circuit is open, return stale cache or None
-        # Get cache entry once to avoid race conditions
-        cache_entry = self._cache.get(peer_id)
-        cache_timestamp = cache_entry.timestamp if cache_entry else 0
+        # Get cache entry under lock to avoid race with eviction
+        with self._cache_lock:
+            cache_entry = self._cache.get(peer_id)
+            cache_timestamp = cache_entry.timestamp if cache_entry else 0
 
         if self._is_circuit_open():
             if cached_data and cache_entry:
