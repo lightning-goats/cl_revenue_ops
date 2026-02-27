@@ -1236,9 +1236,9 @@ class TestDefenseExclusions:
         # Should have called sling-except-peer to add the threat peer
         add_calls = [
             c for c in mock_plugin.rpc.call.call_args_list
-            if c[0][0] == "sling-except-peer" and c[0][1].get("add")
+            if c[0][0] == "sling-except-peer" and "add" in c[0][1]
         ]
-        added_peers = [c[0][1]["peer"] for c in add_calls]
+        added_peers = [c[0][1]["id"] for c in add_calls]
         assert threat_peer in added_peers
 
     def test_sync_ignores_low_severity(self, mock_plugin, mock_database):
@@ -1263,9 +1263,9 @@ class TestDefenseExclusions:
         # Should NOT have added the low-severity peer
         add_calls = [
             c for c in mock_plugin.rpc.call.call_args_list
-            if c[0][0] == "sling-except-peer" and c[0][1].get("add")
+            if c[0][0] == "sling-except-peer" and "add" in c[0][1]
         ]
-        added_peers = [c[0][1]["peer"] for c in add_calls]
+        added_peers = [c[0][1]["id"] for c in add_calls]
         assert low_threat not in added_peers
 
     def test_sync_defense_failure_graceful(self, mock_plugin, mock_database):
