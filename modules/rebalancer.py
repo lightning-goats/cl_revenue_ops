@@ -1486,7 +1486,7 @@ class JobManager:
         try:
             # Get current sling exclusions
             try:
-                result = self.plugin.rpc.call("sling-except-peer", {})
+                result = self.plugin.rpc.call("sling-except-peer", ["list"])
                 current_exclusions = set(result.get("peers", []))
             except (RpcError, KeyError):
                 current_exclusions = set()
@@ -1522,10 +1522,7 @@ class JobManager:
             for peer_id in peers_to_exclude:
                 if peer_id not in current_exclusions:
                     try:
-                        self.plugin.rpc.call("sling-except-peer", {
-                            "id": peer_id,
-                            "add": ""
-                        })
+                        self.plugin.rpc.call("sling-except-peer", ["add", peer_id])
                         excluded_count += 1
                         self.plugin.log(
                             f"Sling Exclusion: Added {peer_id[:16]}... to global exclusion list",
@@ -1558,10 +1555,7 @@ class JobManager:
             True if successfully added, False otherwise
         """
         try:
-            self.plugin.rpc.call("sling-except-peer", {
-                "id": peer_id,
-                "add": ""
-            })
+            self.plugin.rpc.call("sling-except-peer", ["add", peer_id])
             self.plugin.log(
                 f"Sling Exclusion: Added {peer_id[:16]}... to exclusion list",
                 level='info'
@@ -1584,10 +1578,7 @@ class JobManager:
             True if successfully removed, False otherwise
         """
         try:
-            self.plugin.rpc.call("sling-except-peer", {
-                "id": peer_id,
-                "remove": ""
-            })
+            self.plugin.rpc.call("sling-except-peer", ["remove", peer_id])
             self.plugin.log(
                 f"Sling Exclusion: Removed {peer_id[:16]}... from exclusion list",
                 level='info'
