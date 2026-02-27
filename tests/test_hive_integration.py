@@ -364,6 +364,7 @@ class TestCoordinatedFeeRecommendation:
         mock_plugin.rpc = mock_rpc
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = False
+        bridge._availability_check_time = time.time()  # Prevent cache refresh via RPC
 
         result = bridge.query_coordinated_fee_recommendation(
             channel_id="123x1x0",
@@ -383,6 +384,9 @@ class TestRoutingOutcomeReporting:
 
         mock_plugin.rpc = mock_rpc
         mock_rpc.call.return_value = {"success": True}
+        # Telemetry policy uses async_preferred=True, so fire_and_forget
+        # is attempted first. Remove it so the sync rpc.call path is used.
+        del mock_rpc.fire_and_forget
 
         bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
         bridge._hive_available = True

@@ -435,6 +435,7 @@ class TestGracefulDegradation:
 
     def test_returns_none_when_circuit_open(self, mock_hive_bridge, mock_plugin):
         """Test that methods return None when circuit breaker is open."""
+        mock_hive_bridge._circuit_breaker_enabled = True
         mock_hive_bridge._circuit.is_open = True
         mock_hive_bridge._circuit.last_failure = time.time()
 
