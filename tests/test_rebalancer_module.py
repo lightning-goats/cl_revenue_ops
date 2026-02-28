@@ -1295,16 +1295,15 @@ class TestChannelExclusions:
         jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
         jm.source_failure_counts["111x222x0"] = 6.0
 
-        mock_plugin.rpc.call.return_value = {"channels": []}
+        mock_plugin.rpc.call.return_value = []
 
         changes = jm.sync_channel_exclusions()
 
         add_calls = [
             c for c in mock_plugin.rpc.call.call_args_list
-            if c[0][0] == "sling-except-chan" and c[0][1].get("add")
+            if c[0][0] == "sling-except-chan" and c[0][1] == ["add", "111x222x0"]
         ]
         assert len(add_calls) == 1
-        assert add_calls[0][0][1]["scid"] == "111x222x0"
         assert changes >= 1
 
     def test_sync_channel_exclusions_low_failure(self, mock_plugin, mock_database):
@@ -1315,14 +1314,14 @@ class TestChannelExclusions:
         jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
         jm.source_failure_counts["111x222x0"] = 2.0
 
-        mock_plugin.rpc.call.return_value = {"channels": []}
+        mock_plugin.rpc.call.return_value = []
 
         changes = jm.sync_channel_exclusions()
 
         # No exclusion should be added for count < 5.0
         add_calls = [
             c for c in mock_plugin.rpc.call.call_args_list
-            if c[0][0] == "sling-except-chan" and c[0][1].get("add")
+            if c[0][0] == "sling-except-chan" and isinstance(c[0][1], list) and len(c[0][1]) == 2 and c[0][1][0] == "add"
         ]
         assert len(add_calls) == 0
         assert changes == 0
@@ -1336,14 +1335,10 @@ class TestChannelExclusions:
         mock_plugin.rpc.call.return_value = {}
 
         assert jm.add_channel_exclusion("111x222x0") is True
-        mock_plugin.rpc.call.assert_called_with("sling-except-chan", {
-            "scid": "111x222x0", "add": True
-        })
+        mock_plugin.rpc.call.assert_called_with("sling-except-chan", ["add", "111x222x0"])
 
         assert jm.remove_channel_exclusion("111x222x0") is True
-        mock_plugin.rpc.call.assert_called_with("sling-except-chan", {
-            "scid": "111x222x0", "remove": True
-        })
+        mock_plugin.rpc.call.assert_called_with("sling-except-chan", ["remove", "111x222x0"])
 
 
 # =============================================================================

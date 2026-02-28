@@ -1183,17 +1183,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             forwards_to_insert = []
 
             for fwd in result.get("forwards", []):
-                received_time = fwd.get("received_time", 0)
+                received_time = int(fwd.get("received_time", 0) or 0)
                 if received_time > start_time:
+                    resolved_time = int(fwd.get("resolved_time", 0) or 0)
                     forwards_to_insert.append({
                         'in_channel': fwd.get("in_channel", ""),
                         'out_channel': fwd.get("out_channel", ""),
                         'in_msat': _parse_msat(fwd.get("in_msat", fwd.get("in_msatoshi", 0))),
                         'out_msat': _parse_msat(fwd.get("out_msat", fwd.get("out_msatoshi", 0))),
                         'fee_msat': _parse_msat(fwd.get("fee_msat", fwd.get("fee_msatoshi", 0))),
-                        'resolution_time': (fwd.get("resolved_time", 0) - received_time) if fwd.get("resolved_time") else 0,
+                        'resolution_time': max(0, resolved_time - received_time) if resolved_time > 0 else 0,
                         'received_time': received_time,
-                        'resolved_time': int(fwd.get("resolved_time", 0) or 0)
+                        'resolved_time': resolved_time
                     })
 
             if forwards_to_insert:
@@ -2355,7 +2356,9 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         forwards_ok = forward_count >= min_forwards
 
         if is_sleeping:
-            mins_until_wake = (sleep_until - now) // 60
+            # E1 FIX: Clamp to 0 to avoid displaying negative minutes when
+            # sleep_until has passed but is_sleeping flag hasn't been cleared yet.
+            mins_until_wake = max(0, (sleep_until - now) // 60)
             skip_reason = f"SLEEPING (wake in {mins_until_wake} min)"
             status = "sleeping"
             result["summary"]["sleeping"] += 1
@@ -2472,7 +2475,7 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
         fee_ppm = int(fee_ppm)
         if fee_ppm < 0:
             return {"status": "error", "error": "fee_ppm must be non-negative"}
-    except ValueError:
+    except (ValueError, TypeError):
         return {"status": "error", "error": "fee_ppm must be an integer"}
 
     # SCID or PeerID format check
@@ -2535,8 +2538,8 @@ def revenue_fee_anchor(plugin: Plugin,
             ttl_seconds = int(ttl_hours) * 3600
         except (ValueError, TypeError):
             return {"status": "error", "error": "ttl_hours must be an integer"}
-        if ttl_seconds < 1 or ttl_seconds > 604800:
-            return {"status": "error", "error": "ttl must be between 1 second and 7 days"}
+        if ttl_seconds < 3600 or ttl_seconds > 604800:
+            return {"status": "error", "error": "ttl_hours must be between 1 hour and 7 days (168 hours)"}
 
         try:
             base_weight = float(base_weight)
@@ -2614,7 +2617,7 @@ def revenue_rebalance(plugin: Plugin,
         amount_sats = int(amount_sats)
         if amount_sats < 1:
             return {"status": "error", "error": "amount_sats must be at least 1"}
-    except ValueError:
+    except (ValueError, TypeError):
         return {"status": "error", "error": "amount_sats must be an integer"}
         
     if max_fee_sats is not None:
@@ -2622,7 +2625,7 @@ def revenue_rebalance(plugin: Plugin,
             max_fee_sats = int(max_fee_sats)
             if max_fee_sats < 0:
                 return {"status": "error", "error": "max_fee_sats must be non-negative"}
-        except ValueError:
+        except (ValueError, TypeError):
             return {"status": "error", "error": "max_fee_sats must be an integer or null"}
 
     # Basic SCID format check
@@ -3401,6 +3404,15 @@ def revenue_hot_channel_protection_peers(plugin: Plugin, action: str = "list", p
         if action == "add":
             if not peer_id:
                 return {"error": "Usage: revenue-hot-channel-protection-peers add <peer_id> [note] [min_depletion_trigger_pct]"}
+            if not re.match(r'^[0-9a-fA-F]{66}$', peer_id):
+                return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
+            if min_depletion_trigger_pct is not None:
+                try:
+                    pct_val = float(min_depletion_trigger_pct)
+                except (ValueError, TypeError):
+                    return {"error": "min_depletion_trigger_pct must be a number"}
+                if not (0.0 < pct_val <= 100.0):
+                    return {"error": "min_depletion_trigger_pct must be between 0 (exclusive) and 100"}
             database.add_hot_channel_protection_override_peer(str(peer_id), note or "", min_depletion_trigger_pct=min_depletion_trigger_pct)
             plugin.log(f"HOT CHANNEL OVERRIDE: added peer {peer_id}" + (f" depletion_trigger={float(min_depletion_trigger_pct):.1f}%" if min_depletion_trigger_pct is not None else ""), level='info')
             rows = database.list_hot_channel_protection_override_peers()
@@ -5429,7 +5441,7 @@ def _boltz_pending_swap_count() -> int:
                 pending += 1
         return pending
     except Exception as exc:
-        _log(f"boltz: pending swap count check failed, assuming 1 pending: {exc}", "warn")
+        plugin.log(f"boltz: pending swap count check failed, assuming 1 pending: {exc}", level="warn")
         return 1  # Fail closed: assume a swap is pending to prevent overlap
 
 
@@ -5463,15 +5475,9 @@ def _boltz_liquidity_cost_components(window_hours: int = 24) -> Dict[str, Any]:
     if boltz_manager is None:
         return {"source": "boltz", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
     try:
-        if hasattr(boltz_manager, "get_boltz_cost_components"):
-            comps = boltz_manager.get_boltz_cost_components(window_hours=window_hours)
-        else:
-            budget = boltz_manager.budget()
-            comps = {
-                "spent_24h_sats": int(budget.get("boltz_spent_24h_sats_estimate", budget.get("spent_24h_sats_estimate", 0)) or 0),
-                "reserved_24h_sats": 0,
-                "counted_swaps": int(budget.get("counted_swaps", 0) or 0),
-            }
+        if not hasattr(boltz_manager, "get_boltz_cost_components"):
+            return {"source": "boltz", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
+        comps = boltz_manager.get_boltz_cost_components(window_hours=window_hours)
         return {
             "source": "boltz",
             "available": True,
@@ -5512,7 +5518,7 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
         stale_hours = max(int(getattr(cfg, "reservation_timeout_hours", 4) or 4), wh)
         database.cleanup_stale_spend_reservations(max_age_seconds=stale_hours * 3600)
     except Exception as exc:
-        _log(f"cleanup_stale_spend_reservations failed: {exc}", "debug")
+        plugin.log(f"cleanup_stale_spend_reservations failed: {exc}", level="debug")
 
     # Actual cost components (canonical data sources)
     rebalance = _rebalance_liquidity_cost_components(window_hours=wh)
@@ -6556,9 +6562,9 @@ def revenue_boltz_expansion_treasury_cycle(
             rec_cd = cooldown_seconds
         with _boltz_balance_lock:
             last_ts = int(_boltz_balance_last_action.get(ch_id, 0) or 0)
-        if rec_cd > 0 and last_ts > 0 and (now - last_ts) < rec_cd:
-            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'cooldown_active', 'cooldown_remaining_sec': rec_cd - (now - last_ts), 'recommendation': rec})
-            continue
+            if rec_cd > 0 and last_ts > 0 and (now - last_ts) < rec_cd:
+                skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'cooldown_active', 'cooldown_remaining_sec': rec_cd - (now - last_ts), 'recommendation': rec})
+                continue
 
         if dry_run:
             executed.append({'status': 'would_execute', 'direction': direction, 'channel_id': ch_id, 'peer_id': peer_id, 'amount_sats': amount_sats, 'estimated_fee_sats': est_fee, 'estimated_receive_onchain_sats': est_receive, 'recommendation': rec})

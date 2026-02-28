@@ -1152,6 +1152,17 @@ class JobManager:
                 actual_fee_sats=fee_sats,
                 actual_profit_sats=0
             )
+            # E3 FIX: Record cost in rebalance_costs for lifetime accounting,
+            # matching _handle_job_success (line 1001) and _handle_job_budget_exceeded (line 1100).
+            # Without this, partial timeout fees are lost from budget tracking.
+            if fee_sats > 0:
+                self.database.record_rebalance_cost(
+                    channel_id=job.scid_normalized,
+                    peer_id=job.candidate.to_peer_id,
+                    cost_sats=fee_sats,
+                    amount_sats=amount_transferred,
+                    timestamp=int(time.time())
+                )
         else:
             self.plugin.log(
                 f"Rebalance TIMEOUT: {job.scid} after {elapsed_hours:.1f}h with no progress",
@@ -1214,17 +1225,16 @@ class JobManager:
             Number of orphan jobs terminated
         """
         try:
-            # Get list of all sling jobs
-            result = self.plugin.rpc.call("sling-job", {})
-            jobs = result.get("jobs", [])
-            
+            # Get list of all sling jobs (sling-jobsettings returns dict keyed by SCID)
+            result = self.plugin.rpc.call("sling-jobsettings", {})
+            jobs = result if isinstance(result, dict) else {}
+
             if not jobs:
                 self.plugin.log("Startup Hygiene: No orphan sling jobs found", level='debug')
                 return 0
-            
+
             orphan_count = 0
-            for job in jobs:
-                scid = job.get("scid", "")
+            for scid in jobs:
                 if not scid:
                     continue
                 
@@ -1266,7 +1276,7 @@ class JobManager:
             return orphan_count
 
         except RpcError as e:
-            # sling-job might not be available or no jobs exist
+            # sling-jobsettings might not be available or no jobs exist
             self.plugin.log(f"Startup Hygiene: Could not query sling jobs: {e}", level='debug')
             return 0
         except Exception as e:
@@ -1487,7 +1497,7 @@ class JobManager:
             # Get current sling exclusions
             try:
                 result = self.plugin.rpc.call("sling-except-peer", ["list"])
-                current_exclusions = set(result.get("peers", []))
+                current_exclusions = set(result) if isinstance(result, list) else set(result.get("peers", []))
             except (RpcError, KeyError):
                 current_exclusions = set()
 
@@ -1603,8 +1613,8 @@ class JobManager:
         try:
             # Get current sling channel exclusions
             try:
-                result = self.plugin.rpc.call("sling-except-chan", {})
-                current_exclusions = set(result.get("channels", []))
+                result = self.plugin.rpc.call("sling-except-chan", ["list"])
+                current_exclusions = set(result) if isinstance(result, list) else set(result.get("channels", []))
             except (RpcError, KeyError):
                 current_exclusions = set()
 
@@ -1657,10 +1667,7 @@ class JobManager:
         """
         try:
             sling_scid = self._to_sling_scid(scid)
-            self.plugin.rpc.call("sling-except-chan", {
-                "scid": sling_scid,
-                "add": True
-            })
+            self.plugin.rpc.call("sling-except-chan", ["add", sling_scid])
             self.plugin.log(
                 f"Sling Channel Exclusion: Added {sling_scid} to exclusion list",
                 level='debug'
@@ -1682,10 +1689,7 @@ class JobManager:
         """
         try:
             sling_scid = self._to_sling_scid(scid)
-            self.plugin.rpc.call("sling-except-chan", {
-                "scid": sling_scid,
-                "remove": True
-            })
+            self.plugin.rpc.call("sling-except-chan", ["remove", sling_scid])
             self.plugin.log(
                 f"Sling Channel Exclusion: Removed {sling_scid} from exclusion list",
                 level='debug'
@@ -1707,8 +1711,10 @@ class JobManager:
         
         elapsed = int(time.time()) - job.start_time
         current_balance = self._get_channel_local_balance(normalized)
-        transferred = current_balance - job.initial_local_sats
-        
+        raw_delta = current_balance - job.initial_local_sats
+        # For push: negative delta = liquidity drained (success), so flip sign
+        transferred = -raw_delta if job.direction == "push" else raw_delta
+
         return {
             "scid": job.scid,
             "source_candidates": job.source_candidates,
@@ -2701,7 +2707,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         if is_hive_transfer:
             # Allow negative profit (cost) up to tolerance for hive transfers (strategic).
             # A depleted channel earns nothing — small rebalance loss is worth it for fleet coordination.
-            profit_threshold = max(profit_threshold, -(self.config.hive_rebalance_tolerance))
+            profit_threshold = min(profit_threshold, -(self.config.hive_rebalance_tolerance))
 
         # Check Profit against Dynamic Threshold
         if expected_profit < profit_threshold:
@@ -2925,7 +2931,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         if spread <= 0:
             return None
         max_fee_ppm = max(1, int(spread * cfg.kelly_fraction))
-        max_budget = int(amount * max_fee_ppm / 1_000_000)
+        max_budget = max(1, (amount * max_fee_ppm + 999_999) // 1_000_000)
 
         if max_budget <= 0:
             return None
@@ -3251,8 +3257,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             source_capacity = info.get("capacity", 1)
             source_turnover_rate = self._calculate_turnover_rate(cid, source_capacity)
 
-            # Get flow state FIRST - needed for flow-aware opportunity cost
-            state = self.database.get_channel_state(cid)
+            # E5 FIX: Reuse state from source protection check above (line 3244)
+            # instead of making a duplicate DB query for the same channel.
             flow_state = state.get("state", "balanced") if state else "balanced"
 
             # =================================================================
@@ -3853,6 +3859,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
                 if reserved_budget:
                     self.database.release_budget_reservation(str(rebalance_id))
+                with self._pending_lock:
+                    self._pending.pop(candidate.to_channel, None)
 
         except Exception as e:
             result["message"] = str(e)
@@ -4012,6 +4020,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             max_fee_sats: Maximum fee willing to pay (optional)
             force: If True, suppress capital control warnings
         """
+        # Normalize SCIDs to 'x' format for consistent DB storage and queries
+        from_channel = from_channel.replace(':', 'x')
+        to_channel = to_channel.replace(':', 'x')
         # Warn if capital controls would block this (but don't enforce for manual)
         capital_ok = self._check_capital_controls()
         if not capital_ok and not force:
@@ -4159,15 +4170,21 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # If proportional budget enabled: max(fixed_floor, revenue_24h * percentage)
             effective_budget = cfg.daily_budget_sats
 
+            # R-R6-1 FIX: Compute budget_window_hours once, used by both
+            # proportional budget and fee-spent check below.
+            now = int(time.time())
+            budget_window_hours = max(1, int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24))
+
             if cfg.enable_proportional_budget:
-                now = int(time.time())
-                revenue_24h = self.database.get_total_routing_revenue(now - 86400)
-                proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
+                # E4 FIX: Use configurable budget window, matching execute_rebalance (line 3760)
+                # instead of hardcoded 86400 which ignores total_cost_budget_window_hours.
+                revenue_window = self.database.get_total_routing_revenue(now - (budget_window_hours * 3600))
+                proportional_budget = int(revenue_window * cfg.proportional_budget_pct)
                 effective_budget = max(cfg.daily_budget_sats, proportional_budget)
 
                 self.plugin.log(
                     f"CAPITAL CONTROL: Revenue-proportional budget active. "
-                    f"Revenue 24h: {revenue_24h} sats, {cfg.proportional_budget_pct*100:.1f}% = {proportional_budget} sats, "
+                    f"Revenue {budget_window_hours}h: {revenue_window} sats, {cfg.proportional_budget_pct*100:.1f}% = {proportional_budget} sats, "
                     f"Effective budget: {effective_budget} sats (floor: {cfg.daily_budget_sats})",
                     level='debug'
                 )
@@ -4176,8 +4193,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             if getattr(self, "global_budget_limit_provider", None) is not None:
                 effective_budget = self._get_global_budget_limit(cfg)
 
-            budget_window_hours = max(1, int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24))
-            fees_spent_24h = self.database.get_total_rebalance_fees(int(time.time()) - (budget_window_hours * 3600))
+            fees_spent_24h = self.database.get_total_rebalance_fees(now - (budget_window_hours * 3600))
             ext_costs = self._get_external_liquidity_costs()
             ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
             ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)

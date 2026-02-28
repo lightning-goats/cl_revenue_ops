@@ -169,12 +169,12 @@ class PolicyManager:
     """
 
     # Default policy for peers without explicit configuration
+    # L11 FIX: Use default_factory (no explicit tags=[]) to avoid shared mutable list
     DEFAULT_POLICY = PeerPolicy(
         peer_id="",
         strategy=FeeStrategy.DYNAMIC,
         rebalance_mode=RebalanceMode.ENABLED,
         fee_ppm_target=None,
-        tags=[],
         updated_at=0
     )
 
@@ -284,10 +284,12 @@ class PolicyManager:
         Raises:
             ValueError: If peer_id is not a valid 66-char hex string
         """
-        if not peer_id or not PEER_ID_PATTERN.match(peer_id):
+        # L-R5-2 FIX: Handle None/non-string inputs without TypeError
+        if not peer_id or not isinstance(peer_id, str) or not PEER_ID_PATTERN.match(peer_id):
+            peer_str = str(peer_id or '')
             raise ValueError(
-                f"Invalid peer_id: must be 66-character hex string, got '{peer_id[:20]}...'"
-                if len(peer_id) > 20 else f"Invalid peer_id: '{peer_id}'"
+                f"Invalid peer_id: must be 66-character hex string, got '{peer_str[:20]}...'"
+                if len(peer_str) > 20 else f"Invalid peer_id: '{peer_str}'"
             )
     
     def _invalidate_cache(self) -> None:
@@ -314,23 +316,31 @@ class PolicyManager:
 
     def _load_cache(self) -> None:
         """Load all policies into cache from database."""
+        # M6 FIX: Check validity under lock, but read DB outside lock
+        # to avoid blocking all policy-reading threads during DB I/O.
         with self._cache_lock:
             if self._cache_valid:
                 return
 
-            conn = self.database._get_connection()
-            rows = conn.execute(
-                "SELECT * FROM peer_policies ORDER BY updated_at DESC"
-            ).fetchall()
+        # Read DB outside the lock (thread-local connections are safe)
+        conn = self.database._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM peer_policies ORDER BY updated_at DESC"
+        ).fetchall()
 
-            self._cache.clear()
-            for row in rows:
-                policy = self._row_to_policy(row)
-                # v2.0: Skip expired policies during cache load
-                if not policy.is_expired():
-                    self._cache[policy.peer_id] = policy
+        new_cache = {}
+        for row in rows:
+            policy = self._row_to_policy(row)
+            # v2.0: Skip expired policies during cache load
+            if not policy.is_expired():
+                new_cache[policy.peer_id] = policy
 
-            self._cache_valid = True
+        # Update cache atomically under lock
+        with self._cache_lock:
+            # Re-check: another thread may have loaded while we were reading
+            if not self._cache_valid:
+                self._cache = new_cache
+                self._cache_valid = True
 
     def _row_to_policy(self, row) -> PeerPolicy:
         """Convert a database row to a PeerPolicy object."""
@@ -444,7 +454,11 @@ class PolicyManager:
         """Delete an expired policy from the database."""
         try:
             conn = self.database._get_connection()
-            conn.execute("DELETE FROM peer_policies WHERE peer_id = ?", (peer_id,))
+            now = int(time.time())
+            conn.execute(
+                "DELETE FROM peer_policies WHERE peer_id = ? AND expires_at IS NOT NULL AND expires_at < ?",
+                (peer_id, now)
+            )
         except Exception as e:
             self.plugin.log(f"PolicyManager: Error deleting expired policy: {e}", level='warn')
 
@@ -613,6 +627,15 @@ class PolicyManager:
                 raise ValueError(f"fee_multiplier_max must be >= {GLOBAL_MIN_FEE_MULTIPLIER}")
             if new_mult_max > GLOBAL_MAX_FEE_MULTIPLIER:
                 raise ValueError(f"fee_multiplier_max must be <= {GLOBAL_MAX_FEE_MULTIPLIER}")
+
+        # L-R5-8 FIX: Cross-validate multiplier min/max instead of silently storing
+        # inverted bounds that get swapped at read time by get_fee_multiplier_bounds().
+        if new_mult_min is not None and new_mult_max is not None:
+            if new_mult_min > new_mult_max:
+                raise ValueError(
+                    f"fee_multiplier_min ({new_mult_min}) cannot exceed "
+                    f"fee_multiplier_max ({new_mult_max})"
+                )
 
         # v2.0: Calculate expiry timestamp
         new_expires_at = existing.expires_at
@@ -1073,15 +1096,13 @@ class PolicyManager:
         results = []
         now = int(time.time())
 
-        # Validate all updates first (fail fast), including rate limits
+        # M5 FIX: Validate all updates first (fail fast).
+        # Rate limit check is deferred until after full validation to avoid
+        # incrementing counters for batches that fail on a later entry.
         validated = []
         for update in updates:
             peer_id = update.get('peer_id', '')
             self._validate_peer_id(peer_id)
-            if not self._check_rate_limit(peer_id):
-                raise RuntimeError(
-                    f"Rate limited: max {MAX_POLICY_CHANGES_PER_MINUTE} changes/minute for {peer_id[:12]}..."
-                )
 
             existing = self.get_policy(peer_id)
 
@@ -1130,6 +1151,14 @@ class PolicyManager:
                 if mult_max > GLOBAL_MAX_FEE_MULTIPLIER:
                     raise ValueError(f"fee_multiplier_max must be <= {GLOBAL_MAX_FEE_MULTIPLIER} for peer {peer_id[:12]}...")
 
+            # L-R5-8 FIX: Cross-validate multiplier min/max in batch path too
+            if mult_min is not None and mult_max is not None:
+                if mult_min > mult_max:
+                    raise ValueError(
+                        f"fee_multiplier_min ({mult_min}) cannot exceed "
+                        f"fee_multiplier_max ({mult_max}) for peer {peer_id[:12]}..."
+                    )
+
             # Process expiry
             expires_at = existing.expires_at
             expires_in_hours = update.get('expires_in_hours')
@@ -1146,6 +1175,27 @@ class PolicyManager:
                 peer_id, new_strategy, new_rebalance_mode, fee_ppm,
                 tags, mult_min, mult_max, expires_at
             ))
+
+        # M5 FIX + M-R6-2 FIX: Check rate limits after full validation passes.
+        # First do a read-only check for ALL peers (no counter mutation).
+        # Only record timestamps after all peers pass, preventing counter
+        # pollution when a later peer in the batch fails the rate limit.
+        now = int(time.time())
+        window_start = now - 60
+        with self._cache_lock:
+            for peer_id, *_ in validated:
+                timestamps = self._change_timestamps.get(peer_id, [])
+                active = [ts for ts in timestamps if ts > window_start]
+                if len(active) >= MAX_POLICY_CHANGES_PER_MINUTE:
+                    raise RuntimeError(
+                        f"Rate limited: max {MAX_POLICY_CHANGES_PER_MINUTE} changes/minute for {peer_id[:12]}..."
+                    )
+            # All passed - now record timestamps atomically
+            for peer_id, *_ in validated:
+                timestamps = self._change_timestamps.get(peer_id, [])
+                timestamps = [ts for ts in timestamps if ts > window_start]
+                timestamps.append(now)
+                self._change_timestamps[peer_id] = timestamps
 
         # Execute batch insert atomically
         conn = self.database._get_connection()
@@ -1220,10 +1270,16 @@ class PolicyManager:
 
         deleted_count = cursor.rowcount
 
-        # Update cache and notify subscribers so they switch to default strategy
+        # Update cache and notify subscribers so they switch to default strategy.
+        # Only evict from cache if the policy is still expired (guards against
+        # a concurrent set_policy() that inserted a fresh policy between the
+        # DB DELETE and this cache update).
         for row in expired_rows:
             peer_id = row['peer_id']
-            self._remove_from_cache(peer_id)
+            with self._cache_lock:
+                cached = self._cache.get(peer_id)
+                if cached and cached.is_expired():
+                    del self._cache[peer_id]
             self._notify_change(peer_id, self.get_policy(peer_id))
 
         if deleted_count > 0:

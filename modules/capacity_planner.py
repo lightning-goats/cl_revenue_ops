@@ -135,12 +135,15 @@ class CapacityPlanner:
             # Rebalance difficulty penalty: low success rate reduces effective ROI
             success_data = self.profitability.database.get_channel_rebalance_success_rate(scid, 30)
             rebal_penalty = 0.0
-            if success_data and success_data['total'] >= 3:
-                if success_data['success_rate'] < 0.5:
-                    rebal_penalty = (0.5 - success_data['success_rate']) * 50  # Up to 25% ROI penalty
+            # M9 FIX: Use .get() to prevent KeyError if dict missing expected keys
+            if success_data and success_data.get('total', 0) >= 3:
+                sr = success_data.get('success_rate', 1.0)
+                if sr < 0.5:
+                    rebal_penalty = (0.5 - sr) * 50  # Up to 25% ROI penalty
 
             effective_roi = prof.marginal_roi_percent - rebal_penalty
-            rebal_difficulty = round(1.0 - (success_data['success_rate'] if success_data and success_data['total'] >= 3 else 1.0), 2)
+            sr_val = success_data.get('success_rate', 1.0) if success_data and success_data.get('total', 0) >= 3 else 1.0
+            rebal_difficulty = round(1.0 - sr_val, 2)
 
             if (effective_roi > 20.0 and
                 turnover > 0.5 and
@@ -177,8 +180,8 @@ class CapacityPlanner:
             # Rebalance difficulty scoring from success rate history
             success_data = self.profitability.database.get_channel_rebalance_success_rate(scid, 30)
             rebal_difficulty = 0.0
-            if success_data and success_data['total'] >= 3:
-                rebal_difficulty = 1.0 - success_data['success_rate']  # 0=easy, 1=impossible
+            if success_data and success_data.get('total', 0) >= 3:
+                rebal_difficulty = 1.0 - success_data.get('success_rate', 1.0)  # 0=easy, 1=impossible
 
             # SCID formatting check - ensure 'x' separator
             scid_display = scid.replace(':', 'x')

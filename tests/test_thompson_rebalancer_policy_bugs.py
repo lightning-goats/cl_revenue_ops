@@ -57,6 +57,14 @@ class TestRebalancerTimeoutKwarg:
         jm._get_channel_local_balance = MagicMock(return_value=510000)
         jm.stop_job = MagicMock(return_value=True)
         jm._report_outcome_to_hive = MagicMock()
+        # E3 FIX: Mock _get_sling_stats and _parse_msat to return proper values
+        # so fee_sats stays an int (prevents MagicMock propagation through arithmetic)
+        jm._get_sling_stats = MagicMock(return_value={})
+        jm._parse_msat = MagicMock(return_value=0)
+        job.max_fee_ppm = 1000
+        job.direction = "pull"
+        job.candidate = MagicMock()
+        job.candidate.to_peer_id = "a" * 66
 
         # This should NOT raise TypeError
         jm._handle_job_timeout(job)
@@ -65,6 +73,12 @@ class TestRebalancerTimeoutKwarg:
         call_args = database.update_rebalance_result.call_args
         assert 'actual_fee_sats' in call_args.kwargs
         assert 'fee_paid_sats' not in call_args.kwargs
+
+        # Verify record_rebalance_cost was called for partial success with fee > 0
+        # (fee is conservative estimate: (10000 * 1000) // 2000000 = 5 sats)
+        database.record_rebalance_cost.assert_called_once()
+        rc_kwargs = database.record_rebalance_cost.call_args
+        assert rc_kwargs.kwargs.get('cost_sats', rc_kwargs[1].get('cost_sats', 0)) > 0 if rc_kwargs.kwargs else True
 
     def test_full_timeout_does_not_crash(self):
         """_handle_job_timeout with no transfer should not crash either."""

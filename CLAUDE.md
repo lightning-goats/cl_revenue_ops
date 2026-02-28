@@ -49,7 +49,7 @@ Core Lightning
 | `capacity_planner.py` | Channel sizing recommendations ("Winners & Losers") |
 | `hive_bridge.py` | cl-hive integration, MCF assignments, Kalman velocity sharing |
 | `clboss_manager.py` | Optional CLBoss integration for unmanage commands |
-| `database.py` | SQLite with WAL mode, 27 tables, accounting + Kalman state persistence |
+| `database.py` | SQLite with WAL mode, 32 tables, accounting + Kalman state persistence |
 | `config.py` | Hot-reloadable configuration |
 | `utils.py` | Shared utility functions |
 
@@ -186,13 +186,13 @@ cl-revenue-ops/
 │   ├── capacity_planner.py # Channel recommendations
 │   ├── hive_bridge.py      # cl-hive integration
 │   ├── clboss_manager.py   # Optional CLBoss integration
-│   ├── database.py         # SQLite layer (27 tables)
+│   ├── database.py         # SQLite layer (32 tables)
 │   ├── config.py           # Configuration
 │   └── utils.py            # Shared utilities
 ├── config/
 │   ├── cl-revenue-ops.conf.full     # Full config with all options documented
 │   └── cl-revenue-ops.conf.minimal  # Quick-start production config
-├── tests/                  # 319 tests across 14 files
+├── tests/                  # 514 tests across 21 files
 ├── migrations/             # Database migrations
 └── docs/                   # Documentation
     ├── specs/              # Technical specifications

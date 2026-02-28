@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
     'db_path',
     'dry_run',  # Safety: don't allow enabling dry_run to hide actions
+    'sling_available',  # L15 FIX: Runtime dependency flag, set during init only
 })
 
 # Type mapping for config fields (for validation)
@@ -226,6 +227,14 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_min_amount': (1000, 50000000),
     'rebalance_max_amount': (10000, 100000000),
     'flow_window_days': (1, 365),
+}
+
+# Valid values for string enum fields
+STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
+    'hive_enabled': ('auto', 'true', 'false'),
+    'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
+    'total_cost_budget_mode': ('fixed', 'profit_pct'),
+    'rebalancer_plugin': ('sling',),
 }
 
 
@@ -477,6 +486,18 @@ class Config:
             if hasattr(self, key) and key not in IMMUTABLE_CONFIG_KEYS:
                 self._apply_override(key, value)
         self._version = database.get_config_version()
+        # M-R5-2 FIX: Post-load cross-field invariant repair.
+        # Overrides applied individually may violate cross-field constraints
+        # (e.g., min_fee_ppm > max_fee_ppm from TOCTOU race or manual DB edits).
+        if self.min_fee_ppm > self.max_fee_ppm:
+            self.min_fee_ppm = self.max_fee_ppm
+        if self.rebalance_min_amount > self.rebalance_max_amount:
+            self.rebalance_min_amount = self.rebalance_max_amount
+        if hasattr(self, 'low_liquidity_threshold') and hasattr(self, 'high_liquidity_threshold'):
+            if self.low_liquidity_threshold >= self.high_liquidity_threshold:
+                # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
+                # high_liquidity_threshold is very small (e.g., < 0.05).
+                self.low_liquidity_threshold = max(0.0, self.high_liquidity_threshold - 0.05)
     
     def _apply_override(self, key: str, value: str) -> None:
         """Apply a single override with type conversion and range validation."""
@@ -495,6 +516,13 @@ class Config:
                 min_val, max_val = CONFIG_FIELD_RANGES[key]
                 if not (min_val <= typed_value <= max_val):
                     return  # Skip out-of-range override, keep default
+            # String enum validation (matching update_runtime behavior)
+            if key in STRING_ENUM_VALID_VALUES:
+                valid_values = STRING_ENUM_VALID_VALUES[key]
+                if typed_value not in valid_values and (not isinstance(typed_value, str) or typed_value.lower() not in [v.lower() for v in valid_values]):
+                    return  # Skip invalid enum override, keep default
+                if isinstance(typed_value, str):
+                    typed_value = typed_value.lower()
             setattr(self, key, typed_value)
         except (ValueError, TypeError, AttributeError):
             pass  # Keep default if conversion fails
@@ -538,17 +566,35 @@ class Config:
                 return {"error": f"Value {typed_value} out of range [{min_val}, {max_val}] for {key}"}
 
         # 3b. VALIDATE: String enum check
-        STRING_ENUM_VALID_VALUES = {
-            'hive_enabled': ('auto', 'true', 'false'),
-            'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
-        }
         if key in STRING_ENUM_VALID_VALUES:
-            if typed_value not in STRING_ENUM_VALID_VALUES[key]:
-                valid = ', '.join(STRING_ENUM_VALID_VALUES[key])
+            valid_values = STRING_ENUM_VALID_VALUES[key]
+            # Case-insensitive comparison for string enums
+            if typed_value not in valid_values and (not isinstance(typed_value, str) or typed_value.lower() not in [v.lower() for v in valid_values]):
+                valid = ', '.join(valid_values)
                 return {"error": f"Invalid value '{typed_value}' for {key}. Valid values: {valid}"}
+            # Normalize string enums to lowercase for consistent consumer comparisons
+            if isinstance(typed_value, str):
+                typed_value = typed_value.lower()
 
         # 4-6. WRITE + VERIFY + UPDATE under lock to prevent TOCTOU races
         with self._lock:
+            # M-R5-1 FIX: Cross-field consistency checks INSIDE lock to prevent
+            # TOCTOU race where a concurrent update changes the companion field
+            # between our check and our write.
+            if key == 'min_fee_ppm' and typed_value > self.max_fee_ppm:
+                return {"error": f"min_fee_ppm ({typed_value}) cannot exceed current max_fee_ppm ({self.max_fee_ppm})"}
+            if key == 'max_fee_ppm' and typed_value < self.min_fee_ppm:
+                return {"error": f"max_fee_ppm ({typed_value}) cannot be less than current min_fee_ppm ({self.min_fee_ppm})"}
+            if key == 'rebalance_min_amount' and typed_value > self.rebalance_max_amount:
+                return {"error": f"rebalance_min_amount ({typed_value}) cannot exceed rebalance_max_amount ({self.rebalance_max_amount})"}
+            if key == 'rebalance_max_amount' and typed_value < self.rebalance_min_amount:
+                return {"error": f"rebalance_max_amount ({typed_value}) cannot be less than rebalance_min_amount ({self.rebalance_min_amount})"}
+            # M-R5-4 FIX: Also validate liquidity threshold cross-field consistency
+            if key == 'low_liquidity_threshold' and typed_value >= self.high_liquidity_threshold:
+                return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
+            if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
+                return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
+
             old_value = getattr(self, key)
 
             # 4. WRITE to database

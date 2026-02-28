@@ -1556,7 +1556,7 @@ class ChannelProfitabilityAnalyzer:
                     if (effective_rebalance_cost_30d > revenue_30d * 2 and
                             net_profit_30d < -1000):
                         classification = "hard"
-                        reason = (f"Rebalance cost ({rebalance_cost_30d} sats) exceeds "
+                        reason = (f"Rebalance cost ({effective_rebalance_cost_30d} sats effective) exceeds "
                                   f"2x revenue ({revenue_30d * 2} sats), net loss {net_profit_30d} sats")
                         recommended_action = "disable_rebalance"
 
@@ -1581,6 +1581,15 @@ class ChannelProfitabilityAnalyzer:
                             reason = (f"Minor sustained losses: 7d={net_profit_7d} sats, "
                                       f"30d={net_profit_30d} sats")
                             recommended_action = "reduce_rebalance"
+
+                    # R1 FIX: Catch 30d loss with recent 7d recovery (possibly transient).
+                    # Without this, channels with significant 30d losses but a brief
+                    # 7d positive blip escape bleeder detection entirely.
+                    elif net_profit_30d < 0 and net_profit_7d >= 0:
+                        classification = "soft"
+                        reason = (f"30d loss ({net_profit_30d} sats) but recovering "
+                                  f"(7d: +{net_profit_7d} sats)")
+                        recommended_action = "reduce_rebalance"
 
                     classifications.append(BleederClassification(
                         channel_id=channel_id,
@@ -1629,10 +1638,11 @@ class ChannelProfitabilityAnalyzer:
         """
         now = time.time()
         if self._bleeder_cache is None or now - self._bleeder_cache_time > 300:
-            # Build new cache, then swap timestamp first to prevent concurrent rebuilds
+            # M10 FIX: Set cache before timestamp to prevent a window where
+            # another thread sees a fresh timestamp with stale/None data.
             new_cache = {c.channel_id: c for c in self.identify_bleeders_v2()}
-            self._bleeder_cache_time = now  # Set time first so other threads see "fresh"
             self._bleeder_cache = new_cache
+            self._bleeder_cache_time = now
         return self._bleeder_cache.get(channel_id)
 
     def calculate_roc(self, window_days: int = 30) -> Dict[str, Any]:

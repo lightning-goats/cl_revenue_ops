@@ -1797,11 +1797,14 @@ class Database:
             channel_id, since_day, today_start,
         )).fetchone()
 
-        # Rebalance costs for this channel (DB-5: include partial success costs)
+        # C6 FIX: Use unpruned rebalance_costs table instead of rebalance_history.
+        # rebalance_history is pruned to 90 days by cleanup_old_data(), but
+        # rebalance_costs is never pruned and serves as the source of truth
+        # for lifetime cost accounting. This matters for channels open > 90 days.
         cost_row = conn.execute("""
-            SELECT COALESCE(SUM(actual_fee_sats), 0) as cost_sats
-            FROM rebalance_history
-            WHERE to_channel = ? AND timestamp >= ? AND status IN ('success', 'partial')
+            SELECT COALESCE(SUM(cost_sats), 0) as cost_sats
+            FROM rebalance_costs
+            WHERE channel_id = ? AND timestamp >= ?
         """, (channel_id, since)).fetchone()
 
         revenue_sats = (rev_row['revenue_msat'] // 1000) if rev_row else 0
@@ -2194,11 +2197,11 @@ class Database:
             # Use a transaction to ensure atomicity
             conn.execute("BEGIN IMMEDIATE")
 
-            # Get actual spent (from completed successful rebalances)
+            # Get actual spent from rebalance_costs (source of truth for async sling jobs)
             spent_row = conn.execute("""
-                SELECT COALESCE(SUM(actual_fee_sats), 0) as spent
-                FROM rebalance_history
-                WHERE timestamp >= ? AND status IN ('success', 'partial') AND actual_fee_sats IS NOT NULL
+                SELECT COALESCE(SUM(cost_sats), 0) as spent
+                FROM rebalance_costs
+                WHERE timestamp >= ?
             """, (since_timestamp,)).fetchone()
             actual_spent = spent_row['spent'] if spent_row else 0
 
@@ -2375,7 +2378,7 @@ class Database:
         """Create a generic spend reservation (best-effort, caller enforces budget)."""
         conn = self._get_connection()
         now = int(time.time())
-        amount = self._sanitize_fee(amount_sats, "reserved_sats")
+        amount = self._sanitize_amount(amount_sats, "reserved_sats")
         if amount <= 0:
             return False
         rid = str(reservation_id or "").strip()
@@ -2424,7 +2427,7 @@ class Database:
         """, (rid,))
         changed = cursor.rowcount > 0
         if changed and record_event:
-            amount = self._sanitize_fee(actual_spent_sats if actual_spent_sats is not None else row["reserved_sats"], "actual_spent_sats")
+            amount = self._sanitize_amount(actual_spent_sats if actual_spent_sats is not None else row["reserved_sats"], "actual_spent_sats")
             self.record_spend_event(
                 event_id=f"resv:{rid}",
                 category=row["category"],
@@ -2448,7 +2451,7 @@ class Database:
         if not eid or not cat:
             return False
         ts = int(timestamp or time.time())
-        amount = self._sanitize_fee(amount_sats, "amount_sats")
+        amount = self._sanitize_amount(amount_sats, "amount_sats")
         meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
         try:
             conn.execute("""
@@ -3325,13 +3328,15 @@ class Database:
         if not rows:
             return {'avg': 0.0, 'std': 0.0}
             
-        times = [row['resolution_time'] for row in rows]
+        times = [row['resolution_time'] for row in rows if row['resolution_time'] and row['resolution_time'] > 0]
         n = len(times)
+        if n == 0:
+            return {'avg': 0.0, 'std': 0.0}
         avg = sum(times) / n
-        
+
         if n < 2:
             return {'avg': avg, 'std': 0.0}
-            
+
         variance = sum((x - avg) ** 2 for x in times) / (n - 1)
         std = math.sqrt(variance)
         
@@ -3415,6 +3420,27 @@ class Database:
             (channel_id,)
         ).fetchone()
         return row["open_cost_sats"] if row else None
+
+    def get_channel_cost(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """
+        C5 FIX: Get full channel cost record for closure archival.
+
+        Returns the complete channel_costs row as a dict, used by
+        _archive_closed_channel() in cl-revenue-ops.py.
+
+        Args:
+            channel_id: The channel short ID
+
+        Returns:
+            Dict with keys: channel_id, peer_id, open_cost_sats, capacity_sats, opened_at
+            or None if no record exists.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM channel_costs WHERE channel_id = ?",
+            (channel_id,)
+        ).fetchone()
+        return dict(row) if row else None
     
     def record_rebalance_cost(self, channel_id: str, peer_id: str,
                               cost_sats: int, amount_sats: int,
@@ -3663,10 +3689,10 @@ class Database:
 
             if not self._validate_peer_id(peer_id):
                 self.plugin.log(
-                    f"Security: Invalid peer_id format for {channel_id}, using sanitized value",
+                    f"Security: Invalid peer_id format for {channel_id}, rejecting closure record",
                     level='warn'
                 )
-                peer_id = "invalid_peer_id"
+                return False
 
             # Security: Sanitize fee values
             closure_fee_sats = self._sanitize_fee(closure_fee_sats, "closure_fee")
@@ -3881,12 +3907,15 @@ class Database:
 
             # Input validation (consistent with record_channel_closure)
             capacity_sats = self._sanitize_amount(capacity_sats, "capacity_sats")
-            open_cost_sats = self._sanitize_fee(open_cost_sats, "open_cost_sats")
-            closure_cost_sats = self._sanitize_fee(closure_cost_sats, "closure_cost_sats")
+            open_cost_sats = self._sanitize_amount(open_cost_sats, "open_cost_sats")
+            closure_cost_sats = self._sanitize_amount(closure_cost_sats, "closure_cost_sats")
             total_revenue_sats = self._sanitize_amount(total_revenue_sats, "total_revenue_sats")
-            total_rebalance_cost_sats = self._sanitize_fee(total_rebalance_cost_sats, "total_rebalance_cost_sats")
+            total_rebalance_cost_sats = self._sanitize_amount(total_rebalance_cost_sats, "total_rebalance_cost_sats")
             forward_count = max(0, int(forward_count or 0))
-            _VALID_CLOSE_TYPES = ('mutual', 'unilateral', 'force', 'onchain', 'unknown')
+            # M12 FIX: Include 'local_unilateral' and 'remote_unilateral' to match
+            # _determine_close_type() output and record_channel_closure() validation.
+            _VALID_CLOSE_TYPES = ('mutual', 'local_unilateral', 'remote_unilateral',
+                                 'unilateral', 'force', 'onchain', 'unknown')
             if close_type not in _VALID_CLOSE_TYPES:
                 close_type = 'unknown'
             _VALID_CLOSERS = ('local', 'remote', 'mutual', 'unknown')
@@ -3894,7 +3923,8 @@ class Database:
                 closer = 'unknown'
 
             # Calculate derived values
-            days_open = ((closed_at - opened_at) // 86400) if opened_at else 0
+            # M15 FIX: Clamp to zero to handle clock skew where closed_at < opened_at
+            days_open = max(0, ((closed_at - opened_at) // 86400)) if opened_at else 0
             net_pnl = total_revenue_sats - (open_cost_sats + closure_cost_sats + total_rebalance_cost_sats)
 
             conn.execute("""
@@ -4121,6 +4151,26 @@ class Database:
                 )
                 deleted["flow_history"] = cursor.rowcount
 
+                # L11 FIX: Clean up fee_strategy_state and pid_state to prevent
+                # orphaned rows from accumulating on nodes with frequent channel turnover.
+                try:
+                    cursor = conn.execute(
+                        "DELETE FROM fee_strategy_state WHERE channel_id = ?",
+                        (channel_id,)
+                    )
+                    deleted["fee_strategy_state"] = cursor.rowcount
+                except Exception:
+                    pass  # Table may not exist on older schemas
+
+                try:
+                    cursor = conn.execute(
+                        "DELETE FROM pid_state WHERE channel_id = ?",
+                        (channel_id,)
+                    )
+                    deleted["pid_state"] = cursor.rowcount
+                except Exception:
+                    pass  # Table may not exist on older schemas
+
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -4187,10 +4237,10 @@ class Database:
 
             if not self._validate_peer_id(peer_id):
                 self.plugin.log(
-                    f"Security: Invalid peer_id format for {channel_id}, using sanitized value",
+                    f"Security: Invalid peer_id format for {channel_id}, rejecting splice record",
                     level='warn'
                 )
-                peer_id = "invalid_peer_id"
+                return False
 
             # Security: Sanitize fee and amount values
             fee_sats = self._sanitize_fee(fee_sats, "splice_fee")
@@ -4894,13 +4944,18 @@ class Database:
         conn = self._get_connection()
         now = int(time.time())
 
-        # M-13: Atomic version increment — single statement avoids TOCTOU race
+        # M-13 v2 FIX: Compute version BEFORE INSERT OR REPLACE.
+        # INSERT OR REPLACE deletes the conflicting row first, then inserts.
+        # If the deleted row had the highest version, MAX(version) drops and
+        # the new version can equal or regress, causing missed change detection.
+        current_max = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM config_overrides"
+        ).fetchone()[0]
+        new_version = current_max + 1
         conn.execute("""
             INSERT OR REPLACE INTO config_overrides (key, value, version, updated_at)
-            VALUES (?, ?,
-                    (SELECT COALESCE(MAX(version), 0) + 1 FROM config_overrides),
-                    ?)
-        """, (key, value, now))
+            VALUES (?, ?, ?, ?)
+        """, (key, value, new_version, now))
 
         # Read back the version
         row = conn.execute("SELECT MAX(version) as max_v FROM config_overrides").fetchone()
@@ -5009,14 +5064,16 @@ class Database:
     def prune_expired_fee_anchors(self) -> int:
         """Delete expired fee anchors. Returns count deleted."""
         conn = self._get_connection()
-        now = time.time()
+        now = int(time.time())
         cursor = conn.execute(
             "DELETE FROM fee_anchors WHERE set_at + ttl_seconds < ?", (now,)
         )
         return cursor.rowcount
 
     def close(self):
-        """Close the thread-local database connection (if any)."""
-        if hasattr(self._local, 'conn') and self._local.conn is not None:
-            self._local.conn.close()
-            self._local.conn = None
+        """Close the thread-local database connection (if any).
+
+        M14 FIX: Delegate to close_connection() which also removes the
+        connection from _thread_connections tracking list.
+        """
+        self.close_connection()

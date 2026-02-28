@@ -444,7 +444,7 @@ class PortfolioOptimizer:
                     stat.expected_return = max(0, stat.expected_return - cost_per_hour)
 
                     # Cost uncertainty: lower success rate = higher variance contribution
-                    success_rate = cost_data['success_rate'] if cost_data['success_rate'] > 0 else 1.0
+                    success_rate = cost_data.get('success_rate', 1.0) if cost_data.get('success_rate', 1.0) > 0 else 1.0
                     cost_variance_contribution = (cost_per_hour ** 2) * (1.0 / success_rate - 1.0)
                     stat.variance += cost_variance_contribution
                     stat.std_dev = math.sqrt(max(stat.variance, MIN_VARIANCE))
@@ -905,52 +905,61 @@ class PortfolioOptimizer:
         effective_max = max(MAX_SINGLE_ALLOCATION, 1.0 / n)
         effective_min = min(MIN_SINGLE_ALLOCATION, 1.0 / n)
 
-        # Clip to bounds
-        weights = [
-            max(effective_min, min(effective_max, w))
-            for w in weights
-        ]
+        # H1 FIX: Bounded simplex projection that guarantees convergence.
+        # Instead of iterating clip-then-renormalize (which can oscillate),
+        # we redistribute surplus from clamped weights to unclamped ones.
+        # This converges in at most n iterations since each iteration
+        # permanently fixes at least one weight at a bound.
+        for _ in range(n):
+            # Clip to bounds
+            weights = [max(effective_min, min(effective_max, w)) for w in weights]
 
-        # Normalize to sum to 1
-        total = sum(weights)
-        if total > 0:
-            weights = [w / total for w in weights]
-        else:
-            weights = [1.0 / n] * n
+            total = sum(weights)
+            if total <= 0 or any(math.isnan(w) for w in weights):
+                return [1.0 / n] * n
 
-        # Re-apply bounds after normalization (iterative projection)
-        for _ in range(10):  # Max iterations for bound enforcement
-            needs_adjustment = False
-
-            for i in range(n):
-                if weights[i] < effective_min:
-                    weights[i] = effective_min
-                    needs_adjustment = True
-                elif weights[i] > effective_max:
-                    weights[i] = effective_max
-                    needs_adjustment = True
-
-            if not needs_adjustment:
+            # Check if already valid
+            if abs(total - 1.0) < 1e-12:
                 break
 
-            # Renormalize
-            total = sum(weights)
-            if total > 0:
-                weights = [w / total for w in weights]
+            # Identify which weights are at bounds vs free
+            at_lower = [weights[i] <= effective_min + 1e-12 for i in range(n)]
+            at_upper = [weights[i] >= effective_max - 1e-12 for i in range(n)]
+            fixed = [at_lower[i] or at_upper[i] for i in range(n)]
+            free_indices = [i for i in range(n) if not fixed[i]]
 
-        # M-8: Final enforcement if iterative projection didn't converge
-        total = sum(weights)
-        if abs(total - 1.0) > 1e-6:
-            weights = [max(effective_min, min(effective_max, w)) for w in weights]
-            total = sum(weights)
-            if total > 0:
+            if not free_indices:
+                # All weights at bounds — can't redistribute, just normalize
                 weights = [w / total for w in weights]
+                break
 
-        # Final guarantee: weights must sum to 1.0
+            # Redistribute surplus/deficit proportionally among free weights
+            fixed_sum = sum(weights[i] for i in range(n) if fixed[i])
+            free_sum = sum(weights[i] for i in free_indices)
+            target_free_sum = 1.0 - fixed_sum
+
+            if free_sum > 0 and target_free_sum > 0:
+                scale = target_free_sum / free_sum
+                for i in free_indices:
+                    weights[i] *= scale
+            else:
+                # Degenerate: equal-weight fallback
+                return [1.0 / n] * n
+
+        # Post-loop assertion: verify bounds are satisfied
+        bounds_ok = all(
+            effective_min - 1e-9 <= weights[i] <= effective_max + 1e-9
+            for i in range(n)
+        )
+        sum_ok = abs(sum(weights) - 1.0) < 1e-6
+
+        if not bounds_ok or not sum_ok:
+            # Fallback to equal weights if projection failed
+            return [1.0 / n] * n
+
+        # Final normalization for floating-point precision
         total = sum(weights)
-        if total <= 0 or any(math.isnan(w) for w in weights):
-            weights = [1.0 / n] * n
-        elif abs(total - 1.0) > 1e-9:
+        if abs(total - 1.0) > 1e-12:
             weights = [w / total for w in weights]
 
         return weights
@@ -1022,11 +1031,15 @@ class PortfolioOptimizer:
         systematic_risk = max(0.0, avg_correlation)
         idiosyncratic_risk = 1.0 - systematic_risk
 
-        # Improvement potential (guard against near-zero current_sharpe producing astronomical values)
-        if current_sharpe > 0:
+        # P3 FIX: Handle negative current_sharpe. Previously reported 0%
+        # improvement even when optimization could significantly help.
+        if current_sharpe > 0.001:
             improvement = (optimal_sharpe - current_sharpe) / current_sharpe
             if not math.isfinite(improvement):
                 improvement = 0.0
+        elif optimal_sharpe > 0:
+            # Current Sharpe is negative/zero but optimal is positive: significant improvement
+            improvement = 1.0
         else:
             improvement = 0.0
 

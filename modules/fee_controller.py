@@ -2382,7 +2382,9 @@ class ThompsonAIMDState:
             # Demand-adjusted reward signal
             "baseline_forward_rate": self.baseline_forward_rate,
             # Vegas-Thompson interaction
-            "last_vegas_multiplier": self.last_vegas_multiplier
+            "last_vegas_multiplier": self.last_vegas_multiplier,
+            # F-R6-1 FIX: Persist gossip refresh cooldown so it survives restarts
+            "last_gossip_refresh": self.last_gossip_refresh
         }
 
     @classmethod
@@ -2447,6 +2449,8 @@ class ThompsonAIMDState:
         state.baseline_forward_rate = d.get("baseline_forward_rate", 0.0)
         # Vegas-Thompson interaction (default 1.0 for backward compat)
         state.last_vegas_multiplier = d.get("last_vegas_multiplier", 1.0)
+        # F-R6-1 FIX: Restore gossip refresh cooldown from persisted state
+        state.last_gossip_refresh = d.get("last_gossip_refresh", 0)
 
         # Load legacy fields from main table if provided
         if legacy_state:
@@ -5514,6 +5518,12 @@ class HillClimbingFeeController:
                     ts_state.last_volume_sats = volume_since_sats
                     ts_state.last_update = now
                     self._save_thompson_aimd_state(channel_id, ts_state)
+                    # Reset hc_state observation timer so post-sleep window
+                    # doesn't span the entire sleep period
+                    hc_state.last_update = now
+                    hc_state.last_revenue_rate = current_revenue_rate
+                    hc_state.last_fee_ppm = current_fee_ppm
+                    self._save_hill_climb_state(channel_id, hc_state)
                     self.plugin.log(
                         f"THOMPSON: Market Calm - {channel_id[:12]}... entering sleep mode.",
                         level='info'
@@ -5734,7 +5744,7 @@ class HillClimbingFeeController:
                                 profitability_adjustment = -int(thompson_fee * 0.15)  # -15%
                                 self.plugin.log(
                                     f"P2_PROFIT: {channel_id[:12]}... underwater channel "
-                                    f"(ROI={prof_data.roi_percent:.1f}%), biasing down {profitability_adjustment}ppm",
+                                    f"(ROI={prof_data.roi_percent:.1f}%), biasing down {abs(profitability_adjustment)}ppm",
                                     level='debug'
                                 )
                         elif prof_data.classification == ProfitabilityClass.ZOMBIE:
@@ -6016,8 +6026,12 @@ class HillClimbingFeeController:
                     thompson_state.start_exploration(next_arm)
                     thompson_info = f"thompson_arm={next_arm} (mult={thompson_multiplier:.2f})"
                 else:
-                    # Exploitation: use best known arm
+                    # Exploitation: use best known arm (multiplier stays 1.0 = arm 2)
                     best_arm = thompson_state.get_best_arm()
+                    # Set current_arm to base-fee arm (2) so next cycle's
+                    # update_beliefs attributes the outcome correctly
+                    thompson_state.current_arm = 2
+                    thompson_state.arm_start_time = int(time.time())
                     thompson_info = f"thompson_exploit (best_arm={best_arm})"
 
                 hc_state.set_thompson_state(thompson_state)
@@ -6378,14 +6392,31 @@ class HillClimbingFeeController:
         threshold = hc_state.last_broadcast_fee_ppm * 0.05
         
         # Override: Always broadcast if entering/exiting critical states
-        # or if we have never broadcasted before
+        # or if we have never broadcasted before.
+        # Compare state CATEGORY only (strip parenthetical details) to avoid
+        # hysteresis bypass when balance bucket or modifier values change.
+        last_state_category = (hc_state.last_state or "").split(" (")[0]
+        current_state_category = decision_reason.split(" (")[0]
         significant_change = (delta_broadcast > threshold) or \
                              (hc_state.last_broadcast_fee_ppm <= 1) or \
                              (new_fee_ppm <= 1) or \
-                             (target_found and hc_state.last_state != decision_reason) or \
+                             (target_found and last_state_category != current_state_category) or \
                              (not target_found and hc_state.last_state == "CONGESTION")
 
         if not significant_change:
+            # =========================================================================
+            # GOSSIP REFRESH CHECK: Must run BEFORE last_update reset so we can
+            # detect 24h+ staleness. After reset, last_update=now defeats the check.
+            # =========================================================================
+            if self._should_force_gossip_refresh(channel_id, hc_state, now):
+                return self._create_gossip_refresh_adjustment(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    state=hc_state,
+                    current_fee_ppm=current_fee_ppm,
+                    current_time=now
+                )
+
             # HYSTERESIS: Skip RPC, update internal target but reset observation timer.
             # We MUST reset last_update because the fee/revenue data for this window
             # has already been consumed by Thompson/AIMD posterior updates above.
@@ -6396,7 +6427,7 @@ class HillClimbingFeeController:
             hc_state.step_ppm = step_ppm
             hc_state.last_update = now
             self._save_hill_climb_state(channel_id, hc_state)
-            
+
             self.plugin.log(
                 f"HYSTERESIS: Target fee {new_fee_ppm} is <5% delta from broadcast {hc_state.last_broadcast_fee_ppm}. "
                 f"Skipping gossip; pausing observation.",
@@ -6421,22 +6452,7 @@ class HillClimbingFeeController:
                         f"HYSTERESIS: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
                         level='debug'
                     )
-            
-            # =========================================================================
-            # GOSSIP REFRESH CHECK: Force minimal fee change for frozen channels
-            # =========================================================================
-            # Even though hysteresis says skip, check if channel appears frozen
-            # and needs a gossip refresh to restore network visibility.
-            now = int(time.time())
-            if self._should_force_gossip_refresh(channel_id, hc_state, now):
-                return self._create_gossip_refresh_adjustment(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    state=hc_state,
-                    current_fee_ppm=current_fee_ppm,
-                    current_time=now
-                )
-            
+
             return None
 
         # Build reason string (with rate info)
