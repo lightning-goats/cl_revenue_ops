@@ -4636,7 +4636,11 @@ class HillClimbingFeeController:
 
     def wake_all_sleeping_channels(self) -> int:
         """
-        Wake all sleeping channels immediately.
+        Wake all channels immediately — clears both sleep mode AND observation windows.
+
+        Resets:
+        - is_sleeping / sleep_until (hysteresis sleep)
+        - last_update backdated so MIN_OBSERVATION_HOURS gate passes
 
         Call this when fee_interval changes or when you need to force
         all channels to re-evaluate their fees immediately.
@@ -4646,48 +4650,68 @@ class HillClimbingFeeController:
         """
         woken = 0
         now = int(time.time())
+        # Backdate far enough to satisfy the observation window check
+        backdated = now - int(self.MIN_OBSERVATION_HOURS * 3600) - 1
 
         # TS-3: All state mutations must be inside _state_lock
         with self._state_lock:
             # Wake in-memory Hill Climbing states
             for channel_id, state in list(self._hill_climb_states.items()):
+                changed = False
                 if state.is_sleeping:
                     state.is_sleeping = False
                     state.sleep_until = 0
                     state.stable_cycles = 0
+                    changed = True
+                # Also clear the observation window gate so waiting_time
+                # channels get re-evaluated on the next fee cycle
+                if state.last_update > backdated:
+                    state.last_update = backdated
+                    changed = True
+                if changed:
                     self._save_hill_climb_state(channel_id, state)
                     woken += 1
 
             # Wake in-memory Thompson+AIMD states
             for channel_id, ts_state in list(self._thompson_aimd_states.items()):
+                changed = False
                 if ts_state.is_sleeping:
                     ts_state.is_sleeping = False
                     ts_state.sleep_until = 0
                     ts_state.stable_cycles = 0
+                    changed = True
+                if ts_state.last_update > backdated:
+                    ts_state.last_update = backdated
+                    changed = True
+                if changed:
                     self._save_thompson_aimd_state(channel_id, ts_state)
                     woken += 1
 
-            # Also wake any sleeping channels in database not in memory
+            # Also wake any channels in database not in memory
             try:
                 db_states = self.database.get_all_fee_strategy_states()
                 for db_state in db_states:
                     channel_id = db_state.get("channel_id", "")
-                    if channel_id and db_state.get("is_sleeping", 0):
-                        if channel_id not in self._hill_climb_states:
-                            # Load, wake, and save
-                            hc_state = self._get_hill_climb_state(channel_id)
-                            if hc_state.is_sleeping:
-                                hc_state.is_sleeping = False
-                                hc_state.sleep_until = 0
-                                hc_state.stable_cycles = 0
-                                self._save_hill_climb_state(channel_id, hc_state)
-                                woken += 1
+                    if not channel_id:
+                        continue
+                    is_sleeping = db_state.get("is_sleeping", 0)
+                    db_last_update = db_state.get("last_update", 0)
+                    needs_wake = is_sleeping or db_last_update > backdated
+                    if needs_wake and channel_id not in self._hill_climb_states:
+                        hc_state = self._get_hill_climb_state(channel_id)
+                        hc_state.is_sleeping = False
+                        hc_state.sleep_until = 0
+                        hc_state.stable_cycles = 0
+                        if hc_state.last_update > backdated:
+                            hc_state.last_update = backdated
+                        self._save_hill_climb_state(channel_id, hc_state)
+                        woken += 1
             except Exception as e:
                 self.plugin.log(f"Error waking database states: {e}", level='warning')
 
         if woken > 0:
             self.plugin.log(
-                f"WAKE_ALL: Woke {woken} sleeping channels",
+                f"WAKE_ALL: Woke {woken} channels (cleared sleep + observation windows)",
                 level='info'
             )
 
