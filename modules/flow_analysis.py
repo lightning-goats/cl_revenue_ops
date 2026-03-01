@@ -64,8 +64,12 @@ MULTIPLIER_DEADBAND = 0.1  # Ignore flow_ratio changes smaller than this
 # velocity = (current_ratio - previous_ratio) / time_hours
 # Security: Outlier detection, bounded range
 ENABLE_FLOW_VELOCITY = True
-MAX_VELOCITY = 0.5 / 24.0  # Max flow_ratio change per hour (security bound)
-MIN_VELOCITY = -0.5 / 24.0  # Min flow_ratio change per hour
+MAX_VELOCITY = 0.5  # Max flow_ratio change per hour (security bound)
+MIN_VELOCITY = -0.5  # Min flow_ratio change per hour
+
+# Kalman filter velocity bounds (tighter, since Kalman tracks smooth trends)
+KALMAN_MAX_VELOCITY = 0.5 / 24.0  # ~0.021/hr — physical limit for filtered velocity
+KALMAN_MIN_VELOCITY = -0.5 / 24.0
 VELOCITY_OUTLIER_THRESHOLD = 3.0  # Ignore velocity changes > 3 standard deviations
 
 # Improvement #5: Adaptive EMA Decay
@@ -87,7 +91,7 @@ VOLATILITY_WINDOW_DAYS = 14  # Calculate volatility over longer window than flow
 # - Velocity tracking built into state vector
 #
 # State vector: [flow_ratio, flow_velocity]
-# Measurement: observed flow_ratio from daily buckets
+# Measurement: observed flow_ratio from continuous-time per-forward data
 # =============================================================================
 ENABLE_KALMAN_FILTER = True
 
@@ -240,7 +244,7 @@ class KalmanFlowFilter:
 
         # Bound state after prediction to physical range
         self.state.flow_ratio = max(-1.0, min(1.0, self.state.flow_ratio))
-        self.state.flow_velocity = max(MIN_VELOCITY, min(MAX_VELOCITY, self.state.flow_velocity))
+        self.state.flow_velocity = max(KALMAN_MIN_VELOCITY, min(KALMAN_MAX_VELOCITY, self.state.flow_velocity))
 
         # Process noise adaptation based on volatility
         q_ratio = KALMAN_BASE_PROCESS_NOISE * volatility * KALMAN_VOLATILITY_SCALING
@@ -325,7 +329,7 @@ class KalmanFlowFilter:
 
         # Bound state to physical range
         self.state.flow_ratio = max(-1.0, min(1.0, self.state.flow_ratio))
-        self.state.flow_velocity = max(MIN_VELOCITY, min(MAX_VELOCITY, self.state.flow_velocity))
+        self.state.flow_velocity = max(KALMAN_MIN_VELOCITY, min(KALMAN_MAX_VELOCITY, self.state.flow_velocity))
 
         # Store innovation for regime change detection
         self.state.last_innovation = innovation

@@ -46,13 +46,13 @@ class TestFix3HourlyKalman:
         assert kf.state.variance_ratio > initial_p00
         assert expected_q00_contrib > 1e-5  # Not vanishingly small
 
-    def test_velocity_is_per_hour(self):
-        """Velocity bounds should be in per-hour units."""
-        from modules.flow_analysis import MAX_VELOCITY, MIN_VELOCITY
+    def test_kalman_velocity_bounds_are_per_hour(self):
+        """Kalman velocity bounds should be in per-hour units."""
+        from modules.flow_analysis import KALMAN_MAX_VELOCITY, KALMAN_MIN_VELOCITY
 
         # 0.5/day = ~0.0208/hour
-        assert MAX_VELOCITY == pytest.approx(0.5 / 24.0, rel=1e-6)
-        assert MIN_VELOCITY == pytest.approx(-0.5 / 24.0, rel=1e-6)
+        assert KALMAN_MAX_VELOCITY == pytest.approx(0.5 / 24.0, rel=1e-6)
+        assert KALMAN_MIN_VELOCITY == pytest.approx(-0.5 / 24.0, rel=1e-6)
 
     def test_old_state_migration_resets_filter(self):
         """Old per-day Kalman states should be reset, not loaded."""
@@ -109,17 +109,17 @@ class TestFix3HourlyKalman:
         assert kf.state.flow_velocity == pytest.approx(0.004)
 
     def test_velocity_bounds_clamp(self):
-        """Velocity should be clamped to hourly bounds after predict."""
-        from modules.flow_analysis import KalmanFlowFilter, MAX_VELOCITY, MIN_VELOCITY
+        """Velocity should be clamped to Kalman hourly bounds after predict."""
+        from modules.flow_analysis import KalmanFlowFilter, KALMAN_MAX_VELOCITY, KALMAN_MIN_VELOCITY
 
         kf = KalmanFlowFilter()
         # Set extreme velocity
-        kf.state.flow_velocity = 1.0  # Way above MAX_VELOCITY
+        kf.state.flow_velocity = 1.0  # Way above KALMAN_MAX_VELOCITY
 
         kf.predict(dt_hours=1.0, volatility=1.0)
 
-        assert kf.state.flow_velocity <= MAX_VELOCITY
-        assert kf.state.flow_velocity >= MIN_VELOCITY
+        assert kf.state.flow_velocity <= KALMAN_MAX_VELOCITY
+        assert kf.state.flow_velocity >= KALMAN_MIN_VELOCITY
 
 
 # =========================================================================

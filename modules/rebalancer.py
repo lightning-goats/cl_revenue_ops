@@ -3561,12 +3561,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # Bonus for sink/balanced channels (they have excess outbound we want to use)
             if flow_state == "sink":
                 score += 100
-            elif flow_state == "balanced":
-                # Apply Stagnant Inventory Bonus
-                if source_turnover_rate < 0.0015:
+            elif flow_state in ("balanced", "balanced_active"):
+                # Apply Stagnant Inventory Bonus (only for truly dormant channels)
+                if flow_state == "balanced" and source_turnover_rate < 0.0015:
                     score += 10 # Awakening Bonus
                     self.plugin.log(f"STAGNANT BONUS: Applying +10 priority to stagnant channel {cid[:12]}...", level='info')
-                
+
                 score += 20
             
             # HIVE PRIORITY: Prefer fleet channels for zero-fee internal routing

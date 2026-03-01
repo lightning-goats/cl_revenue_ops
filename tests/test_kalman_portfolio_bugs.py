@@ -158,13 +158,13 @@ class TestKalmanStateBounding:
 
     def test_predict_clamps_velocity(self):
         """After predict, velocity stays bounded."""
-        from modules.flow_analysis import KalmanFlowFilter, KalmanFlowState, MAX_VELOCITY
+        from modules.flow_analysis import KalmanFlowFilter, KalmanFlowState, KALMAN_MAX_VELOCITY
 
         state = KalmanFlowState(flow_velocity=2.0)  # Already extreme
         kf = KalmanFlowFilter(state)
 
         kf.predict(dt_hours=24.0)
-        assert kf.state.flow_velocity <= MAX_VELOCITY
+        assert kf.state.flow_velocity <= KALMAN_MAX_VELOCITY
 
     def test_update_clamps_flow_ratio(self):
         """After update with extreme observation, flow_ratio stays bounded."""

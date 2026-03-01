@@ -1777,7 +1777,7 @@ def run_flow_analysis():
         # Log summary
         sources = sum(1 for r in results.values() if r.state == ChannelState.SOURCE)
         sinks = sum(1 for r in results.values() if r.state == ChannelState.SINK)
-        balanced = sum(1 for r in results.values() if r.state == ChannelState.BALANCED)
+        balanced = sum(1 for r in results.values() if r.state.is_balanced)
         plugin.log(f"Channel states: {sources} sources, {sinks} sinks, {balanced} balanced")
         
         # Apply reputation decay (Phase 3: Time-windowing)
@@ -5709,7 +5709,7 @@ def _boltz_dynamic_channel_tuning(*,
     source_signal = max(source_signal, max(0.0, min(1.0, kalman_ratio)))
 
     # Positive velocity means source-ness increasing (more urgently draining) in this model.
-    drain_accel_score = max(0.0, min(1.0, kalman_velocity / 0.05))  # saturate at ~0.05/day
+    drain_accel_score = max(0.0, min(1.0, kalman_velocity / (0.05 / 24.0)))  # saturate at ~0.05/day (velocity is per-hour)
 
     # Low local balance also contributes to urgency before the static threshold is crossed.
     depletion_score = max(0.0, min(1.0, (60.0 - float(local_pct)) / 40.0))
