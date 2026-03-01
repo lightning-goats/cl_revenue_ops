@@ -1036,6 +1036,15 @@ class GaussianThompsonState:
     )
     noise_variance: float = 1000.0
 
+    # Fixed prior for polynomial regression (never modified by recompute)
+    _prior_coeffs: List[float] = field(default_factory=lambda: [0.0, 1.0, 0.0])
+    _prior_precision: List[List[float]] = field(
+        default_factory=lambda: [[0.01, 0.0, 0.0], [0.0, 0.01, 0.0], [0.0, 0.0, 0.01]]
+    )
+    # Fee range from last recompute (used by _sample_from_polynomial_posterior)
+    _last_fee_min: float = 0.0
+    _last_fee_max: float = 0.0
+
     # Context-specific posteriors: {context_key: (mean, std, count)}
     contextual_posteriors: Dict[str, Tuple[float, float, int]] = field(default_factory=dict)
 
@@ -1081,7 +1090,10 @@ class GaussianThompsonState:
     def _mat3_invert(m: List[List[float]]) -> Optional[List[List[float]]]:
         """3x3 matrix inverse via cofactors. Returns None if singular."""
         det = GaussianThompsonState._mat3_det(m)
-        if abs(det) < 1e-12:
+        # Relative threshold: scale by cube of max element magnitude
+        max_elem = max(abs(m[i][j]) for i in range(3) for j in range(3))
+        tol = 1e-10 * max(1.0, max_elem * max_elem * max_elem)
+        if abs(det) < tol:
             return None
         inv_det = 1.0 / det
         # Cofactor matrix transposed
@@ -1121,11 +1133,11 @@ class GaussianThompsonState:
                 s = sum(L[i][k] * L[j][k] for k in range(j))
                 if i == j:
                     val = m[i][i] - s
-                    if val <= 0:
+                    if val < 1e-12:
                         return None
                     L[i][j] = math.sqrt(val)
                 else:
-                    if L[j][j] < 1e-15:
+                    if L[j][j] < 1e-12:
                         return None
                     L[i][j] = (m[i][j] - s) / L[j][j]
         return L
@@ -1546,12 +1558,9 @@ class GaussianThompsonState:
 
         Returns sampled fee (float) or None to signal fallback to Gaussian.
         """
-        # Need fee range from observations for un-normalization
-        fees = [obs[0] for obs in self.observations if len(obs) >= 4]
-        if not fees:
-            return None
-        fee_min = float(min(fees))
-        fee_max = float(max(fees))
+        # Use fee range from last _recompute_posterior to match normalization
+        fee_min = self._last_fee_min
+        fee_max = self._last_fee_max
         fee_range = fee_max - fee_min
         if fee_range < 5.0:
             return None
@@ -1846,7 +1855,8 @@ class GaussianThompsonState:
             fee_min = min(fee_min, float(fee))
             fee_max = max(fee_max, float(fee))
 
-        if len(weighted_obs) < 2:
+        if len(weighted_obs) < 3:
+            # Need at least 3 points for a 3-parameter polynomial fit
             self._recompute_posterior_legacy(weighted_obs)
             return
 
@@ -1866,9 +1876,9 @@ class GaussianThompsonState:
         sigma2 = max(10.0, self.noise_variance)
         inv_sigma2 = 1.0 / sigma2
 
-        # Prior precision (Lambda_0) and prior mean contribution
-        L0 = [row[:] for row in self.posterior_precision]
-        mu0 = self.posterior_coeffs[:]
+        # Use the FIXED prior (not stored posterior) to avoid precision accumulation
+        L0 = [row[:] for row in self._prior_precision]
+        mu0 = self._prior_coeffs[:]
         L0_mu0 = self._mat3_vec_mul(L0, mu0)
 
         # Accumulate data contribution
@@ -1893,7 +1903,7 @@ class GaussianThompsonState:
         # Posterior mean coefficients
         mu_n = self._mat3_vec_mul(Sigma_n, rhs)
 
-        # Update noise variance from residuals (blended)
+        # Update noise variance from residuals (degrees-of-freedom corrected, blended)
         ss = 0.0
         sw = 0.0
         for fee_raw, rev, w in weighted_obs:
@@ -1901,12 +1911,15 @@ class GaussianThompsonState:
             pred = mu_n[0] * f * f + mu_n[1] * f + mu_n[2]
             ss += w * (rev - pred) ** 2
             sw += w
-        new_sigma2 = ss / max(sw, 1e-6)
+        # Subtract 3 parameters to prevent variance from collapsing to floor
+        new_sigma2 = ss / max(sw - 3.0, 1.0)
         self.noise_variance = max(10.0, 0.7 * new_sigma2 + 0.3 * self.noise_variance)
 
-        # Store polynomial posterior
+        # Store polynomial posterior and fee range for sampling
         self.posterior_coeffs = mu_n
         self.posterior_precision = Ln
+        self._last_fee_min = fee_min
+        self._last_fee_max = fee_max
 
         # Derive posterior_mean (optimal fee) and posterior_std from polynomial
         a, b, _c = mu_n
@@ -2139,8 +2152,10 @@ class GaussianThompsonState:
         self.posterior_coeffs[0] = (
             (1.0 - blend) * self.posterior_coeffs[0] + blend * target_a
         )
-        # Boost precision on 'a' coefficient (tighten prior belief)
-        self.posterior_precision[0][0] += confidence * 0.1
+        # Boost precision on 'a' coefficient (capped to prevent runaway growth)
+        self.posterior_precision[0][0] = min(
+            10.0, self.posterior_precision[0][0] + confidence * 0.1
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state to dict for database storage."""
@@ -2153,6 +2168,10 @@ class GaussianThompsonState:
             "posterior_coeffs": self.posterior_coeffs,
             "posterior_precision": self.posterior_precision,
             "noise_variance": self.noise_variance,
+            "_prior_coeffs": self._prior_coeffs,
+            "_prior_precision": self._prior_precision,
+            "_last_fee_min": self._last_fee_min,
+            "_last_fee_max": self._last_fee_max,
             "contextual_posteriors": self.contextual_posteriors,
             "fleet_optimal_estimate": self.fleet_optimal_estimate,
             "fleet_confidence": self.fleet_confidence,
@@ -2197,13 +2216,47 @@ class GaussianThompsonState:
         state.fleet_max_fee = d.get("fleet_max_fee")
         state.fleet_reporters = d.get("fleet_reporters", 0)
         state.fleet_elasticity = d.get("fleet_elasticity", -1.0)
-        state.posterior_coeffs = d.get("posterior_coeffs", [0.0, 1.0, 0.0])
+        # M1: Validate posterior_coeffs length and type
+        _default_coeffs = [0.0, 1.0, 0.0]
+        raw_coeffs = d.get("posterior_coeffs")
+        if isinstance(raw_coeffs, list) and len(raw_coeffs) == 3:
+            try:
+                state.posterior_coeffs = [float(c) for c in raw_coeffs]
+            except (TypeError, ValueError):
+                state.posterior_coeffs = _default_coeffs[:]
+        else:
+            state.posterior_coeffs = _default_coeffs[:]
+
+        # L5: Validate precision matrix shape and positive diagonals
+        _default_prec = [[0.01, 0.0, 0.0], [0.0, 0.01, 0.0], [0.0, 0.0, 0.01]]
         raw_prec = d.get("posterior_precision")
-        if raw_prec and len(raw_prec) == 3 and all(len(r) == 3 for r in raw_prec):
+        if (raw_prec and len(raw_prec) == 3 and all(len(r) == 3 for r in raw_prec)
+                and all(raw_prec[i][i] > 0 for i in range(3))):
             state.posterior_precision = [list(row) for row in raw_prec]
         else:
-            state.posterior_precision = [[0.01, 0.0, 0.0], [0.0, 0.01, 0.0], [0.0, 0.0, 0.01]]
-        state.noise_variance = d.get("noise_variance", 1000.0)
+            state.posterior_precision = [row[:] for row in _default_prec]
+
+        # L6: Validate noise_variance is positive
+        state.noise_variance = max(10.0, float(d.get("noise_variance", 1000.0)))
+
+        # Restore fixed prior (falls back to defaults for old serialized states)
+        raw_pc = d.get("_prior_coeffs")
+        if isinstance(raw_pc, list) and len(raw_pc) == 3:
+            try:
+                state._prior_coeffs = [float(c) for c in raw_pc]
+            except (TypeError, ValueError):
+                state._prior_coeffs = _default_coeffs[:]
+        else:
+            state._prior_coeffs = _default_coeffs[:]
+        raw_pp = d.get("_prior_precision")
+        if (raw_pp and len(raw_pp) == 3 and all(len(r) == 3 for r in raw_pp)
+                and all(raw_pp[i][i] > 0 for i in range(3))):
+            state._prior_precision = [list(row) for row in raw_pp]
+        else:
+            state._prior_precision = [row[:] for row in _default_prec]
+        state._last_fee_min = float(d.get("_last_fee_min", 0.0))
+        state._last_fee_max = float(d.get("_last_fee_max", 0.0))
+
         state.last_sampled_fee = d.get("last_sampled_fee", 0)
         state.last_sample_time = d.get("last_sample_time", 0)
         return state
@@ -3331,8 +3384,11 @@ class HillClimbingFeeController:
                     continue
                 for c in lyr.get("constraints", []) or []:
                     scid_dir = c.get("short_channel_id_dir")
-                    ts = int(c.get("timestamp") or 0)
-                    max_msat = int(c.get("maximum_msat") or 0)
+                    try:
+                        ts = int(c.get("timestamp") or 0)
+                        max_msat = parse_msat(c.get("maximum_msat", 0))
+                    except (TypeError, ValueError):
+                        continue  # Skip malformed entry, keep rest of cache
                     if not scid_dir or max_msat <= 0:
                         continue
                     if ts and (now - ts) > int(max_age):
@@ -5889,11 +5945,12 @@ class HillClimbingFeeController:
                     ku = ch_state.get("kalman_uncertainty")
                     if (kv is not None and ku is not None
                             and not math.isnan(kv) and not math.isnan(ku)):
+                        ku = max(0.0, ku)  # L7: guard against negative DB values
                         confidence = 1.0 / (1.0 + ku)
                         demand_factor = 1.0 + kv * confidence * 2.0
                         demand_factor = max(0.25, min(4.0, demand_factor))
-            except Exception:
-                pass  # DB errors → EMA fallback
+            except Exception as e:
+                self.plugin.log(f"Kalman demand fallback: {e}", level='debug')
             if demand_factor is None:
                 # EMA fallback
                 demand_factor = (forward_count / max(hours_elapsed, 0.1)) / max(ts_state.baseline_forward_rate, 0.01)
@@ -6085,15 +6142,20 @@ class HillClimbingFeeController:
             is_exploring = abs(thompson_fee - ts_state.thompson.posterior_mean) > ts_state.thompson.posterior_std * 0.5
 
             # Topology depletion: suppress AIMD failure when downstream is depleted
+            # Uses a separate flag to avoid conflating exploration with depletion
+            topology_suppressed = False
             if not is_exploring and success_score < 0.3:
                 capacity = channel_info.get("capacity", 1)
                 try:
                     if self._is_topology_depleted(channel_id, capacity, cfg):
-                        is_exploring = True  # Suppress via existing mechanism
+                        topology_suppressed = True
                 except Exception:
                     pass  # AskRene unavailable → normal AIMD
 
-            ts_state.aimd.record_outcome(success_score=success_score, is_exploring=is_exploring)
+            ts_state.aimd.record_outcome(
+                success_score=success_score,
+                is_exploring=is_exploring or topology_suppressed
+            )
 
             # =====================================================================
             # P2 PROFITABILITY-WEIGHTED THOMPSON SAMPLING

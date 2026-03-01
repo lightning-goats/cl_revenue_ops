@@ -1997,6 +1997,38 @@ class TestPolynomialPosterior:
         state._recompute_posterior()
         assert state.noise_variance != initial_noise
 
+    def test_precision_does_not_accumulate_on_repeated_recompute(self):
+        """H1: Calling _recompute_posterior N times must not make precision grow unbounded."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.noise_variance = 50.0
+        state.observations = _make_obs([
+            (100, 10), (150, 25), (200, 40), (250, 30), (300, 15),
+        ])
+        state._recompute_posterior()
+        prec_after_1 = state.posterior_precision[0][0]
+
+        # Recompute 50 more times — before the fix this would grow O(N)
+        for _ in range(50):
+            state._recompute_posterior()
+
+        prec_after_51 = state.posterior_precision[0][0]
+        # Key invariant: precision must NOT monotonically grow with recompute count.
+        # With the fix (using fixed prior), it should converge, not accumulate.
+        # Allow small drift from noise_variance blending, but not growth.
+        assert prec_after_51 < prec_after_1 * 2.0, \
+            f"Precision grew from {prec_after_1} to {prec_after_51} — accumulation bug"
+
+    def test_two_observations_uses_legacy(self):
+        """L2: Fewer than 3 observations should use legacy path."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.observations = _make_obs([(100, 10), (300, 30)])
+        state._recompute_posterior()
+        # Should still work (legacy path)
+        assert state.posterior_mean > 0
+        assert state.posterior_std >= state.MIN_STD
+
 
 class TestPolynomialSampling:
     """Test sample_fee with polynomial posterior."""
@@ -2048,6 +2080,10 @@ class TestPolynomialSerialization:
         state.posterior_coeffs = [-0.5, 2.0, 10.0]
         state.posterior_precision = [[1.0, 0.1, 0.0], [0.1, 2.0, 0.0], [0.0, 0.0, 0.5]]
         state.noise_variance = 42.0
+        state._prior_coeffs = [-0.1, 0.5, 0.0]
+        state._prior_precision = [[0.05, 0.0, 0.0], [0.0, 0.05, 0.0], [0.0, 0.0, 0.05]]
+        state._last_fee_min = 50.0
+        state._last_fee_max = 400.0
 
         d = state.to_dict()
         restored = GaussianThompsonState.from_dict(d)
@@ -2056,6 +2092,11 @@ class TestPolynomialSerialization:
         for i in range(3):
             assert restored.posterior_precision[i] == pytest.approx(state.posterior_precision[i])
         assert restored.noise_variance == pytest.approx(42.0)
+        assert restored._prior_coeffs == pytest.approx(state._prior_coeffs)
+        for i in range(3):
+            assert restored._prior_precision[i] == pytest.approx(state._prior_precision[i])
+        assert restored._last_fee_min == pytest.approx(50.0)
+        assert restored._last_fee_max == pytest.approx(400.0)
 
     def test_backward_compat_missing_fields(self):
         from modules.fee_controller import GaussianThompsonState
@@ -2072,12 +2113,35 @@ class TestPolynomialSerialization:
         state = GaussianThompsonState.from_dict(old)
         assert state.posterior_coeffs == [0.0, 1.0, 0.0]
         assert state.noise_variance == 1000.0
+        # Fixed prior defaults
+        assert state._prior_coeffs == [0.0, 1.0, 0.0]
+        assert state._prior_precision[0][0] == pytest.approx(0.01)
 
     def test_bad_precision_gets_default(self):
         from modules.fee_controller import GaussianThompsonState
         state = GaussianThompsonState.from_dict({"posterior_precision": [[1, 2], [3, 4]]})
         assert len(state.posterior_precision) == 3
         assert all(len(row) == 3 for row in state.posterior_precision)
+
+    def test_bad_coeffs_get_default(self):
+        """M1: Malformed coeffs should reset to default."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState.from_dict({"posterior_coeffs": [1.0, 2.0]})
+        assert state.posterior_coeffs == [0.0, 1.0, 0.0]
+
+    def test_negative_noise_variance_clamped(self):
+        """L6: Negative noise_variance should be clamped to floor."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState.from_dict({"noise_variance": -5.0})
+        assert state.noise_variance >= 10.0
+
+    def test_negative_precision_diagonal_gets_default(self):
+        """L5: Precision with negative diagonal should reset."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState.from_dict({
+            "posterior_precision": [[-1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        })
+        assert state.posterior_precision[0][0] == pytest.approx(0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -2115,6 +2179,14 @@ class TestElasticityPriorBias:
         original_prec = state.posterior_precision[0][0]
         state._apply_elasticity_to_prior(elasticity=-1.5, confidence=0.8)
         assert state.posterior_precision[0][0] > original_prec
+
+    def test_precision_capped_at_max(self):
+        """H2: Precision should not grow beyond cap after many calls."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        for _ in range(200):
+            state._apply_elasticity_to_prior(elasticity=-2.0, confidence=1.0)
+        assert state.posterior_precision[0][0] <= 10.0
 
 
 class TestElasticityBiasDirection:
@@ -2279,3 +2351,16 @@ class TestTopologyAwareAIMD:
         }
         cfg = MagicMock(askrene_layer='xpay', askrene_max_age_sec=900)
         assert ctrl._is_topology_depleted("100x1x0", 1_000_000, cfg) is False
+
+    def test_msat_string_format_parsed(self):
+        """H3: CLN string msat values like '50000000msat' should be parsed."""
+        ctrl = self._make_controller()
+        now = int(time.time())
+        ctrl.plugin.rpc.call.return_value = {
+            "layers": [{"layer": "xpay", "constraints": [
+                {"short_channel_id_dir": "100x1x0/0", "maximum_msat": "50000000msat", "timestamp": now},
+            ]}]
+        }
+        cfg = MagicMock(askrene_layer='xpay', askrene_max_age_sec=900)
+        ctrl._refresh_askrene_cache(cfg)
+        assert ctrl._askrene_cache.get("100x1x0/0") == 50_000_000
