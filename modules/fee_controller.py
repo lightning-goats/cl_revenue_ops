@@ -1028,6 +1028,14 @@ class GaussianThompsonState:
     posterior_mean: float = 200.0
     posterior_std: float = 100.0
 
+    # Polynomial posterior: R(F) = a*F^2 + b*F + c  (revenue as function of fee)
+    # Bayesian linear regression on phi(F) = [F^2, F, 1]
+    posterior_coeffs: List[float] = field(default_factory=lambda: [0.0, 1.0, 0.0])
+    posterior_precision: List[List[float]] = field(
+        default_factory=lambda: [[0.01, 0.0, 0.0], [0.0, 0.01, 0.0], [0.0, 0.0, 0.01]]
+    )
+    noise_variance: float = 1000.0
+
     # Context-specific posteriors: {context_key: (mean, std, count)}
     contextual_posteriors: Dict[str, Tuple[float, float, int]] = field(default_factory=dict)
 
@@ -1058,6 +1066,69 @@ class GaussianThompsonState:
     current_pheromone_level: float = 0.0
     current_corridor_role: str = "P"     # P=Primary, S=Secondary
     current_time_bucket: str = "normal"  # low/normal/peak
+
+    # -----------------------------------------------------------------
+    # 3x3 matrix helpers (inline to avoid external deps)
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _mat3_det(m: List[List[float]]) -> float:
+        """3x3 determinant via Sarrus' rule."""
+        return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+
+    @staticmethod
+    def _mat3_invert(m: List[List[float]]) -> Optional[List[List[float]]]:
+        """3x3 matrix inverse via cofactors. Returns None if singular."""
+        det = GaussianThompsonState._mat3_det(m)
+        if abs(det) < 1e-12:
+            return None
+        inv_det = 1.0 / det
+        # Cofactor matrix transposed
+        return [
+            [
+                (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+                (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+                (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+            ],
+            [
+                (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+                (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+                (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+            ],
+            [
+                (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+                (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+                (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+            ],
+        ]
+
+    @staticmethod
+    def _mat3_vec_mul(m: List[List[float]], v: List[float]) -> List[float]:
+        """3x3 matrix-vector multiply."""
+        return [
+            m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+            m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+            m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+        ]
+
+    @staticmethod
+    def _cholesky3(m: List[List[float]]) -> Optional[List[List[float]]]:
+        """Inline 3x3 Cholesky decomposition. Returns L such that L*L^T = m, or None."""
+        L = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+        for i in range(3):
+            for j in range(i + 1):
+                s = sum(L[i][k] * L[j][k] for k in range(j))
+                if i == j:
+                    val = m[i][i] - s
+                    if val <= 0:
+                        return None
+                    L[i][j] = math.sqrt(val)
+                else:
+                    if L[j][j] < 1e-15:
+                        return None
+                    L[i][j] = (m[i][j] - s) / L[j][j]
+        return L
 
     def initialize_from_hive(self, optimal_fee: int, confidence: float,
                             elasticity: float) -> None:
@@ -1399,7 +1470,14 @@ class GaussianThompsonState:
             explore_std = max(self.MIN_STD, self.prior_std_fee * 1.5 * explore_mod)
             sampled = random.gauss(self.prior_mean_fee, explore_std)
         else:
-            # Sample from posterior with stigmergic modulation
+            # Try polynomial posterior sampling; fall back to Gaussian
+            sampled = self._sample_from_polynomial_posterior(floor, ceiling, explore_mod)
+            if sampled is not None:
+                sampled_fee = int(max(floor, min(ceiling, sampled)))
+                self.last_sampled_fee = sampled_fee
+                self.last_sample_time = int(time.time())
+                return sampled_fee
+            # Fallback: sample from Gaussian posterior with stigmergic modulation
             modulated_std = max(self.MIN_STD, self.posterior_std * explore_mod)
             sampled = random.gauss(self.posterior_mean, modulated_std)
 
@@ -1456,6 +1534,63 @@ class GaussianThompsonState:
 
         # Fall back to global posterior (which also applies modulation)
         return self.sample_fee(floor, ceiling)
+
+    def _sample_from_polynomial_posterior(
+        self, floor: int, ceiling: int, explore_mod: float
+    ) -> Optional[float]:
+        """
+        Sample optimal fee from the polynomial posterior.
+
+        Draws beta ~ N(mu, Sigma) from the Bayesian posterior over [a, b, c],
+        then finds the optimal fee from the sampled quadratic.
+
+        Returns sampled fee (float) or None to signal fallback to Gaussian.
+        """
+        # Need fee range from observations for un-normalization
+        fees = [obs[0] for obs in self.observations if len(obs) >= 4]
+        if not fees:
+            return None
+        fee_min = float(min(fees))
+        fee_max = float(max(fees))
+        fee_range = fee_max - fee_min
+        if fee_range < 5.0:
+            return None
+
+        # Invert precision to covariance
+        Sigma = self._mat3_invert(self.posterior_precision)
+        if Sigma is None:
+            return None
+
+        # Scale covariance by explore_mod^2
+        em2 = explore_mod * explore_mod
+        Sigma_scaled = [[Sigma[i][j] * em2 for j in range(3)] for i in range(3)]
+
+        # Cholesky decompose for sampling
+        L = self._cholesky3(Sigma_scaled)
+        if L is None:
+            # Fallback: diagonal approximation
+            diag = [max(1e-6, Sigma_scaled[i][i]) for i in range(3)]
+            z = [random.gauss(0, 1) for _ in range(3)]
+            beta_sampled = [
+                self.posterior_coeffs[i] + z[i] * math.sqrt(diag[i])
+                for i in range(3)
+            ]
+        else:
+            z = [random.gauss(0, 1) for _ in range(3)]
+            Lz = self._mat3_vec_mul(L, z)
+            beta_sampled = [self.posterior_coeffs[i] + Lz[i] for i in range(3)]
+
+        a_s, b_s, _c_s = beta_sampled
+        if a_s < -1e-8:
+            # Concave: optimal at -b/(2a) in normalized space
+            f_star_norm = -b_s / (2.0 * a_s)
+            # Allow slight extrapolation
+            f_star_norm = max(-0.2, min(1.2, f_star_norm))
+            sampled = f_star_norm * fee_range + fee_min
+            return sampled
+        else:
+            # Non-concave sample: fall back to Gaussian
+            return None
 
     def update_posterior(
         self,
@@ -1680,49 +1815,171 @@ class GaussianThompsonState:
 
     def _recompute_posterior(self) -> None:
         """
-        Recompute posterior from all observations using weighted mean.
+        Recompute posterior using Bayesian polynomial regression.
 
-        Uses exponential decay weighting so recent observations matter more.
-        High-revenue observations are weighted more heavily.
+        Models R(F) = a*F^2 + b*F + c to learn the revenue-demand curve.
+        Falls back to legacy Normal-Normal when fee range is too narrow
+        (<5 ppm) or the precision matrix is singular.
         """
         if not self.observations:
             self.posterior_mean = float(self.prior_mean_fee)
             self.posterior_std = float(self.prior_std_fee)
             return
 
+        # Collect weighted observations with time decay
         now = int(time.time())
-        total_weight = 0.0
-        weighted_sum = 0.0
-        weighted_sq_sum = 0.0
+        weighted_obs: List[Tuple[float, float, float]] = []  # (fee, revenue, weight)
+        fee_min = float('inf')
+        fee_max = float('-inf')
 
         for obs in self.observations:
-            # Support both 4-tuple (legacy) and 5-tuple (with time_bucket) formats
             if len(obs) >= 4:
                 fee, revenue_rate, base_weight, timestamp = obs[:4]
-                # time_bucket = obs[4] if len(obs) > 4 else "normal" (not used here)
             else:
-                continue  # Skip malformed observations
-
-            # Apply time decay
+                continue
             age_hours = (now - timestamp) / 3600.0
             decay = math.pow(0.5, age_hours / self.DECAY_HOURS)
-
-            # base_weight already incorporates revenue quality from update_posterior()
-            # Only apply time decay here to avoid double-counting revenue
             weight = base_weight * decay
+            if weight < 1e-6:
+                continue
+            weighted_obs.append((float(fee), float(revenue_rate), weight))
+            fee_min = min(fee_min, float(fee))
+            fee_max = max(fee_max, float(fee))
 
-            total_weight += weight
-            weighted_sum += fee * weight
-            weighted_sq_sum += fee * fee * weight
+        if len(weighted_obs) < 2:
+            self._recompute_posterior_legacy(weighted_obs)
+            return
 
+        fee_range = fee_max - fee_min
+        if fee_range < 5.0:
+            # Too narrow to fit quadratic — use legacy Normal-Normal
+            self._recompute_posterior_legacy(weighted_obs)
+            return
+
+        # Normalize fees to [0, 1] for numerical stability
+        inv_range = 1.0 / fee_range
+
+        # Build Bayesian linear regression:
+        #   phi(f) = [f_norm^2, f_norm, 1]
+        #   Lambda_n = Lambda_0 + (1/sigma^2) * sum(w_i * phi_i * phi_i^T)
+        #   mu_n = Lambda_n^{-1} * (Lambda_0 * mu_0 + (1/sigma^2) * sum(w_i * phi_i * r_i))
+        sigma2 = max(10.0, self.noise_variance)
+        inv_sigma2 = 1.0 / sigma2
+
+        # Prior precision (Lambda_0) and prior mean contribution
+        L0 = [row[:] for row in self.posterior_precision]
+        mu0 = self.posterior_coeffs[:]
+        L0_mu0 = self._mat3_vec_mul(L0, mu0)
+
+        # Accumulate data contribution
+        Ln = [row[:] for row in L0]
+        rhs = L0_mu0[:]
+
+        for fee_raw, rev, w in weighted_obs:
+            f = (fee_raw - fee_min) * inv_range  # Normalize to [0,1]
+            phi = [f * f, f, 1.0]
+            wi = w * inv_sigma2
+            for i in range(3):
+                rhs[i] += wi * phi[i] * rev
+                for j in range(3):
+                    Ln[i][j] += wi * phi[i] * phi[j]
+
+        # Invert Lambda_n for posterior covariance
+        Sigma_n = self._mat3_invert(Ln)
+        if Sigma_n is None:
+            self._recompute_posterior_legacy(weighted_obs)
+            return
+
+        # Posterior mean coefficients
+        mu_n = self._mat3_vec_mul(Sigma_n, rhs)
+
+        # Update noise variance from residuals (blended)
+        ss = 0.0
+        sw = 0.0
+        for fee_raw, rev, w in weighted_obs:
+            f = (fee_raw - fee_min) * inv_range
+            pred = mu_n[0] * f * f + mu_n[1] * f + mu_n[2]
+            ss += w * (rev - pred) ** 2
+            sw += w
+        new_sigma2 = ss / max(sw, 1e-6)
+        self.noise_variance = max(10.0, 0.7 * new_sigma2 + 0.3 * self.noise_variance)
+
+        # Store polynomial posterior
+        self.posterior_coeffs = mu_n
+        self.posterior_precision = Ln
+
+        # Derive posterior_mean (optimal fee) and posterior_std from polynomial
+        a, b, _c = mu_n
+        if a < -1e-8:
+            # Concave: optimal at -b/(2a), un-normalize
+            f_star = -b / (2.0 * a)
+            f_star = max(0.0, min(1.0, f_star))
+            self.posterior_mean = f_star * fee_range + fee_min
+        else:
+            # Non-concave: use best observed fee
+            best_fee = fee_min
+            best_rev = float('-inf')
+            for fee_raw, rev, w in weighted_obs:
+                if rev > best_rev:
+                    best_rev = rev
+                    best_fee = fee_raw
+            self.posterior_mean = best_fee
+
+        # Propagated uncertainty via delta method: Var(F*) ≈ (∂F*/∂β)^T Σ (∂F*/∂β)
+        if a < -1e-8:
+            # Gradient of f_star = -b/(2a) w.r.t. [a, b, c]
+            da = b / (2.0 * a * a)       # ∂f*/∂a = b/(2a^2)
+            db = -1.0 / (2.0 * a)        # ∂f*/∂b = -1/(2a)
+            dc = 0.0                       # ∂f*/∂c = 0
+            grad = [da, db, dc]
+            var_fstar = 0.0
+            for i in range(3):
+                for j in range(3):
+                    var_fstar += grad[i] * Sigma_n[i][j] * grad[j]
+            # Un-normalize the variance
+            self.posterior_std = max(self.MIN_STD, math.sqrt(max(0.0, var_fstar)) * fee_range)
+        else:
+            # Non-concave fallback: use observation spread
+            fees = [o[0] for o in weighted_obs]
+            self.posterior_std = max(self.MIN_STD, (max(fees) - min(fees)) / 4.0)
+
+    def _recompute_posterior_legacy(
+        self, weighted_obs: Optional[List[Tuple[float, float, float]]] = None
+    ) -> None:
+        """
+        Legacy Normal-Normal conjugate posterior (fallback for narrow fee ranges).
+
+        Args:
+            weighted_obs: Pre-computed (fee, revenue, weight) tuples.
+                         If None, recomputes from self.observations.
+        """
+        if weighted_obs is None:
+            if not self.observations:
+                self.posterior_mean = float(self.prior_mean_fee)
+                self.posterior_std = float(self.prior_std_fee)
+                return
+            now = int(time.time())
+            weighted_obs = []
+            for obs in self.observations:
+                if len(obs) >= 4:
+                    fee, revenue_rate, base_weight, timestamp = obs[:4]
+                else:
+                    continue
+                age_hours = (now - timestamp) / 3600.0
+                decay = math.pow(0.5, age_hours / self.DECAY_HOURS)
+                weight = base_weight * decay
+                if weight < 1e-6:
+                    continue
+                weighted_obs.append((float(fee), float(revenue_rate), weight))
+
+        total_weight = sum(w for _, _, w in weighted_obs)
         if total_weight > 0.1:
-            # Normal-Normal conjugate update (proper Bayesian posterior)
+            weighted_sum = sum(f * w for f, _, w in weighted_obs)
+            weighted_sq_sum = sum(f * f * w for f, _, w in weighted_obs)
             obs_mean = weighted_sum / total_weight
             variance = (weighted_sq_sum / total_weight) - (obs_mean ** 2)
             variance = max(self.MIN_STD ** 2, variance)
 
-            # Posterior precision = prior precision + data precision
-            # M-14: Guard against zero/tiny prior_std_fee causing division overflow
             prior_precision = 1.0 / max(self.MIN_STD ** 2, self.prior_std_fee ** 2)
             data_precision = total_weight / variance
             posterior_precision = prior_precision + data_precision
@@ -1732,7 +1989,6 @@ class GaussianThompsonState:
             ) / posterior_precision
             self.posterior_std = max(self.MIN_STD, 1.0 / math.sqrt(posterior_precision))
         else:
-            # Not enough weighted observations, use prior
             self.posterior_mean = float(self.prior_mean_fee)
             self.posterior_std = float(self.prior_std_fee)
 
@@ -1862,6 +2118,30 @@ class GaussianThompsonState:
             self.observations = self.observations[-self.MAX_OBSERVATIONS:]
         self._recompute_posterior()
 
+    def _apply_elasticity_to_prior(self, elasticity: float, confidence: float) -> None:
+        """
+        Bias the polynomial prior's quadratic coefficient toward the
+        curvature implied by observed price elasticity.
+
+        Args:
+            elasticity: Current elasticity estimate (typically [-3, 0])
+            confidence: Confidence in the estimate (0-1)
+        """
+        if confidence <= 0.3:
+            return
+        # Map elasticity [-3.0, 0.0] → expected 'a' coefficient [-0.5, -0.01]
+        # More elastic → stronger negative curvature
+        clamped_e = max(-3.0, min(0.0, elasticity))
+        target_a = -0.01 + (clamped_e / -3.0) * (-0.5 - (-0.01))  # linear map
+
+        # Blend toward target with 30% * confidence weight
+        blend = 0.3 * confidence
+        self.posterior_coeffs[0] = (
+            (1.0 - blend) * self.posterior_coeffs[0] + blend * target_a
+        )
+        # Boost precision on 'a' coefficient (tighten prior belief)
+        self.posterior_precision[0][0] += confidence * 0.1
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state to dict for database storage."""
         return {
@@ -1870,6 +2150,9 @@ class GaussianThompsonState:
             "observations": self.observations,  # List of tuples
             "posterior_mean": self.posterior_mean,
             "posterior_std": self.posterior_std,
+            "posterior_coeffs": self.posterior_coeffs,
+            "posterior_precision": self.posterior_precision,
+            "noise_variance": self.noise_variance,
             "contextual_posteriors": self.contextual_posteriors,
             "fleet_optimal_estimate": self.fleet_optimal_estimate,
             "fleet_confidence": self.fleet_confidence,
@@ -1914,6 +2197,13 @@ class GaussianThompsonState:
         state.fleet_max_fee = d.get("fleet_max_fee")
         state.fleet_reporters = d.get("fleet_reporters", 0)
         state.fleet_elasticity = d.get("fleet_elasticity", -1.0)
+        state.posterior_coeffs = d.get("posterior_coeffs", [0.0, 1.0, 0.0])
+        raw_prec = d.get("posterior_precision")
+        if raw_prec and len(raw_prec) == 3 and all(len(r) == 3 for r in raw_prec):
+            state.posterior_precision = [list(row) for row in raw_prec]
+        else:
+            state.posterior_precision = [[0.01, 0.0, 0.0], [0.0, 0.01, 0.0], [0.0, 0.0, 0.01]]
+        state.noise_variance = d.get("noise_variance", 1000.0)
         state.last_sampled_fee = d.get("last_sampled_fee", 0)
         state.last_sample_time = d.get("last_sample_time", 0)
         return state
@@ -2993,6 +3283,11 @@ class HillClimbingFeeController:
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
 
+        # AskRene topology cache (for AIMD depletion checks)
+        self._askrene_cache: Dict[str, int] = {}
+        self._askrene_cache_ts: int = 0
+        self._askrene_lock = threading.Lock()
+
         # Fee anchors: advisor-set soft fee targets (loaded from DB)
         self._fee_anchors: Dict[str, FeeAnchor] = {}
         self._load_fee_anchors()
@@ -3019,6 +3314,52 @@ class HillClimbingFeeController:
                 self._fee_anchors[anchor.channel_id] = anchor
         except Exception as e:
             self.plugin.log(f"Failed to load fee anchors: {e}", level='warning')
+
+    def _refresh_askrene_cache(self, cfg) -> None:
+        """Refresh AskRene constraints cache (best-effort, 30s TTL)."""
+        now = int(time.time())
+        with self._askrene_lock:
+            if self._askrene_cache_ts and (now - self._askrene_cache_ts) < 30:
+                return
+        try:
+            layer = getattr(cfg, 'askrene_layer', 'xpay')
+            max_age = getattr(cfg, 'askrene_max_age_sec', 900)
+            res = self.plugin.rpc.call("askrene-listlayers", {"layer": layer})
+            cache: Dict[str, int] = {}
+            for lyr in res.get("layers", []):
+                if lyr.get("layer") != layer:
+                    continue
+                for c in lyr.get("constraints", []) or []:
+                    scid_dir = c.get("short_channel_id_dir")
+                    ts = int(c.get("timestamp") or 0)
+                    max_msat = int(c.get("maximum_msat") or 0)
+                    if not scid_dir or max_msat <= 0:
+                        continue
+                    if ts and (now - ts) > int(max_age):
+                        continue
+                    if scid_dir not in cache or max_msat < cache[scid_dir]:
+                        cache[scid_dir] = max_msat
+            with self._askrene_lock:
+                self._askrene_cache = cache
+                self._askrene_cache_ts = now
+        except Exception:
+            pass  # AskRene is optional; silent on failure
+
+    def _is_topology_depleted(self, channel_id: str, capacity_sats: int, cfg) -> bool:
+        """Check if downstream topology for a channel is depleted via AskRene.
+
+        Returns True if the tightest AskRene constraint is < 20% of capacity.
+        """
+        self._refresh_askrene_cache(cfg)
+        with self._askrene_lock:
+            cache_snapshot = dict(self._askrene_cache)
+        threshold_msat = capacity_sats * 1000 * 0.20  # 20% of capacity
+        for suffix in ("/0", "/1"):
+            key = f"{channel_id}{suffix}"
+            v = cache_snapshot.get(key)
+            if v is not None and v < threshold_msat:
+                return True
+        return False
 
     def _apply_fee_anchor(self, channel_id: str, proposed_fee: int,
                           floor_ppm: int, ceiling_ppm: int) -> Tuple[int, Optional[str]]:
@@ -5534,15 +5875,41 @@ class HillClimbingFeeController:
                     ts_state.stable_cycles = 0
 
             # =====================================================================
-            # DEMAND-ADJUSTED REWARD SIGNAL
+            # DEMAND-ADJUSTED REWARD SIGNAL (Kalman-primary, EMA-fallback)
             # =====================================================================
             # Normalize revenue by baseline demand so Thompson learns fee effects,
-            # not demand shocks. A demand surge inflates revenue even if the fee
-            # is unchanged; dividing by the demand factor removes this confound.
+            # not demand shocks. Prefer Kalman velocity from flow_analysis when
+            # available; fall back to EMA-based baseline forward rate.
             ts_state.update_baseline_forward_rate(forward_count, hours_elapsed)
-            demand_factor = (forward_count / max(hours_elapsed, 0.1)) / max(ts_state.baseline_forward_rate, 0.01)
-            demand_factor = max(0.25, min(4.0, demand_factor))
+            demand_factor = None
+            try:
+                ch_state = self.database.get_channel_state(channel_id)
+                if ch_state is not None:
+                    kv = ch_state.get("kalman_velocity")
+                    ku = ch_state.get("kalman_uncertainty")
+                    if (kv is not None and ku is not None
+                            and not math.isnan(kv) and not math.isnan(ku)):
+                        confidence = 1.0 / (1.0 + ku)
+                        demand_factor = 1.0 + kv * confidence * 2.0
+                        demand_factor = max(0.25, min(4.0, demand_factor))
+            except Exception:
+                pass  # DB errors → EMA fallback
+            if demand_factor is None:
+                # EMA fallback
+                demand_factor = (forward_count / max(hours_elapsed, 0.1)) / max(ts_state.baseline_forward_rate, 0.01)
+                demand_factor = max(0.25, min(4.0, demand_factor))
             adjusted_revenue_rate = current_revenue_rate / demand_factor
+
+            # =====================================================================
+            # ELASTICITY → POLYNOMIAL PRIOR BIAS
+            # =====================================================================
+            # Bias the quadratic coefficient toward the curvature implied by
+            # observed elasticity before the posterior update incorporates it.
+            if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
+                ts_state.thompson._apply_elasticity_to_prior(
+                    elasticity=elasticity_tracker.current_elasticity,
+                    confidence=elasticity_tracker.confidence
+                )
 
             # =====================================================================
             # THOMPSON SAMPLING: Update Posterior and Sample Fee
@@ -5697,6 +6064,13 @@ class HillClimbingFeeController:
                 ceiling=ceiling_ppm
             )
 
+            # Elasticity-informed sampled fee bias
+            if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
+                direction = elasticity_tracker.get_optimal_direction()
+                if direction != 0:
+                    bias = direction * elasticity_tracker.confidence * ts_state.thompson.posterior_std * 0.3
+                    thompson_fee = int(max(floor_ppm, min(ceiling_ppm, thompson_fee + bias)))
+
             # Apply fleet differentiation offset (computed above, doesn't mutate posterior)
             if differentiation_offset != 0:
                 thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
@@ -5709,6 +6083,16 @@ class HillClimbingFeeController:
             forward_rate = forward_count / max(hours_elapsed, 0.1)
             success_score = forward_rate / max(ts_state.baseline_forward_rate, 0.1)
             is_exploring = abs(thompson_fee - ts_state.thompson.posterior_mean) > ts_state.thompson.posterior_std * 0.5
+
+            # Topology depletion: suppress AIMD failure when downstream is depleted
+            if not is_exploring and success_score < 0.3:
+                capacity = channel_info.get("capacity", 1)
+                try:
+                    if self._is_topology_depleted(channel_id, capacity, cfg):
+                        is_exploring = True  # Suppress via existing mechanism
+                except Exception:
+                    pass  # AskRene unavailable → normal AIMD
+
             ts_state.aimd.record_outcome(success_score=success_score, is_exploring=is_exploring)
 
             # =====================================================================

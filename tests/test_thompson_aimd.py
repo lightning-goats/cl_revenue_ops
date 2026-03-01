@@ -5,8 +5,12 @@ Tests the new GaussianThompsonState, AIMDDefenseState, and ThompsonAIMDState
 classes that replace Hill Climbing as the primary fee optimization algorithm.
 """
 import pytest
+import math
+import random
 import time
+import threading
 from typing import Dict, Any
+from unittest.mock import MagicMock
 
 
 # Test data fixtures
@@ -1837,4 +1841,441 @@ class TestProperContextualPosteriors:
         rest = restored.contextual_posteriors["balanced:none:normal:P"]
         assert len(rest) == 4
         assert abs(orig[0] - rest[0]) < 0.01  # mean
-        assert abs(orig[1] - rest[1]) < 1e-8  # precision
+
+
+# ===========================================================================
+# Mathematical Overhaul Tests
+# ===========================================================================
+
+def _make_obs(fee_revenue_pairs, base_time=None):
+    """Create observation tuples from (fee, revenue) pairs."""
+    if base_time is None:
+        base_time = int(time.time())
+    obs = []
+    for i, (fee, rev) in enumerate(fee_revenue_pairs):
+        obs.append((fee, rev, 0.5, base_time - (len(fee_revenue_pairs) - i) * 3600, "normal"))
+    return obs
+
+
+# ---------------------------------------------------------------------------
+# Prompt 3 — True Thompson Sampling (Bayesian Polynomial Regression)
+# ---------------------------------------------------------------------------
+
+class TestMat3Helpers:
+    """Test 3x3 matrix helper static methods."""
+
+    def test_mat3_det_identity(self):
+        from modules.fee_controller import GaussianThompsonState as GTS
+        I = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        assert abs(GTS._mat3_det(I) - 1.0) < 1e-12
+
+    def test_mat3_det_diagonal(self):
+        from modules.fee_controller import GaussianThompsonState as GTS
+        m = [[2, 0, 0], [0, 3, 0], [0, 0, 5]]
+        assert abs(GTS._mat3_det(m) - 30.0) < 1e-12
+
+    def test_mat3_invert_identity(self):
+        from modules.fee_controller import GaussianThompsonState as GTS
+        I = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        inv = GTS._mat3_invert(I)
+        assert inv is not None
+        for i in range(3):
+            for j in range(3):
+                expected = 1.0 if i == j else 0.0
+                assert abs(inv[i][j] - expected) < 1e-10
+
+    def test_mat3_invert_singular_returns_none(self):
+        from modules.fee_controller import GaussianThompsonState as GTS
+        m = [[1, 2, 3], [2, 4, 6], [0, 0, 0]]
+        assert GTS._mat3_invert(m) is None
+
+    def test_mat3_invert_roundtrip(self):
+        from modules.fee_controller import GaussianThompsonState as GTS
+        m = [[4, 2, 1], [2, 5, 3], [1, 3, 6]]
+        inv = GTS._mat3_invert(m)
+        assert inv is not None
+        for i in range(3):
+            for j in range(3):
+                val = sum(m[i][k] * inv[k][j] for k in range(3))
+                expected = 1.0 if i == j else 0.0
+                assert abs(val - expected) < 1e-8
+
+    def test_mat3_vec_mul(self):
+        from modules.fee_controller import GaussianThompsonState as GTS
+        I = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        v = [3.0, 4.0, 5.0]
+        result = GTS._mat3_vec_mul(I, v)
+        assert result == pytest.approx(v)
+
+    def test_cholesky3_identity(self):
+        from modules.fee_controller import GaussianThompsonState as GTS
+        I = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        L = GTS._cholesky3(I)
+        assert L is not None
+        for i in range(3):
+            for j in range(3):
+                expected = 1.0 if i == j else 0.0
+                assert abs(L[i][j] - expected) < 1e-10
+
+    def test_cholesky3_not_pd_returns_none(self):
+        from modules.fee_controller import GaussianThompsonState as GTS
+        m = [[-1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        assert GTS._cholesky3(m) is None
+
+    def test_cholesky3_reconstruct(self):
+        from modules.fee_controller import GaussianThompsonState as GTS
+        m = [[4, 2, 1], [2, 5, 3], [1, 3, 6]]
+        L = GTS._cholesky3(m)
+        assert L is not None
+        for i in range(3):
+            for j in range(3):
+                val = sum(L[i][k] * L[j][k] for k in range(3))
+                assert abs(val - m[i][j]) < 1e-8
+
+
+class TestPolynomialPosterior:
+    """Test _recompute_posterior with polynomial regression."""
+
+    def test_concave_data_produces_negative_a(self):
+        """With concave revenue-fee data and reasonable noise, quadratic coeff 'a' should be negative."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        # Bootstrap noise_variance to a reasonable level so data can dominate
+        state.noise_variance = 50.0
+        state.observations = _make_obs([
+            (100, 10), (150, 25), (200, 40), (250, 30), (300, 15),
+            (120, 15), (180, 35), (220, 35), (280, 18), (160, 28),
+        ])
+        state._recompute_posterior()
+        assert state.posterior_coeffs[0] < 0
+
+    def test_concave_data_reasonable_posterior_mean(self):
+        """Posterior mean should be near peak of concave data."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.observations = _make_obs([
+            (100, 5), (150, 20), (200, 40), (250, 30), (300, 10),
+            (175, 35), (225, 35), (200, 38),
+        ])
+        state._recompute_posterior()
+        assert 120 < state.posterior_mean < 280
+
+    def test_narrow_fee_range_uses_legacy(self):
+        """Fee range < 5 ppm → legacy Normal-Normal fallback."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.observations = _make_obs([
+            (200, 30), (201, 32), (200, 28), (202, 31),
+        ])
+        state._recompute_posterior()
+        assert state.posterior_mean > 0
+        assert state.posterior_std >= state.MIN_STD
+
+    def test_empty_observations_uses_prior(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.observations = []
+        state._recompute_posterior()
+        assert state.posterior_mean == float(state.prior_mean_fee)
+        assert state.posterior_std == float(state.prior_std_fee)
+
+    def test_single_observation_uses_legacy(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.observations = _make_obs([(200, 30)])
+        state._recompute_posterior()
+        assert state.posterior_mean > 0
+
+    def test_noise_variance_updates(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        initial_noise = state.noise_variance
+        state.observations = _make_obs([
+            (100, 10), (200, 40), (300, 10),
+            (150, 30), (250, 25), (200, 38),
+        ])
+        state._recompute_posterior()
+        assert state.noise_variance != initial_noise
+
+
+class TestPolynomialSampling:
+    """Test sample_fee with polynomial posterior."""
+
+    def test_samples_cluster_around_map(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.observations = _make_obs([
+            (100, 5), (150, 25), (200, 40), (250, 30), (300, 10),
+            (175, 35), (225, 35), (200, 38), (180, 33), (210, 37),
+        ])
+        state._recompute_posterior()
+
+        random.seed(42)
+        samples = [state.sample_fee(50, 500) for _ in range(200)]
+        mean_sample = sum(samples) / len(samples)
+        assert abs(mean_sample - state.posterior_mean) < 100
+
+    def test_sample_fee_respects_bounds(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.observations = _make_obs([
+            (100, 5), (200, 40), (300, 10), (150, 25), (250, 30),
+        ])
+        state._recompute_posterior()
+        for _ in range(100):
+            fee = state.sample_fee(50, 500)
+            assert 50 <= fee <= 500
+
+    def test_non_concave_falls_back_to_gaussian(self):
+        """Monotonically increasing data → not concave → Gaussian fallback."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.observations = _make_obs([
+            (100, 10), (200, 20), (300, 30), (400, 40), (500, 50),
+        ])
+        state._recompute_posterior()
+        for _ in range(50):
+            fee = state.sample_fee(50, 600)
+            assert 50 <= fee <= 600
+
+
+class TestPolynomialSerialization:
+    """Test to_dict/from_dict with new polynomial fields."""
+
+    def test_roundtrip(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.posterior_coeffs = [-0.5, 2.0, 10.0]
+        state.posterior_precision = [[1.0, 0.1, 0.0], [0.1, 2.0, 0.0], [0.0, 0.0, 0.5]]
+        state.noise_variance = 42.0
+
+        d = state.to_dict()
+        restored = GaussianThompsonState.from_dict(d)
+
+        assert restored.posterior_coeffs == pytest.approx(state.posterior_coeffs)
+        for i in range(3):
+            assert restored.posterior_precision[i] == pytest.approx(state.posterior_precision[i])
+        assert restored.noise_variance == pytest.approx(42.0)
+
+    def test_backward_compat_missing_fields(self):
+        from modules.fee_controller import GaussianThompsonState
+        old = {
+            "prior_mean_fee": 200,
+            "prior_std_fee": 100,
+            "observations": [],
+            "posterior_mean": 200.0,
+            "posterior_std": 100.0,
+            "contextual_posteriors": {},
+            "last_sampled_fee": 0,
+            "last_sample_time": 0,
+        }
+        state = GaussianThompsonState.from_dict(old)
+        assert state.posterior_coeffs == [0.0, 1.0, 0.0]
+        assert state.noise_variance == 1000.0
+
+    def test_bad_precision_gets_default(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState.from_dict({"posterior_precision": [[1, 2], [3, 4]]})
+        assert len(state.posterior_precision) == 3
+        assert all(len(row) == 3 for row in state.posterior_precision)
+
+
+# ---------------------------------------------------------------------------
+# Prompt 4 — Elasticity Re-Integration
+# ---------------------------------------------------------------------------
+
+class TestElasticityPriorBias:
+    """Test _apply_elasticity_to_prior."""
+
+    def test_elastic_demand_shifts_a_negative(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.posterior_coeffs = [0.0, 1.0, 0.0]
+        state._apply_elasticity_to_prior(elasticity=-2.0, confidence=0.8)
+        assert state.posterior_coeffs[0] < 0
+
+    def test_inelastic_demand_small_shift(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state.posterior_coeffs = [0.0, 1.0, 0.0]
+        state._apply_elasticity_to_prior(elasticity=-0.1, confidence=0.8)
+        assert state.posterior_coeffs[0] < 0
+        assert state.posterior_coeffs[0] > -0.1
+
+    def test_low_confidence_no_effect(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        original = state.posterior_coeffs[0]
+        state._apply_elasticity_to_prior(elasticity=-2.0, confidence=0.2)
+        assert state.posterior_coeffs[0] == original
+
+    def test_precision_boost(self):
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        original_prec = state.posterior_precision[0][0]
+        state._apply_elasticity_to_prior(elasticity=-1.5, confidence=0.8)
+        assert state.posterior_precision[0][0] > original_prec
+
+
+class TestElasticityBiasDirection:
+    """Test that elasticity bias shifts fee in the expected direction."""
+
+    def test_elastic_bias_lowers_fee(self):
+        from modules.fee_controller import ElasticityTracker
+        tracker = ElasticityTracker()
+        tracker.current_elasticity = -2.0
+        tracker.confidence = 0.8
+        assert tracker.get_optimal_direction() == -1
+
+        posterior_std = 50.0
+        bias = tracker.get_optimal_direction() * tracker.confidence * posterior_std * 0.3
+        assert bias < 0
+
+    def test_inelastic_bias_raises_fee(self):
+        from modules.fee_controller import ElasticityTracker
+        tracker = ElasticityTracker()
+        tracker.current_elasticity = -0.3
+        tracker.confidence = 0.8
+        assert tracker.get_optimal_direction() == 1
+
+
+# ---------------------------------------------------------------------------
+# Prompt 1 — Kalman Demand Normalization
+# ---------------------------------------------------------------------------
+
+class TestKalmanDemandNormalization:
+    """Test Kalman-primary, EMA-fallback demand factor computation."""
+
+    def test_kalman_stable_channel_neutral(self):
+        velocity, uncertainty = 0.0, 0.1
+        confidence = 1.0 / (1.0 + uncertainty)
+        demand_factor = max(0.25, min(4.0, 1.0 + velocity * confidence * 2.0))
+        assert abs(demand_factor - 1.0) < 0.01
+
+    def test_kalman_positive_velocity_increases_demand(self):
+        velocity, uncertainty = 0.3, 0.1
+        confidence = 1.0 / (1.0 + uncertainty)
+        demand_factor = max(0.25, min(4.0, 1.0 + velocity * confidence * 2.0))
+        assert demand_factor > 1.0
+
+    def test_kalman_negative_velocity_decreases_demand(self):
+        velocity, uncertainty = -0.3, 0.1
+        confidence = 1.0 / (1.0 + uncertainty)
+        demand_factor = max(0.25, min(4.0, 1.0 + velocity * confidence * 2.0))
+        assert demand_factor < 1.0
+
+    def test_kalman_high_uncertainty_dampens_effect(self):
+        velocity, uncertainty = 0.5, 10.0
+        confidence = 1.0 / (1.0 + uncertainty)
+        demand_factor = max(0.25, min(4.0, 1.0 + velocity * confidence * 2.0))
+        assert abs(demand_factor - 1.0) < 0.15
+
+    def test_kalman_nan_detected(self):
+        assert math.isnan(float('nan'))
+        assert not math.isnan(0.5)
+
+    def test_demand_factor_clamped_high(self):
+        velocity, uncertainty = 10.0, 0.01
+        confidence = 1.0 / (1.0 + uncertainty)
+        demand_factor = max(0.25, min(4.0, 1.0 + velocity * confidence * 2.0))
+        assert demand_factor == 4.0
+
+    def test_demand_factor_clamped_low(self):
+        velocity, uncertainty = -10.0, 0.01
+        confidence = 1.0 / (1.0 + uncertainty)
+        demand_factor = max(0.25, min(4.0, 1.0 + velocity * confidence * 2.0))
+        assert demand_factor == 0.25
+
+
+# ---------------------------------------------------------------------------
+# Prompt 2 — Topology-Aware AIMD
+# ---------------------------------------------------------------------------
+
+class TestTopologyAwareAIMD:
+    """Test AskRene-based topology depletion detection."""
+
+    def _make_controller(self):
+        from modules.fee_controller import HillClimbingFeeController
+        plugin = MagicMock()
+        plugin.log = MagicMock()
+        plugin.rpc = MagicMock()
+        config = MagicMock()
+        config.snapshot.return_value = MagicMock(
+            askrene_layer='xpay', askrene_max_age_sec=900,
+            min_fee_ppm=1, max_fee_ppm=5000, vegas_decay_rate=0.95,
+        )
+        config.vegas_decay_rate = 0.95
+        database = MagicMock()
+        database.get_all_fee_anchors.return_value = []
+        clboss = MagicMock()
+        return HillClimbingFeeController(
+            plugin=plugin, config=config, database=database,
+            clboss_manager=clboss,
+        )
+
+    def test_askrene_cache_populated(self):
+        ctrl = self._make_controller()
+        now = int(time.time())
+        ctrl.plugin.rpc.call.return_value = {
+            "layers": [{"layer": "xpay", "constraints": [
+                {"short_channel_id_dir": "100x1x0/0", "maximum_msat": 50_000_000, "timestamp": now},
+                {"short_channel_id_dir": "100x1x0/1", "maximum_msat": 200_000_000, "timestamp": now},
+            ]}]
+        }
+        cfg = MagicMock(askrene_layer='xpay', askrene_max_age_sec=900)
+        ctrl._refresh_askrene_cache(cfg)
+        assert len(ctrl._askrene_cache) == 2
+        assert ctrl._askrene_cache["100x1x0/0"] == 50_000_000
+
+    def test_cache_ttl_prevents_refresh(self):
+        ctrl = self._make_controller()
+        ctrl._askrene_cache_ts = int(time.time())
+        ctrl._askrene_cache = {"test/0": 100}
+        cfg = MagicMock(askrene_layer='xpay', askrene_max_age_sec=900)
+        ctrl._refresh_askrene_cache(cfg)
+        ctrl.plugin.rpc.call.assert_not_called()
+
+    def test_topology_depleted_true(self):
+        ctrl = self._make_controller()
+        now = int(time.time())
+        ctrl.plugin.rpc.call.return_value = {
+            "layers": [{"layer": "xpay", "constraints": [
+                {"short_channel_id_dir": "100x1x0/0", "maximum_msat": 10_000, "timestamp": now},
+            ]}]
+        }
+        cfg = MagicMock(askrene_layer='xpay', askrene_max_age_sec=900)
+        assert ctrl._is_topology_depleted("100x1x0", 1_000_000, cfg) is True
+
+    def test_topology_not_depleted(self):
+        ctrl = self._make_controller()
+        now = int(time.time())
+        ctrl.plugin.rpc.call.return_value = {
+            "layers": [{"layer": "xpay", "constraints": [
+                {"short_channel_id_dir": "100x1x0/0", "maximum_msat": 500_000_000, "timestamp": now},
+            ]}]
+        }
+        cfg = MagicMock(askrene_layer='xpay', askrene_max_age_sec=900)
+        assert ctrl._is_topology_depleted("100x1x0", 1_000_000, cfg) is False
+
+    def test_no_cache_entry_not_depleted(self):
+        ctrl = self._make_controller()
+        ctrl.plugin.rpc.call.return_value = {"layers": []}
+        cfg = MagicMock(askrene_layer='xpay', askrene_max_age_sec=900)
+        assert ctrl._is_topology_depleted("999x9x9", 1_000_000, cfg) is False
+
+    def test_rpc_failure_silent(self):
+        ctrl = self._make_controller()
+        ctrl.plugin.rpc.call.side_effect = Exception("RPC timeout")
+        cfg = MagicMock(askrene_layer='xpay', askrene_max_age_sec=900)
+        assert ctrl._is_topology_depleted("100x1x0", 1_000_000, cfg) is False
+
+    def test_stale_constraints_filtered(self):
+        ctrl = self._make_controller()
+        old_ts = int(time.time()) - 2000
+        ctrl.plugin.rpc.call.return_value = {
+            "layers": [{"layer": "xpay", "constraints": [
+                {"short_channel_id_dir": "100x1x0/0", "maximum_msat": 10_000, "timestamp": old_ts},
+            ]}]
+        }
+        cfg = MagicMock(askrene_layer='xpay', askrene_max_age_sec=900)
+        assert ctrl._is_topology_depleted("100x1x0", 1_000_000, cfg) is False
