@@ -105,6 +105,11 @@ class RebalanceCandidate:
     dest_turnover_rate: float
     source_turnover_rate: float  # Turnover rate of the primary source
 
+    # EV v2.0: The cost assumption used to compute expected_profit_sats.
+    # Needed by _handle_job_success to reconcile expected vs actual profit correctly.
+    # Defaults to 0, meaning reconciliation falls back to max_budget_sats (old behavior).
+    expected_fee_sats: int = 0
+
     # Dynamic hot-channel protection metadata (optional)
     hot_channel_protection: bool = False
     hot_channel_protection_score: float = 0.0
@@ -998,12 +1003,12 @@ class JobManager:
             fee_sats = (amount_transferred * job.max_fee_ppm) // 2_000_000
         
         # Calculate actual profit
-        # The expected_profit was calculated with max_budget_sats as the assumed cost.
-        # Actual profit = expected_profit + (budgeted_cost - actual_cost)
-        # If we paid less than budgeted, profit increases; if more, it decreases.
+        # expected_profit was computed as: income - expected_fee - source_loss
+        # Actual profit replaces expected_fee with the real fee paid.
+        # When expected_fee_sats is 0 (legacy candidates), fall back to max_budget_sats.
         expected_profit = job.candidate.expected_profit_sats
-        budgeted_fee = job.candidate.max_budget_sats
-        actual_profit = expected_profit + (budgeted_fee - fee_sats)
+        assumed_fee = job.candidate.expected_fee_sats or job.candidate.max_budget_sats
+        actual_profit = expected_profit + (assumed_fee - fee_sats)
         
         self.plugin.log(
             f"Rebalance SUCCESS: {job.scid} filled with {amount_transferred} sats. "
@@ -2868,6 +2873,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             dest_flow_state=dest_flow_state,
             dest_turnover_rate=dest_turnover_rate,
             source_turnover_rate=source_turnover_rate,
+            expected_fee_sats=expected_fee_sats,
             reason_code=RebalanceReasonCode.EV_POSITIVE.value,
             bleeder_status=dest_bleeder_status,
             source_candidate_peer_ids=[info.get("peer_id", "") for _, info, _, _ in source_candidates],
