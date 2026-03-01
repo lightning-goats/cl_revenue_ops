@@ -2551,10 +2551,10 @@ class HiveFeeIntelligenceBridge:
             "hive-report-rebalance-outcome", payload, policy_key="telemetry"
         )
         if not ok:
-            # Don't block on this telemetry path.
+            # Don't block on this telemetry path, but don't lie about success.
             if err not in ("async_queue_full",) and err and "unknown" not in err.lower():
                 self._log(f"Failed to report rebalance outcome: {err}", level="debug")
-            return True
+            return False
         if result and result.get("error"):
             if "unknown" in str(result.get("error")).lower():
                 return True
@@ -2586,7 +2586,7 @@ class HiveFeeIntelligenceBridge:
         if not ok:
             if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
                 self._log(f"Failed to report cost trends: {err}", level="debug")
-            return True  # Non-fatal telemetry path
+            return False  # Non-fatal but don't misreport success
         if result and result.get("error"):
             if "unknown" in str(result.get("error")).lower():
                 return True
@@ -2709,7 +2709,7 @@ class HiveFeeIntelligenceBridge:
         if not ok:
             if err and "unknown" not in err.lower() and err not in ("async_queue_full",):
                 self._log(f"Failed to report flow intensity: {err}", level="debug")
-            return True  # Don't block on this
+            return False  # Don't block but don't misreport success
         if result and result.get("error"):
             if "unknown" in str(result.get("error")).lower():
                 return True

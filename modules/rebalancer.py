@@ -2216,7 +2216,8 @@ class EVRebalancer:
 
                     # Build push candidate: drain src_id, liquidity flows to depleted channels
                     dest_scids = [d[0] for d in depleted_channels[:5]]
-                    push_ev = self._estimate_push_ev(src_id, src_info, src_ratio, dest_scids)
+                    dest_peer_ids = [d[1].get("peer_id", "") for d in depleted_channels[:5]]
+                    push_ev = self._estimate_push_ev(src_id, src_info, src_ratio, dest_scids, dest_peer_ids)
                     if push_ev and push_ev.expected_profit_sats >= 0:
                         push_candidates.append(push_ev)
 
@@ -2232,6 +2233,18 @@ class EVRebalancer:
                 return (priority, c.expected_profit_sats)
 
             candidates.sort(key=sort_key, reverse=True)
+
+            # When budget is exceeded but hot-channel protection is enabled,
+            # only allow hot-channel-protected candidates through.
+            if getattr(self, '_budget_hot_channel_only', False):
+                hot_only = [c for c in candidates if c.hot_channel_protection]
+                if hot_only:
+                    self.plugin.log(
+                        f"BUDGET_HOT_ONLY: Filtered {len(candidates)} candidates down to "
+                        f"{len(hot_only)} hot-channel-protected candidates",
+                        level='info'
+                    )
+                candidates = hot_only
 
             # Limit to available slots
             return candidates[:available_slots]
@@ -3097,7 +3110,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         }
 
     def _estimate_push_ev(self, src_channel: str, src_info: Dict,
-                          src_ratio: float, dest_scids: List[str]) -> Optional[RebalanceCandidate]:
+                          src_ratio: float, dest_scids: List[str],
+                          dest_peer_ids: Optional[List[str]] = None) -> Optional[RebalanceCandidate]:
         """Estimate EV for a push rebalance (draining an overfull channel)."""
         cfg = self.config.snapshot()
         capacity = src_info.get("capacity", 0)
@@ -3128,10 +3142,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         if max_budget <= 0:
             return None
 
+        # Resolve peer IDs for the destination (source_candidates in push semantics)
+        resolved_peer_ids = dest_peer_ids or []
+
         return RebalanceCandidate(
             source_candidates=dest_scids,
             to_channel=src_channel,
-            primary_source_peer_id="",
+            primary_source_peer_id=resolved_peer_ids[0] if resolved_peer_ids else "",
             to_peer_id=src_peer_id,
             amount_sats=amount,
             amount_msat=amount * 1000,
@@ -3148,7 +3165,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             dest_flow_state="push_drain",
             dest_turnover_rate=0.0,
             source_turnover_rate=0.0,
-            direction="push"
+            direction="push",
+            source_candidate_peer_ids=resolved_peer_ids,
         )
 
     def _estimate_inbound_fee(self, peer_id: str, amount_msat: int = 100000000) -> int:
@@ -4238,7 +4256,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         if max_fee_sats is None:
             # Calculate a budget for a manual push based on estimated spread
             max_fee_sats = int(amount_sats * (fee_ppm - est_in - src_ppm) / 1e6)
-            if max_fee_sats < 0: 
+            if max_fee_sats <= 0:
                 max_fee_sats = 100
         
         max_fee_ppm = int(max_fee_sats * 1e6 / amount_sats) if amount_sats > 0 else 0
@@ -4320,6 +4338,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         RPC issue should not block all rebalancing.  Budget check (DB-only)
         always runs and fails closed.
         """
+        self._budget_hot_channel_only = False
         if cfg is None:
             cfg = self.config.snapshot()
         try:
@@ -4396,9 +4415,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         f"CAPITAL CONTROL: Unified liquidity budget exceeded "
                         f"(rebalance_fees={fees_spent_24h} + external_spent={ext_spent} + "
                         f"external_reserved={ext_reserved} = {total_liquidity_committed} >= {effective_budget}) "
-                        f"but hot-channel protection is enabled; continuing candidate scan for protected channels",
+                        f"but hot-channel protection is enabled; continuing candidate scan for protected channels only",
                         level='warn'
                     )
+                    # Signal that only hot-channel-protected candidates should proceed
+                    self._budget_hot_channel_only = True
                     return True
                 self.plugin.log(
                     f"CAPITAL CONTROL: Unified liquidity budget exceeded "

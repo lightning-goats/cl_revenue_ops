@@ -1239,7 +1239,27 @@ class Database:
         return None
 
     def save_kalman_state(self, channel_id: str, state: Dict[str, Any]) -> None:
-        """Save Kalman filter state for a channel."""
+        """Save Kalman filter state for a channel.
+
+        Rejects NaN/Inf values to prevent poisoning the persisted state.
+        """
+        float_fields = [
+            ("flow_ratio", 0.0), ("flow_velocity", 0.0),
+            ("variance_ratio", 0.1), ("variance_velocity", 0.1),
+            ("covariance", 0.0), ("innovation_variance", 0.01),
+            ("last_innovation", 0.0),
+        ]
+        values = []
+        for key, default in float_fields:
+            v = state.get(key, default)
+            if isinstance(v, float) and not math.isfinite(v):
+                self.plugin.log(
+                    f"Kalman NaN/Inf in {key} for {channel_id}, skipping persist",
+                    level='warn'
+                )
+                return
+            values.append(v)
+
         conn = self._get_connection()
         conn.execute("""
             INSERT OR REPLACE INTO kalman_state
@@ -1248,14 +1268,14 @@ class Database:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             channel_id,
-            state.get("flow_ratio", 0.0),
-            state.get("flow_velocity", 0.0),
-            state.get("variance_ratio", 0.1),
-            state.get("variance_velocity", 0.1),
-            state.get("covariance", 0.0),
+            values[0],  # flow_ratio
+            values[1],  # flow_velocity
+            values[2],  # variance_ratio
+            values[3],  # variance_velocity
+            values[4],  # covariance
             state.get("last_update", 0),
-            state.get("innovation_variance", 0.01),
-            state.get("last_innovation", 0.0),
+            values[5],  # innovation_variance
+            values[6],  # last_innovation
             "per_hour",
         ))
 
@@ -5149,26 +5169,37 @@ class Database:
         """
         Set a config override with transactional safety.
 
+        Uses BEGIN IMMEDIATE to prevent TOCTOU race on version number.
+        Without it, two concurrent calls could read the same MAX(version),
+        both write version N+1 for different keys, causing the config poller
+        to miss one change.
+
         Returns:
             New version number after update
         """
         conn = self._get_connection()
         now = int(time.time())
 
-        # M-13 v2 FIX: Compute version BEFORE INSERT OR REPLACE.
-        # INSERT OR REPLACE deletes the conflicting row first, then inserts.
-        # If the deleted row had the highest version, MAX(version) drops and
-        # the new version can equal or regress, causing missed change detection.
-        current_max = conn.execute(
-            "SELECT COALESCE(MAX(version), 0) FROM config_overrides"
-        ).fetchone()[0]
-        new_version = current_max + 1
-        conn.execute("""
-            INSERT OR REPLACE INTO config_overrides (key, value, version, updated_at)
-            VALUES (?, ?, ?, ?)
-        """, (key, value, new_version, now))
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # M-13 v2 FIX: Compute version BEFORE INSERT OR REPLACE.
+            # INSERT OR REPLACE deletes the conflicting row first, then inserts.
+            # If the deleted row had the highest version, MAX(version) drops and
+            # the new version can equal or regress, causing missed change detection.
+            current_max = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM config_overrides"
+            ).fetchone()[0]
+            new_version = current_max + 1
+            conn.execute("""
+                INSERT OR REPLACE INTO config_overrides (key, value, version, updated_at)
+                VALUES (?, ?, ?, ?)
+            """, (key, value, new_version, now))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
-        # Read back the version
+        # Read back the version (outside transaction; reflects committed state)
         row = conn.execute("SELECT MAX(version) as max_v FROM config_overrides").fetchone()
         return row['max_v'] or 0
 

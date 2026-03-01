@@ -1415,9 +1415,11 @@ class FlowAnalyzer:
             bucket_count = bucket.get('count', 0) or 0
             forward_count += bucket_count
 
-            # Track most recent forward timestamp (day 0 has newest data)
-            if age == 0 and bucket_count > 0:
-                last_forward_ts = bucket.get('last_ts', 0) or 0
+            # Track most recent forward timestamp across ALL buckets (not just today)
+            # to avoid penalizing channels whose last forward was just before midnight.
+            bucket_ts = bucket.get('last_ts', 0) or 0
+            if bucket_ts > last_forward_ts:
+                last_forward_ts = bucket_ts
 
             total_weight += weight
 

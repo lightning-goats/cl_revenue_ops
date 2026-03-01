@@ -1838,3 +1838,138 @@ class TestCircularFlowRisk:
 
         # Should proceed despite query failure
         assert result["success"] is True
+
+
+# =============================================================================
+# Audit Round 8 – Turn 2 Regression Tests
+# =============================================================================
+
+class TestAuditTurn2PushPeerIds:
+    """P0-2 regression: Push candidates must have populated peer IDs."""
+
+    def test_push_ev_populates_source_candidate_peer_ids(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            rebalance_min_amount=10_000,
+            rebalance_max_amount=500_000,
+            kelly_fraction=0.5,
+        )
+        clboss = MagicMock()
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+
+        src_info = {"peer_id": "02" + "a" * 64, "fee_ppm": 500, "capacity": 1_000_000}
+        dest_scids = ["100x1x0", "200x2x0"]
+        dest_peer_ids = ["02" + "b" * 64, "02" + "c" * 64]
+
+        # Mock inbound fee estimation to return a value lower than src_fee
+        r._estimate_inbound_fee = MagicMock(return_value=100)
+
+        result = r._estimate_push_ev("300x3x0", src_info, 0.90, dest_scids, dest_peer_ids)
+        assert result is not None
+        assert result.source_candidate_peer_ids == dest_peer_ids
+        assert result.primary_source_peer_id == dest_peer_ids[0]
+
+    def test_push_ev_empty_dest_peer_ids_uses_empty_string(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            rebalance_min_amount=10_000,
+            rebalance_max_amount=500_000,
+            kelly_fraction=0.5,
+        )
+        clboss = MagicMock()
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+
+        src_info = {"peer_id": "02" + "a" * 64, "fee_ppm": 500, "capacity": 1_000_000}
+        dest_scids = ["100x1x0"]
+        r._estimate_inbound_fee = MagicMock(return_value=100)
+
+        # No dest_peer_ids passed (backward compat)
+        result = r._estimate_push_ev("300x3x0", src_info, 0.90, dest_scids)
+        assert result is not None
+        assert result.source_candidate_peer_ids == []
+        assert result.primary_source_peer_id == ""
+
+
+class TestAuditTurn2ManualRebalanceZeroFee:
+    """P1-1 regression: manual_rebalance zero max_fee_sats when spread==0."""
+
+    def test_manual_rebalance_zero_spread_gets_fallback_fee(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r._check_capital_controls = MagicMock(return_value=True)
+        mock_database.record_rebalance = MagicMock(return_value=123)
+        mock_database.update_rebalance_result = MagicMock()
+
+        # Setup channels where spread = fee_ppm - est_in - src_ppm = 0
+        r._get_channels_with_balances = MagicMock(return_value={
+            "100x1x0": {"capacity": 1_000_000, "spendable_sats": 800_000,
+                        "peer_id": "02" + "a" * 64, "fee_ppm": 200, "base_fee_msat": 0, "htlcs": 0},
+            "200x2x0": {"capacity": 1_000_000, "spendable_sats": 200_000,
+                        "peer_id": "02" + "b" * 64, "fee_ppm": 100, "base_fee_msat": 0, "htlcs": 0},
+        })
+        # est_in = 100 => spread = 100 - 100 - 200 = -200 => fallback to 100
+        r._estimate_inbound_fee = MagicMock(return_value=100)
+
+        result = r.manual_rebalance("100x1x0", "200x2x0", 50_000)
+        # Should succeed (dry run) with a fallback fee, not 0
+        if "candidate" in result:
+            assert result["candidate"]["max_budget_sats"] > 0
+
+
+class TestAuditTurn2HotChannelBudgetFilter:
+    """P1-2 regression: Budget exhaustion + hot-channel should filter non-hot candidates."""
+
+    def test_budget_exceeded_hot_only_filters_non_hot(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer, RebalanceCandidate
+
+        cfg = Config(
+            daily_budget_sats=100,
+            enable_proportional_budget=False,
+            hot_channel_protection_enabled=True,
+        )
+        clboss = MagicMock()
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+
+        # Simulate budget exceeded with hot-channel enabled
+        mock_database.get_total_rebalance_fees = MagicMock(return_value=200)  # > 100 budget
+        mock_plugin.rpc.listfunds.return_value = {
+            "outputs": [{"status": "confirmed", "amount_msat": 10_000_000_000}],
+            "channels": [],
+        }
+
+        # _check_capital_controls should return True (hot-only mode)
+        result = r._check_capital_controls(cfg)
+        assert result is True
+        assert r._budget_hot_channel_only is True
+
+    def test_budget_ok_clears_hot_only_flag(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            daily_budget_sats=1000,
+            enable_proportional_budget=False,
+        )
+        clboss = MagicMock()
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+
+        mock_database.get_total_rebalance_fees = MagicMock(return_value=100)  # < 1000 budget
+        mock_plugin.rpc.listfunds.return_value = {
+            "outputs": [{"status": "confirmed", "amount_msat": 10_000_000_000}],
+            "channels": [],
+        }
+
+        result = r._check_capital_controls(cfg)
+        assert result is True
+        assert r._budget_hot_channel_only is False

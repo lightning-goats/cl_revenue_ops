@@ -4092,7 +4092,7 @@ class HillClimbingFeeController:
 
             if days_since_forward >= self.ZERO_FLOW_DAYS_SEVERE:
                 # Severe reduction after 7+ days of zero flow
-                new_ceiling = int(base_ceiling * self.ZERO_FLOW_REDUCTION_SEVERE)
+                new_ceiling = max(1, int(base_ceiling * self.ZERO_FLOW_REDUCTION_SEVERE))
                 self.plugin.log(
                     f"FLOW_CEILING: {channel_id[:12]}... {days_since_forward:.1f} days "
                     f"no flow, ceiling reduced to {new_ceiling} ppm (50%)",
@@ -4101,7 +4101,7 @@ class HillClimbingFeeController:
                 return new_ceiling
             elif days_since_forward >= self.ZERO_FLOW_DAYS_MODERATE:
                 # Moderate reduction after 3+ days of zero flow
-                new_ceiling = int(base_ceiling * self.ZERO_FLOW_REDUCTION_MODERATE)
+                new_ceiling = max(1, int(base_ceiling * self.ZERO_FLOW_REDUCTION_MODERATE))
                 self.plugin.log(
                     f"FLOW_CEILING: {channel_id[:12]}... {days_since_forward:.1f} days "
                     f"no flow, ceiling reduced to {new_ceiling} ppm (75%)",
@@ -4349,7 +4349,7 @@ class HillClimbingFeeController:
                 return None
 
             recommended_fee = rec.get("recommended_fee_ppm")
-            if not recommended_fee:
+            if recommended_fee is None:
                 return None
 
             # Log the recommendation details
@@ -5233,13 +5233,17 @@ class HillClimbingFeeController:
                 hours_elapsed = (now - _sleep_last_update) / 3600.0 if _sleep_last_update > 0 else 1.0
                 hours_elapsed = max(hours_elapsed, 0.1)  # Prevent division by zero
 
-                revenue_sats = (volume_since_sats * current_fee_ppm) // 1_000_000
+                revenue_sats = (volume_since_sats * current_fee_ppm) / 1_000_000
                 current_revenue_rate = revenue_sats / hours_elapsed
 
                 # Calculate percent change from last known rate
-                last_rate = max(1.0, _sleep_last_revenue_rate)  # Avoid division by zero
-                delta = abs(current_revenue_rate - _sleep_last_revenue_rate)
-                percent_change = delta / last_rate
+                # When last rate was 0 (went to sleep with no revenue), any new
+                # revenue is a meaningful signal — treat as 100% change to trigger wake-up.
+                if _sleep_last_revenue_rate <= 0:
+                    percent_change = 1.0 if current_revenue_rate > 0 else 0.0
+                else:
+                    delta = abs(current_revenue_rate - _sleep_last_revenue_rate)
+                    percent_change = delta / _sleep_last_revenue_rate
 
                 if percent_change > self.WAKE_UP_THRESHOLD:
                     # Significant revenue spike detected - wake up immediately!
@@ -5302,7 +5306,9 @@ class HillClimbingFeeController:
         # NOTE: Shielded channels are NOT protected from Flap Protection.
         # Unstable connections are bad regardless of profitability.
         uptime_pct = self.database.get_peer_uptime_percent(peer_id, 86400)  # 24h window
-        uptime_factor = uptime_pct / 100.0  # Convert 0-100 to 0-1
+        if not isinstance(uptime_pct, (int, float)) or math.isnan(uptime_pct):
+            uptime_pct = 100.0
+        uptime_factor = max(0.0, min(1.0, uptime_pct / 100.0))  # Convert 0-100 to 0-1, clamp
         if uptime_factor < 1.0:
             original_volume = volume_since_sats
             volume_since_sats = int(volume_since_sats * uptime_factor)
@@ -5381,7 +5387,7 @@ class HillClimbingFeeController:
         # Use raw_chain_fee (actual on-chain fee), NOT current_fee_ppm (which may be
         # inflated from 0 to min_fee_ppm). Using inflated fee creates phantom revenue
         # that poisons the Thompson posterior with false positive signals.
-        revenue_sats = (volume_since_sats * raw_chain_fee) // 1_000_000
+        revenue_sats = (volume_since_sats * raw_chain_fee) / 1_000_000
         raw_revenue_rate = revenue_sats / hours_elapsed if hours_elapsed > 0 else 0.0
 
         # Issue #28: Apply EMA smoothing to reduce fee volatility
@@ -6318,7 +6324,14 @@ class HillClimbingFeeController:
             is_virgin_remote = (opener == "remote" and total_sats_out == 0)
 
             if cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
-                if is_virgin_remote:
+                if is_cold_start:
+                    # Cold-start channels need low fees to attract traffic.
+                    # Scarcity pricing would push fees up, contradicting cold-start intent.
+                    self.plugin.log(
+                        f"SCARCITY_SKIP: {channel_id[:12]}... suppressing scarcity (cold-start active).",
+                        level='info'
+                    )
+                elif is_virgin_remote:
                     self.plugin.log(
                         f"VIRGIN CHANNEL AMNESTY: {channel_id[:12]}... suppressing scarcity.",
                         level='info'
@@ -6717,7 +6730,14 @@ class HillClimbingFeeController:
             is_virgin_remote = (opener == "remote" and total_sats_out == 0)
             
             if cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
-                if is_virgin_remote:
+                if is_cold_start:
+                    # Cold-start channels need low fees to attract traffic.
+                    # Scarcity pricing would push fees up, contradicting cold-start intent.
+                    self.plugin.log(
+                        f"SCARCITY_SKIP: {channel_id[:12]}... suppressing scarcity (cold-start active).",
+                        level='info'
+                    )
+                elif is_virgin_remote:
                     # Virgin Remote Channel: Suppress scarcity pricing to encourage break-in traffic
                     self.plugin.log(
                         f"VIRGIN CHANNEL AMNESTY: {channel_id[:12]}... is remote-opened with 0 outbound traffic. "
@@ -7875,20 +7895,27 @@ class HillClimbingFeeController:
             if fail_count == 0:
                 return 0.0
 
-            # Get forward count for this channel
+            # Only consider failures relevant if within the same 7-day window
+            # as the forward count. All-time failures vs 7-day forwards would
+            # produce inflated failure rates for channels with old failures.
+            seven_days_ago = int(time.time()) - 86400 * 7
+            if last_fail < seven_days_ago:
+                return 0.0  # No recent failures
+
+            # Get forward count for this channel (7-day window)
             forward_count = self.database.get_forward_count_since(
                 channel_id,
-                int(time.time()) - 86400 * 7  # Last 7 days
+                seven_days_ago
             )
 
             if forward_count == 0:
-                # No forwards but has failures = 100% failure rate
-                return 1.0 if fail_count > 0 else 0.0
+                # No forwards but has recent failures = high failure rate
+                # Cap at 0.5 since we can't know the real denominator
+                return 0.5 if fail_count > 0 else 0.0
 
-            # Calculate failure rate (failures / total attempts)
-            # Total attempts = forwards + failures
-            total_attempts = forward_count + fail_count
-            failure_rate = fail_count / total_attempts
+            # Use forward count as proxy for total attempts since fail_count
+            # is all-time. This gives a conservative rate estimate.
+            failure_rate = min(fail_count, forward_count) / (forward_count + min(fail_count, forward_count))
 
             return min(1.0, failure_rate)
 
@@ -7914,14 +7941,13 @@ class HillClimbingFeeController:
                 
                 channel_id = channel.get("short_channel_id") or channel.get("channel_id")
                 if channel_id:
-                    # Get balance info
-                    spendable_msat = int(channel.get("spendable_msat", 0) or 0)
-                    receivable_msat = int(channel.get("receivable_msat", 0) or 0)
+                    # Get balance info — use parse_msat for CLN string values like "1000msat"
+                    spendable_msat = parse_msat(channel.get("spendable_msat", 0))
+                    receivable_msat = parse_msat(channel.get("receivable_msat", 0))
 
                     # Calculate capacity - may be null in some CLN versions
-                    total_msat = channel.get("total_msat") or channel.get("capacity_msat")
-                    if not total_msat:
-                        total_msat = spendable_msat + receivable_msat
+                    total_msat_raw = channel.get("total_msat") or channel.get("capacity_msat")
+                    total_msat = parse_msat(total_msat_raw) if total_msat_raw else (spendable_msat + receivable_msat)
 
                     # Get fee info - in newer CLN it's under updates.local
                     updates = channel.get("updates", {})

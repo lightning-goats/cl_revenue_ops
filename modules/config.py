@@ -603,6 +603,11 @@ class Config:
             # 5. READ-BACK verification (prevents Ghost Config - CRITICAL-03)
             read_back = database.get_config_override(key)
             if read_back != value:
+                # Roll back the DB write to prevent phantom config on restart
+                try:
+                    database.delete_config_override(key)
+                except Exception:
+                    pass  # Best-effort cleanup
                 return {"error": "Database write verification failed (Ghost Config prevention)"}
 
             # 6. UPDATE in-memory

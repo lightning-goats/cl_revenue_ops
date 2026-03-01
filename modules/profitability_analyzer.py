@@ -1972,11 +1972,22 @@ class ChannelProfitabilityAnalyzer:
         splice_cost = sum(int(s.get("fee_sats", 0) or 0) for s in splice_history)
 
         # Success-rate-adjusted effective cost
+        # Estimate 30-day costs from success_data (avg_cost_ppm * avg_amount * successes),
+        # inflate only that portion by the success rate, and keep historical costs uninflated.
+        # This prevents a recent bad patch from distorting the entire all-time cost history.
         effective_rebalance_costs = rebalance_costs
         success_data = self.database.get_channel_rebalance_success_rate(channel_id)
         if success_data and success_data['total'] >= 3:
             sr = max(success_data['success_rate'], 0.10)
-            effective_rebalance_costs = int(rebalance_costs / sr)
+            successes = success_data.get('successes', 0) or 0
+            avg_cost_ppm = success_data.get('avg_cost_ppm', 0) or 0
+            avg_amount = success_data.get('avg_amount_sats', 0) or 0
+            recent_spend = int(avg_cost_ppm * avg_amount * successes / 1_000_000) if successes > 0 else 0
+            if recent_spend > 0 and recent_spend < rebalance_costs:
+                historical_costs = rebalance_costs - recent_spend
+                effective_rebalance_costs = historical_costs + int(recent_spend / sr)
+            else:
+                effective_rebalance_costs = int(rebalance_costs / sr)
 
         return ChannelCosts(
             channel_id=channel_id,

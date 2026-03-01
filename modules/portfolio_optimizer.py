@@ -992,6 +992,9 @@ class PortfolioOptimizer:
                 continue
 
             weights = new_weights
+            # Partially restore learning rate after a successful step,
+            # preventing permanent degradation from prior backtracking.
+            learning_rate = min(learning_rate * 1.5, initial_learning_rate)
 
             # Check convergence on objective value
             if abs(obj - prev_objective) < tolerance:
@@ -1008,11 +1011,13 @@ class PortfolioOptimizer:
         """
         n = len(weights)
 
-        # Relax bounds when n makes the original constraints infeasible:
-        #   n <= floor(1/MAX) → max must be >= 1/n
-        #   n >= ceil(1/MIN)  → min must be <= 1/n
+        # Relax bounds when n makes the original constraints too tight.
+        # Ensure at least 20% of total weight is "free" for the optimizer to
+        # express preferences, even at high channel counts.  Without this,
+        # n * MIN_SINGLE_ALLOCATION can consume 100% at n>=50, collapsing
+        # the feasible region to a single equal-weight point.
         effective_max = max(MAX_SINGLE_ALLOCATION, 1.0 / n)
-        effective_min = min(MIN_SINGLE_ALLOCATION, 1.0 / n)
+        effective_min = min(MIN_SINGLE_ALLOCATION, 0.8 / n)
 
         # H1 FIX: Bounded simplex projection that guarantees convergence.
         # Instead of iterating clip-then-renormalize (which can oscillate),

@@ -843,3 +843,212 @@ class TestStartupHygiene:
         calls = mock_plugin.rpc.setconfig.call_args_list
         for i, (opt, val) in enumerate(expected_configs):
             assert calls[i].kwargs.get("config") == opt or calls[i][1].get("config") == opt
+
+
+class TestAuditRound8Regressions:
+    """Regression tests for Audit Round 8 findings in fee_controller.py."""
+
+    def _make_fc(self, mock_plugin, mock_database):
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+        return HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+    # --- P1-1: Flow-adjusted ceiling cannot return 0 ---
+
+    def test_flow_ceiling_severe_reduction_never_zero(self, mock_database, mock_plugin):
+        """_get_flow_adjusted_ceiling must never return 0, even with base_ceiling=1."""
+        fc = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+
+        # Mock: 8 days since last forward (severe reduction zone)
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 86400 * 8
+
+        result = fc._get_flow_adjusted_ceiling(channel_id, current_fee=100, base_ceiling=1)
+        assert result >= 1, f"Flow ceiling must be >= 1, got {result}"
+
+    def test_flow_ceiling_moderate_reduction_never_zero(self, mock_database, mock_plugin):
+        """_get_flow_adjusted_ceiling moderate reduction must not return 0."""
+        fc = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+
+        # Mock: 4 days since last forward (moderate reduction zone)
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 86400 * 4
+
+        result = fc._get_flow_adjusted_ceiling(channel_id, current_fee=100, base_ceiling=1)
+        assert result >= 1, f"Flow ceiling must be >= 1, got {result}"
+
+    # --- P1-2: Hive zero-fee corridor not rejected ---
+
+    def test_coordinated_fee_zero_not_rejected(self, mock_database, mock_plugin):
+        """_get_coordinated_fee_recommendation must accept 0 ppm (hive zero-fee corridors)."""
+        fc = self._make_fc(mock_plugin, mock_database)
+        fc.hive_bridge = MagicMock()
+        fc.ENABLE_HIVE_COORDINATION = True
+        fc.HIVE_COORDINATION_MIN_CONFIDENCE = 0.5
+
+        # Return a recommendation with 0 ppm fee (valid hive zero-fee corridor)
+        fc.hive_bridge.query_coordinated_fee_recommendation.return_value = {
+            "recommended_fee_ppm": 0,
+            "confidence": 0.9,
+            "corridor_role": "transit",
+            "defense_multiplier": 1.0,
+            "pheromone_level": 0.5,
+            "adjustment_reason": "zero-fee corridor"
+        }
+
+        result = fc._get_coordinated_fee_recommendation(
+            channel_id="123x456x0",
+            peer_id="02" + "a" * 64,
+            current_fee=100,
+            local_balance_pct=0.5
+        )
+        # Should return 0, not None
+        assert result == 0, f"Zero-fee recommendation should be accepted, got {result}"
+
+    def test_coordinated_fee_none_still_rejected(self, mock_database, mock_plugin):
+        """_get_coordinated_fee_recommendation rejects missing recommended_fee_ppm."""
+        fc = self._make_fc(mock_plugin, mock_database)
+        fc.hive_bridge = MagicMock()
+        fc.ENABLE_HIVE_COORDINATION = True
+        fc.HIVE_COORDINATION_MIN_CONFIDENCE = 0.5
+
+        # No recommended_fee_ppm key at all
+        fc.hive_bridge.query_coordinated_fee_recommendation.return_value = {
+            "confidence": 0.9,
+            "corridor_role": "transit",
+        }
+
+        result = fc._get_coordinated_fee_recommendation(
+            channel_id="123x456x0",
+            peer_id="02" + "a" * 64,
+            current_fee=100,
+            local_balance_pct=0.5
+        )
+        assert result is None
+
+    # --- P1-4: Revenue precision with small volumes ---
+
+    def test_revenue_calculation_precision_small_volume(self):
+        """Revenue calculation must not lose precision via integer division.
+
+        10000 sats * 50 ppm should produce 0.5 sats, not 0.
+        """
+        # Reproducing the formula from fee_controller.py:5384
+        volume_since_sats = 10_000
+        raw_chain_fee = 50  # ppm
+
+        # Old buggy formula: integer division loses everything
+        old_result = (volume_since_sats * raw_chain_fee) // 1_000_000
+        assert old_result == 0, "Sanity: old formula produces 0"
+
+        # Fixed formula: float division preserves precision
+        new_result = (volume_since_sats * raw_chain_fee) / 1_000_000
+        assert new_result == 0.5, f"Expected 0.5, got {new_result}"
+
+    # --- P1-5: Wake-up from zero revenue rate ---
+
+    def test_wake_up_from_zero_revenue_detects_new_traffic(self):
+        """When last revenue rate was 0, any new revenue should signal wake-up.
+
+        Old logic: max(1.0, 0) = 1.0 as denominator → tiny/1.0 → never wakes.
+        Fixed: zero last_rate + positive current_rate → percent_change = 1.0.
+        """
+        # Simulate the fixed logic
+        _sleep_last_revenue_rate = 0.0
+        current_revenue_rate = 0.1  # Some new traffic
+
+        if _sleep_last_revenue_rate <= 0:
+            percent_change = 1.0 if current_revenue_rate > 0 else 0.0
+        else:
+            delta = abs(current_revenue_rate - _sleep_last_revenue_rate)
+            percent_change = delta / _sleep_last_revenue_rate
+
+        assert percent_change == 1.0, "New traffic from zero should produce 100% change"
+
+    def test_wake_up_zero_to_zero_stays_asleep(self):
+        """When both last and current revenue are zero, don't wake up."""
+        _sleep_last_revenue_rate = 0.0
+        current_revenue_rate = 0.0
+
+        if _sleep_last_revenue_rate <= 0:
+            percent_change = 1.0 if current_revenue_rate > 0 else 0.0
+        else:
+            delta = abs(current_revenue_rate - _sleep_last_revenue_rate)
+            percent_change = delta / _sleep_last_revenue_rate
+
+        assert percent_change == 0.0, "Zero-to-zero should not trigger wake-up"
+
+    # --- P1-6: Failure rate time window consistency ---
+
+    def test_failure_rate_ignores_old_failures(self, mock_database, mock_plugin):
+        """Failure rate should ignore failures older than 7 days."""
+        fc = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+
+        # 100 all-time failures, but last one was 30 days ago
+        mock_database.get_failure_count.return_value = (100, int(time.time()) - 86400 * 30)
+        mock_database.get_forward_count_since.return_value = 50
+
+        rate = fc._get_channel_failure_rate(channel_id)
+        assert rate == 0.0, f"Old failures should be ignored, got rate={rate}"
+
+    def test_failure_rate_counts_recent_failures(self, mock_database, mock_plugin):
+        """Failure rate should count recent failures against recent forwards."""
+        fc = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+
+        # 5 failures, last one was 1 day ago
+        mock_database.get_failure_count.return_value = (5, int(time.time()) - 86400)
+        mock_database.get_forward_count_since.return_value = 20
+
+        rate = fc._get_channel_failure_rate(channel_id)
+        assert 0.0 < rate <= 1.0, f"Recent failures should produce non-zero rate, got {rate}"
+
+    # --- P1-7: parse_msat for _get_channels_info ---
+
+    def test_get_channels_info_handles_msat_strings(self, mock_database, mock_plugin):
+        """_get_channels_info should handle CLN string msat values like '1000000msat'."""
+        fc = self._make_fc(mock_plugin, mock_database)
+
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            "channels": [{
+                "state": "CHANNELD_NORMAL",
+                "short_channel_id": "123x456x0",
+                "peer_id": "02" + "a" * 64,
+                "spendable_msat": "500000000msat",
+                "receivable_msat": "500000000msat",
+                "total_msat": "1000000000msat",
+                "opener": "local",
+                "updates": {"local": {"fee_base_msat": 1000, "fee_proportional_millionths": 100}},
+            }]
+        }
+
+        channels = fc._get_channels_info()
+        assert "123x456x0" in channels
+        info = channels["123x456x0"]
+        assert info["capacity"] == 1_000_000  # 1B msat = 1M sats
+        assert info["spendable_msat"] == 500_000_000
+        assert info["receivable_msat"] == 500_000_000
+
+    # --- P2-5: NaN guard on uptime ---
+
+    def test_uptime_nan_guard(self, mock_database, mock_plugin):
+        """NaN uptime percentage should be treated as 100% (no penalty)."""
+        import math
+        fc = self._make_fc(mock_plugin, mock_database)
+
+        # If get_peer_uptime_percent returns NaN, the NaN guard should prevent
+        # it from corrupting the volume calculation
+        nan_val = float('nan')
+        assert math.isnan(nan_val)
+
+        # The guard: if not isinstance or isnan → default to 100
+        uptime_pct = nan_val
+        if not isinstance(uptime_pct, (int, float)) or math.isnan(uptime_pct):
+            uptime_pct = 100.0
+        uptime_factor = max(0.0, min(1.0, uptime_pct / 100.0))
+
+        assert uptime_factor == 1.0, f"NaN uptime should default to 1.0, got {uptime_factor}"

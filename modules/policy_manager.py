@@ -272,10 +272,19 @@ class PolicyManager:
             if len(timestamps) >= MAX_POLICY_CHANGES_PER_MINUTE:
                 return False
 
-            # Record this change
+            # Check passes — record only after caller confirms the DB write succeeded
+            # (previously recorded here, but that polluted the counter on DB write failure)
+            return True
+
+    def _record_rate_limit_change(self, peer_id: str) -> None:
+        """Record a successful policy change for rate limiting."""
+        now = int(time.time())
+        window_start = now - 60
+        with self._cache_lock:
+            timestamps = self._change_timestamps.get(peer_id, [])
+            timestamps = [ts for ts in timestamps if ts > window_start]
             timestamps.append(now)
             self._change_timestamps[peer_id] = timestamps
-            return True
     
     def _validate_peer_id(self, peer_id: str) -> None:
         """
@@ -675,6 +684,9 @@ class PolicyManager:
             new_mult_max,
             new_expires_at
         ))
+
+        # Record rate-limit change AFTER successful DB write (not before)
+        self._record_rate_limit_change(peer_id)
 
         # v2.0: Write-through cache update (instead of full invalidation)
         new_policy = PeerPolicy(

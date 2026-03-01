@@ -589,3 +589,55 @@ class TestAnalyzeChannelConsistencyWithBatch:
         # The key assertion: both paths produce the same state
         assert single_result.state == batch_result.state
         assert single_result.state == ChannelState.SOURCE  # 0.7 > 0.5
+
+
+# =============================================================================
+# Audit Round 8 – Turn 4 Regression Tests
+# =============================================================================
+
+class TestAuditTurn4LastForwardTsCrossMidnight:
+    """P1-1 regression: last_forward_ts should span all buckets, not just today."""
+
+    def _make_analyzer(self):
+        from modules.flow_analysis import FlowAnalyzer
+        plugin = MagicMock()
+        config = MagicMock()
+        config.snapshot.return_value = config
+        config.source_threshold = 0.5
+        config.sink_threshold = -0.5
+        config.flow_window_days = 7
+        config.flow_decay_factor = 0.85
+        database = MagicMock()
+        return FlowAnalyzer(plugin, config, database)
+
+    def test_last_forward_ts_from_yesterday_bucket(self):
+        """If today's bucket has no forwards, last_forward_ts should use yesterday's."""
+        analyzer = self._make_analyzer()
+
+        now = int(time.time())
+        yesterday_ts = now - 3600  # 1 hour ago (yesterday bucket in a midnight scenario)
+
+        # Day 0: no forwards. Day 1: has forwards with timestamp.
+        daily_buckets = [
+            {"in": 0, "out": 0, "count": 0, "last_ts": 0},
+            {"in": 500, "out": 300, "count": 5, "last_ts": yesterday_ts},
+        ]
+
+        _, _, _, _, _, last_ts = analyzer._calculate_ema_flow(daily_buckets)
+        assert last_ts == yesterday_ts, f"Should capture yesterday's ts, got {last_ts}"
+
+    def test_last_forward_ts_picks_newest_across_buckets(self):
+        """Should pick the newest timestamp across all buckets."""
+        analyzer = self._make_analyzer()
+
+        now = int(time.time())
+        ts_today = now - 60
+        ts_yesterday = now - 86400
+
+        daily_buckets = [
+            {"in": 100, "out": 50, "count": 2, "last_ts": ts_today},
+            {"in": 500, "out": 300, "count": 5, "last_ts": ts_yesterday},
+        ]
+
+        _, _, _, _, _, last_ts = analyzer._calculate_ema_flow(daily_buckets)
+        assert last_ts == ts_today
