@@ -253,20 +253,18 @@ class ClbossManager:
         
         return result
     
-    def remanage(self, peer_id: str, tag: Optional[str] = None) -> Dict[str, Any]:
+    def remanage(self, peer_id: str, tag=None, database=None) -> Dict[str, Any]:
         """
         Re-enable clboss management for a peer.
-        
+
         Use this to hand control back to clboss for a peer we previously
         unmanaged. If no tag is specified, re-enable all tags.
-        
-        Note: clboss resumes full management when clboss-unmanage is
-        called with an empty string for tags.
-        
+
         Args:
             peer_id: The node ID of the peer
             tag: Optional specific tag to re-enable (None = all tags)
-            
+            database: Optional database instance for cleanup of unmanage records
+
         Returns:
             Result dict with status and details
         """
@@ -277,36 +275,26 @@ class ClbossManager:
             "success": False,
             "message": ""
         }
-        
+
         if not self.config.clboss_enabled or not self.is_clboss_available():
             result["message"] = "clboss not available"
             return result
-        
+
         if self.config.dry_run:
             result["success"] = True
             result["message"] = f"[DRY RUN] Would remanage {peer_id} for {tag or 'all tags'}"
             self.plugin.log(result["message"])
             return result
         try:
-            # Determine which tags to manage
+            # P0-2 FIX: Use clboss-manage (not clboss-unmanage with empty string)
+            # for all code paths, including tag=None (re-enable all).
             if tag is None:
-                # Per clboss docs, empty string restores full management
-                self.plugin.rpc.call(
-                    "clboss-unmanage",
-                    [peer_id, ""]
-                )
-                result["success"] = True
-                result["message"] = f"Re-enabled clboss management for {peer_id}"
-                self.plugin.log(f"Remanaged peer {peer_id[:16]}... to clboss")
-                return result
+                tags_to_process = list(ClbossTags.ALL)
             elif isinstance(tag, list):
                 tags_to_process = tag
             else:
-                # Could be a single tag or a comma-separated string
-                # If it's a comma-separated string, clboss-manage can handle it
-                # or we could split it. CLN RPC usually handles comma-sep strings.
                 tags_to_process = [tag]
-            
+
             succeeded_tags = []
             failed_tags = []
             for t in tags_to_process:
@@ -328,13 +316,71 @@ class ClbossManager:
             else:
                 result["message"] = f"Re-enabled clboss management for {peer_id}"
             self.plugin.log(f"Remanaged peer {peer_id[:16]}...: {len(succeeded_tags)} ok, {len(failed_tags)} failed")
-            
+
+            # P0-1 FIX: Clean up DB unmanage records on success
+            if result["success"] and database:
+                try:
+                    if tag is None:
+                        database.remove_unmanage(peer_id)  # remove all tags
+                    else:
+                        database.remove_unmanage(peer_id, tag)
+                except Exception as db_err:
+                    self.plugin.log(f"Failed to clean up unmanage DB record for {peer_id}: {db_err}", level='warn')
+
         except Exception as e:
             result["success"] = False
             result["message"] = f"Error: {str(e)}"
             self.plugin.log(f"Error in remanage: {e}", level='error')
-        
+
         return result
+
+    def reconcile_unmanaged(self, database) -> Dict[str, Any]:
+        """
+        Startup reconciliation: re-manage any peers left orphaned by a crash.
+
+        Reads all DB unmanage records and calls clboss-manage for each,
+        then cleans up the DB records. This ensures peers don't stay
+        permanently unmanaged after a plugin crash/restart.
+
+        Args:
+            database: Database instance with unmanage tracking methods
+
+        Returns:
+            Summary of reconciliation actions
+        """
+        if not self.config.clboss_enabled or not self.is_clboss_available():
+            return {"skipped": True, "reason": "clboss not available"}
+
+        try:
+            orphaned = database.get_all_unmanaged()
+        except Exception as e:
+            return {"skipped": True, "reason": f"DB error: {e}"}
+
+        if not orphaned:
+            return {"skipped": False, "orphaned_count": 0, "remanaged": 0}
+
+        remanaged = 0
+        failed = 0
+        for record in orphaned:
+            peer_id = record.get("peer_id", "")
+            tag = record.get("tag", "")
+            if not peer_id:
+                continue
+            try:
+                tags = tag.split(",") if tag else list(ClbossTags.ALL)
+                for t in tags:
+                    try:
+                        self.plugin.rpc.call("clboss-manage", [peer_id, t])
+                    except RpcError:
+                        pass  # best-effort
+                database.remove_unmanage(peer_id, tag if tag else None)
+                remanaged += 1
+            except Exception as e:
+                failed += 1
+                self.plugin.log(f"Failed to reconcile unmanage for {peer_id}: {e}", level='warn')
+
+        self.plugin.log(f"Clboss reconciliation: {remanaged} remanaged, {failed} failed out of {len(orphaned)} orphaned")
+        return {"skipped": False, "orphaned_count": len(orphaned), "remanaged": remanaged, "failed": failed}
     
     def get_unmanaged_status(self) -> Dict[str, Any]:
         """

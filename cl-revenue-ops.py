@@ -1238,7 +1238,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize clboss manager (handles unmanage commands)
     clboss_manager = ClbossManager(safe_plugin, config)
-    
+    # P0-1 FIX: Reconcile orphaned unmanage records from prior crash/restart
+    try:
+        reconcile_result = clboss_manager.reconcile_unmanaged(database)
+        if not reconcile_result.get("skipped") and reconcile_result.get("orphaned_count", 0) > 0:
+            plugin.log(f"Clboss reconciliation: remanaged {reconcile_result.get('remanaged', 0)} orphaned peers")
+    except Exception as e:
+        plugin.log(f"Clboss reconciliation failed (non-fatal): {e}", level='warn')
+
     # Initialize policy manager (v1.4: Policy-Driven Architecture)
     policy_manager = PolicyManager(database, safe_plugin)
     plugin.log("PolicyManager initialized for peer-level fee/rebalance policies")
@@ -2873,7 +2880,7 @@ def revenue_remanage(plugin: Plugin, peer_id: str, tag: Optional[str] = None) ->
         return {"error": f"Invalid peer_id format: expected 66-character hex pubkey"}
 
     try:
-        result = clboss_manager.remanage(peer_id, tag)
+        result = clboss_manager.remanage(peer_id, tag, database=database)
         return {"status": "success", "peer_id": peer_id, **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -5407,9 +5414,9 @@ def revenue_boltz_deposit(plugin: Plugin, currency: str = None) -> Dict[str, Any
 
 
 @plugin.method("revenue-boltz-backup")
-def revenue_boltz_backup(plugin: Plugin) -> Dict[str, Any]:
+def revenue_boltz_backup(plugin: Plugin, include_mnemonic: bool = False) -> Dict[str, Any]:
     try:
-        return _require_boltz_manager().backup()
+        return _require_boltz_manager().backup(include_mnemonic=bool(include_mnemonic))
     except Exception as e:
         return {"error": str(e)}
 

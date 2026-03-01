@@ -48,6 +48,8 @@ class BoltzCliManager:
         # B1/B3 FIX: Serialize file-based load-modify-save to prevent lost updates
         self._journal_lock = threading.Lock()
         self._ignored_swaps_lock = threading.Lock()
+        # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
+        self._swap_creation_lock = threading.Lock()
         # Optional callback set by cl-revenue-ops plugin to provide non-Boltz liquidity costs
         # (e.g. market rebalance spend/reservations) for unified budget accounting.
         self.external_liquidity_cost_provider = None
@@ -1067,29 +1069,31 @@ class BoltzCliManager:
         source_cur = self._norm_currency(currency, "LBTC")
         wallet_name = self._resolve_wallet_name(source_cur)
 
-        quote = self.quote(amount_sats=amount_sats, swap_type="submarine", currency=source_cur)
-        budget_check = self._enforce_budget_for_quote(quote.get("quote", {}))
-        if not budget_check["allowed"]:
-            return {
-                "status": "rejected",
-                "error": budget_check["reason"],
-                "quote": quote,
-                "budget": budget_check["budget"],
-            }
+        # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
+        with self._swap_creation_lock:
+            quote = self.quote(amount_sats=amount_sats, swap_type="submarine", currency=source_cur)
+            budget_check = self._enforce_budget_for_quote(quote.get("quote", {}))
+            if not budget_check["allowed"]:
+                return {
+                    "status": "rejected",
+                    "error": budget_check["reason"],
+                    "quote": quote,
+                    "budget": budget_check["budget"],
+                }
 
-        warnings: List[str] = []
-        if channel_id or peer_id:
-            warnings.append(
-                "boltzcli createswap (submarine/loop-in) on v2.11.0 does not support channel pinning; channel_id/peer_id used only as trigger metadata"
+            warnings: List[str] = []
+            if channel_id or peer_id:
+                warnings.append(
+                    "boltzcli createswap (submarine/loop-in) on v2.11.0 does not support channel pinning; channel_id/peer_id used only as trigger metadata"
+                )
+
+            args = ["createswap", "--json", "--from-wallet", wallet_name, self._swap_cli_currency(source_cur, source_cur), str(amount_sats)]
+            result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 120))
+            self._record_swap_result(
+                result,
+                source="loop_in",
+                metadata={"trigger_channel_id": channel_id, "trigger_peer_id": peer_id},
             )
-
-        args = ["createswap", "--json", "--from-wallet", wallet_name, self._swap_cli_currency(source_cur, source_cur), str(amount_sats)]
-        result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 120))
-        self._record_swap_result(
-            result,
-            source="loop_in",
-            metadata={"trigger_channel_id": channel_id, "trigger_peer_id": peer_id},
-        )
 
         return {
             "status": "accepted",
@@ -1112,6 +1116,12 @@ class BoltzCliManager:
             raise BoltzCliError("amount_sats must be > 0")
         target_cur = self._norm_currency(currency, "BTC")
 
+        # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
+        with self._swap_creation_lock:
+            return self._loop_out_locked(amount_sats, address, channel_id, peer_id, currency, target_cur)
+
+    def _loop_out_locked(self, amount_sats: int, address: Optional[str], channel_id: Optional[str],
+                         peer_id: Optional[str], currency: Optional[str], target_cur: str) -> Dict[str, Any]:
         quote = self.quote(amount_sats=amount_sats, swap_type="reverse", currency=target_cur)
         budget_check = self._enforce_budget_for_quote(quote.get("quote", {}))
         if not budget_check["allowed"]:
@@ -1417,26 +1427,28 @@ class BoltzCliManager:
         if from_cur == to_cur:
             raise BoltzCliError("from_currency and to_currency must differ")
 
-        quote = self._run_json([
-            "quote", "--json", "--send", str(amount_sats), "--from", from_cur, "--to", to_cur, "chain"
-        ])
-        budget_check = self._enforce_budget_for_quote(quote)
-        if not budget_check["allowed"]:
-            return {
-                "status": "rejected",
-                "error": budget_check["reason"],
-                "quote": quote,
-                "budget": budget_check["budget"],
-            }
+        # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
+        with self._swap_creation_lock:
+            quote = self._run_json([
+                "quote", "--json", "--send", str(amount_sats), "--from", from_cur, "--to", to_cur, "chain"
+            ])
+            budget_check = self._enforce_budget_for_quote(quote)
+            if not budget_check["allowed"]:
+                return {
+                    "status": "rejected",
+                    "error": budget_check["reason"],
+                    "quote": quote,
+                    "budget": budget_check["budget"],
+                }
 
-        args: List[str] = ["createchainswap", "--json", "--from-wallet", self._resolve_wallet_name(from_cur)]
-        if to_address:
-            args.extend(["--to-address", str(to_address)])
-        else:
-            args.extend(["--to-wallet", self._resolve_wallet_name(to_cur)])
-        args.append(str(amount_sats))
-        result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 180))
-        self._record_swap_result(result, source="chainswap")
+            args: List[str] = ["createchainswap", "--json", "--from-wallet", self._resolve_wallet_name(from_cur)]
+            if to_address:
+                args.extend(["--to-address", str(to_address)])
+            else:
+                args.extend(["--to-wallet", self._resolve_wallet_name(to_cur)])
+            args.append(str(amount_sats))
+            result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 180))
+            self._record_swap_result(result, source="chainswap")
         return {
             "status": "accepted",
             "amount_sats": amount_sats,
@@ -1479,16 +1491,20 @@ class BoltzCliManager:
         address = raw.splitlines()[-1].strip() if raw else ""
         return {"wallet": wallet_name, "currency": cur, "address": address, "raw": raw}
 
-    def backup(self) -> Dict[str, Any]:
-        mnemonic = self._run(["swapmnemonic", "get"])  # plaintext by design (caller warning)
+    def backup(self, include_mnemonic: bool = False) -> Dict[str, Any]:
         wallets = self.wallet_balances()
         pending = self._listswaps_json(pending_only=True)
-        return {
-            "swap_mnemonic": mnemonic.strip(),
+        result: Dict[str, Any] = {
             "wallets": wallets.get("wallets", []),
             "pending_swaps": self._extract_swap_list(pending),
-            "warning": "Contains plaintext swap mnemonic. Store securely.",
         }
+        if include_mnemonic:
+            mnemonic = self._run(["swapmnemonic", "get"])
+            result["swap_mnemonic"] = mnemonic.strip()
+            result["warning"] = "Contains plaintext swap mnemonic. Store securely."
+        else:
+            result["note"] = "Swap mnemonic omitted. Pass include_mnemonic=true to include."
+        return result
 
     def backup_verify(self, swap_mnemonic: str) -> Dict[str, Any]:
         current = self._run(["swapmnemonic", "get"]).strip()
