@@ -18,6 +18,7 @@ Phase 4: Async Job Queue
 - Uses sling-job (background) instead of sling-once (blocking)
 """
 
+import math
 import time
 import json
 import threading
@@ -507,7 +508,24 @@ class JobManager:
                 deplete_pct = self.config.sling_deplete_pct_balanced
 
             job_params["depleteuptopercent"] = deplete_pct
-            job_params["depleteuptoamount"] = max(100_000, chunk_size * 2)
+
+            # EV v2.0: Asymmetric depletion tied to actual source excess capital.
+            # Instead of a fixed chunk_size * 2 limit, compute how much the primary
+            # source is overweight and allow Sling to drain exactly that amount.
+            try:
+                primary_source_scid = candidate.source_candidates[0] if candidate.source_candidates else None
+                source_state = self.database.get_channel_state(primary_source_scid) if primary_source_scid else None
+                if source_state and source_state.get("capacity", 0) > 0:
+                    source_cap = source_state["capacity"]
+                    source_bal = self._get_channel_local_balance(primary_source_scid)
+                    source_target_ratio = self.config.sling_target_source if flow_state == "source" else self.config.sling_target_balanced
+                    source_target_sats = int(source_cap * source_target_ratio)
+                    actual_excess = max(0, source_bal - source_target_sats)
+                    job_params["depleteuptoamount"] = max(100_000, actual_excess)
+                else:
+                    job_params["depleteuptoamount"] = max(100_000, chunk_size * 2)
+            except Exception:
+                job_params["depleteuptoamount"] = max(100_000, chunk_size * 2)
 
             # Add candidates if we have them
             if source_scids_sling:
@@ -2481,12 +2499,23 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         # ZERO-TOLERANCE: Evaluate EV on the actual execution unit (one chunk).
         # This matches the "stop after first success" execution model.
-        dynamic_chunk_cap = int(self.config.sling_chunk_size_sats)
+        #
+        # EV v2.0: Dynamic chunk sizing based on avg_forward_size from the
+        # portfolio optimizer. Channels that naturally route small payments
+        # should use smaller chunks to maximize route success probability.
+        # If no portfolio data exists, fall back to the configured default.
+        dest_pm = self._get_portfolio_metrics(dest_channel)
+        dest_avg_fwd = dest_pm.get("avg_forward_size", 0)
+        if dest_avg_fwd > 0:
+            # Size chunks at ~2x the average forward to balance success rate vs. throughput
+            dynamic_chunk_cap = max(self.config.rebalance_min_amount, dest_avg_fwd * 2)
+        else:
+            dynamic_chunk_cap = int(self.config.sling_chunk_size_sats)
         if hot_profile.get('eligible'):
             try:
-                dynamic_chunk_cap = int(self.config.sling_chunk_size_sats * float(hot_profile.get('chunk_multiplier', 1.0) or 1.0))
+                dynamic_chunk_cap = int(dynamic_chunk_cap * float(hot_profile.get('chunk_multiplier', 1.0) or 1.0))
             except Exception:
-                dynamic_chunk_cap = int(self.config.sling_chunk_size_sats)
+                pass
         # Safety: keep per-action size bounded.
         dynamic_chunk_cap = max(self.config.rebalance_min_amount, min(dynamic_chunk_cap, self.config.rebalance_max_amount, max(1, capacity // 4)))
         rebalance_amount = min(desired_amount, dynamic_chunk_cap)
@@ -2594,7 +2623,23 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         if self.config.enable_kelly and not skip_kelly:
             reputation = self.database.get_peer_reputation(dest_info.get("peer_id", ""))
-            p = reputation.get('score', 0.5)  # Success probability
+            historical_p = reputation.get('score', 0.5)  # Historical success probability
+
+            # EV v2.0: Blend AskRene real-time liquidity belief with historical reputation.
+            # AskRene tracks maximum believed capacity per channel direction from
+            # payment successes/failures. If AskRene says max capacity is X and we
+            # want to route Y, probability drops as Y approaches X.
+            p = historical_p
+            try:
+                dest_sling_scid = self.job_manager._to_sling_scid(dest_channel)
+                askrene_max_sats = self.job_manager._askrene_max_sats_for_scid_dir(dest_sling_scid)
+                if askrene_max_sats is not None and askrene_max_sats > 0:
+                    askrene_p = max(0.01, 1.0 - (rebalance_amount / askrene_max_sats))
+                    # Blend: 30% historical, 70% AskRene (real-time is more informative)
+                    p = (historical_p * 0.3) + (askrene_p * 0.7)
+            except Exception:
+                pass  # AskRene is optional; fall back to pure historical
+
             cost_ppm = inbound_fee_ppm + weighted_opp_cost
             # MA-4: Avoid b=inf when cost_ppm=0 (free routing); use large finite value
             b = outbound_fee_ppm / cost_ppm if cost_ppm > 0 else 100.0  # Odds
@@ -2677,12 +2722,74 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         
         dest_turnover_rate = self._calculate_turnover_rate(dest_channel, capacity)
         cooldown_days = self.config.rebalance_cooldown_hours / 24.0
-        expected_utilization = max(min(dest_turnover_rate * cooldown_days, 1.0), 0.05)
-        
+
+        # =================================================================
+        # EV v2.0: PROBABILISTIC UTILIZATION (Normal CDF)
+        # =================================================================
+        # Instead of linear expected_utilization = turnover * cooldown (capped at 1.0),
+        # model demand as a Gaussian process using Kalman filter predictions.
+        # P(utilized) = P(demand > rebalance_amount) = 1 - Phi(z)
+        # where z = (rebalance_amount - predicted_volume) / std_dev
+        #
+        # Fallback: When Kalman data is unavailable, use the original linear heuristic.
+        # =================================================================
+        kalman = self._get_kalman_metrics(dest_channel)
+        kalman_velocity = kalman["velocity"]
+        kalman_uncertainty = kalman["uncertainty"]
+
+        if abs(kalman_velocity) > 1e-6 and kalman_uncertainty > 1e-6:
+            # Kalman-based probabilistic utilization
+            predicted_volume = abs(kalman_velocity) * capacity * cooldown_days
+            std_dev = kalman_uncertainty * capacity * math.sqrt(max(cooldown_days, 0.01))
+
+            # P(demand >= rebalance_amount) using complementary error function
+            z = (rebalance_amount - predicted_volume) / (std_dev * math.sqrt(2) + 1e-8)
+            prob_utilized = 0.5 * (1.0 - math.erf(z))
+
+            # Clamp to [0.05, 1.0] — never assume zero utilization for a live channel
+            expected_utilization = max(0.05, min(1.0, prob_utilized))
+        else:
+            # Fallback: linear heuristic (original logic)
+            expected_utilization = max(min(dest_turnover_rate * cooldown_days, 1.0), 0.05)
+
         expected_income = (rebalance_amount * expected_utilization * outbound_fee_ppm) // 1_000_000
+
+        # =================================================================
+        # EV v2.0: SHARPE-DERIVED OPPORTUNITY COST
+        # =================================================================
+        # Instead of crude turnover_weight = min(1.0, source_turnover_rate * 7),
+        # use the marginal Sharpe contribution from the portfolio optimizer to
+        # quantify the true opportunity cost of moving capital from source to dest.
+        # =================================================================
+        source_pm = self._get_portfolio_metrics(primary_source_id)
+        source_sharpe = source_pm.get("marginal_sharpe", 0.0)
+        dest_sharpe = dest_pm.get("marginal_sharpe", 0.0)
+
+        if source_sharpe > 0 and dest_sharpe > 0:
+            # Sharpe penalty: if source contributes more per unit risk than dest,
+            # the opportunity cost is proportionally higher.
+            sharpe_penalty_factor = max(1.0, source_sharpe / max(0.01, dest_sharpe))
+        else:
+            # No portfolio data — fall back to turnover-based weight
+            sharpe_penalty_factor = 1.0
+
         turnover_weight = min(1.0, source_turnover_rate * 7)
-        expected_source_loss = (rebalance_amount * expected_utilization * source_fee_ppm * turnover_weight) // 1_000_000
-        expected_profit = expected_income - max_budget_sats - expected_source_loss
+        expected_source_loss = int(
+            (rebalance_amount * expected_utilization * source_fee_ppm * turnover_weight * sharpe_penalty_factor) // 1_000_000
+        )
+
+        # =================================================================
+        # EV v2.0: EXPECTED COST vs MAX BUDGET
+        # =================================================================
+        # Use the expected routing fee (historical median) instead of max_budget_sats
+        # (the worst-case ceiling). max_budget_sats is still passed to Sling as the
+        # hard cap, but EV should reflect the likely cost, not the worst case.
+        # =================================================================
+        expected_fee_sats = self._estimate_expected_fee_sats(dest_peer_id, rebalance_amount)
+        # Never let expected fee exceed the max budget (it's a ceiling)
+        expected_fee_sats = min(expected_fee_sats, max_budget_sats)
+
+        expected_profit = expected_income - expected_fee_sats - expected_source_loss
         
         # Strategic Rebalance Exemption: Dynamic threshold based on destination policy
         # PPM-BASED PROFIT GATE: When rebalance_min_profit_ppm > 0, the threshold
@@ -2770,6 +2877,69 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             return max(0.0001, min(1.0, volume / capacity))
         except Exception: 
             return 0.05
+
+    def _get_kalman_metrics(self, channel_id: str) -> Dict[str, float]:
+        """Retrieve Kalman filter state for a channel from the DB.
+
+        Returns dict with flow_ratio, flow_velocity, uncertainty (sqrt of variance_ratio).
+        Falls back to neutral defaults if unavailable.
+        """
+        try:
+            ks = self.database.get_kalman_state(channel_id)
+            if ks:
+                import math
+                return {
+                    "flow_ratio": float(ks.get("flow_ratio", 0.0)),
+                    "velocity": float(ks.get("flow_velocity", 0.0)),
+                    "uncertainty": math.sqrt(max(0.0, float(ks.get("variance_ratio", 0.1)))),
+                }
+        except Exception:
+            pass
+        return {"flow_ratio": 0.0, "velocity": 0.0, "uncertainty": 0.316}
+
+    def _get_portfolio_metrics(self, channel_id: str) -> Dict[str, Any]:
+        """Retrieve cached portfolio metrics for a channel from the DB.
+
+        Returns dict with avg_forward_size, marginal_sharpe_contribution, etc.
+        Falls back to safe defaults if unavailable.
+        """
+        try:
+            pm = self.database.get_portfolio_metrics(channel_id)
+            if pm:
+                return {
+                    "avg_forward_size": int(pm.get("avg_forward_size", 0)),
+                    "marginal_sharpe": float(pm.get("marginal_sharpe_contribution", 0.0)),
+                    "expected_return": float(pm.get("expected_return", 0.0)),
+                    "std_dev": float(pm.get("std_dev", 0.0)),
+                    "forward_frequency": float(pm.get("forward_frequency", 0.0)),
+                }
+        except Exception:
+            pass
+        return {
+            "avg_forward_size": 0,
+            "marginal_sharpe": 0.0,
+            "expected_return": 0.0,
+            "std_dev": 0.0,
+            "forward_frequency": 0.0,
+        }
+
+    def _estimate_expected_fee_sats(self, dest_peer_id: str, rebalance_amount: int) -> int:
+        """Estimate the expected routing fee (not the max budget) for a rebalance.
+
+        Uses historical median when available, falls back to estimated inbound fee.
+        This is used for EV calculation (expected cost), while max_budget_sats
+        remains the hard execution cap passed to Sling.
+        """
+        try:
+            hist_data = self.database.get_historical_inbound_fee_ppm(dest_peer_id)
+            if hist_data and hist_data.get('sample_count', 0) >= 3:
+                median_ppm = hist_data.get('median_fee_ppm', 0)
+                return max(1, (rebalance_amount * median_ppm) // 1_000_000)
+        except Exception:
+            pass
+        # Fallback: use the inbound fee estimate (already accounts for historical data)
+        inbound_ppm = self._estimate_inbound_fee(dest_peer_id)
+        return max(1, (rebalance_amount * inbound_ppm) // 1_000_000)
 
     def _estimate_daily_channel_contribution(self, prof: Optional[Any]) -> float:
         if not prof:

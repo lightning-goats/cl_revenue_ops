@@ -1117,6 +1117,22 @@ class Database:
         except Exception as e:
             self.plugin.log(f"DB migration warning: Kalman schema migration failed: {e}", level="warn")
 
+        # Portfolio metrics table (for EV v2.0 rebalancer integration)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS portfolio_metrics (
+                    channel_id TEXT PRIMARY KEY,
+                    avg_forward_size INTEGER DEFAULT 0,
+                    marginal_sharpe_contribution REAL DEFAULT 0.0,
+                    expected_return REAL DEFAULT 0.0,
+                    std_dev REAL DEFAULT 0.0,
+                    forward_frequency REAL DEFAULT 0.0,
+                    last_update INTEGER DEFAULT 0
+                )
+            """)
+        except Exception as e:
+            self.plugin.log(f"DB migration warning: Portfolio metrics schema failed: {e}", level="warn")
+
     # =========================================================================
     # Channel State Methods
     # =========================================================================
@@ -1236,6 +1252,51 @@ class Database:
         conn = self._get_connection()
         rows = conn.execute("SELECT * FROM kalman_state").fetchall()
         return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Portfolio Metrics Methods (EV v2.0)
+    # =========================================================================
+
+    def save_portfolio_metrics(self, metrics: List[Dict[str, Any]]) -> None:
+        """Batch-save portfolio metrics for all channels."""
+        conn = self._get_connection()
+        now = int(time.time())
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for m in metrics:
+                conn.execute("""
+                    INSERT OR REPLACE INTO portfolio_metrics
+                    (channel_id, avg_forward_size, marginal_sharpe_contribution,
+                     expected_return, std_dev, forward_frequency, last_update)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    m["channel_id"],
+                    int(m.get("avg_forward_size", 0)),
+                    float(m.get("marginal_sharpe_contribution", 0.0)),
+                    float(m.get("expected_return", 0.0)),
+                    float(m.get("std_dev", 0.0)),
+                    float(m.get("forward_frequency", 0.0)),
+                    now,
+                ))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def get_portfolio_metrics(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Get portfolio metrics for a single channel."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM portfolio_metrics WHERE channel_id = ?",
+            (channel_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_all_portfolio_metrics(self) -> Dict[str, Dict[str, Any]]:
+        """Get portfolio metrics for all channels, keyed by channel_id."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM portfolio_metrics").fetchall()
+        return {row["channel_id"]: dict(row) for row in rows}
 
     # =========================================================================
     # Channel Probe Methods

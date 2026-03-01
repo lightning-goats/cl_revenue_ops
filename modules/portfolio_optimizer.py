@@ -1221,6 +1221,24 @@ class PortfolioOptimizer:
         # Get notable correlations
         correlations = self.get_correlation_pairs(min_abs_correlation=0.3)
 
+        # Persist portfolio metrics to DB for cross-module consumption (EV v2.0)
+        try:
+            metrics_batch = []
+            for scid, s in stats.items():
+                marginal_sharpe = self._calculate_marginal_sharpe(scid, optimal_weights)
+                metrics_batch.append({
+                    "channel_id": scid,
+                    "avg_forward_size": s.avg_forward_size,
+                    "marginal_sharpe_contribution": marginal_sharpe,
+                    "expected_return": s.expected_return,
+                    "std_dev": s.std_dev,
+                    "forward_frequency": s.forward_frequency,
+                })
+            if metrics_batch:
+                self.database.save_portfolio_metrics(metrics_batch)
+        except Exception as e:
+            self.plugin.log(f"Portfolio metrics persistence failed (non-fatal): {e}", level='debug')
+
         return {
             "summary": summary.to_dict(),
             "channel_statistics": {
