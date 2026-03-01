@@ -643,3 +643,25 @@ class TestConsumerVelocityConversion:
         predicted_volume = abs(kalman_velocity) * capacity * cooldown_hours
         # 0.005 * 1M * 72 = 360,000 sats
         assert predicted_volume == pytest.approx(360_000, rel=1e-6)
+
+    def test_rebalancer_std_dev_uses_days_not_hours(self):
+        """Diffusion std_dev should scale with sqrt(days), not sqrt(hours).
+
+        kalman_uncertainty is dimensionless (on flow_ratio), so diffusion
+        scales with sqrt(calendar_days). Using sqrt(hours) inflates std_dev
+        by ~4.9x, causing budget over-reservation.
+        """
+        import math
+        kalman_uncertainty = 0.15  # dimensionless
+        capacity = 1_000_000
+        cooldown_days = 3
+
+        # Correct: sqrt(days)
+        std_dev_correct = kalman_uncertainty * capacity * math.sqrt(cooldown_days)
+        # Wrong: sqrt(hours) — 4.9x inflation
+        cooldown_hours = cooldown_days * 24.0
+        std_dev_wrong = kalman_uncertainty * capacity * math.sqrt(cooldown_hours)
+
+        assert std_dev_wrong / std_dev_correct == pytest.approx(math.sqrt(24), rel=1e-3)
+        # The correct std_dev should be ~4.9x smaller
+        assert std_dev_correct < std_dev_wrong

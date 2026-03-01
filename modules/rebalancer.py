@@ -2751,10 +2751,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         if abs(kalman_velocity) > 1e-6 and kalman_uncertainty > 1e-6:
             # Kalman-based probabilistic utilization
-            # kalman_velocity is per-hour; convert to per-day for cooldown_days math
+            # kalman_velocity is per-hour; multiply by hours for volume prediction
             cooldown_hours = cooldown_days * 24.0
             predicted_volume = abs(kalman_velocity) * capacity * cooldown_hours
-            std_dev = kalman_uncertainty * capacity * math.sqrt(max(cooldown_hours, 0.01))
+            # Uncertainty is dimensionless (on flow_ratio); diffusion scales with sqrt(days)
+            std_dev = kalman_uncertainty * capacity * math.sqrt(max(cooldown_days, 0.01))
 
             # P(demand >= rebalance_amount) using complementary error function
             z = (rebalance_amount - predicted_volume) / (std_dev * math.sqrt(2) + 1e-8)
