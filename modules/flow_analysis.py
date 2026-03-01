@@ -517,6 +517,20 @@ class FlowAnalyzer:
         self._kalman_filters: Dict[str, KalmanFlowFilter] = {}
         self._kalman_lock = threading.Lock()
 
+        # One-time purge: clear Kalman states poisoned by the has_observation=True bug.
+        # All filters converged to flow_ratio≈0.0, locking every channel as BALANCED.
+        # Fresh filters will re-converge with real observations (EMA drives until then).
+        try:
+            n = self.database.reset_all_kalman_states()
+            if n > 0:
+                self.plugin.log(
+                    f"FLOW: Purged {n} poisoned Kalman states (has_observation bug). "
+                    f"Filters will re-converge from EMA-based classification.",
+                    level='info'
+                )
+        except Exception:
+            pass  # Non-critical — filters will still work from fresh defaults
+
     # =========================================================================
     # v2.1 KALMAN FILTER METHODS
     # =========================================================================

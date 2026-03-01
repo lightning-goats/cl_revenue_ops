@@ -1265,6 +1265,16 @@ class Database:
         rows = conn.execute("SELECT * FROM kalman_state").fetchall()
         return [dict(row) for row in rows]
 
+    def reset_all_kalman_states(self) -> int:
+        """Delete all Kalman filter states, forcing fresh re-convergence.
+
+        Returns:
+            Number of rows deleted.
+        """
+        conn = self._get_connection()
+        cursor = conn.execute("DELETE FROM kalman_state")
+        return cursor.rowcount
+
     # =========================================================================
     # Portfolio Metrics Methods (EV v2.0)
     # =========================================================================
