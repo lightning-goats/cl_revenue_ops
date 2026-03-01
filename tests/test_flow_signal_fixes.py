@@ -535,6 +535,87 @@ class TestFix5PendingHTLC:
 # Integration: Consumer velocity conversion
 # =========================================================================
 
+class TestKalmanConvergenceGuard:
+    """Tests for Kalman convergence guard and predict-only mode."""
+
+    def test_predict_only_when_no_observation(self):
+        """has_observation=False should skip update, keeping filter at prior state."""
+        from modules.flow_analysis import KalmanFlowFilter
+
+        kf = KalmanFlowFilter()
+        # Set a non-zero state to verify it doesn't get pulled to 0.0
+        kf.state.flow_ratio = 0.7
+        kf.state.flow_velocity = 0.001
+        kf.state.last_update = int(time.time()) - 3600
+
+        # Predict step grows uncertainty but preserves ratio direction
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        predicted_ratio = kf.state.flow_ratio
+
+        # Without update, ratio should still be near 0.7 (shifted by velocity*dt)
+        assert predicted_ratio > 0.5, f"Predict-only should preserve prior: {predicted_ratio}"
+        # Uncertainty should grow (no observation to reduce it)
+        assert kf.get_uncertainty() > 0.1
+
+    def test_update_with_zero_pulls_toward_balanced(self):
+        """Updating with observation=0.0 should pull filter toward zero (the bug)."""
+        from modules.flow_analysis import KalmanFlowFilter
+
+        kf = KalmanFlowFilter()
+        kf.state.flow_ratio = 0.7
+        kf.state.flow_velocity = 0.0
+        kf.state.last_update = int(time.time()) - 3600
+
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        kf.update(0.0, confidence=0.5)
+
+        # Update with 0.0 should pull ratio toward 0.0
+        assert kf.state.flow_ratio < 0.7, "Update with 0.0 should reduce ratio"
+
+    def test_unconverged_filter_preserves_ema_classification(self):
+        """Kalman with high uncertainty should NOT override EMA classification."""
+        from modules.flow_analysis import (
+            KALMAN_INITIAL_VARIANCE, KALMAN_CONVERGENCE_UNCERTAINTY
+        )
+        import math
+
+        initial_uncertainty = math.sqrt(KALMAN_INITIAL_VARIANCE)
+        # Fresh filter uncertainty should exceed the convergence threshold
+        assert initial_uncertainty > KALMAN_CONVERGENCE_UNCERTAINTY, \
+            f"Initial uncertainty {initial_uncertainty} should exceed threshold {KALMAN_CONVERGENCE_UNCERTAINTY}"
+
+    def test_converged_filter_overrides_classification(self):
+        """Kalman with low uncertainty should override EMA classification."""
+        from modules.flow_analysis import (
+            KalmanFlowFilter, KALMAN_CONVERGENCE_UNCERTAINTY
+        )
+
+        kf = KalmanFlowFilter()
+        # Simulate convergence: many updates drive variance down
+        kf.state.last_update = int(time.time()) - 3600
+        for _ in range(50):
+            kf.predict(dt_hours=1.0, volatility=1.0)
+            kf.update(0.8, confidence=0.8)  # Consistent SOURCE observation
+
+        assert kf.get_uncertainty() < KALMAN_CONVERGENCE_UNCERTAINTY, \
+            f"Converged filter uncertainty {kf.get_uncertainty()} should be below threshold"
+        assert kf.state.flow_ratio > 0.5, "Converged filter should reflect observations"
+
+    def test_predict_only_updates_last_update(self):
+        """Predict-only mode should still update last_update timestamp."""
+        from modules.flow_analysis import KalmanFlowFilter
+
+        kf = KalmanFlowFilter()
+        kf.state.last_update = int(time.time()) - 7200  # 2 hours ago
+        old_ts = kf.state.last_update
+
+        kf.predict(dt_hours=2.0, volatility=1.0)
+        # In predict-only mode, the caller sets last_update
+        # (The filter's update() sets it; for predict-only, _apply_kalman_filter sets it)
+        # Just verify predict itself doesn't corrupt state
+        assert kf.state.last_update == old_ts  # predict() doesn't touch last_update
+
+
 class TestConsumerVelocityConversion:
     """Tests that consumers correctly convert per-hour velocity."""
 

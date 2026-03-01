@@ -116,6 +116,10 @@ KALMAN_INITIAL_VARIANCE = 0.1  # Starting P[0,0] and P[1,1]
 KALMAN_VOLATILITY_SCALING = 2.0  # How much volatility increases process noise
 KALMAN_CONFIDENCE_SCALING = 0.8  # How much confidence reduces measurement noise
 
+# Convergence threshold: Kalman must be this confident before overriding EMA classification
+# sqrt(KALMAN_INITIAL_VARIANCE) ≈ 0.316; converged filters typically reach 0.05-0.15
+KALMAN_CONVERGENCE_UNCERTAINTY = 0.25  # Below this, Kalman overrides EMA state
+
 # BALANCED_ACTIVE classification: distinguish busy two-way channels from dormant ones
 BALANCED_ACTIVE_TURNOVER_THRESHOLD = 0.01  # 1% of capacity per day
 
@@ -602,17 +606,20 @@ class FlowAnalyzer:
         observed_ratio: float,
         confidence: float,
         daily_buckets: List[Dict[str, int]],
-        prev_ts: int
+        prev_ts: int,
+        has_observation: bool = True
     ) -> Tuple[float, float, float, bool]:
         """
         Apply Kalman filter to get smoothed flow ratio estimate.
 
         Args:
             channel_id: Channel identifier
-            observed_ratio: Raw flow ratio from EMA
+            observed_ratio: Raw flow ratio from per-forward data
             confidence: Observation confidence (0.1 to 1.0)
             daily_buckets: Daily flow data for volatility calculation
             prev_ts: Previous update timestamp
+            has_observation: If False, run predict-only (no update).
+                Prevents feeding a fake 0.0 observation when no flow data exists.
 
         Returns:
             (kalman_ratio, kalman_velocity, uncertainty, regime_change)
@@ -635,11 +642,18 @@ class FlowAnalyzer:
         # Calculate volatility for process noise adaptation
         volatility = self._calculate_kalman_volatility(daily_buckets)
 
-        # Predict step
+        # Predict step (always runs — grows uncertainty over time)
         kf.predict(dt_hours, volatility)
 
-        # Update step with observation
-        innovation = kf.update(observed_ratio, confidence)
+        # Update step — only when we have real observation data.
+        # Without this guard, channels with no forwards get observation=0.0
+        # which actively pulls the filter toward BALANCED regardless of prior state.
+        innovation = 0.0
+        if has_observation:
+            innovation = kf.update(observed_ratio, confidence)
+        else:
+            # Predict-only: still record that we ran so dt_hours stays accurate
+            kf.state.last_update = int(time.time())
 
         # L-25: Log warning on NaN recovery
         if kf._nan_recovery_count > 0:
@@ -993,16 +1007,19 @@ class FlowAnalyzer:
                         observed_ratio=raw_observation,
                         confidence=kalman_confidence,
                         daily_buckets=channel_daily,
-                        prev_ts=prev_ts
+                        prev_ts=prev_ts,
+                        has_observation=(raw_count > 0)
                     )
                 metrics.kalman_flow_ratio = kalman_ratio
                 metrics.kalman_velocity = kalman_velocity
                 metrics.kalman_uncertainty = kalman_uncertainty
                 metrics.kalman_regime_change = regime_change
 
-                # Use Kalman estimate for state classification if enabled
-                # Kalman provides smoother estimates with faster regime change detection
-                if not metrics.is_congested:
+                # Use Kalman estimate for state classification only when the filter
+                # has converged (low uncertainty). Unconverged filters (fresh/reset)
+                # produce near-zero ratios that incorrectly classify everything as BALANCED.
+                # Until converged, keep the EMA-based classification from _calculate_metrics().
+                if not metrics.is_congested and kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY:
                     if kalman_ratio > self.config.source_threshold:
                         metrics.state = ChannelState.SOURCE
                     elif kalman_ratio < self.config.sink_threshold:
@@ -1160,15 +1177,16 @@ class FlowAnalyzer:
                     observed_ratio=raw_observation,
                     confidence=kalman_confidence,
                     daily_buckets=channel_daily,
-                    prev_ts=prev_ts
+                    prev_ts=prev_ts,
+                    has_observation=(raw_count > 0)
                 )
             metrics.kalman_flow_ratio = kalman_ratio
             metrics.kalman_velocity = kalman_velocity
             metrics.kalman_uncertainty = kalman_uncertainty
             metrics.kalman_regime_change = regime_change
 
-            # Re-classify state using Kalman estimate (matching analyze_all_channels behavior)
-            if not metrics.is_congested:
+            # Re-classify using Kalman only when converged (matching analyze_all_channels)
+            if not metrics.is_congested and kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY:
                 if kalman_ratio > self.config.source_threshold:
                     metrics.state = ChannelState.SOURCE
                 elif kalman_ratio < self.config.sink_threshold:
