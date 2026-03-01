@@ -64,8 +64,8 @@ MULTIPLIER_DEADBAND = 0.1  # Ignore flow_ratio changes smaller than this
 # velocity = (current_ratio - previous_ratio) / time_hours
 # Security: Outlier detection, bounded range
 ENABLE_FLOW_VELOCITY = True
-MAX_VELOCITY = 0.5  # Max flow_ratio change per hour (security bound)
-MIN_VELOCITY = -0.5  # Min flow_ratio change per hour
+MAX_VELOCITY = 0.5 / 24.0  # Max flow_ratio change per hour (security bound)
+MIN_VELOCITY = -0.5 / 24.0  # Min flow_ratio change per hour
 VELOCITY_OUTLIER_THRESHOLD = 3.0  # Ignore velocity changes > 3 standard deviations
 
 # Improvement #5: Adaptive EMA Decay
@@ -93,10 +93,11 @@ ENABLE_KALMAN_FILTER = True
 
 # Process noise (Q) - how much we expect flow to change naturally
 # Higher = more responsive but noisier, Lower = smoother but slower
-KALMAN_BASE_PROCESS_NOISE = 0.01  # Base variance in flow_ratio per day
-KALMAN_VELOCITY_PROCESS_NOISE = 0.005  # Base variance in velocity per day
-KALMAN_MIN_PROCESS_NOISE = 0.001  # Security floor
-KALMAN_MAX_PROCESS_NOISE = 0.1  # Security ceiling
+# All noise parameters are per-hour to avoid dt³ collapse at hourly updates.
+KALMAN_BASE_PROCESS_NOISE = 0.01 / 24.0  # Base variance in flow_ratio per hour
+KALMAN_VELOCITY_PROCESS_NOISE = 0.005 / 24.0  # Base variance in velocity per hour
+KALMAN_MIN_PROCESS_NOISE = 0.001 / 24.0  # Security floor
+KALMAN_MAX_PROCESS_NOISE = 0.1 / 24.0  # Security ceiling
 
 # Measurement noise (R) - uncertainty in observations
 # Scaled inversely by forward count (more forwards = less noise)
@@ -111,6 +112,9 @@ KALMAN_INITIAL_VARIANCE = 0.1  # Starting P[0,0] and P[1,1]
 KALMAN_VOLATILITY_SCALING = 2.0  # How much volatility increases process noise
 KALMAN_CONFIDENCE_SCALING = 0.8  # How much confidence reduces measurement noise
 
+# BALANCED_ACTIVE classification: distinguish busy two-way channels from dormant ones
+BALANCED_ACTIVE_TURNOVER_THRESHOLD = 0.01  # 1% of capacity per day
+
 
 @dataclass
 class KalmanFlowState:
@@ -122,7 +126,7 @@ class KalmanFlowState:
 
     Attributes:
         flow_ratio: Estimated flow ratio (-1 to 1)
-        flow_velocity: Estimated rate of change per day
+        flow_velocity: Estimated rate of change per hour
         variance_ratio: Uncertainty in flow_ratio estimate
         variance_velocity: Uncertainty in velocity estimate
         covariance: Cross-covariance between ratio and velocity
@@ -176,7 +180,7 @@ class KalmanFlowFilter:
     3. Weights by confidence (more forwards = trust observation more)
     4. Provides uncertainty estimates
 
-    State transition model (discrete time, dt in days):
+    State transition model (discrete time, dt in hours):
         flow_ratio[k] = flow_ratio[k-1] + velocity[k-1] * dt + noise
         velocity[k] = velocity[k-1] + noise
 
@@ -212,15 +216,15 @@ class KalmanFlowFilter:
             max_cov = math.sqrt(self.state.variance_ratio * self.state.variance_velocity) * 0.9
             self.state.covariance = max(-max_cov, min(max_cov, self.state.covariance))
 
-    def predict(self, dt_days: float, volatility: float = 1.0) -> None:
+    def predict(self, dt_hours: float, volatility: float = 1.0) -> None:
         """
         Prediction step: Project state forward in time.
 
         Args:
-            dt_days: Time since last update in days
+            dt_hours: Time since last update in hours
             volatility: Multiplier for process noise (higher = more uncertain)
         """
-        if dt_days <= 0:
+        if dt_hours <= 0:
             return
 
         # NaN guard before computation
@@ -231,7 +235,7 @@ class KalmanFlowFilter:
         # State transition: x_k = A * x_{k-1}
         # A = [[1, dt], [0, 1]]
         # flow_ratio += velocity * dt
-        self.state.flow_ratio += self.state.flow_velocity * dt_days
+        self.state.flow_ratio += self.state.flow_velocity * dt_hours
         # velocity stays the same (random walk)
 
         # Bound state after prediction to physical range
@@ -255,9 +259,9 @@ class KalmanFlowFilter:
         # Q matrix from piecewise-constant acceleration noise:
         #   Q = [[q_r*dt + q_v*dt^3/3, q_v*dt^2/2], [q_v*dt^2/2, q_v*dt]]
         # This ensures Q is positive semi-definite for all dt values.
-        new_p00 = p00 + 2 * dt_days * p01 + dt_days * dt_days * p11 + q_ratio * dt_days + q_velocity * dt_days * dt_days * dt_days / 3.0
-        new_p01 = p01 + dt_days * p11 + q_velocity * dt_days * dt_days / 2.0
-        new_p11 = p11 + q_velocity * dt_days
+        new_p00 = p00 + 2 * dt_hours * p01 + dt_hours * dt_hours * p11 + q_ratio * dt_hours + q_velocity * dt_hours * dt_hours * dt_hours / 3.0
+        new_p01 = p01 + dt_hours * p11 + q_velocity * dt_hours * dt_hours / 2.0
+        new_p11 = p11 + q_velocity * dt_hours
 
         self.state.variance_ratio = new_p00
         self.state.covariance = new_p01
@@ -362,18 +366,25 @@ class KalmanFlowFilter:
 class ChannelState(Enum):
     """
     Classification of channel flow state.
-    
+
     SOURCE: Net outflow - channel is draining
     SINK: Net inflow - channel is filling
     BALANCED: Roughly equal flow - ideal state
+    BALANCED_ACTIVE: High-turnover two-way channel (balanced but busy)
     UNKNOWN: Not enough data to classify
     CONGESTED: HTLC slots near exhaustion (>80% used)
     """
     SOURCE = "source"
     SINK = "sink"
     BALANCED = "balanced"
+    BALANCED_ACTIVE = "balanced_active"
     UNKNOWN = "unknown"
     CONGESTED = "congested"
+
+    @property
+    def is_balanced(self) -> bool:
+        """True for both BALANCED and BALANCED_ACTIVE."""
+        return self in (ChannelState.BALANCED, ChannelState.BALANCED_ACTIVE)
 
 
 @dataclass
@@ -432,9 +443,11 @@ class FlowMetrics:
     previous_ratio_timestamp: int = 0  # When previous was recorded
     # v2.1 Kalman filter fields
     kalman_flow_ratio: float = 0.0  # Kalman-filtered flow ratio estimate
-    kalman_velocity: float = 0.0  # Kalman-estimated velocity (ratio change/day)
+    kalman_velocity: float = 0.0  # Kalman-estimated velocity (ratio change/hour)
     kalman_uncertainty: float = 0.1  # Standard deviation of estimate
     kalman_regime_change: bool = False  # True if regime change detected
+    # v2.2 fields
+    pending_outbound_htlc_sats: int = 0  # Locked liquidity in pending outbound HTLCs
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -507,6 +520,7 @@ class FlowAnalyzer:
         Get or create Kalman filter for a channel.
 
         Loads persisted state from database if available.
+        Resets old per-day velocity states to fresh filters (re-converges in ~10 hours).
         """
         with self._kalman_lock:
             if channel_id in self._kalman_filters:
@@ -515,8 +529,13 @@ class FlowAnalyzer:
         # Try to load from database (outside lock — DB has its own locking)
         state_dict = self.database.get_kalman_state(channel_id)
         if state_dict:
-            state = KalmanFlowState.from_dict(state_dict)
-            kf = KalmanFlowFilter(state)
+            velocity_unit = state_dict.get("velocity_unit") or "per_day"
+            if velocity_unit == "per_hour":
+                state = KalmanFlowState.from_dict(state_dict)
+                kf = KalmanFlowFilter(state)
+            else:
+                # Old per-day velocity state — reset to fresh filter
+                kf = KalmanFlowFilter()
         else:
             kf = KalmanFlowFilter()
 
@@ -601,21 +620,21 @@ class FlowAnalyzer:
 
         kf = self._get_kalman_filter(channel_id)
 
-        # Calculate time since last update
+        # Calculate time since last update (in hours)
         now = int(time.time())
         if kf.state.last_update > 0:
-            dt_days = (now - kf.state.last_update) / 86400.0
+            dt_hours = (now - kf.state.last_update) / 3600.0
         else:
-            dt_days = 1.0  # First run, assume 1 day
+            dt_hours = 24.0  # First run, assume 1 day
 
-        # Cap dt to prevent explosion after long gaps
-        dt_days = min(dt_days, 7.0)
+        # Cap dt to prevent explosion after long gaps (7 days = 168 hours)
+        dt_hours = min(dt_hours, 168.0)
 
         # Calculate volatility for process noise adaptation
         volatility = self._calculate_kalman_volatility(daily_buckets)
 
         # Predict step
-        kf.predict(dt_days, volatility)
+        kf.predict(dt_hours, volatility)
 
         # Update step with observation
         innovation = kf.update(observed_ratio, confidence)
@@ -648,6 +667,43 @@ class FlowAnalyzer:
             kf.get_uncertainty(),
             regime_change
         )
+
+    def _compute_raw_kalman_observation(
+        self, channel_id: str, capacity: int,
+        net_flow_entries: List[Dict[str, Any]],
+        halflife_hours: float = 24.0,
+    ) -> Tuple[float, int]:
+        """Compute raw Kalman observation using continuous-time exponential decay.
+
+        Bypasses the EMA pipeline to provide an unsmoothed observation that
+        satisfies the Kalman filter's white-noise measurement assumption.
+
+        Returns (raw_ratio, entry_count). Falls back to (0.0, 0) on no data.
+        """
+        if not net_flow_entries or capacity <= 0:
+            return 0.0, 0
+
+        now = time.time()
+        ln2 = math.log(2)
+        weighted_net_sats = 0.0
+        total_weight = 0.0
+
+        for entry in net_flow_entries:
+            ts = entry.get("timestamp", 0)
+            net_msat = entry.get("net_msat", 0)
+            age_hours = (now - ts) / 3600.0
+            if age_hours < 0:
+                age_hours = 0.0
+            weight = math.exp(-ln2 / halflife_hours * age_hours)
+            weighted_net_sats += (net_msat / 1000.0) * weight
+            total_weight += weight
+
+        if total_weight <= 0:
+            return 0.0, 0
+
+        raw_ratio = weighted_net_sats / (total_weight * capacity)
+        raw_ratio = max(-1.0, min(1.0, raw_ratio))
+        return raw_ratio, len(net_flow_entries)
 
     # =========================================================================
     # v2.0 IMPROVEMENT METHODS
@@ -839,6 +895,11 @@ class FlowAnalyzer:
         
         # Get flow data from local forwards table (daily buckets for EMA calculation).
         flow_data_daily = self._get_daily_flow_from_db()
+
+        # Raw per-forward data for Kalman observation (bypasses EMA smoothing)
+        raw_flow_data = self.database.get_continuous_net_flow_all(
+            window_hours=self.config.flow_window_days * 24
+        )
         
         # Analyze each channel
         for channel in channels:
@@ -863,8 +924,12 @@ class FlowAnalyzer:
             if capacity == 0:
                 capacity = int(channel.get("capacity", 0))
 
-            # Get current balance for fallback inference
-            our_balance = spendable_msat // 1000
+            # Get current balance, deducting pending outbound HTLCs as locked liquidity.
+            # Note: CLN's spendable_msat typically already accounts for in-flight HTLCs.
+            # This provides an explicit safety margin for edge cases and older CLN versions.
+            pending_out_msat = channel.get("pending_outbound_htlc_msat", 0)
+            effective_spendable_msat = max(0, spendable_msat - pending_out_msat)
+            our_balance = effective_spendable_msat // 1000
 
             # Get daily buckets for this channel
             channel_daily = flow_data_daily.get(channel_id, [])
@@ -913,11 +978,18 @@ class FlowAnalyzer:
 
             # v2.1: Apply Kalman filter for improved flow estimation
             if ENABLE_KALMAN_FILTER:
+                # Compute raw observation from per-forward data (not EMA-smoothed)
+                raw_entries = raw_flow_data.get(channel_id, [])
+                raw_observation, raw_count = self._compute_raw_kalman_observation(
+                    channel_id, capacity, raw_entries
+                )
+                kalman_confidence = self._calculate_confidence(raw_count, last_forward_ts) if raw_count > 0 else metrics.confidence
+
                 kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change = \
                     self._apply_kalman_filter(
                         channel_id=channel_id,
-                        observed_ratio=metrics.flow_ratio,
-                        confidence=metrics.confidence,
+                        observed_ratio=raw_observation,
+                        confidence=kalman_confidence,
                         daily_buckets=channel_daily,
                         prev_ts=prev_ts
                     )
@@ -934,7 +1006,11 @@ class FlowAnalyzer:
                     elif kalman_ratio < self.config.sink_threshold:
                         metrics.state = ChannelState.SINK
                     else:
-                        metrics.state = ChannelState.BALANCED
+                        turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
+                        if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
+                            metrics.state = ChannelState.BALANCED_ACTIVE
+                        else:
+                            metrics.state = ChannelState.BALANCED
 
             results[channel_id] = metrics
 
@@ -1015,7 +1091,10 @@ class FlowAnalyzer:
         if capacity == 0:
             capacity = int(channel.get("capacity", 0))
 
-        our_balance = spendable_msat // 1000
+        # Deduct pending outbound HTLCs as locked liquidity
+        pending_out_msat = channel.get("pending_outbound_htlc_msat", 0)
+        effective_spendable_msat = max(0, spendable_msat - pending_out_msat)
+        our_balance = effective_spendable_msat // 1000
 
         # Get daily flow data
         flow_data_daily = self._get_daily_flow_from_db(channel_id)
@@ -1064,11 +1143,21 @@ class FlowAnalyzer:
 
         # v2.1: Apply Kalman filter
         if ENABLE_KALMAN_FILTER:
+            # Compute raw observation from per-forward data (not EMA-smoothed)
+            raw_flow_data = self.database.get_continuous_net_flow_all(
+                window_hours=self.config.flow_window_days * 24
+            )
+            raw_entries = raw_flow_data.get(channel_id, [])
+            raw_observation, raw_count = self._compute_raw_kalman_observation(
+                channel_id, capacity, raw_entries
+            )
+            kalman_confidence = self._calculate_confidence(raw_count, last_forward_ts) if raw_count > 0 else metrics.confidence
+
             kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change = \
                 self._apply_kalman_filter(
                     channel_id=channel_id,
-                    observed_ratio=metrics.flow_ratio,
-                    confidence=metrics.confidence,
+                    observed_ratio=raw_observation,
+                    confidence=kalman_confidence,
                     daily_buckets=channel_daily,
                     prev_ts=prev_ts
                 )
@@ -1084,7 +1173,11 @@ class FlowAnalyzer:
                 elif kalman_ratio < self.config.sink_threshold:
                     metrics.state = ChannelState.SINK
                 else:
-                    metrics.state = ChannelState.BALANCED
+                    turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
+                    if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
+                        metrics.state = ChannelState.BALANCED_ACTIVE
+                    else:
+                        metrics.state = ChannelState.BALANCED
 
         # Persist state so single-channel analysis is reflected in get_channel_state()
         self.database.update_channel_state(
@@ -1144,6 +1237,10 @@ class FlowAnalyzer:
         else:
             flow_ratio = 0.0
 
+        # Calculate daily volume early (needed for BALANCED_ACTIVE classification)
+        total_volume = sats_in + sats_out
+        daily_volume = total_volume // max(self.config.flow_window_days, 1)
+
         # Check HTLC slot congestion FIRST
         htlc_utilization = active_htlcs / max_htlcs if max_htlcs > 0 else 0.0
         is_congested = htlc_utilization > self.config.htlc_congestion_threshold
@@ -1161,7 +1258,11 @@ class FlowAnalyzer:
             elif flow_ratio < self.config.sink_threshold:
                 state = ChannelState.SINK
             else:
-                state = ChannelState.BALANCED
+                turnover = daily_volume / capacity if capacity > 0 else 0.0
+                if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
+                    state = ChannelState.BALANCED_ACTIVE
+                else:
+                    state = ChannelState.BALANCED
         else:
             # FALLBACK: Infer from current balance
             outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
@@ -1175,10 +1276,6 @@ class FlowAnalyzer:
             else:
                 state = ChannelState.BALANCED
                 flow_ratio = 0.0
-
-        # Calculate daily volume (simple average for display/stats)
-        total_volume = sats_in + sats_out
-        daily_volume = total_volume // max(self.config.flow_window_days, 1)
 
         # v2.0: Calculate confidence score
         confidence = self._calculate_confidence(forward_count, last_forward_ts)
@@ -1343,7 +1440,14 @@ class FlowAnalyzer:
                     # Count active HTLCs from the htlcs array
                     htlcs = channel_info.get("htlcs", [])
                     channel_info["active_htlcs"] = len(htlcs) if htlcs else 0
-                    
+
+                    # Sum pending outbound HTLC amounts (locked liquidity)
+                    pending_out_msat = 0
+                    for htlc in (htlcs or []):
+                        if htlc.get("direction") == "out":
+                            pending_out_msat += int(htlc.get("amount_msat", 0) or 0)
+                    channel_info["pending_outbound_htlc_msat"] = pending_out_msat
+
                     channels.append(channel_info)
             
             return channels

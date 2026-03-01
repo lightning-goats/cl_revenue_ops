@@ -1111,6 +1111,8 @@ class Database:
                 ks_cols = {row[1] for row in conn.execute("PRAGMA table_info(kalman_state)").fetchall()}
                 if 'last_innovation' not in ks_cols:
                     conn.execute("ALTER TABLE kalman_state ADD COLUMN last_innovation REAL DEFAULT 0.0")
+                if 'velocity_unit' not in ks_cols:
+                    conn.execute("ALTER TABLE kalman_state ADD COLUMN velocity_unit TEXT DEFAULT 'per_day'")
             except Exception as e:
                 self.plugin.log(f"Kalman migration warning: {e}", level='debug')
 
@@ -1203,12 +1205,21 @@ class Database:
         return [dict(row) for row in rows]
     
     def get_channels_by_state(self, state: str) -> List[Dict[str, Any]]:
-        """Get all channels with a specific state."""
+        """Get all channels with a specific state.
+
+        For backward compatibility, querying "balanced" returns both
+        "balanced" and "balanced_active" channels.
+        """
         conn = self._get_connection()
-        rows = conn.execute(
-            "SELECT * FROM channel_states WHERE state = ?",
-            (state,)
-        ).fetchall()
+        if state == "balanced":
+            rows = conn.execute(
+                "SELECT * FROM channel_states WHERE state IN ('balanced', 'balanced_active')"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM channel_states WHERE state = ?",
+                (state,)
+            ).fetchall()
         return [dict(row) for row in rows]
 
     # =========================================================================
@@ -1233,8 +1244,8 @@ class Database:
         conn.execute("""
             INSERT OR REPLACE INTO kalman_state
             (channel_id, flow_ratio, flow_velocity, variance_ratio, variance_velocity,
-             covariance, last_update, innovation_variance, last_innovation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             covariance, last_update, innovation_variance, last_innovation, velocity_unit)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             channel_id,
             state.get("flow_ratio", 0.0),
@@ -1244,7 +1255,8 @@ class Database:
             state.get("covariance", 0.0),
             state.get("last_update", 0),
             state.get("innovation_variance", 0.01),
-            state.get("last_innovation", 0.0)
+            state.get("last_innovation", 0.0),
+            "per_hour",
         ))
 
     def get_all_kalman_states(self) -> List[Dict[str, Any]]:
@@ -3035,6 +3047,38 @@ class Database:
                 bucket["last_ts"] = last_ts
 
         return flow_data
+
+    def get_continuous_net_flow_all(self, window_hours: int = 168) -> Dict[str, List[Dict[str, Any]]]:
+        """Per-forward net flow with timestamps for all channels.
+
+        Returns {channel_id: [{timestamp, net_msat}, ...]} sorted by timestamp DESC.
+        Unlike get_daily_flow_buckets_all() (calendar-day grouping), this returns
+        individual forwards for continuous-time weighting in the Kalman filter.
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - window_hours * 3600
+
+        rows = conn.execute("""
+            SELECT out_channel AS channel_id, timestamp, out_msat AS net_msat
+            FROM forwards WHERE timestamp >= ?
+            UNION ALL
+            SELECT in_channel AS channel_id, timestamp, -in_msat AS net_msat
+            FROM forwards WHERE timestamp >= ?
+            ORDER BY channel_id, timestamp DESC
+        """, (cutoff, cutoff)).fetchall()
+
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            cid = row["channel_id"]
+            if not cid:
+                continue
+            if cid not in result:
+                result[cid] = []
+            result[cid].append({
+                "timestamp": int(row["timestamp"]),
+                "net_msat": int(row["net_msat"]),
+            })
+        return result
 
     def get_portfolio_forward_buckets(
         self,

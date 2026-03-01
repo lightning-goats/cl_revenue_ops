@@ -78,13 +78,15 @@ class TestKalmanLastInnovationPersistence:
 
         db.save_kalman_state("chan123", state_dict)
 
-        # Verify the INSERT includes 9 values (channel_id + 8 fields)
+        # Verify the INSERT includes 10 values (channel_id + 8 state fields + velocity_unit)
         call_args = mock_conn.execute.call_args
         sql = call_args[0][0]
         params = call_args[0][1]
         assert "last_innovation" in sql
-        assert len(params) == 9  # channel_id + 8 state fields
-        assert params[-1] == -0.33  # last_innovation is last param
+        assert "velocity_unit" in sql
+        assert len(params) == 10  # channel_id + 8 state fields + velocity_unit
+        assert params[-2] == -0.33  # last_innovation is second-to-last param
+        assert params[-1] == "per_hour"  # velocity_unit is last param
 
 
 class TestKalmanSaveErrorHandling:
@@ -149,20 +151,20 @@ class TestKalmanStateBounding:
         state = KalmanFlowState(flow_ratio=0.8, flow_velocity=0.5)
         kf = KalmanFlowFilter(state)
 
-        # dt=7 days, velocity=0.5 → would add 3.5, pushing to 4.3
-        kf.predict(dt_days=7.0, volatility=1.0)
+        # dt=168 hours (7 days), extreme velocity → would push ratio far out of range
+        kf.predict(dt_hours=168.0, volatility=1.0)
         assert kf.state.flow_ratio <= 1.0
         assert kf.state.flow_ratio >= -1.0
 
     def test_predict_clamps_velocity(self):
         """After predict, velocity stays bounded."""
-        from modules.flow_analysis import KalmanFlowFilter, KalmanFlowState
+        from modules.flow_analysis import KalmanFlowFilter, KalmanFlowState, MAX_VELOCITY
 
         state = KalmanFlowState(flow_velocity=2.0)  # Already extreme
         kf = KalmanFlowFilter(state)
 
-        kf.predict(dt_days=1.0)
-        assert kf.state.flow_velocity <= 1.0
+        kf.predict(dt_hours=24.0)
+        assert kf.state.flow_velocity <= MAX_VELOCITY
 
     def test_update_clamps_flow_ratio(self):
         """After update with extreme observation, flow_ratio stays bounded."""
@@ -188,7 +190,7 @@ class TestKalmanStateBounding:
         state = KalmanFlowState(flow_ratio=-0.9, flow_velocity=-0.8)
         kf = KalmanFlowFilter(state)
 
-        kf.predict(dt_days=5.0)
+        kf.predict(dt_hours=120.0)
         assert kf.state.flow_ratio >= -1.0
 
 
@@ -209,7 +211,7 @@ class TestKalmanNaNRecovery:
         )
         kf = KalmanFlowFilter(state)
 
-        kf.predict(dt_days=1.0)
+        kf.predict(dt_hours=24.0)
 
         # State should be reset (NaN detected)
         assert not math.isnan(kf.state.flow_ratio)
@@ -263,7 +265,7 @@ class TestKalmanCovariancePositiveDefiniteness:
 
         # Multiple updates to stress the covariance
         for i in range(20):
-            kf.predict(dt_days=0.5)
+            kf.predict(dt_hours=12.0)
             kf.update(0.3 + 0.1 * (i % 3), confidence=0.5)
 
         # Determinant should be positive

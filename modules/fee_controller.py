@@ -5952,7 +5952,8 @@ class HillClimbingFeeController:
                             and not math.isnan(kv) and not math.isnan(ku)):
                         ku = max(0.0, ku)  # L7: guard against negative DB values
                         confidence = 1.0 / (1.0 + ku)
-                        demand_factor = 1.0 + kv * confidence * 2.0
+                        # kv is per-hour; scale to per-day for demand factor
+                        demand_factor = 1.0 + (kv * 24.0) * confidence * 2.0
                         demand_factor = max(0.25, min(4.0, demand_factor))
             except Exception as e:
                 self.plugin.log(f"Kalman demand fallback: {e}", level='debug')

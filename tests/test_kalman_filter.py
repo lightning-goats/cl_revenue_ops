@@ -60,7 +60,7 @@ class TestKalmanFlowFilter:
         kf = KalmanFlowFilter()
         initial_var = kf.state.variance_ratio
 
-        kf.predict(dt_days=1.0, volatility=1.0)
+        kf.predict(dt_hours=24.0, volatility=1.0)
 
         # Uncertainty should increase after prediction (process noise)
         assert kf.state.variance_ratio > initial_var
@@ -70,11 +70,11 @@ class TestKalmanFlowFilter:
         from modules.flow_analysis import KalmanFlowFilter
 
         kf = KalmanFlowFilter()
-        kf.state.flow_velocity = 0.1  # 0.1 per day
+        kf.state.flow_velocity = 0.1 / 24.0  # 0.1 per day = ~0.00417 per hour
 
-        kf.predict(dt_days=2.0, volatility=1.0)
+        kf.predict(dt_hours=48.0, volatility=1.0)
 
-        # Ratio should have increased by velocity * dt
+        # Ratio should have increased by velocity * dt = (0.1/24) * 48 = 0.2
         assert kf.state.flow_ratio == pytest.approx(0.2, rel=0.1)
 
     def test_update_reduces_uncertainty(self):
@@ -82,7 +82,7 @@ class TestKalmanFlowFilter:
         from modules.flow_analysis import KalmanFlowFilter
 
         kf = KalmanFlowFilter()
-        kf.predict(dt_days=1.0, volatility=1.0)
+        kf.predict(dt_hours=24.0, volatility=1.0)
         pre_update_var = kf.state.variance_ratio
 
         kf.update(observed_ratio=0.5, confidence=1.0)
@@ -97,7 +97,7 @@ class TestKalmanFlowFilter:
         kf = KalmanFlowFilter()
         kf.state.flow_ratio = 0.0
 
-        kf.predict(dt_days=1.0, volatility=1.0)
+        kf.predict(dt_hours=24.0, volatility=1.0)
         kf.update(observed_ratio=0.6, confidence=1.0)
 
         # Estimate should be between 0 and 0.6
@@ -110,8 +110,8 @@ class TestKalmanFlowFilter:
         kf_high = KalmanFlowFilter()
         kf_low = KalmanFlowFilter()
 
-        kf_high.predict(dt_days=1.0, volatility=1.0)
-        kf_low.predict(dt_days=1.0, volatility=1.0)
+        kf_high.predict(dt_hours=24.0, volatility=1.0)
+        kf_low.predict(dt_hours=24.0, volatility=1.0)
 
         kf_high.update(observed_ratio=0.5, confidence=1.0)
         kf_low.update(observed_ratio=0.5, confidence=0.2)
@@ -126,8 +126,8 @@ class TestKalmanFlowFilter:
         kf_volatile = KalmanFlowFilter()
         kf_stable = KalmanFlowFilter()
 
-        kf_volatile.predict(dt_days=1.0, volatility=2.0)
-        kf_stable.predict(dt_days=1.0, volatility=0.5)
+        kf_volatile.predict(dt_hours=24.0, volatility=2.0)
+        kf_stable.predict(dt_hours=24.0, volatility=0.5)
 
         # Both observe same value
         kf_volatile.update(observed_ratio=0.5, confidence=1.0)
@@ -142,15 +142,15 @@ class TestKalmanFlowFilter:
 
         kf = KalmanFlowFilter()
 
-        # Simulate regime change: flow jumps to 0.6
-        for _ in range(10):
-            kf.predict(dt_days=1.0, volatility=1.0)
+        # Simulate regime change: flow jumps to 0.6 (hourly observations over 2 days)
+        for _ in range(48):
+            kf.predict(dt_hours=1.0, volatility=1.0)
             kf.update(observed_ratio=0.6, confidence=0.8)
 
-        # After 10 observations, should be close to 0.6
+        # After 48 hourly observations, should be close to 0.6
         assert kf.state.flow_ratio == pytest.approx(0.6, abs=0.1)
-        # Velocity should have settled near 0
-        assert abs(kf.state.flow_velocity) < 0.05
+        # Velocity should have settled near 0 (per-hour scale)
+        assert abs(kf.state.flow_velocity) < 0.01
 
     def test_get_uncertainty(self):
         """Test uncertainty calculation."""
@@ -168,13 +168,13 @@ class TestKalmanFlowFilter:
 
         kf = KalmanFlowFilter()
 
-        # Stabilize at 0
+        # Stabilize at 0 (hourly updates)
         for _ in range(5):
-            kf.predict(dt_days=1.0, volatility=0.5)
+            kf.predict(dt_hours=24.0, volatility=0.5)
             kf.update(observed_ratio=0.0, confidence=1.0)
 
         # Large sudden change
-        kf.predict(dt_days=1.0, volatility=0.5)
+        kf.predict(dt_hours=24.0, volatility=0.5)
         kf.update(observed_ratio=0.8, confidence=1.0)
 
         # Innovation should be large relative to expected
@@ -196,10 +196,10 @@ class TestKalmanVsEMA:
         estimates = []
 
         for obs in observations:
-            kf.predict(dt_days=1.0, volatility=1.5)  # Higher volatility = faster response
+            kf.predict(dt_hours=24.0, volatility=1.5)  # Higher volatility = faster response
             kf.update(obs, confidence=0.9)
             estimates.append(kf.state.flow_ratio)
 
-        # Kalman should reach >0.4 within first 3 observations
+        # Kalman should reach >0.4 within first 3 daily observations
         # (EMA with decay=0.8 would take longer)
         assert estimates[2] > 0.4
