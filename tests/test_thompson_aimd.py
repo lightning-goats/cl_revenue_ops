@@ -2154,31 +2154,29 @@ class TestElasticityPriorBias:
     def test_elastic_demand_shifts_a_negative(self):
         from modules.fee_controller import GaussianThompsonState
         state = GaussianThompsonState()
-        state.posterior_coeffs = [0.0, 1.0, 0.0]
         state._apply_elasticity_to_prior(elasticity=-2.0, confidence=0.8)
-        assert state.posterior_coeffs[0] < 0
+        assert state._prior_coeffs[0] < 0
 
     def test_inelastic_demand_small_shift(self):
         from modules.fee_controller import GaussianThompsonState
         state = GaussianThompsonState()
-        state.posterior_coeffs = [0.0, 1.0, 0.0]
         state._apply_elasticity_to_prior(elasticity=-0.1, confidence=0.8)
-        assert state.posterior_coeffs[0] < 0
-        assert state.posterior_coeffs[0] > -0.1
+        assert state._prior_coeffs[0] < 0
+        assert state._prior_coeffs[0] > -0.1
 
     def test_low_confidence_no_effect(self):
         from modules.fee_controller import GaussianThompsonState
         state = GaussianThompsonState()
-        original = state.posterior_coeffs[0]
+        original = state._prior_coeffs[0]
         state._apply_elasticity_to_prior(elasticity=-2.0, confidence=0.2)
-        assert state.posterior_coeffs[0] == original
+        assert state._prior_coeffs[0] == original
 
     def test_precision_boost(self):
         from modules.fee_controller import GaussianThompsonState
         state = GaussianThompsonState()
-        original_prec = state.posterior_precision[0][0]
+        original_prec = state._prior_precision[0][0]
         state._apply_elasticity_to_prior(elasticity=-1.5, confidence=0.8)
-        assert state.posterior_precision[0][0] > original_prec
+        assert state._prior_precision[0][0] > original_prec
 
     def test_precision_capped_at_max(self):
         """H2: Precision should not grow beyond cap after many calls."""
@@ -2186,7 +2184,18 @@ class TestElasticityPriorBias:
         state = GaussianThompsonState()
         for _ in range(200):
             state._apply_elasticity_to_prior(elasticity=-2.0, confidence=1.0)
-        assert state.posterior_precision[0][0] <= 10.0
+        assert state._prior_precision[0][0] <= 10.0
+
+    def test_no_compounding_drift(self):
+        """Repeated calls should not compound the prior bias."""
+        from modules.fee_controller import GaussianThompsonState
+        state = GaussianThompsonState()
+        state._apply_elasticity_to_prior(elasticity=-2.0, confidence=0.8)
+        first_a = state._prior_coeffs[0]
+        # Call again with same params — should get same result (reset-then-bias)
+        state._apply_elasticity_to_prior(elasticity=-2.0, confidence=0.8)
+        second_a = state._prior_coeffs[0]
+        assert abs(first_a - second_a) < 1e-10
 
 
 class TestElasticityBiasDirection:

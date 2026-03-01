@@ -2136,6 +2136,10 @@ class GaussianThompsonState:
         Bias the polynomial prior's quadratic coefficient toward the
         curvature implied by observed price elasticity.
 
+        Modifies _prior_coeffs and _prior_precision so that the next
+        _recompute_posterior() call incorporates the elasticity signal.
+        Uses reset-to-default-then-bias to avoid compounding drift.
+
         Args:
             elasticity: Current elasticity estimate (typically [-3, 0])
             confidence: Confidence in the estimate (0-1)
@@ -2147,14 +2151,15 @@ class GaussianThompsonState:
         clamped_e = max(-3.0, min(0.0, elasticity))
         target_a = -0.01 + (clamped_e / -3.0) * (-0.5 - (-0.01))  # linear map
 
-        # Blend toward target with 30% * confidence weight
+        # Reset to default then blend toward target (prevents compounding drift)
+        default_a = 0.0
         blend = 0.3 * confidence
-        self.posterior_coeffs[0] = (
-            (1.0 - blend) * self.posterior_coeffs[0] + blend * target_a
-        )
-        # Boost precision on 'a' coefficient (capped to prevent runaway growth)
-        self.posterior_precision[0][0] = min(
-            10.0, self.posterior_precision[0][0] + confidence * 0.1
+        self._prior_coeffs[0] = (1.0 - blend) * default_a + blend * target_a
+
+        # Boost precision on 'a' coefficient (reset from default 0.01, capped)
+        default_prec_a = 0.01
+        self._prior_precision[0][0] = min(
+            10.0, default_prec_a + confidence * 0.1
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -6149,8 +6154,8 @@ class HillClimbingFeeController:
                 try:
                     if self._is_topology_depleted(channel_id, capacity, cfg):
                         topology_suppressed = True
-                except Exception:
-                    pass  # AskRene unavailable → normal AIMD
+                except Exception as e:
+                    self.plugin.log(f"Topology depletion check failed: {e}", level='debug')
 
             ts_state.aimd.record_outcome(
                 success_score=success_score,
