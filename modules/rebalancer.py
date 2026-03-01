@@ -518,7 +518,14 @@ class JobManager:
                 if source_state and source_state.get("capacity", 0) > 0:
                     source_cap = source_state["capacity"]
                     source_bal = self._get_channel_local_balance(primary_source_scid)
-                    source_target_ratio = self.config.sling_target_source if flow_state == "source" else self.config.sling_target_balanced
+                    # Use the SOURCE channel's own flow state (not the destination's)
+                    source_flow = source_state.get("state", "balanced")
+                    if source_flow == "source":
+                        source_target_ratio = self.config.sling_target_source
+                    elif source_flow == "sink":
+                        source_target_ratio = self.config.sling_target_sink
+                    else:
+                        source_target_ratio = self.config.sling_target_balanced
                     source_target_sats = int(source_cap * source_target_ratio)
                     actual_excess = max(0, source_bal - source_target_sats)
                     job_params["depleteuptoamount"] = max(100_000, actual_excess)
@@ -2746,6 +2753,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             z = (rebalance_amount - predicted_volume) / (std_dev * math.sqrt(2) + 1e-8)
             prob_utilized = 0.5 * (1.0 - math.erf(z))
 
+            # Guard: NaN propagation through erf() would produce 1.0 (most optimistic)
+            # due to Python's min/max argument-order semantics. Treat NaN as fallback.
+            if not math.isfinite(prob_utilized):
+                prob_utilized = dest_turnover_rate * cooldown_days
+
             # Clamp to [0.05, 1.0] — never assume zero utilization for a live channel
             expected_utilization = max(0.05, min(1.0, prob_utilized))
         else:
@@ -2887,7 +2899,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         try:
             ks = self.database.get_kalman_state(channel_id)
             if ks:
-                import math
                 return {
                     "flow_ratio": float(ks.get("flow_ratio", 0.0)),
                     "velocity": float(ks.get("flow_velocity", 0.0)),
