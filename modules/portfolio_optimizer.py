@@ -295,6 +295,7 @@ class PortfolioOptimizer:
         self._covariance_matrix: Dict[Tuple[str, str], float] = {}
         self._correlation_matrix: Dict[Tuple[str, str], float] = {}
         self._last_calculation: int = 0
+        self._last_summary: Optional[PortfolioSummary] = None
         self._cache_ttl_seconds: int = 3600  # 1 hour cache
 
         # Risk aversion (can be configured)
@@ -313,7 +314,8 @@ class PortfolioOptimizer:
         self,
         channels: List[Dict[str, Any]],
         forwards: List[Dict[str, Any]],
-        flow_states: Optional[Dict[str, Any]] = None
+        flow_states: Optional[Dict[str, Any]] = None,
+        inbound_forwards: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, ChannelStatistics]:
         """
         Collect revenue statistics for all channels.
@@ -322,6 +324,7 @@ class PortfolioOptimizer:
             channels: List of channel info dicts from listpeerchannels
             forwards: List of forward records (raw or bucketed), typically sourced from the local DB
             flow_states: Optional Kalman flow states per channel
+            inbound_forwards: Optional inbound forward buckets (grouped by in_channel)
 
         Returns:
             Dict mapping channel_id to ChannelStatistics
@@ -342,7 +345,7 @@ class PortfolioOptimizer:
             local_sats = _safe_msat_to_sats(ch.get("to_us_msat", 0))
             total_local_sats += local_sats
 
-        # Filter forwards to window and group by channel
+        # Filter forwards to window and group by out_channel
         channel_forwards: Dict[str, List[Dict[str, Any]]] = {}
         for fwd in forwards:
             ts = fwd.get("received_time") or fwd.get("timestamp", 0)
@@ -354,6 +357,19 @@ class PortfolioOptimizer:
                 if out_scid not in channel_forwards:
                     channel_forwards[out_scid] = []
                 channel_forwards[out_scid].append(fwd)
+
+        # Build inbound forwards map (keyed by in_channel)
+        inbound_channel_forwards: Dict[str, List[Dict[str, Any]]] = {}
+        if inbound_forwards:
+            for fwd in inbound_forwards:
+                ts = fwd.get("received_time") or fwd.get("timestamp", 0)
+                if ts < window_start:
+                    continue
+                in_scid = fwd.get("in_channel")
+                if in_scid:
+                    if in_scid not in inbound_channel_forwards:
+                        inbound_channel_forwards[in_scid] = []
+                    inbound_channel_forwards[in_scid].append(fwd)
 
         # Calculate statistics per channel
         for scid, ch in channel_info.items():
@@ -368,13 +384,37 @@ class PortfolioOptimizer:
             # Current allocation
             current_alloc = local_sats / total_local_sats if total_local_sats > 0 else 0
 
-            # Get forwards for this channel
+            # Get outbound forwards for this channel
             fwds = channel_forwards.get(scid, [])
 
-            # Calculate revenue statistics
-            expected_return, variance, obs_count = self._calculate_revenue_stats(
+            # Calculate outbound revenue statistics
+            out_return, out_var, out_obs = self._calculate_revenue_stats(
                 fwds, window_start, now
             )
+
+            # Calculate inbound revenue statistics (bidirectional attribution)
+            in_fwds = inbound_channel_forwards.get(scid, [])
+            in_return, in_var, in_obs = self._calculate_revenue_stats(
+                in_fwds, window_start, now
+            )
+
+            # Merge with 50/50 split consistent with profitability_analyzer semantics:
+            # A forward earns fee credit for both its inbound and outbound channel.
+            if in_return > 0 or out_return > 0:
+                expected_return = (out_return + in_return) / 2
+                # Var((X+Y)/2) = (Var(X) + Var(Y)) / 4 for independent X, Y
+                variance = (out_var + in_var) / 4
+                obs_count = max(out_obs, in_obs)
+            else:
+                expected_return = out_return
+                variance = out_var
+                obs_count = out_obs
+
+            # Fix 3: Sparse data variance inflation — channels with too few observations
+            # get unreliable variance. Inflate to a conservative prior so the optimizer
+            # naturally de-weights them rather than over-allocating.
+            if obs_count < MIN_OBSERVATIONS and obs_count > 0:
+                variance = max(variance, expected_return ** 2 if expected_return > 0 else MIN_VARIANCE * 1000)
 
             # Calculate data quality
             data_quality = min(1.0, obs_count / MIN_OBSERVATIONS) if obs_count > 0 else 0.0
@@ -390,13 +430,14 @@ class PortfolioOptimizer:
             # Classify channel role (simplified heuristic)
             role = self._classify_channel_role(fwds, peer_id)
 
-            # Calculate forward metrics
+            # Calculate forward metrics (outbound + inbound combined)
             avg_size = 0
             freq = 0.0
-            if fwds:
+            all_fwds = fwds + in_fwds
+            if all_fwds:
                 total_count = 0
                 total_out_sats = 0
-                for f in fwds:
+                for f in all_fwds:
                     c = f.get("count", 1) or 0
                     try:
                         c = int(c)
@@ -404,7 +445,7 @@ class PortfolioOptimizer:
                         c = 0
                     if c <= 0:
                         c = 1
-                    out_sats = _safe_msat_to_sats(f.get("out_msat", 0))
+                    out_sats = _safe_msat_to_sats(f.get("out_msat", 0) or f.get("in_msat", 0))
                     if out_sats > 0:
                         total_out_sats += out_sats
                         total_count += c
@@ -422,7 +463,7 @@ class PortfolioOptimizer:
                 current_local_sats=local_sats,
                 current_allocation_pct=current_alloc,
                 observation_count=obs_count,
-                last_observation=now if fwds else 0,
+                last_observation=now if all_fwds else 0,
                 data_quality=data_quality,
                 role=role,
                 avg_forward_size=avg_size,
@@ -432,6 +473,8 @@ class PortfolioOptimizer:
             )
 
         # Post-process: adjust expected returns for rebalance costs
+        # Fix 2: Cap cost deduction at 50% of observed revenue so rebalance
+        # history can't eliminate a genuinely earning channel.
         for scid, stat in stats.items():
             try:
                 cost_data = self.database.get_channel_rebalance_success_rate(scid, PORTFOLIO_WINDOW_DAYS)
@@ -441,7 +484,7 @@ class PortfolioOptimizer:
                     avg_cost = avg_cost_ppm * avg_amount / 1_000_000
                     hours_in_window = PORTFOLIO_WINDOW_DAYS * 24
                     cost_per_hour = (avg_cost * cost_data['successes']) / hours_in_window if hours_in_window > 0 else 0
-                    stat.expected_return = max(0, stat.expected_return - cost_per_hour)
+                    stat.expected_return = max(stat.expected_return * 0.5, stat.expected_return - cost_per_hour)
 
                     # Cost uncertainty: lower success rate = higher variance contribution
                     success_rate = cost_data.get('success_rate', 1.0) if cost_data.get('success_rate', 1.0) > 0 else 1.0
@@ -572,12 +615,15 @@ class PortfolioOptimizer:
     def calculate_covariance_matrix(
         self,
         channels: List[Dict[str, Any]],
-        forwards: List[Dict[str, Any]]
+        forwards: List[Dict[str, Any]],
+        inbound_forwards: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[Tuple[str, str], float]:
         """
         Calculate covariance matrix between all channel pairs.
 
         Uses time-bucketed revenue rates to compute covariances.
+        When inbound_forwards are provided, merges inbound revenue into each
+        channel's time series with a 50/50 split for bidirectional attribution.
 
         Returns:
             Dict mapping (channel_a, channel_b) to covariance value
@@ -593,8 +639,8 @@ class PortfolioOptimizer:
             if scid:
                 scids.append(scid)
 
-        # Build revenue rate time series per channel
-        channel_series: Dict[str, Dict[int, float]] = {scid: {} for scid in scids}
+        # Build outbound revenue rate time series per channel
+        out_series: Dict[str, Dict[int, float]] = {scid: {} for scid in scids}
 
         for fwd in forwards:
             ts = fwd.get("received_time") or fwd.get("timestamp", 0)
@@ -602,7 +648,7 @@ class PortfolioOptimizer:
                 continue
 
             out_scid = fwd.get("out_channel")
-            if not out_scid or out_scid not in channel_series:
+            if not out_scid or out_scid not in out_series:
                 continue
 
             bucket_idx = (ts - window_start) // interval_secs
@@ -617,9 +663,46 @@ class PortfolioOptimizer:
                 fee = 0
             fee_sats = fee / 1000
 
-            if bucket_idx not in channel_series[out_scid]:
-                channel_series[out_scid][bucket_idx] = 0.0
-            channel_series[out_scid][bucket_idx] += fee_sats / OBSERVATION_INTERVAL_HOURS
+            if bucket_idx not in out_series[out_scid]:
+                out_series[out_scid][bucket_idx] = 0.0
+            out_series[out_scid][bucket_idx] += fee_sats / OBSERVATION_INTERVAL_HOURS
+
+        # Build inbound revenue rate time series per channel
+        in_series: Dict[str, Dict[int, float]] = {scid: {} for scid in scids}
+        if inbound_forwards:
+            for fwd in inbound_forwards:
+                ts = fwd.get("received_time") or fwd.get("timestamp", 0)
+                if ts < window_start:
+                    continue
+
+                in_scid = fwd.get("in_channel")
+                if not in_scid or in_scid not in in_series:
+                    continue
+
+                bucket_idx = (ts - window_start) // interval_secs
+
+                fee = fwd.get("fee_msat") or fwd.get("fee", 0)
+                if isinstance(fee, str):
+                    try:
+                        fee = int(fee.replace("msat", "").strip())
+                    except (ValueError, AttributeError):
+                        fee = 0
+                elif not isinstance(fee, (int, float)):
+                    fee = 0
+                fee_sats = fee / 1000
+
+                if bucket_idx not in in_series[in_scid]:
+                    in_series[in_scid][bucket_idx] = 0.0
+                in_series[in_scid][bucket_idx] += fee_sats / OBSERVATION_INTERVAL_HOURS
+
+        # Merge outbound and inbound with 50/50 split for bidirectional attribution
+        channel_series: Dict[str, Dict[int, float]] = {scid: {} for scid in scids}
+        for scid in scids:
+            all_buckets = set(out_series[scid].keys()) | set(in_series[scid].keys())
+            for b in all_buckets:
+                out_val = out_series[scid].get(b, 0.0)
+                in_val = in_series[scid].get(b, 0.0)
+                channel_series[scid][b] = (out_val + in_val) / 2
 
         # Calculate covariance for each pair
         covariance_matrix: Dict[Tuple[str, str], float] = {}
@@ -678,8 +761,11 @@ class PortfolioOptimizer:
                 var_b = sum((b - mean_b) ** 2 for b in vals_b) / denominator
 
                 if var_a > MIN_VARIANCE and var_b > MIN_VARIANCE:
-                    corr = cov / (math.sqrt(var_a) * math.sqrt(var_b))
-                    correlation_matrix[(scid_a, scid_b)] = max(-1.0, min(1.0, corr))
+                    raw_corr = cov / (math.sqrt(var_a) * math.sqrt(var_b))
+                    # Fix 7: Log when raw correlation exceeds [-1, 1] (numerical instability)
+                    if abs(raw_corr) > 1.0:
+                        self.log(f"Correlation clamped {scid_a[:8]}/{scid_b[:8]}: {raw_corr:.4f}", level='debug')
+                    correlation_matrix[(scid_a, scid_b)] = max(-1.0, min(1.0, raw_corr))
                 else:
                     correlation_matrix[(scid_a, scid_b)] = 0.0
 
@@ -826,6 +912,7 @@ class PortfolioOptimizer:
         weights_dict = {scids[i]: optimal_weights[i] for i in range(n)}
 
         self._last_calculation = now
+        self._last_summary = summary
 
         return weights_dict, summary
 
@@ -836,13 +923,16 @@ class PortfolioOptimizer:
         risk_aversion: float,
         n: int,
         max_iterations: int = 1000,
-        learning_rate: float = 0.01,
+        initial_learning_rate: float = 0.01,
         tolerance: float = 1e-6
     ) -> List[float]:
         """
-        Optimize using projected gradient descent.
+        Optimize using projected gradient descent with adaptive learning rate.
 
         Objective: max sum(w_i * r_i) - lambda * sum(w_i * w_j * cov_ij)
+
+        Uses objective-value tracking and halves learning rate on regression
+        (backtracking line search) for more robust convergence.
         """
         # MA-6: Normalize both returns AND covariance to match scales.
         # This prevents the gradient from being dominated by one term.
@@ -856,8 +946,18 @@ class PortfolioOptimizer:
             for i in range(n)
         ]
 
+        def _objective(w: List[float]) -> float:
+            ret = sum(w[i] * normalized_returns[i] for i in range(n))
+            risk = sum(
+                w[i] * w[j] * normalized_cov[i][j]
+                for i in range(n) for j in range(n)
+            )
+            return ret - risk_aversion * risk
+
         # Initialize with equal weights
         weights = [1.0 / n] * n
+        learning_rate = initial_learning_rate
+        prev_objective = _objective(weights)
 
         for iteration in range(max_iterations):
             # Calculate gradient
@@ -882,12 +982,21 @@ class PortfolioOptimizer:
             # Project to feasible region (simplex with bounds)
             new_weights = self._project_to_simplex(new_weights)
 
-            # Check convergence
-            max_change = max(abs(new_weights[i] - weights[i]) for i in range(n))
+            # Check objective value for backtracking
+            obj = _objective(new_weights)
+            if obj < prev_objective:
+                # Objective regressed — halve learning rate and retry
+                learning_rate *= 0.5
+                if learning_rate < 1e-8:
+                    break
+                continue
+
             weights = new_weights
 
-            if max_change < tolerance:
+            # Check convergence on objective value
+            if abs(obj - prev_objective) < tolerance:
                 break
+            prev_objective = obj
 
         return weights
 
@@ -1008,28 +1117,26 @@ class PortfolioOptimizer:
         # Concentration index (Herfindahl)
         concentration = sum(w ** 2 for w in optimal_weights)
 
-        # Risk decomposition (simplified)
-        # Systematic = average correlation * total variance
-        avg_correlation = 0.0
-        pair_count = 0
+        # Risk decomposition: portfolio-weighted average correlation
+        # Weights correlation by the product of optimal allocations so that
+        # low-weight pairs don't dominate the metric.
+        weighted_corr_sum = 0.0
+        weight_product_sum = 0.0
         for i in range(n):
             for j in range(i + 1, n):
                 std_i = math.sqrt(max(cov_matrix[i][i], MIN_VARIANCE))
                 std_j = math.sqrt(max(cov_matrix[j][j], MIN_VARIANCE))
                 if std_i > 0 and std_j > 0:
                     corr = cov_matrix[i][j] / (std_i * std_j)
-                    avg_correlation += corr
-                    pair_count += 1
+                    w_product = optimal_weights[i] * optimal_weights[j]
+                    weighted_corr_sum += corr * w_product
+                    weight_product_sum += w_product
 
-        if pair_count > 0:
-            avg_correlation /= pair_count
+        avg_correlation = weighted_corr_sum / weight_product_sum if weight_product_sum > 0 else 0.0
 
-        # avg_correlation can be negative (hedged portfolio) — clamp to [-1, 1]
-        avg_correlation = max(-1.0, min(1.0, avg_correlation))
-        # L-9: Clamp systematic risk to non-negative (negative correlation
-        # means diversification benefit, not negative systematic risk)
-        systematic_risk = max(0.0, avg_correlation)
-        idiosyncratic_risk = 1.0 - systematic_risk
+        # Clamp to valid range; negative correlation IS a hedging benefit — report truthfully
+        systematic_risk = max(-1.0, min(1.0, avg_correlation))
+        idiosyncratic_risk = 1.0 - max(0.0, systematic_risk)
 
         # P3 FIX: Handle negative current_sharpe. Previously reported 0%
         # improvement even when optimization could significantly help.
@@ -1127,15 +1234,22 @@ class PortfolioOptimizer:
         channel_id: str,
         weights: Dict[str, float]
     ) -> float:
-        """Calculate marginal contribution to portfolio Sharpe ratio."""
+        """
+        Calculate marginal contribution to portfolio Sharpe ratio.
+
+        Uses portfolio-relative formula: (channel_return - portfolio_return) / portfolio_std * weight
+        """
         stats = self._channel_stats.get(channel_id)
-        if not stats:
+        if not stats or not self._last_summary:
             return 0.0
 
-        # Simplified: return / std as contribution proxy
-        if stats.std_dev > 0:
-            return stats.expected_return / stats.std_dev * weights.get(channel_id, 0.0)
-        return 0.0
+        portfolio_std = self._last_summary.portfolio_std_dev
+        portfolio_return = self._last_summary.expected_portfolio_return
+        w = weights.get(channel_id, 0.0)
+        if portfolio_std <= 0 or w <= 0:
+            return 0.0
+
+        return (stats.expected_return - portfolio_return) / portfolio_std * w
 
     def _calculate_diversification_benefit(self, channel_id: str) -> float:
         """
@@ -1192,7 +1306,8 @@ class PortfolioOptimizer:
         channels: List[Dict[str, Any]],
         forwards: List[Dict[str, Any]],
         flow_states: Optional[Dict[str, Any]] = None,
-        risk_aversion: Optional[float] = None
+        risk_aversion: Optional[float] = None,
+        inbound_forwards: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
         Full portfolio analysis: collect stats, optimize, generate recommendations.
@@ -1202,15 +1317,16 @@ class PortfolioOptimizer:
             forwards: Forward list (raw or bucketed), typically sourced from the local DB
             flow_states: Optional Kalman flow states
             risk_aversion: Risk aversion parameter (higher = more conservative)
+            inbound_forwards: Optional inbound forward buckets (grouped by in_channel)
 
         Returns:
             Complete analysis dict with statistics, allocations, correlations
         """
         # Collect statistics
-        stats = self.collect_channel_statistics(channels, forwards, flow_states)
+        stats = self.collect_channel_statistics(channels, forwards, flow_states, inbound_forwards)
 
         # Calculate covariances
-        self.calculate_covariance_matrix(channels, forwards)
+        self.calculate_covariance_matrix(channels, forwards, inbound_forwards)
 
         # Optimize allocation
         optimal_weights, summary = self.optimize_allocation(risk_aversion)
@@ -1261,6 +1377,7 @@ class PortfolioOptimizer:
         self,
         channels: List[Dict[str, Any]],
         forwards: List[Dict[str, Any]],
+        inbound_forwards: Optional[List[Dict[str, Any]]] = None,
         max_recommendations: int = 5
     ) -> List[Dict[str, Any]]:
         """
@@ -1271,7 +1388,7 @@ class PortfolioOptimizer:
         Returns:
             List of rebalance recommendations with channel_id, direction, amount
         """
-        analysis = self.analyze_portfolio(channels, forwards)
+        analysis = self.analyze_portfolio(channels, forwards, inbound_forwards=inbound_forwards)
         recommendations = analysis.get("recommendations", [])[:max_recommendations]
 
         result = []

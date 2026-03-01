@@ -297,13 +297,12 @@ class TestKalmanCovariancePositiveDefiniteness:
 
 class TestPortfolioRiskDecomposition:
     """
-    Bug: systematic_risk = max(0.0, avg_correlation) clipped negative
-    correlations to zero. A well-hedged portfolio with avg_correlation=-0.3
-    would report 0% systematic / 100% idiosyncratic, hiding the hedging benefit.
+    Fix 4: Risk decomposition now uses portfolio-weighted average correlation
+    and reports negative correlation truthfully as a hedging benefit.
     """
 
-    def test_negative_correlation_clamped_to_zero(self):
-        """Negative avg_correlation should produce zero systematic_risk (L-9 clamp)."""
+    def test_negative_correlation_reported_truthfully(self):
+        """Negative weighted avg_correlation should produce negative systematic_risk."""
         from modules.portfolio_optimizer import PortfolioOptimizer
 
         optimizer = PortfolioOptimizer.__new__(PortfolioOptimizer)
@@ -332,11 +331,10 @@ class TestPortfolioRiskDecomposition:
             total_local_sats=1000000
         )
 
-        # L-9: systematic_risk clamped to non-negative (negative correlation
-        # means diversification benefit, not negative systematic risk)
-        assert summary.systematic_risk_pct == 0.0, \
-            f"Hedged portfolio should show zero systematic risk, got {summary.systematic_risk_pct}"
-        # idiosyncratic should be 1.0 when systematic is clamped to 0
+        # Fix 4: Negative correlation IS hedging benefit — report truthfully
+        assert summary.systematic_risk_pct < 0.0, \
+            f"Hedged portfolio should show negative systematic risk, got {summary.systematic_risk_pct}"
+        # idiosyncratic = 1 - max(0, systematic) = 1.0 when systematic is negative
         assert summary.idiosyncratic_risk_pct == 1.0
 
     def test_positive_correlation_still_works(self):

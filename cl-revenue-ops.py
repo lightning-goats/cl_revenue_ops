@@ -3666,6 +3666,11 @@ def revenue_portfolio(
             interval_hours=4,
             out_channels=out_scids
         )
+        inbound_forwards = database.get_portfolio_inbound_forward_buckets(
+            since_timestamp=cutoff,
+            interval_hours=4,
+            in_channels=out_scids
+        )
 
         # Get Kalman flow states from the dedicated kalman_state table
         flow_states = {}
@@ -3690,7 +3695,8 @@ def revenue_portfolio(
             channels=channels,
             forwards=forwards,
             flow_states=flow_states,
-            risk_aversion=risk_aversion
+            risk_aversion=risk_aversion,
+            inbound_forwards=inbound_forwards
         )
 
         return {
@@ -3776,6 +3782,11 @@ def revenue_portfolio_rebalance(
             interval_hours=4,
             out_channels=out_scids
         )
+        inbound_forwards = database.get_portfolio_inbound_forward_buckets(
+            since_timestamp=cutoff,
+            interval_hours=4,
+            in_channels=out_scids
+        )
 
         optimizer = PortfolioOptimizer(
             database=database,
@@ -3785,6 +3796,7 @@ def revenue_portfolio_rebalance(
         recommendations = optimizer.get_rebalance_priorities(
             channels=channels,
             forwards=forwards,
+            inbound_forwards=inbound_forwards,
             max_recommendations=max_recommendations
         )
 

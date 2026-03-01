@@ -3192,7 +3192,59 @@ class Database:
                 "count": int(r["count"] or 0),
             })
         return result
-    
+
+    def get_portfolio_inbound_forward_buckets(
+        self,
+        since_timestamp: int,
+        interval_hours: int = 4,
+        in_channels: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return bucketed forward data grouped by in_channel for inbound revenue attribution.
+
+        Mirrors get_portfolio_forward_buckets() but groups by in_channel so that
+        the portfolio optimizer can attribute revenue to inbound-gateway channels.
+
+        Returned records include:
+        - in_channel
+        - received_time (bucket start timestamp)
+        - fee_msat (sum)
+        - in_msat (sum)
+        - count (number of forwards in the bucket)
+        """
+        conn = self._get_connection()
+        interval_secs = max(1, int(interval_hours)) * 3600
+
+        in_filter = ""
+        query_params: List[Any] = [interval_secs, interval_secs, since_timestamp]
+        if in_channels:
+            placeholders = ",".join("?" for _ in in_channels)
+            in_filter = f" AND in_channel IN ({placeholders})"
+            query_params.extend(list(in_channels))
+
+        rows = conn.execute(f"""
+            SELECT
+                in_channel,
+                (timestamp / ?) * ? AS bucket_ts,
+                COALESCE(SUM(fee_msat), 0) AS fee_msat,
+                COALESCE(SUM(in_msat), 0) AS in_msat,
+                COUNT(*) AS count
+            FROM forwards
+            WHERE timestamp >= ? {in_filter}
+            GROUP BY in_channel, bucket_ts
+        """, query_params).fetchall()
+
+        result: List[Dict[str, Any]] = []
+        for r in rows:
+            result.append({
+                "in_channel": r["in_channel"],
+                "received_time": int(r["bucket_ts"] or 0),
+                "fee_msat": int(r["fee_msat"] or 0),
+                "in_msat": int(r["in_msat"] or 0),
+                "count": int(r["count"] or 0),
+            })
+        return result
+
     
     def record_forward(self, in_channel: str, out_channel: str,
                        in_msat: int, out_msat: int, fee_msat: int, *args) -> None:
