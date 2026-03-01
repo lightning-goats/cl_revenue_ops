@@ -2118,8 +2118,28 @@ class EVRebalancer:
                         source_channels.append((channel_id, info, outbound_ratio))
             
             if not depleted_channels or not source_channels:
+                total = len(channels) - len(active_channels)
+                if not depleted_channels and not source_channels:
+                    self.plugin.log(
+                        f"No rebalance candidates: all {total} channels are in balanced range "
+                        f"({cfg.low_liquidity_threshold:.0%}-{cfg.high_liquidity_threshold:.0%} outbound). "
+                        f"None are depleted (<{cfg.low_liquidity_threshold:.0%}) or overfull (>{cfg.high_liquidity_threshold:.0%}).",
+                        level='info'
+                    )
+                elif not depleted_channels:
+                    self.plugin.log(
+                        f"No rebalance candidates: {len(source_channels)} overfull channels but no depleted "
+                        f"channels (<{cfg.low_liquidity_threshold:.0%} outbound) to fill.",
+                        level='info'
+                    )
+                else:
+                    self.plugin.log(
+                        f"No rebalance candidates: {len(depleted_channels)} depleted channels but no source "
+                        f"channels (>{cfg.high_liquidity_threshold:.0%} outbound) to drain.",
+                        level='info'
+                    )
                 return candidates
-                
+
             self.plugin.log(
                 f"Found {len(depleted_channels)} depleted and {len(source_channels)} source channels "
                 f"(excluding {len(active_channels)} with active jobs)"
@@ -2473,11 +2493,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         
         # Smart Allocation: Use the LOWER of volume target or capacity target
         # This prevents overfilling slow channels while still allowing fast channels
-        # to be fully stocked
-        if vol_target > 0:
+        # to be fully stocked.
+        # FIX: Only constrain by volume when vol_target is meaningful (above min_amount).
+        # Otherwise a tiny trickle of volume (e.g. 10k sats) would reduce the target
+        # below min_amount and get killed by the sizing guard — worse than zero volume.
+        if vol_target >= self.config.rebalance_min_amount:
             raw_target = min(cap_target, vol_target)
         else:
-            # No volume data yet - fall back to capacity-based target
+            # No meaningful volume data - fall back to capacity-based target
             raw_target = cap_target
         
         # CRITICAL: Clamp raw_target to capacity (never exceed what's possible)
