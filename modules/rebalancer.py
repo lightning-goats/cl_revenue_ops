@@ -3296,12 +3296,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             )
             return route_fee
 
-        # Ultimate fallback
+        # Ultimate fallback: use configured estimate (not hardcoded 1000 PPM)
+        fallback = self.config.inbound_fee_estimate_ppm
         self.plugin.log(
-            f"INBOUND FEE EST [{peer_id[:12]}...]: Default fallback 1000 PPM",
+            f"INBOUND FEE EST [{peer_id[:12]}...]: Default fallback {fallback} PPM",
             level='debug'
         )
-        return 1000
+        return fallback
 
     def _get_last_hop_fee(self, peer_id: str, amount_msat: int = 100000000) -> Optional[int]:
         """
