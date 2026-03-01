@@ -521,13 +521,15 @@ class FlowAnalyzer:
         # All filters converged to flow_ratio≈0.0, locking every channel as BALANCED.
         # Fresh filters will re-converge with real observations (EMA drives until then).
         try:
-            n = self.database.reset_all_kalman_states()
-            if n > 0:
-                self.plugin.log(
-                    f"FLOW: Purged {n} poisoned Kalman states (has_observation bug). "
-                    f"Filters will re-converge from EMA-based classification.",
-                    level='info'
-                )
+            if self.database.kalman_purge_needed():
+                n = self.database.reset_all_kalman_states()
+                self.database.mark_kalman_purge_done()
+                if n > 0:
+                    self.plugin.log(
+                        f"FLOW: Purged {n} poisoned Kalman states (has_observation bug). "
+                        f"Filters will re-converge from EMA-based classification.",
+                        level='info'
+                    )
         except Exception:
             pass  # Non-critical — filters will still work from fresh defaults
 

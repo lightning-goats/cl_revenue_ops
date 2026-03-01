@@ -1275,6 +1275,30 @@ class Database:
         cursor = conn.execute("DELETE FROM kalman_state")
         return cursor.rowcount
 
+    def kalman_purge_needed(self) -> bool:
+        """Check whether the one-time Kalman purge has already run."""
+        conn = self._get_connection()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS plugin_flags (
+                flag TEXT PRIMARY KEY,
+                value TEXT,
+                created_at INTEGER
+            )
+        """)
+        row = conn.execute(
+            "SELECT 1 FROM plugin_flags WHERE flag = 'kalman_observation_purge_v1'"
+        ).fetchone()
+        return row is None
+
+    def mark_kalman_purge_done(self) -> None:
+        """Record that the one-time Kalman purge has completed."""
+        conn = self._get_connection()
+        conn.execute(
+            "INSERT OR IGNORE INTO plugin_flags (flag, value, created_at) "
+            "VALUES ('kalman_observation_purge_v1', 'done', ?)",
+            (int(time.time()),)
+        )
+
     # =========================================================================
     # Portfolio Metrics Methods (EV v2.0)
     # =========================================================================
