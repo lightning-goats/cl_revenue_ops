@@ -450,8 +450,6 @@ class FlowMetrics:
     kalman_velocity: float = 0.0  # Kalman-estimated velocity (ratio change/hour)
     kalman_uncertainty: float = 0.1  # Standard deviation of estimate
     kalman_regime_change: bool = False  # True if regime change detected
-    # v2.2 fields
-    pending_outbound_htlc_sats: int = 0  # Locked liquidity in pending outbound HTLCs
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -1148,10 +1146,9 @@ class FlowAnalyzer:
         # v2.1: Apply Kalman filter
         if ENABLE_KALMAN_FILTER:
             # Compute raw observation from per-forward data (not EMA-smoothed)
-            raw_flow_data = self.database.get_continuous_net_flow_all(
-                window_hours=self.config.flow_window_days * 24
+            raw_entries = self.database.get_continuous_net_flow_channel(
+                channel_id, window_hours=self.config.flow_window_days * 24
             )
-            raw_entries = raw_flow_data.get(channel_id, [])
             raw_observation, raw_count = self._compute_raw_kalman_observation(
                 channel_id, capacity, raw_entries
             )

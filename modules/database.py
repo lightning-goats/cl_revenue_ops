@@ -3080,6 +3080,26 @@ class Database:
             })
         return result
 
+    def get_continuous_net_flow_channel(self, channel_id: str, window_hours: int = 168) -> List[Dict[str, Any]]:
+        """Per-forward net flow for a single channel.
+
+        More efficient than get_continuous_net_flow_all() when only one
+        channel is needed (e.g., analyze_channel single-channel path).
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - window_hours * 3600
+
+        rows = conn.execute("""
+            SELECT timestamp, out_msat AS net_msat
+            FROM forwards WHERE out_channel = ? AND timestamp >= ?
+            UNION ALL
+            SELECT timestamp, -in_msat AS net_msat
+            FROM forwards WHERE in_channel = ? AND timestamp >= ?
+            ORDER BY timestamp DESC
+        """, (channel_id, cutoff, channel_id, cutoff)).fetchall()
+
+        return [{"timestamp": int(r["timestamp"]), "net_msat": int(r["net_msat"])} for r in rows]
+
     def get_portfolio_forward_buckets(
         self,
         since_timestamp: int,
