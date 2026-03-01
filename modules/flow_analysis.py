@@ -993,7 +993,7 @@ class FlowAnalyzer:
                         confidence=kalman_confidence,
                         daily_buckets=channel_daily,
                         prev_ts=prev_ts,
-                        has_observation=True  # Always update so idle channels decay to 0.0
+                        has_observation=(raw_count > 0)
                     )
                 metrics.kalman_flow_ratio = kalman_ratio
                 metrics.kalman_velocity = kalman_velocity
@@ -1161,7 +1161,7 @@ class FlowAnalyzer:
                     confidence=kalman_confidence,
                     daily_buckets=channel_daily,
                     prev_ts=prev_ts,
-                    has_observation=True  # Always update so idle channels decay to 0.0
+                    has_observation=(raw_count > 0)
                 )
             metrics.kalman_flow_ratio = kalman_ratio
             metrics.kalman_velocity = kalman_velocity
