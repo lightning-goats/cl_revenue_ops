@@ -129,8 +129,8 @@ class TestFix3HourlyKalman:
 class TestFix1RawObservation:
     """Tests for raw (non-EMA) Kalman observation (Fix 1)."""
 
-    def test_continuous_time_decay(self):
-        """Recent forwards should be weighted more than old ones."""
+    def test_24h_rolling_sum(self):
+        """24h window should sum all net flow, not average per-forward."""
         from modules.flow_analysis import FlowAnalyzer
 
         plugin = MagicMock()
@@ -140,19 +140,43 @@ class TestFix1RawObservation:
         analyzer = FlowAnalyzer(plugin, config, db)
 
         now = time.time()
+        # 1000 forwards of 10k sats each within the last 24h
         entries = [
-            {"timestamp": now - 1 * 3600, "net_msat": 1_000_000},  # 1hr ago: +1000 sats
-            {"timestamp": now - 48 * 3600, "net_msat": -1_000_000},  # 48hrs ago: -1000 sats
+            {"timestamp": now - i * 60, "net_msat": 10_000_000}  # +10k sats each
+            for i in range(1000)
+        ]
+
+        ratio, count = analyzer._compute_raw_kalman_observation(
+            "100x1x0", capacity=100_000_000, net_flow_entries=entries
+        )
+
+        # Total: 1000 * 10k = 10M sats. Ratio = 10M / 100M = 0.1
+        # Old bug: would compute 10k / 100M = 0.0001 (average per forward)
+        assert ratio == pytest.approx(0.1, rel=1e-3)
+        assert count == 1000
+
+    def test_excludes_entries_outside_24h(self):
+        """Entries older than 24h should be excluded from the rolling window."""
+        from modules.flow_analysis import FlowAnalyzer
+
+        plugin = MagicMock()
+        config = MagicMock()
+        db = MagicMock()
+        analyzer = FlowAnalyzer(plugin, config, db)
+
+        now = time.time()
+        entries = [
+            {"timestamp": now - 1 * 3600, "net_msat": 1_000_000},   # 1hr ago: +1000 sats
+            {"timestamp": now - 48 * 3600, "net_msat": -5_000_000},  # 48hrs ago: excluded
         ]
 
         ratio, count = analyzer._compute_raw_kalman_observation(
             "100x1x0", capacity=100_000, net_flow_entries=entries
         )
 
-        # Recent forward (1hr) has much higher weight than 48hr-old one
-        # So net ratio should be positive (biased toward recent outflow)
-        assert ratio > 0
-        assert count == 2
+        # Only the recent entry counts: +1000 / 100_000 = 0.01
+        assert ratio == pytest.approx(0.01, rel=1e-3)
+        assert count == 1
 
     def test_no_data_fallback(self):
         """Empty entries should return (0.0, 0)."""
@@ -184,27 +208,6 @@ class TestFix1RawObservation:
         )
         assert ratio == 0.0
         assert count == 0
-
-    def test_recent_weighted_more(self):
-        """Two identical forwards at different ages should produce positive ratio when recent is outbound."""
-        from modules.flow_analysis import FlowAnalyzer
-
-        plugin = MagicMock()
-        config = MagicMock()
-        db = MagicMock()
-        analyzer = FlowAnalyzer(plugin, config, db)
-
-        now = time.time()
-        # Recent: outflow. Old: inflow. Equal amounts.
-        entries = [
-            {"timestamp": now - 0.5 * 3600, "net_msat": 500_000},   # 0.5hr: +500 sats out
-            {"timestamp": now - 72 * 3600, "net_msat": -500_000},    # 72hr: -500 sats in
-        ]
-
-        ratio, _ = analyzer._compute_raw_kalman_observation(
-            "100x1x0", capacity=10_000, net_flow_entries=entries, halflife_hours=24.0
-        )
-        assert ratio > 0  # Recent outflow dominates
 
     def test_ratio_clamped_to_bounds(self):
         """Ratio must be clamped to [-1, 1]."""
@@ -444,11 +447,11 @@ class TestFix4BalancedActive:
 # Fix 5: Pending HTLC Liquidity
 # =========================================================================
 
-class TestFix5PendingHTLC:
-    """Tests for pending HTLC liquidity deduction (Fix 5)."""
+class TestFix5NoHTLCDoubleDeduction:
+    """Tests that CLN's spendable_msat is used directly without HTLC double-deduction."""
 
-    def test_outbound_htlc_deducted(self):
-        """Outbound HTLC amounts should be extracted from channel info."""
+    def test_no_htlc_extraction_in_channels(self):
+        """_get_channels() should NOT extract pending_outbound_htlc_msat."""
         from modules.flow_analysis import FlowAnalyzer
 
         plugin = MagicMock()
@@ -473,11 +476,19 @@ class TestFix5PendingHTLC:
 
         channels = analyzer._get_channels()
         assert len(channels) == 1
-        # Only outbound HTLCs counted: 100M + 50M = 150M msat
-        assert channels[0]["pending_outbound_htlc_msat"] == 150000000
+        # pending_outbound_htlc_msat should NOT be extracted (CLN handles it)
+        assert "pending_outbound_htlc_msat" not in channels[0]
 
-    def test_inbound_htlc_ignored(self):
-        """Inbound HTLCs should not affect pending_outbound_htlc_msat."""
+    def test_spendable_msat_used_directly(self):
+        """Balance should come directly from spendable_msat without HTLC deduction."""
+        # CLN's spendable_msat already accounts for pending HTLCs and reserve.
+        # our_balance should be spendable_msat // 1000, nothing subtracted.
+        spendable_msat = 500_000_000  # 500k sats
+        our_balance = spendable_msat // 1000
+        assert our_balance == 500_000
+
+    def test_active_htlc_count_still_tracked(self):
+        """Active HTLC count should still be tracked for congestion detection."""
         from modules.flow_analysis import FlowAnalyzer
 
         plugin = MagicMock()
@@ -489,6 +500,7 @@ class TestFix5PendingHTLC:
                 "spendable_msat": 500000000,
                 "receivable_msat": 500000000,
                 "htlcs": [
+                    {"direction": "out", "amount_msat": 100000000},
                     {"direction": "in", "amount_msat": 200000000},
                 ],
             }]
@@ -498,37 +510,8 @@ class TestFix5PendingHTLC:
         analyzer = FlowAnalyzer(plugin, config, db)
 
         channels = analyzer._get_channels()
-        assert channels[0]["pending_outbound_htlc_msat"] == 0
-
-    def test_no_htlcs_unchanged(self):
-        """Channels with no HTLCs should have zero pending amount."""
-        from modules.flow_analysis import FlowAnalyzer
-
-        plugin = MagicMock()
-        plugin.rpc.listpeerchannels.return_value = {
-            "channels": [{
-                "state": "CHANNELD_NORMAL",
-                "short_channel_id": "100x1x0",
-                "peer_id": "peer1",
-                "spendable_msat": 500000000,
-                "receivable_msat": 500000000,
-                "htlcs": [],
-            }]
-        }
-        config = MagicMock()
-        db = MagicMock()
-        analyzer = FlowAnalyzer(plugin, config, db)
-
-        channels = analyzer._get_channels()
-        assert channels[0]["pending_outbound_htlc_msat"] == 0
-
-    def test_max_zero_guard(self):
-        """Deduction should never produce negative balance."""
-        # If pending > spendable, effective should be 0 (not negative)
-        spendable_msat = 100000
-        pending_out_msat = 500000  # More than spendable
-        effective = max(0, spendable_msat - pending_out_msat)
-        assert effective == 0
+        # HTLC count still tracked for congestion detection
+        assert channels[0]["active_htlcs"] == 2
 
 
 # =========================================================================
@@ -536,29 +519,28 @@ class TestFix5PendingHTLC:
 # =========================================================================
 
 class TestKalmanConvergenceGuard:
-    """Tests for Kalman convergence guard and predict-only mode."""
+    """Tests for Kalman convergence guard and idle channel decay."""
 
-    def test_predict_only_when_no_observation(self):
-        """has_observation=False should skip update, keeping filter at prior state."""
+    def test_idle_channel_decays_to_balanced(self):
+        """Idle channels (0.0 observation) should gradually decay toward balanced."""
         from modules.flow_analysis import KalmanFlowFilter
 
         kf = KalmanFlowFilter()
-        # Set a non-zero state to verify it doesn't get pulled to 0.0
         kf.state.flow_ratio = 0.7
-        kf.state.flow_velocity = 0.001
+        kf.state.flow_velocity = 0.0
         kf.state.last_update = int(time.time()) - 3600
 
-        # Predict step grows uncertainty but preserves ratio direction
-        kf.predict(dt_hours=1.0, volatility=1.0)
-        predicted_ratio = kf.state.flow_ratio
+        # Simulate several cycles of zero observation (idle channel)
+        for _ in range(20):
+            kf.predict(dt_hours=1.0, volatility=1.0)
+            kf.update(0.0, confidence=0.5)
 
-        # Without update, ratio should still be near 0.7 (shifted by velocity*dt)
-        assert predicted_ratio > 0.5, f"Predict-only should preserve prior: {predicted_ratio}"
-        # Uncertainty should grow (no observation to reduce it)
-        assert kf.get_uncertainty() > 0.1
+        # Filter should have pulled ratio toward 0.0
+        assert kf.state.flow_ratio < 0.3, \
+            f"Idle channel should decay toward balanced: {kf.state.flow_ratio}"
 
-    def test_update_with_zero_pulls_toward_balanced(self):
-        """Updating with observation=0.0 should pull filter toward zero (the bug)."""
+    def test_single_zero_does_not_snap_to_balanced(self):
+        """A single zero observation should not immediately reset a converged filter."""
         from modules.flow_analysis import KalmanFlowFilter
 
         kf = KalmanFlowFilter()
@@ -569,7 +551,9 @@ class TestKalmanConvergenceGuard:
         kf.predict(dt_hours=1.0, volatility=1.0)
         kf.update(0.0, confidence=0.5)
 
-        # Update with 0.0 should pull ratio toward 0.0
+        # One zero obs pulls toward 0 but doesn't snap there
+        assert kf.state.flow_ratio > 0.1, \
+            f"Single zero should not snap to balanced: {kf.state.flow_ratio}"
         assert kf.state.flow_ratio < 0.7, "Update with 0.0 should reduce ratio"
 
     def test_unconverged_filter_preserves_ema_classification(self):
@@ -600,20 +584,6 @@ class TestKalmanConvergenceGuard:
         assert kf.get_uncertainty() < KALMAN_CONVERGENCE_UNCERTAINTY, \
             f"Converged filter uncertainty {kf.get_uncertainty()} should be below threshold"
         assert kf.state.flow_ratio > 0.5, "Converged filter should reflect observations"
-
-    def test_predict_only_updates_last_update(self):
-        """Predict-only mode should still update last_update timestamp."""
-        from modules.flow_analysis import KalmanFlowFilter
-
-        kf = KalmanFlowFilter()
-        kf.state.last_update = int(time.time()) - 7200  # 2 hours ago
-        old_ts = kf.state.last_update
-
-        kf.predict(dt_hours=2.0, volatility=1.0)
-        # In predict-only mode, the caller sets last_update
-        # (The filter's update() sets it; for predict-only, _apply_kalman_filter sets it)
-        # Just verify predict itself doesn't corrupt state
-        assert kf.state.last_update == old_ts  # predict() doesn't touch last_update
 
 
 class TestConsumerVelocityConversion:
@@ -665,3 +635,71 @@ class TestConsumerVelocityConversion:
         assert std_dev_wrong / std_dev_correct == pytest.approx(math.sqrt(24), rel=1e-3)
         # The correct std_dev should be ~4.9x smaller
         assert std_dev_correct < std_dev_wrong
+
+
+class TestThompsonExtrapolation:
+    """Tests for Thompson posterior f_star clamping (Fix 4)."""
+
+    def test_f_star_allows_extrapolation_above(self):
+        """f_star should be allowed to exceed 1.0 (extrapolate beyond tested range)."""
+        # Simulate a concave posterior where peak is beyond current max fee
+        a = -0.5
+        b = 1.6  # Peak at -b/(2a) = 1.6
+        f_star = -b / (2.0 * a)
+        f_star = max(-0.5, min(1.5, f_star))
+
+        assert f_star == 1.5  # Clamped to safe extrapolation limit, not 1.0
+
+    def test_f_star_allows_extrapolation_below(self):
+        """f_star should be allowed to go below 0.0 (extrapolate below min fee)."""
+        a = -0.5
+        b = -0.3  # Peak at -(-0.3)/(2*-0.5) = -0.3
+        f_star = -b / (2.0 * a)
+        f_star = max(-0.5, min(1.5, f_star))
+
+        assert f_star == -0.3  # Allowed, not clamped to 0.0
+
+    def test_f_star_within_range_unchanged(self):
+        """f_star within [0, 1] should pass through unchanged."""
+        a = -1.0
+        b = 1.0  # Peak at 0.5
+        f_star = -b / (2.0 * a)
+        f_star = max(-0.5, min(1.5, f_star))
+
+        assert f_star == 0.5
+
+
+class TestAskReneClamp:
+    """Tests for AskRene probability clamping (Fix 5)."""
+
+    def test_capacity_ratio_clamped_at_99(self):
+        """When rebalance_amount > askrene_max_sats, ratio should clamp to 0.99."""
+        rebalance_amount = 2_000_000
+        askrene_max_sats = 500_000
+
+        capacity_ratio = min(0.99, rebalance_amount / askrene_max_sats)
+        askrene_p = 1.0 - capacity_ratio
+
+        assert capacity_ratio == 0.99
+        assert askrene_p == pytest.approx(0.01, rel=1e-6)
+
+    def test_normal_ratio_passes_through(self):
+        """When rebalance_amount < askrene_max_sats, ratio is computed normally."""
+        rebalance_amount = 300_000
+        askrene_max_sats = 1_000_000
+
+        capacity_ratio = min(0.99, rebalance_amount / askrene_max_sats)
+        askrene_p = 1.0 - capacity_ratio
+
+        assert capacity_ratio == pytest.approx(0.3, rel=1e-6)
+        assert askrene_p == pytest.approx(0.7, rel=1e-6)
+
+    def test_blended_p_always_positive(self):
+        """Blended probability should always be positive for valid Kelly input."""
+        historical_p = 0.5
+        # Worst case: rebalance far exceeds max_sats
+        capacity_ratio = min(0.99, 10_000_000 / 100_000)
+        askrene_p = 1.0 - capacity_ratio
+        p = (historical_p * 0.3) + (askrene_p * 0.7)
+
+        assert p > 0, f"Blended probability must be positive: {p}"

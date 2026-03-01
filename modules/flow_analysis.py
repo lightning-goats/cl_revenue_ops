@@ -687,12 +687,11 @@ class FlowAnalyzer:
     def _compute_raw_kalman_observation(
         self, channel_id: str, capacity: int,
         net_flow_entries: List[Dict[str, Any]],
-        halflife_hours: float = 24.0,
     ) -> Tuple[float, int]:
-        """Compute raw Kalman observation using continuous-time exponential decay.
+        """Compute raw Kalman observation using a 24-hour rolling window.
 
         Bypasses the EMA pipeline to provide an unsmoothed observation that
-        satisfies the Kalman filter's white-noise measurement assumption.
+        satisfies the Kalman filter's measurement assumptions.
 
         Returns (raw_ratio, entry_count). Falls back to (0.0, 0) on no data.
         """
@@ -700,26 +699,16 @@ class FlowAnalyzer:
             return 0.0, 0
 
         now = time.time()
-        ln2 = math.log(2)
-        weighted_net_sats = 0.0
-        total_weight = 0.0
+        # Look at exactly the last 24 hours of flow
+        recent_entries = [e for e in net_flow_entries if (now - e.get("timestamp", 0)) <= 86400]
 
-        for entry in net_flow_entries:
-            ts = entry.get("timestamp", 0)
-            net_msat = entry.get("net_msat", 0)
-            age_hours = (now - ts) / 3600.0
-            if age_hours < 0:
-                age_hours = 0.0
-            weight = math.exp(-ln2 / halflife_hours * age_hours)
-            weighted_net_sats += (net_msat / 1000.0) * weight
-            total_weight += weight
-
-        if total_weight <= 0:
+        if not recent_entries:
             return 0.0, 0
 
-        raw_ratio = weighted_net_sats / (total_weight * capacity)
-        raw_ratio = max(-1.0, min(1.0, raw_ratio))
-        return raw_ratio, len(net_flow_entries)
+        net_sats_24h = sum(e.get("net_msat", 0) / 1000.0 for e in recent_entries)
+        raw_ratio = net_sats_24h / capacity
+
+        return max(-1.0, min(1.0, raw_ratio)), len(recent_entries)
 
     # =========================================================================
     # v2.0 IMPROVEMENT METHODS
@@ -940,12 +929,8 @@ class FlowAnalyzer:
             if capacity == 0:
                 capacity = int(channel.get("capacity", 0))
 
-            # Get current balance, deducting pending outbound HTLCs as locked liquidity.
-            # Note: CLN's spendable_msat typically already accounts for in-flight HTLCs.
-            # This provides an explicit safety margin for edge cases and older CLN versions.
-            pending_out_msat = channel.get("pending_outbound_htlc_msat", 0)
-            effective_spendable_msat = max(0, spendable_msat - pending_out_msat)
-            our_balance = effective_spendable_msat // 1000
+            # CLN's spendable_msat already accounts for pending HTLCs and channel reserve.
+            our_balance = spendable_msat // 1000
 
             # Get daily buckets for this channel
             channel_daily = flow_data_daily.get(channel_id, [])
@@ -1008,7 +993,7 @@ class FlowAnalyzer:
                         confidence=kalman_confidence,
                         daily_buckets=channel_daily,
                         prev_ts=prev_ts,
-                        has_observation=(raw_count > 0)
+                        has_observation=True  # Always update so idle channels decay to 0.0
                     )
                 metrics.kalman_flow_ratio = kalman_ratio
                 metrics.kalman_velocity = kalman_velocity
@@ -1110,10 +1095,8 @@ class FlowAnalyzer:
         if capacity == 0:
             capacity = int(channel.get("capacity", 0))
 
-        # Deduct pending outbound HTLCs as locked liquidity
-        pending_out_msat = channel.get("pending_outbound_htlc_msat", 0)
-        effective_spendable_msat = max(0, spendable_msat - pending_out_msat)
-        our_balance = effective_spendable_msat // 1000
+        # CLN's spendable_msat already accounts for pending HTLCs and channel reserve.
+        our_balance = spendable_msat // 1000
 
         # Get daily flow data
         flow_data_daily = self._get_daily_flow_from_db(channel_id)
@@ -1178,7 +1161,7 @@ class FlowAnalyzer:
                     confidence=kalman_confidence,
                     daily_buckets=channel_daily,
                     prev_ts=prev_ts,
-                    has_observation=(raw_count > 0)
+                    has_observation=True  # Always update so idle channels decay to 0.0
                 )
             metrics.kalman_flow_ratio = kalman_ratio
             metrics.kalman_velocity = kalman_velocity
@@ -1459,13 +1442,6 @@ class FlowAnalyzer:
                     # Count active HTLCs from the htlcs array
                     htlcs = channel_info.get("htlcs", [])
                     channel_info["active_htlcs"] = len(htlcs) if htlcs else 0
-
-                    # Sum pending outbound HTLC amounts (locked liquidity)
-                    pending_out_msat = 0
-                    for htlc in (htlcs or []):
-                        if htlc.get("direction") == "out":
-                            pending_out_msat += int(htlc.get("amount_msat", 0) or 0)
-                    channel_info["pending_outbound_htlc_msat"] = pending_out_msat
 
                     channels.append(channel_info)
             

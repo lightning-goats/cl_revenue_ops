@@ -2646,7 +2646,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 dest_sling_scid = self.job_manager._to_sling_scid(dest_channel)
                 askrene_max_sats = self.job_manager._askrene_max_sats_for_scid_dir(dest_sling_scid)
                 if askrene_max_sats is not None and askrene_max_sats > 0:
-                    askrene_p = max(0.01, 1.0 - (rebalance_amount / askrene_max_sats))
+                    # Clamp ratio to 0.99 so probability never goes negative
+                    capacity_ratio = min(0.99, rebalance_amount / askrene_max_sats)
+                    askrene_p = 1.0 - capacity_ratio
                     # Blend: 30% historical, 70% AskRene (real-time is more informative)
                     p = (historical_p * 0.3) + (askrene_p * 0.7)
             except Exception:

@@ -1926,7 +1926,8 @@ class GaussianThompsonState:
         if a < -1e-8:
             # Concave: optimal at -b/(2a), un-normalize
             f_star = -b / (2.0 * a)
-            f_star = max(0.0, min(1.0, f_star))
+            # Allow safe extrapolation up to 50% beyond the tested range
+            f_star = max(-0.5, min(1.5, f_star))
             self.posterior_mean = f_star * fee_range + fee_min
         else:
             # Non-concave: use best observed fee
