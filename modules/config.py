@@ -294,10 +294,10 @@ class Config:
                                         # Recommended: 20 ppm (~10 sats per 500k chunk)
     rebalance_max_amount: int = 5000000  # Max rebalance amount in sats
     rebalance_min_amount: int = 50000    # Min rebalance amount in sats
-    low_liquidity_threshold: float = 0.2  # Below 20% = low outbound
-    high_liquidity_threshold: float = 0.8 # Above 80% = high outbound
+    low_liquidity_threshold: float = 0.3  # Below 30% = low outbound
+    high_liquidity_threshold: float = 0.7 # Above 70% = high outbound
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
-    inbound_fee_estimate_ppm: int = 500  # Network routing cost estimate in PPM
+    inbound_fee_estimate_ppm: int = 200  # Network routing cost estimate in PPM
     
     # clboss integration
     clboss_enabled: bool = True    # Whether to use clboss-unmanage
