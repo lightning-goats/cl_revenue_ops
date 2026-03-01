@@ -73,10 +73,11 @@ class ChannelCosts:
     open_cost_sats: int
     rebalance_cost_sats: int
     effective_rebalance_cost_sats: int = 0  # cost adjusted for success rate
+    splice_cost_sats: int = 0
 
     @property
     def total_cost_sats(self) -> int:
-        return self.open_cost_sats + self.rebalance_cost_sats
+        return self.open_cost_sats + self.splice_cost_sats + self.rebalance_cost_sats
 
 
 @dataclass
@@ -104,8 +105,8 @@ class ChannelRevenue:
 
     @property
     def total_contribution_sats(self) -> int:
-        """Total value: direct fees + fees enabled by sourcing volume."""
-        return self.fees_earned_sats + self.sourced_fee_contribution_sats
+        """Total value: 50% of direct fees + 50% of fees enabled by sourcing."""
+        return (self.fees_earned_sats + self.sourced_fee_contribution_sats) // 2
 
     @property
     def total_forward_count(self) -> int:
@@ -152,42 +153,25 @@ class ChannelProfitability:
     fee_per_sat_routed: float
     days_open: int
     last_routed: Optional[int]
-    
+    marginal_profit_30d_sats: int = 0
+    rebalance_cost_30d_sats: int = 0
+
     @property
     def marginal_roi(self) -> float:
         """
-        Calculate Marginal ROI (Operational profitability).
+        Marginal ROI on a trailing 30-day window.
 
-        This metric EXCLUDES open_cost_sats (sunk cost) and focuses only on
-        operational profitability: are we covering our rebalancing costs?
-
-        Uses total_contribution_sats which includes:
-        - Direct fees earned (as exit channel)
-        - Sourced fee contribution (fees enabled by sourcing inbound volume)
-
-        Formula: (total_contribution - rebalance_costs) / max(1, rebalance_costs)
+        Uses 30-day trailing contribution and rebalance costs so that
+        ancient bad rebalances don't permanently poison the metric.
 
         Returns:
             Marginal ROI as a decimal (e.g., 0.5 = 50% marginal return)
             Returns 1.0 if no rebalance costs and earning/contributing
             Returns 0.0 if no rebalance costs and no contribution
         """
-        # Use total contribution (direct fees + sourced fee contribution)
-        total_contribution = self.revenue.total_contribution_sats
-        # Use effective cost (adjusted for success rate) when available
-        effective = getattr(self.costs, 'effective_rebalance_cost_sats', 0)
-        rebalance_costs = effective if effective > 0 else self.costs.rebalance_cost_sats
-
-        # If no rebalancing has occurred, check if channel is contributing value
-        if rebalance_costs == 0:
-            # No operational costs - if contributing anything, it's pure profit
-            return 1.0 if total_contribution > 0 else 0.0
-
-        # Marginal profit = total contribution minus rebalancing costs (NO open cost!)
-        marginal_profit = total_contribution - rebalance_costs
-
-        # ROI relative to rebalancing investment
-        return marginal_profit / max(1, rebalance_costs)
+        if self.rebalance_cost_30d_sats == 0:
+            return 1.0 if self.marginal_profit_30d_sats > 0 else 0.0
+        return self.marginal_profit_30d_sats / max(1, self.rebalance_cost_30d_sats)
     
     @property
     def marginal_roi_percent(self) -> float:
@@ -527,10 +511,11 @@ class ChannelProfitabilityAnalyzer:
             else:
                 # No costs recorded (e.g. remote open, no rebalancing)
                 # Infinite ROI if contributing value, 0 otherwise
-                roi = 1.0 if total_contribution > 0 else 0.0
+                # Zero-cost channels: use Return on Capacity for meaningful ranking
+                roi = total_contribution / max(1, capacity) if total_contribution > 0 else 0.0
 
-            # Cost/fee per sat routed (using total volume: exit + sourced)
-            total_volume = revenue.volume_routed_sats + revenue.sourced_volume_sats
+            # Cost/fee per sat routed (physical throughput per channel, not double-counted)
+            total_volume = max(revenue.volume_routed_sats, revenue.sourced_volume_sats)
             if total_volume > 0:
                 cost_per_sat = costs.total_cost_sats / total_volume
                 fee_per_sat = total_contribution / total_volume
@@ -544,13 +529,19 @@ class ChannelProfitabilityAnalyzer:
             
             # Last routing activity
             last_routed = self._get_last_routing_time(channel_id)
-            
+
+            # 30-day trailing P&L for marginal ROI
+            pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days=30)
+            contribution_30d = pnl_30d.get('total_contribution_sats', 0)
+            rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
+            marginal_profit_30d = contribution_30d - rebalance_cost_30d
+
             # Classify
             classification = self._classify_channel(
                 roi, net_profit, last_routed, days_open,
                 channel_id=channel_id
             )
-            
+
             profitability = ChannelProfitability(
                 channel_id=channel_id,
                 peer_id=peer_id,
@@ -563,7 +554,9 @@ class ChannelProfitabilityAnalyzer:
                 cost_per_sat_routed=cost_per_sat,
                 fee_per_sat_routed=fee_per_sat,
                 days_open=days_open,
-                last_routed=last_routed
+                last_routed=last_routed,
+                marginal_profit_30d_sats=marginal_profit_30d,
+                rebalance_cost_30d_sats=rebalance_cost_30d
             )
             
             return profitability
@@ -1974,6 +1967,10 @@ class ChannelProfitabilityAnalyzer:
                     level='debug'
                 )
         
+        # Splice costs
+        splice_history = self.database.get_channel_splice_history(channel_id)
+        splice_cost = sum(int(s.get("fee_sats", 0) or 0) for s in splice_history)
+
         # Success-rate-adjusted effective cost
         effective_rebalance_costs = rebalance_costs
         success_data = self.database.get_channel_rebalance_success_rate(channel_id)
@@ -1986,7 +1983,8 @@ class ChannelProfitabilityAnalyzer:
             peer_id=peer_id,
             open_cost_sats=open_cost,
             rebalance_cost_sats=rebalance_costs,
-            effective_rebalance_cost_sats=effective_rebalance_costs
+            effective_rebalance_cost_sats=effective_rebalance_costs,
+            splice_cost_sats=splice_cost
         )
     
     def _sanity_check_open_cost(self, channel_id: str, peer_id: str,
@@ -2455,8 +2453,15 @@ class ChannelProfitabilityAnalyzer:
                     if hours_since_diag_success > 48 and (not last_routed or last_routed < last_success_time):
                         return ProfitabilityClass.ZOMBIE
                 elif last_success_time == 0:
-                    # No success in 2+ attempts (and last_success_time is guaranteed int 0 here)
-                    return ProfitabilityClass.ZOMBIE
+                    # No success in 2+ attempts — but only ZOMBIE if truly inactive
+                    if days_inactive >= 7:
+                        return ProfitabilityClass.ZOMBIE
+                    else:
+                        self.plugin.log(
+                            f"PROFITABILITY: Diagnostic failed for {channel_id[:12]}... but channel "
+                            f"routed {days_inactive}d ago. Skipping ZOMBIE classification.",
+                            level='debug'
+                        )
             # --- FIX FOR NoneType CRASH ENDS HERE ---
                     
         # 2. Check for STAGNANT_CANDIDATE (0 forwards in last 7 days + unprofitable)

@@ -2001,7 +2001,7 @@ class Database:
 
         # Calculate total contribution value
         # Direct fees + sourced fee contribution (what we helped earn elsewhere)
-        total_contribution = direct_pnl['revenue_sats'] + inbound['sourced_fee_contribution_sats']
+        total_contribution = (direct_pnl['revenue_sats'] + inbound['sourced_fee_contribution_sats']) // 2
 
         return {
             'channel_id': channel_id,

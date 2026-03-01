@@ -59,50 +59,40 @@ def _make_profitability(
 
 
 class TestEffectiveCost:
-    """Test effective_rebalance_cost_sats in marginal_roi."""
+    """Test marginal_roi using 30-day trailing fields."""
 
-    def test_marginal_roi_uses_effective_cost(self):
-        """When effective > raw, marginal_roi should be lower."""
-        # Raw cost = 1000, effective = 2000 (50% success rate)
+    def test_marginal_roi_with_30d_profit(self):
+        """marginal_roi should reflect 30d profit / 30d rebalance cost."""
         prof = _make_profitability(
             rebalance_cost_sats=1000,
             effective_rebalance_cost_sats=2000,
             fees_earned_sats=3000,
         )
+        # Override 30d fields: profit=500, cost=200 -> 500/200 = 2.5
+        prof.marginal_profit_30d_sats = 500
+        prof.rebalance_cost_30d_sats = 200
+        assert abs(prof.marginal_roi - 2.5) < 0.01
 
-        # marginal_roi = (3000 - 2000) / max(1, 2000) = 0.5
-        assert abs(prof.marginal_roi - 0.5) < 0.01
-
-        # Compare with raw cost version
-        prof_raw = _make_profitability(
-            rebalance_cost_sats=1000,
-            effective_rebalance_cost_sats=0,  # fallback to raw
-            fees_earned_sats=3000,
-        )
-        # marginal_roi = (3000 - 1000) / max(1, 1000) = 2.0
-        assert abs(prof_raw.marginal_roi - 2.0) < 0.01
-
-        # Effective cost version has lower ROI
-        assert prof.marginal_roi < prof_raw.marginal_roi
-
-    def test_effective_cost_fallback(self):
-        """When effective_rebalance_cost_sats=0, falls back to raw."""
+    def test_marginal_roi_negative_30d(self):
+        """Negative 30d profit yields negative marginal_roi."""
         prof = _make_profitability(
             rebalance_cost_sats=500,
             effective_rebalance_cost_sats=0,
             fees_earned_sats=1500,
         )
-
-        # Should use raw cost: (1500 - 500) / max(1, 500) = 2.0
-        assert abs(prof.marginal_roi - 2.0) < 0.01
+        prof.marginal_profit_30d_sats = -300
+        prof.rebalance_cost_30d_sats = 600
+        assert abs(prof.marginal_roi - (-0.5)) < 0.01
 
     def test_no_costs_returns_one_if_earning(self):
-        """With zero costs but earning, marginal_roi = 1.0."""
+        """With zero 30d costs but positive 30d profit, marginal_roi = 1.0."""
         prof = _make_profitability(
             rebalance_cost_sats=0,
             effective_rebalance_cost_sats=0,
             fees_earned_sats=1000,
         )
+        prof.marginal_profit_30d_sats = 500
+        prof.rebalance_cost_30d_sats = 0
         assert prof.marginal_roi == 1.0
 
     def test_bleeder_classification_includes_effective_cost(self):

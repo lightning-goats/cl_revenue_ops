@@ -68,7 +68,7 @@ def test_windowed_pnl_includes_pruned_daily_rollups(db):
     full = db.get_channel_full_pnl("A", window_days=30)
     assert full["direct_revenue_sats"] == 8
     assert full["sourced_fee_contribution_sats"] == 10
-    assert full["total_contribution_sats"] == 18
+    assert full["total_contribution_sats"] == 9  # (8 + 10) // 2 = 9 (50/50 split)
 
 
 def test_total_routing_revenue_includes_daily_rollups(db):
