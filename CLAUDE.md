@@ -56,10 +56,15 @@ Core Lightning
 ### Key Algorithms
 
 **The Alpha Sequence** (Fee Priority):
-1. **Congestion Check**: HTLC slots > 80% → Max Fee
-2. **Vegas Reflex**: Mempool spike > 200% → Raise floor
-3. **Scarcity Pricing**: Local balance < 35% → Exponential increase
-4. **Thompson Sampling**: Stable channel → Bayesian exploration of optimal fee point
+1. **HIVE Safety**: Fleet members → Enforced hive_fee_ppm (usually 0)
+2. **Congestion Check**: HTLC slots saturated → Ceiling fee
+3. **Zero-Fee Probe**: Dead channel defibrillator → 0 PPM
+4. **Thompson+AIMD**: Primary fee optimization → Bayesian sampling + defensive AIMD
+
+**Post-Thompson Modifiers** (applied after fee sampling):
+- **Vegas Reflex**: Mempool spike > 200% → Raises fee floor (pre-bounds)
+- **Scarcity Pricing**: Local balance < threshold → Linear increase (1.0x-3.0x via bounds multiplier)
+- **Hive Coordination**: Fleet-aware fee blending and competition avoidance
 
 **EV-Based Rebalancing**:
 - Only rebalance if `Expected_Revenue > Rebalance_Cost`

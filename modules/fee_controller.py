@@ -1,36 +1,45 @@
 """
-Hill Climbing Fee Controller module for cl-revenue-ops
+Fee Controller module for cl-revenue-ops
 
 MODULE 2: Revenue-Maximizing Fee Controller (Dynamic Pricing)
 
-This module implements a Hill Climbing (Perturb & Observe) algorithm
+This module implements a Thompson Sampling + AIMD fee optimization system
 for dynamically adjusting channel fees to maximize revenue.
 
-Why Hill Climbing Instead of PID?
-- PID targets a static flow rate, ignoring price elasticity
-- Hill Climbing actively seeks the revenue-maximizing fee point
-- It adapts to changing market conditions and peer behavior
+Primary Algorithm: Gaussian Thompson Sampling
+- Bayesian posterior over polynomial fee-revenue response curve
+- Contextual sampling (time-aware, pheromone-modulated)
+- Automatic exploration/exploitation balance via posterior uncertainty
 
-Hill Climbing Algorithm:
-1. Perturb: Make a small fee change in a direction
-2. Observe: Measure the resulting revenue change
-3. Decide:
-   - If Revenue Increased: Keep going in the same direction
-   - If Revenue Decreased: Reverse direction (we went too far)
-4. Repeat: Continuously seek the optimal fee point
+Defense Layer: AIMD (Additive Increase / Multiplicative Decrease)
+- Rapid response to routing failures (multiplicative decrease 0.85x)
+- Gradual recovery on sustained success (+0.02 modifier per streak)
+- Coordinates with Thompson to avoid conflicting during exploration
+
+The Alpha Sequence (Fee Priority Chain):
+1. HIVE Safety: Fleet members always get configured hive_fee_ppm (usually 0)
+2. Congestion: HTLC slots saturated → ceiling fee
+3. Zero-Fee Probe: Defibrillator for dead channels → 0 PPM
+4. Thompson+AIMD: Primary fee optimization algorithm
+
+Post-Thompson Modifiers (applied after sampling):
+- Scarcity Pricing: Linear multiplier (1.0x-3.0x) for low local balance
+- Vegas Reflex: Mempool spike defense (raises fee floor)
+- Hive Coordination: Fleet-aware fee blending
+- Competition Avoidance: Differentiate from fleet members
+
+Legacy Fallback: Hill Climbing (Perturb & Observe)
+- Used only when ENABLE_THOMPSON_AIMD is False
 
 Revenue Calculation:
 - Revenue = Volume * Fee
-- We track revenue over time windows to measure impact of changes
+- Revenue rate tracked over observation windows with EMA smoothing
+- Demand-adjusted via Kalman flow estimation
 
 Constraints:
-- Never drop below floor (economic minimum based on chain costs)
-- Never exceed ceiling (prevent absurd fees)
-- Use liquidity bucket multipliers as secondary weighting
-- Unmanage from clboss before setting fees
-
-The Hill Climber provides adaptive, revenue-seeking fee adjustments that
-find the optimal price point where volume * fee is maximized.
+- Floor: max(chain cost, balance floor, rebalance cost floor, saturation floor, Vegas floor)
+- Ceiling: min(max_fee_ppm, flow-adjusted ceiling, profitability ceiling)
+- Bounds multipliers applied to floor/ceiling, not fee directly
 """
 
 import time
@@ -1622,6 +1631,14 @@ class GaussianThompsonState:
         """
         now = int(time.time())
 
+        # Guard against NaN/Inf inputs that would corrupt the posterior
+        if not math.isfinite(hours) or hours <= 0:
+            hours = 1.0
+        if not math.isfinite(revenue_rate) or revenue_rate < 0:
+            revenue_rate = 0.0
+        if not math.isfinite(fee) or fee < 0:
+            return  # Skip corrupt observation entirely
+
         # Weight based on revenue (higher revenue = more confidence)
         # and observation duration (longer = more confidence)
         # MA-8: Use log scale to avoid saturation at 100 sats/hr on high-volume nodes
@@ -2284,7 +2301,7 @@ class AIMDDefenseState:
     Provides rapid response to routing failures by:
     - Tracking consecutive successes and failures
     - Multiplicative decrease (0.85x) on failure streaks
-    - Additive increase (+5 ppm) on success streaks
+    - Additive increase (+0.02 modifier) on success streaks
 
     This overlays Thompson Sampling to provide quick recovery when
     market conditions change suddenly. Thompson learns slowly but
@@ -3057,22 +3074,21 @@ class FeeAdjustment:
 
 class HillClimbingFeeController:
     """
-    Hill Climbing (Perturb & Observe) fee controller for revenue maximization.
-    
-    The controller aims to find the revenue-maximizing fee by iteratively
-    adjusting fees and observing the revenue impact.
-    
+    Thompson Sampling + AIMD fee controller for revenue maximization.
+
+    Primary: Gaussian Thompson Sampling with polynomial posterior samples
+    fees from a Bayesian belief about the fee-revenue curve. Defense: AIMD
+    provides rapid response to routing failures via multiplicative decrease.
+    Legacy Hill Climbing (Perturb & Observe) serves as fallback when
+    ENABLE_THOMPSON_AIMD is False.
+
     Key Principles:
     1. Revenue Focus: Maximize Volume * Fee, not just volume
-    2. Adaptive: Learns from revenue changes to find optimal fees
-    3. Bounded: Respects floor/ceiling constraints
-    4. Liquidity-aware: Uses bucket multipliers as weights
+    2. Bayesian: Maintains posterior over fee-revenue relationship
+    3. Bounded: Respects floor/ceiling constraints with multipliers
+    4. Liquidity-aware: Uses bucket multipliers as floor weights
     5. clboss override: Unmanages from clboss before setting fees
-    
-    Hill Climbing Parameters:
-    - step_ppm: Base fee change per iteration (default 50 ppm)
-    - step_percent: Alternative step as percentage (default 5%)
-    - min_observation_window: Minimum time between changes (default 6 hours)
+    6. Fleet-aware: Coordinates with cl-hive for competition avoidance
     """
     
     # Hill Climbing parameters

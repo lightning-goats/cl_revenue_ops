@@ -1391,14 +1391,27 @@ class Database:
             VALUES (?, ?, ?)
         """, (channel_id, probe_type, now))
 
-    def get_channel_probe(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        """Gets the probe flag for a channel."""
+    def get_channel_probe(self, channel_id: str, max_age_seconds: int = 86400) -> Optional[Dict[str, Any]]:
+        """Gets the probe flag for a channel, returning None if expired.
+
+        Args:
+            channel_id: Channel to check
+            max_age_seconds: Maximum age of probe before auto-expiry (default 24h)
+        """
         conn = self._get_connection()
         row = conn.execute(
             "SELECT * FROM channel_probes WHERE channel_id = ?",
             (channel_id,)
         ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        probe = dict(row)
+        # Auto-expire stale probes to prevent permanent 0-fee
+        started_at = probe.get("started_at", 0)
+        if started_at > 0 and (int(time.time()) - started_at) > max_age_seconds:
+            conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
+            return None
+        return probe
 
     def clear_channel_probe(self, channel_id: str):
         """Clears the probe flag for a channel."""
