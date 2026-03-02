@@ -1004,30 +1004,41 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Backup doesn't exist, proceed with migration
         
-        migrated_count = 0
-        for row in rows:
-            peer_id = row['peer_id']
-            reason = row['reason'] or 'migrated_ignore'
-            ignored_at = row['ignored_at']
-            
-            # Check if peer already has a policy (don't overwrite)
-            existing = conn.execute(
-                "SELECT 1 FROM peer_policies WHERE peer_id = ?", (peer_id,)
-            ).fetchone()
-            
-            if not existing:
-                import json
-                tags = json.dumps(['migrated_ignore', reason] if reason != 'migrated_ignore' else ['migrated_ignore'])
-                conn.execute("""
-                    INSERT INTO peer_policies 
-                        (peer_id, strategy, rebalance_mode, fee_ppm_target, tags, updated_at)
-                    VALUES (?, 'passive', 'disabled', NULL, ?, ?)
-                """, (peer_id, tags, ignored_at))
-                migrated_count += 1
-        
-        # Rename old table to backup (preserve data for safety)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            migrated_count = 0
+            for row in rows:
+                peer_id = row['peer_id']
+                reason = row['reason'] or 'migrated_ignore'
+                ignored_at = row['ignored_at']
+
+                # Check if peer already has a policy (don't overwrite)
+                existing = conn.execute(
+                    "SELECT 1 FROM peer_policies WHERE peer_id = ?", (peer_id,)
+                ).fetchone()
+
+                if not existing:
+                    import json
+                    tags = json.dumps(['migrated_ignore', reason] if reason != 'migrated_ignore' else ['migrated_ignore'])
+                    conn.execute("""
+                        INSERT INTO peer_policies
+                            (peer_id, strategy, rebalance_mode, fee_ppm_target, tags, updated_at)
+                        VALUES (?, 'passive', 'disabled', NULL, ?, ?)
+                    """, (peer_id, tags, ignored_at))
+                    migrated_count += 1
+
+            # Rename old table to backup (preserve data for safety)
+            if migrated_count > 0:
+                conn.execute("ALTER TABLE ignored_peers RENAME TO _backup_ignored_peers")
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
         if migrated_count > 0:
-            conn.execute("ALTER TABLE ignored_peers RENAME TO _backup_ignored_peers")
             self.plugin.log(
                 f"v1.4 Migration: Migrated {migrated_count} ignored peers to peer_policies. "
                 f"Old table renamed to _backup_ignored_peers.",
