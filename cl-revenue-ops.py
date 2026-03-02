@@ -1403,6 +1403,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 if database:
                     days_to_keep = max(8, config.flow_window_days + 1)
                     database.cleanup_old_data(days_to_keep=days_to_keep)
+
+                # AUDIT FIX PM-5: Clean up expired time-limited policies
+                if policy_manager:
+                    try:
+                        policy_manager.cleanup_expired_policies()
+                    except Exception as e:
+                        plugin.log(f"Error cleaning expired policies: {e}", level='debug')
                 
             except (RPCTimeoutError, RPCBreakerOpen) as e:
                 plugin.log(f"RPC degraded in flow analysis: {e}. Skipping this cycle.", level='warn')
@@ -2141,7 +2148,8 @@ def revenue_rebalance_debug(
             except Exception:
                 state_lookup = {}
 
-        profitability_analyzer = getattr(rebalancer, "_profitability_analyzer", None) if include_hot_markers else None
+        # AUDIT FIX Issue-11: Renamed to avoid shadowing the global profitability_analyzer
+        prof_analyzer = getattr(rebalancer, "_profitability_analyzer", None) if include_hot_markers else None
         compute_hot = getattr(rebalancer, "_compute_hot_channel_protection", None) if include_hot_markers else None
         hot_profile_cache: Dict[str, Dict[str, Any]] = {}
         prof_cache: Dict[str, Any] = {}
@@ -2221,9 +2229,9 @@ def revenue_rebalance_debug(
                             velocity = (sats_in + sats_out) / max(float(capacity), 1.0) / max(float(getattr(cfg, "flow_window_days", 7) or 7), 1.0)
 
                         prof = prof_cache.get(cid, None)
-                        if cid not in prof_cache and profitability_analyzer is not None:
+                        if cid not in prof_cache and prof_analyzer is not None:
                             try:
-                                prof = profitability_analyzer.analyze_channel(cid)
+                                prof = prof_analyzer.analyze_channel(cid)
                             except Exception:
                                 prof = None
                             prof_cache[cid] = prof
@@ -2422,7 +2430,11 @@ def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[st
         result = flow_analyzer.analyze_channel(channel_id)
         return {"channel": channel_id, "analysis": result.to_dict() if result else None}
     else:
-        run_flow_analysis()
+        # AUDIT FIX Issue-4: Catch exceptions from run_flow_analysis (it re-raises)
+        try:
+            run_flow_analysis()
+        except Exception as e:
+            return {"error": f"Flow analysis failed: {e}"}
         return {"status": "Flow analysis triggered"}
 
 
@@ -3197,6 +3209,9 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
                     updates = updates_json
                 if not isinstance(updates, list):
                     return {"error": "updates must be a JSON array"}
+                # AUDIT FIX Issue-18: Cap batch size to prevent unbounded processing
+                if len(updates) > 100:
+                    return {"error": f"Batch too large: {len(updates)} entries, max 100"}
             except json.JSONDecodeError as e:
                 return {"error": f"Invalid JSON in updates: {e}"}
 

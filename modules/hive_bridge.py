@@ -50,6 +50,7 @@ Yield Metrics:
 Author: Lightning Goats Team
 """
 
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -693,7 +694,12 @@ class HiveFeeIntelligenceBridge:
                 return self._stale_with_reduced_confidence(cached_data, age)
             return None
 
-        assert result is not None
+        # AUDIT FIX HB-1: Replace assert with explicit check (assert is stripped with -O flag)
+        if result is None:
+            if cached_data and cache_entry:
+                age = time.time() - cache_timestamp
+                return self._stale_with_reduced_confidence(cached_data, age)
+            return None
         if result.get("error"):
             if result.get("error") == "no_data":
                 return None
@@ -1422,6 +1428,13 @@ class HiveFeeIntelligenceBridge:
 
         # M-18: Clamp recommended fee to configured bounds
         if 'recommended_fee_ppm' in result:
+            # AUDIT FIX HB-3: Type-validate recommended_fee_ppm from hive RPC
+            try:
+                result['recommended_fee_ppm'] = int(result['recommended_fee_ppm'])
+            except (TypeError, ValueError):
+                self._log(f"Invalid recommended_fee_ppm type: {type(result['recommended_fee_ppm'])}", level="warn")
+                del result['recommended_fee_ppm']
+                return result
             min_fee = self.config.min_fee_ppm if self.config else 0
             max_fee = self.config.max_fee_ppm if self.config else 100000
             result['recommended_fee_ppm'] = max(min_fee, min(result['recommended_fee_ppm'], max_fee))
@@ -2430,6 +2443,15 @@ class HiveFeeIntelligenceBridge:
         if not (-1.0 <= flow_ratio <= 1.0):
             self._log(f"Invalid flow_ratio value {flow_ratio}, clamping to [-1,1]", level="debug")
             flow_ratio = max(-1.0, min(1.0, flow_ratio))
+
+        # AUDIT FIX HB-5: Validate velocity for NaN/inf before fleet-wide propagation
+        if not math.isfinite(velocity_pct_per_hour):
+            self._log(f"Invalid velocity {velocity_pct_per_hour}, dropping report", level="warn")
+            return False
+        velocity_pct_per_hour = max(-0.5, min(0.5, velocity_pct_per_hour))
+
+        if not math.isfinite(uncertainty):
+            uncertainty = 0.1
 
         if uncertainty < 0:
             self._log(f"Invalid uncertainty value {uncertainty}, using abs", level="debug")
