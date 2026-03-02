@@ -2380,6 +2380,16 @@ class HiveFeeIntelligenceBridge:
         if self._is_circuit_open() or not self.is_available():
             return None
 
+        # HB-6: Validate amount_sats to prevent nonsensical RPC calls
+        try:
+            amount_sats = int(amount_sats)
+        except (TypeError, ValueError):
+            self.plugin.log(f"Invalid amount_sats type: {type(amount_sats)}", level='debug')
+            return None
+        if amount_sats <= 0 or amount_sats > 100_000_000:  # Cap at 1 BTC
+            self.plugin.log(f"amount_sats out of range: {amount_sats}", level='debug')
+            return None
+
         params = {
             "from_channel": from_channel,
             "to_channel": to_channel,

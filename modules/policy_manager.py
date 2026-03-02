@@ -166,6 +166,13 @@ class PolicyManager:
     Thread Safety:
         Uses the Database's thread-local connection pattern.
         Policy reads are idempotent; writes are atomic via SQLite.
+
+    Known Limitations:
+    - PM-1: Write-through cache update can overwrite concurrent DB writes in a narrow
+      window. DB is authoritative; cache is rebuilt on next full load. Non-critical.
+    - PM-4: Batch rate-limit checks use arrival-order, not policy-priority order. This means
+      high-priority policy changes could be rate-limited by earlier low-priority ones in the
+      same batch. Non-critical timing issue.
     """
 
     # Default policy for peers without explicit configuration

@@ -91,6 +91,9 @@ class CapacityPlanner:
             peers = self.plugin.rpc.listpeers().get("peers", [])
             for peer in peers:
                 peer_id = peer.get("id")
+                # CP-2: Guard against None peer_id from malformed listpeers responses
+                if not peer_id:
+                    continue
                 features = peer.get("features", "")
                 # BOLT 9: option_splice uses feature bits 62 (even=required) / 63 (odd=optional)
                 # CLN provides 'features' as a hex string.

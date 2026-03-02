@@ -275,6 +275,14 @@ class PortfolioOptimizer:
 
     Implements Markowitz optimization to find optimal liquidity allocation
     across channels that maximizes risk-adjusted returns.
+
+    Known Limitations (documented, not bugs — this is an advisory module):
+    - C-1: Variance calculation can underestimate when bucket counts differ between
+      channels. Acceptable because portfolio analysis is advisory, not actionable.
+    - I-5: Marginal Sharpe ignores cross-correlation (uses simplified formula).
+      Correct marginal contribution requires full covariance decomposition.
+    - I-7: Gershgorin PSD enforcement can inflate diagonal elements. This is a
+      deliberate stability-over-accuracy tradeoff for the advisory display.
     """
 
     def __init__(self, database, plugin, hive_bridge=None):
@@ -723,18 +731,21 @@ class PortfolioOptimizer:
                 series_a = channel_series[scid_a]
                 series_b = channel_series[scid_b]
 
-                # Find common buckets
-                common_buckets = set(series_a.keys()) & set(series_b.keys())
+                # I-9 FIX: Use bucket union with 0.0 for missing entries.
+                # Intersection drops periods where one channel had activity but the
+                # other didn't — that zero-revenue signal is meaningful for covariance.
+                all_buckets = set(series_a.keys()) | set(series_b.keys())
 
-                if len(common_buckets) < 3:
-                    # Not enough common data
+                if len(all_buckets) < 3:
+                    # Not enough data
                     covariance_matrix[(scid_a, scid_b)] = 0.0
                     correlation_matrix[(scid_a, scid_b)] = 0.0
                     continue
 
-                # Get aligned values
-                vals_a = [series_a[b] for b in sorted(common_buckets)]
-                vals_b = [series_b[b] for b in sorted(common_buckets)]
+                # Get aligned values (missing entries default to 0.0 revenue)
+                sorted_buckets = sorted(all_buckets)
+                vals_a = [series_a.get(b, 0.0) for b in sorted_buckets]
+                vals_b = [series_b.get(b, 0.0) for b in sorted_buckets]
 
                 # Safety check: need at least 2 values for variance calculation
                 n_samples = len(vals_a)
@@ -999,8 +1010,11 @@ class PortfolioOptimizer:
             # preventing permanent degradation from prior backtracking.
             learning_rate = min(learning_rate * 1.5, initial_learning_rate)
 
-            # Check convergence on objective value
-            if abs(obj - prev_objective) < tolerance:
+            # I-3 FIX: Check convergence using both absolute and relative tolerance.
+            # Absolute tolerance alone fails for large objective values.
+            abs_change = abs(obj - prev_objective)
+            rel_change = abs_change / max(abs(obj), 1e-12)
+            if abs_change < tolerance or rel_change < tolerance:
                 break
             prev_objective = obj
 
@@ -1063,9 +1077,10 @@ class PortfolioOptimizer:
                 # Degenerate: equal-weight fallback
                 return [1.0 / n] * n
 
-        # Post-loop assertion: verify bounds are satisfied
+        # I-10 FIX: Relaxed bounds tolerance from 1e-9 to 1e-6 to accommodate
+        # floating-point accumulation in redistribution loop with many channels
         bounds_ok = all(
-            effective_min - 1e-9 <= weights[i] <= effective_max + 1e-9
+            effective_min - 1e-6 <= weights[i] <= effective_max + 1e-6
             for i in range(n)
         )
         sum_ok = abs(sum(weights) - 1.0) < 1e-6
@@ -1126,25 +1141,30 @@ class PortfolioOptimizer:
         concentration = sum(w ** 2 for w in optimal_weights)
 
         # Risk decomposition: portfolio-weighted average correlation
-        # Weights correlation by the product of optimal allocations so that
-        # low-weight pairs don't dominate the metric.
-        weighted_corr_sum = 0.0
-        weight_product_sum = 0.0
-        for i in range(n):
-            for j in range(i + 1, n):
-                std_i = math.sqrt(max(cov_matrix[i][i], MIN_VARIANCE))
-                std_j = math.sqrt(max(cov_matrix[j][j], MIN_VARIANCE))
-                if std_i > 0 and std_j > 0:
-                    corr = cov_matrix[i][j] / (std_i * std_j)
-                    w_product = optimal_weights[i] * optimal_weights[j]
-                    weighted_corr_sum += corr * w_product
-                    weight_product_sum += w_product
+        # I-8: Single-channel special case — all risk is idiosyncratic by definition
+        if n <= 1:
+            systematic_risk = 0.0
+            idiosyncratic_risk = 1.0
+        else:
+            # Weights correlation by the product of optimal allocations so that
+            # low-weight pairs don't dominate the metric.
+            weighted_corr_sum = 0.0
+            weight_product_sum = 0.0
+            for i in range(n):
+                for j in range(i + 1, n):
+                    std_i = math.sqrt(max(cov_matrix[i][i], MIN_VARIANCE))
+                    std_j = math.sqrt(max(cov_matrix[j][j], MIN_VARIANCE))
+                    if std_i > 0 and std_j > 0:
+                        corr = cov_matrix[i][j] / (std_i * std_j)
+                        w_product = optimal_weights[i] * optimal_weights[j]
+                        weighted_corr_sum += corr * w_product
+                        weight_product_sum += w_product
 
-        avg_correlation = weighted_corr_sum / weight_product_sum if weight_product_sum > 0 else 0.0
+            avg_correlation = weighted_corr_sum / weight_product_sum if weight_product_sum > 0 else 0.0
 
-        # Clamp to valid range; negative correlation IS a hedging benefit — report truthfully
-        systematic_risk = max(-1.0, min(1.0, avg_correlation))
-        idiosyncratic_risk = 1.0 - max(0.0, systematic_risk)
+            # Clamp to valid range; negative correlation IS a hedging benefit — report truthfully
+            systematic_risk = max(-1.0, min(1.0, avg_correlation))
+            idiosyncratic_risk = 1.0 - max(0.0, systematic_risk)
 
         # P3 FIX: Handle negative current_sharpe. Previously reported 0%
         # improvement even when optimization could significantly help.

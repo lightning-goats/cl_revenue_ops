@@ -24,6 +24,7 @@ The pattern:
 """
 
 import time
+import threading
 from typing import Dict, Any, Optional, List
 from pyln.client import Plugin, RpcError
 
@@ -72,6 +73,9 @@ class ClbossManager:
         self.config = config
         self._clboss_available: Optional[bool] = None
         self._clboss_check_time: float = 0
+        # CB-1: Lock protects _clboss_available and _clboss_check_time from
+        # concurrent reads/writes across timer threads and RPC handlers
+        self._clboss_lock = threading.Lock()
         # Retry checking for clboss every 5 minutes if previously unavailable
         self._clboss_retry_interval: float = 300
 
@@ -88,38 +92,43 @@ class ClbossManager:
         if not self.config.clboss_enabled:
             return False
 
-        # If we have a cached result and it's True, use it
-        # If cached result is False, retry after the interval
-        if self._clboss_available is not None:
-            if self._clboss_available:
-                return True
-            # Previously unavailable - check if we should retry
-            if time.time() - self._clboss_check_time < self._clboss_retry_interval:
-                return False
-            # Time to retry
-            self.plugin.log("Retrying clboss availability check...")
-        
+        with self._clboss_lock:
+            # If we have a cached result and it's True, use it
+            # If cached result is False, retry after the interval
+            if self._clboss_available is not None:
+                if self._clboss_available:
+                    return True
+                # Previously unavailable - check if we should retry
+                if time.time() - self._clboss_check_time < self._clboss_retry_interval:
+                    return False
+                # Time to retry
+                self.plugin.log("Retrying clboss availability check...")
+
+        # RPC call outside lock to avoid holding lock during I/O
         try:
-            # Try to call a clboss command to see if it's available
             result = self.plugin.rpc.call("clboss-status")
-            self._clboss_available = True
-            self._clboss_check_time = time.time()
+            with self._clboss_lock:
+                self._clboss_available = True
+                self._clboss_check_time = time.time()
             self.plugin.log("clboss detected and available")
             return True
         except RpcError as e:
             if "Unknown command" in str(e) or "not found" in str(e).lower():
-                self._clboss_available = False
-                self._clboss_check_time = time.time()
+                with self._clboss_lock:
+                    self._clboss_available = False
+                    self._clboss_check_time = time.time()
                 self.plugin.log("clboss not available - commands will be skipped (will retry in 5 min)")
                 return False
             # Other RPC errors - clboss may be present but had a transient issue.
             # Don't cache True; leave uncached so we retry next time.
             self.plugin.log(f"clboss RPC error (will retry): {e}", level='debug')
-            return self._clboss_available if self._clboss_available is not None else False
+            with self._clboss_lock:
+                return self._clboss_available if self._clboss_available is not None else False
         except Exception as e:
             self.plugin.log(f"Error checking clboss availability: {e}", level='warn')
-            self._clboss_available = False
-            self._clboss_check_time = time.time()
+            with self._clboss_lock:
+                self._clboss_available = False
+                self._clboss_check_time = time.time()
             return False
     
     def reset_availability_cache(self) -> bool:

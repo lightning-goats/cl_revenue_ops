@@ -37,7 +37,8 @@ def parse_msat(msat_val: Any) -> int:
             _log.debug("parse_msat: failed to convert .millisatoshis %r: %s", msat_val, e)
             return 0
     if isinstance(msat_val, bool):
-        return int(msat_val)
+        # U-1 FIX: bool is never a valid msat value (True→1 would be wrong)
+        return 0
     if isinstance(msat_val, (int, float)):
         try:
             return int(msat_val)
