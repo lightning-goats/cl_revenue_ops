@@ -85,7 +85,11 @@ class CapacityPlanner:
             return "UNKNOWN: Could not fetch feerates."
 
     def _get_peer_splice_map(self) -> Dict[str, bool]:
-        """Identify which peers support splicing (bits 62/63 for option_splice)."""
+        """Identify which peers support splicing (bits 62/63 for option_splice).
+
+        CP-1: Uses deprecated listpeers RPC (still functional in CLN v24+).
+        Migration to listpeerchannels is tracked as a separate effort.
+        """
         splice_map = {}
         try:
             peers = self.plugin.rpc.listpeers().get("peers", [])

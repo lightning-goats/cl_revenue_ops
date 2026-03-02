@@ -1932,6 +1932,17 @@ class EVRebalancer:
     When cl-hive is available, the rebalancer adjusts its EV threshold
     based on our health tier. Struggling nodes accept lower EV to recover
     faster; thriving nodes are more selective to conserve routing fees.
+
+    Known Limitations (documented, not bugs):
+    - I-5: Balance delta can false-positive under concurrent forwarding — a forward
+      completing during the measurement window inflates/deflates the delta. Fixing
+      this requires async forwarding awareness (architectural change).
+    - I-16: SCID-keyed failure counts are invalidated by splice events because splice
+      changes the SCID. A future migration to peer_id-keyed tracking would fix this.
+    - I-18: Predictive rebalancing (pre-position liquidity before demand spikes) is a
+      future feature requiring demand forecasting integration.
+    - I-19: HIVE_COORDINATED strategy is a placeholder for future fleet-coordinated
+      rebalancing where cl-hive directs liquidity flows.
     """
 
     def __init__(self, plugin: Plugin, config: Config, database: Database,

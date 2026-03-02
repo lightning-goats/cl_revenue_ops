@@ -295,7 +295,7 @@ class Config:
     expansion_treasury_min_deficit_sats: int = 250_000
     expansion_treasury_preferred_currency: str = 'BTC'
     expansion_treasury_max_actions: int = 1
-    expansion_treasury_min_source_local_pct: float = 80.0
+    expansion_treasury_min_source_local_pct: float = 80.0  # I-7: 0-100 scale (not 0-1)
     expansion_treasury_exclude_protected: bool = True
     
     # Flow analysis parameters
