@@ -1022,7 +1022,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     try:
         config_fields = {f.name for f in dataclasses.fields(Config)}
-    except Exception:
+    except Exception as e:
+        plugin.log(f"Config field introspection failed, using kwargs: {e}", level='debug')
         config_fields = set(config_kwargs.keys())
     dropped = [k for k in config_kwargs.keys() if k not in config_fields]
     if dropped:
@@ -1127,9 +1128,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Phase 7: Load config overrides from database (persisted runtime changes)
     try:
-        config.load_overrides(database)
+        override_warnings = config.load_overrides(database)
         if config._version > 0:
             plugin.log(f"Loaded config overrides from database (version {config._version})")
+        for w in override_warnings:
+            plugin.log(f"Config override: {w}", level='warn')
     except Exception as e:
         plugin.log(f"Warning: Could not load config overrides: {e}", level='warn')
     
@@ -1360,7 +1363,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         try:
             if not hive_bridge.is_available():
                 return
-        except Exception:
+        except Exception as e:
+            plugin.log(f"Hive availability check failed: {e}", level='debug')
             return
 
         now = int(time.time())
@@ -2149,7 +2153,8 @@ def revenue_rebalance_debug(
                     for s in (database.get_all_channel_states() or [])
                     if (s.get("channel_id") or "")
                 }
-            except Exception:
+            except Exception as e:
+                plugin.log(f"Channel state lookup failed: {e}", level='debug')
                 state_lookup = {}
 
         # AUDIT FIX Issue-11: Renamed to avoid shadowing the global profitability_analyzer
@@ -2166,11 +2171,13 @@ def revenue_rebalance_debug(
                     pct = r.get("min_depletion_trigger_pct")
                     try:
                         pct_f = float(pct) if pct is not None else None
-                    except Exception:
+                    except Exception as e:
+                        plugin.log(f"Hot channel override pct parse failed for {pid}: {e}", level='debug')
                         pct_f = None
                     if pid and pct_f is not None and 0.0 < pct_f <= 100.0:
                         hot_override_depletion_thresholds[pid] = pct_f / 100.0
-            except Exception:
+            except Exception as e:
+                plugin.log(f"Hot channel override list failed: {e}", level='debug')
                 hot_override_depletion_thresholds = {}
 
         effective_low_thresholds_seen_pct: set[float] = set()
@@ -2236,7 +2243,8 @@ def revenue_rebalance_debug(
                         if cid not in prof_cache and prof_analyzer is not None:
                             try:
                                 prof = prof_analyzer.analyze_channel(cid)
-                            except Exception:
+                            except Exception as e:
+                                plugin.log(f"Profitability analysis failed for {cid[:12]}...: {e}", level='debug')
                                 prof = None
                             prof_cache[cid] = prof
 
@@ -3706,8 +3714,8 @@ def revenue_portfolio(
                 cid = ks.get("channel_id")
                 if cid:
                     flow_states[cid] = ks
-        except Exception:
-            pass
+        except Exception as e:
+            plugin.log(f"Kalman state lookup for portfolio failed: {e}", level='debug')
 
         # Initialize optimizer
         optimizer = PortfolioOptimizer(
@@ -4190,7 +4198,8 @@ def _resolve_event_channel_scid(event: Dict[str, Any]) -> Optional[str]:
             scid = _match_scid_from_channels(channels)
             if scid:
                 return scid
-        except Exception:
+        except Exception as e:
+            plugin.log(f"SCID resolution attempt failed for {raw_channel_id_lc[:16]}: {e}", level='debug')
             continue
 
     # Fallback for CLOSED events where the channel may already be gone
@@ -4210,8 +4219,8 @@ def _resolve_event_channel_scid(event: Dict[str, Any]) -> Optional[str]:
             for candidate in candidates:
                 if isinstance(candidate, str) and candidate.lower() == raw_channel_id_lc:
                     return normalize_scid(scid)
-    except Exception:
-        pass
+    except Exception as e:
+        plugin.log(f"Closed channel SCID fallback failed for {raw_channel_id_lc[:16]}: {e}", level='debug')
 
     return None
 
@@ -4696,8 +4705,8 @@ def _notify_hive_of_closure(channel_id: str, peer_id: str, closer: str,
                 # Estimate volume from revenue
                 if our_fee_ppm > 0 and total_revenue_sats > 0:
                     forward_volume_sats = (total_revenue_sats * 1_000_000) // our_fee_ppm
-            except Exception:
-                pass
+            except Exception as e:
+                plugin.log(f"Forward volume estimation failed for {channel_id[:12]}...: {e}", level='debug')
 
         # M-9: Use fire_and_forget since return value is only for logging
         safe_plugin.rpc.fire_and_forget("hive-channel-closed", {
@@ -5004,8 +5013,8 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
                         if closer == 'unknown' and ch.get('closer'):
                             closer = ch.get('closer')  # 'local' or 'remote'
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                plugin.log(f"Closed channel lookup failed for {channel_id[:12]}...: {e}", level='debug')
 
         now = int(time.time())
 
@@ -5741,7 +5750,8 @@ def _boltz_channel_daily_contribution_estimate_sats(prof) -> float:
         # Conservative normalization: use up to 30 days if channel is older.
         days = max(1, min(days_open, 30))
         return total / days
-    except Exception:
+    except Exception as e:
+        plugin.log(f"Daily contribution estimate failed: {e}", level='debug')
         return 0.0
 
 
@@ -5835,7 +5845,8 @@ def _get_confirmed_onchain_sats() -> int:
     """Return confirmed on-chain wallet outputs in sats from CLN listfunds."""
     try:
         lf = safe_plugin.rpc.listfunds()
-    except Exception:
+    except Exception as e:
+        plugin.log(f"listfunds RPC failed for onchain balance: {e}", level='debug')
         return 0
     outputs = lf.get("outputs", []) if isinstance(lf, dict) else []
     total = 0

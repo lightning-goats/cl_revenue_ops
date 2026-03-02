@@ -489,6 +489,7 @@ class Config:
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _override_warnings: list = field(default_factory=list, repr=False, compare=False)
     
     def snapshot(self) -> 'ConfigSnapshot':
         """
@@ -500,8 +501,9 @@ class Config:
         """
         return ConfigSnapshot.from_config(self)
     
-    def load_overrides(self, database: 'Database') -> None:
-        """Load config overrides from database on startup."""
+    def load_overrides(self, database: 'Database') -> list:
+        """Load config overrides from database on startup. Returns list of warnings."""
+        self._override_warnings.clear()
         overrides = database.get_all_config_overrides()
         for key, value in overrides.items():
             if hasattr(self, key) and key not in IMMUTABLE_CONFIG_KEYS:
@@ -519,7 +521,8 @@ class Config:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
                 # high_liquidity_threshold is very small (e.g., < 0.05).
                 self.low_liquidity_threshold = max(0.0, self.high_liquidity_threshold - 0.05)
-    
+        return list(self._override_warnings)
+
     def _apply_override(self, key: str, value: str) -> None:
         """Apply a single override with type conversion and range validation."""
         field_type = CONFIG_FIELD_TYPES.get(key, str)
@@ -532,24 +535,27 @@ class Config:
                 typed_value = float(value)
                 # AUDIT FIX C-2: Reject NaN/Infinity for float fields
                 if not math.isfinite(typed_value):
-                    return  # Skip non-finite override, keep default
+                    self._override_warnings.append(f"Skipped non-finite override for {key}: {value}")
+                    return
             else:
                 typed_value = value
             # Range validation (matching update_runtime behavior)
             if key in CONFIG_FIELD_RANGES:
                 min_val, max_val = CONFIG_FIELD_RANGES[key]
                 if not (min_val <= typed_value <= max_val):
-                    return  # Skip out-of-range override, keep default
+                    self._override_warnings.append(f"Skipped out-of-range override for {key}: {typed_value} not in [{min_val}, {max_val}]")
+                    return
             # String enum validation (matching update_runtime behavior)
             if key in STRING_ENUM_VALID_VALUES:
                 valid_values = STRING_ENUM_VALID_VALUES[key]
                 if typed_value not in valid_values and (not isinstance(typed_value, str) or typed_value.lower() not in [v.lower() for v in valid_values]):
-                    return  # Skip invalid enum override, keep default
+                    self._override_warnings.append(f"Skipped invalid enum override for {key}: {typed_value}")
+                    return
                 if isinstance(typed_value, str):
                     typed_value = typed_value.lower()
             setattr(self, key, typed_value)
-        except (ValueError, TypeError, AttributeError):
-            pass  # Keep default if conversion fails
+        except (ValueError, TypeError, AttributeError) as e:
+            self._override_warnings.append(f"Override conversion failed for {key}={value}: {e}")
     
     def update_runtime(self, database: 'Database', key: str, value: str) -> Dict[str, Any]:
         """
