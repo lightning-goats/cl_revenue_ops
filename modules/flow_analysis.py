@@ -164,17 +164,22 @@ class KalmanFlowState:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "KalmanFlowState":
-        # M-19: Use `or` to guard against None values from DB migration columns
-        # (dict.get returns None when key exists but value is NULL, not the default)
+        # AUDIT FIX I-7: Use `is not None` instead of `or` to correctly handle
+        # stored 0.0 values. The old `or` pattern treats 0.0 as falsy, silently
+        # promoting zero-valued fields (especially variance_ratio) to their defaults.
+        def _safe(key, default):
+            v = d.get(key)
+            return float(v) if v is not None else default
+
         return cls(
-            flow_ratio=float(d.get("flow_ratio") or 0.0),
-            flow_velocity=float(d.get("flow_velocity") or 0.0),
-            variance_ratio=float(d.get("variance_ratio") or KALMAN_INITIAL_VARIANCE),
-            variance_velocity=float(d.get("variance_velocity") or KALMAN_INITIAL_VARIANCE),
-            covariance=float(d.get("covariance") or 0.0),
+            flow_ratio=_safe("flow_ratio", 0.0),
+            flow_velocity=_safe("flow_velocity", 0.0),
+            variance_ratio=_safe("variance_ratio", KALMAN_INITIAL_VARIANCE),
+            variance_velocity=_safe("variance_velocity", KALMAN_INITIAL_VARIANCE),
+            covariance=_safe("covariance", 0.0),
             last_update=int(d.get("last_update") or 0),
-            innovation_variance=float(d.get("innovation_variance") or 0.01),
-            last_innovation=float(d.get("last_innovation") or 0.0)
+            innovation_variance=_safe("innovation_variance", 0.01),
+            last_innovation=_safe("last_innovation", 0.0)
         )
 
 
@@ -338,7 +343,8 @@ class KalmanFlowFilter:
         # Store innovation for regime change detection
         self.state.last_innovation = innovation
         # Update innovation variance (exponential moving average)
-        self.state.innovation_variance = 0.9 * self.state.innovation_variance + 0.1 * innovation * innovation
+        # AUDIT FIX I-6: Floor prevents near-zero collapse causing oversensitive regime detection
+        self.state.innovation_variance = max(0.001, 0.9 * self.state.innovation_variance + 0.1 * innovation * innovation)
 
         self.state.last_update = int(time.time())
 
@@ -670,6 +676,9 @@ class FlowAnalyzer:
         else:
             # Predict-only: still record that we ran so dt_hours stays accurate
             kf.state.last_update = int(time.time())
+            # AUDIT FIX I-3: Check for NaN after predict-only path
+            if kf._has_nan():
+                kf._reset_state()
 
         # L-25: Log warning on NaN recovery
         if kf._nan_recovery_count > 0:

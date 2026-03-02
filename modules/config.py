@@ -10,6 +10,7 @@ Phase 7 additions:
 - Vegas Reflex and Scarcity Pricing settings
 """
 
+import math
 import threading
 import dataclasses
 from dataclasses import dataclass, asdict, field
@@ -150,6 +151,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalancer_plugin': str,
     'enable_flow_asymmetry': bool,
     'enable_peer_sync': bool,
+    # AUDIT FIX C-1: clboss_enabled was missing, causing bool set as string
+    'clboss_enabled': bool,
 }
 
 # Range constraints for numeric fields
@@ -227,6 +230,24 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_min_amount': (1000, 50000000),
     'rebalance_max_amount': (10000, 100000000),
     'flow_window_days': (1, 365),
+    # AUDIT FIX C-2/I-4: Missing range validation for float/int fields
+    'source_threshold': (-1.0, 1.0),
+    'sink_threshold': (-1.0, 1.0),
+    'expansion_treasury_min_source_local_pct': (0.0, 100.0),
+    'hot_channel_protection_max_chunk_multiplier': (1.0, 20.0),
+    'hot_channel_protection_min_cooldown_hours': (0.0, 168.0),
+    'hot_channel_protection_min_marginal_roi': (0.0, 10.0),
+    'hot_channel_protection_min_velocity': (0.0, 1.0),
+    'hot_channel_protection_profit_budget_pct': (0.0, 1.0),
+    'inbound_fee_estimate_ppm': (0, 5000),
+    'rebalance_cooldown_hours': (1, 168),
+    'target_flow': (1000, 100000000),
+    'clboss_unmanage_duration_hours': (1, 168),
+    'estimated_open_cost_sats': (0, 1000000),
+    'expansion_treasury_max_actions': (1, 10),
+    'expansion_treasury_min_deficit_sats': (0, 100000000),
+    'expansion_treasury_onchain_target_sats': (0, 1000000000),
+    'hot_channel_protection_max_rebalance_fee_ppm': (0, 100000),
 }
 
 # Valid values for string enum fields
@@ -509,6 +530,9 @@ class Config:
                 typed_value = int(value)
             elif field_type == float:
                 typed_value = float(value)
+                # AUDIT FIX C-2: Reject NaN/Infinity for float fields
+                if not math.isfinite(typed_value):
+                    return  # Skip non-finite override, keep default
             else:
                 typed_value = value
             # Range validation (matching update_runtime behavior)
@@ -554,6 +578,9 @@ class Config:
                 typed_value = int(value)
             elif field_type == float:
                 typed_value = float(value)
+                # AUDIT FIX C-2: Reject NaN/Infinity for float fields
+                if not math.isfinite(typed_value):
+                    return {"error": f"Value {value} is not a finite number for {key}"}
             else:
                 typed_value = value
         except (ValueError, TypeError) as e:
@@ -594,6 +621,11 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
+            # AUDIT FIX I-5: Validate sink/source threshold cross-field consistency
+            if key == 'sink_threshold' and typed_value >= self.source_threshold:
+                return {"error": f"sink_threshold ({typed_value}) must be less than source_threshold ({self.source_threshold})"}
+            if key == 'source_threshold' and typed_value <= self.sink_threshold:
+                return {"error": f"source_threshold ({typed_value}) must be greater than sink_threshold ({self.sink_threshold})"}
 
             old_value = getattr(self, key)
 

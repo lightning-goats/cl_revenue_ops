@@ -984,6 +984,9 @@ class PortfolioOptimizer:
 
             # Check objective value for backtracking
             obj = _objective(new_weights)
+            # AUDIT FIX I-14: NaN in covariance matrix silently corrupts output
+            if not math.isfinite(obj):
+                return [1.0 / n] * n
             if obj < prev_objective:
                 # Objective regressed — halve learning rate and retry
                 learning_rate *= 0.5
