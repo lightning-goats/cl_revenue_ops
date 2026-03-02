@@ -1004,7 +1004,9 @@ class BoltzCliManager:
         }
 
     def _enforce_budget_for_quote(self, quote: Dict[str, Any]) -> Dict[str, Any]:
-        fee_sats = max(0, self._parse_int(quote.get("boltzFee"), 0)) + max(0, self._parse_int(quote.get("networkFee"), 0))
+        # Use the same fee estimation as spend accounting to prevent asymmetry
+        # where the gate underestimates and allows budget overruns.
+        fee_sats = self._estimate_swap_fee_sats(quote)
         budget = self.get_budget_status()
         allowed = True
         reason = None
@@ -1280,7 +1282,12 @@ class BoltzCliManager:
             if chan_ids and self._contains_chanids_cln_error(result):
                 self._reverse_chanids_supported = False
                 warnings.append("CLN boltz backend rejected chanIds in JSON result; retried reverse swap without channel pinning")
-                result = self._run_json(_build_args(include_chanids=False), timeout=max(self.cfg.timeout_seconds, 120))
+                # Re-check budget before creating second swap (first swap may have consumed fees)
+                retry_budget = self._enforce_budget_for_quote(quote)
+                if not retry_budget["allowed"]:
+                    warnings.append(f"Budget exhausted after chanId rejection: {retry_budget.get('reason')}")
+                else:
+                    result = self._run_json(_build_args(include_chanids=False), timeout=max(self.cfg.timeout_seconds, 120))
             elif chan_ids and include_chanids_initial:
                 # Some CLN/Boltz versions accept create-reverse-swap first, then surface the chanIds rejection asynchronously in swapinfo.
                 primary_created = self._primary_swap_entry(result)
@@ -1300,7 +1307,12 @@ class BoltzCliManager:
                             if self._contains_chanids_cln_error(probe):
                                 self._reverse_chanids_supported = False
                                 warnings.append("CLN boltz backend rejected chanIds asynchronously; retried reverse swap without channel pinning")
-                                result = self._run_json(_build_args(include_chanids=False), timeout=probe_timeout)
+                                # Re-check budget before creating second swap
+                                retry_budget = self._enforce_budget_for_quote(quote)
+                                if not retry_budget["allowed"]:
+                                    warnings.append(f"Budget exhausted after async chanId rejection: {retry_budget.get('reason')}")
+                                else:
+                                    result = self._run_json(_build_args(include_chanids=False), timeout=probe_timeout)
                                 break
                             probe_primary = self._primary_swap_entry(probe)
                             if probe_primary and not self._is_error_swap(probe_primary):
@@ -1313,7 +1325,12 @@ class BoltzCliManager:
                 # CLN backends may reject chanIds even though boltzcli accepts the flag.
                 self._reverse_chanids_supported = False
                 warnings.append("CLN boltz backend rejected chanIds; retried reverse swap without channel pinning")
-                result = self._run_json(_build_args(include_chanids=False), timeout=max(self.cfg.timeout_seconds, 120))
+                # Re-check budget before creating second swap
+                retry_budget = self._enforce_budget_for_quote(quote)
+                if not retry_budget["allowed"]:
+                    warnings.append(f"Budget exhausted after chanId exception: {retry_budget.get('reason')}")
+                else:
+                    result = self._run_json(_build_args(include_chanids=False), timeout=max(self.cfg.timeout_seconds, 120))
             else:
                 raise
         self._record_swap_result(

@@ -187,13 +187,18 @@ class CapacityPlanner:
             scid_display = scid.replace(':', 'x')
 
             # Logic 1: FIRE SALE mode (Zombie or Deeply Underwater)
+            # Guard: require flow data before recommending closure (matches _identify_winners).
+            # Without flow data we can't assess channel viability, so demote to DEFIBRILLATE at most.
             is_fire_sale = False
             fire_sale_reason = None
-            if prof.days_open > 90:
+            if prof.days_open > 90 and flow_metrics is not None:
                 if prof.classification == ProfitabilityClass.ZOMBIE:
                     is_fire_sale = True
                     fire_sale_reason = "ZOMBIE"
-                elif prof.classification == ProfitabilityClass.UNDERWATER and prof.roi_percent < -50.0:
+                elif prof.classification == ProfitabilityClass.UNDERWATER and prof.marginal_roi_percent < -50.0:
+                    # Use marginal ROI (operational, 30-day trailing) to avoid sunk cost fallacy.
+                    # A channel covering its rebalance costs shouldn't be closed just because
+                    # the opening fee hasn't been recouped yet.
                     is_fire_sale = True
                     fire_sale_reason = "FIRE SALE"
 

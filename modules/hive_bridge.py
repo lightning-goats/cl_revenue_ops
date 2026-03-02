@@ -2454,9 +2454,9 @@ class HiveFeeIntelligenceBridge:
             # M-24: Return False to indicate failure (callers should not block on this)
             return False
         if result and result.get("error"):
-            # Method might not be implemented yet - that's OK
+            # Method might not be implemented yet - don't misreport as success
             if "unknown" in str(result.get("error")).lower():
-                return True
+                return False
             self._log(f"Kalman velocity report error: {result.get('error')}", level="debug")
             return False
         return True
@@ -2557,7 +2557,7 @@ class HiveFeeIntelligenceBridge:
             return False
         if result and result.get("error"):
             if "unknown" in str(result.get("error")).lower():
-                return True
+                return False
             self._log(f"Rebalance outcome report error: {result.get('error')}", level="debug")
             return False
         return True
@@ -2589,7 +2589,7 @@ class HiveFeeIntelligenceBridge:
             return False  # Non-fatal but don't misreport success
         if result and result.get("error"):
             if "unknown" in str(result.get("error")).lower():
-                return True
+                return False
             return False
         return True
 
@@ -2712,7 +2712,7 @@ class HiveFeeIntelligenceBridge:
             return False  # Don't block but don't misreport success
         if result and result.get("error"):
             if "unknown" in str(result.get("error")).lower():
-                return True
+                return False
             self._log(f"Flow intensity report error: {result.get('error')}", level="debug")
             return False
         return True

@@ -1122,14 +1122,19 @@ class JobManager:
             with self._source_failures_lock:
                 self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
 
-        # Record actual rebalance cost even on budget failure
+        # Record actual rebalance cost even on budget failure.
+        # Compute actual amount transferred from balance delta (not 0)
+        # to avoid distorting cost-per-sat metrics.
         actual_cost_sats = (fee_msat + 999) // 1000
+        current_balance = self._get_channel_local_balance(job.scid_normalized)
+        raw_delta = current_balance - job.initial_local_sats
+        amount_transferred = max(0, -raw_delta if job.direction == "push" else raw_delta)
         if actual_cost_sats > 0 and job.candidate:
             try:
                 dest_peer_id = job.candidate.to_peer_id
                 self.database.record_rebalance_cost(
                     job.scid_normalized, dest_peer_id,
-                    actual_cost_sats, 0)
+                    actual_cost_sats, amount_transferred)
             except Exception as e:
                 self.plugin.log(f"Failed to record rebalance cost: {e}", level='debug')
 
@@ -1288,6 +1293,14 @@ class JobManager:
             try:
                 cutoff = int(time.time()) - self.job_timeout_seconds
                 conn = self.database._get_connection()
+                # First, get the IDs of orphaned records so we can release their budget reservations
+                orphaned_rows = conn.execute("""
+                    SELECT id FROM rebalance_history
+                    WHERE status IN ('pending', 'pending_async')
+                      AND timestamp < ?
+                """, (cutoff,)).fetchall()
+                orphaned_ids = [row['id'] for row in orphaned_rows]
+
                 cursor = conn.execute("""
                     UPDATE rebalance_history
                     SET status = 'failed', error_message = 'orphaned_on_restart'
@@ -1295,9 +1308,20 @@ class JobManager:
                       AND timestamp < ?
                 """, (cutoff,))
                 orphaned_db = cursor.rowcount
+
+                # Release budget reservations for orphaned jobs
+                released_count = 0
+                for rid in orphaned_ids:
+                    try:
+                        self.database.release_budget_reservation(str(rid))
+                        released_count += 1
+                    except Exception:
+                        pass
+
                 if orphaned_db > 0:
                     self.plugin.log(
-                        f"Startup Hygiene: Marked {orphaned_db} orphaned DB rebalance records as failed",
+                        f"Startup Hygiene: Marked {orphaned_db} orphaned DB rebalance records as failed, "
+                        f"released {released_count} budget reservations",
                         level='info'
                     )
             except Exception as e:

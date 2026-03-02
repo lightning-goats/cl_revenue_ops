@@ -2055,7 +2055,7 @@ class Database:
 
         # Calculate total contribution value
         # Direct fees + sourced fee contribution (what we helped earn elsewhere)
-        total_contribution = (direct_pnl['revenue_sats'] + inbound['sourced_fee_contribution_sats']) // 2
+        total_contribution = direct_pnl['revenue_sats'] + inbound['sourced_fee_contribution_sats']
 
         return {
             'channel_id': channel_id,
@@ -2121,6 +2121,10 @@ class Database:
         """
         conn = self._get_connection()
 
+        # Exclude current day from daily stats to prevent double-counting
+        # with forwards that haven't been pruned yet (boundary day fix).
+        today_start = (int(time.time()) // 86400) * 86400
+
         exit_row = conn.execute("""
             SELECT
                 (
@@ -2131,7 +2135,7 @@ class Database:
                 (
                     SELECT COALESCE(SUM(total_fee_msat), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ?
+                    WHERE channel_id = ? AND date < ?
                 ) AS fee_msat,
                 (
                     SELECT COALESCE(SUM(out_msat), 0)
@@ -2141,7 +2145,7 @@ class Database:
                 (
                     SELECT COALESCE(SUM(total_out_msat), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ?
+                    WHERE channel_id = ? AND date < ?
                 ) AS out_msat,
                 (
                     SELECT COALESCE(COUNT(*), 0)
@@ -2151,9 +2155,11 @@ class Database:
                 (
                     SELECT COALESCE(SUM(forward_count), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ?
+                    WHERE channel_id = ? AND date < ?
                 ) AS forward_count
-        """, (channel_id, channel_id, channel_id, channel_id, channel_id, channel_id)).fetchone()
+        """, (channel_id, channel_id, today_start,
+              channel_id, channel_id, today_start,
+              channel_id, channel_id, today_start)).fetchone()
 
         inbound_row = conn.execute("""
             SELECT
@@ -2165,7 +2171,7 @@ class Database:
                 (
                     SELECT COALESCE(SUM(total_in_msat), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ?
+                    WHERE channel_id = ? AND date < ?
                 ) AS in_msat,
                 (
                     SELECT COALESCE(SUM(fee_msat), 0)
@@ -2175,7 +2181,7 @@ class Database:
                 (
                     SELECT COALESCE(SUM(total_fee_msat), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ?
+                    WHERE channel_id = ? AND date < ?
                 ) AS fee_msat,
                 (
                     SELECT COALESCE(COUNT(*), 0)
@@ -2185,9 +2191,11 @@ class Database:
                 (
                     SELECT COALESCE(SUM(forward_count), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ?
+                    WHERE channel_id = ? AND date < ?
                 ) AS forward_count
-        """, (channel_id, channel_id, channel_id, channel_id, channel_id, channel_id)).fetchone()
+        """, (channel_id, channel_id, today_start,
+              channel_id, channel_id, today_start,
+              channel_id, channel_id, today_start)).fetchone()
 
         return {
             "fees_earned_sats": int((exit_row["fee_msat"] or 0) // 1000) if exit_row else 0,
@@ -2208,6 +2216,10 @@ class Database:
               sourced_volume_sats, sourced_fee_contribution_sats, sourced_forward_count
         """
         conn = self._get_connection()
+
+        # Exclude current day from daily stats to prevent double-counting
+        # with forwards that haven't been pruned yet (boundary day fix).
+        today_start = (int(time.time()) // 86400) * 86400
 
         revenue: Dict[str, Dict[str, int]] = {}
 
@@ -2230,10 +2242,11 @@ class Database:
                        SUM(total_out_msat) as out_msat,
                        SUM(forward_count) as cnt
                 FROM daily_forwarding_stats
+                WHERE date < ?
                 GROUP BY channel_id
             )
             GROUP BY channel_id
-        """).fetchall()
+        """, (today_start,)).fetchall()
 
         for r in exit_rows:
             cid = r["channel_id"]
@@ -2267,10 +2280,11 @@ class Database:
                        SUM(total_fee_msat) as fee_msat,
                        SUM(forward_count) as cnt
                 FROM daily_forwarding_stats_inbound
+                WHERE date < ?
                 GROUP BY channel_id
             )
             GROUP BY channel_id
-        """).fetchall()
+        """, (today_start,)).fetchall()
 
         for r in inbound_rows:
             cid = r["channel_id"]
@@ -3804,26 +3818,32 @@ class Database:
                 - total_forwards: Count of all completed forwards (including pruned)
         """
         conn = self._get_connection()
-        
+
+        # Exclude current day from daily stats to prevent double-counting
+        # with forwards that haven't been pruned yet (boundary day fix).
+        today_start = (int(time.time()) // 86400) * 86400
+
         # Get pruned historical aggregates from lifetime_aggregates table
         lifetime_row = conn.execute(
             "SELECT pruned_revenue_msat, pruned_forward_count FROM lifetime_aggregates WHERE id = 1"
         ).fetchone()
         pruned_revenue_msat = lifetime_row["pruned_revenue_msat"] if lifetime_row else 0
         pruned_forward_count = lifetime_row["pruned_forward_count"] if lifetime_row else 0
-        
+
         # Current revenue from forwards table (in msat) - not yet pruned
         revenue_row = conn.execute(
             "SELECT COALESCE(SUM(fee_msat), 0) as total FROM forwards"
         ).fetchone()
         current_revenue_msat = revenue_row["total"] if revenue_row else 0
-        
-        # Rolled-up revenue from daily_forwarding_stats
+
+        # Rolled-up revenue from daily_forwarding_stats (exclude today to avoid
+        # double-counting with forwards on the boundary day)
         rollup_revenue_row = conn.execute(
-            "SELECT COALESCE(SUM(total_fee_msat), 0) as total FROM daily_forwarding_stats"
+            "SELECT COALESCE(SUM(total_fee_msat), 0) as total FROM daily_forwarding_stats WHERE date < ?",
+            (today_start,)
         ).fetchone()
         rollup_revenue_msat = rollup_revenue_row["total"] if rollup_revenue_row else 0
-        
+
         # Combine pruned (legacy) + rolled-up + current
         total_revenue_msat = pruned_revenue_msat + rollup_revenue_msat + current_revenue_msat
         
@@ -3857,9 +3877,10 @@ class Database:
         ).fetchone()
         current_forwards = count_row["total"] if count_row else 0
         
-        # Rolled-up forward count
+        # Rolled-up forward count (exclude today, same boundary fix as revenue)
         rollup_count_row = conn.execute(
-            "SELECT COALESCE(SUM(forward_count), 0) as total FROM daily_forwarding_stats"
+            "SELECT COALESCE(SUM(forward_count), 0) as total FROM daily_forwarding_stats WHERE date < ?",
+            (today_start,)
         ).fetchone()
         rollup_forwards = rollup_count_row["total"] if rollup_count_row else 0
         
@@ -5218,8 +5239,28 @@ class Database:
     def delete_config_override(self, key: str) -> bool:
         """Delete a config override, returning to default."""
         conn = self._get_connection()
-        cursor = conn.execute("DELETE FROM config_overrides WHERE key = ?", (key,))
-        return cursor.rowcount > 0
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute("DELETE FROM config_overrides WHERE key = ?", (key,))
+            if cursor.rowcount > 0:
+                # Bump version so config poller detects the deletion.
+                # Insert a sentinel row that will be overwritten on next set_config_override.
+                current_max = conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM config_overrides"
+                ).fetchone()[0]
+                new_version = current_max + 1
+                now = int(time.time())
+                conn.execute("""
+                    INSERT OR REPLACE INTO config_overrides (key, value, version, updated_at)
+                    VALUES ('_version_bump', '', ?, ?)
+                """, (new_version, now))
+                conn.execute("COMMIT")
+                return True
+            conn.execute("COMMIT")
+            return False
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
     
     # =========================================================================
     # Mempool Fee History Methods (Phase 7: Vegas Reflex)
