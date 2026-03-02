@@ -553,6 +553,11 @@ class HistoricalResponseCurve:
         MAX_FLEET_FEE_PPM = 200_000  # 2x absolute max as sanity bound
         MAX_FLEET_REVENUE = 100_000.0  # sats/hr sanity bound
 
+        # I-10 FIX: Cap fleet observations to prevent displacement of local data
+        local_count = len(self.observations)
+        max_fleet = max(5, local_count)
+        fleet_observations = fleet_observations[:max_fleet]
+
         # Add fleet observations with reduced weight
         now = int(time.time())
         for obs in fleet_observations:
@@ -3089,6 +3094,14 @@ class HillClimbingFeeController:
     4. Liquidity-aware: Uses bucket multipliers as floor weights
     5. clboss override: Unmanages from clboss before setting fees
     6. Fleet-aware: Coordinates with cl-hive for competition avoidance
+
+    Known Limitations (documented, not bugs):
+    - I-12: No per-channel fee change rate limit — timer interval provides implicit limiting
+    - I-13: Slow AIMD recovery after demand drops — deliberate to prevent oscillation
+    - I-14: RLock held across DB I/O in adjust_fees — architectural constraint, single-threaded cycle
+    - I-15: Dual HC/Thompson state objects — legacy compatibility for HC fallback path
+    - I-16: Non-atomic state save (Thompson + HC states) — single-threaded cycle mitigates
+    - I-17: HIVE_COORDINATED strategy — future feature, placeholder only
     """
     
     # Hill Climbing parameters
@@ -6152,7 +6165,10 @@ class HillClimbingFeeController:
             # Compute continuous success score (not binary) and detect if Thompson
             # is exploring so AIMD doesn't penalize exploratory fee experiments.
             forward_rate = forward_count / max(hours_elapsed, 0.1)
-            # AIMD success score normalized against Kalman expected demand
+            # AIMD success score normalized against Kalman expected demand.
+            # The 10x multiplier is deliberate normalization (I-11): expected_demand is in
+            # forwards/hour from Kalman, but forward_rate spans the observation window.
+            # Dividing by 10x expected_demand normalizes score to ~[0,1] for typical windows.
             success_score = forward_rate / max(expected_demand * 10.0, 0.1)
             is_exploring = abs(thompson_fee - ts_state.thompson.posterior_mean) > ts_state.thompson.posterior_std * 0.5
 

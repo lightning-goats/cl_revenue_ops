@@ -496,7 +496,7 @@ class FlowMetrics:
 class FlowAnalyzer:
     """
     Analyzes routing flow to classify channels as Source/Sink/Balanced.
-    
+
     Flow Analysis Logic:
     1. Query local SQLite forwards table (hydrated once on startup if needed)
     2. Calculate net flow for each channel using Exponential Moving Average (EMA)
@@ -505,6 +505,15 @@ class FlowAnalyzer:
        - FlowRatio > 0.5: SOURCE (draining)
        - FlowRatio < -0.5: SINK (filling)
        - Otherwise: BALANCED
+
+    Known Limitations (documented, not bugs):
+    - C-1: has_observation=True unconditionally in Kalman — design tradeoff: setting False
+      for idle channels would cause the filter to converge to 0.0, losing state. True keeps
+      the prediction step active so idle channels decay naturally via process noise.
+    - I-2: analyze_all_channels is not re-entrant — single-threaded timer mitigates; the
+      _analyze_all_running flag prevents redundant DB writes from concurrent calls.
+    - I-4: Hourly observations are time-correlated — inherent in the hourly-update/24h-window
+      design. Kalman process noise accounts for this.
     """
     
     def __init__(self, plugin: Plugin, config, database):
@@ -522,6 +531,8 @@ class FlowAnalyzer:
         # v2.1: Kalman filter state cache (channel_id -> KalmanFlowFilter)
         self._kalman_filters: Dict[str, KalmanFlowFilter] = {}
         self._kalman_lock = threading.Lock()
+        # I-9: Flag to skip DB persistence in analyze_channel() during bulk analysis
+        self._analyze_all_running: bool = False
 
         # One-time purge: clear Kalman states poisoned by the has_observation=True bug.
         # All filters converged to flow_ratio≈0.0, locking every channel as BALANCED.
@@ -913,7 +924,16 @@ class FlowAnalyzer:
             Dict mapping channel_id to FlowMetrics
         """
         results = {}
-        
+        self._analyze_all_running = True
+
+        try:
+            return self._analyze_all_channels_impl()
+        finally:
+            self._analyze_all_running = False
+
+    def _analyze_all_channels_impl(self) -> Dict[str, 'FlowMetrics']:
+        results = {}
+
         # Get list of all channels
         channels = self._get_channels()
         
@@ -1206,24 +1226,27 @@ class FlowAnalyzer:
                     else:
                         metrics.state = ChannelState.BALANCED
 
-        # Persist state so single-channel analysis is reflected in get_channel_state()
-        self.database.update_channel_state(
-            channel_id=channel_id,
-            peer_id=peer_id,
-            state=metrics.state.value,
-            flow_ratio=metrics.flow_ratio,
-            sats_in=total_in,
-            sats_out=total_out,
-            capacity=capacity,
-            confidence=metrics.confidence,
-            velocity=metrics.velocity,
-            flow_multiplier=metrics.flow_multiplier,
-            ema_decay=adaptive_decay,
-            forward_count=forward_count,
-            kalman_flow_ratio=metrics.kalman_flow_ratio,
-            kalman_velocity=metrics.kalman_velocity,
-            kalman_uncertainty=metrics.kalman_uncertainty
-        )
+        # I-9: Skip DB persistence when called during bulk analyze_all_channels(),
+        # which does its own DB writes. This avoids redundant writes and potential
+        # race conditions if analyze_channel() is called from a debug handler mid-cycle.
+        if not self._analyze_all_running:
+            self.database.update_channel_state(
+                channel_id=channel_id,
+                peer_id=peer_id,
+                state=metrics.state.value,
+                flow_ratio=metrics.flow_ratio,
+                sats_in=total_in,
+                sats_out=total_out,
+                capacity=capacity,
+                confidence=metrics.confidence,
+                velocity=metrics.velocity,
+                flow_multiplier=metrics.flow_multiplier,
+                ema_decay=adaptive_decay,
+                forward_count=forward_count,
+                kalman_flow_ratio=metrics.kalman_flow_ratio,
+                kalman_velocity=metrics.kalman_velocity,
+                kalman_uncertainty=metrics.kalman_uncertainty
+            )
 
         return metrics
 
