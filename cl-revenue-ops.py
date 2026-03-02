@@ -1877,11 +1877,15 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     """
     if database is None:
         return {"error": "Plugin not fully initialized"}
-    
-    channel_states = database.get_all_channel_states()
-    fee_history = database.get_recent_fee_changes(limit=10)
-    rebalance_history = database.get_recent_rebalances(limit=10)
-    
+
+    # AUDIT FIX: Guard against database exceptions in status RPC
+    try:
+        channel_states = database.get_all_channel_states()
+        fee_history = database.get_recent_fee_changes(limit=10)
+        rebalance_history = database.get_recent_rebalances(limit=10)
+    except Exception as e:
+        return {"error": f"Database query failed: {e}"}
+
     return {
         "status": "running",
         "version": PLUGIN_VERSION,
@@ -4224,16 +4228,24 @@ def _parse_msat(msat_val: Any) -> int:
 def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     """
     Notification when a forward completes (success or failure).
-    
+
     We use this for:
     1. Real-time flow tracking (settled forwards)
     2. Peer reputation tracking (success/failure rates)
-    
+
     Reputation tracking helps identify unreliable peers for traffic intelligence.
     """
+    # AUDIT FIX: Top-level guard prevents unhandled exceptions from crashing CLN event processing
+    try:
+        _on_forward_event_impl(forward_event, plugin, **kwargs)
+    except Exception as e:
+        plugin.log(f"Error in forward_event handler: {e}", level='error')
+
+
+def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
     if database is None:
         return
-    
+
     status = forward_event.get("status")
     in_channel = normalize_scid(forward_event.get("in_channel")) if forward_event.get("in_channel") else None
 
@@ -4321,12 +4333,20 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
 def on_peer_connect(plugin: Plugin, **kwargs):
     """
     Notification when a peer connects.
-    
+
     Records the connection event for uptime tracking.
     """
+    # AUDIT FIX: Top-level guard prevents unhandled exceptions from crashing CLN event processing
+    try:
+        _on_peer_connect_impl(plugin, **kwargs)
+    except Exception as e:
+        plugin.log(f"Error in peer_connect handler: {e}", level='error')
+
+
+def _on_peer_connect_impl(plugin: Plugin, **kwargs):
     if database is None:
         return
-    
+
     # Log full structure for debugging
     plugin.log(f"Connect notification: {kwargs}", level='debug')
     
@@ -4359,6 +4379,14 @@ def on_peer_disconnect(plugin: Plugin, **kwargs):
 
     Records the disconnection event for uptime tracking.
     """
+    # AUDIT FIX: Top-level guard prevents unhandled exceptions from crashing CLN event processing
+    try:
+        _on_peer_disconnect_impl(plugin, **kwargs)
+    except Exception as e:
+        plugin.log(f"Error in peer_disconnect handler: {e}", level='error')
+
+
+def _on_peer_disconnect_impl(plugin: Plugin, **kwargs):
     if database is None:
         return
 
@@ -4403,6 +4431,14 @@ def on_channel_state_changed(plugin: Plugin, **kwargs):
     - CLOSED: Channel is fully closed and resolved
     - FUNDING_SPEND_SEEN: Funding output has been spent (close initiated)
     """
+    # AUDIT FIX: Top-level guard prevents unhandled exceptions from crashing CLN event processing
+    try:
+        _on_channel_state_changed_impl(plugin, **kwargs)
+    except Exception as e:
+        plugin.log(f"Error in channel_state_changed handler: {e}", level='error')
+
+
+def _on_channel_state_changed_impl(plugin: Plugin, **kwargs):
     if database is None:
         return
 

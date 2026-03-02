@@ -272,7 +272,7 @@ class Config:
     
     # Timer intervals (in seconds)
     flow_interval: int = 3600      # 1 hour
-    fee_interval: int = 600        # 10 minutes
+    fee_interval: int = 1800       # 30 minutes (matches option default)
     rebalance_interval: int = 900  # 15 minutes
     # Hot-channel protection (Sling aggressiveness for fast-draining, high-profit channels)
     hot_channel_protection_enabled: bool = True
