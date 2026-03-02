@@ -31,7 +31,7 @@
 # ============================================================================
 
 # Target daily flow per channel in sats (used for liquidity scoring)
-#revenue-ops-target-flow=250000
+#revenue-ops-target-flow=100000
 
 # Flow analysis interval in seconds (1 hour default)
 #revenue-ops-flow-interval=3600
@@ -50,11 +50,11 @@
 
 # Fee floor - minimum fee rate (protects against L1 fee spikes)
 # RECOMMENDATION: 100 ppm for competitive markets, 50 ppm for volume focus
-#revenue-ops-min-fee-ppm=100
+#revenue-ops-min-fee-ppm=10
 
 # Fee ceiling - maximum fee rate
 # RECOMMENDATION: 2500-5000 ppm depending on channel positioning
-#revenue-ops-max-fee-ppm=2500
+#revenue-ops-max-fee-ppm=5000
 
 # --- Scarcity Pricing (v2.0) ---
 # Apply fee multiplier when outbound liquidity is scarce
@@ -64,7 +64,7 @@
 #revenue-ops-scarcity-pricing=true
 
 # Outbound ratio below which scarcity pricing kicks in (0.15 = 15%)
-#revenue-ops-scarcity-threshold=0.15
+#revenue-ops-scarcity-threshold=0.35
 
 # --- Vegas Reflex (v2.0) ---
 # Dynamically raise fee floor during mempool congestion
@@ -82,7 +82,7 @@
 
 # Minimum expected profit in sats to trigger rebalance
 # RECOMMENDATION: 50-100 sats for active rebalancing, 200+ for conservative
-#revenue-ops-rebalance-min-profit=50
+#revenue-ops-rebalance-min-profit=10
 
 # Rebalancer backend (only 'sling' supported)
 #revenue-ops-rebalancer=sling
@@ -96,7 +96,7 @@
 #revenue-ops-daily-budget-sats=5000
 
 # On-chain + Off-chain reserve threshold (abort rebalancing if below)
-#revenue-ops-min-wallet-reserve=500000
+#revenue-ops-min-wallet-reserve=1000000
 
 # --- Revenue-Proportional Budget ---
 # Scale daily budget as percentage of trailing 24h routing revenue
@@ -107,14 +107,14 @@
 
 # Percentage of 24h revenue to use as budget (0.10 = 10%)
 # RECOMMENDATION: 5-15% depending on risk tolerance
-#revenue-ops-proportional-budget-pct=0.10
+#revenue-ops-proportional-budget-pct=0.30
 
 # ============================================================================
 # RISK MANAGEMENT (Kelly Criterion)
 # ============================================================================
 
 # Scale rebalance budget based on historical success rate
-#revenue-ops-enable-kelly=true
+#revenue-ops-enable-kelly=false
 
 # Kelly fraction multiplier (0.5 = Half Kelly = conservative)
 # RECOMMENDATION: 0.5 for stable nodes, 0.3 for conservative
@@ -148,7 +148,7 @@
 # ============================================================================
 
 # Path to SQLite database
-#revenue-ops-db-path=~/.lightning/revenue-ops.db
+#revenue-ops-db-path=~/.lightning/revenue_ops.db
 
 # ============================================================================
 # EXAMPLE CONFIGURATIONS

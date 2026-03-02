@@ -305,7 +305,7 @@ class Config:
     sink_threshold: float = -0.5    # FlowRatio < -0.5 = Sink (filling)
     
     # Fee parameters
-    min_fee_ppm: int = 25          # Floor fee in PPM
+    min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)
     max_fee_ppm: int = 5000        # Ceiling fee in PPM
     base_fee_msat: int = 0         # Base fee (we focus on PPM)
     
@@ -359,12 +359,12 @@ class Config:
                                      # 0.98^24 ≈ 0.61, meaning old data loses ~40% weight daily
 
     # Kelly Criterion Position Sizing (Phase 4: Risk Management)
-    enable_kelly: bool = True        # If True, scale rebalance budget by Kelly fraction
+    enable_kelly: bool = False       # If True, scale rebalance budget by Kelly fraction (opt-in)
     kelly_bypass_for_fleet: bool = True  # If True, skip Kelly for hive/fleet destinations
                                           # Fleet paths are ~free (0 ppm internal), so Kelly's
                                           # EV gate is counterproductive — it kills candidates
                                           # before the fleet path optimizer can apply zero-fee routing.
-    kelly_fraction: float = 0.6      # Multiplier for Kelly fraction (0.6 = "Half-Plus Kelly")
+    kelly_fraction: float = 0.5      # Multiplier for Kelly fraction (0.5 = Half Kelly)
                                       # Full Kelly (1.0) maximizes growth but has high volatility
                                       # Half Kelly (0.5) reduces volatility drag significantly
     
