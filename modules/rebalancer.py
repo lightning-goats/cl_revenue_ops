@@ -466,7 +466,7 @@ class JobManager:
             budget_ppm = (chunk_budget_msat * 1_000_000) // (chunk_size * 1000) if chunk_size > 0 else 0
         else:
             budget_ppm = 0
-        maxppm = max(1, min(candidate.max_fee_ppm, budget_ppm)) if budget_ppm > 0 else 0
+        maxppm = int(max(1, min(candidate.max_fee_ppm, budget_ppm))) if budget_ppm > 0 else 0
         if maxppm <= 0:
             return {"success": False, "error": "Budget too small to allow any routing fee (maxppm=0)"}
         
@@ -2919,7 +2919,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # Fallback: linear heuristic (original logic)
             expected_utilization = max(min(dest_turnover_rate * cooldown_days, 1.0), 0.05)
 
-        expected_income = (rebalance_amount * expected_utilization * outbound_fee_ppm) // 1_000_000
+        expected_income = int((rebalance_amount * expected_utilization * outbound_fee_ppm) // 1_000_000)
 
         # =================================================================
         # EV v2.0: SHARPE-DERIVED OPPORTUNITY COST
