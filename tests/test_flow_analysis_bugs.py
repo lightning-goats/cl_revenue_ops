@@ -61,7 +61,7 @@ class TestAnalyzeChannelKalmanReclassification:
         }
 
         # Mock _apply_kalman_filter to return a high ratio (above source_threshold)
-        kalman_result = (0.6, 0.01, 0.05, False)
+        kalman_result = (0.6, 0.01, 0.05, False, 10)
 
         with patch.object(analyzer, '_get_channel', return_value=channel_info), \
              patch.object(analyzer, '_get_daily_flow_from_db', return_value={"100x1x0": []}), \
@@ -95,7 +95,7 @@ class TestAnalyzeChannelKalmanReclassification:
         }
 
         # Kalman ratio well below sink threshold
-        kalman_result = (-0.5, -0.02, 0.05, False)
+        kalman_result = (-0.5, -0.02, 0.05, False, 10)
 
         with patch.object(analyzer, '_get_channel', return_value=channel_info), \
              patch.object(analyzer, '_get_daily_flow_from_db', return_value={"100x1x0": []}), \
@@ -129,7 +129,7 @@ class TestAnalyzeChannelKalmanReclassification:
         }
 
         # Kalman ratio in balanced range
-        kalman_result = (0.1, 0.0, 0.05, False)
+        kalman_result = (0.1, 0.0, 0.05, False, 10)
 
         with patch.object(analyzer, '_get_channel', return_value=channel_info), \
              patch.object(analyzer, '_get_daily_flow_from_db', return_value={"100x1x0": []}), \
@@ -175,7 +175,7 @@ class TestAnalyzeChannelKalmanReclassification:
         )
 
         # Kalman ratio above source threshold, but shouldn't override CONGESTED
-        kalman_result = (0.8, 0.05, 0.03, False)
+        kalman_result = (0.8, 0.05, 0.03, False, 10)
 
         with patch.object(analyzer, '_get_channel', return_value=channel_info), \
              patch.object(analyzer, '_get_daily_flow_from_db', return_value={"100x1x0": []}), \
@@ -188,6 +188,80 @@ class TestAnalyzeChannelKalmanReclassification:
 
         assert result is not None
         assert result.state == ChannelState.CONGESTED
+
+    def test_low_observation_count_does_not_override_ema(self):
+        """Kalman should NOT override EMA classification when observation_count < KALMAN_MIN_OBSERVATIONS."""
+        from modules.flow_analysis import ChannelState, KALMAN_MIN_OBSERVATIONS
+
+        analyzer, database = self._make_analyzer(source_threshold=0.3)
+
+        channel_info = {
+            "short_channel_id": "100x1x0",
+            "peer_id": "02" + "a" * 64,
+            "capacity_msat": 10_000_000_000,
+            "spendable_msat": 3_000_000_000,
+            "receivable_msat": 7_000_000_000,
+            "state": "CHANNELD_NORMAL",
+            "htlc_minimum_msat": 0,
+            "htlc_maximum_msat": 1_000_000_000,
+            "max_accepted_htlcs": 483,
+            "htlcs": []
+        }
+
+        # Kalman has low uncertainty (converged) but too few observations
+        # EMA would classify as SOURCE (high ema_out), but Kalman says BALANCED (0.1 ratio)
+        # With insufficient observations, EMA should win
+        # EMA flow_ratio = (ema_out - ema_in) / capacity = (4M - 500K) / 10M = 0.35 > 0.3
+        kalman_result_low_obs = (0.1, 0.0, 0.05, False, KALMAN_MIN_OBSERVATIONS - 1)
+
+        with patch.object(analyzer, '_get_channel', return_value=channel_info), \
+             patch.object(analyzer, '_get_daily_flow_from_db', return_value={"100x1x0": []}), \
+             patch.object(analyzer, '_calculate_ema_flow', return_value=(500_000, 4_000_000, 1_000_000, 8_000_000, 10, int(time.time()))), \
+             patch.object(analyzer, '_calculate_adaptive_decay', return_value=0.8), \
+             patch.object(analyzer, '_apply_kalman_filter', return_value=kalman_result_low_obs):
+
+            result = analyzer.analyze_channel("100x1x0")
+
+        assert result is not None
+        # EMA classification should be used (SOURCE), not Kalman (BALANCED)
+        assert result.state == ChannelState.SOURCE
+
+    def test_sufficient_observations_allows_kalman_override(self):
+        """Kalman SHOULD override EMA when observation_count >= KALMAN_MIN_OBSERVATIONS."""
+        from modules.flow_analysis import ChannelState, KALMAN_MIN_OBSERVATIONS
+
+        analyzer, database = self._make_analyzer(source_threshold=0.3)
+
+        channel_info = {
+            "short_channel_id": "100x1x0",
+            "peer_id": "02" + "a" * 64,
+            "capacity_msat": 10_000_000_000,
+            "spendable_msat": 3_000_000_000,
+            "receivable_msat": 7_000_000_000,
+            "state": "CHANNELD_NORMAL",
+            "htlc_minimum_msat": 0,
+            "htlc_maximum_msat": 1_000_000_000,
+            "max_accepted_htlcs": 483,
+            "htlcs": []
+        }
+
+        # Kalman converged AND has enough observations — should override EMA
+        # EMA would say SOURCE (ratio=0.35), but Kalman says BALANCED (0.1 ratio)
+        kalman_result_enough_obs = (0.1, 0.0, 0.05, False, KALMAN_MIN_OBSERVATIONS)
+
+        with patch.object(analyzer, '_get_channel', return_value=channel_info), \
+             patch.object(analyzer, '_get_daily_flow_from_db', return_value={"100x1x0": []}), \
+             patch.object(analyzer, '_calculate_ema_flow', return_value=(500_000, 4_000_000, 1_000_000, 8_000_000, 10, int(time.time()))), \
+             patch.object(analyzer, '_calculate_adaptive_decay', return_value=0.8), \
+             patch.object(analyzer, '_apply_kalman_filter', return_value=kalman_result_enough_obs):
+
+            result = analyzer.analyze_channel("100x1x0")
+
+        assert result is not None
+        # Kalman should override: ratio (0.1) < source_threshold (0.3) → balanced
+        # High volume may produce BALANCED_ACTIVE instead of BALANCED
+        assert result.state in (ChannelState.BALANCED, ChannelState.BALANCED_ACTIVE)
+        assert result.state != ChannelState.SOURCE
 
 
 class TestRemoveClosedChannelDataCleanup:
@@ -559,7 +633,7 @@ class TestAnalyzeChannelConsistencyWithBatch:
         }
 
         # Use consistent kalman results for both paths
-        kalman_result = (0.7, 0.02, 0.05, False)
+        kalman_result = (0.7, 0.02, 0.05, False, 10)
 
         with patch.object(analyzer, '_get_channel', return_value=channel_info), \
              patch.object(analyzer, '_get_channels', return_value=[channel_info]), \

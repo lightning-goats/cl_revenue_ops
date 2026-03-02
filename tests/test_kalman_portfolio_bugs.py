@@ -84,9 +84,10 @@ class TestKalmanLastInnovationPersistence:
         params = call_args[0][1]
         assert "last_innovation" in sql
         assert "velocity_unit" in sql
-        assert len(params) == 10  # channel_id + 8 state fields + velocity_unit
-        assert params[-2] == -0.33  # last_innovation is second-to-last param
-        assert params[-1] == "per_hour"  # velocity_unit is last param
+        assert "observation_count" in sql
+        assert len(params) == 11  # channel_id + 8 state fields + velocity_unit + observation_count
+        assert params[-3] == -0.33  # last_innovation is third-to-last param
+        assert params[-2] == "per_hour"  # velocity_unit is second-to-last param
 
 
 class TestKalmanSaveErrorHandling:

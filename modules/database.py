@@ -1128,6 +1128,8 @@ class Database:
                     conn.execute("ALTER TABLE kalman_state ADD COLUMN last_innovation REAL DEFAULT 0.0")
                 if 'velocity_unit' not in ks_cols:
                     conn.execute("ALTER TABLE kalman_state ADD COLUMN velocity_unit TEXT DEFAULT 'per_day'")
+                if 'observation_count' not in ks_cols:
+                    conn.execute("ALTER TABLE kalman_state ADD COLUMN observation_count INTEGER DEFAULT 0")
             except Exception as e:
                 self.plugin.log(f"Kalman migration warning: {e}", level='debug')
 
@@ -1279,8 +1281,9 @@ class Database:
         conn.execute("""
             INSERT OR REPLACE INTO kalman_state
             (channel_id, flow_ratio, flow_velocity, variance_ratio, variance_velocity,
-             covariance, last_update, innovation_variance, last_innovation, velocity_unit)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             covariance, last_update, innovation_variance, last_innovation, velocity_unit,
+             observation_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             channel_id,
             values[0],  # flow_ratio
@@ -1292,6 +1295,7 @@ class Database:
             values[5],  # innovation_variance
             values[6],  # last_innovation
             "per_hour",
+            state.get("observation_count", 0),
         ))
 
     def get_all_kalman_states(self) -> List[Dict[str, Any]]:
@@ -1321,7 +1325,7 @@ class Database:
             )
         """)
         row = conn.execute(
-            "SELECT 1 FROM plugin_flags WHERE flag = 'kalman_observation_purge_v1'"
+            "SELECT 1 FROM plugin_flags WHERE flag = 'kalman_observation_purge_v2'"
         ).fetchone()
         return row is None
 
@@ -1330,7 +1334,7 @@ class Database:
         conn = self._get_connection()
         conn.execute(
             "INSERT OR IGNORE INTO plugin_flags (flag, value, created_at) "
-            "VALUES ('kalman_observation_purge_v1', 'done', ?)",
+            "VALUES ('kalman_observation_purge_v2', 'done', ?)",
             (int(time.time()),)
         )
 

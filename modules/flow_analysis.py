@@ -119,6 +119,7 @@ KALMAN_CONFIDENCE_SCALING = 0.8  # How much confidence reduces measurement noise
 # Convergence threshold: Kalman must be this confident before overriding EMA classification
 # sqrt(KALMAN_INITIAL_VARIANCE) ≈ 0.316; converged filters typically reach 0.05-0.15
 KALMAN_CONVERGENCE_UNCERTAINTY = 0.25  # Below this, Kalman overrides EMA state
+KALMAN_MIN_OBSERVATIONS = 5  # Minimum observation count before Kalman can override EMA
 
 # BALANCED_ACTIVE classification: distinguish busy two-way channels from dormant ones
 BALANCED_ACTIVE_TURNOVER_THRESHOLD = 0.01  # 1% of capacity per day
@@ -149,6 +150,7 @@ class KalmanFlowState:
     last_update: int = 0
     innovation_variance: float = 0.01  # Running estimate of prediction errors
     last_innovation: float = 0.0  # Most recent prediction error
+    observation_count: int = 0  # Number of real observations (not predict-only)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -159,7 +161,8 @@ class KalmanFlowState:
             "covariance": self.covariance,
             "last_update": self.last_update,
             "innovation_variance": self.innovation_variance,
-            "last_innovation": self.last_innovation
+            "last_innovation": self.last_innovation,
+            "observation_count": self.observation_count,
         }
 
     @classmethod
@@ -179,7 +182,8 @@ class KalmanFlowState:
             covariance=_safe("covariance", 0.0),
             last_update=int(d.get("last_update") or 0),
             innovation_variance=_safe("innovation_variance", 0.01),
-            last_innovation=_safe("last_innovation", 0.0)
+            last_innovation=_safe("last_innovation", 0.0),
+            observation_count=int(d.get("observation_count") or 0),
         )
 
 
@@ -347,6 +351,7 @@ class KalmanFlowFilter:
         self.state.innovation_variance = max(0.001, 0.9 * self.state.innovation_variance + 0.1 * innovation * innovation)
 
         self.state.last_update = int(time.time())
+        self.state.observation_count += 1
 
         # NaN guard: reset on corruption
         if self._has_nan():
@@ -534,17 +539,18 @@ class FlowAnalyzer:
         # I-9: Flag to skip DB persistence in analyze_channel() during bulk analysis
         self._analyze_all_running: bool = False
 
-        # One-time purge: clear Kalman states poisoned by the has_observation=True bug.
-        # All filters converged to flow_ratio≈0.0, locking every channel as BALANCED.
-        # Fresh filters will re-converge with real observations (EMA drives until then).
+        # One-time purge v2: clear Kalman states missing observation_count.
+        # Without observation gating, filters declared "converged" after 1-2 cycles
+        # while flow_ratio was still near 0.0, overriding correct EMA classifications.
+        # Fresh filters will now require KALMAN_MIN_OBSERVATIONS before overriding EMA.
         try:
             if self.database.kalman_purge_needed():
                 n = self.database.reset_all_kalman_states()
                 self.database.mark_kalman_purge_done()
                 if n > 0:
                     self.plugin.log(
-                        f"FLOW: Purged {n} poisoned Kalman states (has_observation bug). "
-                        f"Filters will re-converge from EMA-based classification.",
+                        f"FLOW: Purged {n} Kalman states (adding observation gating). "
+                        f"Filters will re-converge with observation count tracking.",
                         level='info'
                     )
         except Exception:
@@ -641,7 +647,7 @@ class FlowAnalyzer:
         daily_buckets: List[Dict[str, int]],
         prev_ts: int,
         has_observation: bool = True
-    ) -> Tuple[float, float, float, bool]:
+    ) -> Tuple[float, float, float, bool, int]:
         """
         Apply Kalman filter to get smoothed flow ratio estimate.
 
@@ -655,10 +661,10 @@ class FlowAnalyzer:
                 Prevents feeding a fake 0.0 observation when no flow data exists.
 
         Returns:
-            (kalman_ratio, kalman_velocity, uncertainty, regime_change)
+            (kalman_ratio, kalman_velocity, uncertainty, regime_change, observation_count)
         """
         if not ENABLE_KALMAN_FILTER:
-            return observed_ratio, 0.0, 0.1, False
+            return observed_ratio, 0.0, 0.1, False, 0
 
         kf = self._get_kalman_filter(channel_id)
 
@@ -717,7 +723,8 @@ class FlowAnalyzer:
             kf.state.flow_ratio,
             kf.state.flow_velocity,
             kf.get_uncertainty(),
-            regime_change
+            regime_change,
+            kf.state.observation_count
         )
 
     def _compute_raw_kalman_observation(
@@ -1031,7 +1038,7 @@ class FlowAnalyzer:
                 )
                 kalman_confidence = self._calculate_confidence(raw_count, last_forward_ts) if raw_count > 0 else metrics.confidence
 
-                kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change = \
+                kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change, obs_count = \
                     self._apply_kalman_filter(
                         channel_id=channel_id,
                         observed_ratio=raw_observation,
@@ -1046,10 +1053,15 @@ class FlowAnalyzer:
                 metrics.kalman_regime_change = regime_change
 
                 # Use Kalman estimate for state classification only when the filter
-                # has converged (low uncertainty). Unconverged filters (fresh/reset)
-                # produce near-zero ratios that incorrectly classify everything as BALANCED.
-                # Until converged, keep the EMA-based classification from _calculate_metrics().
-                if not metrics.is_congested and kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY:
+                # has converged (low uncertainty) AND has accumulated enough observations.
+                # Without the observation count check, fresh/purged filters declare
+                # "confident" (low variance) after just 1-2 cycles while the flow_ratio
+                # estimate is still near 0.0, incorrectly overriding EMA with BALANCED.
+                kalman_converged = (
+                    kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY
+                    and obs_count >= KALMAN_MIN_OBSERVATIONS
+                )
+                if not metrics.is_congested and kalman_converged:
                     if kalman_ratio > self.config.source_threshold:
                         metrics.state = ChannelState.SOURCE
                     elif kalman_ratio < self.config.sink_threshold:
@@ -1199,7 +1211,7 @@ class FlowAnalyzer:
             )
             kalman_confidence = self._calculate_confidence(raw_count, last_forward_ts) if raw_count > 0 else metrics.confidence
 
-            kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change = \
+            kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change, obs_count = \
                 self._apply_kalman_filter(
                     channel_id=channel_id,
                     observed_ratio=raw_observation,
@@ -1214,7 +1226,11 @@ class FlowAnalyzer:
             metrics.kalman_regime_change = regime_change
 
             # Re-classify using Kalman only when converged (matching analyze_all_channels)
-            if not metrics.is_congested and kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY:
+            kalman_converged = (
+                kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY
+                and obs_count >= KALMAN_MIN_OBSERVATIONS
+            )
+            if not metrics.is_congested and kalman_converged:
                 if kalman_ratio > self.config.source_threshold:
                     metrics.state = ChannelState.SOURCE
                 elif kalman_ratio < self.config.sink_threshold:
