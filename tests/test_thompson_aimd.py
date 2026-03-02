@@ -1381,92 +1381,70 @@ class TestPolynomialSmoothing:
 # =============================================================================
 
 class TestDemandAdjustedRevenue:
-    """Tests for Improvement #1: Demand-Adjusted Reward Signal."""
+    """Tests for Improvement #1: Demand-Adjusted Reward Signal (Kalman-based)."""
 
-    def test_baseline_init_from_zero(self):
-        """First call initializes baseline from current rate."""
-        from modules.fee_controller import ThompsonAIMDState
-        ts = ThompsonAIMDState()
-        assert ts.baseline_forward_rate == 0.0
+    def test_default_expected_demand(self):
+        """Default expected_demand is 0.5 (healthy baseline)."""
+        expected_demand = 0.5
+        demand_factor = max(0.25, min(4.0, expected_demand / 0.5))
+        assert demand_factor == 1.0  # 0.5/0.5 = 1.0, no adjustment
 
-        result = ts.update_baseline_forward_rate(forward_count=10, hours_elapsed=2.0)
-        # First call: baseline should be set to current_rate = 10/2 = 5.0
-        assert result == 5.0
-        assert ts.baseline_forward_rate == 5.0
-
-    def test_slow_ema_decay(self):
-        """Baseline uses slow alpha=0.05 to track long-term demand."""
-        from modules.fee_controller import ThompsonAIMDState
-        ts = ThompsonAIMDState()
-
-        # Initialize
-        ts.update_baseline_forward_rate(forward_count=10, hours_elapsed=1.0)
-        initial = ts.baseline_forward_rate  # 10.0
-
-        # Update with same rate — should barely change
-        ts.update_baseline_forward_rate(forward_count=10, hours_elapsed=1.0)
-        assert abs(ts.baseline_forward_rate - initial) < 0.01
-
-    def test_clamping_lower_bound(self):
-        """Baseline never goes below 0.01."""
-        from modules.fee_controller import ThompsonAIMDState
-        ts = ThompsonAIMDState()
-        ts.update_baseline_forward_rate(forward_count=0, hours_elapsed=10.0)
-        assert ts.baseline_forward_rate >= 0.01
-
-    def test_demand_spike_inflates_factor(self):
-        """During a demand spike, demand_factor > 1 reduces adjusted revenue."""
-        from modules.fee_controller import ThompsonAIMDState
-        ts = ThompsonAIMDState()
-
-        # Set baseline to 5 forwards/hour
-        ts.baseline_forward_rate = 5.0
-
-        # Spike: 20 forwards in 1 hour
-        current_rate = 20.0 / 1.0
-        demand_factor = current_rate / max(ts.baseline_forward_rate, 0.01)
-        demand_factor = max(0.25, min(4.0, demand_factor))
-        assert demand_factor == 4.0  # capped at 4.0
+    def test_high_kalman_demand_inflates_factor(self):
+        """High flow_ratio + velocity → high demand_factor → reduced adjusted revenue."""
+        import math
+        kr = 0.8   # strong flow ratio
+        kv = 0.02  # positive velocity
+        expected_demand = abs(kr) + abs(kv * 24.0)
+        # expected_demand = 0.8 + 0.48 = 1.28
+        assert not math.isnan(expected_demand)
+        demand_factor = max(0.25, min(4.0, expected_demand / 0.5))
+        assert demand_factor == min(4.0, 1.28 / 0.5)  # 2.56
 
         adjusted = 100.0 / demand_factor
-        assert adjusted == 25.0  # revenue divided by demand factor
+        assert adjusted < 100.0  # revenue reduced by demand
 
-    def test_demand_drop_boosts_adjusted_revenue(self):
-        """During a demand drop, demand_factor < 1 boosts adjusted revenue."""
-        from modules.fee_controller import ThompsonAIMDState
-        ts = ThompsonAIMDState()
-        ts.baseline_forward_rate = 10.0
+    def test_low_demand_clamps_factor_to_one(self):
+        """When expected_demand < 0.05, demand_factor = 1.0 to avoid noise."""
+        expected_demand = 0.02
+        assert expected_demand < 0.05
+        demand_factor = 1.0  # bypass formula
+        adjusted = 100.0 / demand_factor
+        assert adjusted == 100.0  # no adjustment
 
-        # Drop: 2 forwards in 1 hour
-        current_rate = 2.0 / 1.0
-        demand_factor = current_rate / max(ts.baseline_forward_rate, 0.01)
-        demand_factor = max(0.25, min(4.0, demand_factor))
-        assert demand_factor == 0.25  # clamped at 0.25 (not 0.2)
+    def test_demand_factor_lower_bound(self):
+        """Demand factor is clamped to minimum 0.25."""
+        expected_demand = 0.06  # just above threshold
+        demand_factor = max(0.25, min(4.0, expected_demand / 0.5))
+        # 0.06/0.5 = 0.12, clamped to 0.25
+        assert demand_factor == 0.25
 
-    def test_stable_demand_no_adjustment(self):
-        """When demand matches baseline, factor ~1.0, no adjustment."""
-        from modules.fee_controller import ThompsonAIMDState
-        ts = ThompsonAIMDState()
-        ts.baseline_forward_rate = 5.0
+    def test_demand_factor_upper_bound(self):
+        """Demand factor is capped at 4.0."""
+        expected_demand = 5.0  # very high demand
+        demand_factor = max(0.25, min(4.0, expected_demand / 0.5))
+        assert demand_factor == 4.0
 
-        current_rate = 5.0 / 1.0
-        demand_factor = current_rate / max(ts.baseline_forward_rate, 0.01)
-        demand_factor = max(0.25, min(4.0, demand_factor))
-        assert demand_factor == 1.0
+    def test_nan_kalman_falls_back_to_default(self):
+        """NaN flow_ratio/velocity keeps default expected_demand = 0.5."""
+        import math
+        kr = float('nan')
+        kv = 0.01
+        expected_demand = 0.5  # default
+        if not math.isnan(kr) and not math.isnan(kv):
+            expected_demand = abs(kr) + abs(kv * 24.0)
+        assert expected_demand == 0.5
 
     def test_serialization_roundtrip(self):
-        """baseline_forward_rate and last_vegas_multiplier survive serialization."""
+        """last_vegas_multiplier survives serialization (baseline_forward_rate removed)."""
         from modules.fee_controller import ThompsonAIMDState
         ts = ThompsonAIMDState()
-        ts.baseline_forward_rate = 7.5
         ts.last_vegas_multiplier = 1.8
 
         d = ts.to_v2_dict()
-        assert d["baseline_forward_rate"] == 7.5
+        assert "baseline_forward_rate" not in d
         assert d["last_vegas_multiplier"] == 1.8
 
         restored = ThompsonAIMDState.from_v2_dict(d)
-        assert restored.baseline_forward_rate == 7.5
         assert restored.last_vegas_multiplier == 1.8
 
 

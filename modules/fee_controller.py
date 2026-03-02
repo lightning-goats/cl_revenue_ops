@@ -2364,7 +2364,7 @@ class AIMDDefenseState:
 
         Args:
             was_success: Legacy binary flag (True/False). Used if success_score not provided.
-            success_score: Continuous score (forward_rate / baseline_forward_rate).
+            success_score: Continuous score (forward_rate / expected_demand).
                           Values > 1.0 mean above-average demand.
             is_exploring: If True, failures during Thompson exploration are ignored
                          to prevent AIMD from creating a downward spiral.
@@ -2639,9 +2639,6 @@ class ThompsonAIMDState:
     # Gossip refresh tracking
     last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
 
-    # Demand-adjusted reward signal: EMA of forwards/hour (slow decay)
-    baseline_forward_rate: float = 0.0
-
     # Vegas-Thompson interaction tracking
     last_vegas_multiplier: float = 1.0
 
@@ -2685,33 +2682,6 @@ class ThompsonAIMDState:
             )
         return self.ema_revenue_rate
 
-    def update_baseline_forward_rate(self, forward_count: int, hours_elapsed: float,
-                                      alpha: float = 0.05) -> float:
-        """
-        Update EMA of forwards/hour for demand normalization.
-
-        Uses a slow decay (alpha=0.05) so baseline tracks long-term demand,
-        not short-term spikes. Revenue rate is then divided by
-        (current_rate / baseline) to remove demand effects from the reward signal.
-
-        Args:
-            forward_count: Number of forwards since last update
-            hours_elapsed: Hours since last update
-            alpha: Smoothing factor (0.05 = very slow, tracks trend)
-
-        Returns:
-            Updated baseline forward rate
-        """
-        current_rate = forward_count / max(hours_elapsed, 0.1)
-        if self.baseline_forward_rate <= 0:
-            self.baseline_forward_rate = max(current_rate, 0.1)
-        else:
-            self.baseline_forward_rate = (
-                alpha * current_rate + (1 - alpha) * self.baseline_forward_rate
-            )
-        self.baseline_forward_rate = max(self.baseline_forward_rate, 0.01)
-        return self.baseline_forward_rate
-
     def to_v2_dict(self) -> Dict[str, Any]:
         """
         Serialize to v2 JSON format for database storage.
@@ -2728,8 +2698,6 @@ class ThompsonAIMDState:
             "elasticity": self.elasticity_data,
             # Legacy thompson_data kept for migration path
             "thompson": self.thompson_data,
-            # Demand-adjusted reward signal
-            "baseline_forward_rate": self.baseline_forward_rate,
             # Vegas-Thompson interaction
             "last_vegas_multiplier": self.last_vegas_multiplier,
             # F-R6-1 FIX: Persist gossip refresh cooldown so it survives restarts
@@ -2794,8 +2762,6 @@ class ThompsonAIMDState:
         state.elasticity_data = d.get("elasticity", {})
         state.thompson_data = d.get("thompson", {})
         state.algorithm_version = d.get("algorithm_version", "migrated")
-        # Demand-adjusted reward signal (default 0.0 for backward compat)
-        state.baseline_forward_rate = d.get("baseline_forward_rate", 0.0)
         # Vegas-Thompson interaction (default 1.0 for backward compat)
         state.last_vegas_multiplier = d.get("last_vegas_multiplier", 1.0)
         # F-R6-1 FIX: Restore gossip refresh cooldown from persisted state
@@ -5967,31 +5933,26 @@ class HillClimbingFeeController:
                     ts_state.stable_cycles = 0
 
             # =====================================================================
-            # DEMAND-ADJUSTED REWARD SIGNAL (Kalman-primary, EMA-fallback)
+            # DEMAND-ADJUSTED REWARD SIGNAL (Kalman)
             # =====================================================================
-            # Normalize revenue by baseline demand so Thompson learns fee effects,
-            # not demand shocks. Prefer Kalman velocity from flow_analysis when
-            # available; fall back to EMA-based baseline forward rate.
-            ts_state.update_baseline_forward_rate(forward_count, hours_elapsed)
-            demand_factor = None
+            expected_demand = 0.5  # healthy baseline
             try:
                 ch_state = self.database.get_channel_state(channel_id)
                 if ch_state is not None:
-                    kv = ch_state.get("kalman_velocity")
-                    ku = ch_state.get("kalman_uncertainty")
-                    if (kv is not None and ku is not None
-                            and not math.isnan(kv) and not math.isnan(ku)):
-                        ku = max(0.0, ku)  # L7: guard against negative DB values
-                        confidence = 1.0 / (1.0 + ku)
-                        # kv is per-hour; scale to per-day for demand factor
-                        demand_factor = 1.0 + (kv * 24.0) * confidence * 2.0
-                        demand_factor = max(0.25, min(4.0, demand_factor))
+                    kr = ch_state.get("kalman_flow_ratio", ch_state.get("flow_ratio", 0.0))
+                    kv = ch_state.get("kalman_velocity", 0.0)
+                    if not math.isnan(kr) and not math.isnan(kv):
+                        # Approximate daily momentum
+                        expected_demand = abs(kr) + abs(kv * 24.0)
             except Exception as e:
                 self.plugin.log(f"Kalman demand fallback: {e}", level='debug')
-            if demand_factor is None:
-                # EMA fallback
-                demand_factor = (forward_count / max(hours_elapsed, 0.1)) / max(ts_state.baseline_forward_rate, 0.01)
-                demand_factor = max(0.25, min(4.0, demand_factor))
+
+            # Scale expected demand into a bounded factor
+            if expected_demand < 0.05:
+                demand_factor = 1.0  # Too low, avoid amplifying noise
+            else:
+                demand_factor = max(0.25, min(4.0, expected_demand / 0.5))
+
             adjusted_revenue_rate = current_revenue_rate / demand_factor
 
             # =====================================================================
@@ -6175,7 +6136,8 @@ class HillClimbingFeeController:
             # Compute continuous success score (not binary) and detect if Thompson
             # is exploring so AIMD doesn't penalize exploratory fee experiments.
             forward_rate = forward_count / max(hours_elapsed, 0.1)
-            success_score = forward_rate / max(ts_state.baseline_forward_rate, 0.1)
+            # AIMD success score normalized against Kalman expected demand
+            success_score = forward_rate / max(expected_demand * 10.0, 0.1)
             is_exploring = abs(thompson_fee - ts_state.thompson.posterior_mean) > ts_state.thompson.posterior_std * 0.5
 
             # Topology depletion: suppress AIMD failure when downstream is depleted

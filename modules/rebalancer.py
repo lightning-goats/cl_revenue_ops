@@ -1492,8 +1492,12 @@ class JobManager:
                     continue
                 for c in layer.get("constraints", []) or []:
                     scid_dir = c.get("short_channel_id_dir")
-                    ts = int(c.get("timestamp") or 0)
-                    max_msat = int(c.get("maximum_msat") or 0)
+                    try:
+                        ts = int(c.get("timestamp") or 0)
+                        # FIX: Use class method, 'parse_msat' is not defined in global scope
+                        max_msat = self._parse_msat(c.get("maximum_msat", 0))
+                    except (TypeError, ValueError):
+                        continue  # Skip malformed entry, keep rest of cache
                     if not scid_dir or max_msat <= 0:
                         continue
                     # Age filter
@@ -3189,6 +3193,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         if max_budget <= 0:
             return None
 
+        # FIX: Calculate expected fee rather than subtracting absolute max_budget
+        expected_fee_sats = self._estimate_expected_fee_sats(src_peer_id, amount)
+        expected_fee_sats = min(expected_fee_sats, max_budget)
+
+        # Calculate expected profit using the expected fee, NOT max_budget
+        expected_profit = int(spread * amount / 1_000_000) - expected_fee_sats
+
         # Resolve peer IDs for the destination (source_candidates in push semantics)
         resolved_peer_ids = dest_peer_ids or []
 
@@ -3207,11 +3218,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             max_budget_sats=max_budget,
             max_budget_msat=max_budget * 1000,
             max_fee_ppm=max_fee_ppm,
-            expected_profit_sats=int(spread * amount / 1_000_000) - max_budget,
+            expected_profit_sats=expected_profit,
             liquidity_ratio=src_ratio,
             dest_flow_state="push_drain",
             dest_turnover_rate=0.0,
             source_turnover_rate=0.0,
+            expected_fee_sats=expected_fee_sats,
             direction="push",
             source_candidate_peer_ids=resolved_peer_ids,
         )
@@ -3301,12 +3313,35 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 )
                 return estimate
 
+        # --- NEW: Cost-Curve from Failures ---
+        # If we have recent failures, the true cost floor is higher than the failed attempts
+        failed_floor = 0
+        try:
+            # Look at last 24h of failures to this peer
+            recent_fails = self.database.get_recent_rebalances(limit=20)
+            peer_fails = [
+                f for f in recent_fails
+                if f.get('status') == 'failed'
+                and f.get('to_channel', '').endswith(peer_id)
+            ]
+            if peer_fails:
+                # Find the highest max_fee_sats that resulted in a routing failure
+                highest_failed_sats = max(f.get('max_fee_sats', 0) for f in peer_fails)
+                failed_floor = (highest_failed_sats * 1_000_000) // max(1, amount_msat // 1000)
+        except Exception:
+            pass
+
         # No historical data - fall back to heuristics
         if last_hop is not None:
             estimate = last_hop + self.config.inbound_fee_estimate_ppm
+
+            # Ensure our estimate is strictly above the proven failure floor
+            if failed_floor > 0 and estimate <= failed_floor:
+                estimate = failed_floor + 25  # Small buffer above the known failure point
+
             self.plugin.log(
                 f"INBOUND FEE EST [{peer_id[:12]}...]: Last-hop based "
-                f"{estimate} PPM (last_hop={last_hop})",
+                f"{estimate} PPM (last_hop={last_hop}, fail_floor={failed_floor})",
                 level='debug'
             )
             return estimate

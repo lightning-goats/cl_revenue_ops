@@ -2064,9 +2064,8 @@ class Database:
         # Get inbound contribution
         inbound = self.get_channel_inbound_contribution(channel_id, window_days)
 
-        # Calculate total contribution value
-        # Direct fees + sourced fee contribution (what we helped earn elsewhere)
-        total_contribution = direct_pnl['revenue_sats'] + inbound['sourced_fee_contribution_sats']
+        # FIX: Apply the 50/50 split here to prevent double-counting in the dictionary return
+        total_contribution = (direct_pnl['revenue_sats'] + inbound['sourced_fee_contribution_sats']) // 2
 
         return {
             'channel_id': channel_id,

@@ -37,13 +37,13 @@ def _insert_forward(conn, *, in_channel, out_channel, in_msat, out_msat, fee_msa
 
 
 # =========================================================================
-# Fix #17: get_channel_full_pnl summed revenue instead of dividing by 2
+# Fix #17: get_channel_full_pnl applies 50/50 split to prevent double-counting
 # =========================================================================
 
-class TestFullPnlNoHalving:
-    """get_channel_full_pnl must sum direct + sourced, never halve."""
+class TestFullPnl5050Split:
+    """get_channel_full_pnl must apply 50/50 split to match Revenue dataclass."""
 
-    def test_total_contribution_is_sum_not_average(self, db):
+    def test_total_contribution_is_halved(self, db):
         now = int(time.time())
         conn = db._get_connection()
         # Exit-side: 10000 msat fee => 10 sats
@@ -56,11 +56,11 @@ class TestFullPnlNoHalving:
         full = db.get_channel_full_pnl("A", window_days=30)
         assert full["direct_revenue_sats"] == 10
         assert full["sourced_fee_contribution_sats"] == 6
-        # Must be sum (16), not average (8)
-        assert full["total_contribution_sats"] == 16
+        # 50/50 split: (10 + 6) // 2 = 8
+        assert full["total_contribution_sats"] == 8
 
     def test_zero_sourced_contribution(self, db):
-        """Channel with no inbound traffic: total = direct + 0."""
+        """Channel with no inbound traffic: total = (direct + 0) // 2."""
         now = int(time.time())
         conn = db._get_connection()
         _insert_forward(conn, in_channel="B", out_channel="A",
@@ -69,7 +69,8 @@ class TestFullPnlNoHalving:
         full = db.get_channel_full_pnl("A", window_days=30)
         assert full["direct_revenue_sats"] == 5
         assert full["sourced_fee_contribution_sats"] == 0
-        assert full["total_contribution_sats"] == 5
+        # 50/50 split: (5 + 0) // 2 = 2
+        assert full["total_contribution_sats"] == 2
 
 
 # =========================================================================
