@@ -579,6 +579,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_time ON forwards(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_channels ON forwards(in_channel, out_channel)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_channel ON rebalance_costs(channel_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_channel_time ON rebalance_costs(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_states_peer ON channel_states(peer_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connection_history_peer_time ON peer_connection_history(peer_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_time ON mempool_fee_history(timestamp)")
@@ -2821,18 +2822,19 @@ class Database:
     def get_rebalance_history_by_peer(self, peer_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Get rebalance history for channels belonging to a specific peer.
-        
+
         Joins rebalance_history with channel_states to find channels
         for the given peer, then returns rebalances to those channels.
-        
+
         Args:
             peer_id: The peer node ID
-            limit: Maximum records to return
-            
+            limit: Maximum records to return (clamped to [1, 1000])
+
         Returns:
             List of rebalance records with fee and amount info.
             Note: fee_paid_msat is in millisatoshis (actual_fee_sats * 1000)
         """
+        limit = max(1, min(limit, 1000))
         conn = self._get_connection()
         
         # First get all channels for this peer
@@ -4722,17 +4724,15 @@ class Database:
         conn = self._get_connection()
         now = int(time.time())
 
-        conn.execute("""
+        # Use RETURNING for atomic upsert+read (SQLite 3.35+)
+        row = conn.execute("""
             INSERT INTO channel_failures (channel_id, failure_count, last_failure_time)
             VALUES (?, 1, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
                 failure_count = failure_count + 1,
                 last_failure_time = ?
-        """, (channel_id, now, now))
-
-        row = conn.execute(
-            "SELECT failure_count FROM channel_failures WHERE channel_id = ?",
-            (channel_id,)).fetchone()
+            RETURNING failure_count
+        """, (channel_id, now, now)).fetchone()
         return row[0] if row else 1
     
     def reset_failure_count(self, channel_id: str) -> None:
