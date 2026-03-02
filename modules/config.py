@@ -88,6 +88,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_max_amount': int,
     'rebalance_min_amount': int,
     'rebalance_cooldown_hours': int,
+    'futility_cooldown_hours': int,
     'inbound_fee_estimate_ppm': int,
     # Phase 7 additions
     'enable_vegas_reflex': bool,
@@ -241,6 +242,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hot_channel_protection_profit_budget_pct': (0.0, 1.0),
     'inbound_fee_estimate_ppm': (0, 5000),
     'rebalance_cooldown_hours': (1, 168),
+    'futility_cooldown_hours': (1, 168),
     'target_flow': (1000, 100000000),
     'clboss_unmanage_duration_hours': (1, 168),
     'estimated_open_cost_sats': (0, 1000000),
@@ -318,6 +320,7 @@ class Config:
     low_liquidity_threshold: float = 0.3  # Below 30% = low outbound
     high_liquidity_threshold: float = 0.7 # Above 70% = high outbound
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
+    futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
     inbound_fee_estimate_ppm: int = 200  # Network routing cost estimate in PPM
     
     # clboss integration
@@ -723,8 +726,9 @@ class ConfigSnapshot:
     low_liquidity_threshold: float
     high_liquidity_threshold: float
     rebalance_cooldown_hours: int
+    futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
-    
+
     # clboss integration
     clboss_enabled: bool
     clboss_unmanage_duration_hours: int

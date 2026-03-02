@@ -1374,23 +1374,31 @@ class JobManager:
             try:
                 cutoff = int(time.time()) - self.job_timeout_seconds
                 conn = self.database._get_connection()
-                # First, get the IDs of orphaned records so we can release their budget reservations
-                orphaned_rows = conn.execute("""
-                    SELECT id FROM rebalance_history
-                    WHERE status IN ('pending', 'pending_async')
-                      AND timestamp < ?
-                """, (cutoff,)).fetchall()
-                orphaned_ids = [row['id'] for row in orphaned_rows]
+                # I-7 FIX: Wrap orphan cleanup in transaction for atomicity
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    # First, get the IDs of orphaned records so we can release their budget reservations
+                    orphaned_rows = conn.execute("""
+                        SELECT id FROM rebalance_history
+                        WHERE status IN ('pending', 'pending_async')
+                          AND timestamp < ?
+                    """, (cutoff,)).fetchall()
+                    orphaned_ids = [row['id'] for row in orphaned_rows]
 
-                cursor = conn.execute("""
-                    UPDATE rebalance_history
-                    SET status = 'failed', error_message = 'orphaned_on_restart'
-                    WHERE status IN ('pending', 'pending_async')
-                      AND timestamp < ?
-                """, (cutoff,))
-                orphaned_db = cursor.rowcount
+                    cursor = conn.execute("""
+                        UPDATE rebalance_history
+                        SET status = 'failed', error_message = 'orphaned_on_restart'
+                        WHERE status IN ('pending', 'pending_async')
+                          AND timestamp < ?
+                    """, (cutoff,))
+                    orphaned_db = cursor.rowcount
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
 
-                # Release budget reservations for orphaned jobs
+                # Release budget reservations for orphaned jobs (outside transaction —
+                # release_budget_reservation manages its own transactions)
                 released_count = 0
                 for rid in orphaned_ids:
                     try:
@@ -1913,6 +1921,13 @@ class EVRebalancer:
     IF and HOW MUCH to rebalance. The actual execution is delegated to
     the JobManager which manages sling background jobs.
 
+    Thread Safety (I-13, I-14, S-9):
+    The rebalance cycle runs single-threaded on a timer. Candidate evaluation,
+    EV calculation, and sling job dispatch all happen within one timer callback.
+    No locking is needed for cycle-local state because only one cycle runs at
+    a time. The _pending dict is the only shared state (accessed by async job
+    callbacks) and is protected by _pending_lock.
+
     NNLB Integration:
     When cl-hive is available, the rebalancer adjusts its EV threshold
     based on our health tier. Struggling nodes accept lower EV to recover
@@ -2271,7 +2286,7 @@ class EVRebalancer:
                 fail_count, last_fail = self.database.get_failure_count(dest_id)
                 if fail_count >= 10:
                     now = int(time.time())
-                    futility_cooldown = 172800  # 48 hours in seconds
+                    futility_cooldown = getattr(cfg, 'futility_cooldown_hours', 48) * 3600
                     if (now - last_fail) < futility_cooldown:
                         self.plugin.log(
                             f"FUTILITY BREAKER: Skipping {dest_id[:12]}... - {fail_count} consecutive failures, "

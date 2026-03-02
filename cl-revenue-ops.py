@@ -513,6 +513,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-futility-cooldown-hours',
+    default='48',
+    description='Hours before retrying a channel after 10+ consecutive rebalance failures (default: 48)'
+)
+
+plugin.add_option(
     name='revenue-ops-flow-window-days',
     default='7',
     description='Number of days to analyze for flow calculation (default: 7)'
@@ -988,6 +994,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
+        futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         clboss_enabled=options['revenue-ops-clboss-enabled'].lower() == 'true',
         rebalancer_plugin=options['revenue-ops-rebalancer'],
