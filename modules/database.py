@@ -1027,8 +1027,11 @@ class Database:
                     """, (peer_id, tags, ignored_at))
                     migrated_count += 1
 
-            # Rename old table to backup (preserve data for safety)
-            if migrated_count > 0:
+            # Rename old table to backup (preserve data for safety).
+            # Always rename when rows were processed, even if all peers already had
+            # policies (migrated_count == 0). Otherwise the non-empty table persists
+            # and triggers re-migration on every startup.
+            if migrated_count > 0 or len(rows) > 0:
                 conn.execute("ALTER TABLE ignored_peers RENAME TO _backup_ignored_peers")
             conn.execute("COMMIT")
         except Exception:
@@ -2804,16 +2807,17 @@ class Database:
         # Get rebalances to these channels
         # Note: actual_fee_sats is stored in sats, convert to msat for fee_paid_msat
         rows = conn.execute(f"""
-            SELECT 
+            SELECT
                 to_channel,
                 amount_sats,
+                max_fee_sats,
                 COALESCE(actual_fee_sats, 0) * 1000 as fee_paid_msat,
                 amount_sats * 1000 as amount_msat,
                 status,
                 timestamp
-            FROM rebalance_history 
+            FROM rebalance_history
             WHERE to_channel IN ({placeholders})
-            ORDER BY timestamp DESC 
+            ORDER BY timestamp DESC
             LIMIT ?
         """, (*channel_ids, limit)).fetchall()
         
@@ -5235,10 +5239,14 @@ class Database:
         return row['max_v'] or 0
 
     def get_all_config_overrides(self) -> Dict[str, str]:
-        """Get all config overrides as a dictionary."""
+        """Get all config overrides as a dictionary.
+
+        Filters out internal sentinel rows (keys starting with '_') to prevent
+        them from leaking into user-facing displays or config application.
+        """
         conn = self._get_connection()
         rows = conn.execute("SELECT key, value FROM config_overrides").fetchall()
-        return {row['key']: row['value'] for row in rows}
+        return {row['key']: row['value'] for row in rows if not row['key'].startswith('_')}
 
     def get_config_version(self) -> int:
         """Get current config version (max version in table)."""

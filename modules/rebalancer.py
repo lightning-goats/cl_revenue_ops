@@ -124,6 +124,9 @@ class RebalanceCandidate:
     # Direction: "pull" fills to_channel from sources; "push" drains to_channel to destinations
     direction: str = "pull"
 
+    # I-17 FIX: Track whether this rebalance was routed via fleet channels
+    via_fleet: bool = False
+
     # Multi-source peer IDs aligned with source_candidates (best-first).
     # Optional for backward compatibility; when absent, callers may fall back to primary_source_peer_id.
     source_candidate_peer_ids: List[str] = field(default_factory=list)
@@ -170,7 +173,9 @@ class RebalanceCandidate:
             "hot_channel_protection_score": round(self.hot_channel_protection_score, 4),
             "dynamic_budget_override_sats": self.dynamic_budget_override_sats,
             "dynamic_channel_profit_budget_sats": self.dynamic_channel_profit_budget_sats,
-            "recommended_cooldown_hours": round(self.recommended_cooldown_hours, 2) if self.recommended_cooldown_hours else 0.0
+            "recommended_cooldown_hours": round(self.recommended_cooldown_hours, 2) if self.recommended_cooldown_hours else 0.0,
+            "expected_fee_sats": self.expected_fee_sats,
+            "via_fleet": self.via_fleet
         }
 
 
@@ -386,14 +391,23 @@ class JobManager:
         return self._normalize_scid(scid)
     
     def _get_channel_local_balance(self, channel_id: str) -> int:
-        """Get current local balance of a channel in sats."""
+        """Get current local balance of a channel in sats.
+
+        Only returns balance for channels in CHANNELD_NORMAL state (or if state
+        is not reported). Returns 0 for channels in closing/non-normal states.
+        """
         try:
             listfunds = self.plugin.rpc.listfunds()
             normalized = self._normalize_scid(channel_id)
-            
+
             for channel in listfunds.get("channels", []):
                 scid = channel.get("short_channel_id", "")
                 if self._normalize_scid(scid) == normalized:
+                    # I-8 FIX: Filter out non-normal channels to prevent false
+                    # positive success detection during channel closure
+                    ch_state = channel.get("state")
+                    if ch_state and ch_state != "CHANNELD_NORMAL":
+                        return 0
                     # M-22: Use _parse_msat for consistent Millisatoshi handling
                     our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
                     return our_amount_msat // 1000
@@ -442,8 +456,16 @@ class JobManager:
         # Calculate chunk size (amount per rebalance attempt)
         chunk_size = min(candidate.amount_sats, self.chunk_size_sats)
 
-        # ZERO-TOLERANCE: Enforce sats-budget-derived fee cap on the execution unit (chunk).
-        budget_ppm = (candidate.max_budget_msat * 1_000_000) // (chunk_size * 1000) if chunk_size > 0 else 0
+        # I-4 FIX: Scale budget proportionally to chunk size. The EV analysis computed
+        # max_budget_sats for the full candidate.amount_sats. If we chunk into smaller
+        # pieces, the per-chunk budget must be proportionally smaller to maintain the
+        # same effective PPM cap. Without this, the PPM cap is inflated by the ratio
+        # of full_amount / chunk_size, allowing sling to overpay on routes.
+        if chunk_size > 0 and candidate.amount_sats > 0:
+            chunk_budget_msat = (candidate.max_budget_msat * chunk_size) // candidate.amount_sats
+            budget_ppm = (chunk_budget_msat * 1_000_000) // (chunk_size * 1000) if chunk_size > 0 else 0
+        else:
+            budget_ppm = 0
         maxppm = max(1, min(candidate.max_fee_ppm, budget_ppm)) if budget_ppm > 0 else 0
         if maxppm <= 0:
             return {"success": False, "error": "Budget too small to allow any routing fee (maxppm=0)"}
@@ -630,12 +652,14 @@ class JobManager:
         if not job or job is None:  # None = sentinel from start_job
             return False
 
+        sling_stopped = False
         try:
             # First stop the job gracefully
             try:
                 self.plugin.rpc.call("sling-stop", {"scid": job.scid})
+                sling_stopped = True
             except RpcError:
-                pass  # May already be stopped
+                sling_stopped = True  # RpcError means sling responded (job may already be stopped)
 
             # Then delete it to prevent restart
             try:
@@ -650,6 +674,20 @@ class JobManager:
 
         except Exception as e:
             self.plugin.log(f"Error stopping job {job.scid}: {e}", level='warn')
+            # C-3 FIX: If sling is unreachable (timeout, connection error), the job
+            # may still be running and spending fees. Re-add to _active_jobs so
+            # monitor_jobs continues tracking it. RpcError is fine (sling responded),
+            # but other exceptions (timeout, connection) mean we couldn't confirm the stop.
+            if not sling_stopped:
+                with self._jobs_lock:
+                    if normalized not in self._active_jobs:
+                        self._active_jobs[normalized] = job
+                        self.plugin.log(
+                            f"Re-added job {job.scid} to tracking (sling unreachable, "
+                            f"job may still be running)",
+                            level='warn'
+                        )
+                return False
 
         # Report updated rebalancing activity to fleet
         self._report_rebalancing_activity()
@@ -695,7 +733,24 @@ class JobManager:
             self._last_exclusion_sync = now
 
         # M-1: Snapshot active jobs under lock for thread-safe iteration
+        # C-2 FIX: Also clean up stale sentinel entries (None values) from stuck start_job calls.
+        # If a sling RPC hangs during start_job, the sentinel blocks the slot indefinitely.
+        sentinel_timeout = 300  # 5 minutes
         with self._jobs_lock:
+            stale_sentinels = [
+                k for k, v in self._active_jobs.items()
+                if v is None
+            ]
+            # We can't track sentinel creation time (it's just None), so clean up
+            # any sentinels found during monitoring — if start_job is still working,
+            # it will re-add the job. This is safe because start_job checks for
+            # existing entries before inserting.
+            for k in stale_sentinels:
+                del self._active_jobs[k]
+                self.plugin.log(
+                    f"Cleaned up stale sentinel for {k} (stuck start_job?)",
+                    level='info'
+                )
             jobs_snapshot = {k: v for k, v in self._active_jobs.items() if v is not None}
 
         if not jobs_snapshot:
@@ -722,8 +777,20 @@ class JobManager:
             
             # Check current channel balance for progress
             current_balance = local_balances.get(job.scid_normalized)
+
+            # C-4 FIX: Detect channel closure (not in CHANNELD_NORMAL state).
+            # _get_local_balances_map only includes CHANNELD_NORMAL channels,
+            # so a missing key means the channel is closing/closed.
             if current_balance is None:
-                current_balance = self._get_channel_local_balance(job.scid_normalized)
+                self.plugin.log(
+                    f"Job {job.scid}: channel no longer in CHANNELD_NORMAL state, "
+                    f"terminating job immediately",
+                    level='info'
+                )
+                self._handle_job_failure(job, {})
+                summary["failed"] += 1
+                continue
+
             # For pull: positive delta = liquidity gained (success)
             # For push: negative delta = liquidity drained (success), so flip sign
             raw_delta = current_balance - job.initial_local_sats
@@ -789,13 +856,24 @@ class JobManager:
         return summary
 
     def _get_local_balances_map(self) -> Dict[str, int]:
-        """Return a map of normalized scid -> local balance sats (single listfunds call)."""
+        """Return a map of normalized scid -> local balance sats (single listfunds call).
+
+        Only includes channels in CHANNELD_NORMAL state. Channels that are closing
+        or in other non-normal states are excluded so that monitor_jobs can detect
+        channel closures (missing key = channel no longer normal).
+        """
         balances: Dict[str, int] = {}
         try:
             listfunds = self.plugin.rpc.listfunds()
             for channel in listfunds.get("channels", []):
                 scid = channel.get("short_channel_id", "")
                 if not scid:
+                    continue
+                # C-4 FIX: Exclude channels in known non-normal states.
+                # This allows monitor_jobs to detect channel closures via missing keys.
+                # If state is absent (old CLN or test mock), include the channel.
+                ch_state = channel.get("state")
+                if ch_state and ch_state != "CHANNELD_NORMAL":
                     continue
                 # M-22b: Use _parse_msat for consistent Millisatoshi handling
                 our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
@@ -1237,13 +1315,16 @@ class JobManager:
         with self._jobs_lock:
             jobs_snapshot = [(k, v) for k, v in self._active_jobs.items() if v is not None]
         for scid, job in jobs_snapshot:
-            # Release budget reservation before stopping (prevents orphaned reservations on shutdown)
+            # I-10 FIX: Stop the job FIRST, then release budget. Releasing before
+            # stop means if sling-stop fails, the budget is freed but the job
+            # continues spending. By stopping first, we at least attempt to halt
+            # the spend before releasing the reservation.
+            if self.stop_job(scid, reason=reason):
+                count += 1
             try:
                 self.database.release_budget_reservation(str(job.rebalance_id))
             except Exception as e:
                 self.plugin.log(f"Failed to release budget reservation during stop_all: {e}", level='debug')
-            if self.stop_job(scid, reason=reason):
-                count += 1
         return count
     
     def cleanup_orphans(self) -> int:
@@ -2860,8 +2941,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             sharpe_penalty_factor = 1.0
 
         turnover_weight = min(1.0, source_turnover_rate * 7)
+        # I-2 FIX: Use source channel's own utilization probability for opportunity cost,
+        # not the destination's expected_utilization. These are independent probabilistic events.
+        source_utilization = max(0.05, min(1.0, source_turnover_rate * cooldown_days))
         expected_source_loss = int(
-            (rebalance_amount * expected_utilization * source_fee_ppm * turnover_weight * sharpe_penalty_factor) // 1_000_000
+            (rebalance_amount * source_utilization * source_fee_ppm * turnover_weight * sharpe_penalty_factor) // 1_000_000
         )
 
         # =================================================================
@@ -2871,6 +2955,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # (the worst-case ceiling). max_budget_sats is still passed to Sling as the
         # hard cap, but EV should reflect the likely cost, not the worst case.
         # =================================================================
+        # I-3 FIX: Cap budget ceiling at utilization-adjusted income for non-hive peers.
+        # Without this, Sling can spend up to the full-spread budget even though
+        # utilization < 1.0 means we won't earn the full spread before next rebalance.
+        if not is_hive_destination and expected_income > 0:
+            max_budget_sats = min(max_budget_sats, max(1, expected_income))
+            max_budget_msat = max_budget_sats * 1000
+
         expected_fee_sats = self._estimate_expected_fee_sats(dest_peer_id, rebalance_amount)
         # Never let expected fee exceed the max budget (it's a ceiling)
         expected_fee_sats = min(expected_fee_sats, max_budget_sats)
@@ -3126,7 +3217,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             score = max(score, 0.60)
 
         profit_budget_pct = float(getattr(cfg, 'hot_channel_protection_profit_budget_pct', 0.75) or 0.75)
-        channel_profit_budget_sats = int(max(0.0, daily_contrib_est) * max(0.0, min(1.0, profit_budget_pct)))
+        # I-12 FIX: Use ceiling instead of floor to prevent truncation to 0 for small
+        # daily_contrib_est values (e.g., 0.5 sats/day * 0.75 = 0.375 -> was 0, now 1)
+        channel_profit_budget_sats = max(1, int(math.ceil(max(0.0, daily_contrib_est) * max(0.0, min(1.0, profit_budget_pct)))))
 
         max_chunk_mult = max(1.0, float(getattr(cfg, 'hot_channel_protection_max_chunk_multiplier', 4.0) or 4.0))
         chunk_multiplier = 1.0 + ((max_chunk_mult - 1.0) * score)
@@ -3197,8 +3290,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         expected_fee_sats = self._estimate_expected_fee_sats(src_peer_id, amount)
         expected_fee_sats = min(expected_fee_sats, max_budget)
 
-        # Calculate expected profit using the expected fee, NOT max_budget
-        expected_profit = int(spread * amount / 1_000_000) - expected_fee_sats
+        # I-1 FIX: Apply utilization discount to push EV (same as pull EV).
+        # Push targets are channels with 3+ source failures, which may have low demand.
+        src_turnover = self._calculate_turnover_rate(src_peer_id, capacity)
+        cooldown_days = max(0.01, getattr(cfg, 'rebalance_cooldown_hours', 24) / 24.0)
+        expected_utilization = max(0.05, min(1.0, src_turnover * cooldown_days))
+
+        # Calculate expected profit with utilization discount
+        expected_income = int(spread * amount * expected_utilization / 1_000_000)
+        expected_profit = expected_income - expected_fee_sats
 
         # Resolve peer IDs for the destination (source_candidates in push semantics)
         resolved_peer_ids = dest_peer_ids or []
@@ -3242,7 +3342,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         3. Historical data (low) - Use with buffer
         4. Last hop fee + buffer - Gossip-based estimate
         5. Route estimation - Ask CLN for a route
-        6. Default fallback - 1000 PPM
+        6. Default fallback - configured inbound_fee_estimate_ppm
 
         Returns:
             Estimated inbound fee in PPM
@@ -3313,21 +3413,27 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 )
                 return estimate
 
-        # --- NEW: Cost-Curve from Failures ---
+        # --- Cost-Curve from Failures ---
         # If we have recent failures, the true cost floor is higher than the failed attempts
         failed_floor = 0
         try:
-            # Look at last 24h of failures to this peer
-            recent_fails = self.database.get_recent_rebalances(limit=20)
+            # Look at recent failures to this peer (joins through channel_states for SCID→peer mapping)
+            recent_peer_rebalances = self.database.get_rebalance_history_by_peer(peer_id, limit=20)
             peer_fails = [
-                f for f in recent_fails
+                f for f in recent_peer_rebalances
                 if f.get('status') == 'failed'
-                and f.get('to_channel', '').endswith(peer_id)
             ]
             if peer_fails:
-                # Find the highest max_fee_sats that resulted in a routing failure
-                highest_failed_sats = max(f.get('max_fee_sats', 0) for f in peer_fails)
-                failed_floor = (highest_failed_sats * 1_000_000) // max(1, amount_msat // 1000)
+                # Find the highest PPM that resulted in a routing failure.
+                # Use each record's own amount_sats for accurate PPM conversion.
+                failed_ppms = []
+                for f in peer_fails:
+                    f_fee = f.get('max_fee_sats', 0) or 0
+                    f_amt = f.get('amount_sats', 0) or 0
+                    if f_fee > 0 and f_amt > 0:
+                        failed_ppms.append((f_fee * 1_000_000) // f_amt)
+                if failed_ppms:
+                    failed_floor = max(failed_ppms)
         except Exception:
             pass
 
@@ -3952,6 +4058,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                             candidate.max_budget_sats = min(candidate.max_budget_sats, max(1, candidate.amount_sats * 50 // 1_000_000))
                             candidate.max_budget_msat = candidate.max_budget_sats * 1000
 
+                        # I-17 FIX: Mark candidate as fleet-routed for hive outcome reporting
+                        candidate.via_fleet = True
+
                         self.plugin.log(
                             f"FLEET_PATH: Injected {len(fleet_scids)} fleet SCIDs as source candidates "
                             f"for {candidate.to_channel[:12]}..., max_fee_ppm capped to {candidate.max_fee_ppm}",
@@ -4083,10 +4192,16 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 if hot_override_limit > 0:
                     # Candidate-specific protection budget can exceed the standard daily cap.
                     protected_limit = max(0, hot_override_limit - ext_spent - ext_reserved)
+                    # I-11 FIX: Cap aggregate hot channel spend at 2x the configured daily budget.
+                    # Without this, multiple hot channels can each independently override the budget,
+                    # leading to total spend of 3-5x the configured limit.
+                    max_hot_budget = max(effective_budget * 2, effective_budget)
+                    protected_limit = min(protected_limit, max(0, max_hot_budget - ext_spent - ext_reserved))
                     if protected_limit > rebalance_budget_limit:
                         self.plugin.log(
-                            f"HOT CHANNEL PROTECTION: Using protected rebalance budget limit {protected_limit} sats \
-(global remaining {rebalance_budget_limit}, channel_profit_budget={hot_override_limit}) for {db_to_channel}",
+                            f"HOT CHANNEL PROTECTION: Using protected rebalance budget limit {protected_limit} sats "
+                            f"(global remaining {rebalance_budget_limit}, channel_profit_budget={hot_override_limit}, "
+                            f"aggregate cap={max_hot_budget}) for {db_to_channel}",
                             level='info'
                         )
                         rebalance_budget_limit = protected_limit
