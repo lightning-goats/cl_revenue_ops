@@ -1324,13 +1324,24 @@ class FlowAnalyzer:
             elif flow_ratio < self.config.sink_threshold:
                 state = ChannelState.SINK
             else:
-                turnover = daily_volume / capacity if capacity > 0 else 0.0
-                if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-                    state = ChannelState.BALANCED_ACTIVE
+                # EMA net flow is small relative to capacity — use balance position
+                # as a structural signal. A channel with most liquidity on one side
+                # is clearly a source or sink regardless of EMA magnitude.
+                # (EMA flow_ratio for typical channels is 0.01-0.10 — too small
+                # to exceed ±0.5 thresholds, so balance position is more reliable.)
+                outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
+                if outbound_ratio < 0.25:
+                    state = ChannelState.SOURCE
+                elif outbound_ratio > 0.75:
+                    state = ChannelState.SINK
                 else:
-                    state = ChannelState.BALANCED
+                    turnover = daily_volume / capacity if capacity > 0 else 0.0
+                    if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
+                        state = ChannelState.BALANCED_ACTIVE
+                    else:
+                        state = ChannelState.BALANCED
         else:
-            # FALLBACK: Infer from current balance
+            # FALLBACK: Infer from current balance (no flow data at all)
             outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
 
             if outbound_ratio < 0.30:

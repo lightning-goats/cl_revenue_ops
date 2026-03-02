@@ -442,6 +442,98 @@ class TestFix4BalancedActive:
 
         assert metrics.state == ChannelState.BALANCED_ACTIVE
 
+    def test_ema_balanced_but_depleted_classified_as_source(self):
+        """When EMA ratio is small but balance is heavily depleted, classify as SOURCE."""
+        from modules.flow_analysis import FlowAnalyzer, ChannelState
+
+        plugin = MagicMock()
+        config = MagicMock()
+        config.source_threshold = 0.5
+        config.sink_threshold = -0.5
+        config.htlc_congestion_threshold = 0.8
+        config.flow_window_days = 7
+        db = MagicMock()
+        analyzer = FlowAnalyzer(plugin, config, db)
+
+        # EMA ratio is small (0.03) — below ±0.5 threshold
+        # But channel is heavily depleted (15% outbound = being drained)
+        capacity = 10_000_000
+        metrics = analyzer._calculate_metrics(
+            channel_id="100x1x0",
+            peer_id="peer1",
+            sats_in=200_000,
+            sats_out=500_000,
+            capacity=capacity,
+            ema_in=200_000 / 7,
+            ema_out=500_000 / 7,
+            our_balance=1_500_000,  # 15% of capacity
+            forward_count=50,
+            last_forward_ts=int(time.time()),
+        )
+
+        assert metrics.state == ChannelState.SOURCE
+
+    def test_ema_balanced_but_full_classified_as_sink(self):
+        """When EMA ratio is small but balance is heavily full, classify as SINK."""
+        from modules.flow_analysis import FlowAnalyzer, ChannelState
+
+        plugin = MagicMock()
+        config = MagicMock()
+        config.source_threshold = 0.5
+        config.sink_threshold = -0.5
+        config.htlc_congestion_threshold = 0.8
+        config.flow_window_days = 7
+        db = MagicMock()
+        analyzer = FlowAnalyzer(plugin, config, db)
+
+        # EMA ratio is small (-0.03) — within ±0.5 threshold
+        # But channel is heavily full (85% outbound = receiving)
+        capacity = 10_000_000
+        metrics = analyzer._calculate_metrics(
+            channel_id="100x1x0",
+            peer_id="peer1",
+            sats_in=500_000,
+            sats_out=200_000,
+            capacity=capacity,
+            ema_in=500_000 / 7,
+            ema_out=200_000 / 7,
+            our_balance=8_500_000,  # 85% of capacity
+            forward_count=50,
+            last_forward_ts=int(time.time()),
+        )
+
+        assert metrics.state == ChannelState.SINK
+
+    def test_ema_balanced_and_balanced_position_stays_balanced(self):
+        """When EMA ratio and balance position are both moderate, stay BALANCED."""
+        from modules.flow_analysis import FlowAnalyzer, ChannelState
+
+        plugin = MagicMock()
+        config = MagicMock()
+        config.source_threshold = 0.5
+        config.sink_threshold = -0.5
+        config.htlc_congestion_threshold = 0.8
+        config.flow_window_days = 7
+        db = MagicMock()
+        analyzer = FlowAnalyzer(plugin, config, db)
+
+        # EMA ratio small, balance at 50% — genuinely balanced
+        capacity = 10_000_000
+        metrics = analyzer._calculate_metrics(
+            channel_id="100x1x0",
+            peer_id="peer1",
+            sats_in=100_000,
+            sats_out=100_000,
+            capacity=capacity,
+            ema_in=100_000 / 7,
+            ema_out=100_000 / 7,
+            our_balance=5_000_000,  # 50% of capacity
+            forward_count=5,
+            last_forward_ts=int(time.time()),
+        )
+
+        assert metrics.state == ChannelState.BALANCED
+
 
 # =========================================================================
 # Fix 5: Pending HTLC Liquidity
