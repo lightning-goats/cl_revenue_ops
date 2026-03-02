@@ -716,10 +716,12 @@ class ChannelProfitabilityAnalyzer:
         if not profitability:
             return 1.0
         
-        # Budget based on ROI - pay up to what the channel has proven to earn
+        # AUDIT FIX I-3: Use marginal_roi (not total ROI) to avoid sunk cost fallacy.
+        # A channel with a high opening cost but good operational returns should
+        # still get full rebalance budget, matching get_fee_multiplier philosophy.
         if profitability.classification == ProfitabilityClass.PROFITABLE:
             # Pay more for proven earners - up to 1.5x normal budget
-            return min(1.5, 1.0 + (profitability.roi_percent / 100))
+            return min(1.5, 1.0 + max(0.0, profitability.marginal_roi))
         elif profitability.classification == ProfitabilityClass.BREAK_EVEN:
             return 1.0
         elif profitability.classification == ProfitabilityClass.UNDERWATER:
@@ -1986,8 +1988,10 @@ class ChannelProfitabilityAnalyzer:
             if recent_spend > 0 and recent_spend < rebalance_costs:
                 historical_costs = rebalance_costs - recent_spend
                 effective_rebalance_costs = historical_costs + int(recent_spend / sr)
-            else:
-                effective_rebalance_costs = int(rebalance_costs / sr)
+            # AUDIT FIX I-4: Don't inflate all-time costs by recent success rate.
+            # The fallback previously did int(rebalance_costs / sr) which could
+            # 10x historical costs from a 30-day bad patch. Use uninflated costs
+            # when we can't isolate the recent spending portion.
 
         return ChannelCosts(
             channel_id=channel_id,

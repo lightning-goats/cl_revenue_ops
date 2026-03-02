@@ -1360,7 +1360,10 @@ class Database:
                 ))
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             raise
 
     def get_portfolio_metrics(self, channel_id: str) -> Optional[Dict[str, Any]]:
@@ -2507,22 +2510,36 @@ class Database:
         """
         conn = self._get_connection()
 
-        # First get stats on what we're clearing
-        stats = conn.execute("""
-            SELECT COUNT(*) as count, COALESCE(SUM(reserved_sats), 0) as total_sats
-            FROM budget_reservations
-            WHERE status = 'active'
-        """).fetchone()
+        # AUDIT FIX I-1: Wrap in BEGIN IMMEDIATE to prevent TOCTOU race.
+        # Without this, a new reservation created between the read and update
+        # would be silently released.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
 
-        count = stats['count'] if stats else 0
-        total_sats = stats['total_sats'] if stats else 0
+            # First get stats on what we're clearing
+            stats = conn.execute("""
+                SELECT COUNT(*) as count, COALESCE(SUM(reserved_sats), 0) as total_sats
+                FROM budget_reservations
+                WHERE status = 'active'
+            """).fetchone()
 
-        # Release all active reservations
-        conn.execute("""
-            UPDATE budget_reservations
-            SET status = 'released'
-            WHERE status = 'active'
-        """)
+            count = stats['count'] if stats else 0
+            total_sats = stats['total_sats'] if stats else 0
+
+            # Release all active reservations
+            conn.execute("""
+                UPDATE budget_reservations
+                SET status = 'released'
+                WHERE status = 'active'
+            """)
+
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
         if count > 0:
             self.plugin.log(
@@ -2768,17 +2785,29 @@ class Database:
         """
         conn = self._get_connection()
 
-        spent_row = conn.execute("""
-            SELECT COALESCE(SUM(cost_sats), 0) as spent
-            FROM rebalance_costs
-            WHERE timestamp >= ?
-        """, (since_timestamp,)).fetchone()
+        # AUDIT FIX C-1: Wrap in transaction for consistent snapshot.
+        # Without this, a rebalance completing between the two reads
+        # could move sats from reserved to spent, skewing the total.
+        try:
+            conn.execute("BEGIN")
+            spent_row = conn.execute("""
+                SELECT COALESCE(SUM(cost_sats), 0) as spent
+                FROM rebalance_costs
+                WHERE timestamp >= ?
+            """, (since_timestamp,)).fetchone()
 
-        reserved_row = conn.execute("""
-            SELECT COALESCE(SUM(reserved_sats), 0) as reserved
-            FROM budget_reservations
-            WHERE status = 'active' AND reserved_at >= ?
-        """, (since_timestamp,)).fetchone()
+            reserved_row = conn.execute("""
+                SELECT COALESCE(SUM(reserved_sats), 0) as reserved
+                FROM budget_reservations
+                WHERE status = 'active' AND reserved_at >= ?
+            """, (since_timestamp,)).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
         spent = spent_row['spent'] if spent_row else 0
         reserved = reserved_row['reserved'] if reserved_row else 0
