@@ -1067,11 +1067,19 @@ class FlowAnalyzer:
                     elif kalman_ratio < self.config.sink_threshold:
                         metrics.state = ChannelState.SINK
                     else:
-                        turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
-                        if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-                            metrics.state = ChannelState.BALANCED_ACTIVE
+                        # Kalman ratio is small — use balance position as
+                        # structural signal (matching EMA fallback logic).
+                        outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
+                        if outbound_ratio < 0.25:
+                            metrics.state = ChannelState.SOURCE
+                        elif outbound_ratio > 0.75:
+                            metrics.state = ChannelState.SINK
                         else:
-                            metrics.state = ChannelState.BALANCED
+                            turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
+                            if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
+                                metrics.state = ChannelState.BALANCED_ACTIVE
+                            else:
+                                metrics.state = ChannelState.BALANCED
 
             # Diagnostic: log first 3 channels to trace classification
             if len(results) < 3:
@@ -1250,11 +1258,19 @@ class FlowAnalyzer:
                 elif kalman_ratio < self.config.sink_threshold:
                     metrics.state = ChannelState.SINK
                 else:
-                    turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
-                    if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-                        metrics.state = ChannelState.BALANCED_ACTIVE
+                    # Kalman ratio is small — use balance position as
+                    # structural signal (matching EMA fallback logic).
+                    outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
+                    if outbound_ratio < 0.25:
+                        metrics.state = ChannelState.SOURCE
+                    elif outbound_ratio > 0.75:
+                        metrics.state = ChannelState.SINK
                     else:
-                        metrics.state = ChannelState.BALANCED
+                        turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
+                        if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
+                            metrics.state = ChannelState.BALANCED_ACTIVE
+                        else:
+                            metrics.state = ChannelState.BALANCED
 
         # I-9: Skip DB persistence when called during bulk analyze_all_channels(),
         # which does its own DB writes. This avoids redundant writes and potential
