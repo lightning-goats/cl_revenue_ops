@@ -4682,12 +4682,19 @@ class HillClimbingFeeController:
                     self._save_thompson_aimd_state(channel_id, ts_state)
                     woken += 1
 
-            # Also wake any channels in database not in memory
+            # Also wake any channels in database not yet in memory.
+            # Skip closed channels: only wake entries that match an
+            # in-memory state (HC or Thompson) — those are the channels
+            # that have been seen in a recent adjust_all_fees cycle.
+            active_ids = set(self._hill_climb_states.keys()) | set(self._thompson_aimd_states.keys())
             try:
                 db_states = self.database.get_all_fee_strategy_states()
                 for db_state in db_states:
                     channel_id = db_state.get("channel_id", "")
                     if not channel_id:
+                        continue
+                    # Skip channels not in any active in-memory state
+                    if channel_id not in active_ids:
                         continue
                     is_sleeping = db_state.get("is_sleeping", 0)
                     db_last_update = db_state.get("last_update", 0)
