@@ -1927,11 +1927,11 @@ class TestAuditTurn2ManualRebalanceZeroFee:
 
 
 class TestAuditTurn2HotChannelBudgetFilter:
-    """P1-2 regression: Budget exhaustion + hot-channel should filter non-hot candidates."""
+    """Budget enforcement: daily budget is a hard cap, never exceeded."""
 
-    def test_budget_exceeded_hot_only_filters_non_hot(self, mock_plugin, mock_database):
+    def test_budget_exceeded_blocks_even_with_hot_channel_protection(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.rebalancer import EVRebalancer, RebalanceCandidate
+        from modules.rebalancer import EVRebalancer
 
         cfg = Config(
             daily_budget_sats=100,
@@ -1948,12 +1948,32 @@ class TestAuditTurn2HotChannelBudgetFilter:
             "channels": [],
         }
 
-        # _check_capital_controls should return True (hot-only mode)
+        # _check_capital_controls must return False — daily budget is a hard cap
         result = r._check_capital_controls(cfg)
-        assert result is True
-        assert r._budget_hot_channel_only is True
+        assert result is False
 
-    def test_budget_ok_clears_hot_only_flag(self, mock_plugin, mock_database):
+    def test_budget_exceeded_blocks_without_hot_channel_protection(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            daily_budget_sats=100,
+            enable_proportional_budget=False,
+            hot_channel_protection_enabled=False,
+        )
+        clboss = MagicMock()
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+
+        mock_database.get_total_rebalance_fees = MagicMock(return_value=200)
+        mock_plugin.rpc.listfunds.return_value = {
+            "outputs": [{"status": "confirmed", "amount_msat": 10_000_000_000}],
+            "channels": [],
+        }
+
+        result = r._check_capital_controls(cfg)
+        assert result is False
+
+    def test_budget_ok_allows_rebalancing(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
@@ -1972,7 +1992,6 @@ class TestAuditTurn2HotChannelBudgetFilter:
 
         result = r._check_capital_controls(cfg)
         assert result is True
-        assert r._budget_hot_channel_only is False
 
 
 class TestVolumeBasedSizingFix:

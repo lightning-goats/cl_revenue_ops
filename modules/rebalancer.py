@@ -4218,10 +4218,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 if hot_override_limit > 0:
                     # Candidate-specific protection budget can exceed the standard daily cap.
                     protected_limit = max(0, hot_override_limit - ext_spent - ext_reserved)
-                    # I-11 FIX: Cap aggregate hot channel spend at 2x the configured daily budget.
-                    # Without this, multiple hot channels can each independently override the budget,
-                    # leading to total spend of 3-5x the configured limit.
-                    max_hot_budget = max(effective_budget * 2, effective_budget)
+                    # Cap aggregate hot channel spend at the configured daily budget.
+                    # Hot channel protection provides per-channel priority within the budget,
+                    # but never allows total spend to exceed the effective daily budget.
+                    max_hot_budget = effective_budget
                     protected_limit = min(protected_limit, max(0, max_hot_budget - ext_spent - ext_reserved))
                     if protected_limit > rebalance_budget_limit:
                         self.plugin.log(
@@ -4634,17 +4634,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)
             total_liquidity_committed = fees_spent_24h + ext_spent + ext_reserved
             if total_liquidity_committed >= effective_budget:
-                if getattr(cfg, 'hot_channel_protection_enabled', False):
-                    self.plugin.log(
-                        f"CAPITAL CONTROL: Unified liquidity budget exceeded "
-                        f"(rebalance_fees={fees_spent_24h} + external_spent={ext_spent} + "
-                        f"external_reserved={ext_reserved} = {total_liquidity_committed} >= {effective_budget}) "
-                        f"but hot-channel protection is enabled; continuing candidate scan for protected channels only",
-                        level='warn'
-                    )
-                    # Signal that only hot-channel-protected candidates should proceed
-                    self._budget_hot_channel_only = True
-                    return True
                 self.plugin.log(
                     f"CAPITAL CONTROL: Unified liquidity budget exceeded "
                     f"(rebalance_fees={fees_spent_24h} + external_spent={ext_spent} + "
