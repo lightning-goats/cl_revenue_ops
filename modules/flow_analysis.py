@@ -1081,20 +1081,6 @@ class FlowAnalyzer:
                             else:
                                 metrics.state = ChannelState.BALANCED
 
-            # Diagnostic: log first 3 channels to trace classification
-            if len(results) < 3:
-                ob_pct = (our_balance / capacity * 100) if capacity > 0 else -1
-                self.plugin.log(
-                    f"FLOW_DIAG {channel_id}: state={metrics.state.value} "
-                    f"ema_ratio={metrics.flow_ratio:.4f} "
-                    f"has_flow={total_in > 0 or total_out > 0} "
-                    f"total_in={total_in} total_out={total_out} "
-                    f"our_bal={our_balance} cap={capacity} ob_pct={ob_pct:.1f}% "
-                    f"kalman_unc={metrics.kalman_uncertainty:.3f} "
-                    f"kalman_obs={getattr(self._get_kalman_filter(channel_id).state, 'observation_count', '?')}",
-                    level='info'
-                )
-
             results[channel_id] = metrics
 
             # Store in database (with v2.0 and v2.1 fields)
