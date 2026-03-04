@@ -4632,15 +4632,23 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             ext_costs = self._get_external_liquidity_costs()
             ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
             ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)
-            total_liquidity_committed = fees_spent_24h + ext_spent + ext_reserved
-            if total_liquidity_committed >= effective_budget:
+            # Gate on actual spending only — each subsystem (Boltz, rebalancer)
+            # enforces its own reservation limits independently.
+            total_actual_spent = fees_spent_24h + ext_spent
+            if total_actual_spent >= effective_budget:
                 self.plugin.log(
                     f"CAPITAL CONTROL: Unified liquidity budget exceeded "
-                    f"(rebalance_fees={fees_spent_24h} + external_spent={ext_spent} + "
-                    f"external_reserved={ext_reserved} = {total_liquidity_committed} >= {effective_budget})",
+                    f"(rebalance_fees={fees_spent_24h} + external_spent={ext_spent} "
+                    f"= {total_actual_spent} >= {effective_budget})",
                     level='warn'
                 )
                 return False
+            if ext_reserved > 0:
+                self.plugin.log(
+                    f"CAPITAL CONTROL: External reservations={ext_reserved} sats pending "
+                    f"(actual_spent={total_actual_spent}/{effective_budget})",
+                    level='debug'
+                )
 
             return True
         except Exception as e:
