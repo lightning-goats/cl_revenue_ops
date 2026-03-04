@@ -1381,12 +1381,21 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         try:
             tlv = profitability_analyzer.get_tlv().get("tlv_sats", 0)
             pnl = profitability_analyzer.get_pnl_summary(window_days=YIELD_REPORT_WINDOW_DAYS)
+            # H3 FIX: Include Boltz costs in yield report for settlement visibility
+            boltz_cost_sats = 0
+            if boltz_manager is not None:
+                try:
+                    boltz_comps = boltz_manager.get_boltz_cost_components(window_hours=YIELD_REPORT_WINDOW_DAYS * 24)
+                    boltz_cost_sats = int(boltz_comps.get("spent_24h_sats", 0) or 0)
+                except Exception:
+                    pass
             hive_bridge.report_yield_and_costs(
                 tlv_sats=int(tlv or 0),
                 operating_costs_sats=int(pnl.get("opex_sats", 0) or 0),
                 routing_revenue_sats=int(pnl.get("gross_revenue_sats", 0) or 0),
                 rebalance_costs_sats=int(pnl.get("rebalance_cost_sats", 0) or 0),
                 period_days=YIELD_REPORT_WINDOW_DAYS,
+                boltz_costs_sats=boltz_cost_sats,
             )
             last_yield_report_time = now
         except Exception as e:

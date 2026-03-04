@@ -3903,7 +3903,8 @@ class HiveFeeIntelligenceBridge:
         operating_costs_sats: int,
         routing_revenue_sats: int,
         rebalance_costs_sats: int,
-        period_days: int = 30
+        period_days: int = 30,
+        boltz_costs_sats: int = 0,
     ) -> bool:
         """
         Report both yield metrics and settlement period costs to cl-hive.
@@ -3917,6 +3918,7 @@ class HiveFeeIntelligenceBridge:
             routing_revenue_sats: Routing revenue in period
             rebalance_costs_sats: Rebalance costs for settlement (may overlap with operating_costs)
             period_days: Period length in days
+            boltz_costs_sats: Boltz swap costs in sats for the period
 
         Returns:
             True if both reports succeeded
@@ -3925,6 +3927,18 @@ class HiveFeeIntelligenceBridge:
             tlv_sats, operating_costs_sats, routing_revenue_sats, period_days
         )
         costs_ok = self.report_period_costs(rebalance_costs_sats)
+        # H3 FIX: Report Boltz costs separately for settlement visibility
+        if boltz_costs_sats > 0:
+            try:
+                self._rpc_call_with_policy(
+                    "hive-report-period-costs",
+                    {"boltz_costs_sats": boltz_costs_sats},
+                    policy_key="telemetry",
+                    require_available=False,
+                    count_error_response_failure=False,
+                )
+            except Exception:
+                pass  # Non-critical telemetry
         return yield_ok and costs_ok
 
     # =========================================================================
