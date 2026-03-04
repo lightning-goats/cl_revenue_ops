@@ -5793,6 +5793,7 @@ def _boltz_dynamic_channel_tuning(*,
     daily_contrib_est: float,
     marginal_roi: Optional[float],
     state_row: Optional[Dict[str, Any]] = None,
+    predicted_depletion_hours: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Derive per-channel dynamic thresholds/sizing hints for Boltz balancing.
 
@@ -5819,11 +5820,22 @@ def _boltz_dynamic_channel_tuning(*,
     # Positive velocity means source-ness increasing (more urgently draining) in this model.
     drain_accel_score = max(0.0, min(1.0, kalman_velocity / (0.05 / 24.0)))  # saturate at ~0.05/day (velocity is per-hour)
 
+    # H2 FIX: Hive anticipatory liquidity signal — predicted depletion boosts urgency
+    anticipatory_urgency = 0.0
+    if predicted_depletion_hours is not None and predicted_depletion_hours > 0:
+        # Saturate at 6h: anything <6h gets max urgency
+        anticipatory_urgency = max(0.0, min(1.0, (6.0 - predicted_depletion_hours) / 6.0))
+
     # Low local balance also contributes to urgency before the static threshold is crossed.
     depletion_score = max(0.0, min(1.0, (60.0 - float(local_pct)) / 40.0))
 
     hotness_score = max(0.0, min(1.0, 0.55 * contrib_score + 0.45 * roi_score))
-    drain_score = max(0.0, min(1.0, 0.50 * source_signal + 0.30 * drain_accel_score + 0.20 * depletion_score))
+    drain_score = max(0.0, min(1.0,
+        0.40 * source_signal +
+        0.25 * drain_accel_score +
+        0.20 * depletion_score +
+        0.15 * anticipatory_urgency
+    ))
     protection_score = max(0.0, min(1.0, 0.60 * hotness_score + 0.40 * drain_score))
 
     # Dynamic loop-in behavior: trigger earlier and refill deeper for high-score channels.
@@ -5863,6 +5875,8 @@ def _boltz_dynamic_channel_tuning(*,
             'source_signal': round(source_signal, 4),
             'drain_accel_score': round(drain_accel_score, 4),
             'depletion_score': round(depletion_score, 4),
+            'anticipatory_urgency': round(anticipatory_urgency, 4),
+            'predicted_depletion_hours': predicted_depletion_hours,
             'kalman_flow_ratio': round(kalman_ratio, 4),
             'kalman_velocity': round(kalman_velocity, 6),
         },
@@ -6031,6 +6045,16 @@ def _build_boltz_balance_plan(
     budget_status = bm.budget()
     pending_swaps = _boltz_pending_swap_count()
 
+    # H2 FIX: Query hive anticipatory data once for all channels
+    _antic_predictions: Dict[str, Any] = {}
+    if hive_bridge is not None:
+        try:
+            antic = hive_bridge.safe_call("hive-anticipatory-status")
+            if isinstance(antic, dict):
+                _antic_predictions = antic.get("channel_predictions", {}) or {}
+        except Exception:
+            pass
+
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
@@ -6071,6 +6095,15 @@ def _build_boltz_balance_plan(
                 })
                 continue
 
+        # H2 FIX: Extract per-channel depletion prediction from pre-fetched hive data
+        predicted_depletion_hours = None
+        ch_pred = _antic_predictions.get(channel_id, {})
+        if isinstance(ch_pred, dict) and "predicted_depletion_hours" in ch_pred:
+            try:
+                predicted_depletion_hours = float(ch_pred["predicted_depletion_hours"])
+            except (TypeError, ValueError):
+                pass
+
         tuning = _boltz_dynamic_channel_tuning(
             local_pct=local_pct,
             low_trigger_pct=low_trigger_pct,
@@ -6081,6 +6114,7 @@ def _build_boltz_balance_plan(
             daily_contrib_est=daily_contrib_est,
             marginal_roi=marginal_roi,
             state_row=state_row,
+            predicted_depletion_hours=predicted_depletion_hours,
         )
         dyn = tuning.get("dynamic_thresholds", {}) if isinstance(tuning, dict) else {}
         hints = tuning.get("execution_hints", {}) if isinstance(tuning, dict) else {}
