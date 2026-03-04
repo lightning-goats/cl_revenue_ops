@@ -700,11 +700,21 @@ class BoltzCliManager:
                 reserved += fee_est
                 reserved_count += 1
 
-        # Cap reserved at remaining Boltz budget to prevent over-estimation
-        # from blocking the unified capital control (fee estimate fallback can overcount)
-        daily_budget = max(0, int(getattr(self.cfg, "daily_budget_sats", 0) or 0))
-        if daily_budget > 0:
-            max_reservable = max(0, daily_budget - boltz_spent)
+        # Cap reserved at remaining budget to prevent over-estimation
+        # from blocking the unified capital control (fee estimate fallback can overcount).
+        # Use the tighter of Boltz-specific and global (unified) budget.
+        boltz_budget = max(0, int(getattr(self.cfg, "daily_budget_sats", 0) or 0))
+        cap_budget = boltz_budget
+        if callable(getattr(self, "global_budget_limit_provider", None)):
+            try:
+                gb = self.global_budget_limit_provider()
+                global_budget = max(0, int(gb.get("effective_budget_sats", 0) or 0))
+                if global_budget > 0:
+                    cap_budget = min(cap_budget, global_budget) if cap_budget > 0 else global_budget
+            except Exception:
+                pass
+        if cap_budget > 0:
+            max_reservable = max(0, cap_budget - boltz_spent)
             reserved = min(reserved, max_reservable)
 
         return {
