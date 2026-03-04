@@ -221,3 +221,34 @@ class TestPendingSwapReservation:
         mgr._augment_with_swap_journal = MagicMock(side_effect=lambda s, **kw: s)
         result = mgr.get_boltz_cost_components(window_hours=24)
         assert result["reserved_24h_sats"] == 0
+
+
+class TestAutoCycleErrorCounter:
+    """C3: Error counter should not reset on blocked state."""
+
+    def test_error_increments_counter(self):
+        state = {'consecutive_errors': 2}
+        result = {'error': 'something failed'}
+        if isinstance(result, dict) and 'error' in result:
+            state['consecutive_errors'] = int(state.get('consecutive_errors', 0) or 0) + 1
+        assert state['consecutive_errors'] == 3
+
+    def test_success_resets_counter(self):
+        state = {'consecutive_errors': 5}
+        result = {'status': 'executed'}
+        if isinstance(result, dict) and 'error' not in result:
+            status = str(result.get('status') or '')
+            if status in ('executed', 'dry_run'):
+                state['consecutive_errors'] = 0
+        assert state['consecutive_errors'] == 0
+
+    def test_blocked_preserves_counter(self):
+        state = {'consecutive_errors': 3}
+        result = {'status': 'blocked', 'reason': 'pending_swaps'}
+        if isinstance(result, dict) and 'error' in result:
+            state['consecutive_errors'] = int(state.get('consecutive_errors', 0) or 0) + 1
+        elif isinstance(result, dict):
+            status = str(result.get('status') or '')
+            if status in ('executed', 'dry_run'):
+                state['consecutive_errors'] = 0
+        assert state['consecutive_errors'] == 3

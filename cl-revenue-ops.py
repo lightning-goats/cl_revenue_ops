@@ -1559,9 +1559,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
                 _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
             else:
+                # C3 FIX: Only reset error counter on actual success, not on blocked/other states
+                status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
+                if status in ('executed', 'dry_run'):
+                    with _boltz_auto_cycle_state_lock:
+                        _boltz_auto_cycle_state['consecutive_errors'] = 0
                 _boltz_auto_cycle_mark_state(last_error=None)
-                with _boltz_auto_cycle_state_lock:
-                    _boltz_auto_cycle_state['consecutive_errors'] = 0
             return result if isinstance(result, dict) else {'status': status, 'result': result}
         except Exception as e:
             with _boltz_auto_cycle_state_lock:
