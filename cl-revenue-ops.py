@@ -6173,6 +6173,30 @@ def _build_boltz_balance_plan(
             })
             continue
 
+        # F2 FIX: Check hive route availability before recommending Boltz
+        hive_route_available = False
+        if hive_bridge is not None:
+            try:
+                hive_path = hive_bridge.safe_call("hive-fleet-rebalance-path", {
+                    "channel_id": channel_id,
+                    "direction": direction,
+                    "amount_sats": raw_amount,
+                })
+                if isinstance(hive_path, dict) and hive_path.get("viable"):
+                    hive_route_available = True
+            except Exception:
+                pass
+
+        if hive_route_available:
+            skipped.append({
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "reason": "hive_route_available",
+                "direction": direction,
+                "note": "Free hive circular rebalance available; skipping Boltz",
+            })
+            continue
+
         try:
             quote_resp = bm.quote(
                 amount_sats=amount_sats,
@@ -6224,6 +6248,8 @@ def _build_boltz_balance_plan(
             "raw_amount_sats": raw_amount,
             "flow_state": flow_state,
             "policy_gate": policy_reason,
+            "hive_route_checked": hive_bridge is not None,
+            "hive_route_available": False,
             "profitability": None if prof is None else {
                 "classification": prof_class,
                 "net_profit_sats": getattr(prof, "net_profit_sats", None),
