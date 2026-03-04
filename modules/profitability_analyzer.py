@@ -155,6 +155,7 @@ class ChannelProfitability:
     last_routed: Optional[int]
     marginal_profit_30d_sats: int = 0
     rebalance_cost_30d_sats: int = 0
+    opener: str = "local"
 
     @property
     def marginal_roi(self) -> float:
@@ -556,7 +557,8 @@ class ChannelProfitabilityAnalyzer:
                 days_open=days_open,
                 last_routed=last_routed,
                 marginal_profit_30d_sats=marginal_profit_30d,
-                rebalance_cost_30d_sats=rebalance_cost_30d
+                rebalance_cost_30d_sats=rebalance_cost_30d,
+                opener=opener
             )
             
             return profitability

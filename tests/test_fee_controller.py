@@ -1052,3 +1052,35 @@ class TestAuditRound8Regressions:
         uptime_factor = max(0.0, min(1.0, uptime_pct / 100.0))
 
         assert uptime_factor == 1.0, f"NaN uptime should default to 1.0, got {uptime_factor}"
+
+
+class TestCalculateFloorOpener:
+    """Tests for fee floor discount on remote-opened channels."""
+
+    def test_remote_opener_lower_floor(self, mock_plugin, mock_database):
+        from modules.fee_controller import HillClimbingFeeController
+        config = MagicMock()
+        clboss = MagicMock()
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        chain_costs = {"open_cost_sats": 5000, "close_cost_sats": 3000, "sat_per_vbyte": 5.0}
+        floor_local = fc._calculate_floor(5_000_000, chain_costs=chain_costs, opener="local")
+        floor_remote = fc._calculate_floor(5_000_000, chain_costs=chain_costs, opener="remote")
+        assert floor_remote < floor_local
+
+    def test_static_floor_remote_discount(self):
+        from modules.config import ChainCostDefaults
+        floor_local = ChainCostDefaults.calculate_floor_ppm(5_000_000, opener="local")
+        floor_remote = ChainCostDefaults.calculate_floor_ppm(5_000_000, opener="remote")
+        assert floor_remote < floor_local
+
+    def test_default_opener_is_local(self, mock_plugin, mock_database):
+        from modules.fee_controller import HillClimbingFeeController
+        config = MagicMock()
+        clboss = MagicMock()
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        chain_costs = {"open_cost_sats": 5000, "close_cost_sats": 3000, "sat_per_vbyte": 5.0}
+        floor_default = fc._calculate_floor(5_000_000, chain_costs=chain_costs)
+        floor_local = fc._calculate_floor(5_000_000, chain_costs=chain_costs, opener="local")
+        assert floor_default == floor_local

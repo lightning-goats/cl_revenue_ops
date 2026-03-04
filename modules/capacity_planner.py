@@ -226,6 +226,14 @@ class CapacityPlanner:
                 is_fire_sale = True
                 fire_sale_reason = "STAGNANT+HARD_REBAL"
 
+            # Remote-opened channels are "free" capacity — raise the bar for closing.
+            # They cost us nothing to acquire, so only close if deeply underwater.
+            opener = getattr(prof, 'opener', 'local')
+            if opener == 'remote' and is_fire_sale and not is_stagnant:
+                if prof.marginal_roi_percent > -75.0:
+                    # Skip close recommendation for remote channels unless deeply underwater
+                    continue
+
             if is_fire_sale or is_stagnant:
                 # PROTECTION: A channel cannot be recommended for "Close" or "Splice-out"
                 # until the diagnostic_rebalance has been attempted at least twice in the last 14 days.
@@ -245,6 +253,7 @@ class CapacityPlanner:
                         "estimated_closure_cost_sats": estimated_closure_cost,
                         "peer_supports_splice": peer_splice_map.get(prof.peer_id, False),
                         "rebal_difficulty": round(rebal_difficulty, 2),
+                        "opener": opener,
                         "action": "DEFIBRILLATE"
                     })
                 else:
@@ -259,6 +268,7 @@ class CapacityPlanner:
                         "estimated_closure_cost_sats": estimated_closure_cost,
                         "peer_supports_splice": peer_splice_map.get(prof.peer_id, False),
                         "rebal_difficulty": round(rebal_difficulty, 2),
+                        "opener": opener,
                         "action": "CLOSE"
                     })
 

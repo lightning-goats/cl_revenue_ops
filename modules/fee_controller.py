@@ -5427,7 +5427,8 @@ class HillClimbingFeeController:
                 marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
         
         # Calculate Floor and Ceiling
-        base_floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id)
+        opener = channel_info.get("opener", "local")
+        base_floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id, opener=opener)
         base_floor_ppm = max(base_floor_ppm, cfg.min_fee_ppm)
         # Apply flow state to floor (sinks can go lower)
         base_floor_ppm = int(base_floor_ppm * flow_state_multiplier)
@@ -7447,6 +7448,7 @@ class HillClimbingFeeController:
                 'receivable_msat': receivable_msat,
                 'fee_base_msat': fee_base,
                 'fee_proportional_millionths': fee_ppm,
+                'opener': target_ch.get('opener', 'local'),
             }
 
             # ── Policy check ──────────────────────────────────────────
@@ -7526,7 +7528,8 @@ class HillClimbingFeeController:
 
     def _calculate_floor(self, capacity_sats: int,
                          chain_costs: Optional[Dict[str, int]] = None,
-                         peer_id: Optional[str] = None) -> int:
+                         peer_id: Optional[str] = None,
+                         opener: str = "local") -> int:
         """
         Calculate the economic floor fee for a channel.
         
@@ -7554,8 +7557,8 @@ class HillClimbingFeeController:
         # Use provided chain_costs (hoisted from adjust_all_fees for efficiency)
         # Falls back to static defaults if chain_costs is None (RPC failed)
         dynamic_costs = chain_costs
-        floor_ppm = ChainCostDefaults.calculate_floor_ppm(capacity_sats)
-        
+        floor_ppm = ChainCostDefaults.calculate_floor_ppm(capacity_sats, opener=opener)
+
         if dynamic_costs:
             # 1. Calculate Base Floor (Cost Recovery) using REPLACEMENT COST
             # We ignore historical costs (what we paid) and look at what it costs
@@ -7563,7 +7566,10 @@ class HillClimbingFeeController:
             open_cost = dynamic_costs.get("open_cost_sats", ChainCostDefaults.CHANNEL_OPEN_COST_SATS)
             close_cost = dynamic_costs.get("close_cost_sats", ChainCostDefaults.CHANNEL_CLOSE_COST_SATS)
             
-            total_chain_cost = open_cost + close_cost
+            if opener == "remote":
+                total_chain_cost = close_cost  # We didn't pay to open
+            else:
+                total_chain_cost = open_cost + close_cost
             estimated_lifetime_volume = ChainCostDefaults.DAILY_VOLUME_SATS * ChainCostDefaults.CHANNEL_LIFETIME_DAYS
             
             if estimated_lifetime_volume > 0:

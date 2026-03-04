@@ -901,17 +901,22 @@ class ChainCostDefaults:
     DAILY_VOLUME_SATS: int = 1000000        # 1M sats/day
     
     @classmethod
-    def calculate_floor_ppm(cls, capacity_sats: int) -> int:
+    def calculate_floor_ppm(cls, capacity_sats: int, opener: str = "local") -> int:
         """
         Calculate the economic floor fee for a channel.
-        
+
         Args:
             capacity_sats: Channel capacity in satoshis
-            
+            opener: Who opened the channel ('local' or 'remote').
+                    Remote-opened channels exclude the open cost since we didn't pay it.
+
         Returns:
             Minimum fee in PPM that covers channel costs
         """
-        total_chain_cost = cls.CHANNEL_OPEN_COST_SATS + cls.CHANNEL_CLOSE_COST_SATS
+        if opener == "remote":
+            total_chain_cost = cls.CHANNEL_CLOSE_COST_SATS  # We didn't pay to open
+        else:
+            total_chain_cost = cls.CHANNEL_OPEN_COST_SATS + cls.CHANNEL_CLOSE_COST_SATS
         estimated_lifetime_volume = cls.DAILY_VOLUME_SATS * cls.CHANNEL_LIFETIME_DAYS
         
         # Calculate minimum fee to break even
