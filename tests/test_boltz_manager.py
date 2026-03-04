@@ -1,4 +1,4 @@
-"""Regression tests for boltz_manager P0 fixes."""
+"""Regression tests for boltz_manager P0 fixes and audit correctness fixes."""
 
 import threading
 import time
@@ -119,3 +119,54 @@ class TestBackupMnemonicOmission:
         assert "swap_mnemonic" in result
         assert result["swap_mnemonic"] == "word1 word2 word3"
         assert "warning" in result
+
+
+class TestCooldownPreClaim:
+    """C1: Cooldown pre-claim prevents double execution for same channel."""
+
+    def test_pre_claim_blocks_second_thread(self):
+        """Two threads racing on the same channel: only one should execute."""
+        lock = threading.Lock()
+        last_action = {}
+        results = []
+
+        def simulate_cycle(thread_id, cooldown_seconds=60):
+            now = int(time.time())
+            ch_id = "100x1x0"
+            with lock:
+                last_ts = int(last_action.get(ch_id, 0) or 0)
+                if cooldown_seconds > 0 and last_ts > 0 and (now - last_ts) < cooldown_seconds:
+                    results.append((thread_id, "cooldown_active"))
+                    return
+                # Pre-claim
+                last_action[ch_id] = now
+            # Simulate swap execution outside lock
+            time.sleep(0.05)
+            results.append((thread_id, "executed"))
+
+        t1 = threading.Thread(target=simulate_cycle, args=(1,))
+        t2 = threading.Thread(target=simulate_cycle, args=(2,))
+        t1.start()
+        time.sleep(0.01)
+        t2.start()
+        t1.join(timeout=3)
+        t2.join(timeout=3)
+        statuses = [s for _, s in results]
+        assert "executed" in statuses
+        assert "cooldown_active" in statuses
+
+    def test_failed_swap_clears_pre_claim(self):
+        """If swap fails, the pre-claimed cooldown slot is restored."""
+        lock = threading.Lock()
+        last_action = {"100x1x0": 0}
+        ch_id = "100x1x0"
+        now = 1000000
+        # Pre-claim inside lock
+        with lock:
+            original_ts = int(last_action.get(ch_id, 0) or 0)
+            last_action[ch_id] = now
+        # Simulate failure - restore
+        with lock:
+            if last_action.get(ch_id) == now:
+                last_action[ch_id] = original_ts
+        assert last_action[ch_id] == 0

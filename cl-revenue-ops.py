@@ -6422,6 +6422,8 @@ def revenue_boltz_balance_cycle(
                     "recommendation": rec,
                 })
                 continue
+            # C1 FIX: Pre-claim cooldown slot to prevent TOCTOU double-execution
+            _boltz_balance_last_action[ch_id] = now
 
         if dry_run:
             executed.append({
@@ -6459,10 +6461,13 @@ def revenue_boltz_balance_cycle(
                     "recommendation": rec,
                 })
                 if status == "accepted":
-                    with _boltz_balance_lock:
-                        _boltz_balance_last_action[ch_id] = int(time.time())
+                    # C1: Pre-claim already set; just update budget
                     remaining_budget = max(0, remaining_budget - est_fee)
                 else:
+                    # C1: Rejected - restore original cooldown timestamp
+                    with _boltz_balance_lock:
+                        if _boltz_balance_last_action.get(ch_id) == now:
+                            _boltz_balance_last_action[ch_id] = last_ts
                     skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id, "reason": "execution_rejected", "result": res})
             else:
                 executed.append({
@@ -6476,6 +6481,10 @@ def revenue_boltz_balance_cycle(
                     "recommendation": rec,
                 })
         except Exception as e:
+            # C1: Exception - restore original cooldown timestamp
+            with _boltz_balance_lock:
+                if _boltz_balance_last_action.get(ch_id) == now:
+                    _boltz_balance_last_action[ch_id] = last_ts
             skipped_exec.append({
                 "channel_id": ch_id,
                 "peer_id": peer_id,
@@ -6662,6 +6671,8 @@ def revenue_boltz_expansion_treasury_cycle(
             if rec_cd > 0 and last_ts > 0 and (now - last_ts) < rec_cd:
                 skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'cooldown_active', 'cooldown_remaining_sec': rec_cd - (now - last_ts), 'recommendation': rec})
                 continue
+            # C1 FIX: Pre-claim cooldown slot to prevent TOCTOU double-execution
+            _boltz_balance_last_action[ch_id] = now
 
         if dry_run:
             executed.append({'status': 'would_execute', 'direction': direction, 'channel_id': ch_id, 'peer_id': peer_id, 'amount_sats': amount_sats, 'estimated_fee_sats': est_fee, 'estimated_receive_onchain_sats': est_receive, 'recommendation': rec})
@@ -6676,13 +6687,20 @@ def revenue_boltz_expansion_treasury_cycle(
             payload = {'status': status or 'unknown', 'direction': direction, 'channel_id': ch_id, 'peer_id': peer_id, 'amount_sats': amount_sats, 'estimated_fee_sats': est_fee, 'estimated_receive_onchain_sats': est_receive, 'result': res, 'recommendation': rec}
             executed.append(payload)
             if status == 'accepted':
-                with _boltz_balance_lock:
-                    _boltz_balance_last_action[ch_id] = int(time.time())
+                # C1: Pre-claim already set; just update budget
                 remaining_budget = max(0, remaining_budget - est_fee)
                 target_deficit_remaining = max(0, target_deficit_remaining - est_receive)
             elif status == 'rejected':
+                # C1: Rejected - restore original cooldown timestamp
+                with _boltz_balance_lock:
+                    if _boltz_balance_last_action.get(ch_id) == now:
+                        _boltz_balance_last_action[ch_id] = last_ts
                 skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'execution_rejected', 'result': res})
         except Exception as e:
+            # C1: Exception - restore original cooldown timestamp
+            with _boltz_balance_lock:
+                if _boltz_balance_last_action.get(ch_id) == now:
+                    _boltz_balance_last_action[ch_id] = last_ts
             skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': f'execution_failed: {e}', 'recommendation': rec})
 
     return {
