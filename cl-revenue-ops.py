@@ -6055,6 +6055,18 @@ def _build_boltz_balance_plan(
         except Exception:
             pass
 
+    # F2 FIX: Pre-fetch hive rebalance recommendations to check for free fleet paths
+    _hive_rebal_recs: Dict[str, Dict[str, Any]] = {}
+    if hive_bridge is not None:
+        try:
+            rebal_resp = hive_bridge.safe_call("hive-rebalance-recommendations", {"prediction_hours": 24})
+            if isinstance(rebal_resp, dict):
+                for rec_item in (rebal_resp.get("recommendations") or []):
+                    if isinstance(rec_item, dict) and rec_item.get("channel_id"):
+                        _hive_rebal_recs[str(rec_item["channel_id"])] = rec_item
+        except Exception:
+            pass
+
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
@@ -6175,17 +6187,9 @@ def _build_boltz_balance_plan(
 
         # F2 FIX: Check hive route availability before recommending Boltz
         hive_route_available = False
-        if hive_bridge is not None:
-            try:
-                hive_path = hive_bridge.safe_call("hive-fleet-rebalance-path", {
-                    "channel_id": channel_id,
-                    "direction": direction,
-                    "amount_sats": raw_amount,
-                })
-                if isinstance(hive_path, dict) and hive_path.get("viable"):
-                    hive_route_available = True
-            except Exception:
-                pass
+        hive_rec = _hive_rebal_recs.get(str(channel_id), {})
+        if isinstance(hive_rec, dict) and hive_rec.get("fleet_path_available") and hive_rec.get("recommendation") == "use_fleet_path":
+            hive_route_available = True
 
         if hive_route_available:
             skipped.append({
