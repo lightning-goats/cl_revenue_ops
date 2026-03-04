@@ -3846,9 +3846,9 @@ class HiveFeeIntelligenceBridge:
     # SETTLEMENT INTEGRATION (Issue #42: Net Profit Settlement)
     # =========================================================================
 
-    def report_period_costs(self, rebalance_costs_sats: int) -> bool:
+    def report_period_costs(self, rebalance_costs_sats: int, boltz_costs_sats: int = 0) -> bool:
         """
-        Report rebalancing costs to cl-hive for net profit settlement.
+        Report rebalancing and Boltz costs to cl-hive for net profit settlement.
 
         This is non-critical telemetry. We intentionally avoid a blocking RPC
         round-trip so lock contention in cl-hive fee gossip paths cannot stall
@@ -3856,6 +3856,7 @@ class HiveFeeIntelligenceBridge:
 
         Args:
             rebalance_costs_sats: Total rebalancing costs in sats for the period
+            boltz_costs_sats: Boltz swap costs in sats for the period
 
         Returns:
             True if the report was queued (or recently coalesced), False if not.
@@ -3871,17 +3872,21 @@ class HiveFeeIntelligenceBridge:
         with self._period_costs_report_lock:
             # Coalesce duplicate values on a short interval; this call may be
             # made frequently from fee/yield loops and does not need exact ack.
+            total_costs = rebalance_costs_sats + max(0, int(boltz_costs_sats or 0))
             if (
-                self._last_reported_period_costs_sats == rebalance_costs_sats
+                self._last_reported_period_costs_sats == total_costs
                 and (now - self._last_period_costs_report_time) < self._period_costs_report_min_interval
             ):
                 return True
-            self._last_reported_period_costs_sats = rebalance_costs_sats
+            self._last_reported_period_costs_sats = total_costs
             self._last_period_costs_report_time = now
 
+        params = {"rebalance_costs_sats": rebalance_costs_sats}
+        if boltz_costs_sats > 0:
+            params["boltz_costs_sats"] = int(boltz_costs_sats)
         ok, result, err = self._rpc_call_with_policy(
             "hive-report-period-costs",
-            {"rebalance_costs_sats": rebalance_costs_sats},
+            params,
             policy_key="telemetry",
             require_available=False,  # checked above
             count_error_response_failure=False,
@@ -3926,19 +3931,7 @@ class HiveFeeIntelligenceBridge:
         yield_ok = self.report_yield_metrics(
             tlv_sats, operating_costs_sats, routing_revenue_sats, period_days
         )
-        costs_ok = self.report_period_costs(rebalance_costs_sats)
-        # H3 FIX: Report Boltz costs separately for settlement visibility
-        if boltz_costs_sats > 0:
-            try:
-                self._rpc_call_with_policy(
-                    "hive-report-period-costs",
-                    {"boltz_costs_sats": boltz_costs_sats},
-                    policy_key="telemetry",
-                    require_available=False,
-                    count_error_response_failure=False,
-                )
-            except Exception:
-                pass  # Non-critical telemetry
+        costs_ok = self.report_period_costs(rebalance_costs_sats, boltz_costs_sats=boltz_costs_sats)
         return yield_ok and costs_ok
 
     # =========================================================================
