@@ -700,6 +700,13 @@ class BoltzCliManager:
                 reserved += fee_est
                 reserved_count += 1
 
+        # Cap reserved at remaining Boltz budget to prevent over-estimation
+        # from blocking the unified capital control (fee estimate fallback can overcount)
+        daily_budget = max(0, int(getattr(self.cfg, "daily_budget_sats", 0) or 0))
+        if daily_budget > 0:
+            max_reservable = max(0, daily_budget - boltz_spent)
+            reserved = min(reserved, max_reservable)
+
         return {
             "spent_24h_sats": boltz_spent,
             "reserved_24h_sats": reserved,
