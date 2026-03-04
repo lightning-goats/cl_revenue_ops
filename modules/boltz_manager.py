@@ -686,9 +686,24 @@ class BoltzCliManager:
                 "state": s.get("state"),
                 "status": s.get("status"),
             })
+        # C2 FIX: Count pending (non-completed, non-error) swaps as reserved budget
+        reserved = 0
+        reserved_count = 0
+        for s in swaps:
+            if self._is_completed_swap(s) or self._is_error_swap(s):
+                continue
+            ts = self._swap_created_ts(s)
+            if ts is None or ts < cutoff:
+                continue
+            fee_est = self._estimate_swap_fee_sats(s)
+            if fee_est > 0:
+                reserved += fee_est
+                reserved_count += 1
+
         return {
             "spent_24h_sats": boltz_spent,
-            "reserved_24h_sats": 0,
+            "reserved_24h_sats": reserved,
+            "reserved_swaps": reserved_count,
             "counted_swaps": len(counted),
             "skipped_without_timestamp": unknown_ts,
             "counted_details": counted[:20],

@@ -170,3 +170,54 @@ class TestCooldownPreClaim:
             if last_action.get(ch_id) == now:
                 last_action[ch_id] = original_ts
         assert last_action[ch_id] == 0
+
+
+class TestPendingSwapReservation:
+    """C2: Pending swaps should be counted in reserved_24h_sats."""
+
+    def test_pending_swap_counted_as_reserved(self):
+        mgr = _make_manager()
+        now = int(time.time())
+        pending_swap = {
+            "id": "swap_pending_1", "createdAt": str(now - 100),
+            "state": "pending", "status": "pending",
+            "boltzFee": "50", "networkFee": "10",
+        }
+        completed_swap = {
+            "id": "swap_done_1", "createdAt": str(now - 200),
+            "completedAt": str(now - 150),
+            "updatedAt": str(now - 150),
+            "state": "completed", "status": "swap.completed",
+            "boltzFee": "40", "networkFee": "5",
+        }
+        mgr._listswaps_json = MagicMock(return_value={"swaps": [pending_swap, completed_swap]})
+        mgr._augment_with_swap_journal = MagicMock(side_effect=lambda s, **kw: s)
+        result = mgr.get_boltz_cost_components(window_hours=24)
+        assert result["spent_24h_sats"] == 45
+        assert result["reserved_24h_sats"] > 0
+
+    def test_error_swap_not_reserved(self):
+        mgr = _make_manager()
+        now = int(time.time())
+        error_swap = {
+            "id": "swap_err_1", "createdAt": str(now - 100),
+            "state": "error", "status": "swap.failed",
+            "error": "some error", "boltzFee": "50", "networkFee": "10",
+        }
+        mgr._listswaps_json = MagicMock(return_value={"swaps": [error_swap]})
+        mgr._augment_with_swap_journal = MagicMock(side_effect=lambda s, **kw: s)
+        result = mgr.get_boltz_cost_components(window_hours=24)
+        assert result["reserved_24h_sats"] == 0
+
+    def test_old_pending_swap_not_reserved(self):
+        mgr = _make_manager()
+        now = int(time.time())
+        old_pending = {
+            "id": "swap_old_1", "createdAt": str(now - 100000),
+            "state": "pending", "status": "pending",
+            "boltzFee": "50", "networkFee": "10",
+        }
+        mgr._listswaps_json = MagicMock(return_value={"swaps": [old_pending]})
+        mgr._augment_with_swap_journal = MagicMock(side_effect=lambda s, **kw: s)
+        result = mgr.get_boltz_cost_components(window_hours=24)
+        assert result["reserved_24h_sats"] == 0
