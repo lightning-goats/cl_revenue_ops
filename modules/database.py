@@ -2653,17 +2653,77 @@ class Database:
             self.plugin.log(f"Record spend event failed: {e}", level='error')
             return False
 
-    def cleanup_stale_spend_reservations(self, max_age_seconds: int = 86400) -> int:
+    def cleanup_stale_spend_reservations(self, max_age_seconds: int = 86400, category: Optional[str] = None) -> int:
         conn = self._get_connection()
         cutoff = int(time.time()) - max_age_seconds
-        cursor = conn.execute("""
+        params = [cutoff]
+        category_clause = ""
+        if category:
+            category_clause = " AND category = ?"
+            params.append(str(category).strip().lower())
+        cursor = conn.execute(f"""
             UPDATE spend_reservations
             SET status = 'released'
-            WHERE status = 'active' AND reserved_at < ?
-        """, (cutoff,))
+            WHERE status = 'active' AND reserved_at < ?{category_clause}
+        """, tuple(params))
         return cursor.rowcount
 
-    def get_spend_ledger_summary(self, window_hours: int = 24) -> Dict[str, Any]:
+    def release_spend_reservations(
+        self,
+        category: Optional[str] = None,
+        older_than_seconds: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Release active spend reservations with optional filters for safe operational recovery."""
+        conn = self._get_connection()
+        where = ["status = 'active'"]
+        params: List[Any] = []
+
+        if category:
+            where.append("category = ?")
+            params.append(str(category).strip().lower())
+
+        if older_than_seconds is not None and int(older_than_seconds) > 0:
+            cutoff = int(time.time()) - int(older_than_seconds)
+            where.append("reserved_at < ?")
+            params.append(cutoff)
+
+        where_sql = " AND ".join(where)
+        limit_sql = f" LIMIT {int(limit)}" if limit is not None and int(limit) > 0 else ""
+
+        rows = conn.execute(
+            f"""
+            SELECT reservation_id, reserved_sats
+            FROM spend_reservations
+            WHERE {where_sql}
+            ORDER BY reserved_at ASC{limit_sql}
+            """,
+            tuple(params),
+        ).fetchall()
+
+        if not rows:
+            return {"released_count": 0, "released_sats": 0, "reservation_ids": []}
+
+        ids = [str(r["reservation_id"]) for r in rows]
+        released_sats = int(sum(int(r["reserved_sats"] or 0) for r in rows))
+
+        qmarks = ",".join(["?"] * len(ids))
+        conn.execute(
+            f"UPDATE spend_reservations SET status = 'released' WHERE reservation_id IN ({qmarks})",
+            tuple(ids),
+        )
+        return {
+            "released_count": len(ids),
+            "released_sats": released_sats,
+            "reservation_ids": ids,
+        }
+
+    def get_spend_ledger_summary(
+        self,
+        window_hours: int = 24,
+        include_reservations: bool = False,
+        reservation_limit: int = 50,
+    ) -> Dict[str, Any]:
         """Summarize generic spend ledger events + reservations for unified budget accounting."""
         conn = self._get_connection()
         cutoff = int(time.time()) - (int(window_hours) * 3600)
@@ -2696,13 +2756,44 @@ class Database:
         spent_by_category = {str(r["category"]): int(r["total"] or 0) for r in by_cat_events}
         reserved_by_category = {str(r["category"]): int(r["total"] or 0) for r in by_cat_resv}
 
-        return {
+        result = {
             "window_hours": int(window_hours),
             "spent_24h_sats": int((spent_row["total_spent"] if spent_row else 0) or 0),
             "reserved_24h_sats": int((reserved_row["total_reserved"] if reserved_row else 0) or 0),
             "spent_by_category": spent_by_category,
             "reserved_by_category": reserved_by_category,
         }
+
+        if include_reservations:
+            rows = conn.execute(
+                """
+                SELECT reservation_id, category, subcategory, reserved_sats, reserved_at,
+                       reference_id, channel_id, status, metadata_json
+                FROM spend_reservations
+                WHERE status = 'active' AND reserved_at >= ?
+                ORDER BY reserved_at ASC
+                LIMIT ?
+                """,
+                (cutoff, max(1, int(reservation_limit))),
+            ).fetchall()
+            now = int(time.time())
+            result["active_reservations"] = [
+                {
+                    "reservation_id": str(r["reservation_id"]),
+                    "category": str(r["category"]),
+                    "subcategory": r["subcategory"],
+                    "reserved_sats": int(r["reserved_sats"] or 0),
+                    "reserved_at": int(r["reserved_at"] or 0),
+                    "age_seconds": max(0, now - int(r["reserved_at"] or now)),
+                    "reference_id": r["reference_id"],
+                    "channel_id": r["channel_id"],
+                    "status": r["status"],
+                    "metadata_json": r["metadata_json"],
+                }
+                for r in rows
+            ]
+
+        return result
 
     def get_daily_rebalance_spend(self, window_hours: int = 24) -> Dict[str, Any]:
         """

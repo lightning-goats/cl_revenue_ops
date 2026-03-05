@@ -5281,12 +5281,21 @@ def revenue_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[
 
 
 @plugin.method("revenue-spend-ledger")
-def revenue_spend_ledger(plugin: Plugin, window_hours: int = 24) -> Dict[str, Any]:
+def revenue_spend_ledger(
+    plugin: Plugin,
+    window_hours: int = 24,
+    include_reservations: bool = False,
+    reservation_limit: int = 50,
+) -> Dict[str, Any]:
     """Summary of generic spend ledger events/reservations (for opens/closes/splices/etc.)."""
     if database is None:
         return {"error": "Database not initialized"}
     try:
-        return database.get_spend_ledger_summary(window_hours=int(window_hours))
+        return database.get_spend_ledger_summary(
+            window_hours=int(window_hours),
+            include_reservations=bool(include_reservations),
+            reservation_limit=int(reservation_limit),
+        )
     except Exception as e:
         return {"error": str(e)}
 
@@ -5357,6 +5366,33 @@ def revenue_spend_release(plugin: Plugin, reservation_id: str) -> Dict[str, Any]
     try:
         ok = database.release_spend_reservation(str(reservation_id))
         return {"status": "success" if ok else "not_found", "reservation_id": str(reservation_id)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("revenue-spend-release-stale")
+def revenue_spend_release_stale(
+    plugin: Plugin,
+    max_age_seconds: int = 3600,
+    category: str = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Release stale generic spend reservations (safe recovery path for orphaned reservations)."""
+    if database is None:
+        return {"error": "Database not initialized"}
+    try:
+        result = database.release_spend_reservations(
+            category=(None if not category else str(category).strip().lower()),
+            older_than_seconds=max(1, int(max_age_seconds)),
+            limit=max(1, int(limit)),
+        )
+        return {
+            "status": "success",
+            "released_count": int(result.get("released_count", 0) or 0),
+            "released_sats": int(result.get("released_sats", 0) or 0),
+            "reservation_ids": result.get("reservation_ids", []),
+            "budget_after": _total_cost_budget_status(),
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -5620,9 +5656,9 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
 
     # Best-effort cleanup for generic spend reservations (e.g. channel open/splice
     # reservations) so accepted actions that aren't explicitly settled do not block
-    # budget forever. Uses max(reservation_timeout_hours, window_hours).
+    # budget for an entire window. Keep timeout bounded and independent from window size.
     try:
-        stale_hours = max(int(getattr(cfg, "reservation_timeout_hours", 4) or 4), wh)
+        stale_hours = max(1, int(getattr(cfg, "reservation_timeout_hours", 4) or 4))
         database.cleanup_stale_spend_reservations(max_age_seconds=stale_hours * 3600)
     except Exception as exc:
         plugin.log(f"cleanup_stale_spend_reservations failed: {exc}", level="debug")
