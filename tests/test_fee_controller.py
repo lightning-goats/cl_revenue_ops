@@ -254,6 +254,7 @@ class TestSkipReasons:
             "sleeping": 0,
             "waiting_time": 0,
             "waiting_forwards": 0,
+            "alpha_guard": 0,
             "fee_unchanged": 0,
             "gossip_hysteresis": 0,
             "idempotent": 0,
@@ -273,6 +274,245 @@ class TestSkipReasons:
             skip_reasons["policy_hive"] += 1
 
         assert skip_reasons["policy_hive"] == 1
+
+
+class TestAdjustAllFeesSkipClassification:
+    """Scheduler-level skip classification regressions."""
+
+    def _make_fc(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        cfg = MockConfigSnapshot(
+            hive_fee_ppm=0,
+            min_fee_ppm=1,
+            max_fee_ppm=5000,
+            fee_interval=1800,
+            enable_vegas_reflex=False,
+        )
+        fc.config.snapshot.return_value = cfg
+        fc.policy_manager = None
+        fc._get_dynamic_chain_costs = MagicMock(return_value=None)
+        fc._prune_stale_states = MagicMock()
+        return fc
+
+    @staticmethod
+    def _summary_messages(log_mock):
+        return [
+            call.args[0]
+            for call in log_mock.call_args_list
+            if call.args and isinstance(call.args[0], str) and call.args[0].startswith("Fee adjustment:")
+        ]
+
+    def test_adjust_all_fees_does_not_report_waiting_time_after_window_consumed(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """A consumed observation window should not be reclassified as waiting_time."""
+        from modules.fee_controller import HillClimbState
+
+        fc = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = sample_peer_ids[0]
+        now = int(time.time())
+        hc_state = HillClimbState(
+            last_update=now - 7200,
+            last_fee_ppm=100,
+            last_broadcast_fee_ppm=100,
+        )
+        fc._hill_climb_states[channel_id] = hc_state
+
+        mock_database.get_all_channel_states.return_value = [
+            {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
+        ]
+        mock_database.get_forward_count_since.return_value = 3
+        fc._get_channels_info = MagicMock(return_value={
+            channel_id: {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "fee_proportional_millionths": 100,
+            }
+        })
+
+        def consume_window(**_kwargs):
+            hc_state.last_update = now
+            return None
+
+        fc._adjust_channel_fee = MagicMock(side_effect=consume_window)
+
+        fc._adjust_all_fees_inner()
+
+        summary_messages = self._summary_messages(mock_plugin.log)
+        assert len(summary_messages) == 1
+        assert "waiting_time" not in summary_messages[0]
+
+    def test_adjust_all_fees_reports_gossip_hysteresis(self, mock_database, mock_plugin, sample_peer_ids):
+        """Internal target changes without broadcast should hit gossip_hysteresis."""
+        from modules.fee_controller import HillClimbState
+
+        fc = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = sample_peer_ids[0]
+        now = int(time.time())
+        hc_state = HillClimbState(
+            last_update=now - 7200,
+            last_fee_ppm=100,
+            last_broadcast_fee_ppm=100,
+        )
+        fc._hill_climb_states[channel_id] = hc_state
+
+        mock_database.get_all_channel_states.return_value = [
+            {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
+        ]
+        mock_database.get_forward_count_since.return_value = 3
+        fc._get_channels_info = MagicMock(return_value={
+            channel_id: {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "fee_proportional_millionths": 100,
+            }
+        })
+
+        def skip_with_internal_target(**_kwargs):
+            hc_state.last_update = now
+            hc_state.last_fee_ppm = 110
+            return None
+
+        fc._adjust_channel_fee = MagicMock(side_effect=skip_with_internal_target)
+
+        fc._adjust_all_fees_inner()
+
+        summary_messages = self._summary_messages(mock_plugin.log)
+        assert len(summary_messages) == 1
+        assert "'gossip_hysteresis': 1" in summary_messages[0]
+
+    def test_adjust_all_fees_reports_alpha_guard(self, mock_database, mock_plugin, sample_peer_ids):
+        """Consumed windows with no target/broadcast change should hit alpha_guard."""
+        from modules.fee_controller import HillClimbState
+
+        fc = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = sample_peer_ids[0]
+        now = int(time.time())
+        hc_state = HillClimbState(
+            last_update=now - 7200,
+            last_fee_ppm=100,
+            last_broadcast_fee_ppm=90,
+        )
+        fc._hill_climb_states[channel_id] = hc_state
+
+        mock_database.get_all_channel_states.return_value = [
+            {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
+        ]
+        mock_database.get_forward_count_since.return_value = 3
+        fc._get_channels_info = MagicMock(return_value={
+            channel_id: {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "fee_proportional_millionths": 100,
+            }
+        })
+
+        def skip_below_threshold(**_kwargs):
+            hc_state.last_update = now
+            hc_state.last_fee_ppm = 100
+            hc_state.last_broadcast_fee_ppm = 90
+            return None
+
+        fc._adjust_channel_fee = MagicMock(side_effect=skip_below_threshold)
+
+        fc._adjust_all_fees_inner()
+
+        summary_messages = self._summary_messages(mock_plugin.log)
+        assert len(summary_messages) == 1
+        assert "'alpha_guard': 1" in summary_messages[0]
+
+    def test_adjust_all_fees_reports_idempotent(self, mock_database, mock_plugin, sample_peer_ids):
+        """Same-fee on-chain no-op should hit idempotent."""
+        from modules.fee_controller import HillClimbState
+
+        fc = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = sample_peer_ids[0]
+        now = int(time.time())
+        hc_state = HillClimbState(
+            last_update=now - 7200,
+            last_fee_ppm=100,
+            last_broadcast_fee_ppm=90,
+        )
+        fc._hill_climb_states[channel_id] = hc_state
+
+        mock_database.get_all_channel_states.return_value = [
+            {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
+        ]
+        mock_database.get_forward_count_since.return_value = 3
+        fc._get_channels_info = MagicMock(return_value={
+            channel_id: {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "fee_proportional_millionths": 100,
+            }
+        })
+
+        def skip_idempotent(**_kwargs):
+            hc_state.last_update = now
+            hc_state.last_fee_ppm = 100
+            hc_state.last_broadcast_fee_ppm = 100
+            return None
+
+        fc._adjust_channel_fee = MagicMock(side_effect=skip_idempotent)
+
+        fc._adjust_all_fees_inner()
+
+        summary_messages = self._summary_messages(mock_plugin.log)
+        assert len(summary_messages) == 1
+        assert "'idempotent': 1" in summary_messages[0]
+
+    def test_dynamic_window_with_enough_forwards_is_not_reclassified_as_waiting_time(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """Dynamic-window channels with enough forwards should not hit waiting_time."""
+        from modules.fee_controller import HillClimbState
+
+        fc = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = sample_peer_ids[0]
+        now = int(time.time())
+        hc_state = HillClimbState(
+            last_update=now - 1800,
+            last_fee_ppm=100,
+            last_broadcast_fee_ppm=90,
+        )
+        fc._hill_climb_states[channel_id] = hc_state
+
+        mock_database.get_all_channel_states.return_value = [
+            {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
+        ]
+        mock_database.get_forward_count_since.return_value = 3
+        fc._get_channels_info = MagicMock(return_value={
+            channel_id: {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "fee_proportional_millionths": 100,
+            }
+        })
+
+        def consume_forward_qualified_window(**_kwargs):
+            hc_state.last_update = now
+            hc_state.last_fee_ppm = 100
+            hc_state.last_broadcast_fee_ppm = 90
+            return None
+
+        fc._adjust_channel_fee = MagicMock(side_effect=consume_forward_qualified_window)
+
+        fc._adjust_all_fees_inner()
+
+        summary_messages = self._summary_messages(mock_plugin.log)
+        assert len(summary_messages) == 1
+        assert "waiting_time" not in summary_messages[0]
 
 
 class TestFeeAdjustmentReason:
