@@ -5598,6 +5598,7 @@ class HillClimbingFeeController:
         saturation_drain_ceiling = self._get_saturation_drain_ceiling(
             channel_id, local_balance_pct, current_fee_ppm, cfg.min_fee_ppm
         )
+        saturation_drain_active = saturation_drain_ceiling is not None
         if saturation_drain_ceiling is not None:
             # Drain ceiling takes precedence - cap the ceiling
             if base_ceiling_ppm > saturation_drain_ceiling:
@@ -5610,7 +5611,11 @@ class HillClimbingFeeController:
         # saturated channels, and cost recovery for rebalanced channels all take
         # priority over normal ceiling limits. If any protective floor is active,
         # ensure ceiling accommodates it.
-        effective_floor = max(balance_floor_ppm, saturation_floor_ppm, rebalance_floor_ppm or 0)
+        effective_floor = max(
+            balance_floor_ppm,
+            saturation_floor_ppm,
+            0 if saturation_drain_active else (rebalance_floor_ppm or 0),
+        )
         if effective_floor > cfg.min_fee_ppm:  # A protective floor is active
             min_ceiling_for_floor = effective_floor + 100  # Allow room for hill climbing
             if base_ceiling_ppm < min_ceiling_for_floor:
@@ -5669,6 +5674,19 @@ class HillClimbingFeeController:
                     f"band={band_min_ppm or '-'}-{band_max_ppm or '-'} ppm",
                     level='debug'
                 )
+
+        if saturation_drain_ceiling is not None:
+            capped_floor_ppm = min(base_floor_ppm, saturation_drain_ceiling)
+            capped_ceiling_ppm = min(base_ceiling_ppm, saturation_drain_ceiling)
+            if capped_floor_ppm != base_floor_ppm or capped_ceiling_ppm != base_ceiling_ppm:
+                self.plugin.log(
+                    f"SATURATION_DRAIN_CAP: {channel_id[:12]}... "
+                    f"floor={base_floor_ppm}->{capped_floor_ppm}, "
+                    f"ceiling={base_ceiling_ppm}->{capped_ceiling_ppm}",
+                    level='info'
+                )
+            base_floor_ppm = capped_floor_ppm
+            base_ceiling_ppm = capped_ceiling_ppm
 
         # =====================================================================
         # IMPROVEMENT #1: Apply Multipliers to Bounds (Not Fee Directly)

@@ -705,7 +705,7 @@ class TestSaturationProtectionFloor:
         )
         assert result == global_min
 
-    def test_saturation_floor_skipped_when_drain_ceiling_applies(self, mock_database, mock_plugin):
+    def test_saturation_drain_floor_skipped_when_drain_ceiling_applies(self, mock_database, mock_plugin):
         """Saturation floor should NOT apply to channels >90% when drain ceiling is enabled."""
         from modules.fee_controller import HillClimbingFeeController
         from modules.config import Config
@@ -741,10 +741,10 @@ class TestSaturationProtectionFloor:
 # =============================================================================
 
 
-class TestSaturationDrainCeiling:
+class TestSaturation_Drain_Ceiling:
     """Tests for saturation drain ceiling that caps fees for heavily saturated channels."""
 
-    def test_drain_ceiling_not_applied_below_threshold(self, mock_database, mock_plugin):
+    def test_saturation_drain_ceiling_not_applied_below_threshold(self, mock_database, mock_plugin):
         """Drain ceiling should not apply to channels below 90% local balance."""
         from modules.fee_controller import HillClimbingFeeController
         from modules.config import Config
@@ -770,7 +770,7 @@ class TestSaturationDrainCeiling:
         result = fc._get_saturation_drain_ceiling(channel_id, 89.0, current_fee, global_min)
         assert result is None
 
-    def test_drain_ceiling_applies_at_90_percent(self, mock_database, mock_plugin):
+    def test_saturation_drain_ceiling_applies_at_90_percent(self, mock_database, mock_plugin):
         """Drain ceiling should apply to channels at 90%+ local balance."""
         from modules.fee_controller import HillClimbingFeeController
         from modules.config import Config
@@ -790,7 +790,7 @@ class TestSaturationDrainCeiling:
         # Should be 3x global_min = 30 ppm
         assert result == int(global_min * fc.SATURATION_DRAIN_CEILING_MULT_90)
 
-    def test_drain_ceiling_scales_with_saturation_severity(self, mock_database, mock_plugin):
+    def test_saturation_drain_ceiling_scales_with_saturation_severity(self, mock_database, mock_plugin):
         """More severe saturation should result in lower ceiling."""
         from modules.fee_controller import HillClimbingFeeController
         from modules.config import Config
@@ -822,7 +822,7 @@ class TestSaturationDrainCeiling:
         assert result_severe == int(global_min * 2.0)    # 20 ppm
         assert result_critical == int(global_min * 1.5)  # 15 ppm
 
-    def test_drain_ceiling_disabled_returns_none(self, mock_database, mock_plugin):
+    def test_saturation_drain_ceiling_disabled_returns_none(self, mock_database, mock_plugin):
         """When feature disabled, should return None."""
         from modules.fee_controller import HillClimbingFeeController
         from modules.config import Config
@@ -840,7 +840,7 @@ class TestSaturationDrainCeiling:
         result = fc._get_saturation_drain_ceiling(channel_id, 99.0, current_fee, global_min)
         assert result is None
 
-    def test_drain_ceiling_interaction_with_saturation_floor(self, mock_database, mock_plugin):
+    def test_saturation_drain_ceiling_interaction_with_saturation_floor(self, mock_database, mock_plugin):
         """Verify drain ceiling and floor don't conflict in the 80-90% range."""
         from modules.fee_controller import HillClimbingFeeController
         from modules.config import Config
@@ -869,6 +869,222 @@ class TestSaturationDrainCeiling:
         ceiling = fc._get_saturation_drain_ceiling(channel_id, 95.0, current_fee, global_min)
         assert floor == global_min  # Floor is not active (drain takes over)
         assert ceiling is not None  # Ceiling is active
+
+
+# =============================================================================
+# Saturation Drain _adjust_channel_fee Integration Tests
+# =============================================================================
+
+
+class TestSaturation_Drain_AdjustChannelFee:
+    """Regression tests for saturation-drain ceiling in _adjust_channel_fee."""
+
+    def _make_fc(self, mock_plugin, mock_database, *, policy_manager=None, hive_bridge=None):
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+        fc = HillClimbingFeeController(
+            mock_plugin,
+            config,
+            mock_database,
+            clboss,
+            policy_manager=policy_manager,
+            hive_bridge=hive_bridge,
+        )
+
+        cfg = MockConfigSnapshot(
+            min_fee_ppm=10,
+            max_fee_ppm=2000,
+            fee_interval=1800,
+            enable_reputation=False,
+            enable_scarcity_pricing=False,
+            scarcity_threshold=0.30,
+            ema_smoothing_alpha=0.3,
+            inbound_fee_estimate_ppm=200,
+            thompson_prior_std_fee=200.0,
+            hive_min_confidence_for_prior=0.3,
+            routing_intelligence_enabled=False,
+        )
+        fc.config.snapshot.return_value = cfg
+
+        fc.ENABLE_THOMPSON_AIMD = False
+        fc.ENABLE_HISTORICAL_CURVE = False
+        fc.ENABLE_ELASTICITY = False
+        fc.ENABLE_THOMPSON_SAMPLING = False
+        fc.ENABLE_COLD_START = False
+        fc.ENABLE_HIVE_COORDINATION = False
+        fc.ENABLE_COMPETITION_AVOIDANCE = False
+        fc._calculate_floor = MagicMock(return_value=cfg.min_fee_ppm)
+        fc._get_channel_age_days = MagicMock(return_value=120)
+        fc._get_fee_volatility = MagicMock(return_value=0.0)
+        fc._get_channel_failure_rate = MagicMock(return_value=0.0)
+        fc._apply_fee_anchor = MagicMock(side_effect=lambda cid, fee, floor, ceiling: (fee, None))
+        fc.set_channel_fee = MagicMock(return_value={"success": True})
+
+        mock_database.get_channel_probe.return_value = None
+        mock_database.get_volume_since.return_value = 100_000
+        mock_database.get_weighted_volume_since.return_value = 100_000
+        mock_database.get_forward_count_since.return_value = 10
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_channel_state.return_value = {
+            "kalman_flow_ratio": 0.95,
+            "kalman_velocity": 0.0,
+        }
+        mock_database.get_fee_strategy_state.return_value = {
+            "last_revenue_rate": 5.0,
+            "last_fee_ppm": 500,
+            "trend_direction": 1,
+            "step_ppm": 50,
+            "last_update": int(time.time()) - 7200,
+            "consecutive_same_direction": 0,
+            "is_sleeping": 0,
+            "sleep_until": 0,
+            "stable_cycles": 0,
+            "forward_count_since_update": 10,
+            "last_volume_sats": 100_000,
+            "v2_state_json": None,
+        }
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 1800
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_channel_cost_history.return_value = []
+        mock_database.get_channel_rebalance_success_rate.return_value = None
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+        mock_database.get_recent_fee_changes.return_value = []
+        mock_database.update_fee_strategy_state = MagicMock()
+        mock_database.record_fee_change = MagicMock()
+
+        return fc, cfg
+
+    def _channel_info(self, *, current_fee_ppm=500, local_balance_pct=95.0):
+        capacity_sats = 1_000_000
+        spendable_sats = int(capacity_sats * (local_balance_pct / 100.0))
+        return {
+            "channel_id": "123x456x0",
+            "peer_id": "02" + "a" * 64,
+            "capacity": capacity_sats,
+            "spendable_msat": f"{spendable_sats * 1000}msat",
+            "receivable_msat": f"{(capacity_sats - spendable_sats) * 1000}msat",
+            "fee_base_msat": 0,
+            "fee_proportional_millionths": current_fee_ppm,
+            "opener": "local",
+        }
+
+    def test_saturation_drain_adjust_channel_fee_caps_fee_on_legacy_path(self, mock_database, mock_plugin):
+        """A >90% local channel should clamp to the drain ceiling during adjustment."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        channel_info = self._channel_info(current_fee_ppm=100, local_balance_pct=95.0)
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            channel_info["peer_id"],
+            {"state": "source", "forward_count": 50, "sats_out": 10000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        expected_ceiling = int(cfg.min_fee_ppm * fc.SATURATION_DRAIN_CEILING_MULT_95)
+        assert result is not None
+        assert result.new_fee_ppm == expected_ceiling
+
+    def test_saturation_drain_adjust_channel_fee_keeps_rebalance_floor_from_raising_ceiling(
+        self, mock_database, mock_plugin
+    ):
+        """Rebalance floor must not override the drain ceiling for saturated source channels."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        channel_info = self._channel_info(current_fee_ppm=100, local_balance_pct=95.0)
+        now = int(time.time())
+        mock_database.get_channel_cost_history.return_value = [
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": now - 3600},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": now - 7200},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": now - 10800},
+        ]
+        mock_database.get_channel_rebalance_success_rate.return_value = {
+            "total": 3,
+            "successes": 3,
+            "failures": 0,
+            "success_rate": 1.0,
+            "avg_cost_ppm": 100,
+            "avg_amount_sats": 1_000_000,
+        }
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            channel_info["peer_id"],
+            {"state": "source", "forward_count": 50, "sats_out": 10000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        expected_ceiling = int(cfg.min_fee_ppm * fc.SATURATION_DRAIN_CEILING_MULT_95)
+        assert result is not None
+        assert result.new_fee_ppm == expected_ceiling
+
+    def test_saturation_drain_adjust_channel_fee_preserves_cap_against_policy_autoband(
+        self, mock_database, mock_plugin
+    ):
+        """Dynamic policy autobands must not re-raise the drain ceiling."""
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = False
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id="02" + "a" * 64,
+            strategy=FeeStrategy.DYNAMIC,
+            fee_ppm_target=500,
+            fee_multiplier_min=1.0,
+        )
+
+        fc, cfg = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+        channel_info = self._channel_info(current_fee_ppm=100, local_balance_pct=95.0)
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            channel_info["peer_id"],
+            {"state": "congested", "forward_count": 50, "sats_out": 10000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        expected_ceiling = int(cfg.min_fee_ppm * fc.SATURATION_DRAIN_CEILING_MULT_95)
+        assert result is not None
+        assert result.new_fee_ppm == expected_ceiling
+
+    def test_saturation_drain_adjust_channel_fee_preserves_cap_against_hive_bounds(
+        self, mock_database, mock_plugin
+    ):
+        """High-confidence hive fee intel must not re-raise the drain ceiling."""
+        hive_bridge = MagicMock()
+        hive_bridge.query_fee_intelligence.return_value = {
+            "confidence": 1.0,
+            "avg_fee_charged": 1000,
+            "optimal_fee_estimate": 800,
+            "market_share": 0.10,
+            "estimated_elasticity": -0.2,
+        }
+
+        fc, cfg = self._make_fc(
+            mock_plugin,
+            mock_database,
+            hive_bridge=hive_bridge,
+        )
+        fc.ENABLE_HIVE_INTELLIGENCE = True
+        channel_info = self._channel_info(local_balance_pct=95.0)
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            channel_info["peer_id"],
+            {"state": "congested", "forward_count": 50, "sats_out": 10000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        expected_ceiling = int(cfg.min_fee_ppm * fc.SATURATION_DRAIN_CEILING_MULT_95)
+        assert result is not None
+        assert result.new_fee_ppm == expected_ceiling
 
 
 # =============================================================================
