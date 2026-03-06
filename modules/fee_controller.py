@@ -3168,9 +3168,9 @@ class HillClimbingFeeController:
     # protect scarce liquidity and ensure any routing is adequately compensated.
     ENABLE_BALANCE_FLOOR = True       # Feature flag
     CRITICAL_BALANCE_THRESHOLD = 10   # Percent - below this is "critical"
-    CRITICAL_BALANCE_MIN_FEE = 500    # PPM floor for critically drained channels
+    CRITICAL_BALANCE_MIN_FEE = 200    # PPM floor for critically drained channels (reduced from 500)
     LOW_BALANCE_THRESHOLD = 25        # Percent - below this is "low"
-    LOW_BALANCE_MIN_FEE = 200         # PPM floor for low balance channels
+    LOW_BALANCE_MIN_FEE = 100         # PPM floor for low balance channels (reduced from 200)
 
     # ==========================================================================
     # Issue #20: Flow-Based Ceiling Reduction
@@ -3218,6 +3218,28 @@ class HillClimbingFeeController:
     # Idle duration multipliers (hours since last forward)
     SATURATION_IDLE_HOURS_LONG = 72       # 3+ days idle = 1.5x protection
     SATURATION_IDLE_HOURS_SHORT = 24      # 1+ day idle = 1.25x protection
+
+    # ==========================================================================
+    # Saturation Drain Ceiling (Fix: Fee Death Spiral Inversion)
+    # ==========================================================================
+    # When a channel is HEAVILY saturated (>90% local balance), it needs LOW
+    # fees to ATTRACT outbound flow and drain excess local liquidity. This is
+    # the OPPOSITE of the saturation floor which protects against flash drains.
+    #
+    # The death spiral problem: saturated channels get high fees (saturation
+    # floor), depleted channels get high fees (balance floor), so ALL channels
+    # end up with high fees and routing dies.
+    #
+    # This ceiling CAPS fees low for heavily saturated channels to encourage
+    # drainage. The ceiling scales with saturation severity.
+    ENABLE_SATURATION_DRAIN = True        # Feature flag
+    SATURATION_DRAIN_THRESHOLD_PCT = 90   # Above this % local balance = needs drainage
+    SATURATION_DRAIN_SEVERE_PCT = 95      # Above this = more aggressive drainage
+    SATURATION_DRAIN_CRITICAL_PCT = 99    # Above this = most aggressive drainage
+    # Ceiling multipliers (applied to global_min)
+    SATURATION_DRAIN_CEILING_MULT_90 = 3.0   # 90-95%: ceiling at 3x global_min
+    SATURATION_DRAIN_CEILING_MULT_95 = 2.0   # 95-99%: ceiling at 2x global_min
+    SATURATION_DRAIN_CEILING_MULT_99 = 1.5   # 99%+: ceiling at 1.5x global_min
 
     # ==========================================================================
     # Cold-Start Mode for Stagnant Channels
@@ -3906,8 +3928,12 @@ class HillClimbingFeeController:
         if not self.ENABLE_SATURATION_FLOOR:
             return global_min
 
-        # Only apply to saturated channels (high local balance)
+        # Only apply to saturated channels (high local balance) in the 80-90% range
+        # Channels >90% use saturation DRAIN ceiling instead (need LOW fees to drain)
         if local_balance_pct < self.SATURATION_THRESHOLD_PCT:
+            return global_min
+        if self.ENABLE_SATURATION_DRAIN and local_balance_pct >= self.SATURATION_DRAIN_THRESHOLD_PCT:
+            # >90%: Drain ceiling applies, not protection floor
             return global_min
 
         # Get recent activity metrics
@@ -3965,6 +3991,76 @@ class HillClimbingFeeController:
             )
 
         return max(global_min, protection_floor)
+
+    def _get_saturation_drain_ceiling(
+        self,
+        channel_id: str,
+        local_balance_pct: float,
+        current_fee_ppm: int,
+        global_min: int
+    ) -> Optional[int]:
+        """
+        Saturation drain ceiling for heavily saturated channels.
+
+        When a channel has >90% local balance, it needs LOW fees to ATTRACT
+        outbound flow and drain excess liquidity. This is the OPPOSITE of the
+        saturation floor (which protects against flash drains for 80-90% range).
+
+        The death spiral problem: saturated channels get high fees from the
+        saturation floor, depleted channels get high fees from balance floor,
+        so ALL channels end up with high fees and routing dies.
+
+        This ceiling CAPS fees low to encourage drainage. The ceiling tightens
+        as saturation becomes more severe:
+        - 90-95% local: ceiling at 3x global_min
+        - 95-99% local: ceiling at 2x global_min
+        - 99%+ local:   ceiling at 1.5x global_min
+
+        Args:
+            channel_id: Channel to check
+            local_balance_pct: Local balance as percentage (0-100)
+            current_fee_ppm: Current fee in PPM
+            global_min: Global minimum fee from config
+
+        Returns:
+            Ceiling in PPM if saturation drain applies, None otherwise
+        """
+        if not self.ENABLE_SATURATION_DRAIN:
+            return None
+
+        # Only apply to heavily saturated channels (>90% local balance)
+        if local_balance_pct < self.SATURATION_DRAIN_THRESHOLD_PCT:
+            return None
+
+        # Calculate ceiling based on saturation severity
+        if local_balance_pct >= self.SATURATION_DRAIN_CRITICAL_PCT:
+            ceiling_mult = self.SATURATION_DRAIN_CEILING_MULT_99
+            severity = "critical"
+        elif local_balance_pct >= self.SATURATION_DRAIN_SEVERE_PCT:
+            ceiling_mult = self.SATURATION_DRAIN_CEILING_MULT_95
+            severity = "severe"
+        else:
+            ceiling_mult = self.SATURATION_DRAIN_CEILING_MULT_90
+            severity = "moderate"
+
+        drain_ceiling = int(global_min * ceiling_mult)
+
+        # Only apply if current fee is above the drain ceiling
+        if current_fee_ppm > drain_ceiling:
+            self.plugin.log(
+                f"SATURATION_DRAIN: {channel_id[:12]}... local={local_balance_pct:.0f}% ({severity}), "
+                f"capping fee from {current_fee_ppm} to {drain_ceiling}ppm "
+                f"(ceiling={ceiling_mult:.1f}x global_min={global_min})",
+                level='info'
+            )
+        else:
+            self.plugin.log(
+                f"SATURATION_DRAIN: {channel_id[:12]}... local={local_balance_pct:.0f}% ({severity}), "
+                f"current_fee={current_fee_ppm}ppm already below drain_ceiling={drain_ceiling}ppm",
+                level='debug'
+            )
+
+        return drain_ceiling
 
     def _get_rebalance_cost_floor(
         self,
@@ -5415,7 +5511,7 @@ class HillClimbingFeeController:
         if flow_state == "source":
             flow_state_multiplier = 1.25  # Sources are scarce - higher fees
         elif flow_state == "sink":
-            flow_state_multiplier = 0.80  # Sinks fill for free - lower floor
+            flow_state_multiplier = 0.50  # Sinks fill for free - aggressively lower floor
         
         # Get profitability multiplier (uses marginal ROI now)
         profitability_multiplier = 1.0
@@ -5493,6 +5589,19 @@ class HillClimbingFeeController:
         base_ceiling_ppm = self._get_flow_adjusted_ceiling(
             channel_id, current_fee_ppm, base_ceiling_ppm
         )
+
+        # =====================================================================
+        # Saturation Drain Ceiling (Fix: Fee Death Spiral Inversion)
+        # =====================================================================
+        # Heavily saturated channels (>90% local) need LOW fees to drain.
+        # This ceiling overrides normal ceiling to encourage outbound flow.
+        saturation_drain_ceiling = self._get_saturation_drain_ceiling(
+            channel_id, local_balance_pct, current_fee_ppm, cfg.min_fee_ppm
+        )
+        if saturation_drain_ceiling is not None:
+            # Drain ceiling takes precedence - cap the ceiling
+            if base_ceiling_ppm > saturation_drain_ceiling:
+                base_ceiling_ppm = saturation_drain_ceiling
 
         # =====================================================================
         # Issue #18 Fix: Balance Floor Priority (extended for Issue #32 & saturation)

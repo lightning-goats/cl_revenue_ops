@@ -502,8 +502,8 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-max-fee-ppm',
-    default='5000',
-    description='Maximum fee ceiling in PPM (default: 5000)'
+    default='2000',
+    description='Maximum fee ceiling in PPM (default: 2000)'
 )
 
 plugin.add_option(

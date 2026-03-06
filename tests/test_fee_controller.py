@@ -575,7 +575,7 @@ class TestSaturationProtectionFloor:
         assert result == global_min
 
     def test_saturation_floor_applies_to_saturated_idle_channels(self, mock_database, mock_plugin):
-        """Saturated idle channels should get a protective floor."""
+        """Saturated idle channels should get a protective floor (80-90% range)."""
         from modules.fee_controller import HillClimbingFeeController
         from modules.config import Config
 
@@ -588,11 +588,12 @@ class TestSaturationProtectionFloor:
         capacity_sats = 5_000_000  # 5M sats -> 25 ppm base floor
         global_min = 5
 
-        # Saturated (100% balance), idle (no recent forwards)
+        # Saturated (85% balance - in floor range), idle (no recent forwards)
+        # Note: >90% now uses drain ceiling instead, floor only applies 80-90%
         mock_database.get_last_forward_time.return_value = None  # Never forwarded
         mock_database.get_forward_count_since.return_value = 0   # No recent forwards
 
-        result = fc._get_saturation_protection_floor(channel_id, capacity_sats, 100.0, global_min)
+        result = fc._get_saturation_protection_floor(channel_id, capacity_sats, 85.0, global_min)
 
         # Should be: max(15, 5M/200K) = 25 ppm base
         # activity_factor = 1.0 (idle)
@@ -602,7 +603,7 @@ class TestSaturationProtectionFloor:
         assert result > global_min  # Higher than global min
 
     def test_saturation_floor_decays_with_activity(self, mock_database, mock_plugin):
-        """Protection floor should decay as channel becomes active."""
+        """Protection floor should decay as channel becomes active (80-90% range)."""
         from modules.fee_controller import HillClimbingFeeController
         from modules.config import Config
 
@@ -619,23 +620,24 @@ class TestSaturationProtectionFloor:
         # Recently active channel
         mock_database.get_last_forward_time.return_value = now - 3600  # 1 hour ago
 
-        # Test with increasing activity levels
+        # Test with increasing activity levels (using 85% to stay in floor range)
+        # Note: >90% now uses drain ceiling instead, floor only applies 80-90%
         # Cautious: 10-19 forwards -> 75% protection
         mock_database.get_forward_count_since.return_value = 15
         result_cautious = fc._get_saturation_protection_floor(
-            channel_id, capacity_sats, 100.0, global_min
+            channel_id, capacity_sats, 85.0, global_min
         )
 
         # Warming: 20-49 forwards -> 50% protection
         mock_database.get_forward_count_since.return_value = 30
         result_warming = fc._get_saturation_protection_floor(
-            channel_id, capacity_sats, 100.0, global_min
+            channel_id, capacity_sats, 85.0, global_min
         )
 
         # Trusted: 50+ forwards -> no protection
         mock_database.get_forward_count_since.return_value = 60
         result_trusted = fc._get_saturation_protection_floor(
-            channel_id, capacity_sats, 100.0, global_min
+            channel_id, capacity_sats, 85.0, global_min
         )
 
         # More activity should mean lower (or no) protection
@@ -643,7 +645,7 @@ class TestSaturationProtectionFloor:
         assert result_trusted == global_min  # Fully trusted
 
     def test_saturation_floor_scales_with_capacity(self, mock_database, mock_plugin):
-        """Larger channels should get higher protection floors."""
+        """Larger channels should get higher protection floors (80-90% range)."""
         from modules.fee_controller import HillClimbingFeeController
         from modules.config import Config
 
@@ -660,19 +662,20 @@ class TestSaturationProtectionFloor:
         mock_database.get_last_forward_time.return_value = now - 86400 * 2  # 2 days ago
         mock_database.get_forward_count_since.return_value = 5  # Low activity
 
+        # Note: >90% now uses drain ceiling instead, floor only applies 80-90%
         # 1M sat channel
         result_1m = fc._get_saturation_protection_floor(
-            channel_id, 1_000_000, 100.0, global_min
+            channel_id, 1_000_000, 85.0, global_min
         )
 
         # 5M sat channel
         result_5m = fc._get_saturation_protection_floor(
-            channel_id, 5_000_000, 100.0, global_min
+            channel_id, 5_000_000, 85.0, global_min
         )
 
         # 10M sat channel
         result_10m = fc._get_saturation_protection_floor(
-            channel_id, 10_000_000, 100.0, global_min
+            channel_id, 10_000_000, 85.0, global_min
         )
 
         # Larger channels should have higher floors
@@ -701,6 +704,171 @@ class TestSaturationProtectionFloor:
             channel_id, capacity_sats, 100.0, global_min
         )
         assert result == global_min
+
+    def test_saturation_floor_skipped_when_drain_ceiling_applies(self, mock_database, mock_plugin):
+        """Saturation floor should NOT apply to channels >90% when drain ceiling is enabled."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc.ENABLE_SATURATION_DRAIN = True  # Ensure drain ceiling is enabled
+
+        channel_id = "123x456x0"
+        capacity_sats = 10_000_000
+        global_min = 10
+
+        mock_database.get_last_forward_time.return_value = None
+        mock_database.get_forward_count_since.return_value = 0
+
+        # 95% local balance - drain ceiling should apply, not protection floor
+        result = fc._get_saturation_protection_floor(
+            channel_id, capacity_sats, 95.0, global_min
+        )
+        assert result == global_min  # No floor because drain ceiling takes over
+
+        # 85% local balance - protection floor should still apply (80-90% range)
+        result = fc._get_saturation_protection_floor(
+            channel_id, capacity_sats, 85.0, global_min
+        )
+        assert result > global_min  # Floor applies in 80-90% range
+
+
+# =============================================================================
+# Saturation Drain Ceiling Tests (Fix: Fee Death Spiral Inversion)
+# =============================================================================
+
+
+class TestSaturationDrainCeiling:
+    """Tests for saturation drain ceiling that caps fees for heavily saturated channels."""
+
+    def test_drain_ceiling_not_applied_below_threshold(self, mock_database, mock_plugin):
+        """Drain ceiling should not apply to channels below 90% local balance."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        current_fee = 500
+        global_min = 10
+
+        # Not heavily saturated (50% balance) - should return None
+        result = fc._get_saturation_drain_ceiling(channel_id, 50.0, current_fee, global_min)
+        assert result is None
+
+        # Not heavily saturated (85% balance - in floor range, not drain) - should return None
+        result = fc._get_saturation_drain_ceiling(channel_id, 85.0, current_fee, global_min)
+        assert result is None
+
+        # Not heavily saturated (89% balance) - should return None
+        result = fc._get_saturation_drain_ceiling(channel_id, 89.0, current_fee, global_min)
+        assert result is None
+
+    def test_drain_ceiling_applies_at_90_percent(self, mock_database, mock_plugin):
+        """Drain ceiling should apply to channels at 90%+ local balance."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        current_fee = 500
+        global_min = 10
+
+        # 90% local balance - moderate drainage ceiling
+        result = fc._get_saturation_drain_ceiling(channel_id, 90.0, current_fee, global_min)
+        assert result is not None
+        # Should be 3x global_min = 30 ppm
+        assert result == int(global_min * fc.SATURATION_DRAIN_CEILING_MULT_90)
+
+    def test_drain_ceiling_scales_with_saturation_severity(self, mock_database, mock_plugin):
+        """More severe saturation should result in lower ceiling."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        current_fee = 500
+        global_min = 10
+
+        # 92% - moderate (3x)
+        result_moderate = fc._get_saturation_drain_ceiling(channel_id, 92.0, current_fee, global_min)
+
+        # 97% - severe (2x)
+        result_severe = fc._get_saturation_drain_ceiling(channel_id, 97.0, current_fee, global_min)
+
+        # 99.5% - critical (1.5x)
+        result_critical = fc._get_saturation_drain_ceiling(channel_id, 99.5, current_fee, global_min)
+
+        # More saturated = lower ceiling
+        assert result_moderate > result_severe
+        assert result_severe > result_critical
+
+        # Verify exact values
+        assert result_moderate == int(global_min * 3.0)  # 30 ppm
+        assert result_severe == int(global_min * 2.0)    # 20 ppm
+        assert result_critical == int(global_min * 1.5)  # 15 ppm
+
+    def test_drain_ceiling_disabled_returns_none(self, mock_database, mock_plugin):
+        """When feature disabled, should return None."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc.ENABLE_SATURATION_DRAIN = False  # Disable feature
+
+        channel_id = "123x456x0"
+        current_fee = 500
+        global_min = 10
+
+        result = fc._get_saturation_drain_ceiling(channel_id, 99.0, current_fee, global_min)
+        assert result is None
+
+    def test_drain_ceiling_interaction_with_saturation_floor(self, mock_database, mock_plugin):
+        """Verify drain ceiling and floor don't conflict in the 80-90% range."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+
+        channel_id = "123x456x0"
+        capacity_sats = 5_000_000
+        current_fee = 500
+        global_min = 10
+
+        mock_database.get_last_forward_time.return_value = None
+        mock_database.get_forward_count_since.return_value = 0
+
+        # 85% - floor applies, ceiling does not
+        floor = fc._get_saturation_protection_floor(channel_id, capacity_sats, 85.0, global_min)
+        ceiling = fc._get_saturation_drain_ceiling(channel_id, 85.0, current_fee, global_min)
+        assert floor > global_min  # Floor is active
+        assert ceiling is None      # Ceiling is not active
+
+        # 95% - ceiling applies, floor does not
+        floor = fc._get_saturation_protection_floor(channel_id, capacity_sats, 95.0, global_min)
+        ceiling = fc._get_saturation_drain_ceiling(channel_id, 95.0, current_fee, global_min)
+        assert floor == global_min  # Floor is not active (drain takes over)
+        assert ceiling is not None  # Ceiling is active
 
 
 # =============================================================================
