@@ -27,11 +27,21 @@ IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
     'sling_available',  # L15 FIX: Runtime dependency flag, set during init only
 })
 
+PUBLIC_RUNTIME_KEYS = (
+    'paused',
+    'daily_budget_sats',
+    'min_fee_ppm',
+    'max_fee_ppm',
+)
+
+DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset()
+
 # Type mapping for config fields (for validation)
 CONFIG_FIELD_TYPES: Dict[str, type] = {
     'flow_interval': int,
     'fee_interval': int,
     'rebalance_interval': int,
+    'paused': bool,
     'min_fee_ppm': int,
     'max_fee_ppm': int,
     'daily_budget_sats': int,
@@ -155,6 +165,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # AUDIT FIX C-1: clboss_enabled was missing, causing bool set as string
     'clboss_enabled': bool,
 }
+
+DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset(
+    key for key in CONFIG_FIELD_TYPES.keys() if key not in PUBLIC_RUNTIME_KEYS
+)
 
 # Range constraints for numeric fields
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
@@ -392,6 +406,7 @@ class Config:
     sling_deplete_pct_balanced: float = 0.20  # Sling default
 
     # Safety flags
+    paused: bool = False           # If True, suppress automated executor actions
     dry_run: bool = False          # If True, log but don't execute
     
     # Runtime dependency flags (set during init based on listplugins)
@@ -503,6 +518,28 @@ class Config:
         torn reads when config is updated mid-cycle.
         """
         return ConfigSnapshot.from_config(self)
+
+    def public_runtime_keys(self) -> list[str]:
+        """Return the supported public runtime controls."""
+        return list(PUBLIC_RUNTIME_KEYS)
+
+    @classmethod
+    def is_public_runtime_key(cls, key: str) -> bool:
+        """Return True when the key is part of the supported operator surface."""
+        return key in PUBLIC_RUNTIME_KEYS
+
+    def public_runtime_dict(self) -> Dict[str, Any]:
+        """Return only the supported public runtime controls and their values."""
+        return {key: getattr(self, key) for key in PUBLIC_RUNTIME_KEYS}
+
+    @classmethod
+    def classify_runtime_key(cls, key: str) -> str:
+        """Classify a runtime key for operator-surface decisions."""
+        if cls.is_public_runtime_key(key):
+            return "public"
+        if key in DEPRECATED_RUNTIME_KEYS:
+            return "deprecated"
+        return "internal"
     
     def load_overrides(self, database: 'Database') -> list:
         """Load config overrides from database on startup. Returns list of warnings."""
@@ -685,6 +722,7 @@ class ConfigSnapshot:
     flow_interval: int
     fee_interval: int
     rebalance_interval: int
+    paused: bool
     hot_channel_protection_enabled: bool
     hot_channel_protection_override_peers: str
     hot_channel_protection_min_velocity: float
