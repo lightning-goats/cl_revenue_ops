@@ -735,6 +735,30 @@ class TestSaturationProtectionFloor:
         )
         assert result > global_min  # Floor applies in 80-90% range
 
+    def test_saturation_drain_disabled_restores_legacy_floor_above_90(self, mock_database, mock_plugin):
+        """Disabling drain ceiling should restore the old >90% saturation floor behavior."""
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        clboss = MagicMock()
+
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc.ENABLE_SATURATION_DRAIN = False
+
+        channel_id = "123x456x0"
+        capacity_sats = 10_000_000
+        global_min = 10
+
+        mock_database.get_last_forward_time.return_value = None
+        mock_database.get_forward_count_since.return_value = 0
+
+        result = fc._get_saturation_protection_floor(
+            channel_id, capacity_sats, 95.0, global_min
+        )
+
+        assert result > global_min
+
 
 # =============================================================================
 # Saturation Drain Ceiling Tests (Fix: Fee Death Spiral Inversion)
@@ -1078,6 +1102,79 @@ class TestSaturation_Drain_AdjustChannelFee:
             channel_info["channel_id"],
             channel_info["peer_id"],
             {"state": "congested", "forward_count": 50, "sats_out": 10000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        expected_ceiling = int(cfg.min_fee_ppm * fc.SATURATION_DRAIN_CEILING_MULT_95)
+        assert result is not None
+        assert result.new_fee_ppm == expected_ceiling
+
+    def test_saturation_drain_adjust_channel_fee_reverts_to_floor_behavior_when_disabled(
+        self, mock_database, mock_plugin
+    ):
+        """Disabling drain should restore the old >90% saturation-floor path."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        fc.ENABLE_SATURATION_DRAIN = False
+        channel_info = self._channel_info(current_fee_ppm=100, local_balance_pct=95.0)
+        mock_database.get_last_forward_time.return_value = None
+        mock_database.get_forward_count_since.return_value = 0
+
+        saturation_floor = fc._get_saturation_protection_floor(
+            channel_info["channel_id"],
+            channel_info["capacity"],
+            95.0,
+            cfg.min_fee_ppm,
+        )
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            channel_info["peer_id"],
+            {"state": "congested", "forward_count": 50, "sats_out": 10000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        drain_ceiling = int(cfg.min_fee_ppm * fc.SATURATION_DRAIN_CEILING_MULT_95)
+        assert saturation_floor > cfg.min_fee_ppm
+        assert result is not None
+        assert result.new_fee_ppm >= saturation_floor
+        assert result.new_fee_ppm > drain_ceiling
+
+    def test_saturation_drain_adjust_channel_fee_preserves_cap_against_vegas_floor_boost(
+        self, mock_database, mock_plugin
+    ):
+        """Vegas reflex floor boosts must still be capped by the drain ceiling."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        channel_info = self._channel_info(current_fee_ppm=100, local_balance_pct=95.0)
+        fc._calculate_floor.return_value = 50
+        fc._vegas_state.get_floor_multiplier = MagicMock(return_value=4.0)
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            channel_info["peer_id"],
+            {"state": "congested", "forward_count": 50, "sats_out": 10000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        expected_ceiling = int(cfg.min_fee_ppm * fc.SATURATION_DRAIN_CEILING_MULT_95)
+        assert result is not None
+        assert result.new_fee_ppm == expected_ceiling
+
+    def test_saturation_drain_adjust_channel_fee_caps_vegas_floor_spike(
+        self, mock_database, mock_plugin
+    ):
+        """Vegas Reflex floor spikes must still be capped by the drain ceiling."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        fc._vegas_state.get_floor_multiplier = MagicMock(return_value=4.0)
+        fc._calculate_floor = MagicMock(return_value=20)
+        channel_info = self._channel_info(current_fee_ppm=100, local_balance_pct=95.0)
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            channel_info["peer_id"],
+            {"state": "source", "forward_count": 50, "sats_out": 10000},
             channel_info,
             cfg=cfg,
         )
