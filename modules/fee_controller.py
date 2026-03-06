@@ -7879,6 +7879,7 @@ class HillClimbingFeeController:
 
         # Serialize v2.0 state to JSON
         v2_data = {
+            "algorithm_version": "thompson_aimd_v1",
             "historical_curve": state.historical_curve_data,
             "elasticity": state.elasticity_data,
             "thompson": state.thompson_data,
