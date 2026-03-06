@@ -1086,6 +1086,41 @@ class TestSaturation_Drain_AdjustChannelFee:
         assert result is not None
         assert result.new_fee_ppm == expected_ceiling
 
+    def test_saturation_drain_adjust_channel_fee_preserves_cap_against_hive_defense_legacy(
+        self, mock_database, mock_plugin
+    ):
+        """Legacy hill-climb defense multipliers must not bypass the drain ceiling."""
+        hive_bridge = MagicMock()
+        hive_bridge.query_defense_status.return_value = {
+            "peer_threat": {
+                "is_threat": True,
+                "threat_type": "drain",
+                "severity": 0.9,
+                "defensive_multiplier": 3.0,
+            }
+        }
+
+        fc, cfg = self._make_fc(
+            mock_plugin,
+            mock_database,
+            hive_bridge=hive_bridge,
+        )
+        fc.ENABLE_HIVE_COORDINATION = True
+        fc.ENABLE_HIVE_INTELLIGENCE = False
+        channel_info = self._channel_info(current_fee_ppm=100, local_balance_pct=95.0)
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            channel_info["peer_id"],
+            {"state": "source", "forward_count": 50, "sats_out": 10000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        expected_ceiling = int(cfg.min_fee_ppm * fc.SATURATION_DRAIN_CEILING_MULT_95)
+        assert result is not None
+        assert result.new_fee_ppm == expected_ceiling
+
 
 # =============================================================================
 # Success-Rate-Adjusted Cost Floor Tests (Change 9)

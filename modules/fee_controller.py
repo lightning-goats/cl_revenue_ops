@@ -6947,7 +6947,10 @@ class HillClimbingFeeController:
                 defense_fee = self._apply_defense_multiplier(peer_id, new_fee_ppm)
                 if defense_fee != new_fee_ppm:
                     # Defense multiplier can exceed normal ceiling for threats
-                    new_fee_ppm = max(floor_ppm, defense_fee)
+                    if saturation_drain_ceiling is not None:
+                        new_fee_ppm = max(floor_ppm, min(effective_ceiling, defense_fee))
+                    else:
+                        new_fee_ppm = max(floor_ppm, defense_fee)
 
             # =================================================================
             # PHASE 2: Fleet-Aware Fee Adjustment
