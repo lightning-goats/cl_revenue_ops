@@ -4845,6 +4845,7 @@ class HillClimbingFeeController:
             "sleeping": 0,
             "waiting_time": 0,
             "waiting_forwards": 0,
+            "alpha_guard": 0,
             "fee_unchanged": 0,
             "gossip_hysteresis": 0,
             "idempotent": 0,
@@ -4969,6 +4970,16 @@ class HillClimbingFeeController:
                 actual_fee = channel_info.get("fee_proportional_millionths", 0)
                 hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=actual_fee)
                 now = int(time.time())
+                pre_is_sleeping = hc_state.is_sleeping
+                pre_last_update = hc_state.last_update
+                pre_last_broadcast_fee = hc_state.last_broadcast_fee_ppm
+                pre_forward_count = 0
+                pre_hours_elapsed = 0.0
+                if pre_last_update > 0:
+                    pre_hours_elapsed = (now - pre_last_update) / 3600.0
+                    pre_forward_count = self.database.get_forward_count_since(
+                        channel_id, pre_last_update
+                    )
 
                 adjustment = self._adjust_channel_fee(
                     channel_id=channel_id,
@@ -4982,22 +4993,17 @@ class HillClimbingFeeController:
                 if adjustment:
                     adjustments.append(adjustment)
                 else:
-                    # Track why this channel was skipped
-                    if hc_state.is_sleeping:
-                        skip_reasons["sleeping"] += 1
-                    elif hc_state.last_update > 0:
-                        hours_elapsed = (now - hc_state.last_update) / 3600.0
-                        forward_count = self.database.get_forward_count_since(
-                            channel_id, hc_state.last_update)
-                        if hours_elapsed < self.MIN_OBSERVATION_HOURS:
-                            skip_reasons["waiting_time"] += 1
-                        elif forward_count < self.MIN_FORWARDS_FOR_SIGNAL:
-                            skip_reasons["waiting_forwards"] += 1
-                        else:
-                            # Must be fee unchanged, gossip hysteresis, or idempotent
-                            skip_reasons["fee_unchanged"] += 1
-                    else:
-                        skip_reasons["fee_unchanged"] += 1
+                    skip_reason = self._classify_no_adjustment_skip_reason(
+                        hc_state=hc_state,
+                        now=now,
+                        pre_is_sleeping=pre_is_sleeping,
+                        pre_last_update=pre_last_update,
+                        pre_hours_elapsed=pre_hours_elapsed,
+                        pre_forward_count=pre_forward_count,
+                        actual_fee_ppm=actual_fee,
+                        pre_last_broadcast_fee_ppm=pre_last_broadcast_fee,
+                    )
+                    skip_reasons[skip_reason] += 1
 
             except Exception as e:
                 self.plugin.log(f"Error adjusting fee for {channel_id}: {e}", level='error')
@@ -5018,6 +5024,46 @@ class HillClimbingFeeController:
                 )
 
         return adjustments
+
+    def _classify_no_adjustment_skip_reason(
+        self,
+        hc_state: "HillClimbState",
+        now: int,
+        pre_is_sleeping: bool,
+        pre_last_update: int,
+        pre_hours_elapsed: float,
+        pre_forward_count: int,
+        actual_fee_ppm: int,
+        pre_last_broadcast_fee_ppm: int,
+    ) -> str:
+        """Classify scheduler skip reasons without trusting post-call timer resets."""
+        if pre_is_sleeping:
+            return "sleeping"
+
+        if pre_last_update > 0:
+            if self.ENABLE_DYNAMIC_WINDOWS:
+                time_ok = pre_hours_elapsed >= self.MIN_OBSERVATION_HOURS
+                forwards_ok = pre_forward_count >= self.MIN_FORWARDS_FOR_SIGNAL
+                if not time_ok and not forwards_ok:
+                    return "waiting_time"
+            else:
+                if pre_hours_elapsed < self.MIN_OBSERVATION_HOURS:
+                    return "waiting_time"
+
+        if hc_state.last_update >= now:
+            if (
+                hc_state.last_fee_ppm != actual_fee_ppm
+                and hc_state.last_broadcast_fee_ppm == pre_last_broadcast_fee_ppm
+            ):
+                return "gossip_hysteresis"
+            if (
+                hc_state.last_fee_ppm == actual_fee_ppm
+                and hc_state.last_broadcast_fee_ppm == actual_fee_ppm
+            ):
+                return "idempotent"
+            return "alpha_guard"
+
+        return "fee_unchanged"
 
     def _should_force_gossip_refresh(
         self,
