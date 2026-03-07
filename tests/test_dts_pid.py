@@ -2,7 +2,7 @@
 import math
 import time
 import pytest
-from modules.fee_controller import GaussianThompsonState, PIDState
+from modules.fee_controller import GaussianThompsonState, PIDState, ThompsonAIMDState
 
 
 class TestPIDState:
@@ -144,3 +144,38 @@ class TestDTSDiscountFactor:
         assert ts.posterior_std > 100.0
         max_std = math.sqrt(1.0 / GaussianThompsonState.MIN_PRECISION)
         assert ts.posterior_std <= max_std + 0.01
+
+
+class TestPIDStatePersistence:
+    """Tests for PID state serialization in ThompsonAIMDState."""
+
+    def test_v2_dict_includes_pid_state(self):
+        ts = ThompsonAIMDState()
+        ts.algorithm_version = "thompson_aimd_v1"
+        d = ts.to_v2_dict()
+        assert "pid_state" in d
+
+    def test_pid_state_roundtrip(self):
+        ts = ThompsonAIMDState()
+        ts.algorithm_version = "thompson_aimd_v1"
+        ts.pid = PIDState(kp=3.0, ki=0.2, kd=4.0)
+        ts.pid.ewma_error = 0.25
+        ts.pid.integral_error = 1.5
+        ts.pid.last_update_time = 1000000
+        d = ts.to_v2_dict()
+        restored = ThompsonAIMDState.from_v2_dict(d)
+        assert restored.pid.kp == 3.0
+        assert abs(restored.pid.ewma_error - 0.25) < 1e-9
+        assert abs(restored.pid.integral_error - 1.5) < 1e-9
+        assert restored.pid.last_update_time == 1000000
+
+    def test_missing_pid_state_initializes_fresh(self):
+        d = {
+            "algorithm_version": "thompson_aimd_v1",
+            "thompson_state": {},
+            "aimd_state": {},
+        }
+        ts = ThompsonAIMDState.from_v2_dict(d)
+        assert isinstance(ts.pid, PIDState)
+        assert ts.pid.kp == 2.0
+        assert ts.pid.ewma_error == 0.0
