@@ -339,10 +339,12 @@ class TestDTSPIDIntegration:
         ch_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
+        # Use current_fee_ppm=500 so PID-adjusted fees (around 150-200)
+        # are far enough from current to pass the Alpha Guard threshold.
         # First call to initialise Thompson state
         fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
-            self._channel_info(outbound_pct=50.0), cfg=cfg
+            self._channel_info(outbound_pct=50.0, current_fee_ppm=500), cfg=cfg
         )
 
         # Pin Thompson sample_fee to return a deterministic value
@@ -355,7 +357,7 @@ class TestDTSPIDIntegration:
 
         result_balanced = fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
-            self._channel_info(outbound_pct=50.0), cfg=cfg
+            self._channel_info(outbound_pct=50.0, current_fee_ppm=500), cfg=cfg
         )
 
         # Reset PID for saturated run
@@ -364,7 +366,7 @@ class TestDTSPIDIntegration:
 
         result_saturated = fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
-            self._channel_info(outbound_pct=90.0), cfg=cfg
+            self._channel_info(outbound_pct=90.0, current_fee_ppm=500), cfg=cfg
         )
         assert result_balanced is not None and result_saturated is not None
         assert result_saturated.new_fee_ppm <= result_balanced.new_fee_ppm
