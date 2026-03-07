@@ -1174,6 +1174,7 @@ class TestSaturation_Drain_AdjustChannelFee:
         fc.config.snapshot.return_value = cfg
 
         fc.ENABLE_THOMPSON_AIMD = False
+        fc.ENABLE_SIMPLIFIED_FEE_PATH = False  # Allow legacy Hill Climbing path
         fc.ENABLE_HISTORICAL_CURVE = False
         fc.ENABLE_ELASTICITY = False
         fc.ENABLE_THOMPSON_SAMPLING = False

@@ -48,6 +48,7 @@ def test_threadsafe_rpc_fire_and_forget_drops_when_async_queue_full():
 def test_revenue_fee_anchor_rejects_invalid_numeric_fields():
     mod = _load_plugin_module()
     mod.fee_controller = MagicMock()
+    mod.fee_controller.ENABLE_SIMPLIFIED_FEE_PATH = False  # Test legacy validation path
 
     r1 = mod.revenue_fee_anchor(
         mod.plugin, action="set", channel_id="1x2x3", target_fee_ppm=100, ttl_hours="abc"

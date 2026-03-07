@@ -3293,6 +3293,12 @@ class HillClimbingFeeController:
     # Thompson Sampling is now the PRIMARY algorithm (not secondary to Hill Climbing)
     # AIMD provides quick defensive adjustments when market conditions change
     ENABLE_THOMPSON_AIMD = True       # Master switch for Thompson+AIMD (replaces Hill Climbing)
+
+    # Phase 1 simplification: skip unvalidated post-Thompson modifiers
+    # (elasticity, profitability weighting, cold-start, competition avoidance,
+    #  stigmergic modulation, fee anchors, historical response curve)
+    # Set False to restore legacy 13-modifier path for rollback.
+    ENABLE_SIMPLIFIED_FEE_PATH = True
     THOMPSON_COLD_START_BONUS = 1.5   # Extra exploration for channels with few observations
     THOMPSON_CONTEXT_WEIGHT = 0.7     # Weight for contextual vs global posterior
     AIMD_DEFENSE_CEILING_BOOST = 0.1  # Allow 10% above ceiling when in defense mode
@@ -5925,6 +5931,7 @@ class HillClimbingFeeController:
         target_found = False
         is_cold_start = False  # Initialize here; may be set True in Hill Climbing branch
         heuristic_modifiers = HeuristicModifiers()  # Initialize early; populated in Hill Climbing branch
+        volatility_reset = False  # Default; set True only inside Hill Climbing/Thompson volatility paths
 
         # Priority 1: Congestion (Emergency High Fee)
         if is_congested:
@@ -6055,181 +6062,184 @@ class HillClimbingFeeController:
 
             # Record observation for historical analysis
             regime_already_checked = False
-            if self.ENABLE_HISTORICAL_CURVE:
-                historical_curve.add_observation(
-                    fee_ppm=current_fee_ppm,
-                    revenue_rate=current_revenue_rate,
-                    forward_count=forward_count
-                )
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                if self.ENABLE_HISTORICAL_CURVE:
+                    historical_curve.add_observation(
+                        fee_ppm=current_fee_ppm,
+                        revenue_rate=current_revenue_rate,
+                        forward_count=forward_count
+                    )
 
-                # Check for regime change
-                # M-12: Track whether we already checked regime to avoid double-detection below
-                regime_already_checked = False
-                if now - historical_curve.last_regime_check > self.REGIME_CHECK_INTERVAL:
-                    historical_curve.last_regime_check = now
-                    regime_already_checked = True
-                    if historical_curve.detect_regime_change(current_revenue_rate):
-                        self.plugin.log(
-                            f"THOMPSON: Regime change detected for {channel_id[:12]}... "
-                            f"Resetting Thompson posterior.",
-                            level='info'
-                        )
-                        historical_curve.reset_curve()
-                        # Reset Thompson and AIMD on regime change
-                        ts_state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
-                        ts_state.aimd.reset()
+                    # Check for regime change
+                    # M-12: Track whether we already checked regime to avoid double-detection below
+                    regime_already_checked = False
+                    if now - historical_curve.last_regime_check > self.REGIME_CHECK_INTERVAL:
+                        historical_curve.last_regime_check = now
+                        regime_already_checked = True
+                        if historical_curve.detect_regime_change(current_revenue_rate):
+                            self.plugin.log(
+                                f"THOMPSON: Regime change detected for {channel_id[:12]}... "
+                                f"Resetting Thompson posterior.",
+                                level='info'
+                            )
+                            historical_curve.reset_curve()
+                            # Reset Thompson and AIMD on regime change
+                            ts_state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
+                            ts_state.aimd.reset()
 
-                ts_state.set_historical_curve(historical_curve)
+                    ts_state.set_historical_curve(historical_curve)
 
             # Update elasticity tracker
-            if self.ENABLE_ELASTICITY:
-                elasticity_tracker.add_observation(
-                    fee_ppm=current_fee_ppm,
-                    volume_sats=volume_since_sats,
-                    revenue_rate=current_revenue_rate
-                )
-                ts_state.set_elasticity_tracker(elasticity_tracker)
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                if self.ENABLE_ELASTICITY:
+                    elasticity_tracker.add_observation(
+                        fee_ppm=current_fee_ppm,
+                        volume_sats=volume_since_sats,
+                        revenue_rate=current_revenue_rate
+                    )
+                    ts_state.set_elasticity_tracker(elasticity_tracker)
 
             # =====================================================================
             # P2 FLEET INTEGRATION: Elasticity & Curve Sharing
             # =====================================================================
             # Share observations with fleet and incorporate fleet-aggregated data
             # for better collective learning
-            if self.hive_bridge and self.hive_bridge.is_available():
-                # --- ELASTICITY SHARING ---
-                if self.ENABLE_ELASTICITY and elasticity_tracker.should_broadcast():
-                    try:
-                        broadcast_data = elasticity_tracker.get_broadcast_data()
-                        self.hive_bridge.broadcast_elasticity_observation(
-                            peer_id=peer_id,
-                            elasticity=broadcast_data["elasticity"],
-                            confidence=broadcast_data["confidence"],
-                            sample_count=broadcast_data["sample_count"]
-                        )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_ELASTICITY: Failed to broadcast elasticity: {e}",
-                            level='debug'
-                        )
-
-                # Query and incorporate fleet elasticity data
-                if self.ENABLE_ELASTICITY:
-                    try:
-                        fleet_elasticity = self.hive_bridge.query_fleet_elasticity(peer_id)
-                        if fleet_elasticity:
-                            elasticity_tracker.incorporate_fleet_data(
-                                fleet_elasticity=fleet_elasticity.get("elasticity", -1.0),
-                                fleet_confidence=fleet_elasticity.get("confidence", 0),
-                                fleet_weight=0.3  # 30% weight to fleet data
-                            )
-                            ts_state.set_elasticity_tracker(elasticity_tracker)
-                            self.plugin.log(
-                                f"P2_ELASTICITY: {channel_id[:12]}... incorporated fleet data "
-                                f"(fleet_e={fleet_elasticity.get('elasticity', -1.0):.2f}, "
-                                f"local_e={elasticity_tracker.current_elasticity:.2f})",
-                                level='debug'
-                            )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_ELASTICITY: Failed to query fleet elasticity: {e}",
-                            level='debug'
-                        )
-
-                # --- RESPONSE CURVE SHARING ---
-                if self.ENABLE_HISTORICAL_CURVE and historical_curve.should_broadcast_observation(
-                    fee_ppm=current_fee_ppm,
-                    revenue_rate=current_revenue_rate,
-                    forward_count=forward_count
-                ):
-                    try:
-                        self.hive_bridge.broadcast_curve_observation(
-                            peer_id=peer_id,
-                            fee_ppm=current_fee_ppm,
-                            revenue_rate=current_revenue_rate,
-                            forward_count=forward_count
-                        )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_CURVE: Failed to broadcast curve observation: {e}",
-                            level='debug'
-                        )
-
-                # Query and incorporate fleet aggregated curve
-                if self.ENABLE_HISTORICAL_CURVE:
-                    try:
-                        fleet_curve = self.hive_bridge.query_aggregated_curve(peer_id)
-                        if fleet_curve and fleet_curve.get("observations"):
-                            historical_curve.incorporate_fleet_curve(
-                                fleet_observations=fleet_curve["observations"],
-                                fleet_weight=0.25  # 25% weight to fleet curve
-                            )
-                            ts_state.set_historical_curve(historical_curve)
-                            self.plugin.log(
-                                f"P2_CURVE: {channel_id[:12]}... incorporated "
-                                f"{len(fleet_curve['observations'])} fleet observations",
-                                level='debug'
-                            )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_CURVE: Failed to query fleet curve: {e}",
-                            level='debug'
-                        )
-
-                # --- REGIME CHANGE DETECTION & COORDINATION ---
-                # M-12: Skip if already checked above in the Thompson block
-                if self.ENABLE_HISTORICAL_CURVE and not regime_already_checked:
-                    regime_changed = historical_curve.detect_regime_change(current_revenue_rate)
-                    if regime_changed:
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                if self.hive_bridge and self.hive_bridge.is_available():
+                    # --- ELASTICITY SHARING ---
+                    if self.ENABLE_ELASTICITY and elasticity_tracker.should_broadcast():
                         try:
-                            # Determine change type based on direction
-                            recent = historical_curve.observations[-10:] if len(historical_curve.observations) >= 10 else historical_curve.observations
-                            avg_revenue = sum(o.revenue_rate for o in recent) / len(recent) if recent else 0
-                            change_type = "expansion" if current_revenue_rate > avg_revenue else "contraction"
-
-                            self.hive_bridge.broadcast_regime_change(
+                            broadcast_data = elasticity_tracker.get_broadcast_data()
+                            self.hive_bridge.broadcast_elasticity_observation(
                                 peer_id=peer_id,
-                                change_type=change_type,
-                                old_regime={"avg_revenue": avg_revenue},
-                                new_regime={"current_revenue": current_revenue_rate},
-                                evidence={
-                                    "ratio": current_revenue_rate / max(1, avg_revenue),
-                                    "observation_count": len(historical_curve.observations)
-                                }
-                            )
-                            self.plugin.log(
-                                f"P2_REGIME: {channel_id[:12]}... detected {change_type} "
-                                f"(ratio={(current_revenue_rate / max(1, avg_revenue)):.2f})",
-                                level='info'
+                                elasticity=broadcast_data["elasticity"],
+                                confidence=broadcast_data["confidence"],
+                                sample_count=broadcast_data["sample_count"]
                             )
                         except Exception as e:
                             self.plugin.log(
-                                f"P2_REGIME: Failed to broadcast regime change: {e}",
+                                f"P2_ELASTICITY: Failed to broadcast elasticity: {e}",
                                 level='debug'
                             )
 
-                    # Query fleet regime status to detect coordinated shifts
-                    try:
-                        fleet_regime = self.hive_bridge.query_fleet_regime_status(peer_id)
-                        if fleet_regime and fleet_regime.get("regime_change_detected"):
-                            # Fleet detected regime change - reset our curve to adapt
-                            fleet_change_type = fleet_regime.get("change_type", "unknown")
-                            fleet_evidence_count = fleet_regime.get("evidence_count", 0)
+                    # Query and incorporate fleet elasticity data
+                    if self.ENABLE_ELASTICITY:
+                        try:
+                            fleet_elasticity = self.hive_bridge.query_fleet_elasticity(peer_id)
+                            if fleet_elasticity:
+                                elasticity_tracker.incorporate_fleet_data(
+                                    fleet_elasticity=fleet_elasticity.get("elasticity", -1.0),
+                                    fleet_confidence=fleet_elasticity.get("confidence", 0),
+                                    fleet_weight=0.3  # 30% weight to fleet data
+                                )
+                                ts_state.set_elasticity_tracker(elasticity_tracker)
+                                self.plugin.log(
+                                    f"P2_ELASTICITY: {channel_id[:12]}... incorporated fleet data "
+                                    f"(fleet_e={fleet_elasticity.get('elasticity', -1.0):.2f}, "
+                                    f"local_e={elasticity_tracker.current_elasticity:.2f})",
+                                    level='debug'
+                                )
+                        except Exception as e:
+                            self.plugin.log(
+                                f"P2_ELASTICITY: Failed to query fleet elasticity: {e}",
+                                level='debug'
+                            )
 
-                            if fleet_evidence_count >= 3 and not regime_changed:
-                                # Fleet has strong evidence, we should adapt even if we
-                                # didn't detect it locally
-                                historical_curve.reset_curve()
+                    # --- RESPONSE CURVE SHARING ---
+                    if self.ENABLE_HISTORICAL_CURVE and historical_curve.should_broadcast_observation(
+                        fee_ppm=current_fee_ppm,
+                        revenue_rate=current_revenue_rate,
+                        forward_count=forward_count
+                    ):
+                        try:
+                            self.hive_bridge.broadcast_curve_observation(
+                                peer_id=peer_id,
+                                fee_ppm=current_fee_ppm,
+                                revenue_rate=current_revenue_rate,
+                                forward_count=forward_count
+                            )
+                        except Exception as e:
+                            self.plugin.log(
+                                f"P2_CURVE: Failed to broadcast curve observation: {e}",
+                                level='debug'
+                            )
+
+                    # Query and incorporate fleet aggregated curve
+                    if self.ENABLE_HISTORICAL_CURVE:
+                        try:
+                            fleet_curve = self.hive_bridge.query_aggregated_curve(peer_id)
+                            if fleet_curve and fleet_curve.get("observations"):
+                                historical_curve.incorporate_fleet_curve(
+                                    fleet_observations=fleet_curve["observations"],
+                                    fleet_weight=0.25  # 25% weight to fleet curve
+                                )
                                 ts_state.set_historical_curve(historical_curve)
                                 self.plugin.log(
-                                    f"P2_REGIME: {channel_id[:12]}... resetting curve due to "
-                                    f"fleet {fleet_change_type} detection (evidence={fleet_evidence_count})",
+                                    f"P2_CURVE: {channel_id[:12]}... incorporated "
+                                    f"{len(fleet_curve['observations'])} fleet observations",
+                                    level='debug'
+                                )
+                        except Exception as e:
+                            self.plugin.log(
+                                f"P2_CURVE: Failed to query fleet curve: {e}",
+                                level='debug'
+                            )
+
+                    # --- REGIME CHANGE DETECTION & COORDINATION ---
+                    # M-12: Skip if already checked above in the Thompson block
+                    if self.ENABLE_HISTORICAL_CURVE and not regime_already_checked:
+                        regime_changed = historical_curve.detect_regime_change(current_revenue_rate)
+                        if regime_changed:
+                            try:
+                                # Determine change type based on direction
+                                recent = historical_curve.observations[-10:] if len(historical_curve.observations) >= 10 else historical_curve.observations
+                                avg_revenue = sum(o.revenue_rate for o in recent) / len(recent) if recent else 0
+                                change_type = "expansion" if current_revenue_rate > avg_revenue else "contraction"
+
+                                self.hive_bridge.broadcast_regime_change(
+                                    peer_id=peer_id,
+                                    change_type=change_type,
+                                    old_regime={"avg_revenue": avg_revenue},
+                                    new_regime={"current_revenue": current_revenue_rate},
+                                    evidence={
+                                        "ratio": current_revenue_rate / max(1, avg_revenue),
+                                        "observation_count": len(historical_curve.observations)
+                                    }
+                                )
+                                self.plugin.log(
+                                    f"P2_REGIME: {channel_id[:12]}... detected {change_type} "
+                                    f"(ratio={(current_revenue_rate / max(1, avg_revenue)):.2f})",
                                     level='info'
                                 )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_REGIME: Failed to query fleet regime status: {e}",
-                            level='debug'
-                        )
+                            except Exception as e:
+                                self.plugin.log(
+                                    f"P2_REGIME: Failed to broadcast regime change: {e}",
+                                    level='debug'
+                                )
+
+                        # Query fleet regime status to detect coordinated shifts
+                        try:
+                            fleet_regime = self.hive_bridge.query_fleet_regime_status(peer_id)
+                            if fleet_regime and fleet_regime.get("regime_change_detected"):
+                                # Fleet detected regime change - reset our curve to adapt
+                                fleet_change_type = fleet_regime.get("change_type", "unknown")
+                                fleet_evidence_count = fleet_regime.get("evidence_count", 0)
+
+                                if fleet_evidence_count >= 3 and not regime_changed:
+                                    # Fleet has strong evidence, we should adapt even if we
+                                    # didn't detect it locally
+                                    historical_curve.reset_curve()
+                                    ts_state.set_historical_curve(historical_curve)
+                                    self.plugin.log(
+                                        f"P2_REGIME: {channel_id[:12]}... resetting curve due to "
+                                        f"fleet {fleet_change_type} detection (evidence={fleet_evidence_count})",
+                                        level='info'
+                                    )
+                        except Exception as e:
+                            self.plugin.log(
+                                f"P2_REGIME: Failed to query fleet regime status: {e}",
+                                level='debug'
+                            )
 
             # =====================================================================
             # VOLATILITY & HYSTERESIS (preserved)
@@ -6299,11 +6309,12 @@ class HillClimbingFeeController:
             # =====================================================================
             # Bias the quadratic coefficient toward the curvature implied by
             # observed elasticity before the posterior update incorporates it.
-            if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
-                ts_state.thompson._apply_elasticity_to_prior(
-                    elasticity=elasticity_tracker.current_elasticity,
-                    confidence=elasticity_tracker.confidence
-                )
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
+                    ts_state.thompson._apply_elasticity_to_prior(
+                        elasticity=elasticity_tracker.current_elasticity,
+                        confidence=elasticity_tracker.confidence
+                    )
 
             # =====================================================================
             # THOMPSON SAMPLING: Update Posterior and Sample Fee
@@ -6335,139 +6346,145 @@ class HillClimbingFeeController:
 
             # =====================================================================
             # BROADCAST FEE DISCOVERIES (P1 Integration)
+            # + P2 COMPETITION AVOIDANCE: Thompson Posterior Sharing
             # =====================================================================
-            # Check if this observation represents a significant discovery
-            # that should be shared with the fleet
-            if self.hive_bridge and self.hive_bridge.is_available():
-                discovery = ts_state.thompson.check_for_discovery(
-                    fee=current_fee_ppm,
-                    revenue_rate=current_revenue_rate,
-                    min_revenue_rate=50.0,
-                    min_observations=5
-                )
-                if discovery:
-                    self.hive_bridge.broadcast_fee_observation(
-                        peer_id=peer_id,
-                        fee_ppm=discovery["fee_ppm"],
-                        revenue_rate=discovery["revenue_rate"],
-                        confidence=discovery["confidence"],
-                        discovery_type=discovery["discovery_type"],
-                        metadata={
-                            "posterior_mean": ts_state.thompson.posterior_mean,
-                            "posterior_std": ts_state.thompson.posterior_std,
-                            "observation_count": discovery.get("observation_count", 0),
-                            "context": context_key
-                        }
-                    )
-                    self.plugin.log(
-                        f"THOMPSON_DISCOVERY: {channel_id[:12]}... broadcasting "
-                        f"{discovery['discovery_type']} at {discovery['fee_ppm']}ppm "
-                        f"(revenue={discovery['revenue_rate']:.1f}sats/hr, "
-                        f"conf={discovery['confidence']:.2f})",
-                        level='info'
-                    )
-
-            # =====================================================================
-            # P2 COMPETITION AVOIDANCE: Thompson Posterior Sharing
-            # =====================================================================
-            # Share our Thompson posterior summary with fleet and query other
-            # members' posteriors. If our posterior overlaps significantly with
-            # fleet members, differentiate by biasing away from crowded regions.
+            # Gated: fee discovery broadcasts and competition avoidance require
+            # stigmergic context and fleet coordination (not needed in simplified path)
             fleet_posteriors = None
             differentiation_offset = 0
-            if self.hive_bridge and self.hive_bridge.is_available():
-                # Share our posterior summary for fleet coordination
-                try:
-                    obs_count = len(ts_state.thompson.observations)
-                    if obs_count >= 5:  # Only share if we have meaningful data
-                        self.hive_bridge.share_posterior_summary(
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                # Check if this observation represents a significant discovery
+                # that should be shared with the fleet
+                if self.hive_bridge and self.hive_bridge.is_available():
+                    discovery = ts_state.thompson.check_for_discovery(
+                        fee=current_fee_ppm,
+                        revenue_rate=current_revenue_rate,
+                        min_revenue_rate=50.0,
+                        min_observations=5
+                    )
+                    if discovery:
+                        self.hive_bridge.broadcast_fee_observation(
                             peer_id=peer_id,
-                            posterior_mean=ts_state.thompson.posterior_mean,
-                            posterior_std=ts_state.thompson.posterior_std,
-                            observation_count=obs_count,
-                            corridor_role=corridor_role
+                            fee_ppm=discovery["fee_ppm"],
+                            revenue_rate=discovery["revenue_rate"],
+                            confidence=discovery["confidence"],
+                            discovery_type=discovery["discovery_type"],
+                            metadata={
+                                "posterior_mean": ts_state.thompson.posterior_mean,
+                                "posterior_std": ts_state.thompson.posterior_std,
+                                "observation_count": discovery.get("observation_count", 0),
+                                "context": context_key
+                            }
                         )
-                except Exception as e:
-                    self.plugin.log(
-                        f"P2_COMPETE: Failed to share posterior: {e}",
-                        level='debug'
-                    )
+                        self.plugin.log(
+                            f"THOMPSON_DISCOVERY: {channel_id[:12]}... broadcasting "
+                            f"{discovery['discovery_type']} at {discovery['fee_ppm']}ppm "
+                            f"(revenue={discovery['revenue_rate']:.1f}sats/hr, "
+                            f"conf={discovery['confidence']:.2f})",
+                            level='info'
+                        )
 
-                # Query fleet posteriors for competition avoidance
-                try:
-                    fleet_posteriors = self.hive_bridge.query_fleet_posteriors(peer_id)
-                    if fleet_posteriors and fleet_posteriors.get("members"):
-                        # Analyze if we're in a crowded region
-                        our_mean = ts_state.thompson.posterior_mean
-                        crowded_region = False
-                        differentiation_direction = 0  # -1 = lower, 1 = higher
-
-                        for member in fleet_posteriors["members"]:
-                            member_mean = member.get("mean", 0)
-                            member_std = member.get("std", 100)
-
-                            # Check if posteriors significantly overlap
-                            # (means within 1.5 std of each other)
-                            overlap_threshold = 1.5 * max(ts_state.thompson.posterior_std, member_std)
-                            if abs(our_mean - member_mean) < overlap_threshold:
-                                crowded_region = True
-
-                                # Determine differentiation direction based on corridor role
-                                # Primary corridors go slightly lower (volume capture)
-                                # Secondary corridors go slightly higher (margin capture)
-                                if corridor_role == "P":
-                                    differentiation_direction = -1  # Primary goes lower
-                                else:
-                                    differentiation_direction = 1   # Secondary goes higher
-                                break
-
-                        if crowded_region:
-                            # Compute differentiation offset (applied to sampled fee, NOT posterior)
-                            diff_amount = int(ts_state.thompson.posterior_std * 0.3)
-                            differentiation_offset = differentiation_direction * diff_amount
-                            self.plugin.log(
-                                f"P2_COMPETE: {channel_id[:12]}... differentiating "
-                                f"from crowded region (mean: {ts_state.thompson.posterior_mean:.0f}, "
-                                f"offset={differentiation_offset:+d}, role={corridor_role})",
-                                level='info'
+                # Share our Thompson posterior summary with fleet and query other
+                # members' posteriors. If our posterior overlaps significantly with
+                # fleet members, differentiate by biasing away from crowded regions.
+                if self.hive_bridge and self.hive_bridge.is_available():
+                    # Share our posterior summary for fleet coordination
+                    try:
+                        obs_count = len(ts_state.thompson.observations)
+                        if obs_count >= 5:  # Only share if we have meaningful data
+                            self.hive_bridge.share_posterior_summary(
+                                peer_id=peer_id,
+                                posterior_mean=ts_state.thompson.posterior_mean,
+                                posterior_std=ts_state.thompson.posterior_std,
+                                observation_count=obs_count,
+                                corridor_role=corridor_role
                             )
-                except Exception as e:
-                    self.plugin.log(
-                        f"P2_COMPETE: Failed to query fleet posteriors: {e}",
-                        level='debug'
-                    )
+                    except Exception as e:
+                        self.plugin.log(
+                            f"P2_COMPETE: Failed to share posterior: {e}",
+                            level='debug'
+                        )
+
+                    # Query fleet posteriors for competition avoidance
+                    try:
+                        fleet_posteriors = self.hive_bridge.query_fleet_posteriors(peer_id)
+                        if fleet_posteriors and fleet_posteriors.get("members"):
+                            # Analyze if we're in a crowded region
+                            our_mean = ts_state.thompson.posterior_mean
+                            crowded_region = False
+                            differentiation_direction = 0  # -1 = lower, 1 = higher
+
+                            for member in fleet_posteriors["members"]:
+                                member_mean = member.get("mean", 0)
+                                member_std = member.get("std", 100)
+
+                                # Check if posteriors significantly overlap
+                                # (means within 1.5 std of each other)
+                                overlap_threshold = 1.5 * max(ts_state.thompson.posterior_std, member_std)
+                                if abs(our_mean - member_mean) < overlap_threshold:
+                                    crowded_region = True
+
+                                    # Determine differentiation direction based on corridor role
+                                    # Primary corridors go slightly lower (volume capture)
+                                    # Secondary corridors go slightly higher (margin capture)
+                                    if corridor_role == "P":
+                                        differentiation_direction = -1  # Primary goes lower
+                                    else:
+                                        differentiation_direction = 1   # Secondary goes higher
+                                    break
+
+                            if crowded_region:
+                                # Compute differentiation offset (applied to sampled fee, NOT posterior)
+                                diff_amount = int(ts_state.thompson.posterior_std * 0.3)
+                                differentiation_offset = differentiation_direction * diff_amount
+                                self.plugin.log(
+                                    f"P2_COMPETE: {channel_id[:12]}... differentiating "
+                                    f"from crowded region (mean: {ts_state.thompson.posterior_mean:.0f}, "
+                                    f"offset={differentiation_offset:+d}, role={corridor_role})",
+                                    level='info'
+                                )
+                    except Exception as e:
+                        self.plugin.log(
+                            f"P2_COMPETE: Failed to query fleet posteriors: {e}",
+                            level='debug'
+                        )
 
             # =====================================================================
-            # STIGMERGIC MODULATION (P1 Integration)
+            # THOMPSON SAMPLING: Sample Fee
             # =====================================================================
-            # Set context for exploration/exploitation balance based on:
-            # - Pheromone level: High = exploit, low = explore
-            # - Corridor role: Primary = exploit, secondary = explore
-            # - Time bucket: For time-aware posterior selection
-            ts_state.thompson.set_context_modulation(
-                pheromone_level=pheromone_level,
-                corridor_role=corridor_role,
-                time_bucket=time_bucket
-            )
+            if self.ENABLE_SIMPLIFIED_FEE_PATH:
+                # Simplified: direct posterior sample, no stigmergic modulation
+                thompson_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
+            else:
+                # Legacy: stigmergic context + elasticity bias + competition offset
+                # Set context for exploration/exploitation balance based on:
+                # - Pheromone level: High = exploit, low = explore
+                # - Corridor role: Primary = exploit, secondary = explore
+                # - Time bucket: For time-aware posterior selection
+                ts_state.thompson.set_context_modulation(
+                    pheromone_level=pheromone_level,
+                    corridor_role=corridor_role,
+                    time_bucket=time_bucket
+                )
 
-            # Sample fee from Thompson posterior (contextual if enough data)
-            # Now applies stigmergic modulation to exploration/exploitation
-            thompson_fee = ts_state.thompson.sample_fee_contextual(
-                context_key=context_key,
-                floor=floor_ppm,
-                ceiling=ceiling_ppm
-            )
+                # Sample fee from Thompson posterior (contextual if enough data)
+                # Now applies stigmergic modulation to exploration/exploitation
+                thompson_fee = ts_state.thompson.sample_fee_contextual(
+                    context_key=context_key,
+                    floor=floor_ppm,
+                    ceiling=ceiling_ppm
+                )
 
-            # Elasticity-informed sampled fee bias
-            if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
-                direction = elasticity_tracker.get_optimal_direction()
-                if direction != 0:
-                    bias = direction * elasticity_tracker.confidence * ts_state.thompson.posterior_std * 0.3
-                    thompson_fee = int(max(floor_ppm, min(ceiling_ppm, thompson_fee + bias)))
+                # Elasticity-informed sampled fee bias
+                if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
+                    direction = elasticity_tracker.get_optimal_direction()
+                    if direction != 0:
+                        bias = direction * elasticity_tracker.confidence * ts_state.thompson.posterior_std * 0.3
+                        thompson_fee = int(max(floor_ppm, min(ceiling_ppm, thompson_fee + bias)))
 
-            # Apply fleet differentiation offset (computed above, doesn't mutate posterior)
-            if differentiation_offset != 0:
-                thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
+                # Apply fleet differentiation offset (computed above, doesn't mutate posterior)
+                if differentiation_offset != 0:
+                    thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
 
             # =====================================================================
             # WEIGHTED AIMD SUCCESS METRIC + AIMD-THOMPSON COORDINATION
@@ -6505,51 +6522,52 @@ class HillClimbingFeeController:
             # - Profitable channels: Allow more aggressive exploration (wider range)
             # - Underperforming channels: Constrain to proven ranges
             # - Zombie/Fire Sale: Force low fees regardless of Thompson
-            profitability_adjustment = 0
-            if self.profitability:
-                try:
-                    from .profitability_analyzer import ProfitabilityClass
-                    prof_data = self.profitability.get_profitability(channel_id)
-                    if prof_data:
-                        # Calculate profitability weight
-                        if prof_data.classification == ProfitabilityClass.PROFITABLE:
-                            # Highly profitable - allow upward exploration
-                            if prof_data.roi_percent > 20:
-                                # Very profitable - bias toward higher fees
-                                profitability_adjustment = int(thompson_fee * 0.1)  # +10%
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                profitability_adjustment = 0
+                if self.profitability:
+                    try:
+                        from .profitability_analyzer import ProfitabilityClass
+                        prof_data = self.profitability.get_profitability(channel_id)
+                        if prof_data:
+                            # Calculate profitability weight
+                            if prof_data.classification == ProfitabilityClass.PROFITABLE:
+                                # Highly profitable - allow upward exploration
+                                if prof_data.roi_percent > 20:
+                                    # Very profitable - bias toward higher fees
+                                    profitability_adjustment = int(thompson_fee * 0.1)  # +10%
+                                    self.plugin.log(
+                                        f"P2_PROFIT: {channel_id[:12]}... profitable channel "
+                                        f"(ROI={prof_data.roi_percent:.1f}%), biasing up +{profitability_adjustment}ppm",
+                                        level='debug'
+                                    )
+                            elif prof_data.classification == ProfitabilityClass.MARGINAL:
+                                # Marginal - stay conservative with Thompson
+                                pass  # No adjustment
+                            elif prof_data.classification == ProfitabilityClass.UNDERWATER:
+                                # Underwater - bias toward lower fees to increase flow
+                                if prof_data.roi_percent < -20:
+                                    profitability_adjustment = -int(thompson_fee * 0.15)  # -15%
+                                    self.plugin.log(
+                                        f"P2_PROFIT: {channel_id[:12]}... underwater channel "
+                                        f"(ROI={prof_data.roi_percent:.1f}%), biasing down {abs(profitability_adjustment)}ppm",
+                                        level='debug'
+                                    )
+                            elif prof_data.classification == ProfitabilityClass.ZOMBIE:
+                                # Zombie - aggressive low pricing
+                                profitability_adjustment = floor_ppm - thompson_fee  # Force to floor
                                 self.plugin.log(
-                                    f"P2_PROFIT: {channel_id[:12]}... profitable channel "
-                                    f"(ROI={prof_data.roi_percent:.1f}%), biasing up +{profitability_adjustment}ppm",
-                                    level='debug'
+                                    f"P2_PROFIT: {channel_id[:12]}... zombie channel, "
+                                    f"forcing to floor ({floor_ppm}ppm)",
+                                    level='info'
                                 )
-                        elif prof_data.classification == ProfitabilityClass.MARGINAL:
-                            # Marginal - stay conservative with Thompson
-                            pass  # No adjustment
-                        elif prof_data.classification == ProfitabilityClass.UNDERWATER:
-                            # Underwater - bias toward lower fees to increase flow
-                            if prof_data.roi_percent < -20:
-                                profitability_adjustment = -int(thompson_fee * 0.15)  # -15%
-                                self.plugin.log(
-                                    f"P2_PROFIT: {channel_id[:12]}... underwater channel "
-                                    f"(ROI={prof_data.roi_percent:.1f}%), biasing down {abs(profitability_adjustment)}ppm",
-                                    level='debug'
-                                )
-                        elif prof_data.classification == ProfitabilityClass.ZOMBIE:
-                            # Zombie - aggressive low pricing
-                            profitability_adjustment = floor_ppm - thompson_fee  # Force to floor
-                            self.plugin.log(
-                                f"P2_PROFIT: {channel_id[:12]}... zombie channel, "
-                                f"forcing to floor ({floor_ppm}ppm)",
-                                level='info'
-                            )
 
-                        # Apply profitability adjustment
-                        thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + profitability_adjustment))
-                except Exception as e:
-                    self.plugin.log(
-                        f"P2_PROFIT: Failed to get profitability adjustment: {e}",
-                        level='debug'
-                    )
+                            # Apply profitability adjustment
+                            thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + profitability_adjustment))
+                    except Exception as e:
+                        self.plugin.log(
+                            f"P2_PROFIT: Failed to get profitability adjustment: {e}",
+                            level='debug'
+                        )
 
             # =====================================================================
             # FLEET DEFENSE COORDINATION
@@ -6604,20 +6622,21 @@ class HillClimbingFeeController:
                 decision_reason = f"thompson_sample (ctx={context_key})"
 
             # Cold-start mode: channels with very few forwards need lower fees
-            is_cold_start = False
-            total_forwards = state.get("forward_count", 0) if state else 0
-            if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
-                if current_fee_ppm > cfg.min_fee_ppm:
-                    is_cold_start = True
-                    # Bias Thompson toward lower fees for cold channels
-                    cold_target = min(new_fee_ppm, floor_ppm + 50)
-                    new_fee_ppm = cold_target
-                    decision_reason = f"thompson_cold_start (fwds={total_forwards})"
-                    self.plugin.log(
-                        f"THOMPSON COLD-START: {channel_id[:12]}... has {total_forwards} forwards. "
-                        f"Biasing toward floor ({new_fee_ppm} ppm).",
-                        level='info'
-                    )
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                is_cold_start = False
+                total_forwards = state.get("forward_count", 0) if state else 0
+                if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
+                    if current_fee_ppm > cfg.min_fee_ppm:
+                        is_cold_start = True
+                        # Bias Thompson toward lower fees for cold channels
+                        cold_target = min(new_fee_ppm, floor_ppm + 50)
+                        new_fee_ppm = cold_target
+                        decision_reason = f"thompson_cold_start (fwds={total_forwards})"
+                        self.plugin.log(
+                            f"THOMPSON COLD-START: {channel_id[:12]}... has {total_forwards} forwards. "
+                            f"Biasing toward floor ({new_fee_ppm} ppm).",
+                            level='info'
+                        )
 
             # Update volume tracking
             ts_state.last_volume_sats = volume_since_sats
@@ -6684,11 +6703,12 @@ class HillClimbingFeeController:
                         new_fee_ppm = blended_fee
 
             # Fee anchor blend (advisor soft target)
-            new_fee_ppm, anchor_reason = self._apply_fee_anchor(
-                channel_id, new_fee_ppm, floor_ppm, effective_ceiling
-            )
-            if anchor_reason:
-                decision_reason = f"{decision_reason}+{anchor_reason}"
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                new_fee_ppm, anchor_reason = self._apply_fee_anchor(
+                    channel_id, new_fee_ppm, floor_ppm, effective_ceiling
+                )
+                if anchor_reason:
+                    decision_reason = f"{decision_reason}+{anchor_reason}"
 
             # Defense multiplier -- skip in Thompson path: already applied inside aimd.apply_to_fee()
             if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not self.ENABLE_THOMPSON_AIMD:
@@ -6735,7 +6755,8 @@ class HillClimbingFeeController:
         # FALLBACK: Hill Climbing (Legacy Algorithm)
         # =====================================================================
         # Used when ENABLE_THOMPSON_AIMD is False
-        elif not target_found:
+        # Gated behind ENABLE_SIMPLIFIED_FEE_PATH — doubly unreachable when both flags are True
+        elif not target_found and not self.ENABLE_SIMPLIFIED_FEE_PATH:
             # HILL CLIMBING DECISION (Rate-Based)
             rate_change = current_revenue_rate - hc_state.last_revenue_rate
             last_direction = hc_state.trend_direction
