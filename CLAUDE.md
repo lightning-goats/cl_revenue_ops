@@ -36,7 +36,7 @@ sling (Rebalancing Engine - required)
 Core Lightning
 ```
 
-### Module Organization (12 modules)
+### Module Organization (11 modules)
 
 | Module | Purpose |
 |--------|---------|
@@ -45,7 +45,6 @@ Core Lightning
 | `flow_analysis.py` | Sink/Source detection, Kalman-filtered flow estimation with NaN recovery |
 | `policy_manager.py` | Per-peer policy engine (dynamic/static/passive/hive) |
 | `profitability_analyzer.py` | P&L calculation, ROC metrics, capacity recommendations |
-| `portfolio_optimizer.py` | Markowitz Mean-Variance optimization, Sharpe ratio, simplex projection |
 | `capacity_planner.py` | Channel sizing recommendations ("Winners & Losers") |
 | `hive_bridge.py` | cl-hive integration, MCF assignments, Kalman velocity sharing |
 | `clboss_manager.py` | Optional CLBoss integration for unmanage commands |
@@ -78,12 +77,6 @@ Core Lightning
 - State bounding: Clamps flow_ratio to [-1, 1], velocity to [-0.5, 0.5]
 - Covariance PD enforcement: Ensures positive-definite via eigenvalue correction
 - Persisted to `kalman_state` DB table for restart survival
-
-**Portfolio Optimization** (in `portfolio_optimizer.py`):
-- Markowitz Mean-Variance with Sharpe ratio objective
-- Simplex projection constrains allocations to sum to 1.0
-- Risk decomposition: Marginal risk contribution per channel
-- Correlation analysis for hedging opportunity detection
 
 ### Key Patterns
 
@@ -181,13 +174,12 @@ Core Lightning
 ```
 cl-revenue-ops/
 ├── cl-revenue-ops.py       # Main plugin entry point
-├── modules/                # 12 modules
+├── modules/                # 11 modules
 │   ├── fee_controller.py   # Thompson Sampling + Alpha Sequence
 │   ├── rebalancer.py       # EV-based rebalancing
 │   ├── flow_analysis.py    # Sink/Source detection + Kalman filter
 │   ├── policy_manager.py   # Per-peer policies
 │   ├── profitability_analyzer.py  # P&L and ROC
-│   ├── portfolio_optimizer.py     # Markowitz Mean-Variance optimization
 │   ├── capacity_planner.py # Channel recommendations
 │   ├── hive_bridge.py      # cl-hive integration
 │   ├── clboss_manager.py   # Optional CLBoss integration

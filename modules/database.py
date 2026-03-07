@@ -891,6 +891,12 @@ class Database:
         except sqlite3.OperationalError:
             pass
 
+        # Drop portfolio_metrics table (module removed)
+        try:
+            conn.execute("DROP TABLE IF EXISTS portfolio_metrics")
+        except Exception as e:
+            self.plugin.log(f"DB migration warning: {e}", level='debug')
+
         # Rebalancer efficiency: failure-informed routing columns
         for col, col_type, default in [
             ("last_attempted_ppm", "INTEGER", "0"),
@@ -1143,21 +1149,6 @@ class Database:
         except Exception as e:
             self.plugin.log(f"DB migration warning: Kalman schema migration failed: {e}", level="warn")
 
-        # Portfolio metrics table (for EV v2.0 rebalancer integration)
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS portfolio_metrics (
-                    channel_id TEXT PRIMARY KEY,
-                    avg_forward_size INTEGER DEFAULT 0,
-                    marginal_sharpe_contribution REAL DEFAULT 0.0,
-                    expected_return REAL DEFAULT 0.0,
-                    std_dev REAL DEFAULT 0.0,
-                    forward_frequency REAL DEFAULT 0.0,
-                    last_update INTEGER DEFAULT 0
-                )
-            """)
-        except Exception as e:
-            self.plugin.log(f"DB migration warning: Portfolio metrics schema failed: {e}", level="warn")
 
     # =========================================================================
     # Channel State Methods
@@ -1336,53 +1327,6 @@ class Database:
             (int(time.time()),)
         )
 
-    # =========================================================================
-    # Portfolio Metrics Methods (EV v2.0)
-    # =========================================================================
-
-    def save_portfolio_metrics(self, metrics: List[Dict[str, Any]]) -> None:
-        """Batch-save portfolio metrics for all channels."""
-        conn = self._get_connection()
-        now = int(time.time())
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for m in metrics:
-                conn.execute("""
-                    INSERT OR REPLACE INTO portfolio_metrics
-                    (channel_id, avg_forward_size, marginal_sharpe_contribution,
-                     expected_return, std_dev, forward_frequency, last_update)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    m["channel_id"],
-                    int(m.get("avg_forward_size", 0)),
-                    float(m.get("marginal_sharpe_contribution", 0.0)),
-                    float(m.get("expected_return", 0.0)),
-                    float(m.get("std_dev", 0.0)),
-                    float(m.get("forward_frequency", 0.0)),
-                    now,
-                ))
-            conn.execute("COMMIT")
-        except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-
-    def get_portfolio_metrics(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        """Get portfolio metrics for a single channel."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT * FROM portfolio_metrics WHERE channel_id = ?",
-            (channel_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def get_all_portfolio_metrics(self) -> Dict[str, Dict[str, Any]]:
-        """Get portfolio metrics for all channels, keyed by channel_id."""
-        conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM portfolio_metrics").fetchall()
-        return {row["channel_id"]: dict(row) for row in rows}
 
     # =========================================================================
     # Channel Probe Methods
@@ -3320,116 +3264,6 @@ class Database:
 
         return [{"timestamp": int(r["timestamp"]), "net_msat": int(r["net_msat"])} for r in rows]
 
-    def get_portfolio_forward_buckets(
-        self,
-        since_timestamp: int,
-        interval_hours: int = 4,
-        out_channels: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Return bucketed forward data suitable for PortfolioOptimizer.
-
-        This avoids `listforwards` RPC and keeps result size bounded by aggregating
-        at a fixed time interval.
-
-        Returned records include:
-        - out_channel
-        - received_time (bucket start timestamp)
-        - fee_msat (sum)
-        - out_msat (sum)
-        - count (number of forwards in the bucket)
-        """
-        conn = self._get_connection()
-        interval_secs = max(1, int(interval_hours)) * 3600
-
-        params: List[Any] = [interval_secs, since_timestamp]
-        out_filter = ""
-        if out_channels:
-            placeholders = ",".join("?" for _ in out_channels)
-            out_filter = f" AND out_channel IN ({placeholders})"
-            params.extend(list(out_channels))
-
-        # DB-7: Build params explicitly instead of fragile slicing.
-        # The query needs interval_secs twice (for division and multiplication),
-        # then since_timestamp, then any out_channel filters.
-        query_params: List[Any] = [interval_secs, interval_secs, since_timestamp]
-        if out_channels:
-            query_params.extend(list(out_channels))
-
-        rows = conn.execute(f"""
-            SELECT
-                out_channel,
-                (timestamp / ?) * ? AS bucket_ts,
-                COALESCE(SUM(fee_msat), 0) AS fee_msat,
-                COALESCE(SUM(out_msat), 0) AS out_msat,
-                COUNT(*) AS count
-            FROM forwards
-            WHERE timestamp >= ? {out_filter}
-            GROUP BY out_channel, bucket_ts
-        """, query_params).fetchall()
-
-        result: List[Dict[str, Any]] = []
-        for r in rows:
-            result.append({
-                "out_channel": r["out_channel"],
-                "received_time": int(r["bucket_ts"] or 0),
-                "fee_msat": int(r["fee_msat"] or 0),
-                "out_msat": int(r["out_msat"] or 0),
-                "count": int(r["count"] or 0),
-            })
-        return result
-
-    def get_portfolio_inbound_forward_buckets(
-        self,
-        since_timestamp: int,
-        interval_hours: int = 4,
-        in_channels: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Return bucketed forward data grouped by in_channel for inbound revenue attribution.
-
-        Mirrors get_portfolio_forward_buckets() but groups by in_channel so that
-        the portfolio optimizer can attribute revenue to inbound-gateway channels.
-
-        Returned records include:
-        - in_channel
-        - received_time (bucket start timestamp)
-        - fee_msat (sum)
-        - in_msat (sum)
-        - count (number of forwards in the bucket)
-        """
-        conn = self._get_connection()
-        interval_secs = max(1, int(interval_hours)) * 3600
-
-        in_filter = ""
-        query_params: List[Any] = [interval_secs, interval_secs, since_timestamp]
-        if in_channels:
-            placeholders = ",".join("?" for _ in in_channels)
-            in_filter = f" AND in_channel IN ({placeholders})"
-            query_params.extend(list(in_channels))
-
-        rows = conn.execute(f"""
-            SELECT
-                in_channel,
-                (timestamp / ?) * ? AS bucket_ts,
-                COALESCE(SUM(fee_msat), 0) AS fee_msat,
-                COALESCE(SUM(in_msat), 0) AS in_msat,
-                COUNT(*) AS count
-            FROM forwards
-            WHERE timestamp >= ? {in_filter}
-            GROUP BY in_channel, bucket_ts
-        """, query_params).fetchall()
-
-        result: List[Dict[str, Any]] = []
-        for r in rows:
-            result.append({
-                "in_channel": r["in_channel"],
-                "received_time": int(r["bucket_ts"] or 0),
-                "fee_msat": int(r["fee_msat"] or 0),
-                "in_msat": int(r["in_msat"] or 0),
-                "count": int(r["count"] or 0),
-            })
-        return result
 
     
     def record_forward(self, in_channel: str, out_channel: str,

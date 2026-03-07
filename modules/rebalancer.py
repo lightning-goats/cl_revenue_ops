@@ -2883,17 +2883,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # ZERO-TOLERANCE: Evaluate EV on the actual execution unit (one chunk).
         # This matches the "stop after first success" execution model.
         #
-        # EV v2.0: Dynamic chunk sizing based on avg_forward_size from the
-        # portfolio optimizer. Channels that naturally route small payments
-        # should use smaller chunks to maximize route success probability.
-        # If no portfolio data exists, fall back to the configured default.
-        dest_pm = self._get_portfolio_metrics(dest_channel)
-        dest_avg_fwd = dest_pm.get("avg_forward_size", 0)
-        if dest_avg_fwd > 0:
-            # Size chunks at ~2x the average forward to balance success rate vs. throughput
-            dynamic_chunk_cap = max(self.config.rebalance_min_amount, dest_avg_fwd * 2)
-        else:
-            dynamic_chunk_cap = int(self.config.sling_chunk_size_sats)
+        dynamic_chunk_cap = int(self.config.sling_chunk_size_sats)
         if hot_profile.get('eligible'):
             try:
                 dynamic_chunk_cap = int(dynamic_chunk_cap * float(hot_profile.get('chunk_multiplier', 1.0) or 1.0))
@@ -3161,24 +3151,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         expected_income = int((rebalance_amount * expected_utilization * outbound_fee_ppm) // 1_000_000)
 
-        # =================================================================
-        # EV v2.0: SHARPE-DERIVED OPPORTUNITY COST
-        # =================================================================
-        # Instead of crude turnover_weight = min(1.0, source_turnover_rate * 7),
-        # use the marginal Sharpe contribution from the portfolio optimizer to
-        # quantify the true opportunity cost of moving capital from source to dest.
-        # =================================================================
-        source_pm = self._get_portfolio_metrics(primary_source_id)
-        source_sharpe = source_pm.get("marginal_sharpe", 0.0)
-        dest_sharpe = dest_pm.get("marginal_sharpe", 0.0)
-
-        if source_sharpe > 0 and dest_sharpe > 0:
-            # Sharpe penalty: if source contributes more per unit risk than dest,
-            # the opportunity cost is proportionally higher.
-            sharpe_penalty_factor = max(1.0, source_sharpe / max(0.01, dest_sharpe))
-        else:
-            # No portfolio data — fall back to turnover-based weight
-            sharpe_penalty_factor = 1.0
+        sharpe_penalty_factor = 1.0
 
         turnover_weight = min(1.0, source_turnover_rate * 7)
         # I-2 FIX: Use source channel's own utilization probability for opportunity cost,
@@ -3314,32 +3287,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         except Exception:
             pass
         return {"flow_ratio": 0.0, "velocity": 0.0, "uncertainty": 0.316}
-
-    def _get_portfolio_metrics(self, channel_id: str) -> Dict[str, Any]:
-        """Retrieve cached portfolio metrics for a channel from the DB.
-
-        Returns dict with avg_forward_size, marginal_sharpe_contribution, etc.
-        Falls back to safe defaults if unavailable.
-        """
-        try:
-            pm = self.database.get_portfolio_metrics(channel_id)
-            if pm:
-                return {
-                    "avg_forward_size": int(pm.get("avg_forward_size", 0)),
-                    "marginal_sharpe": float(pm.get("marginal_sharpe_contribution", 0.0)),
-                    "expected_return": float(pm.get("expected_return", 0.0)),
-                    "std_dev": float(pm.get("std_dev", 0.0)),
-                    "forward_frequency": float(pm.get("forward_frequency", 0.0)),
-                }
-        except Exception:
-            pass
-        return {
-            "avg_forward_size": 0,
-            "marginal_sharpe": 0.0,
-            "expected_return": 0.0,
-            "std_dev": 0.0,
-            "forward_frequency": 0.0,
-        }
 
     def _estimate_expected_fee_sats(self, dest_peer_id: str, rebalance_amount: int) -> int:
         """Estimate the expected routing fee (not the max budget) for a rebalance.
