@@ -2599,6 +2599,111 @@ class AIMDDefenseState:
 
 
 # =============================================================================
+# IMPROVEMENT #7b: PID Balance Controller
+# =============================================================================
+# PID controller that adjusts fee multiplier based on channel balance drift.
+# Uses EWMA-smoothed error, capacity-scaled gains, and anti-windup clamping.
+# =============================================================================
+
+# Dynamic target ratios by flow state
+_PID_TARGET_RATIOS = {
+    "source": 0.7,
+    "sink": 0.3,
+    "balanced": 0.5,
+    "balanced_active": 0.5,
+    "congested": 0.5,
+    "unknown": 0.5,
+}
+
+
+@dataclass
+class PIDState:
+    """PID controller state for channel balance management."""
+    kp: float = 2.0
+    ki: float = 0.1
+    kd: float = 5.0
+    ewma_error: float = 0.0
+    integral_error: float = 0.0
+    prev_ewma_error: float = 0.0
+    last_update_time: int = 0
+    integral_clamp: float = 3.0
+    _EWMA_ALPHA: float = 0.3
+
+    def calculate_multiplier(
+        self,
+        current_outbound_ratio: float,
+        capacity_sats: int,
+        flow_state: str = "balanced",
+    ) -> float:
+        now = int(time.time())
+        if self.last_update_time <= 0:
+            dt = 0.0
+        else:
+            dt = max((now - self.last_update_time) / 3600.0, 0.0)
+        self.last_update_time = now
+
+        target = _PID_TARGET_RATIOS.get(flow_state, 0.5)
+
+        # Guard NaN/Inf
+        if not math.isfinite(current_outbound_ratio):
+            current_outbound_ratio = target
+        raw_error = target - current_outbound_ratio
+
+        self.ewma_error = (
+            self._EWMA_ALPHA * raw_error
+            + (1.0 - self._EWMA_ALPHA) * self.ewma_error
+        )
+
+        scale = 1.0 / math.log2(max(capacity_sats, 1) / 1_000_000 + 2)
+        eff_kp = self.kp * scale
+        eff_ki = self.ki * scale
+        eff_kd = self.kd * scale
+
+        p_term = eff_kp * self.ewma_error
+
+        if dt > 0:
+            self.integral_error += self.ewma_error * dt
+            self.integral_error = max(
+                -self.integral_clamp,
+                min(self.integral_clamp, self.integral_error),
+            )
+        i_term = eff_ki * self.integral_error
+
+        if dt > 0:
+            d_term = eff_kd * (self.ewma_error - self.prev_ewma_error) / max(dt, 0.1)
+        else:
+            d_term = 0.0
+        self.prev_ewma_error = self.ewma_error
+
+        output = p_term + i_term + d_term
+        multiplier = 1.5 ** output
+        return max(0.1, min(10.0, multiplier))
+
+    def to_dict(self) -> dict:
+        return {
+            "kp": self.kp, "ki": self.ki, "kd": self.kd,
+            "ewma_error": self.ewma_error,
+            "integral_error": self.integral_error,
+            "prev_ewma_error": self.prev_ewma_error,
+            "last_update_time": self.last_update_time,
+            "integral_clamp": self.integral_clamp,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PIDState":
+        state = cls()
+        state.kp = float(d.get("kp", 2.0))
+        state.ki = float(d.get("ki", 0.1))
+        state.kd = float(d.get("kd", 5.0))
+        state.ewma_error = float(d.get("ewma_error", 0.0))
+        state.integral_error = float(d.get("integral_error", 0.0))
+        state.prev_ewma_error = float(d.get("prev_ewma_error", 0.0))
+        state.last_update_time = int(d.get("last_update_time", 0))
+        state.integral_clamp = float(d.get("integral_clamp", 3.0))
+        return state
+
+
+# =============================================================================
 # IMPROVEMENT #8: Combined Thompson+AIMD State
 # =============================================================================
 # Unified state class that combines Thompson Sampling with AIMD defense.
