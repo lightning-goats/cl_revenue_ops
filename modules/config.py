@@ -164,9 +164,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'clboss_enabled': bool,
 }
 
-DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset(
-    key for key in CONFIG_FIELD_TYPES.keys() if key not in PUBLIC_RUNTIME_KEYS
-)
+# Explicit migration shims only. Non-public keys remain internal until they are
+# intentionally exposed as deprecated compatibility controls.
+DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset()
 
 # Range constraints for numeric fields
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {

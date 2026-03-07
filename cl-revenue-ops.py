@@ -3506,7 +3506,7 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
     Get or set runtime configuration (Phase 7: Dynamic Runtime Configuration).
     
     Usage:
-      lightning-cli revenue-config get           # Get all config
+      lightning-cli revenue-config get           # Get public operator controls
       lightning-cli revenue-config get <key>     # Get specific key
       lightning-cli revenue-config set <key> <value>  # Set key
       lightning-cli revenue-config reset <key>   # Reset to default
@@ -3515,33 +3515,39 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
     Examples:
       lightning-cli revenue-config get daily_budget_sats
       lightning-cli revenue-config set daily_budget_sats 10000
-      lightning-cli revenue-config set enable_vegas_reflex false
+      lightning-cli revenue-config set paused true
     """
     if config is None or database is None:
         return {"error": "Plugin not initialized"}
+
+    def _not_public_error(runtime_key: str) -> Dict[str, Any]:
+        return {"error": f"Key '{runtime_key}' is not a public runtime control"}
     
     if action == "get":
         if key:
             if not hasattr(config, key) or key.startswith('_'):
                 return {"error": f"Unknown config key: {key}"}
-            return {
+            result = {
                 "key": key,
                 "value": getattr(config, key),
-                "version": config._version
+                "version": config._version,
+                "classification": config.classify_runtime_key(key),
             }
+            if not config.is_public_runtime_key(key):
+                result["warning"] = _not_public_error(key)["error"]
+            return result
         else:
-            # Return all config as dict (exclude private fields)
-            snapshot = config.snapshot()
-            from dataclasses import asdict
-            config_dict = asdict(snapshot)
             return {
-                "config": config_dict,
+                "config": config.public_runtime_dict(),
                 "version": config._version
             }
     
     elif action == "set":
         if not key or value is None:
             return {"error": "Usage: revenue-config set <key> <value>"}
+
+        if not config.is_public_runtime_key(key):
+            return _not_public_error(key)
         
         result = config.update_runtime(database, key, str(value))
         
@@ -3557,6 +3563,9 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
     elif action == "reset":
         if not key:
             return {"error": "Usage: revenue-config reset <key>"}
+
+        if not config.is_public_runtime_key(key):
+            return _not_public_error(key)
         
         if database.delete_config_override(key):
             return {
@@ -3566,8 +3575,7 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
         return {"error": f"No override found for '{key}'"}
     
     elif action == "list-mutable":
-        from modules.config import CONFIG_FIELD_TYPES, IMMUTABLE_CONFIG_KEYS
-        mutable = [k for k in CONFIG_FIELD_TYPES.keys() if k not in IMMUTABLE_CONFIG_KEYS]
+        mutable = sorted(config.public_runtime_keys())
         return {"mutable_keys": sorted(mutable), "count": len(mutable)}
     
     else:
