@@ -111,6 +111,10 @@ class RebalanceCandidate:
     # Defaults to 0, meaning reconciliation falls back to max_budget_sats (old behavior).
     expected_fee_sats: int = 0
 
+    # EV-derived max fee PPM before graduated escalation.
+    # Used by adaptive chunk sizing to scale chunk inversely with fee escalation.
+    ev_base_fee_ppm: int = 0
+
     # Dynamic hot-channel protection metadata (optional)
     hot_channel_protection: bool = False
     hot_channel_protection_score: float = 0.0
@@ -268,6 +272,18 @@ class JobManager:
         if any(s in msg for s in ("exceeded", "budget", "overpaid")):
             return "budget_exceeded"
         return "other"
+
+    @staticmethod
+    def _scale_chunk_for_escalation(base_chunk: int, base_ppm: int, actual_ppm: int, min_amount: int) -> int:
+        """
+        Scale chunk size inversely with fee escalation to keep per-attempt cost constant.
+
+        If we're paying 3x the base fee rate, use 1/3 the chunk size.
+        """
+        if base_ppm <= 0 or actual_ppm <= base_ppm:
+            return base_chunk
+        scaled = int(base_chunk * base_ppm / actual_ppm)
+        return max(min_amount, scaled)
 
     def get_active_rebalancing_peers(self) -> List[str]:
         """Get deduplicated peer IDs from all active jobs (source + dest peers)."""
@@ -468,6 +484,17 @@ class JobManager:
         
         # Calculate chunk size (amount per rebalance attempt)
         chunk_size = min(candidate.amount_sats, self.chunk_size_sats)
+
+        # Adaptive chunk sizing: reduce chunk when fee has been escalated
+        # to keep per-attempt fee risk constant.
+        ev_base_ppm = getattr(candidate, 'ev_base_fee_ppm', 0)
+        if ev_base_ppm > 0 and candidate.max_fee_ppm > ev_base_ppm:
+            chunk_size = self._scale_chunk_for_escalation(
+                base_chunk=chunk_size,
+                base_ppm=ev_base_ppm,
+                actual_ppm=candidate.max_fee_ppm,
+                min_amount=getattr(self.config, 'rebalance_min_amount', 50000),
+            )
 
         # I-4 FIX: Scale budget proportionally to chunk size. The EV analysis computed
         # max_budget_sats for the full candidate.amount_sats. If we chunk into smaller
@@ -3065,6 +3092,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         if max_fee_ppm <= 0:
             return None
 
+        # Snapshot EV-derived fee before escalation (for adaptive chunk sizing)
+        ev_base_fee_ppm = max_fee_ppm
+
         # Graduated fee escalation: if previous attempts failed at lower fees,
         # start above the last failure point (capped at EV-derived max).
         fail_count, _ = self.database.get_failure_count(dest_channel)
@@ -3231,6 +3261,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             dest_turnover_rate=dest_turnover_rate,
             source_turnover_rate=source_turnover_rate,
             expected_fee_sats=expected_fee_sats,
+            ev_base_fee_ppm=ev_base_fee_ppm,
             reason_code=RebalanceReasonCode.EV_POSITIVE.value,
             bleeder_status=dest_bleeder_status,
             source_candidate_peer_ids=[info.get("peer_id", "") for _, info, _, _ in source_candidates],

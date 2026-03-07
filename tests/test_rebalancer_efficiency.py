@@ -223,3 +223,40 @@ class TestFasterNoRouteFutility:
     def test_zero_failures_not_futile(self):
         from modules.rebalancer import EVRebalancer
         assert EVRebalancer._should_skip_futility(0, "") is False
+
+
+# =============================================================================
+# Task 6: Adaptive chunk sizing on fee escalation
+# =============================================================================
+
+class TestAdaptiveChunkSizing:
+    """Verify chunk size scales inversely with fee escalation."""
+
+    def test_no_escalation_uses_base_chunk(self):
+        from modules.rebalancer import JobManager
+        result = JobManager._scale_chunk_for_escalation(
+            base_chunk=500000, base_ppm=50, actual_ppm=50, min_amount=50000
+        )
+        assert result == 500000
+
+    def test_escalation_reduces_chunk(self):
+        from modules.rebalancer import JobManager
+        result = JobManager._scale_chunk_for_escalation(
+            base_chunk=500000, base_ppm=50, actual_ppm=150, min_amount=50000
+        )
+        # 500000 * (50/150) = 166666
+        assert result == 166666
+
+    def test_chunk_never_below_min_amount(self):
+        from modules.rebalancer import JobManager
+        result = JobManager._scale_chunk_for_escalation(
+            base_chunk=500000, base_ppm=10, actual_ppm=5000, min_amount=50000
+        )
+        assert result == 50000
+
+    def test_zero_base_ppm_uses_base_chunk(self):
+        from modules.rebalancer import JobManager
+        result = JobManager._scale_chunk_for_escalation(
+            base_chunk=500000, base_ppm=0, actual_ppm=100, min_amount=50000
+        )
+        assert result == 500000
