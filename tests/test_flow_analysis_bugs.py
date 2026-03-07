@@ -170,7 +170,6 @@ class TestAnalyzeChannelKalmanReclassification:
             flow_ratio=0.0,
             state=ChannelState.CONGESTED,
             daily_volume=100,
-            analysis_window_days=7,
             is_congested=True
         )
 
@@ -419,13 +418,13 @@ class TestReportFlowObservationWiring:
             channel_id="100x1x0", peer_id="02" + "a" * 64,
             sats_in=1000, sats_out=2000, capacity=10_000_000,
             flow_ratio=0.5, state=ChannelState.SOURCE,
-            daily_volume=3000, analysis_window_days=7
+            daily_volume=3000
         )
         metrics2 = FlowMetrics(
             channel_id="200x2x0", peer_id="02" + "b" * 64,
             sats_in=2000, sats_out=1000, capacity=10_000_000,
             flow_ratio=-0.5, state=ChannelState.SINK,
-            daily_volume=3000, analysis_window_days=7
+            daily_volume=3000
         )
 
         mock_flow_analyzer = MagicMock()

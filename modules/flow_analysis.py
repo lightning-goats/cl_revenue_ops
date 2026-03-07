@@ -420,13 +420,7 @@ class FlowMetrics:
         flow_ratio: (sats_out - sats_in) / capacity
         state: Classified state (SOURCE/SINK/BALANCED/CONGESTED)
         daily_volume: Average daily routing volume
-        analysis_window_days: Number of days analyzed
-        htlc_min: Minimum HTLC amount (msat)
-        htlc_max: Maximum HTLC amount (msat)
-        active_htlcs: Number of currently active HTLCs
-        max_htlcs: Maximum allowed HTLCs on the channel
         is_congested: True if HTLC slots are >80% utilized
-        our_balance: Current outbound balance in sats
 
         v2.0 Fields:
         confidence: Flow confidence score (0.1 to 1.0) based on data quality
@@ -434,8 +428,6 @@ class FlowMetrics:
         flow_multiplier: Graduated multiplier for fee adjustments (0.5 to 2.0)
         ema_decay: Adaptive decay factor used for this channel
         forward_count: Number of forwards in analysis window
-        previous_flow_ratio: Prior flow_ratio for velocity calculation
-        previous_ratio_timestamp: When previous ratio was recorded
     """
     channel_id: str
     peer_id: str
@@ -445,21 +437,13 @@ class FlowMetrics:
     flow_ratio: float
     state: ChannelState
     daily_volume: int
-    analysis_window_days: int
-    htlc_min: int = 0
-    htlc_max: int = 0
-    active_htlcs: int = 0
-    max_htlcs: int = 483  # Default per BOLT spec
     is_congested: bool = False
-    our_balance: int = 0
     # v2.0 fields
     confidence: float = 1.0  # Flow confidence score
     velocity: float = 0.0  # Rate of change of flow_ratio
     flow_multiplier: float = 1.0  # Graduated multiplier for fee adjustments
     ema_decay: float = 0.8  # Adaptive decay factor used
     forward_count: int = 0  # Forwards in analysis window
-    previous_flow_ratio: float = 0.0  # For velocity calculation
-    previous_ratio_timestamp: int = 0  # When previous was recorded
     # v2.1 Kalman filter fields
     kalman_flow_ratio: float = 0.0  # Kalman-filtered flow ratio estimate
     kalman_velocity: float = 0.0  # Kalman-estimated velocity (ratio change/hour)
@@ -477,13 +461,7 @@ class FlowMetrics:
             "flow_ratio": round(self.flow_ratio, 4),
             "state": self.state.value,
             "daily_volume": self.daily_volume,
-            "analysis_window_days": self.analysis_window_days,
-            "htlc_min": self.htlc_min,
-            "htlc_max": self.htlc_max,
-            "active_htlcs": self.active_htlcs,
-            "max_htlcs": self.max_htlcs,
             "is_congested": self.is_congested,
-            "our_balance": self.our_balance,
             # v2.0 fields
             "confidence": round(self.confidence, 3),
             "velocity": round(self.velocity, 4),
@@ -1390,21 +1368,13 @@ class FlowAnalyzer:
             flow_ratio=flow_ratio,
             state=state,
             daily_volume=daily_volume,
-            analysis_window_days=self.config.flow_window_days,
-            htlc_min=htlc_min,
-            htlc_max=htlc_max,
-            active_htlcs=active_htlcs,
-            max_htlcs=max_htlcs,
             is_congested=is_congested,
-            our_balance=our_balance,
             # v2.0 fields
             confidence=confidence,
             velocity=velocity,
             flow_multiplier=flow_multiplier,
             ema_decay=adaptive_decay,
             forward_count=forward_count,
-            previous_flow_ratio=previous_ratio,
-            previous_ratio_timestamp=previous_ratio_ts
         )
     
     def _get_daily_flow_from_db(self, channel_id: Optional[str] = None) -> Dict[str, List[Dict[str, int]]]:

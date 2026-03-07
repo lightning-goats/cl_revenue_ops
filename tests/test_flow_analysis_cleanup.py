@@ -35,3 +35,37 @@ class TestFlowHistoryRemoval:
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()]
         assert "flow_history" not in tables
+
+
+class TestFlowMetricsCleanup:
+    """Verify unused fields removed from FlowMetrics."""
+
+    def test_no_htlc_fields(self):
+        from modules.flow_analysis import FlowMetrics
+        assert 'htlc_min' not in FlowMetrics.__dataclass_fields__
+        assert 'htlc_max' not in FlowMetrics.__dataclass_fields__
+        assert 'active_htlcs' not in FlowMetrics.__dataclass_fields__
+        assert 'max_htlcs' not in FlowMetrics.__dataclass_fields__
+
+    def test_no_our_balance_field(self):
+        from modules.flow_analysis import FlowMetrics
+        assert 'our_balance' not in FlowMetrics.__dataclass_fields__
+
+    def test_no_previous_ratio_fields(self):
+        from modules.flow_analysis import FlowMetrics
+        assert 'previous_flow_ratio' not in FlowMetrics.__dataclass_fields__
+        assert 'previous_ratio_timestamp' not in FlowMetrics.__dataclass_fields__
+
+    def test_no_analysis_window_days_field(self):
+        from modules.flow_analysis import FlowMetrics
+        assert 'analysis_window_days' not in FlowMetrics.__dataclass_fields__
+
+    def test_retained_fields_still_exist(self):
+        """Core fields consumed by fee_controller/rebalancer must remain."""
+        from modules.flow_analysis import FlowMetrics
+        for field in ['channel_id', 'peer_id', 'sats_in', 'sats_out', 'capacity',
+                      'flow_ratio', 'state', 'daily_volume', 'is_congested',
+                      'confidence', 'velocity', 'flow_multiplier', 'ema_decay',
+                      'forward_count', 'kalman_flow_ratio', 'kalman_velocity',
+                      'kalman_uncertainty', 'kalman_regime_change']:
+            assert field in FlowMetrics.__dataclass_fields__, f"Missing retained field: {field}"

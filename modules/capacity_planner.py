@@ -215,9 +215,11 @@ class CapacityPlanner:
             if flow_metrics:
                 # Safe ratio calculations to prevent ZeroDivisionError
                 cap = flow_metrics.capacity or 0
-                outbound_ratio = flow_metrics.our_balance / cap if cap > 0 else 0
                 turnover = flow_metrics.daily_volume / cap if cap > 0 else 0
-                if (0.4 <= outbound_ratio <= 0.6) and (turnover < 0.0015):
+                # A channel with near-zero flow_ratio has balanced flow direction;
+                # combined with low turnover this signals stagnancy.
+                is_balanced = abs(flow_metrics.flow_ratio) < 0.2
+                if is_balanced and (turnover < 0.0015):
                     if prof.marginal_roi_percent < 10.0:
                         is_stagnant = True
 
