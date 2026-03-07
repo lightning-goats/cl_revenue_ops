@@ -438,3 +438,97 @@ class TestDTSPIDShadowMode:
         assert len(shadow_logs) > 0, (
             f"Expected DTS_PID_SHADOW log. Last 5 logs: {log_calls[-5:]}"
         )
+
+
+class TestDTSPIDHiveIntegration:
+    def _channel_info(self, *, current_fee_ppm=150, outbound_pct=50.0):
+        capacity_sats = 2_000_000
+        spendable_sats = int(capacity_sats * (outbound_pct / 100.0))
+        return {
+            "fee_proportional_millionths": current_fee_ppm,
+            "capacity": capacity_sats,
+            "spendable_msat": f"{spendable_sats * 1000}msat",
+            "opener": "local",
+        }
+
+    def test_hive_blend_applies_to_dts_pid(self, mock_plugin, mock_database):
+        """Hive coordination should blend with DTS+PID result."""
+        from modules.hive_bridge import HiveFeeIntelligenceBridge
+        hive = MagicMock(spec=HiveFeeIntelligenceBridge)
+        hive.is_available.return_value = True
+        hive.query_fee_intelligence.return_value = None
+        hive.query_defense_status.return_value = None
+        hive.query_coordinated_fee_recommendation.return_value = {
+            "recommended_fee": 100,
+            "confidence": 0.8,
+        }
+
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        fc.hive_bridge = hive
+        fc.ENABLE_HIVE_COORDINATION = True
+        fc.HIVE_COORDINATION_WEIGHT = 0.3
+
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64,
+            {"state": "balanced", "forward_count": 50, "sats_out": 10000},
+            self._channel_info(), cfg=cfg,
+        )
+        assert result is not None
+        assert isinstance(result, FeeAdjustment)
+
+    def test_hive_safety_shortcircuit_unchanged(self, mock_plugin, mock_database):
+        """Hive fleet members should still get hive_fee_ppm, not DTS+PID."""
+        from modules.policy_manager import PolicyManager
+        policy_mgr = MagicMock(spec=PolicyManager)
+        policy_mgr.is_hive_peer.return_value = True
+
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        fc.policy_manager = policy_mgr
+        cfg.hive_fee_ppm = 0
+
+        # Mock set_channel_fee to succeed so the safety path returns a FeeAdjustment
+        fc.set_channel_fee = MagicMock(return_value={"success": True})
+
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64,
+            {"state": "balanced", "forward_count": 50, "sats_out": 10000},
+            self._channel_info(), cfg=cfg,
+        )
+        assert result is not None
+        assert result.new_fee_ppm == 0
+
+
+class TestPIDEdgeCases:
+    def test_rapid_balance_change_ewma_dampens(self):
+        pid = PIDState()
+        pid.last_update_time = int(time.time()) - 1800
+        for _ in range(5):
+            pid.calculate_multiplier(0.5, capacity_sats=2_000_000)
+            pid.last_update_time = int(time.time()) - 1800
+        pid.calculate_multiplier(0.1, capacity_sats=2_000_000)
+        ewma_after = pid.ewma_error
+        raw_error = 0.5 - 0.1
+        assert abs(ewma_after) < abs(raw_error), (
+            f"EWMA ({ewma_after}) should dampen raw error ({raw_error})"
+        )
+
+    def test_long_quiet_period_reasonable_dt(self):
+        pid = PIDState()
+        pid.last_update_time = int(time.time()) - 86400 * 7
+        m = pid.calculate_multiplier(0.3, capacity_sats=2_000_000)
+        assert 0.1 <= m <= 10.0
+        assert abs(pid.integral_error) <= pid.integral_clamp + 0.01
+
+    def test_zero_capacity_no_crash(self):
+        pid = PIDState()
+        pid.last_update_time = int(time.time()) - 1800
+        m = pid.calculate_multiplier(0.5, capacity_sats=0)
+        assert 0.1 <= m <= 10.0
+
+    def test_nan_outbound_ratio_handled(self):
+        pid = PIDState()
+        pid.last_update_time = int(time.time()) - 1800
+        m = pid.calculate_multiplier(float('nan'), capacity_sats=2_000_000)
+        assert math.isfinite(m) and 0.1 <= m <= 10.0
+        assert math.isfinite(pid.ewma_error)
+        assert math.isfinite(pid.integral_error)
