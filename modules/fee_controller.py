@@ -3292,6 +3292,12 @@ class HillClimbingFeeController:
     # Thompson Sampling is now the PRIMARY algorithm (not secondary to Hill Climbing)
     # AIMD provides quick defensive adjustments when market conditions change
     ENABLE_THOMPSON_AIMD = True       # Master switch for Thompson+AIMD (replaces Hill Climbing)
+
+    # Phase 1 simplification: skip unvalidated post-Thompson modifiers
+    # (elasticity, profitability weighting, cold-start, competition avoidance,
+    #  stigmergic modulation, fee anchors, historical response curve)
+    # Set False to restore legacy 13-modifier path for rollback.
+    ENABLE_SIMPLIFIED_FEE_PATH = True
     THOMPSON_COLD_START_BONUS = 1.5   # Extra exploration for channels with few observations
     THOMPSON_CONTEXT_WEIGHT = 0.7     # Weight for contextual vs global posterior
     AIMD_DEFENSE_CEILING_BOOST = 0.1  # Allow 10% above ceiling when in defense mode

@@ -1600,3 +1600,12 @@ class TestCalculateFloorOpener:
         floor_default = fc._calculate_floor(5_000_000, chain_costs=chain_costs)
         floor_local = fc._calculate_floor(5_000_000, chain_costs=chain_costs, opener="local")
         assert floor_default == floor_local
+
+
+class TestSimplifiedFeePathFlag:
+    """Verify the ENABLE_SIMPLIFIED_FEE_PATH flag exists and defaults to True."""
+
+    def test_flag_exists_and_defaults_true(self):
+        from modules.fee_controller import HillClimbingFeeController
+        assert hasattr(HillClimbingFeeController, 'ENABLE_SIMPLIFIED_FEE_PATH')
+        assert HillClimbingFeeController.ENABLE_SIMPLIFIED_FEE_PATH is True
