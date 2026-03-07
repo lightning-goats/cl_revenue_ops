@@ -166,10 +166,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'clboss_enabled': bool,
 }
 
-DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset(
-    key for key in CONFIG_FIELD_TYPES.keys() if key not in PUBLIC_RUNTIME_KEYS
-)
-
 # Range constraints for numeric fields
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
