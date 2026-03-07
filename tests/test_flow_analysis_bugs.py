@@ -266,8 +266,8 @@ class TestAnalyzeChannelKalmanReclassification:
 
 class TestRemoveClosedChannelDataCleanup:
     """
-    Bug: remove_closed_channel_data() didn't clean up kalman_state or flow_history
-    tables when a channel was closed, causing stale data to accumulate.
+    Bug: remove_closed_channel_data() didn't clean up kalman_state
+    table when a channel was closed, causing stale data to accumulate.
     """
 
     @pytest.fixture
@@ -331,16 +331,6 @@ class TestRemoveClosedChannelDataCleanup:
                 innovation_variance REAL DEFAULT 0.01
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS flow_history (
-                channel_id TEXT,
-                timestamp INTEGER,
-                sats_in INTEGER,
-                sats_out INTEGER,
-                flow_ratio REAL,
-                state TEXT
-            )
-        """)
         conn.commit()
         conn.close()
 
@@ -380,32 +370,6 @@ class TestRemoveClosedChannelDataCleanup:
         assert row is None
         assert result["kalman_state"] == 1
 
-    def test_flow_history_cleaned_on_channel_close(self, db_with_tables):
-        """Flow history should be deleted when a channel is closed."""
-        db = self._make_database(db_with_tables)
-        channel_id = "100x1x0"
-
-        # Insert flow history entries
-        conn = db._get_connection()
-        now = int(time.time())
-        for i in range(5):
-            conn.execute(
-                "INSERT INTO flow_history (channel_id, timestamp, sats_in, sats_out, flow_ratio, state) VALUES (?, ?, ?, ?, ?, ?)",
-                (channel_id, now - i * 86400, 1000, 2000, 0.5, "source")
-            )
-
-        # Verify they exist
-        count = conn.execute("SELECT COUNT(*) FROM flow_history WHERE channel_id = ?", (channel_id,)).fetchone()[0]
-        assert count == 5
-
-        # Remove closed channel data
-        result = db.remove_closed_channel_data(channel_id)
-
-        # Verify flow_history is cleaned up
-        count = conn.execute("SELECT COUNT(*) FROM flow_history WHERE channel_id = ?", (channel_id,)).fetchone()[0]
-        assert count == 0
-        assert result["flow_history"] == 5
-
     def test_other_channels_not_affected(self, db_with_tables):
         """Cleanup should not affect other channels' data."""
         db = self._make_database(db_with_tables)
@@ -422,14 +386,6 @@ class TestRemoveClosedChannelDataCleanup:
             "INSERT INTO kalman_state (channel_id, flow_ratio) VALUES (?, ?)",
             (open_channel, 0.3)
         )
-        conn.execute(
-            "INSERT INTO flow_history (channel_id, timestamp, sats_in, sats_out, flow_ratio, state) VALUES (?, ?, ?, ?, ?, ?)",
-            (closed_channel, int(time.time()), 1000, 2000, 0.5, "source")
-        )
-        conn.execute(
-            "INSERT INTO flow_history (channel_id, timestamp, sats_in, sats_out, flow_ratio, state) VALUES (?, ?, ?, ?, ?, ?)",
-            (open_channel, int(time.time()), 500, 500, 0.0, "balanced")
-        )
 
         # Close only the first channel
         db.remove_closed_channel_data(closed_channel)
@@ -437,18 +393,15 @@ class TestRemoveClosedChannelDataCleanup:
         # Open channel's data should still exist
         row = conn.execute("SELECT * FROM kalman_state WHERE channel_id = ?", (open_channel,)).fetchone()
         assert row is not None
-        count = conn.execute("SELECT COUNT(*) FROM flow_history WHERE channel_id = ?", (open_channel,)).fetchone()[0]
-        assert count == 1
 
     def test_result_dict_has_new_keys(self, db_with_tables):
-        """The returned dict should include kalman_state and flow_history counts."""
+        """The returned dict should include kalman_state count."""
         db = self._make_database(db_with_tables)
         result = db.remove_closed_channel_data("nonexistent_channel")
 
         assert "kalman_state" in result
-        assert "flow_history" in result
+        assert "flow_history" not in result
         assert result["kalman_state"] == 0
-        assert result["flow_history"] == 0
 
 
 class TestReportFlowObservationWiring:

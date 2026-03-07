@@ -327,18 +327,6 @@ class Database:
             )
         """)
         
-        # Flow history table - tracks flow over time
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS flow_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                sats_in INTEGER NOT NULL,
-                sats_out INTEGER NOT NULL,
-                flow_ratio REAL NOT NULL,
-                state TEXT NOT NULL
-            )
-        """)
         
         # PID state table - stores controller state per channel
         # LEGACY: Kept for backward compatibility, but Hill Climbing uses fee_strategy_state
@@ -577,7 +565,6 @@ class Database:
         """)
 
         # Create indexes for common queries
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_time ON forwards(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_channels ON forwards(in_channel, out_channel)")
@@ -898,6 +885,12 @@ class Database:
         # v2.0 Migration: Add Kalman filter columns and table
         self._migrate_kalman_schema(conn)
 
+        # Flow analysis cleanup: remove dead flow_history table
+        try:
+            conn.execute("DROP TABLE IF EXISTS flow_history")
+        except sqlite3.OperationalError:
+            pass
+
         # Rebalancer efficiency: failure-informed routing columns
         for col, col_type, default in [
             ("last_attempted_ppm", "INTEGER", "0"),
@@ -1188,8 +1181,6 @@ class Database:
         conn = self._get_connection()
         now = int(time.time())
 
-        # Both writes must be atomic: if the history insert fails after the
-        # state upsert, we'd have state without a history trail.
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute("""
@@ -1201,13 +1192,6 @@ class Database:
             """, (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, now,
                   confidence, velocity, flow_multiplier, ema_decay, forward_count,
                   kalman_flow_ratio, kalman_velocity, kalman_uncertainty))
-
-            # Also record in history
-            conn.execute("""
-                INSERT INTO flow_history
-                (channel_id, timestamp, sats_in, sats_out, flow_ratio, state)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (channel_id, now, sats_in, sats_out, flow_ratio, state))
 
             conn.execute("COMMIT")
         except Exception:
@@ -4520,8 +4504,7 @@ class Database:
             "channel_failures": 0,
             "channel_probes": 0,
             "clboss_unmanaged": 0,
-            "kalman_state": 0,
-            "flow_history": 0
+            "kalman_state": 0
         }
 
         try:
@@ -4563,13 +4546,6 @@ class Database:
                     (channel_id,)
                 )
                 deleted["kalman_state"] = cursor.rowcount
-
-                # Remove flow history for closed channel
-                cursor = conn.execute(
-                    "DELETE FROM flow_history WHERE channel_id = ?",
-                    (channel_id,)
-                )
-                deleted["flow_history"] = cursor.rowcount
 
                 # L11 FIX: Clean up fee_strategy_state and pid_state to prevent
                 # orphaned rows from accumulating on nodes with frequent channel turnover.
@@ -5088,7 +5064,6 @@ class Database:
         now = int(time.time())
         cutoff = now - (days_to_keep * 86400)
 
-        flow_count = 0
         forwards_count = 0
         pruned_revenue = 0
         pruned_count = 0
@@ -5101,9 +5076,6 @@ class Database:
         try:
             conn.execute("BEGIN IMMEDIATE")
             # Count rows before deletion for logging
-            flow_count = conn.execute(
-                "SELECT COUNT(*) as cnt FROM flow_history WHERE timestamp < ?", (cutoff,)
-            ).fetchone()["cnt"]
             forwards_count = conn.execute(
                 "SELECT COUNT(*) as cnt FROM forwards WHERE timestamp < ?", (cutoff,)
             ).fetchone()["cnt"]
@@ -5169,7 +5141,6 @@ class Database:
                 # We NO LONGER update lifetime_aggregates for new data, 
                 # but we leave the table alone as it contains legacy history.
 
-            conn.execute("DELETE FROM flow_history WHERE timestamp < ?", (cutoff,))
             conn.execute("DELETE FROM forwards WHERE timestamp < ?", (cutoff,))
             conn.execute("DELETE FROM peer_connection_history WHERE timestamp < ?", (cutoff,))
 
@@ -5195,22 +5166,20 @@ class Database:
         # L-20: Use incremental_vacuum instead of full VACUUM to avoid blocking readers.
         # Full VACUUM requires exclusive lock and copies the entire database.
         # incremental_vacuum frees pages without blocking concurrent reads.
-        if flow_count > 0 or forwards_count > 0:
+        if forwards_count > 0:
             try:
                 conn.execute("PRAGMA incremental_vacuum(100)")
                 self.plugin.log("Database incremental_vacuum completed")
             except Exception as e:
                 self.plugin.log(f"incremental_vacuum failed (non-fatal): {e}", level='warn')
 
-        if forwards_count > 0:
             self.plugin.log(
                 f"Preserved {pruned_revenue // 1000} sats revenue from {pruned_count} forwards before pruning"
             )
 
-        if flow_count > 0 or forwards_count > 0:
             self.plugin.log(
                 f"Cleaned up data older than {days_to_keep} days: "
-                f"{flow_count} flow_history rows, {forwards_count} forwards rows"
+                f"{forwards_count} forwards rows"
             )
     
     # =========================================================================
