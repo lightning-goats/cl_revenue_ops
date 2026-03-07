@@ -317,3 +317,34 @@ class TestFleetFeeCapRestoration:
 
         assert candidate.max_fee_ppm == 200
         assert candidate.max_budget_sats == 100
+
+
+# =============================================================================
+# Task 8: Fleet-aware fee caps by route topology
+# =============================================================================
+
+class TestFleetAwareFeeCaps:
+    """Verify fee caps match route topology."""
+
+    def test_pure_fleet_route_caps_at_zero(self):
+        """Both source and dest are hive peers — all hops are free."""
+        from modules.rebalancer import EVRebalancer
+        result = EVRebalancer._fleet_fee_cap(
+            ev_max_fee_ppm=200, both_hive=True
+        )
+        assert result == 0
+
+    def test_fleet_assisted_external_keeps_ev_ppm(self):
+        """Fleet source, external dest — fleet hops free, external hops cost."""
+        from modules.rebalancer import EVRebalancer
+        result = EVRebalancer._fleet_fee_cap(
+            ev_max_fee_ppm=200, both_hive=False
+        )
+        assert result == 200
+
+    def test_zero_ev_ppm_stays_zero(self):
+        from modules.rebalancer import EVRebalancer
+        result = EVRebalancer._fleet_fee_cap(
+            ev_max_fee_ppm=0, both_hive=False
+        )
+        assert result == 0

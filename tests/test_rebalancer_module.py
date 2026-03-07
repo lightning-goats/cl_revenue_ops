@@ -962,8 +962,8 @@ class TestFleetPathInjection:
         # Original source still present
         assert "111x222x0" in cand.source_candidates
 
-    def test_fleet_maxppm_reduced(self, mock_plugin, mock_database):
-        """max_fee_ppm should be capped to 50 when fleet path is available."""
+    def test_fleet_maxppm_unchanged_for_external_dest(self, mock_plugin, mock_database):
+        """Fleet-assisted external route: fee unchanged (fleet hops free, external hops cost)."""
         fleet_member_a = "02" + "f" * 64
 
         fleet_info = {
@@ -982,7 +982,37 @@ class TestFleetPathInjection:
 
         r.execute_rebalance(cand)
 
-        assert cand.max_fee_ppm == 50
+        # External dest means fee is NOT capped — only fleet hops are free
+        assert cand.max_fee_ppm == original_max_ppm
+
+    def test_fleet_maxppm_zero_for_pure_fleet(self, mock_plugin, mock_database):
+        """Pure fleet route (both hive): fee capped to 0 — all hops are free."""
+        fleet_member_a = "02" + "f" * 64
+        hive_dest = "02" + "b" * 64
+        hive_source = "02" + "a" * 64
+
+        fleet_info = {
+            "fleet_path_available": True,
+            "fleet_path": ["02" + "d" * 64],
+            "source_eligible_members": [fleet_member_a],
+            "estimated_fleet_cost_sats": 0,
+            "estimated_external_cost_sats": 0,
+            "savings_pct": 100.0,
+        }
+        r, _, _ = self._make_rebalancer(mock_plugin, mock_database, fleet_info)
+
+        # Make both dest and source hive peers
+        r.policy_manager = MagicMock()
+        r.policy_manager.is_hive_peer.return_value = True
+        r.policy_manager.should_rebalance.return_value = True
+
+        cand = _candidate()
+        assert cand.max_fee_ppm > 0  # Sanity
+
+        r.execute_rebalance(cand)
+
+        assert cand.max_fee_ppm == 0
+        assert cand.max_budget_sats == 0
 
     def test_fleet_path_unavailable_no_change(self, mock_plugin, mock_database):
         """Source candidates should be unchanged when no fleet path is available."""

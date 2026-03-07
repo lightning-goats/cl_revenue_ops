@@ -2074,6 +2074,19 @@ class EVRebalancer:
             return ev_max_fee_ppm
         return min(int(last_attempted_ppm * 1.5), ev_max_fee_ppm)
 
+    @staticmethod
+    def _fleet_fee_cap(ev_max_fee_ppm: int, both_hive: bool) -> int:
+        """
+        Determine fee cap based on fleet route topology.
+
+        Pure fleet (both hive): 0 PPM — all hops are fleet members at hive_fee_ppm=0.
+        Fleet-assisted (external dest): EV-derived maxppm — fleet hops are free,
+        only external hops cost. No reason to penalize.
+        """
+        if both_hive:
+            return 0
+        return ev_max_fee_ppm
+
     def _parse_msat(self, v: Any) -> int:
         """Delegate to shared parse_msat in utils.py."""
         return _shared_parse_msat(v)
@@ -4300,12 +4313,21 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                             p for p in existing_peer_ids if p not in fleet_peer_ids
                         ]
 
-                        # Cap max_fee_ppm to fleet-appropriate level
-                        candidate.max_fee_ppm = min(candidate.max_fee_ppm, 50)
-                        # Reduce budget proportionally
-                        if candidate.max_budget_sats > 0:
-                            candidate.max_budget_sats = min(candidate.max_budget_sats, max(1, candidate.amount_sats * 50 // 1_000_000))
-                            candidate.max_budget_msat = candidate.max_budget_sats * 1000
+                        # Fleet-aware fee cap based on route topology
+                        both_hive = (self._is_hive_peer(candidate.to_peer_id)
+                                     and self._is_hive_peer(candidate.primary_source_peer_id))
+                        fleet_cap = self._fleet_fee_cap(candidate.max_fee_ppm, both_hive)
+                        if fleet_cap < candidate.max_fee_ppm:
+                            candidate.max_fee_ppm = fleet_cap
+                            if fleet_cap == 0:
+                                candidate.max_budget_sats = 0
+                                candidate.max_budget_msat = 0
+                            elif candidate.max_budget_sats > 0:
+                                candidate.max_budget_sats = min(
+                                    candidate.max_budget_sats,
+                                    max(1, candidate.amount_sats * fleet_cap // 1_000_000)
+                                )
+                                candidate.max_budget_msat = candidate.max_budget_sats * 1000
 
                         # I-17 FIX: Mark candidate as fleet-routed for hive outcome reporting
                         candidate.via_fleet = True
