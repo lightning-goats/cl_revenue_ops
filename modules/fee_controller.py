@@ -6170,139 +6170,145 @@ class HillClimbingFeeController:
 
             # =====================================================================
             # BROADCAST FEE DISCOVERIES (P1 Integration)
+            # + P2 COMPETITION AVOIDANCE: Thompson Posterior Sharing
             # =====================================================================
-            # Check if this observation represents a significant discovery
-            # that should be shared with the fleet
-            if self.hive_bridge and self.hive_bridge.is_available():
-                discovery = ts_state.thompson.check_for_discovery(
-                    fee=current_fee_ppm,
-                    revenue_rate=current_revenue_rate,
-                    min_revenue_rate=50.0,
-                    min_observations=5
-                )
-                if discovery:
-                    self.hive_bridge.broadcast_fee_observation(
-                        peer_id=peer_id,
-                        fee_ppm=discovery["fee_ppm"],
-                        revenue_rate=discovery["revenue_rate"],
-                        confidence=discovery["confidence"],
-                        discovery_type=discovery["discovery_type"],
-                        metadata={
-                            "posterior_mean": ts_state.thompson.posterior_mean,
-                            "posterior_std": ts_state.thompson.posterior_std,
-                            "observation_count": discovery.get("observation_count", 0),
-                            "context": context_key
-                        }
-                    )
-                    self.plugin.log(
-                        f"THOMPSON_DISCOVERY: {channel_id[:12]}... broadcasting "
-                        f"{discovery['discovery_type']} at {discovery['fee_ppm']}ppm "
-                        f"(revenue={discovery['revenue_rate']:.1f}sats/hr, "
-                        f"conf={discovery['confidence']:.2f})",
-                        level='info'
-                    )
-
-            # =====================================================================
-            # P2 COMPETITION AVOIDANCE: Thompson Posterior Sharing
-            # =====================================================================
-            # Share our Thompson posterior summary with fleet and query other
-            # members' posteriors. If our posterior overlaps significantly with
-            # fleet members, differentiate by biasing away from crowded regions.
+            # Gated: fee discovery broadcasts and competition avoidance require
+            # stigmergic context and fleet coordination (not needed in simplified path)
             fleet_posteriors = None
             differentiation_offset = 0
-            if self.hive_bridge and self.hive_bridge.is_available():
-                # Share our posterior summary for fleet coordination
-                try:
-                    obs_count = len(ts_state.thompson.observations)
-                    if obs_count >= 5:  # Only share if we have meaningful data
-                        self.hive_bridge.share_posterior_summary(
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                # Check if this observation represents a significant discovery
+                # that should be shared with the fleet
+                if self.hive_bridge and self.hive_bridge.is_available():
+                    discovery = ts_state.thompson.check_for_discovery(
+                        fee=current_fee_ppm,
+                        revenue_rate=current_revenue_rate,
+                        min_revenue_rate=50.0,
+                        min_observations=5
+                    )
+                    if discovery:
+                        self.hive_bridge.broadcast_fee_observation(
                             peer_id=peer_id,
-                            posterior_mean=ts_state.thompson.posterior_mean,
-                            posterior_std=ts_state.thompson.posterior_std,
-                            observation_count=obs_count,
-                            corridor_role=corridor_role
+                            fee_ppm=discovery["fee_ppm"],
+                            revenue_rate=discovery["revenue_rate"],
+                            confidence=discovery["confidence"],
+                            discovery_type=discovery["discovery_type"],
+                            metadata={
+                                "posterior_mean": ts_state.thompson.posterior_mean,
+                                "posterior_std": ts_state.thompson.posterior_std,
+                                "observation_count": discovery.get("observation_count", 0),
+                                "context": context_key
+                            }
                         )
-                except Exception as e:
-                    self.plugin.log(
-                        f"P2_COMPETE: Failed to share posterior: {e}",
-                        level='debug'
-                    )
+                        self.plugin.log(
+                            f"THOMPSON_DISCOVERY: {channel_id[:12]}... broadcasting "
+                            f"{discovery['discovery_type']} at {discovery['fee_ppm']}ppm "
+                            f"(revenue={discovery['revenue_rate']:.1f}sats/hr, "
+                            f"conf={discovery['confidence']:.2f})",
+                            level='info'
+                        )
 
-                # Query fleet posteriors for competition avoidance
-                try:
-                    fleet_posteriors = self.hive_bridge.query_fleet_posteriors(peer_id)
-                    if fleet_posteriors and fleet_posteriors.get("members"):
-                        # Analyze if we're in a crowded region
-                        our_mean = ts_state.thompson.posterior_mean
-                        crowded_region = False
-                        differentiation_direction = 0  # -1 = lower, 1 = higher
-
-                        for member in fleet_posteriors["members"]:
-                            member_mean = member.get("mean", 0)
-                            member_std = member.get("std", 100)
-
-                            # Check if posteriors significantly overlap
-                            # (means within 1.5 std of each other)
-                            overlap_threshold = 1.5 * max(ts_state.thompson.posterior_std, member_std)
-                            if abs(our_mean - member_mean) < overlap_threshold:
-                                crowded_region = True
-
-                                # Determine differentiation direction based on corridor role
-                                # Primary corridors go slightly lower (volume capture)
-                                # Secondary corridors go slightly higher (margin capture)
-                                if corridor_role == "P":
-                                    differentiation_direction = -1  # Primary goes lower
-                                else:
-                                    differentiation_direction = 1   # Secondary goes higher
-                                break
-
-                        if crowded_region:
-                            # Compute differentiation offset (applied to sampled fee, NOT posterior)
-                            diff_amount = int(ts_state.thompson.posterior_std * 0.3)
-                            differentiation_offset = differentiation_direction * diff_amount
-                            self.plugin.log(
-                                f"P2_COMPETE: {channel_id[:12]}... differentiating "
-                                f"from crowded region (mean: {ts_state.thompson.posterior_mean:.0f}, "
-                                f"offset={differentiation_offset:+d}, role={corridor_role})",
-                                level='info'
+                # Share our Thompson posterior summary with fleet and query other
+                # members' posteriors. If our posterior overlaps significantly with
+                # fleet members, differentiate by biasing away from crowded regions.
+                if self.hive_bridge and self.hive_bridge.is_available():
+                    # Share our posterior summary for fleet coordination
+                    try:
+                        obs_count = len(ts_state.thompson.observations)
+                        if obs_count >= 5:  # Only share if we have meaningful data
+                            self.hive_bridge.share_posterior_summary(
+                                peer_id=peer_id,
+                                posterior_mean=ts_state.thompson.posterior_mean,
+                                posterior_std=ts_state.thompson.posterior_std,
+                                observation_count=obs_count,
+                                corridor_role=corridor_role
                             )
-                except Exception as e:
-                    self.plugin.log(
-                        f"P2_COMPETE: Failed to query fleet posteriors: {e}",
-                        level='debug'
-                    )
+                    except Exception as e:
+                        self.plugin.log(
+                            f"P2_COMPETE: Failed to share posterior: {e}",
+                            level='debug'
+                        )
+
+                    # Query fleet posteriors for competition avoidance
+                    try:
+                        fleet_posteriors = self.hive_bridge.query_fleet_posteriors(peer_id)
+                        if fleet_posteriors and fleet_posteriors.get("members"):
+                            # Analyze if we're in a crowded region
+                            our_mean = ts_state.thompson.posterior_mean
+                            crowded_region = False
+                            differentiation_direction = 0  # -1 = lower, 1 = higher
+
+                            for member in fleet_posteriors["members"]:
+                                member_mean = member.get("mean", 0)
+                                member_std = member.get("std", 100)
+
+                                # Check if posteriors significantly overlap
+                                # (means within 1.5 std of each other)
+                                overlap_threshold = 1.5 * max(ts_state.thompson.posterior_std, member_std)
+                                if abs(our_mean - member_mean) < overlap_threshold:
+                                    crowded_region = True
+
+                                    # Determine differentiation direction based on corridor role
+                                    # Primary corridors go slightly lower (volume capture)
+                                    # Secondary corridors go slightly higher (margin capture)
+                                    if corridor_role == "P":
+                                        differentiation_direction = -1  # Primary goes lower
+                                    else:
+                                        differentiation_direction = 1   # Secondary goes higher
+                                    break
+
+                            if crowded_region:
+                                # Compute differentiation offset (applied to sampled fee, NOT posterior)
+                                diff_amount = int(ts_state.thompson.posterior_std * 0.3)
+                                differentiation_offset = differentiation_direction * diff_amount
+                                self.plugin.log(
+                                    f"P2_COMPETE: {channel_id[:12]}... differentiating "
+                                    f"from crowded region (mean: {ts_state.thompson.posterior_mean:.0f}, "
+                                    f"offset={differentiation_offset:+d}, role={corridor_role})",
+                                    level='info'
+                                )
+                    except Exception as e:
+                        self.plugin.log(
+                            f"P2_COMPETE: Failed to query fleet posteriors: {e}",
+                            level='debug'
+                        )
 
             # =====================================================================
-            # STIGMERGIC MODULATION (P1 Integration)
+            # THOMPSON SAMPLING: Sample Fee
             # =====================================================================
-            # Set context for exploration/exploitation balance based on:
-            # - Pheromone level: High = exploit, low = explore
-            # - Corridor role: Primary = exploit, secondary = explore
-            # - Time bucket: For time-aware posterior selection
-            ts_state.thompson.set_context_modulation(
-                pheromone_level=pheromone_level,
-                corridor_role=corridor_role,
-                time_bucket=time_bucket
-            )
+            if self.ENABLE_SIMPLIFIED_FEE_PATH:
+                # Simplified: direct posterior sample, no stigmergic modulation
+                thompson_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
+            else:
+                # Legacy: stigmergic context + elasticity bias + competition offset
+                # Set context for exploration/exploitation balance based on:
+                # - Pheromone level: High = exploit, low = explore
+                # - Corridor role: Primary = exploit, secondary = explore
+                # - Time bucket: For time-aware posterior selection
+                ts_state.thompson.set_context_modulation(
+                    pheromone_level=pheromone_level,
+                    corridor_role=corridor_role,
+                    time_bucket=time_bucket
+                )
 
-            # Sample fee from Thompson posterior (contextual if enough data)
-            # Now applies stigmergic modulation to exploration/exploitation
-            thompson_fee = ts_state.thompson.sample_fee_contextual(
-                context_key=context_key,
-                floor=floor_ppm,
-                ceiling=ceiling_ppm
-            )
+                # Sample fee from Thompson posterior (contextual if enough data)
+                # Now applies stigmergic modulation to exploration/exploitation
+                thompson_fee = ts_state.thompson.sample_fee_contextual(
+                    context_key=context_key,
+                    floor=floor_ppm,
+                    ceiling=ceiling_ppm
+                )
 
-            # Elasticity-informed sampled fee bias
-            if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
-                direction = elasticity_tracker.get_optimal_direction()
-                if direction != 0:
-                    bias = direction * elasticity_tracker.confidence * ts_state.thompson.posterior_std * 0.3
-                    thompson_fee = int(max(floor_ppm, min(ceiling_ppm, thompson_fee + bias)))
+                # Elasticity-informed sampled fee bias
+                if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
+                    direction = elasticity_tracker.get_optimal_direction()
+                    if direction != 0:
+                        bias = direction * elasticity_tracker.confidence * ts_state.thompson.posterior_std * 0.3
+                        thompson_fee = int(max(floor_ppm, min(ceiling_ppm, thompson_fee + bias)))
 
-            # Apply fleet differentiation offset (computed above, doesn't mutate posterior)
-            if differentiation_offset != 0:
-                thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
+                # Apply fleet differentiation offset (computed above, doesn't mutate posterior)
+                if differentiation_offset != 0:
+                    thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
 
             # =====================================================================
             # WEIGHTED AIMD SUCCESS METRIC + AIMD-THOMPSON COORDINATION
