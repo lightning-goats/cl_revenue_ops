@@ -6346,51 +6346,52 @@ class HillClimbingFeeController:
             # - Profitable channels: Allow more aggressive exploration (wider range)
             # - Underperforming channels: Constrain to proven ranges
             # - Zombie/Fire Sale: Force low fees regardless of Thompson
-            profitability_adjustment = 0
-            if self.profitability:
-                try:
-                    from .profitability_analyzer import ProfitabilityClass
-                    prof_data = self.profitability.get_profitability(channel_id)
-                    if prof_data:
-                        # Calculate profitability weight
-                        if prof_data.classification == ProfitabilityClass.PROFITABLE:
-                            # Highly profitable - allow upward exploration
-                            if prof_data.roi_percent > 20:
-                                # Very profitable - bias toward higher fees
-                                profitability_adjustment = int(thompson_fee * 0.1)  # +10%
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                profitability_adjustment = 0
+                if self.profitability:
+                    try:
+                        from .profitability_analyzer import ProfitabilityClass
+                        prof_data = self.profitability.get_profitability(channel_id)
+                        if prof_data:
+                            # Calculate profitability weight
+                            if prof_data.classification == ProfitabilityClass.PROFITABLE:
+                                # Highly profitable - allow upward exploration
+                                if prof_data.roi_percent > 20:
+                                    # Very profitable - bias toward higher fees
+                                    profitability_adjustment = int(thompson_fee * 0.1)  # +10%
+                                    self.plugin.log(
+                                        f"P2_PROFIT: {channel_id[:12]}... profitable channel "
+                                        f"(ROI={prof_data.roi_percent:.1f}%), biasing up +{profitability_adjustment}ppm",
+                                        level='debug'
+                                    )
+                            elif prof_data.classification == ProfitabilityClass.MARGINAL:
+                                # Marginal - stay conservative with Thompson
+                                pass  # No adjustment
+                            elif prof_data.classification == ProfitabilityClass.UNDERWATER:
+                                # Underwater - bias toward lower fees to increase flow
+                                if prof_data.roi_percent < -20:
+                                    profitability_adjustment = -int(thompson_fee * 0.15)  # -15%
+                                    self.plugin.log(
+                                        f"P2_PROFIT: {channel_id[:12]}... underwater channel "
+                                        f"(ROI={prof_data.roi_percent:.1f}%), biasing down {abs(profitability_adjustment)}ppm",
+                                        level='debug'
+                                    )
+                            elif prof_data.classification == ProfitabilityClass.ZOMBIE:
+                                # Zombie - aggressive low pricing
+                                profitability_adjustment = floor_ppm - thompson_fee  # Force to floor
                                 self.plugin.log(
-                                    f"P2_PROFIT: {channel_id[:12]}... profitable channel "
-                                    f"(ROI={prof_data.roi_percent:.1f}%), biasing up +{profitability_adjustment}ppm",
-                                    level='debug'
+                                    f"P2_PROFIT: {channel_id[:12]}... zombie channel, "
+                                    f"forcing to floor ({floor_ppm}ppm)",
+                                    level='info'
                                 )
-                        elif prof_data.classification == ProfitabilityClass.MARGINAL:
-                            # Marginal - stay conservative with Thompson
-                            pass  # No adjustment
-                        elif prof_data.classification == ProfitabilityClass.UNDERWATER:
-                            # Underwater - bias toward lower fees to increase flow
-                            if prof_data.roi_percent < -20:
-                                profitability_adjustment = -int(thompson_fee * 0.15)  # -15%
-                                self.plugin.log(
-                                    f"P2_PROFIT: {channel_id[:12]}... underwater channel "
-                                    f"(ROI={prof_data.roi_percent:.1f}%), biasing down {abs(profitability_adjustment)}ppm",
-                                    level='debug'
-                                )
-                        elif prof_data.classification == ProfitabilityClass.ZOMBIE:
-                            # Zombie - aggressive low pricing
-                            profitability_adjustment = floor_ppm - thompson_fee  # Force to floor
-                            self.plugin.log(
-                                f"P2_PROFIT: {channel_id[:12]}... zombie channel, "
-                                f"forcing to floor ({floor_ppm}ppm)",
-                                level='info'
-                            )
 
-                        # Apply profitability adjustment
-                        thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + profitability_adjustment))
-                except Exception as e:
-                    self.plugin.log(
-                        f"P2_PROFIT: Failed to get profitability adjustment: {e}",
-                        level='debug'
-                    )
+                            # Apply profitability adjustment
+                            thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + profitability_adjustment))
+                    except Exception as e:
+                        self.plugin.log(
+                            f"P2_PROFIT: Failed to get profitability adjustment: {e}",
+                            level='debug'
+                        )
 
             # =====================================================================
             # FLEET DEFENSE COORDINATION
@@ -6445,20 +6446,21 @@ class HillClimbingFeeController:
                 decision_reason = f"thompson_sample (ctx={context_key})"
 
             # Cold-start mode: channels with very few forwards need lower fees
-            is_cold_start = False
-            total_forwards = state.get("forward_count", 0) if state else 0
-            if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
-                if current_fee_ppm > cfg.min_fee_ppm:
-                    is_cold_start = True
-                    # Bias Thompson toward lower fees for cold channels
-                    cold_target = min(new_fee_ppm, floor_ppm + 50)
-                    new_fee_ppm = cold_target
-                    decision_reason = f"thompson_cold_start (fwds={total_forwards})"
-                    self.plugin.log(
-                        f"THOMPSON COLD-START: {channel_id[:12]}... has {total_forwards} forwards. "
-                        f"Biasing toward floor ({new_fee_ppm} ppm).",
-                        level='info'
-                    )
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                is_cold_start = False
+                total_forwards = state.get("forward_count", 0) if state else 0
+                if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
+                    if current_fee_ppm > cfg.min_fee_ppm:
+                        is_cold_start = True
+                        # Bias Thompson toward lower fees for cold channels
+                        cold_target = min(new_fee_ppm, floor_ppm + 50)
+                        new_fee_ppm = cold_target
+                        decision_reason = f"thompson_cold_start (fwds={total_forwards})"
+                        self.plugin.log(
+                            f"THOMPSON COLD-START: {channel_id[:12]}... has {total_forwards} forwards. "
+                            f"Biasing toward floor ({new_fee_ppm} ppm).",
+                            level='info'
+                        )
 
             # Update volume tracking
             ts_state.last_volume_sats = volume_since_sats
@@ -6525,11 +6527,12 @@ class HillClimbingFeeController:
                         new_fee_ppm = blended_fee
 
             # Fee anchor blend (advisor soft target)
-            new_fee_ppm, anchor_reason = self._apply_fee_anchor(
-                channel_id, new_fee_ppm, floor_ppm, effective_ceiling
-            )
-            if anchor_reason:
-                decision_reason = f"{decision_reason}+{anchor_reason}"
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                new_fee_ppm, anchor_reason = self._apply_fee_anchor(
+                    channel_id, new_fee_ppm, floor_ppm, effective_ceiling
+                )
+                if anchor_reason:
+                    decision_reason = f"{decision_reason}+{anchor_reason}"
 
             # Defense multiplier -- skip in Thompson path: already applied inside aimd.apply_to_fee()
             if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not self.ENABLE_THOMPSON_AIMD:
