@@ -5884,6 +5884,11 @@ class HillClimbingFeeController:
         if vegas_multiplier > 1.0:
             base_floor_ppm = int(base_floor_ppm * vegas_multiplier)
 
+        # Snapshot hard safety floor BEFORE heuristic floors are applied.
+        # DTS+PID uses this instead of floor_ppm, which includes balance_floor
+        # and saturation_floor — heuristics the PID is designed to replace.
+        _hard_floor_ppm = base_floor_ppm
+
         # =====================================================================
         # Issue #19: Balance-Based Minimum Fee Floor
         # =====================================================================
@@ -5928,6 +5933,10 @@ class HillClimbingFeeController:
             )
             base_floor_ppm = rebalance_floor_ppm
 
+        # Include rebalance cost in hard floor (economic constraint, not heuristic)
+        if rebalance_floor_ppm is not None:
+            _hard_floor_ppm = max(_hard_floor_ppm, rebalance_floor_ppm)
+
         base_ceiling_ppm = cfg.max_fee_ppm
 
         # =====================================================================
@@ -5938,6 +5947,10 @@ class HillClimbingFeeController:
         base_ceiling_ppm = self._get_flow_adjusted_ceiling(
             channel_id, current_fee_ppm, base_ceiling_ppm
         )
+
+        # Snapshot hard ceiling BEFORE saturation drain ceiling is applied.
+        # DTS+PID uses this — saturation drain is a heuristic the PID replaces.
+        _hard_ceiling_ppm = base_ceiling_ppm
 
         # =====================================================================
         # Saturation Drain Ceiling (Fix: Fee Death Spiral Inversion)
@@ -6677,7 +6690,11 @@ class HillClimbingFeeController:
                     flow_state=flow_state_str,
                 )
                 new_fee_ppm = int(thompson_fee * pid_multiplier)
-                new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
+
+                # Use hard safety constraints only — bypass legacy heuristic
+                # floors (balance_floor, saturation_floor) and ceilings
+                # (saturation_drain) that the PID is designed to replace.
+                new_fee_ppm = max(_hard_floor_ppm, min(_hard_ceiling_ppm, new_fee_ppm))
 
                 decision_reason = (
                     f"dts_pid (dts={thompson_fee}, pid={pid_multiplier:.2f}, "
@@ -6687,8 +6704,10 @@ class HillClimbingFeeController:
                 # Update volume tracking
                 ts_state.last_volume_sats = volume_since_sats
 
-                # Skip cold-start ceiling (not used in DTS+PID)
-                effective_ceiling = ceiling_ppm
+                # Align downstream vars to hard constraints so Hive coordination
+                # doesn't re-apply legacy heuristic bounds
+                effective_ceiling = _hard_ceiling_ppm
+                floor_ppm = _hard_floor_ppm
                 base_new_fee = new_fee_ppm
 
                 # PID handles balance management; no cold-start needed
@@ -6898,32 +6917,29 @@ class HillClimbingFeeController:
                 # =====================================================================
                 # DTS+PID SHADOW MODE: Log what DTS+PID would have set
                 # =====================================================================
+                # Uses the PERSISTED ts_state.pid so EWMA and integral errors
+                # accumulate correctly across cycles (not an ephemeral PIDState).
+                # Clamps to hard safety constraints, bypassing legacy heuristic
+                # floors/ceilings that the PID is designed to replace.
                 try:
-                    shadow_dts_fee = thompson_fee  # Already sampled above
-                    shadow_precision = 1.0 / max(ts_state.thompson.posterior_std ** 2, 1.0)
-                    shadow_precision *= 0.95
-                    shadow_precision = max(shadow_precision, GaussianThompsonState.MIN_PRECISION)
-
                     try:
                         sh_ch_state = self.database.get_channel_state(channel_id)
                         sh_flow = (sh_ch_state or {}).get("state", "balanced")
                     except Exception:
                         sh_flow = "balanced"
 
-                    shadow_pid = PIDState()
-                    shadow_pid.last_update_time = ts_state.pid.last_update_time or (int(time.time()) - 1800)
-                    shadow_pid_mult = shadow_pid.calculate_multiplier(
-                        outbound_ratio,
-                        channel_info.get("capacity", 2_000_000),
+                    shadow_pid_mult = ts_state.pid.calculate_multiplier(
+                        current_outbound_ratio=outbound_ratio,
+                        capacity_sats=channel_info.get("capacity", 2_000_000),
                         flow_state=sh_flow,
                     )
-                    shadow_fee = int(shadow_dts_fee * shadow_pid_mult)
-                    shadow_fee = max(floor_ppm, min(ceiling_ppm, shadow_fee))
+                    shadow_fee = int(thompson_fee * shadow_pid_mult)
+                    shadow_fee = max(_hard_floor_ppm, min(_hard_ceiling_ppm, shadow_fee))
 
                     self.plugin.log(
                         f"DTS_PID_SHADOW: {channel_id[:12]}... "
                         f"actual={new_fee_ppm} shadow={shadow_fee} "
-                        f"(dts={shadow_dts_fee}, pid={shadow_pid_mult:.2f}, "
+                        f"(dts={thompson_fee}, pid={shadow_pid_mult:.2f}, "
                         f"flow={sh_flow}, outbound={outbound_ratio:.2f})",
                         level='info'
                     )
