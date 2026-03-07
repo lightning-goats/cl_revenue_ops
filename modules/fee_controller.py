@@ -2133,6 +2133,29 @@ class GaussianThompsonState:
         if new_floor > self.posterior_mean:
             self.posterior_mean += (new_floor - self.posterior_mean) * 0.3
 
+    # Minimum posterior precision to prevent infinite variance on quiet channels.
+    # Corresponds to max std ≈ 200 ppm.
+    MIN_PRECISION = 0.000025
+
+    def apply_dts_discount(self, gamma: float = 0.95) -> None:
+        """Apply Discounted Thompson Sampling decay to posterior precision.
+
+        Widens the posterior by reducing precision, making the model
+        "5% less certain" per cycle. Replaces HistoricalResponseCurve
+        regime detection.
+
+        Half-life at 30-min cycles with gamma=0.95: ~6.5 hours.
+
+        Args:
+            gamma: Discount factor in (0, 1). Lower = faster forgetting.
+        """
+        if not (0.0 < gamma < 1.0):
+            return
+        precision = 1.0 / max(self.posterior_std ** 2, 1.0)
+        precision *= gamma
+        precision = max(precision, self.MIN_PRECISION)
+        self.posterior_std = math.sqrt(1.0 / precision)
+
     def inject_synthetic_observation(self, fee, revenue_rate, weight_scale=0.3, time_bucket="normal"):
         """
         Inject a reduced-weight synthetic observation from Alpha Sequence bypasses.

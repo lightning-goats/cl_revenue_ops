@@ -2,7 +2,7 @@
 import math
 import time
 import pytest
-from modules.fee_controller import PIDState
+from modules.fee_controller import GaussianThompsonState, PIDState
 
 
 class TestPIDState:
@@ -107,3 +107,40 @@ class TestPIDState:
         pid.last_update_time = int(time.time()) - 1800
         m = pid.calculate_multiplier(0.5, capacity_sats=0)
         assert 0.1 <= m <= 10.0
+
+
+class TestDTSDiscountFactor:
+    """Tests for Discounted Thompson Sampling posterior decay."""
+
+    def test_discount_widens_posterior(self):
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 200.0
+        ts.posterior_std = 30.0
+        std_before = ts.posterior_std
+        ts.apply_dts_discount(gamma=0.95)
+        assert ts.posterior_std > std_before
+
+    def test_discount_preserves_mean(self):
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 250.0
+        ts.posterior_std = 50.0
+        mean_before = ts.posterior_mean
+        ts.apply_dts_discount(gamma=0.95)
+        assert ts.posterior_mean == mean_before
+
+    def test_minimum_precision_cap(self):
+        ts = GaussianThompsonState()
+        ts.posterior_std = 5000.0
+        ts.apply_dts_discount(gamma=0.5)
+        max_std = math.sqrt(1.0 / GaussianThompsonState.MIN_PRECISION)
+        assert ts.posterior_std <= max_std + 0.01
+
+    def test_repeated_discount_converges(self):
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 300.0
+        ts.posterior_std = 20.0
+        for _ in range(100):
+            ts.apply_dts_discount(gamma=0.95)
+        assert ts.posterior_std > 100.0
+        max_std = math.sqrt(1.0 / GaussianThompsonState.MIN_PRECISION)
+        assert ts.posterior_std <= max_std + 0.01
