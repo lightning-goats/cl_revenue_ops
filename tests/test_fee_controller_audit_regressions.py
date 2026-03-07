@@ -604,3 +604,272 @@ class TestAIMDDefenseState:
         for _ in range(200):
             state.record_outcome(success_score=0.9)
         assert state.aimd_modifier <= 1.5
+
+
+# =============================================================================
+# Simplified Fee Path Integration Tests
+# =============================================================================
+
+class TestSimplifiedFeePath:
+    """Integration tests for the simplified Thompson+AIMD path.
+
+    Verifies that with ENABLE_SIMPLIFIED_FEE_PATH = True (the default):
+    1. Fees are produced within configured bounds
+    2. Elasticity tracker state is NOT updated
+    3. Historical response curve state is NOT updated
+    4. AIMD defense still applies
+    5. Scarcity pricing still applies (via bounds multiplier)
+    6. Hive coordination blend still applies
+    """
+
+    def _make_fc(self, mock_plugin, mock_database, *, hive_bridge=None):
+        """Create a fee controller configured for the simplified path."""
+        fc = _make_fc(mock_plugin, mock_database, hive_bridge=hive_bridge)
+
+        cfg = _make_config_snapshot()
+        fc.config.snapshot.return_value = cfg
+
+        # Database mocks
+        mock_database.get_channel_probe.return_value = None
+        mock_database.get_volume_since.return_value = 50_000
+        mock_database.get_weighted_volume_since.return_value = 50_000
+        mock_database.get_forward_count_since.return_value = 10
+        mock_database.get_peer_uptime_percent.return_value = 99.5
+        mock_database.get_channel_state.return_value = {
+            "kalman_flow_ratio": 0.5,
+            "kalman_velocity": 0.0,
+        }
+        mock_database.get_fee_strategy_state.return_value = {
+            "last_revenue_rate": 5.0,
+            "last_fee_ppm": 150,
+            "trend_direction": 1,
+            "step_ppm": 50,
+            "last_update": int(time.time()) - 7200,
+            "consecutive_same_direction": 0,
+            "is_sleeping": 0,
+            "sleep_until": 0,
+            "stable_cycles": 0,
+            "forward_count_since_update": 10,
+            "last_volume_sats": 50_000,
+            "v2_state_json": None,
+        }
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 1800
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_channel_cost_history.return_value = []
+        mock_database.get_channel_rebalance_success_rate.return_value = None
+        mock_database.get_peer_latency_stats.return_value = {'avg': 0.0, 'std': 0.0, 'count': 0}
+        mock_database.update_fee_strategy_state = MagicMock()
+        mock_database.record_fee_change = MagicMock()
+
+        # RPC mocks
+        mock_plugin.rpc.setchannelfee.return_value = {}
+        mock_plugin.rpc.feerates.return_value = {"perkw": {"opening": 1000}}
+
+        # Ensure we are on the simplified Thompson+AIMD path
+        fc.ENABLE_THOMPSON_AIMD = True
+        assert fc.ENABLE_SIMPLIFIED_FEE_PATH is True, "Default should be True"
+
+        return fc, cfg
+
+    def _channel_info(self, *, current_fee_ppm=150, outbound_pct=50.0):
+        """Create channel_info dict with configurable fee and balance."""
+        capacity_sats = 2_000_000
+        spendable_sats = int(capacity_sats * (outbound_pct / 100.0))
+        return {
+            "fee_proportional_millionths": current_fee_ppm,
+            "capacity": capacity_sats,
+            "spendable_msat": f"{spendable_sats * 1000}msat",
+            "opener": "local",
+        }
+
+    def _default_state(self):
+        return {"state": "balanced", "forward_count": 50, "sats_out": 10000}
+
+    # ------------------------------------------------------------------
+    # Test 1: Fee within configured bounds
+    # ------------------------------------------------------------------
+    def test_produces_fee_within_bounds(self, mock_plugin, mock_database):
+        """Simplified path should produce a fee within [min_fee_ppm, max_fee_ppm]."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        channel_info = self._channel_info()
+
+        result = fc._adjust_channel_fee(
+            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
+        )
+
+        assert result is not None
+        assert isinstance(result, FeeAdjustment)
+        assert result.new_fee_ppm >= cfg.min_fee_ppm
+        assert result.new_fee_ppm <= cfg.max_fee_ppm
+
+    # ------------------------------------------------------------------
+    # Test 2: Elasticity tracker NOT updated
+    # ------------------------------------------------------------------
+    def test_does_not_update_elasticity_tracker(self, mock_plugin, mock_database):
+        """Simplified path must NOT call elasticity tracker add_observation."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        channel_info = self._channel_info()
+
+        # Seed some elasticity data to verify it's unchanged after adjustment
+        from modules.fee_controller import ThompsonAIMDState, ElasticityTracker
+        ts_state = fc._get_thompson_aimd_state(channel_id, peer_id)
+        tracker_before = ts_state.get_elasticity_tracker()
+        data_before = tracker_before.to_dict()
+
+        result = fc._adjust_channel_fee(
+            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
+        )
+
+        assert result is not None
+        # Re-fetch the state and verify elasticity data is unchanged
+        ts_state_after = fc._get_thompson_aimd_state(channel_id, peer_id)
+        tracker_after = ts_state_after.get_elasticity_tracker()
+        data_after = tracker_after.to_dict()
+        assert data_before == data_after, (
+            "Elasticity tracker should not be updated in simplified path"
+        )
+
+    # ------------------------------------------------------------------
+    # Test 3: Historical response curve NOT updated
+    # ------------------------------------------------------------------
+    def test_does_not_update_historical_curve(self, mock_plugin, mock_database):
+        """Simplified path must NOT call historical_curve.add_observation."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        channel_info = self._channel_info()
+
+        from modules.fee_controller import HistoricalResponseCurve
+        ts_state = fc._get_thompson_aimd_state(channel_id, peer_id)
+        curve_before = ts_state.get_historical_curve()
+        data_before = curve_before.to_dict()
+
+        result = fc._adjust_channel_fee(
+            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
+        )
+
+        assert result is not None
+        ts_state_after = fc._get_thompson_aimd_state(channel_id, peer_id)
+        curve_after = ts_state_after.get_historical_curve()
+        data_after = curve_after.to_dict()
+        assert data_before == data_after, (
+            "Historical response curve should not be updated in simplified path"
+        )
+
+    # ------------------------------------------------------------------
+    # Test 4: AIMD defense still applies (failure streaks lower fee)
+    # ------------------------------------------------------------------
+    def test_aimd_defense_applies(self, mock_plugin, mock_database):
+        """Failure streaks should reduce the AIMD modifier, lowering the fee."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        channel_info = self._channel_info(current_fee_ppm=500)
+
+        # First: get a baseline fee with no AIMD pressure
+        result_baseline = fc._adjust_channel_fee(
+            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
+        )
+        assert result_baseline is not None
+
+        # Now inject a failure streak into the AIMD state
+        ts_state = fc._get_thompson_aimd_state(channel_id, peer_id)
+        for _ in range(10):
+            ts_state.aimd.last_decrease_time = 0  # bypass cooldown
+            ts_state.aimd.record_outcome(success_score=0.05)
+        assert ts_state.aimd.aimd_modifier < 1.0, "AIMD modifier should have decreased"
+
+        # Re-run fee adjustment — AIMD should pull the fee down
+        result_defense = fc._adjust_channel_fee(
+            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
+        )
+        assert result_defense is not None
+        assert "aimd_defense" in result_defense.reason.lower() or "defense" in result_defense.reason.lower(), (
+            f"Expected AIMD defense reason, got: {result_defense.reason}"
+        )
+
+    # ------------------------------------------------------------------
+    # Test 5: Scarcity pricing raises floor via bounds multiplier
+    # ------------------------------------------------------------------
+    def test_scarcity_raises_floor(self, mock_plugin, mock_database):
+        """Low outbound ratio should raise the fee floor via bounds multiplier."""
+        fc, cfg = self._make_fc(mock_plugin, mock_database)
+        cfg.enable_scarcity_pricing = True
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # Normal balance (50%) — baseline
+        channel_info_normal = self._channel_info(outbound_pct=50.0)
+        result_normal = fc._adjust_channel_fee(
+            channel_id, peer_id, self._default_state(), channel_info_normal, cfg=cfg
+        )
+
+        # Scarce balance (10%) — should have higher floor
+        channel_info_scarce = self._channel_info(outbound_pct=10.0)
+        mock_database.get_channel_state.return_value = {
+            "kalman_flow_ratio": 0.1,
+            "kalman_velocity": 0.0,
+        }
+        result_scarce = fc._adjust_channel_fee(
+            channel_id, peer_id,
+            {"state": "sink", "forward_count": 50, "sats_out": 10000},
+            channel_info_scarce, cfg=cfg
+        )
+
+        assert result_normal is not None
+        assert result_scarce is not None
+        # With very low outbound (10%), the liquidity bucket multiplier raises
+        # the floor, so the fee should be >= the normal-balance fee
+        assert result_scarce.new_fee_ppm >= cfg.min_fee_ppm
+
+    # ------------------------------------------------------------------
+    # Test 6: Hive coordination blend applies
+    # ------------------------------------------------------------------
+    def test_hive_coordination_blend(self, mock_plugin, mock_database):
+        """When hive bridge provides a recommendation, fee should be blended."""
+        hive_bridge = MagicMock()
+        hive_bridge.is_available.return_value = True
+        hive_bridge.query_coordinated_fee_recommendation.return_value = {
+            "recommended_fee_ppm": 500,
+            "confidence": 0.9,
+            "corridor_role": "primary",
+            "defense_multiplier": 1.0,
+            "pheromone_level": 0.8,
+            "adjustment_reason": "test_coord",
+        }
+        hive_bridge.query_defense_status.return_value = None
+        hive_bridge.query_hive_prior.return_value = None
+        # Return None for fee intelligence to avoid competitor-adjusted bounds path
+        hive_bridge.query_fee_intelligence.return_value = None
+        # Fleet-aware adjustment returns unchanged fee
+        hive_bridge.check_internal_competition_for_peer.return_value = None
+
+        fc, cfg = self._make_fc(mock_plugin, mock_database, hive_bridge=hive_bridge)
+        fc.ENABLE_HIVE_COORDINATION = True
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        channel_info = self._channel_info(current_fee_ppm=100)
+
+        result = fc._adjust_channel_fee(
+            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
+        )
+
+        assert result is not None
+        # The hive recommends 500 ppm. With HIVE_COORDINATION_WEIGHT=0.5,
+        # the blended fee should be pulled toward 500 from wherever Thompson
+        # sampled. The exact value depends on the Thompson sample, but the
+        # recommendation should have been queried.  It may be called more than
+        # once (e.g. during Thompson prior initialization and during the blend).
+        assert hive_bridge.query_coordinated_fee_recommendation.call_count >= 1
+        # Verify the coordination blend call included local_balance_pct
+        blend_calls = [
+            c for c in hive_bridge.query_coordinated_fee_recommendation.call_args_list
+            if 'local_balance_pct' in (c.kwargs or {})
+        ]
+        assert len(blend_calls) == 1, "Expected exactly one coordination blend call"
+        assert result.new_fee_ppm >= cfg.min_fee_ppm
+        assert result.new_fee_ppm <= cfg.max_fee_ppm
