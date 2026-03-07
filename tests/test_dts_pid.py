@@ -390,3 +390,29 @@ class TestDTSPIDIntegration:
         )
         assert result is not None
         assert isinstance(result, FeeAdjustment)
+
+
+class TestHivePriorIntegration:
+    def test_hive_prior_sets_mean(self):
+        ts = GaussianThompsonState()
+        ts.initialize_dts_from_hive(optimal_fee=350, confidence=0.8)
+        assert ts.posterior_mean == 350.0
+
+    def test_hive_prior_narrows_posterior(self):
+        ts_high = GaussianThompsonState()
+        ts_high.initialize_dts_from_hive(optimal_fee=200, confidence=0.9)
+        ts_low = GaussianThompsonState()
+        ts_low.initialize_dts_from_hive(optimal_fee=200, confidence=0.1)
+        assert ts_high.posterior_std < ts_low.posterior_std
+
+    def test_hive_prior_respects_min_precision(self):
+        ts = GaussianThompsonState()
+        ts.initialize_dts_from_hive(optimal_fee=200, confidence=0.0)
+        max_std = math.sqrt(1.0 / GaussianThompsonState.MIN_PRECISION)
+        assert ts.posterior_std <= max_std + 0.01
+
+    def test_hive_prior_no_data_keeps_defaults(self):
+        ts = GaussianThompsonState()
+        default_mean = ts.posterior_mean
+        ts.initialize_dts_from_hive(optimal_fee=None, confidence=0.0)
+        assert ts.posterior_mean == default_mean

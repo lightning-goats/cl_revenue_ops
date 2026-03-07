@@ -2156,6 +2156,31 @@ class GaussianThompsonState:
         precision = max(precision, self.MIN_PRECISION)
         self.posterior_std = math.sqrt(1.0 / precision)
 
+    def initialize_dts_from_hive(
+        self,
+        optimal_fee: int | None,
+        confidence: float,
+    ) -> None:
+        """Initialize DTS posterior from Hive fleet intelligence.
+
+        Seeds posterior mean from fleet's optimal fee estimate and
+        sets posterior width based on confidence. Higher confidence →
+        tighter posterior.
+
+        Args:
+            optimal_fee: Fleet's estimated optimal fee in ppm, or None.
+            confidence: Hive confidence score (0.0–1.0).
+        """
+        if optimal_fee is not None and optimal_fee > 0:
+            self.posterior_mean = float(optimal_fee)
+            self.prior_mean_fee = optimal_fee
+
+        confidence = max(0.0, min(1.0, confidence))
+        target_std = self.prior_std_fee * (1.0 - confidence * 0.7)
+        target_std = max(self.MIN_STD, target_std)
+        max_std = math.sqrt(1.0 / self.MIN_PRECISION)
+        self.posterior_std = min(target_std, max_std)
+
     def inject_synthetic_observation(self, fee, revenue_rate, weight_scale=0.3, time_bucket="normal"):
         """
         Inject a reduced-weight synthetic observation from Alpha Sequence bypasses.
