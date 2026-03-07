@@ -52,7 +52,14 @@ from modules.config import Config
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
-from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
+from modules.policy_manager import (
+    PolicyManager,
+    FeeStrategy,
+    RebalanceMode,
+    PeerPolicy,
+    READ_ONLY_POLICY_ACTIONS,
+    TACTICAL_POLICY_ACTIONS,
+)
 from modules.hive_bridge import HiveFeeIntelligenceBridge
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.utils import normalize_scid, parse_msat
@@ -1933,6 +1940,7 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
                 "action": "hold",
                 "reason": "unavailable",
                 "dominant_input": "rebalancer",
+                "safety_block": False,
                 "budget_blocked": False,
             }
         ),
@@ -3071,15 +3079,18 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
     """
     Manage peer-level fee and rebalance policies (v1.4 API).
 
+    Normal operator use is now read-only. Tactical policy writes remain
+    available only through explicit internal/debug override flags.
+
     Usage:
       lightning-cli revenue-policy list                           # List all policies
       lightning-cli revenue-policy get <peer_id>                  # Get policy for peer
-      lightning-cli revenue-policy set <peer_id> [options]        # Set/update policy
-      lightning-cli revenue-policy delete <peer_id>               # Delete policy (revert to defaults)
-      lightning-cli revenue-policy tag <peer_id> <tag>            # Add tag to peer
-      lightning-cli revenue-policy untag <peer_id> <tag>          # Remove tag from peer
       lightning-cli revenue-policy find <tag>                     # Find peers by tag
       lightning-cli revenue-policy changes [since=<timestamp>]    # Get policy changes (cl-hive)
+      lightning-cli revenue-policy set <peer_id> [options]        # Deprecated for normal operator use
+      lightning-cli revenue-policy delete <peer_id>               # Deprecated for normal operator use
+      lightning-cli revenue-policy tag <peer_id> <tag>            # Deprecated for normal operator use
+      lightning-cli revenue-policy untag <peer_id> <tag>          # Deprecated for normal operator use
 
     Options for 'set':
       strategy=dynamic|static|hive|passive   Fee control strategy
@@ -3118,6 +3129,24 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
     """
     if policy_manager is None:
         return {"error": "Plugin not initialized"}
+
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    action = str(action or "").strip().lower()
+    internal_override = _truthy(kwargs.get("internal")) or _truthy(kwargs.get("admin"))
+
+    if action in TACTICAL_POLICY_ACTIONS and not internal_override:
+        return {
+            "error": (
+                f"revenue-policy {action} is deprecated for normal operator use. "
+                "Use revenue-policy list/get/find/changes for diagnostics."
+            )
+        }
     
     try:
         if action == "list":
@@ -3286,7 +3315,9 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
                 return {"status": "error", "error": str(e)}
 
         else:
-            return {"error": f"Unknown action: {action}. Use 'list', 'get', 'set', 'delete', 'tag', 'untag', 'find', 'changes', or 'batch'"}
+            allowed = sorted(READ_ONLY_POLICY_ACTIONS | TACTICAL_POLICY_ACTIONS)
+            allowed_text = ", ".join(f"'{name}'" for name in allowed)
+            return {"error": f"Unknown action: {action}. Use {allowed_text}"}
     
     except ValueError as e:
         return {"status": "error", "error": str(e)}

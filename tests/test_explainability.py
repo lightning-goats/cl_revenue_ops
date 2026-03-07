@@ -303,6 +303,7 @@ def test_status_exposes_last_rebalance_decision_reason():
         "action": "suppressed",
         "reason": "budget_exhausted",
         "dominant_input": "daily_budget_sats",
+        "safety_block": True,
         "budget_blocked": True,
     }
 
@@ -310,4 +311,5 @@ def test_status_exposes_last_rebalance_decision_reason():
 
     assert result["rebalance_decision"]["action"] in {"hold", "rebalance", "suppressed"}
     assert "reason" in result["rebalance_decision"]
+    assert "safety_block" in result["rebalance_decision"]
     assert "budget_blocked" in result["rebalance_decision"]

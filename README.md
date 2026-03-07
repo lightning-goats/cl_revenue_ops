@@ -56,7 +56,7 @@ Implements **Gaussian Thompson Sampling with AIMD** for revenue-maximizing fee o
 - **Uses sling** for async background execution with orphan job cleanup
 
 ### Module 4: Policy Engine (v2.0)
-Centralized control via `revenue-policy` command.
+Centralized policy machinery for internal coordination and transition diagnostics.
 
 **Strategies:**
 | Strategy | Behavior |
@@ -72,6 +72,10 @@ Centralized control via `revenue-policy` command.
 - **Auto-Suggestions:** Detect bleeders/zombies and suggest changes
 - **Batch Operations:** Update multiple policies atomically
 - **Rate Limiting:** Prevents policy change spam (10/minute per peer)
+
+Normal operators should treat `revenue-policy` as a read-only diagnostic surface.
+Write actions such as `set`, `delete`, `tag`, `untag`, and `batch` are deprecated
+for normal operator use and reserved for internal/debug coordination flows.
 
 ### Module 5: Observability & Reporting
 - **Financial Snapshots:** Daily recording of Net Worth, Margins, ROC
@@ -224,10 +228,12 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 
 | Command | Description |
 |---------|-------------|
-| `revenue-policy set <peer_id> [opts]` | Set fee/rebalance rules for a peer |
-| `revenue-policy get <peer_id>` | Get policy for a peer |
 | `revenue-policy list` | List all policies |
-| `revenue-policy delete <peer_id>` | Remove policy for a peer |
+| `revenue-policy get <peer_id>` | Get policy for a peer |
+| `revenue-policy find <tag>` | Find peers by tag |
+| `revenue-policy changes [since]` | Inspect policy changes for migration/coordination diagnostics |
+
+Normal operator use of `revenue-policy set/delete/tag/untag/batch` is deprecated.
 
 ### Reporting
 

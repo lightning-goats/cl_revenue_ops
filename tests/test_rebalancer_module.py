@@ -2160,4 +2160,5 @@ class TestLastDecisionSummary:
         assert summary["action"] == "suppressed"
         assert summary["reason"] == "budget_exhausted"
         assert summary["dominant_input"] == "daily_budget_sats"
+        assert summary["safety_block"] is True
         assert summary["budget_blocked"] is True

@@ -1973,6 +1973,7 @@ class EVRebalancer:
             "action": "hold",
             "reason": "not_run",
             "dominant_input": "startup",
+            "safety_block": False,
             "budget_blocked": False,
         }
 
@@ -1985,12 +1986,14 @@ class EVRebalancer:
         action: str,
         reason: str,
         dominant_input: Optional[str],
+        safety_block: bool,
         budget_blocked: bool,
     ) -> None:
         self._last_decision_summary = {
             "action": action,
             "reason": reason,
             "dominant_input": dominant_input,
+            "safety_block": bool(safety_block),
             "budget_blocked": bool(budget_blocked),
         }
 
@@ -2187,6 +2190,7 @@ class EVRebalancer:
                     action="suppressed",
                     reason="no_rebalance_slots",
                     dominant_input="concurrency_limit",
+                    safety_block=True,
                     budget_blocked=False,
                 )
                 self.plugin.log(
@@ -2201,6 +2205,7 @@ class EVRebalancer:
                     action="suppressed",
                     reason="capital_controls_blocked",
                     dominant_input="daily_budget_sats",
+                    safety_block=True,
                     budget_blocked=True,
                 )
                 return candidates
@@ -2211,6 +2216,7 @@ class EVRebalancer:
                     action="hold",
                     reason="no_channel_balance_data",
                     dominant_input="channel_balances",
+                    safety_block=False,
                     budget_blocked=False,
                 )
                 return candidates
@@ -2320,6 +2326,7 @@ class EVRebalancer:
                     action="hold",
                     reason="no_rebalance_candidates",
                     dominant_input="liquidity_balance",
+                    safety_block=False,
                     budget_blocked=False,
                 )
                 return candidates
@@ -2457,6 +2464,7 @@ class EVRebalancer:
                     action="rebalance",
                     reason="profitable_candidates_found",
                     dominant_input=selected[0].reason_code,
+                    safety_block=False,
                     budget_blocked=False,
                 )
             else:
@@ -2464,6 +2472,7 @@ class EVRebalancer:
                     action="hold",
                     reason="no_profitable_candidates",
                     dominant_input="ev_filter",
+                    safety_block=False,
                     budget_blocked=False,
                 )
             return selected
@@ -4052,6 +4061,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     action="suppressed",
                     reason="fleet_conflict",
                     dominant_input="fleet_conflict",
+                    safety_block=True,
                     budget_blocked=False,
                 )
                 self.plugin.log(
@@ -4079,6 +4089,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     action="suppressed",
                     reason="circular_flow_risk",
                     dominant_input="circular_flow_risk",
+                    safety_block=True,
                     budget_blocked=False,
                 )
                 flow_members = circular_risk.get("flow_members", [])
@@ -4188,6 +4199,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                             action="rebalance",
                             reason="circular_rebalance",
                             dominant_input="fleet_path",
+                            safety_block=False,
                             budget_blocked=False,
                         )
                         result["success"] = True
@@ -4236,6 +4248,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     action="suppressed",
                     reason="invalid_channel_ids",
                     dominant_input="validation",
+                    safety_block=True,
                     budget_blocked=False,
                 )
                 self.plugin.log(
@@ -4273,6 +4286,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     action="rebalance",
                     reason="dry_run",
                     dominant_input=candidate.reason_code,
+                    safety_block=False,
                     budget_blocked=False,
                 )
                 self.plugin.log(
@@ -4340,6 +4354,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         action="suppressed",
                         reason="budget_exhausted",
                         dominant_input="daily_budget_sats",
+                        safety_block=True,
                         budget_blocked=True,
                     )
                     self.database.update_rebalance_result(
@@ -4373,6 +4388,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     action="rebalance",
                     reason="async_job_started",
                     dominant_input=candidate.reason_code,
+                    safety_block=False,
                     budget_blocked=False,
                 )
                 job_started = True
@@ -4396,6 +4412,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     action="suppressed",
                     reason="start_job_failed",
                     dominant_input=candidate.reason_code,
+                    safety_block=False,
                     budget_blocked=False,
                 )
                 self.database.update_rebalance_result(
@@ -4413,6 +4430,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 action="suppressed",
                 reason="execution_error",
                 dominant_input="execution_error",
+                safety_block=False,
                 budget_blocked=False,
             )
             result["message"] = str(e)

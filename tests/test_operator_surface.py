@@ -1,3 +1,4 @@
+import pytest
 from unittest.mock import MagicMock
 
 from modules.config import Config
@@ -51,6 +52,12 @@ def _load_operator_surface_module():
         min_fee_ppm=15,
         max_fee_ppm=2500,
     )
+    return mod
+
+
+def _load_policy_surface_module():
+    mod = load_plugin_module()
+    mod.policy_manager = MagicMock()
     return mod
 
 
@@ -154,3 +161,34 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "max_fee_ppm": 2500,
     }
     assert "config" not in result
+
+
+@pytest.mark.parametrize(
+    ("action", "peer_id", "kwargs"),
+    [
+        ("set", "02" + "a" * 64, {"strategy": "static", "fee_ppm": 500}),
+        ("delete", "02" + "a" * 64, {}),
+        ("tag", "02" + "a" * 64, {"tag": "whale"}),
+        ("untag", "02" + "a" * 64, {"tag": "whale"}),
+        ("batch", None, {"updates": [{"peer_id": "02" + "a" * 64, "strategy": "hive"}]}),
+    ],
+)
+def test_revenue_policy_mutations_are_deprecated_for_normal_operator_use(action, peer_id, kwargs):
+    mod = _load_policy_surface_module()
+
+    result = mod.revenue_policy(mod.plugin, action, peer_id, **kwargs)
+
+    assert result["error"].startswith(
+        f"revenue-policy {action} is deprecated for normal operator use"
+    )
+
+
+def test_revenue_policy_list_remains_available_for_transition_diagnostics():
+    mod = _load_policy_surface_module()
+    policy = MagicMock()
+    policy.to_dict.return_value = {"peer_id": "02" + "a" * 64, "strategy": "hive"}
+    mod.policy_manager.get_all_policies.return_value = [policy]
+
+    result = mod.revenue_policy(mod.plugin, "list")
+
+    assert result["count"] == 1
