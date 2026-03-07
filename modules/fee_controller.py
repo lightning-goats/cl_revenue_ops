@@ -6895,6 +6895,44 @@ class HillClimbingFeeController:
                 new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
                 base_new_fee = new_fee_ppm  # For logging compatibility
 
+                # =====================================================================
+                # DTS+PID SHADOW MODE: Log what DTS+PID would have set
+                # =====================================================================
+                try:
+                    shadow_dts_fee = thompson_fee  # Already sampled above
+                    shadow_precision = 1.0 / max(ts_state.thompson.posterior_std ** 2, 1.0)
+                    shadow_precision *= 0.95
+                    shadow_precision = max(shadow_precision, GaussianThompsonState.MIN_PRECISION)
+
+                    try:
+                        sh_ch_state = self.database.get_channel_state(channel_id)
+                        sh_flow = (sh_ch_state or {}).get("state", "balanced")
+                    except Exception:
+                        sh_flow = "balanced"
+
+                    shadow_pid = PIDState()
+                    shadow_pid.last_update_time = ts_state.pid.last_update_time or (int(time.time()) - 1800)
+                    shadow_pid_mult = shadow_pid.calculate_multiplier(
+                        outbound_ratio,
+                        channel_info.get("capacity", 2_000_000),
+                        flow_state=sh_flow,
+                    )
+                    shadow_fee = int(shadow_dts_fee * shadow_pid_mult)
+                    shadow_fee = max(floor_ppm, min(ceiling_ppm, shadow_fee))
+
+                    self.plugin.log(
+                        f"DTS_PID_SHADOW: {channel_id[:12]}... "
+                        f"actual={new_fee_ppm} shadow={shadow_fee} "
+                        f"(dts={shadow_dts_fee}, pid={shadow_pid_mult:.2f}, "
+                        f"flow={sh_flow}, outbound={outbound_ratio:.2f})",
+                        level='info'
+                    )
+                except Exception as e:
+                    self.plugin.log(
+                        f"DTS_PID_SHADOW: {channel_id[:12]}... error: {e}",
+                        level='debug'
+                    )
+
             # =====================================================================
             # Hive Coordination (preserved from Hill Climbing)
             # =====================================================================

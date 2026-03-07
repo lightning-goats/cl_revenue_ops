@@ -416,3 +416,25 @@ class TestHivePriorIntegration:
         default_mean = ts.posterior_mean
         ts.initialize_dts_from_hive(optimal_fee=None, confidence=0.0)
         assert ts.posterior_mean == default_mean
+
+
+class TestDTSPIDShadowMode:
+    def test_shadow_mode_logs_proposed_fee(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database, enable_dts_pid=False)
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64,
+            {"state": "balanced", "forward_count": 50, "sats_out": 10000},
+            {
+                "fee_proportional_millionths": 150,
+                "capacity": 2_000_000,
+                "spendable_msat": "1000000000msat",
+                "opener": "local",
+            },
+            cfg=cfg,
+        )
+        assert result is not None
+        log_calls = [str(c) for c in mock_plugin.log.call_args_list]
+        shadow_logs = [c for c in log_calls if "DTS_PID_SHADOW" in c]
+        assert len(shadow_logs) > 0, (
+            f"Expected DTS_PID_SHADOW log. Last 5 logs: {log_calls[-5:]}"
+        )
