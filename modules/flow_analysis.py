@@ -74,12 +74,10 @@ VELOCITY_OUTLIER_THRESHOLD = 3.0  # Ignore velocity changes > 3 standard deviati
 
 # Improvement #5: Adaptive EMA Decay
 # decay = base_decay + volatility_adjustment
-# Security: Bounded to 0.6 - 0.9 range
+# Security: Bounded to BASE ± DECAY_RANGE/2
 ENABLE_ADAPTIVE_DECAY = True
-BASE_EMA_DECAY = 0.8  # Default decay factor
-MIN_EMA_DECAY = 0.6  # Faster decay for volatile channels (more recent = more weight)
-MAX_EMA_DECAY = 0.9  # Slower decay for stable channels
-VOLATILITY_WINDOW_DAYS = 14  # Calculate volatility over longer window than flow
+BASE_EMA_DECAY = 0.8   # Default decay factor
+DECAY_RANGE = 0.3      # Symmetric range: fast=0.65, slow=0.95
 
 # =============================================================================
 # IMPROVEMENT #6: Kalman Filter for Flow State Estimation
@@ -852,8 +850,11 @@ class FlowAnalyzer:
 
         Volatility = std_dev(daily_net_flow) / mean(daily_volume)
 
-        Security: Bounded to MIN_EMA_DECAY - MAX_EMA_DECAY
+        Security: Bounded to BASE_EMA_DECAY ± DECAY_RANGE/2
         """
+        min_decay = BASE_EMA_DECAY - DECAY_RANGE / 2
+        max_decay = BASE_EMA_DECAY + DECAY_RANGE / 2
+
         if not ENABLE_ADAPTIVE_DECAY:
             return BASE_EMA_DECAY
 
@@ -884,20 +885,20 @@ class FlowAnalyzer:
         volatility = std_dev / mean_volume if mean_volume > 0 else 0
 
         # Map volatility to decay factor
-        # High volatility (>0.5) -> fast decay (0.6)
-        # Low volatility (<0.1) -> slow decay (0.9)
+        # High volatility (>0.5) -> fast decay (min_decay)
+        # Low volatility (<0.1) -> slow decay (max_decay)
         if volatility > 0.5:
-            decay = MIN_EMA_DECAY
+            decay = min_decay
         elif volatility < 0.1:
-            decay = MAX_EMA_DECAY
+            decay = max_decay
         else:
             # Linear interpolation
-            decay = MAX_EMA_DECAY - (volatility - 0.1) * (
-                (MAX_EMA_DECAY - MIN_EMA_DECAY) / 0.4
+            decay = max_decay - (volatility - 0.1) * (
+                (max_decay - min_decay) / 0.4
             )
 
         # Security: enforce bounds
-        return max(MIN_EMA_DECAY, min(MAX_EMA_DECAY, decay))
+        return max(min_decay, min(max_decay, decay))
 
     def analyze_all_channels(self) -> Dict[str, FlowMetrics]:
         """
