@@ -461,7 +461,10 @@ class Database:
             CREATE TABLE IF NOT EXISTS channel_failures (
                 channel_id TEXT PRIMARY KEY,
                 failure_count INTEGER NOT NULL DEFAULT 0,
-                last_failure_time INTEGER NOT NULL DEFAULT 0
+                last_failure_time INTEGER NOT NULL DEFAULT 0,
+                last_attempted_ppm INTEGER NOT NULL DEFAULT 0,
+                last_attempted_amount INTEGER NOT NULL DEFAULT 0,
+                last_error_type TEXT NOT NULL DEFAULT ''
             )
         """)
         
@@ -894,6 +897,17 @@ class Database:
 
         # v2.0 Migration: Add Kalman filter columns and table
         self._migrate_kalman_schema(conn)
+
+        # Rebalancer efficiency: failure-informed routing columns
+        for col, col_type, default in [
+            ("last_attempted_ppm", "INTEGER", "0"),
+            ("last_attempted_amount", "INTEGER", "0"),
+            ("last_error_type", "TEXT", "''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE channel_failures ADD COLUMN {col} {col_type} NOT NULL DEFAULT {default}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
         # Fee anchors table: advisor-set soft fee targets with decaying weight
         conn.execute("""
