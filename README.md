@@ -1,29 +1,33 @@
 # cl-revenue-ops
 
-A Revenue Operations Plugin for Core Lightning that provides intelligent fee management, and profit-aware rebalancing.
+An autonomous profit executor for Core Lightning that sets fees and allocates liquidity to maximize risk-adjusted routing profit.
 
 ## Overview
 
-This plugin acts as a "Revenue Operations" layer for your Lightning node. It makes data-driven decisions about fee pricing and rebalancing to maximize profitability based on economic principles rather than heuristics.
+`cl-revenue-ops` is the node's execution layer for routing profitability. It observes channel economics, decides whether to hold or act, and executes fee or liquidity changes with a small operator-facing safety surface.
+
+Normal operator control is intentionally limited to four runtime controls:
+
+- `paused`
+- `daily_budget_sats`
+- `min_fee_ppm`
+- `max_fee_ppm`
+
+Everything else should be treated as internal model machinery, compatibility scaffolding, or debug/admin-only tooling. The routine operator workflow is decision explainability, not knob tuning: inspect `revenue-status`, understand why the plugin held or acted, and adjust only the four safety rails when necessary.
 
 ## Architecture
 
 ```
-cl-hive (Coordination Layer - optional)
+cl-hive (optional coordination priors)
     ↓
-cl-revenue-ops (Execution Layer - "The CFO")
+cl-revenue-ops (autonomous profit executor)
     ↓
 sling (Rebalancing Engine - required)
     ↓
 Core Lightning
 ```
 
-`cl-revenue-ops` works in two modes:
-
-- **Standalone Mode:** Full functionality for individual node operators
-- **Hive Mode:** Enhanced features when connected to a [cl-hive](https://github.com/lightning-goats/cl-hive) fleet
-
-Both modes use the same codebase. Hive features activate automatically when cl-hive is detected, or can be explicitly controlled via configuration.
+`cl-revenue-ops` runs one execution engine in all cases. When [cl-hive](https://github.com/lightning-goats/cl-hive) is available, it augments local decisions with coordination inputs such as corridor ownership hints, fee priors, peer quality, and rebalance signals. That is not a separate operator product mode; it is the same local executor with better priors.
 
 ## Key Features
 
@@ -32,57 +36,44 @@ Both modes use the same codebase. Hive features activate automatically when cl-h
 - Classifies channels as **SOURCE** (draining), **SINK** (filling), or **BALANCED**
 - Uses bookkeeper plugin data when available for accurate cost tracking
 
-### Module 2: Thompson Sampling Fee Controller
-Implements **Gaussian Thompson Sampling with AIMD** for revenue-maximizing fee optimization.
+### Module 2: Autonomous Fee Execution
+Uses Bayesian and guardrail-aware fee execution to raise, lower, or hold based on expected routing profit.
 
-**The Alpha Sequence** - A prioritized decision flow for fee setting:
+**Decision pipeline:**
 1. **Congestion:** If HTLC slots > 80% full, force Max Fee
 2. **Vegas Reflex:** If L1 mempool spikes >200%, raise fee floor to prevent toxic arbitrage
 3. **Scarcity Pricing:** If local balance < 35%, exponentially raise fees (1x to 3x)
 4. **Thompson Sampling:** Bayesian exploration of fee space with continuous posteriors
 
-**Thompson Sampling Features:**
-- **Contextual Bandits:** Learns optimal fees based on flow direction and balance state
-- **AIMD Defense:** Additive-Increase/Multiplicative-Decrease for rapid market response
-- **Fleet Coordination:** Shares posterior summaries with hive members to avoid competition
-- **Gossip Hysteresis:** Suppresses small fee updates (<5%) to reduce network noise
-- **Virgin Channel Amnesty:** Protects new remote channels from scarcity pricing until break-in
+These components remain internal features. Operators should not tune them routinely; they should inspect the last decision summary exposed by `revenue-status`.
 
-### Module 3: EV-Based Rebalancing
+### Module 3: Profit-Constrained Rebalancing
 - **Positive EV Only:** Only rebalances if `Expected_Revenue > Rebalance_Cost`
 - **Volume-Weighted Targets:** Dynamically adjusts inventory based on velocity
 - **Futility Circuit Breaker:** Stops retrying broken channels after 10 failures
-- **Strategic Exemption:** Allows negative-EV rebalances for "Hive" peers
+- **Coordination Inputs:** Uses cl-hive signals when available without changing the local decision boundary
 - **Uses sling** for async background execution with orphan job cleanup
 
-### Module 4: Policy Engine (v2.0)
-Centralized control via `revenue-policy` command.
+### Module 4: Decision Explainability & Transition Diagnostics
+Centralized status and diagnostic surfaces for operators who need to understand decisions without tuning internals.
 
-**Strategies:**
-| Strategy | Behavior |
-|----------|----------|
-| `dynamic` | Thompson Sampling + Scarcity (Default) |
-| `static` | Fixed fee override |
-| `passive` | Do not manage fees (let CLBoss handle it) |
-| `hive` | Fleet mode (0-fee internal routing) |
+**Primary operator workflow:**
+- `revenue-status` shows `operator_controls`, `fee_decision`, and `rebalance_decision`
+- `revenue-fee-debug` explains deeper fee-controller behavior
+- `revenue-rebalance-debug` explains deeper rebalance suppression or selection behavior
+- `revenue-policy list|get|find|changes` remains available for migration and coordination diagnostics
 
-**v2.0 Features:**
-- **Per-Policy Fee Bounds:** Override fee multipliers per peer
-- **Time-Limited Policies:** Auto-expiring overrides (max 30 days)
-- **Auto-Suggestions:** Detect bleeders/zombies and suggest changes
-- **Batch Operations:** Update multiple policies atomically
-- **Rate Limiting:** Prevents policy change spam (10/minute per peer)
+Normal operators should treat `revenue-policy` as read-only. Write actions such as `set`, `delete`, `tag`, `untag`, and `batch` are deprecated for normal operator use and reserved for internal/debug coordination flows.
 
 ### Module 5: Observability & Reporting
 - **Financial Snapshots:** Daily recording of Net Worth, Margins, ROC
 - **`revenue-report`:** Unified RPC for P&L summaries and peer analytics
 
-### Module 6: "The Hive" Integration (`hive_bridge.py`)
-- **Fleet Hooks:** Provides API hooks (`revenue-policy`) for cl-hive signals
+### Module 6: Hive Coordination Inputs (`hive_bridge.py`)
+- **Fleet Hooks:** Provides coordination inputs to the local executor
 - **Zero-Fee Routing:** Supports internal fleet whitelisting
-- **Inventory Load Balancing:** Supports "Push" rebalancing via Strategic Exemptions
-- **MCF Assignments:** Accepts and executes MCF rebalance assignments from cl-hive
-- **Kalman Velocity Sharing:** Reports flow velocities to cl-hive for coordinated positioning
+- **Inventory Load Balancing:** Supports coordinated rebalancing and MCF assignments
+- **Kalman Velocity Sharing:** Reports flow velocities to cl-hive for better fleet priors
 
 ### Module 7: Kalman Flow Estimation (v2.1)
 - **Kalman Filter:** Smooth, noise-resistant flow state estimation with NaN recovery and state bounding
@@ -101,69 +92,14 @@ Applies Markowitz Mean-Variance portfolio theory to Lightning channel management
 - **Simplex Projection:** Constrained optimization ensures allocations sum to 1.0
 - **Risk Decomposition:** Per-channel marginal risk contribution analysis
 
-## Operating Modes
+## Coordination Model
 
-cl-revenue-ops supports two operating modes:
+The plugin uses one local observe/decide/execute loop:
 
-### Standalone Mode
+- **Local only:** If cl-hive is unavailable, decisions are made from local profitability, liquidity, and routing history.
+- **Fleet augmented:** If cl-hive is available and membership is valid, the same executor consumes coordination inputs such as fee priors, corridor hints, peer quality, and shared velocity signals.
 
-When running without cl-hive (or with `revenue-ops-hive-enabled=false`), you get:
-
-- Thompson Sampling fee optimization
-- EV-based rebalancing
-- Per-channel profitability tracking
-- Financial dashboard and reporting
-- Policy-based peer management
-
-This is the full feature set for individual node operators who don't want to participate in a fleet.
-
-### Hive Mode
-
-When connected to a cl-hive fleet, you unlock additional features:
-
-| Feature | Description |
-|---------|-------------|
-| **Coordinated Fees** | Fleet-wide fee recommendations to avoid internal competition |
-| **Fee Intelligence** | Shared competitor analysis across fleet members |
-| **Rebalance Coordination** | Conflict detection prevents competing for same routes |
-| **Collective Defense** | Mycelium-inspired defense against drain attacks |
-| **Anticipatory Liquidity** | Predictive rebalancing based on temporal patterns |
-| **Time-Based Fees** | Peak/low hour fee adjustments from pattern analysis |
-
-**How Hive Mode Activates:**
-
-Hive mode requires TWO conditions:
-1. **cl-hive plugin is loaded** - The plugin must be installed and running
-2. **Membership established** - Your node must be a hive member (member or neophyte tier)
-
-Membership is verified by checking your tier via `hive-status` RPC. This ensures hive features only activate when you're actually part of a fleet.
-
-**Joining a Hive:**
-
-Lightning Hives use an invitation-based join model:
-
-1. Request an invite ticket from a hive admin (via Nostr, GitHub, etc.)
-2. Open a channel to an existing hive member (skin in the game)
-3. Install and start cl-hive plugin
-4. Use `hive-join <ticket>` to join as a **neophyte** (30-day probation)
-5. Get vouched by existing members for full membership
-
-```
-Invite Ticket → Channel Open → Neophyte (30 days + vouches) → Full Member
-```
-
-**Check your mode:**
-```bash
-lightning-cli revenue-hive-status
-```
-
-**Explicitly set mode:**
-```bash
-# In your CLN config:
-revenue-ops-hive-enabled=false  # Force standalone
-revenue-ops-hive-enabled=true   # Require hive (warn if not member)
-revenue-ops-hive-enabled=auto   # Auto-detect (default)
-```
+Use `lightning-cli revenue-hive-status` to inspect whether coordination inputs are currently available. Legacy hive enablement settings still exist for startup compatibility, but they are not part of the normal runtime operator surface.
 
 ### Module 9: Accounting v2.0 (Closure & Splice Tracking)
 - **Complete P&L Formula:** `Net P&L = Revenue - (Opening + Closure + Splice + Rebalance)`
@@ -224,10 +160,12 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 
 | Command | Description |
 |---------|-------------|
-| `revenue-policy set <peer_id> [opts]` | Set fee/rebalance rules for a peer |
-| `revenue-policy get <peer_id>` | Get policy for a peer |
 | `revenue-policy list` | List all policies |
-| `revenue-policy delete <peer_id>` | Remove policy for a peer |
+| `revenue-policy get <peer_id>` | Get policy for a peer |
+| `revenue-policy find <tag>` | Find peers by tag |
+| `revenue-policy changes [since]` | Inspect policy changes for migration/coordination diagnostics |
+
+Normal operator use of `revenue-policy set/delete/tag/untag/batch` is deprecated.
 
 ### Reporting
 
@@ -247,16 +185,16 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 
 | Command | Description |
 |---------|-------------|
-| `revenue-set-fee <scid> <ppm>` | Manually set fee for a channel |
+| `revenue-set-fee <scid> <ppm>` | Debug/admin override for a specific channel fee |
 | `revenue-fee-anchor [window_days]` | Show fee anchors and flow-derived fee suggestions |
-| `revenue-fee-debug` | Debug fee calculation logic |
+| `revenue-fee-debug` | Debug fee calculation logic and suppression reasons |
 
 ### Rebalancing
 
 | Command | Description |
 |---------|-------------|
-| `revenue-rebalance [scid]` | Manually trigger a rebalance |
-| `revenue-rebalance-debug` | Debug rebalance calculation logic |
+| `revenue-rebalance [scid]` | Debug/admin override to manually trigger a rebalance |
+| `revenue-rebalance-debug` | Debug rebalance calculation logic and blockers |
 | `revenue-clear-reservations` | Clear stale rebalance reservations from DB |
 
 ### Portfolio & Risk
@@ -286,7 +224,16 @@ lightning-cli plugin start $(pwd)/cl-revenue-ops.py
 
 ## Configuration Options
 
-All options can be set in your CLN config file or via `revenue-config set`.
+Only the four public safety controls are supported through `revenue-config set` at runtime:
+
+| Runtime Control | Default | Purpose |
+|-----------------|---------|---------|
+| `paused` | `false` | Stop autonomous execution without unloading the plugin |
+| `daily_budget_sats` | `5000` | Cap daily rebalance spend |
+| `min_fee_ppm` | `10` | Hard lower fee bound |
+| `max_fee_ppm` | `5000` | Hard upper fee bound |
+
+All other configuration should be treated as startup-time CLN settings or internal implementation details. They are not part of the normal operator runtime surface.
 
 ### Core Settings
 
@@ -394,16 +341,16 @@ lightning-cli revenue-status
 lightning-cli revenue-dashboard
 ```
 
-### 3. Set Policies (Optional)
+### 3. Inspect Operator Controls And Decision Explainability
 
 ```bash
-# Set a peer to static fee
-lightning-cli revenue-policy set <peer_id> strategy=static fee_ppm=100
+# Inspect the four supported runtime controls
+lightning-cli revenue-config get
 
-# Set a peer to Hive mode (zero fees)
-lightning-cli revenue-policy set <peer_id> strategy=hive
+# See the latest fee and rebalance decisions with blockers
+lightning-cli revenue-status
 
-# View all policies
+# Inspect legacy policy state during migration
 lightning-cli revenue-policy list
 ```
 
@@ -425,6 +372,7 @@ lightning-cli revenue-history
 | Document | Description |
 |----------|-------------|
 | [Development Roadmap](docs/planning/ROADMAP.md) | Complete feature history and status |
+| [Autonomous Executor Migration](docs/plans/2026-03-06-autonomous-executor-purpose-migration.md) | Migration from knob-tuning workflows to the four-control operator surface |
 | [Technical Specs](docs/specs/) | Algorithm specifications (Phase 7, 8, API) |
 | [Security Audits](docs/audits/) | Red team reports and audit responses |
 

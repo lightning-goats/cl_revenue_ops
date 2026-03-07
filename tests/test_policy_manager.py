@@ -53,6 +53,15 @@ class TestPolicyManagerInit:
         policy = pm.get_policy("02" + "a" * 64)
         assert policy.strategy == FeeStrategy.HIVE
 
+    def test_internal_set_policy_remains_available_for_coordination_code(self, mock_database, mock_plugin):
+        """Direct PolicyManager writes remain available for internal callers."""
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        policy = pm.set_policy("02" + "a" * 64, strategy="static", fee_ppm_target=500)
+
+        assert policy.strategy == FeeStrategy.STATIC
+        assert policy.fee_ppm_target == 500
+
 
 class TestPolicyBatchOperations:
     """Test batch policy operations for cl-hive integration."""

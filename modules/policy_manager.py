@@ -51,6 +51,9 @@ ZOMBIE_FORWARD_THRESHOLD = 0  # Forwards threshold for zombie detection
 # Policy change rate limiting
 MAX_POLICY_CHANGES_PER_MINUTE = 10  # Rate limit per peer
 
+READ_ONLY_POLICY_ACTIONS = frozenset({"list", "get", "find", "changes"})
+TACTICAL_POLICY_ACTIONS = frozenset({"set", "delete", "tag", "untag", "batch"})
+
 
 class FeeStrategy(Enum):
     """Fee control strategy for a peer."""

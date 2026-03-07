@@ -78,6 +78,18 @@ MIN_CONFIDENCE_THRESHOLD = 0.3    # Ignore data below this confidence
 
 
 # =============================================================================
+# COORDINATION INPUTS
+# =============================================================================
+
+@dataclass
+class CoordinationInputs:
+    mode: str
+    priors: Dict[str, Any] = field(default_factory=dict)
+    corridor_hint: Optional[str] = None
+    peer_quality: Optional[Dict[str, Any]] = None
+
+
+# =============================================================================
 # CIRCUIT BREAKER STATE
 # =============================================================================
 

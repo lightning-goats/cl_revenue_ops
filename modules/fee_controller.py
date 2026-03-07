@@ -56,6 +56,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
+from .hive_bridge import CoordinationInputs
 from .policy_manager import PolicyManager, FeeStrategy
 from .utils import parse_msat
 
@@ -3370,6 +3371,13 @@ class HillClimbingFeeController:
         self._askrene_cache_ts: int = 0
         self._askrene_lock = threading.Lock()
 
+        self._last_decision_summary: Dict[str, Any] = {
+            "action": "hold",
+            "reason": "not_run",
+            "dominant_input": "startup",
+            "safety_block": False,
+        }
+
         # Fee anchors: advisor-set soft fee targets (loaded from DB)
         self._fee_anchors: Dict[str, FeeAnchor] = {}
         self._load_fee_anchors()
@@ -3396,6 +3404,24 @@ class HillClimbingFeeController:
                 self._fee_anchors[anchor.channel_id] = anchor
         except Exception as e:
             self.plugin.log(f"Failed to load fee anchors: {e}", level='warning')
+
+    def _set_last_decision_summary(
+        self,
+        *,
+        action: str,
+        reason: str,
+        dominant_input: Optional[str],
+        safety_block: bool,
+    ) -> None:
+        self._last_decision_summary = {
+            "action": action,
+            "reason": reason,
+            "dominant_input": dominant_input,
+            "safety_block": bool(safety_block),
+        }
+
+    def get_last_decision_summary(self) -> Dict[str, Any]:
+        return dict(self._last_decision_summary)
 
     def _refresh_askrene_cache(self, cfg) -> None:
         """Refresh AskRene constraints cache (best-effort, 30s TTL)."""
@@ -3429,6 +3455,56 @@ class HillClimbingFeeController:
                 self._askrene_cache_ts = now
         except Exception:
             pass  # AskRene is optional; silent on failure
+
+    def _get_coordination_inputs(self, channel_id: str, peer_id: str = "") -> CoordinationInputs:
+        if not self.hive_bridge or not self.hive_bridge.is_available():
+            return CoordinationInputs(mode="local_only")
+
+        priors: Dict[str, Any] = {}
+        peer_quality = None
+        corridor_hint = None
+
+        if peer_id:
+            try:
+                peer_quality = self.hive_bridge.get_single_peer_quality(peer_id)
+                if peer_quality:
+                    priors["peer_quality"] = peer_quality
+            except Exception as e:
+                self.plugin.log(
+                    f"COORD_INPUTS: peer quality lookup failed for {peer_id[:12]}...: {e}",
+                    level='debug'
+                )
+
+            try:
+                fee_intelligence = self.hive_bridge.query_fee_intelligence(peer_id)
+                if fee_intelligence:
+                    priors["fee_intelligence"] = fee_intelligence
+            except Exception as e:
+                self.plugin.log(
+                    f"COORD_INPUTS: fee intelligence lookup failed for {peer_id[:12]}...: {e}",
+                    level='debug'
+                )
+
+        try:
+            coordinated_fee = self.hive_bridge.query_coordinated_fee_recommendation(
+                channel_id=channel_id,
+                current_fee=0,
+            )
+            if coordinated_fee:
+                corridor_hint = coordinated_fee.get("corridor_role")
+                priors["coordinated_fee"] = coordinated_fee
+        except Exception as e:
+            self.plugin.log(
+                f"COORD_INPUTS: coordinated fee lookup failed for {channel_id[:12]}...: {e}",
+                level='debug'
+            )
+
+        return CoordinationInputs(
+            mode="fleet_augmented",
+            priors=priors,
+            corridor_hint=corridor_hint,
+            peer_quality=peer_quality,
+        )
 
     def _is_topology_depleted(self, channel_id: str, capacity_sats: int, cfg) -> bool:
         """Check if downstream topology for a channel is depleted via AskRene.
@@ -3706,9 +3782,11 @@ class HillClimbingFeeController:
         state = GaussianThompsonState()
         state.prior_std_fee = cfg.thompson_prior_std_fee
 
-        if self.hive_bridge and self.hive_bridge.is_available():
+        coordination = self._get_coordination_inputs(channel_id, peer_id)
+
+        if coordination.mode == "fleet_augmented":
             try:
-                intel = self.hive_bridge.query_fee_intelligence(peer_id)
+                intel = coordination.priors.get("fee_intelligence")
                 if intel and intel.get("confidence", 0) >= cfg.hive_min_confidence_for_prior:
                     # Use the full profile initialization
                     state.initialize_from_hive_profile(intel)
@@ -4832,6 +4910,12 @@ class HillClimbingFeeController:
         """
         # H-2: Non-blocking concurrency guard - only one fee adjustment cycle at a time
         if not self._state_lock.acquire(blocking=False):
+            self._set_last_decision_summary(
+                action="suppressed",
+                reason="adjustment_in_progress",
+                dominant_input="concurrency_guard",
+                safety_block=True,
+            )
             self.plugin.log("Fee adjustment already in progress, skipping", level='info')
             return []
         try:
@@ -4851,6 +4935,7 @@ class HillClimbingFeeController:
             "sleeping": 0,
             "waiting_time": 0,
             "waiting_forwards": 0,
+            "alpha_guard": 0,
             "fee_unchanged": 0,
             "gossip_hysteresis": 0,
             "idempotent": 0,
@@ -4861,6 +4946,12 @@ class HillClimbingFeeController:
         channel_states = self.database.get_all_channel_states()
         
         if not channel_states:
+            self._set_last_decision_summary(
+                action="hold",
+                reason="no_channel_state_data",
+                dominant_input="channel_state_data",
+                safety_block=False,
+            )
             self.plugin.log("No channel state data for fee adjustment")
             return adjustments
         
@@ -4975,6 +5066,16 @@ class HillClimbingFeeController:
                 actual_fee = channel_info.get("fee_proportional_millionths", 0)
                 hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=actual_fee)
                 now = int(time.time())
+                pre_is_sleeping = hc_state.is_sleeping
+                pre_last_update = hc_state.last_update
+                pre_last_broadcast_fee = hc_state.last_broadcast_fee_ppm
+                pre_forward_count = 0
+                pre_hours_elapsed = 0.0
+                if pre_last_update > 0:
+                    pre_hours_elapsed = (now - pre_last_update) / 3600.0
+                    pre_forward_count = self.database.get_forward_count_since(
+                        channel_id, pre_last_update
+                    )
 
                 adjustment = self._adjust_channel_fee(
                     channel_id=channel_id,
@@ -4988,22 +5089,17 @@ class HillClimbingFeeController:
                 if adjustment:
                     adjustments.append(adjustment)
                 else:
-                    # Track why this channel was skipped
-                    if hc_state.is_sleeping:
-                        skip_reasons["sleeping"] += 1
-                    elif hc_state.last_update > 0:
-                        hours_elapsed = (now - hc_state.last_update) / 3600.0
-                        forward_count = self.database.get_forward_count_since(
-                            channel_id, hc_state.last_update)
-                        if hours_elapsed < self.MIN_OBSERVATION_HOURS:
-                            skip_reasons["waiting_time"] += 1
-                        elif forward_count < self.MIN_FORWARDS_FOR_SIGNAL:
-                            skip_reasons["waiting_forwards"] += 1
-                        else:
-                            # Must be fee unchanged, gossip hysteresis, or idempotent
-                            skip_reasons["fee_unchanged"] += 1
-                    else:
-                        skip_reasons["fee_unchanged"] += 1
+                    skip_reason = self._classify_no_adjustment_skip_reason(
+                        hc_state=hc_state,
+                        now=now,
+                        pre_is_sleeping=pre_is_sleeping,
+                        pre_last_update=pre_last_update,
+                        pre_hours_elapsed=pre_hours_elapsed,
+                        pre_forward_count=pre_forward_count,
+                        actual_fee_ppm=actual_fee,
+                        pre_last_broadcast_fee_ppm=pre_last_broadcast_fee,
+                    )
+                    skip_reasons[skip_reason] += 1
 
             except Exception as e:
                 self.plugin.log(f"Error adjusting fee for {channel_id}: {e}", level='error')
@@ -5017,13 +5113,92 @@ class HillClimbingFeeController:
         if len(adjustments) == 0 and len(channel_states) > 0:
             active_skips = {k: v for k, v in skip_reasons.items() if v > 0}
             if active_skips:
+                dominant_reason = max(active_skips.items(), key=lambda item: item[1])[0]
+                suppressed_reasons = {
+                    "policy_passive",
+                    "policy_static",
+                    "policy_hive",
+                    "sleeping",
+                    "waiting_time",
+                    "waiting_forwards",
+                    "gossip_hysteresis",
+                    "idempotent",
+                    "error",
+                }
+                self._set_last_decision_summary(
+                    action="suppressed" if dominant_reason in suppressed_reasons else "hold",
+                    reason=dominant_reason,
+                    dominant_input=dominant_reason,
+                    safety_block=dominant_reason in suppressed_reasons,
+                )
                 self.plugin.log(
                     f"Fee adjustment: 0/{len(channel_states)} channels adjusted. "
                     f"Skip reasons: {active_skips}",
                     level='info'
                 )
+            else:
+                self._set_last_decision_summary(
+                    action="hold",
+                    reason="fee_unchanged",
+                    dominant_input="fee_unchanged",
+                    safety_block=False,
+                )
+        elif adjustments:
+            last_adjustment = adjustments[-1]
+            if last_adjustment.new_fee_ppm > last_adjustment.old_fee_ppm:
+                action = "raise"
+            elif last_adjustment.new_fee_ppm < last_adjustment.old_fee_ppm:
+                action = "lower"
+            else:
+                action = "hold"
+            self._set_last_decision_summary(
+                action=action,
+                reason=last_adjustment.reason,
+                dominant_input=getattr(last_adjustment, "reason_code", None),
+                safety_block=False,
+            )
 
         return adjustments
+
+    def _classify_no_adjustment_skip_reason(
+        self,
+        hc_state: "HillClimbState",
+        now: int,
+        pre_is_sleeping: bool,
+        pre_last_update: int,
+        pre_hours_elapsed: float,
+        pre_forward_count: int,
+        actual_fee_ppm: int,
+        pre_last_broadcast_fee_ppm: int,
+    ) -> str:
+        """Classify scheduler skip reasons without trusting post-call timer resets."""
+        if pre_is_sleeping:
+            return "sleeping"
+
+        if pre_last_update > 0:
+            if self.ENABLE_DYNAMIC_WINDOWS:
+                time_ok = pre_hours_elapsed >= self.MIN_OBSERVATION_HOURS
+                forwards_ok = pre_forward_count >= self.MIN_FORWARDS_FOR_SIGNAL
+                if not time_ok and not forwards_ok:
+                    return "waiting_time"
+            else:
+                if pre_hours_elapsed < self.MIN_OBSERVATION_HOURS:
+                    return "waiting_time"
+
+        if hc_state.last_update >= now:
+            if (
+                hc_state.last_fee_ppm != actual_fee_ppm
+                and hc_state.last_broadcast_fee_ppm == pre_last_broadcast_fee_ppm
+            ):
+                return "gossip_hysteresis"
+            if (
+                hc_state.last_fee_ppm == actual_fee_ppm
+                and hc_state.last_broadcast_fee_ppm == actual_fee_ppm
+            ):
+                return "idempotent"
+            return "alpha_guard"
+
+        return "fee_unchanged"
 
     def _should_force_gossip_refresh(
         self,
