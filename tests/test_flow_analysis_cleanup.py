@@ -118,3 +118,20 @@ class TestAdaptiveDecayCollapse:
         ]
         decay = fa._calculate_adaptive_decay(buckets)
         assert decay >= 0.9
+
+
+class TestKalmanObservability:
+    """Verify Kalman filter observability improvements."""
+
+    def test_regime_change_logs_at_debug(self):
+        """Regime change should log at debug level, not info."""
+        import inspect
+        from modules.flow_analysis import FlowAnalyzer
+        source = inspect.getsource(FlowAnalyzer)
+        assert "Regime change detected" in source
+        lines = source.split('\n')
+        for i, line in enumerate(lines):
+            if "Regime change detected" in line:
+                context = '\n'.join(lines[max(0,i-2):i+3])
+                assert "level='debug'" in context or 'level="debug"' in context
+                break

@@ -689,7 +689,7 @@ class FlowAnalyzer:
             self.plugin.log(
                 f"KALMAN: Regime change detected for {channel_id[:12]}... "
                 f"(innovation={innovation:.3f}, uncertainty={kf.get_uncertainty():.3f})",
-                level='info'
+                level='debug'
             )
 
         # Save state
