@@ -683,3 +683,13 @@ class TestYieldMetrics:
 
         assert result is not None
         assert result["annualized_roc_pct"] == 7.3
+
+
+class TestCoordinationInputs:
+    def test_coordination_inputs_default_to_empty_priors(self):
+        from modules.hive_bridge import CoordinationInputs
+
+        inputs = CoordinationInputs(mode="local_only")
+
+        assert inputs.mode == "local_only"
+        assert inputs.priors == {}

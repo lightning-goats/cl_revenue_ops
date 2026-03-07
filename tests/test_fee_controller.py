@@ -1840,3 +1840,68 @@ class TestCalculateFloorOpener:
         floor_default = fc._calculate_floor(5_000_000, chain_costs=chain_costs)
         floor_local = fc._calculate_floor(5_000_000, chain_costs=chain_costs, opener="local")
         assert floor_default == floor_local
+
+
+class TestLastDecisionSummary:
+    def test_adjust_all_fees_records_hold_reason_when_no_channel_state_data(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import PIDFeeController
+
+        cfg = Config()
+        clboss = MagicMock()
+        mock_database.prune_expired_fee_anchors.return_value = None
+        mock_database.get_all_fee_anchors.return_value = []
+        mock_database.get_all_channel_states.return_value = []
+
+        fc = PIDFeeController(mock_plugin, cfg, mock_database, clboss)
+
+        adjustments = fc.adjust_all_fees()
+        summary = fc.get_last_decision_summary()
+
+        assert adjustments == []
+        assert summary["action"] == "hold"
+        assert summary["reason"] == "no_channel_state_data"
+        assert summary["dominant_input"] == "channel_state_data"
+        assert summary["safety_block"] is False
+
+
+class TestCoordinationInputs:
+    def _make_fc(self, mock_plugin, mock_database, hive_bridge=None):
+        from modules.config import Config
+        from modules.fee_controller import PIDFeeController
+
+        cfg = Config()
+        clboss = MagicMock()
+        mock_database.prune_expired_fee_anchors.return_value = None
+        mock_database.get_all_fee_anchors.return_value = []
+        return PIDFeeController(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+
+    def test_fee_controller_uses_empty_coordination_inputs_when_hive_unavailable(self, mock_plugin, mock_database):
+        fc = self._make_fc(mock_plugin, mock_database, hive_bridge=None)
+
+        inputs = fc._get_coordination_inputs("123x456x0", peer_id="02" + "a" * 64)
+
+        assert inputs.mode == "local_only"
+        assert inputs.priors == {}
+
+    def test_fee_controller_uses_coordination_priors_when_hive_available(self, mock_plugin, mock_database):
+        hive_bridge = MagicMock()
+        hive_bridge.is_available.return_value = True
+        hive_bridge.get_single_peer_quality.return_value = {
+            "quality": "good",
+            "quality_score": 0.85,
+        }
+        hive_bridge.query_fee_intelligence.return_value = {
+            "confidence": 0.8,
+            "optimal_fee_estimate": 250,
+        }
+        hive_bridge.query_coordinated_fee_recommendation.return_value = {
+            "corridor_role": "primary",
+            "recommended_fee_ppm": 250,
+        }
+        fc = self._make_fc(mock_plugin, mock_database, hive_bridge=hive_bridge)
+
+        inputs = fc._get_coordination_inputs("123x456x0", peer_id="02" + "a" * 64)
+
+        assert inputs.mode == "fleet_augmented"
+        assert "peer_quality" in inputs.priors

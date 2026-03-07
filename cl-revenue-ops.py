@@ -52,7 +52,14 @@ from modules.config import Config
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
-from modules.policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
+from modules.policy_manager import (
+    PolicyManager,
+    FeeStrategy,
+    RebalanceMode,
+    PeerPolicy,
+    READ_ONLY_POLICY_ACTIONS,
+    TACTICAL_POLICY_ACTIONS,
+)
 from modules.hive_bridge import HiveFeeIntelligenceBridge
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.utils import normalize_scid, parse_msat
@@ -1912,12 +1919,31 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     return {
         "status": "running",
         "version": PLUGIN_VERSION,
-        "config": {
-            "target_flow_sats": config.target_flow,
-            "fee_range_ppm": [config.min_fee_ppm, config.max_fee_ppm],
-            "rebalance_min_profit_sats": config.rebalance_min_profit,
-            "dry_run": config.dry_run
+        "operator_controls": {
+            "public_keys": config.public_runtime_keys() if config else [],
+            "values": config.public_runtime_dict() if config else {},
         },
+        "fee_decision": (
+            fee_controller.get_last_decision_summary()
+            if fee_controller and hasattr(fee_controller, "get_last_decision_summary")
+            else {
+                "action": "hold",
+                "reason": "unavailable",
+                "dominant_input": "fee_controller",
+                "safety_block": False,
+            }
+        ),
+        "rebalance_decision": (
+            rebalancer.get_last_decision_summary()
+            if rebalancer and hasattr(rebalancer, "get_last_decision_summary")
+            else {
+                "action": "hold",
+                "reason": "unavailable",
+                "dominant_input": "rebalancer",
+                "safety_block": False,
+                "budget_blocked": False,
+            }
+        ),
         "channel_states": channel_states,
         "recent_fee_changes": fee_history,
         "recent_rebalances": rebalance_history
@@ -3053,15 +3079,18 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
     """
     Manage peer-level fee and rebalance policies (v1.4 API).
 
+    Normal operator use is now read-only. Tactical policy writes remain
+    available only through explicit internal/debug override flags.
+
     Usage:
       lightning-cli revenue-policy list                           # List all policies
       lightning-cli revenue-policy get <peer_id>                  # Get policy for peer
-      lightning-cli revenue-policy set <peer_id> [options]        # Set/update policy
-      lightning-cli revenue-policy delete <peer_id>               # Delete policy (revert to defaults)
-      lightning-cli revenue-policy tag <peer_id> <tag>            # Add tag to peer
-      lightning-cli revenue-policy untag <peer_id> <tag>          # Remove tag from peer
       lightning-cli revenue-policy find <tag>                     # Find peers by tag
       lightning-cli revenue-policy changes [since=<timestamp>]    # Get policy changes (cl-hive)
+      lightning-cli revenue-policy set <peer_id> [options]        # Deprecated for normal operator use
+      lightning-cli revenue-policy delete <peer_id>               # Deprecated for normal operator use
+      lightning-cli revenue-policy tag <peer_id> <tag>            # Deprecated for normal operator use
+      lightning-cli revenue-policy untag <peer_id> <tag>          # Deprecated for normal operator use
 
     Options for 'set':
       strategy=dynamic|static|hive|passive   Fee control strategy
@@ -3100,6 +3129,24 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
     """
     if policy_manager is None:
         return {"error": "Plugin not initialized"}
+
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    action = str(action or "").strip().lower()
+    internal_override = _truthy(kwargs.get("internal")) or _truthy(kwargs.get("admin"))
+
+    if action in TACTICAL_POLICY_ACTIONS and not internal_override:
+        return {
+            "error": (
+                f"revenue-policy {action} is deprecated for normal operator use. "
+                "Use revenue-policy list/get/find/changes for diagnostics."
+            )
+        }
     
     try:
         if action == "list":
@@ -3268,7 +3315,9 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
                 return {"status": "error", "error": str(e)}
 
         else:
-            return {"error": f"Unknown action: {action}. Use 'list', 'get', 'set', 'delete', 'tag', 'untag', 'find', 'changes', or 'batch'"}
+            allowed = sorted(READ_ONLY_POLICY_ACTIONS | TACTICAL_POLICY_ACTIONS)
+            allowed_text = ", ".join(f"'{name}'" for name in allowed)
+            return {"error": f"Unknown action: {action}. Use {allowed_text}"}
     
     except ValueError as e:
         return {"status": "error", "error": str(e)}
@@ -3506,7 +3555,7 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
     Get or set runtime configuration (Phase 7: Dynamic Runtime Configuration).
     
     Usage:
-      lightning-cli revenue-config get           # Get all config
+      lightning-cli revenue-config get           # Get public operator controls
       lightning-cli revenue-config get <key>     # Get specific key
       lightning-cli revenue-config set <key> <value>  # Set key
       lightning-cli revenue-config reset <key>   # Reset to default
@@ -3515,33 +3564,39 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
     Examples:
       lightning-cli revenue-config get daily_budget_sats
       lightning-cli revenue-config set daily_budget_sats 10000
-      lightning-cli revenue-config set enable_vegas_reflex false
+      lightning-cli revenue-config set paused true
     """
     if config is None or database is None:
         return {"error": "Plugin not initialized"}
+
+    def _not_public_error(runtime_key: str) -> Dict[str, Any]:
+        return {"error": f"Key '{runtime_key}' is not a public runtime control"}
     
     if action == "get":
         if key:
             if not hasattr(config, key) or key.startswith('_'):
                 return {"error": f"Unknown config key: {key}"}
-            return {
+            result = {
                 "key": key,
                 "value": getattr(config, key),
-                "version": config._version
+                "version": config._version,
+                "classification": config.classify_runtime_key(key),
             }
+            if not config.is_public_runtime_key(key):
+                result["warning"] = _not_public_error(key)["error"]
+            return result
         else:
-            # Return all config as dict (exclude private fields)
-            snapshot = config.snapshot()
-            from dataclasses import asdict
-            config_dict = asdict(snapshot)
             return {
-                "config": config_dict,
+                "config": config.public_runtime_dict(),
                 "version": config._version
             }
     
     elif action == "set":
         if not key or value is None:
             return {"error": "Usage: revenue-config set <key> <value>"}
+
+        if not config.is_public_runtime_key(key):
+            return _not_public_error(key)
         
         result = config.update_runtime(database, key, str(value))
         
@@ -3557,6 +3612,9 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
     elif action == "reset":
         if not key:
             return {"error": "Usage: revenue-config reset <key>"}
+
+        if not config.is_public_runtime_key(key):
+            return _not_public_error(key)
         
         if database.delete_config_override(key):
             return {
@@ -3566,8 +3624,7 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
         return {"error": f"No override found for '{key}'"}
     
     elif action == "list-mutable":
-        from modules.config import CONFIG_FIELD_TYPES, IMMUTABLE_CONFIG_KEYS
-        mutable = [k for k in CONFIG_FIELD_TYPES.keys() if k not in IMMUTABLE_CONFIG_KEYS]
+        mutable = sorted(config.public_runtime_keys())
         return {"mutable_keys": sorted(mutable), "count": len(mutable)}
     
     else:
