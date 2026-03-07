@@ -3364,6 +3364,13 @@ class HillClimbingFeeController:
         self._askrene_cache_ts: int = 0
         self._askrene_lock = threading.Lock()
 
+        self._last_decision_summary: Dict[str, Any] = {
+            "action": "hold",
+            "reason": "not_run",
+            "dominant_input": "startup",
+            "safety_block": False,
+        }
+
         # Fee anchors: advisor-set soft fee targets (loaded from DB)
         self._fee_anchors: Dict[str, FeeAnchor] = {}
         self._load_fee_anchors()
@@ -3390,6 +3397,24 @@ class HillClimbingFeeController:
                 self._fee_anchors[anchor.channel_id] = anchor
         except Exception as e:
             self.plugin.log(f"Failed to load fee anchors: {e}", level='warning')
+
+    def _set_last_decision_summary(
+        self,
+        *,
+        action: str,
+        reason: str,
+        dominant_input: Optional[str],
+        safety_block: bool,
+    ) -> None:
+        self._last_decision_summary = {
+            "action": action,
+            "reason": reason,
+            "dominant_input": dominant_input,
+            "safety_block": bool(safety_block),
+        }
+
+    def get_last_decision_summary(self) -> Dict[str, Any]:
+        return dict(self._last_decision_summary)
 
     def _refresh_askrene_cache(self, cfg) -> None:
         """Refresh AskRene constraints cache (best-effort, 30s TTL)."""
@@ -4826,6 +4851,12 @@ class HillClimbingFeeController:
         """
         # H-2: Non-blocking concurrency guard - only one fee adjustment cycle at a time
         if not self._state_lock.acquire(blocking=False):
+            self._set_last_decision_summary(
+                action="suppressed",
+                reason="adjustment_in_progress",
+                dominant_input="concurrency_guard",
+                safety_block=True,
+            )
             self.plugin.log("Fee adjustment already in progress, skipping", level='info')
             return []
         try:
@@ -4855,6 +4886,12 @@ class HillClimbingFeeController:
         channel_states = self.database.get_all_channel_states()
         
         if not channel_states:
+            self._set_last_decision_summary(
+                action="hold",
+                reason="no_channel_state_data",
+                dominant_input="channel_state_data",
+                safety_block=False,
+            )
             self.plugin.log("No channel state data for fee adjustment")
             return adjustments
         
@@ -5011,11 +5048,50 @@ class HillClimbingFeeController:
         if len(adjustments) == 0 and len(channel_states) > 0:
             active_skips = {k: v for k, v in skip_reasons.items() if v > 0}
             if active_skips:
+                dominant_reason = max(active_skips.items(), key=lambda item: item[1])[0]
+                suppressed_reasons = {
+                    "policy_passive",
+                    "policy_static",
+                    "policy_hive",
+                    "sleeping",
+                    "waiting_time",
+                    "waiting_forwards",
+                    "gossip_hysteresis",
+                    "idempotent",
+                    "error",
+                }
+                self._set_last_decision_summary(
+                    action="suppressed" if dominant_reason in suppressed_reasons else "hold",
+                    reason=dominant_reason,
+                    dominant_input=dominant_reason,
+                    safety_block=dominant_reason in suppressed_reasons,
+                )
                 self.plugin.log(
                     f"Fee adjustment: 0/{len(channel_states)} channels adjusted. "
                     f"Skip reasons: {active_skips}",
                     level='info'
                 )
+            else:
+                self._set_last_decision_summary(
+                    action="hold",
+                    reason="fee_unchanged",
+                    dominant_input="fee_unchanged",
+                    safety_block=False,
+                )
+        elif adjustments:
+            last_adjustment = adjustments[-1]
+            if last_adjustment.new_fee_ppm > last_adjustment.old_fee_ppm:
+                action = "raise"
+            elif last_adjustment.new_fee_ppm < last_adjustment.old_fee_ppm:
+                action = "lower"
+            else:
+                action = "hold"
+            self._set_last_decision_summary(
+                action=action,
+                reason=last_adjustment.reason,
+                dominant_input=getattr(last_adjustment, "reason_code", None),
+                safety_block=False,
+            )
 
         return adjustments
 

@@ -1916,6 +1916,26 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
             "public_keys": config.public_runtime_keys() if config else [],
             "values": config.public_runtime_dict() if config else {},
         },
+        "fee_decision": (
+            fee_controller.get_last_decision_summary()
+            if fee_controller and hasattr(fee_controller, "get_last_decision_summary")
+            else {
+                "action": "hold",
+                "reason": "unavailable",
+                "dominant_input": "fee_controller",
+                "safety_block": False,
+            }
+        ),
+        "rebalance_decision": (
+            rebalancer.get_last_decision_summary()
+            if rebalancer and hasattr(rebalancer, "get_last_decision_summary")
+            else {
+                "action": "hold",
+                "reason": "unavailable",
+                "dominant_input": "rebalancer",
+                "budget_blocked": False,
+            }
+        ),
         "channel_states": channel_states,
         "recent_fee_changes": fee_history,
         "recent_rebalances": rebalance_history

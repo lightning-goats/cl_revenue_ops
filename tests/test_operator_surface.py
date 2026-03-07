@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock
 
 from modules.config import Config
-from tests.test_plugin_audit_regressions import _load_plugin_module
+from tests.plugin_test_utils import load_plugin_module
 
 
 def test_public_runtime_keys_are_safety_only():
@@ -43,7 +43,7 @@ def test_runtime_key_classification_distinguishes_public_deprecated_and_internal
 
 
 def _load_operator_surface_module():
-    mod = _load_plugin_module()
+    mod = load_plugin_module()
     mod.database = MagicMock()
     mod.config = Config(
         paused=True,
@@ -100,6 +100,43 @@ def test_revenue_config_get_internal_key_marks_it_internal():
     assert result["warning"].startswith(
         "Key 'enable_vegas_reflex' is not a public runtime control"
     )
+
+
+def test_revenue_config_allows_public_set_updates():
+    mod = _load_operator_surface_module()
+    mod.config.update_runtime = MagicMock(
+        return_value={
+            "status": "success",
+            "old_value": True,
+            "new_value": False,
+            "version": 1,
+        }
+    )
+
+    result = mod.revenue_config(mod.plugin, "set", "paused", "false")
+
+    assert result["status"] == "success"
+    mod.config.update_runtime.assert_called_once_with(mod.database, "paused", "false")
+
+
+def test_revenue_config_rejects_internal_knob_resets():
+    mod = _load_operator_surface_module()
+
+    result = mod.revenue_config(mod.plugin, "reset", "enable_vegas_reflex")
+
+    assert result["error"].startswith(
+        "Key 'enable_vegas_reflex' is not a public runtime control"
+    )
+
+
+def test_revenue_config_allows_public_resets():
+    mod = _load_operator_surface_module()
+    mod.database.delete_config_override.return_value = True
+
+    result = mod.revenue_config(mod.plugin, "reset", "paused")
+
+    assert result["status"] == "success"
+    assert "removed" in result["message"]
 
 
 def test_revenue_status_operator_controls_hide_internal_knob_dump():

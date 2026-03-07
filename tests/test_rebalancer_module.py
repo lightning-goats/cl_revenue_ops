@@ -2137,3 +2137,27 @@ class TestNoDeplestedSourceDiagnostics:
         log_calls = [str(c) for c in mock_plugin.log.call_args_list]
         found_diag = any("balanced range" in s or "no depleted" in s.lower() or "no source" in s.lower() for s in log_calls)
         assert found_diag, f"Expected diagnostic log about balanced range, got: {log_calls[-5:]}"
+
+
+class TestLastDecisionSummary:
+    def test_execute_rebalance_records_budget_blocked_summary(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        clboss = MagicMock()
+        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
+
+        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        mock_database.record_rebalance = MagicMock(return_value=456)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(False, 0))
+
+        res = r.execute_rebalance(_candidate(), enforce_budget=True)
+        summary = r.get_last_decision_summary()
+
+        assert res["success"] is False
+        assert summary["action"] == "suppressed"
+        assert summary["reason"] == "budget_exhausted"
+        assert summary["dominant_input"] == "daily_budget_sats"
+        assert summary["budget_blocked"] is True

@@ -29,7 +29,7 @@ from modules.fee_controller import (
     FeeAdjustment
 )
 from modules.config import Config
-from tests.test_plugin_audit_regressions import _load_plugin_module
+from tests.plugin_test_utils import load_plugin_module
 
 
 class TestFeeReasonCode:
@@ -244,7 +244,7 @@ class TestHeuristicTuningConstants:
 
 
 def _load_revenue_status_module():
-    mod = _load_plugin_module()
+    mod = load_plugin_module()
     mod.database = MagicMock()
     mod.database.get_all_channel_states.return_value = []
     mod.database.get_recent_fee_changes.return_value = []
@@ -277,3 +277,37 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "max_fee_ppm": 1800,
     }
     assert "config" not in result
+
+
+def test_status_exposes_last_fee_decision_reason():
+    mod = _load_revenue_status_module()
+    mod.fee_controller = MagicMock()
+    mod.fee_controller.get_last_decision_summary.return_value = {
+        "action": "hold",
+        "reason": "no_channel_state_data",
+        "dominant_input": "channel_state_data",
+        "safety_block": False,
+    }
+
+    result = mod.revenue_status(mod.plugin)
+
+    assert result["fee_decision"]["action"] in {"hold", "raise", "lower", "suppressed"}
+    assert "reason" in result["fee_decision"]
+    assert "safety_block" in result["fee_decision"]
+
+
+def test_status_exposes_last_rebalance_decision_reason():
+    mod = _load_revenue_status_module()
+    mod.rebalancer = MagicMock()
+    mod.rebalancer.get_last_decision_summary.return_value = {
+        "action": "suppressed",
+        "reason": "budget_exhausted",
+        "dominant_input": "daily_budget_sats",
+        "budget_blocked": True,
+    }
+
+    result = mod.revenue_status(mod.plugin)
+
+    assert result["rebalance_decision"]["action"] in {"hold", "rebalance", "suppressed"}
+    assert "reason" in result["rebalance_decision"]
+    assert "budget_blocked" in result["rebalance_decision"]

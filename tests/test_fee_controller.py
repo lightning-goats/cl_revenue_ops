@@ -1600,3 +1600,26 @@ class TestCalculateFloorOpener:
         floor_default = fc._calculate_floor(5_000_000, chain_costs=chain_costs)
         floor_local = fc._calculate_floor(5_000_000, chain_costs=chain_costs, opener="local")
         assert floor_default == floor_local
+
+
+class TestLastDecisionSummary:
+    def test_adjust_all_fees_records_hold_reason_when_no_channel_state_data(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import PIDFeeController
+
+        cfg = Config()
+        clboss = MagicMock()
+        mock_database.prune_expired_fee_anchors.return_value = None
+        mock_database.get_all_fee_anchors.return_value = []
+        mock_database.get_all_channel_states.return_value = []
+
+        fc = PIDFeeController(mock_plugin, cfg, mock_database, clboss)
+
+        adjustments = fc.adjust_all_fees()
+        summary = fc.get_last_decision_summary()
+
+        assert adjustments == []
+        assert summary["action"] == "hold"
+        assert summary["reason"] == "no_channel_state_data"
+        assert summary["dominant_input"] == "channel_state_data"
+        assert summary["safety_block"] is False

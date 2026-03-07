@@ -1969,8 +1969,33 @@ class EVRebalancer:
         # Optional callback injected by cl-revenue-ops to provide unified total-cost budget limit.
         self.global_budget_limit_provider = None
 
+        self._last_decision_summary: Dict[str, Any] = {
+            "action": "hold",
+            "reason": "not_run",
+            "dominant_input": "startup",
+            "budget_blocked": False,
+        }
+
         # Initialize job manager for async execution (pass hive_bridge for outcome reporting)
         self.job_manager = JobManager(plugin, config, database, hive_bridge=hive_bridge)
+
+    def _set_last_decision_summary(
+        self,
+        *,
+        action: str,
+        reason: str,
+        dominant_input: Optional[str],
+        budget_blocked: bool,
+    ) -> None:
+        self._last_decision_summary = {
+            "action": action,
+            "reason": reason,
+            "dominant_input": dominant_input,
+            "budget_blocked": bool(budget_blocked),
+        }
+
+    def get_last_decision_summary(self) -> Dict[str, Any]:
+        return dict(self._last_decision_summary)
 
     def _parse_msat(self, v: Any) -> int:
         """Delegate to shared parse_msat in utils.py."""
@@ -2158,6 +2183,12 @@ class EVRebalancer:
             # Check if we have slots available
             available_slots = self.job_manager.slots_available()
             if available_slots <= 0:
+                self._set_last_decision_summary(
+                    action="suppressed",
+                    reason="no_rebalance_slots",
+                    dominant_input="concurrency_limit",
+                    budget_blocked=False,
+                )
                 self.plugin.log(
                     f"No rebalance slots available ({self.job_manager.active_job_count}/"
                     f"{self.job_manager.max_concurrent_jobs} jobs active)"
@@ -2166,10 +2197,22 @@ class EVRebalancer:
             
             # Check capital controls (pass cfg for thread-safe config access)
             if not self._check_capital_controls(cfg):
+                self._set_last_decision_summary(
+                    action="suppressed",
+                    reason="capital_controls_blocked",
+                    dominant_input="daily_budget_sats",
+                    budget_blocked=True,
+                )
                 return candidates
             
             channels = self._get_channels_with_balances()
             if not channels:
+                self._set_last_decision_summary(
+                    action="hold",
+                    reason="no_channel_balance_data",
+                    dominant_input="channel_balances",
+                    budget_blocked=False,
+                )
                 return candidates
             
             # Note: _peer_inbound_fees cache is now populated by _get_channels_with_balances()
@@ -2273,6 +2316,12 @@ class EVRebalancer:
                         f"channels (>{cfg.high_liquidity_threshold:.0%} outbound) to drain.",
                         level='info'
                     )
+                self._set_last_decision_summary(
+                    action="hold",
+                    reason="no_rebalance_candidates",
+                    dominant_input="liquidity_balance",
+                    budget_blocked=False,
+                )
                 return candidates
 
             self.plugin.log(
@@ -2402,7 +2451,22 @@ class EVRebalancer:
                 candidates = hot_only
 
             # Limit to available slots
-            return candidates[:available_slots]
+            selected = candidates[:available_slots]
+            if selected:
+                self._set_last_decision_summary(
+                    action="rebalance",
+                    reason="profitable_candidates_found",
+                    dominant_input=selected[0].reason_code,
+                    budget_blocked=False,
+                )
+            else:
+                self._set_last_decision_summary(
+                    action="hold",
+                    reason="no_profitable_candidates",
+                    dominant_input="ev_filter",
+                    budget_blocked=False,
+                )
+            return selected
         
         finally:
             # Clear ephemeral fee cache at end of run
@@ -3984,6 +4048,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             conflict = self.hive_bridge.check_rebalance_conflict(candidate.to_peer_id)
             if conflict.get("conflict"):
                 reason = conflict.get("reason", "Fleet member rebalancing through same peer")
+                self._set_last_decision_summary(
+                    action="suppressed",
+                    reason="fleet_conflict",
+                    dominant_input="fleet_conflict",
+                    budget_blocked=False,
+                )
                 self.plugin.log(
                     f"FLEET_CONFLICT: Skipping rebalance to {candidate.to_channel[:12]}... "
                     f"({reason})",
@@ -4005,6 +4075,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 dest_peer_id=candidate.to_peer_id
             )
             if circular_risk.get("risk"):
+                self._set_last_decision_summary(
+                    action="suppressed",
+                    reason="circular_flow_risk",
+                    dominant_input="circular_flow_risk",
+                    budget_blocked=False,
+                )
                 flow_members = circular_risk.get("flow_members", [])
                 cost = circular_risk.get("total_cost_sats", 0)
                 self.plugin.log(
@@ -4108,6 +4184,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         amount_sats=candidate.amount_sats,
                     )
                     if circular_result and circular_result.get("success"):
+                        self._set_last_decision_summary(
+                            action="rebalance",
+                            reason="circular_rebalance",
+                            dominant_input="fleet_path",
+                            budget_blocked=False,
+                        )
                         result["success"] = True
                         result["message"] = "Circular rebalance executed via hive"
                         result["circular_rebalance"] = True
@@ -4150,6 +4232,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
             # Validation: Return error on empty/None channel IDs (HO-01)
             if not candidate.from_channel or not candidate.to_channel:
+                self._set_last_decision_summary(
+                    action="suppressed",
+                    reason="invalid_channel_ids",
+                    dominant_input="validation",
+                    budget_blocked=False,
+                )
                 self.plugin.log(
                     f"Invalid channel IDs: from={candidate.from_channel}, to={candidate.to_channel}",
                     level='error'
@@ -4181,6 +4269,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             )
 
             if cfg.dry_run:
+                self._set_last_decision_summary(
+                    action="rebalance",
+                    reason="dry_run",
+                    dominant_input=candidate.reason_code,
+                    budget_blocked=False,
+                )
                 self.plugin.log(
                     f"[DRY RUN] Would rebalance {candidate.amount_sats} sats "
                     f"from {candidate.from_channel} to {candidate.to_channel}"
@@ -4242,6 +4336,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 reserved_budget = bool(reserved)
 
                 if not reserved_budget:
+                    self._set_last_decision_summary(
+                        action="suppressed",
+                        reason="budget_exhausted",
+                        dominant_input="daily_budget_sats",
+                        budget_blocked=True,
+                    )
                     self.database.update_rebalance_result(
                         rebalance_id, 'failed',
                         error_message=(
@@ -4269,6 +4369,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             res = self.job_manager.start_job(candidate, rebalance_id)
 
             if res.get("success"):
+                self._set_last_decision_summary(
+                    action="rebalance",
+                    reason="async_job_started",
+                    dominant_input=candidate.reason_code,
+                    budget_blocked=False,
+                )
                 job_started = True
                 # Clean up pending entry - job is now tracked by JobManager
                 with self._pending_lock:
@@ -4286,6 +4392,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 )
             else:
                 error = res.get("error", "Failed to start job")
+                self._set_last_decision_summary(
+                    action="suppressed",
+                    reason="start_job_failed",
+                    dominant_input=candidate.reason_code,
+                    budget_blocked=False,
+                )
                 self.database.update_rebalance_result(
                     rebalance_id, 'failed', error_message=error
                 )
@@ -4297,6 +4409,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     self._pending.pop(candidate.to_channel, None)
 
         except Exception as e:
+            self._set_last_decision_summary(
+                action="suppressed",
+                reason="execution_error",
+                dominant_input="execution_error",
+                budget_blocked=False,
+            )
             result["message"] = str(e)
             self.plugin.log(f"Execution error: {e}", level='error')
             if rebalance_id is not None:
