@@ -300,3 +300,152 @@ class TestHiveAwareness:
 
         report = planner.generate_report()
         assert report["summary"]["fleet_members_excluded"] >= 1
+
+
+class TestLoserClassification:
+    """Test loser identification logic."""
+
+    def test_zombie_classified_as_fire_sale(self):
+        """ZOMBIE channel > 90 days old with flow data → ZOMBIE reason, CLOSE action."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+
+        scid = "100x200x0"
+        prof = _mock_profitability(
+            scid=scid, classification=ProfitabilityClass.ZOMBIE,
+            marginal_roi_percent=-80.0, roi_percent=-90.0, days_open=120,
+        )
+        flow = _mock_flow(daily_volume=100, flow_ratio=0.5)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        assert len(losers) == 1
+        assert losers[0]["reason"] == "ZOMBIE"
+        assert losers[0]["action"] == "CLOSE"
+
+    def test_stagnant_channel_low_turnover(self):
+        """Balanced + low turnover + low marginal ROI → STAGNANT."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+
+        scid = "200x300x0"
+        prof = _mock_profitability(
+            scid=scid, classification=ProfitabilityClass.UNDERWATER,
+            marginal_roi_percent=5.0, roi_percent=-10.0, days_open=60,
+        )
+        flow = _mock_flow(daily_volume=1, flow_ratio=0.1, capacity=2_000_000)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        assert len(losers) == 1
+        assert losers[0]["reason"] == "STAGNANT"
+
+    def test_defibrillate_when_few_attempts(self):
+        """Channel with < 2 rebalance attempts → DEFIBRILLATE action."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+
+        scid = "300x400x0"
+        prof = _mock_profitability(
+            scid=scid, classification=ProfitabilityClass.ZOMBIE,
+            marginal_roi_percent=-80.0, roi_percent=-90.0, days_open=120,
+        )
+        flow = _mock_flow(daily_volume=100, flow_ratio=0.5)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 1}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        assert len(losers) == 1
+        assert losers[0]["action"] == "DEFIBRILLATE"
+        assert "(NEEDS DEFIBRILLATOR)" in losers[0]["reason"]
+
+    def test_remote_opened_exemption(self):
+        """Remote-opened fire sale channel with moderate ROI → exempted."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+
+        scid = "400x500x0"
+        prof = _mock_profitability(
+            scid=scid, classification=ProfitabilityClass.ZOMBIE,
+            marginal_roi_percent=-50.0, roi_percent=-60.0, days_open=120,
+        )
+        prof.opener = "remote"
+        flow = _mock_flow(daily_volume=500, flow_ratio=0.5)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        # Zombie + remote + marginal_roi > -75% → exempted (not stagnant, so exemption applies)
+        assert len(losers) == 0
+
+    def test_remote_opened_deeply_underwater_not_exempted(self):
+        """Remote-opened fire sale channel deeply underwater → NOT exempted."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+
+        scid = "500x600x0"
+        prof = _mock_profitability(
+            scid=scid, classification=ProfitabilityClass.ZOMBIE,
+            marginal_roi_percent=-80.0, roi_percent=-90.0, days_open=120,
+        )
+        prof.opener = "remote"
+        flow = _mock_flow(daily_volume=500, flow_ratio=0.5)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        # Zombie + remote + marginal_roi <= -75% → NOT exempted
+        assert len(losers) == 1
+
+
+class TestMempoolRecommendation:
+    """Test mempool fee recommendation thresholds."""
+
+    def test_high_fees_hold(self):
+        """Fees > 100 sat/vB → HOLD."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 150_000}}
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        rec = planner._get_mempool_recommendation()
+        assert rec.startswith("HOLD")
+
+    def test_medium_fees_caution(self):
+        """Fees 50-100 sat/vB → CAUTION."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 75_000}}
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        rec = planner._get_mempool_recommendation()
+        assert rec.startswith("CAUTION")
+
+    def test_low_fees_proceed(self):
+        """Fees < 50 sat/vB → PROCEED."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 25_000}}
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        rec = planner._get_mempool_recommendation()
+        assert rec.startswith("PROCEED")
+
+    def test_rpc_error_returns_unknown(self):
+        """RPC failure → UNKNOWN."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.side_effect = Exception("timeout")
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        rec = planner._get_mempool_recommendation()
+        assert rec.startswith("UNKNOWN")
