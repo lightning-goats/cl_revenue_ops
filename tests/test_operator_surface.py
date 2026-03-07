@@ -35,5 +35,5 @@ def test_runtime_key_classification_distinguishes_public_deprecated_and_internal
     cfg = Config()
 
     assert cfg.classify_runtime_key("paused") == "public"
-    assert cfg.classify_runtime_key("enable_vegas_reflex") == "internal"
+    assert cfg.classify_runtime_key("enable_vegas_reflex") == "deprecated"
     assert cfg.classify_runtime_key("dry_run") == "internal"

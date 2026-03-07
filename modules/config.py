@@ -34,8 +34,6 @@ PUBLIC_RUNTIME_KEYS = (
     'max_fee_ppm',
 )
 
-DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset()
-
 # Type mapping for config fields (for validation)
 CONFIG_FIELD_TYPES: Dict[str, type] = {
     'flow_interval': int,
@@ -165,6 +163,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # AUDIT FIX C-1: clboss_enabled was missing, causing bool set as string
     'clboss_enabled': bool,
 }
+
+DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset(
+    key for key in CONFIG_FIELD_TYPES.keys() if key not in PUBLIC_RUNTIME_KEYS
+)
 
 # Range constraints for numeric fields
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
