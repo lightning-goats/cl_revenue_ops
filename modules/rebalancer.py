@@ -4196,194 +4196,188 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # =====================================================================
         fleet_path_info = None
         if self.hive_bridge:
+            # Check for fleet member conflicts. Downgraded from hard block to
+            # skip-fleet: two fleet members rebalancing to the same external peer
+            # via different routes is fine — just don't inject fleet paths.
+            skip_fleet_path = False
             conflict = self.hive_bridge.check_rebalance_conflict(candidate.to_peer_id)
             if conflict.get("conflict"):
                 reason = conflict.get("reason", "Fleet member rebalancing through same peer")
-                self._set_last_decision_summary(
-                    action="suppressed",
-                    reason="fleet_conflict",
-                    dominant_input="fleet_conflict",
-                    safety_block=True,
-                    budget_blocked=False,
-                )
                 self.plugin.log(
-                    f"FLEET_CONFLICT: Skipping rebalance to {candidate.to_channel[:12]}... "
-                    f"({reason})",
+                    f"FLEET_CONFLICT: {candidate.to_channel[:12]}... skipping fleet path "
+                    f"({reason}), using normal routing",
                     level='info'
                 )
-                result["message"] = f"Skipped due to fleet conflict: {reason}"
-                result["fleet_conflict"] = True
-                with self._pending_lock:
-                    self._pending.pop(candidate.to_channel, None)
-                return result
+                skip_fleet_path = True
 
-            # =====================================================================
-            # PHASE 9: Circular Flow Prevention
-            # Check if source or dest peer is in a known circular flow pattern.
-            # Fails open — if check fails, rebalance proceeds.
-            # =====================================================================
-            circular_risk = self.hive_bridge.check_circular_flow_risk(
-                source_peer_id=candidate.primary_source_peer_id,
-                dest_peer_id=candidate.to_peer_id
-            )
-            if circular_risk.get("risk"):
-                self._set_last_decision_summary(
-                    action="suppressed",
-                    reason="circular_flow_risk",
-                    dominant_input="circular_flow_risk",
-                    safety_block=True,
-                    budget_blocked=False,
+            if not skip_fleet_path:
+                # =====================================================================
+                # PHASE 9: Circular Flow Prevention
+                # Check if source or dest peer is in a known circular flow pattern.
+                # Fails open — if check fails, rebalance proceeds.
+                # =====================================================================
+                circular_risk = self.hive_bridge.check_circular_flow_risk(
+                    source_peer_id=candidate.primary_source_peer_id,
+                    dest_peer_id=candidate.to_peer_id
                 )
-                flow_members = circular_risk.get("flow_members", [])
-                cost = circular_risk.get("total_cost_sats", 0)
-                self.plugin.log(
-                    f"CIRCULAR_FLOW_RISK: Skipping rebalance to {candidate.to_channel[:12]}... "
-                    f"Peers in circular flow: {flow_members}, cost: {cost} sats",
-                    level='info'
-                )
-                result["message"] = "Skipped due to circular flow risk"
-                result["circular_flow_risk"] = True
-                with self._pending_lock:
-                    self._pending.pop(candidate.to_channel, None)
-                return result
-
-            # =====================================================================
-            # PHASE 7: Query Fleet Rebalance Path
-            # Check if routing through fleet members is cheaper.
-            # Fleet channels have 0 fees, so internal paths may save significantly.
-            # =====================================================================
-            fleet_path_info = self.hive_bridge.query_fleet_rebalance_path(
-                from_channel=candidate.from_channel,
-                to_channel=candidate.to_channel,
-                amount_sats=candidate.amount_sats
-            )
-
-            if fleet_path_info and fleet_path_info.get("fleet_path_available"):
-                savings_pct = fleet_path_info.get("savings_pct", 0)
-                fleet_cost = fleet_path_info.get("estimated_fleet_cost_sats", 0)
-                external_cost = fleet_path_info.get("estimated_external_cost_sats", 0)
-
-                self.plugin.log(
-                    f"FLEET_PATH: Internal route available for {candidate.to_channel[:12]}... "
-                    f"Fleet cost: {fleet_cost} sats vs External: {external_cost} sats "
-                    f"(savings: {savings_pct:.0f}%)",
-                    level='info'
-                )
-
-                # Store fleet path info for outcome reporting
-                result["fleet_path_available"] = True
-                result["fleet_savings_pct"] = savings_pct
-
-                # Inject fleet member channels as sling source candidates
-                # so sling tries zero-fee fleet routes first.
-                # source_eligible_members: fleet peers we have channels with
-                # that are also connected to to_peer (ideal 2-hop zero-fee routes).
-                fleet_members = fleet_path_info.get("source_eligible_members", [])
-                if fleet_members:
-                    channels = self._get_channels_with_balances()
-                    peer_to_scid = {}
-                    for scid, info in channels.items():
-                        pid = info.get("peer_id", "")
-                        if pid and pid not in peer_to_scid:
-                            peer_to_scid[pid] = scid
-
-                    fleet_scids = []
-                    fleet_peer_ids = []
-                    for member_pubkey in fleet_members:
-                        scid = peer_to_scid.get(member_pubkey)
-                        if scid:
-                            fleet_scids.append(scid)
-                            fleet_peer_ids.append(member_pubkey)
-
-                    if fleet_scids:
-                        # Snapshot originals before fleet mutation so we can
-                        # restore them if circular rebalance fails and we
-                        # fall back to sling external routing.
-                        _original_max_fee_ppm = candidate.max_fee_ppm
-                        _original_max_budget_sats = candidate.max_budget_sats
-                        _original_max_budget_msat = candidate.max_budget_msat
-
-                        # Prepend fleet SCIDs — sling tries them first, falls back to originals
-                        existing_sources = candidate.source_candidates
-                        existing_peer_ids = getattr(candidate, "source_candidate_peer_ids", []) or []
-                        candidate.source_candidates = fleet_scids + [
-                            s for s in existing_sources if s not in fleet_scids
-                        ]
-                        candidate.source_candidate_peer_ids = fleet_peer_ids + [
-                            p for p in existing_peer_ids if p not in fleet_peer_ids
-                        ]
-
-                        # Fleet-aware fee cap based on route topology
-                        both_hive = (self._is_hive_peer(candidate.to_peer_id)
-                                     and self._is_hive_peer(candidate.primary_source_peer_id))
-                        fleet_cap = self._fleet_fee_cap(candidate.max_fee_ppm, both_hive)
-                        if fleet_cap < candidate.max_fee_ppm:
-                            candidate.max_fee_ppm = fleet_cap
-                            if fleet_cap == 0:
-                                candidate.max_budget_sats = 0
-                                candidate.max_budget_msat = 0
-                            elif candidate.max_budget_sats > 0:
-                                candidate.max_budget_sats = min(
-                                    candidate.max_budget_sats,
-                                    max(1, candidate.amount_sats * fleet_cap // 1_000_000)
-                                )
-                                candidate.max_budget_msat = candidate.max_budget_sats * 1000
-
-                        # I-17 FIX: Mark candidate as fleet-routed for hive outcome reporting
-                        candidate.via_fleet = True
-
-                        self.plugin.log(
-                            f"FLEET_PATH: Injected {len(fleet_scids)} fleet SCIDs as source candidates "
-                            f"for {candidate.to_channel[:12]}..., max_fee_ppm capped to {candidate.max_fee_ppm}",
-                            level='info'
-                        )
-
-            # =====================================================================
-            # PHASE 8: Circular Rebalance Attempt
-            # When both source and dest are hive peers with a fleet path available,
-            # attempt a zero-fee circular rebalance before falling back to sling.
-            # =====================================================================
-            if (fleet_path_info and fleet_path_info.get("fleet_path_available")
-                    and self._is_hive_peer(candidate.to_peer_id)
-                    and self._is_hive_peer(candidate.primary_source_peer_id)):
-                try:
-                    circular_result = self.hive_bridge.execute_circular_rebalance(
-                        from_channel=candidate.from_channel,
-                        to_channel=candidate.to_channel,
-                        amount_sats=candidate.amount_sats,
+                if circular_risk.get("risk"):
+                    self._set_last_decision_summary(
+                        action="suppressed",
+                        reason="circular_flow_risk",
+                        dominant_input="circular_flow_risk",
+                        safety_block=True,
+                        budget_blocked=False,
                     )
-                    if circular_result and circular_result.get("success"):
-                        self._set_last_decision_summary(
-                            action="rebalance",
-                            reason="circular_rebalance",
-                            dominant_input="fleet_path",
-                            safety_block=False,
-                            budget_blocked=False,
-                        )
-                        result["success"] = True
-                        result["message"] = "Circular rebalance executed via hive"
-                        result["circular_rebalance"] = True
-                        result["cost_sats"] = circular_result.get("cost_sats", 0)
-                        self.plugin.log(
-                            f"CIRCULAR REBALANCE: {candidate.amount_sats} sats via hive "
-                            f"({candidate.from_channel[:12]} → {candidate.to_channel[:12]})",
-                            level='info'
-                        )
-                        with self._pending_lock:
-                            self._pending.pop(candidate.to_channel, None)
-                        return result
-                except Exception as e:
+                    flow_members = circular_risk.get("flow_members", [])
+                    cost = circular_risk.get("total_cost_sats", 0)
                     self.plugin.log(
-                        f"CIRCULAR REBALANCE: Failed, falling back to sling: {e}",
-                        level='debug'
+                        f"CIRCULAR_FLOW_RISK: Skipping rebalance to {candidate.to_channel[:12]}... "
+                        f"Peers in circular flow: {flow_members}, cost: {cost} sats",
+                        level='info'
                     )
-                    # Restore original fee cap so sling can try external routes
-                    # without being crippled by the fleet-only 50 PPM cap.
-                    if candidate.via_fleet:
-                        candidate.max_fee_ppm = _original_max_fee_ppm
-                        candidate.max_budget_sats = _original_max_budget_sats
-                        candidate.max_budget_msat = _original_max_budget_msat
-                        candidate.via_fleet = False
+                    result["message"] = "Skipped due to circular flow risk"
+                    result["circular_flow_risk"] = True
+                    with self._pending_lock:
+                        self._pending.pop(candidate.to_channel, None)
+                    return result
+
+                # =====================================================================
+                # PHASE 7: Query Fleet Rebalance Path
+                # Check if routing through fleet members is cheaper.
+                # Fleet channels have 0 fees, so internal paths may save significantly.
+                # =====================================================================
+                fleet_path_info = self.hive_bridge.query_fleet_rebalance_path(
+                    from_channel=candidate.from_channel,
+                    to_channel=candidate.to_channel,
+                    amount_sats=candidate.amount_sats
+                )
+
+                if fleet_path_info and fleet_path_info.get("fleet_path_available"):
+                    savings_pct = fleet_path_info.get("savings_pct", 0)
+                    fleet_cost = fleet_path_info.get("estimated_fleet_cost_sats", 0)
+                    external_cost = fleet_path_info.get("estimated_external_cost_sats", 0)
+
+                    self.plugin.log(
+                        f"FLEET_PATH: Internal route available for {candidate.to_channel[:12]}... "
+                        f"Fleet cost: {fleet_cost} sats vs External: {external_cost} sats "
+                        f"(savings: {savings_pct:.0f}%)",
+                        level='info'
+                    )
+
+                    # Store fleet path info for outcome reporting
+                    result["fleet_path_available"] = True
+                    result["fleet_savings_pct"] = savings_pct
+
+                    # Inject fleet member channels as sling source candidates
+                    # so sling tries zero-fee fleet routes first.
+                    # source_eligible_members: fleet peers we have channels with
+                    # that are also connected to to_peer (ideal 2-hop zero-fee routes).
+                    fleet_members = fleet_path_info.get("source_eligible_members", [])
+                    if fleet_members:
+                        channels = self._get_channels_with_balances()
+                        peer_to_scid = {}
+                        for scid, info in channels.items():
+                            pid = info.get("peer_id", "")
+                            if pid and pid not in peer_to_scid:
+                                peer_to_scid[pid] = scid
+
+                        fleet_scids = []
+                        fleet_peer_ids = []
+                        for member_pubkey in fleet_members:
+                            scid = peer_to_scid.get(member_pubkey)
+                            if scid:
+                                fleet_scids.append(scid)
+                                fleet_peer_ids.append(member_pubkey)
+
+                        if fleet_scids:
+                            # Snapshot originals before fleet mutation so we can
+                            # restore them if circular rebalance fails and we
+                            # fall back to sling external routing.
+                            _original_max_fee_ppm = candidate.max_fee_ppm
+                            _original_max_budget_sats = candidate.max_budget_sats
+                            _original_max_budget_msat = candidate.max_budget_msat
+
+                            # Prepend fleet SCIDs — sling tries them first, falls back to originals
+                            existing_sources = candidate.source_candidates
+                            existing_peer_ids = getattr(candidate, "source_candidate_peer_ids", []) or []
+                            candidate.source_candidates = fleet_scids + [
+                                s for s in existing_sources if s not in fleet_scids
+                            ]
+                            candidate.source_candidate_peer_ids = fleet_peer_ids + [
+                                p for p in existing_peer_ids if p not in fleet_peer_ids
+                            ]
+
+                            # Fleet-aware fee cap based on route topology
+                            both_hive = (self._is_hive_peer(candidate.to_peer_id)
+                                         and self._is_hive_peer(candidate.primary_source_peer_id))
+                            fleet_cap = self._fleet_fee_cap(candidate.max_fee_ppm, both_hive)
+                            if fleet_cap < candidate.max_fee_ppm:
+                                candidate.max_fee_ppm = fleet_cap
+                                if fleet_cap == 0:
+                                    candidate.max_budget_sats = 0
+                                    candidate.max_budget_msat = 0
+                                elif candidate.max_budget_sats > 0:
+                                    candidate.max_budget_sats = min(
+                                        candidate.max_budget_sats,
+                                        max(1, candidate.amount_sats * fleet_cap // 1_000_000)
+                                    )
+                                    candidate.max_budget_msat = candidate.max_budget_sats * 1000
+
+                            # I-17 FIX: Mark candidate as fleet-routed for hive outcome reporting
+                            candidate.via_fleet = True
+
+                            self.plugin.log(
+                                f"FLEET_PATH: Injected {len(fleet_scids)} fleet SCIDs as source candidates "
+                                f"for {candidate.to_channel[:12]}..., max_fee_ppm capped to {candidate.max_fee_ppm}",
+                                level='info'
+                            )
+
+                # =====================================================================
+                # PHASE 8: Circular Rebalance Attempt
+                # When both source and dest are hive peers with a fleet path available,
+                # attempt a zero-fee circular rebalance before falling back to sling.
+                # =====================================================================
+                if (fleet_path_info and fleet_path_info.get("fleet_path_available")
+                        and self._is_hive_peer(candidate.to_peer_id)
+                        and self._is_hive_peer(candidate.primary_source_peer_id)):
+                    try:
+                        circular_result = self.hive_bridge.execute_circular_rebalance(
+                            from_channel=candidate.from_channel,
+                            to_channel=candidate.to_channel,
+                            amount_sats=candidate.amount_sats,
+                        )
+                        if circular_result and circular_result.get("success"):
+                            self._set_last_decision_summary(
+                                action="rebalance",
+                                reason="circular_rebalance",
+                                dominant_input="fleet_path",
+                                safety_block=False,
+                                budget_blocked=False,
+                            )
+                            result["success"] = True
+                            result["message"] = "Circular rebalance executed via hive"
+                            result["circular_rebalance"] = True
+                            result["cost_sats"] = circular_result.get("cost_sats", 0)
+                            self.plugin.log(
+                                f"CIRCULAR REBALANCE: {candidate.amount_sats} sats via hive "
+                                f"({candidate.from_channel[:12]} → {candidate.to_channel[:12]})",
+                                level='info'
+                            )
+                            with self._pending_lock:
+                                self._pending.pop(candidate.to_channel, None)
+                            return result
+                    except Exception as e:
+                        self.plugin.log(
+                            f"CIRCULAR REBALANCE: Failed, falling back to sling: {e}",
+                            level='debug'
+                        )
+                        # Restore original fee cap so sling can try external routes
+                        # without being crippled by the fleet-only 50 PPM cap.
+                        if candidate.via_fleet:
+                            candidate.max_fee_ppm = _original_max_fee_ppm
+                            candidate.max_budget_sats = _original_max_budget_sats
+                            candidate.max_budget_msat = _original_max_budget_msat
+                            candidate.via_fleet = False
 
         rebalance_id: Optional[int] = None
         reserved_budget = False
