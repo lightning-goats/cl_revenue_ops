@@ -1014,6 +1014,37 @@ class TestFleetPathInjection:
         assert cand.max_fee_ppm == 0
         assert cand.max_budget_sats == 0
 
+    def test_fleet_conflict_skips_fleet_path_allows_normal_routing(self, mock_plugin, mock_database):
+        """Fleet conflict should skip fleet path injection but still start the job."""
+        fleet_info = {
+            "fleet_path_available": True,
+            "fleet_path": ["02" + "d" * 64],
+            "source_eligible_members": ["02" + "f" * 64],
+            "estimated_fleet_cost_sats": 0,
+            "estimated_external_cost_sats": 100,
+            "savings_pct": 100.0,
+        }
+        r, _, _ = self._make_rebalancer(mock_plugin, mock_database, fleet_info)
+
+        # Set conflict to True
+        r.hive_bridge.check_rebalance_conflict.return_value = {
+            "conflict": True,
+            "reason": "Fleet member rebalancing through same peer",
+        }
+
+        cand = _candidate(source_candidates=["111x222x0"])
+        original_sources = list(cand.source_candidates)
+        original_ppm = cand.max_fee_ppm
+
+        r.execute_rebalance(cand)
+
+        # Fleet path should NOT have been queried (skipped due to conflict)
+        r.hive_bridge.query_fleet_rebalance_path.assert_not_called()
+        # Source candidates should be unchanged (no fleet prepend)
+        assert cand.source_candidates == original_sources
+        # Fee should be unchanged (no fleet cap mutation)
+        assert cand.max_fee_ppm == original_ppm
+
     def test_fleet_path_unavailable_no_change(self, mock_plugin, mock_database):
         """Source candidates should be unchanged when no fleet path is available."""
         fleet_info = {
