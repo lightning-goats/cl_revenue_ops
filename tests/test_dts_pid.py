@@ -285,8 +285,8 @@ class TestDTSPIDIntegration:
     def _state(self):
         return {"state": "balanced", "forward_count": 50, "sats_out": 10000}
 
-    def test_flag_defaults_false(self):
-        assert HillClimbingFeeController.ENABLE_DTS_PID is False
+    def test_flag_defaults_true(self):
+        assert HillClimbingFeeController.ENABLE_DTS_PID is True
 
     def test_produces_fee_within_bounds(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)

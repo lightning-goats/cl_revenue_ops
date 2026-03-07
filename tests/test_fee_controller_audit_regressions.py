@@ -483,7 +483,7 @@ class TestAdjustChannelFeeEndToEnd:
         assert isinstance(result, FeeAdjustment)
         assert result.new_fee_ppm >= 1, "Fee should not be negative"
         assert result.new_fee_ppm <= cfg.max_fee_ppm + 100, "Fee should not exceed ceiling + buffer"
-        assert "thompson" in result.reason.lower() or result.reason.startswith("CONGESTION")
+        assert "thompson" in result.reason.lower() or "dts_pid" in result.reason.lower() or result.reason.startswith("CONGESTION")
 
     def test_thompson_state_saved_after_adjustment(self, mock_plugin, mock_database):
         """Thompson state should be saved to database after adjustment."""
@@ -766,6 +766,7 @@ class TestSimplifiedFeePath:
     def test_aimd_defense_applies(self, mock_plugin, mock_database):
         """Failure streaks should reduce the AIMD modifier, lowering the fee."""
         fc, cfg = self._make_fc(mock_plugin, mock_database)
+        fc.ENABLE_DTS_PID = False  # AIMD defense is legacy path only
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
         channel_info = self._channel_info(current_fee_ppm=500)

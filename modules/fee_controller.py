@@ -3464,8 +3464,7 @@ class HillClimbingFeeController:
     # DTS+PID Architecture: Discounted Thompson + PID balance controller
     # When True: DTS discount applied, PID multiplier replaces AIMD/scarcity/saturation
     # When False: existing simplified Thompson+AIMD path runs
-    # Default False for shadow-mode validation before live deployment.
-    ENABLE_DTS_PID = False
+    ENABLE_DTS_PID = True
 
     THOMPSON_COLD_START_BONUS = 1.5   # Extra exploration for channels with few observations
     THOMPSON_CONTEXT_WEIGHT = 0.7     # Weight for contextual vs global posterior
