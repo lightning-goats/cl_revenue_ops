@@ -28,6 +28,8 @@ from modules.fee_controller import (
     HeuristicModifiers,
     FeeAdjustment
 )
+from modules.config import Config
+from tests.test_plugin_audit_regressions import _load_plugin_module
 
 
 class TestFeeReasonCode:
@@ -239,3 +241,39 @@ class TestHeuristicTuningConstants:
         FAILURE_CONSERVATIVE_BIAS = 0.8
         assert HIGH_FAILURE_RATE_THRESHOLD == 0.3
         assert FAILURE_CONSERVATIVE_BIAS == 0.8
+
+
+def _load_revenue_status_module():
+    mod = _load_plugin_module()
+    mod.database = MagicMock()
+    mod.database.get_all_channel_states.return_value = []
+    mod.database.get_recent_fee_changes.return_value = []
+    mod.database.get_recent_rebalances.return_value = []
+    mod.config = Config(
+        paused=False,
+        daily_budget_sats=2400,
+        min_fee_ppm=25,
+        max_fee_ppm=1800,
+    )
+    return mod
+
+
+def test_revenue_status_reports_operator_controls_not_full_config():
+    mod = _load_revenue_status_module()
+
+    result = mod.revenue_status(mod.plugin)
+
+    assert "operator_controls" in result
+    assert result["operator_controls"]["public_keys"] == [
+        "paused",
+        "daily_budget_sats",
+        "min_fee_ppm",
+        "max_fee_ppm",
+    ]
+    assert result["operator_controls"]["values"] == {
+        "paused": False,
+        "daily_budget_sats": 2400,
+        "min_fee_ppm": 25,
+        "max_fee_ppm": 1800,
+    }
+    assert "config" not in result

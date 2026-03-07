@@ -1912,11 +1912,9 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     return {
         "status": "running",
         "version": PLUGIN_VERSION,
-        "config": {
-            "target_flow_sats": config.target_flow,
-            "fee_range_ppm": [config.min_fee_ppm, config.max_fee_ppm],
-            "rebalance_min_profit_sats": config.rebalance_min_profit,
-            "dry_run": config.dry_run
+        "operator_controls": {
+            "public_keys": config.public_runtime_keys() if config else [],
+            "values": config.public_runtime_dict() if config else {},
         },
         "channel_states": channel_states,
         "recent_fee_changes": fee_history,

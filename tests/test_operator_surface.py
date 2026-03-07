@@ -100,3 +100,20 @@ def test_revenue_config_get_internal_key_marks_it_internal():
     assert result["warning"].startswith(
         "Key 'enable_vegas_reflex' is not a public runtime control"
     )
+
+
+def test_revenue_status_operator_controls_hide_internal_knob_dump():
+    mod = _load_operator_surface_module()
+    mod.database.get_all_channel_states.return_value = []
+    mod.database.get_recent_fee_changes.return_value = []
+    mod.database.get_recent_rebalances.return_value = []
+
+    result = mod.revenue_status(mod.plugin)
+
+    assert result["operator_controls"]["values"] == {
+        "paused": True,
+        "daily_budget_sats": 1200,
+        "min_fee_ppm": 15,
+        "max_fee_ppm": 2500,
+    }
+    assert "config" not in result
