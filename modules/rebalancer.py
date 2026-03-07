@@ -2020,6 +2020,20 @@ class EVRebalancer:
         return dict(self._last_decision_summary)
 
     @staticmethod
+    def _should_skip_futility(fail_count: int, last_error_type: str) -> bool:
+        """
+        Check if a channel should be skipped by the futility breaker.
+
+        No-route failures trigger at 4 attempts (path likely doesn't exist).
+        Other failures trigger at 10 (existing threshold).
+        """
+        if last_error_type == "no_route" and fail_count >= 4:
+            return True
+        if fail_count >= 10:
+            return True
+        return False
+
+    @staticmethod
     def _apply_fee_escalation(ev_max_fee_ppm: int, fail_count: int, last_attempted_ppm: int) -> int:
         """
         Escalate fee budget based on failure history.
@@ -2412,18 +2426,24 @@ class EVRebalancer:
                 # =====================================================================
                 # Some channels have positive EV spreads but broken routing paths.
                 # Exponential backoff slows down retries, but doesn't stop them.
-                # After 10+ failures, the channel is likely a "Dead End" and further
-                # attempts waste gossip bandwidth and lock HTLCs.
+                # After repeated failures, the channel is likely a "Dead End" and
+                # further attempts waste gossip bandwidth and lock HTLCs.
                 #
-                # Hard Cap: If failed >= 10 times, require 48h cooldown before retry
+                # Error-aware thresholds:
+                #   - no_route failures: 4 attempts (path likely doesn't exist)
+                #   - other failures:   10 attempts (existing threshold)
+                # After threshold hit, require 48h cooldown before retry
                 # =====================================================================
                 fail_count, last_fail = self.database.get_failure_count(dest_id)
-                if fail_count >= 10:
+                fail_meta = self.database.get_failure_metadata(dest_id)
+                if self._should_skip_futility(fail_count, fail_meta["last_error_type"]):
                     now = int(time.time())
                     futility_cooldown = getattr(cfg, 'futility_cooldown_hours', 48) * 3600
                     if (now - last_fail) < futility_cooldown:
+                        threshold = "4 no_route" if fail_meta["last_error_type"] == "no_route" else "10"
                         self.plugin.log(
-                            f"FUTILITY BREAKER: Skipping {dest_id[:12]}... - {fail_count} consecutive failures, "
+                            f"FUTILITY BREAKER: Skipping {dest_id[:12]}... - {fail_count} failures "
+                            f"(threshold: {threshold}), "
                             f"cooldown {(futility_cooldown - (now - last_fail)) // 3600}h remaining",
                             level='debug'
                         )

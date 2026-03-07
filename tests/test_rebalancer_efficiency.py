@@ -167,3 +167,59 @@ class TestGraduatedFeeEscalation:
             ev_max_fee_ppm=100, fail_count=2, last_attempted_ppm=120
         )
         assert result == 100
+
+
+# =============================================================================
+# Task 5: Faster futility breaker for no-route failures
+# =============================================================================
+
+class TestFasterNoRouteFutility:
+    """Verify no-route failures trigger futility faster than other errors."""
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        from modules.database import Database
+        mock_plugin = MagicMock()
+        mock_plugin.log = MagicMock()
+        db = Database(str(tmp_path / "test.db"), mock_plugin)
+        db.initialize()
+        return db
+
+    def test_no_route_futility_at_4_failures(self, db):
+        """4 no_route failures should trigger futility breaker."""
+        for _ in range(4):
+            db.increment_failure_count("100x1x0", error_type="no_route")
+
+        count, last_time = db.get_failure_count("100x1x0")
+        meta = db.get_failure_metadata("100x1x0")
+
+        assert count >= 4
+        assert meta["last_error_type"] == "no_route"
+        from modules.rebalancer import EVRebalancer
+        assert EVRebalancer._should_skip_futility(count, meta["last_error_type"]) is True
+
+    def test_other_error_not_futile_at_4(self, db):
+        """4 timeout failures should NOT trigger futility (needs 10)."""
+        for _ in range(4):
+            db.increment_failure_count("100x1x0", error_type="timeout")
+
+        count, _ = db.get_failure_count("100x1x0")
+        meta = db.get_failure_metadata("100x1x0")
+
+        from modules.rebalancer import EVRebalancer
+        assert EVRebalancer._should_skip_futility(count, meta["last_error_type"]) is False
+
+    def test_other_error_futile_at_10(self, db):
+        """10 timeout failures should trigger futility."""
+        for _ in range(10):
+            db.increment_failure_count("100x1x0", error_type="timeout")
+
+        count, _ = db.get_failure_count("100x1x0")
+        meta = db.get_failure_metadata("100x1x0")
+
+        from modules.rebalancer import EVRebalancer
+        assert EVRebalancer._should_skip_futility(count, meta["last_error_type"]) is True
+
+    def test_zero_failures_not_futile(self):
+        from modules.rebalancer import EVRebalancer
+        assert EVRebalancer._should_skip_futility(0, "") is False
