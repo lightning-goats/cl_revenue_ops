@@ -5886,181 +5886,184 @@ class HillClimbingFeeController:
 
             # Record observation for historical analysis
             regime_already_checked = False
-            if self.ENABLE_HISTORICAL_CURVE:
-                historical_curve.add_observation(
-                    fee_ppm=current_fee_ppm,
-                    revenue_rate=current_revenue_rate,
-                    forward_count=forward_count
-                )
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                if self.ENABLE_HISTORICAL_CURVE:
+                    historical_curve.add_observation(
+                        fee_ppm=current_fee_ppm,
+                        revenue_rate=current_revenue_rate,
+                        forward_count=forward_count
+                    )
 
-                # Check for regime change
-                # M-12: Track whether we already checked regime to avoid double-detection below
-                regime_already_checked = False
-                if now - historical_curve.last_regime_check > self.REGIME_CHECK_INTERVAL:
-                    historical_curve.last_regime_check = now
-                    regime_already_checked = True
-                    if historical_curve.detect_regime_change(current_revenue_rate):
-                        self.plugin.log(
-                            f"THOMPSON: Regime change detected for {channel_id[:12]}... "
-                            f"Resetting Thompson posterior.",
-                            level='info'
-                        )
-                        historical_curve.reset_curve()
-                        # Reset Thompson and AIMD on regime change
-                        ts_state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
-                        ts_state.aimd.reset()
+                    # Check for regime change
+                    # M-12: Track whether we already checked regime to avoid double-detection below
+                    regime_already_checked = False
+                    if now - historical_curve.last_regime_check > self.REGIME_CHECK_INTERVAL:
+                        historical_curve.last_regime_check = now
+                        regime_already_checked = True
+                        if historical_curve.detect_regime_change(current_revenue_rate):
+                            self.plugin.log(
+                                f"THOMPSON: Regime change detected for {channel_id[:12]}... "
+                                f"Resetting Thompson posterior.",
+                                level='info'
+                            )
+                            historical_curve.reset_curve()
+                            # Reset Thompson and AIMD on regime change
+                            ts_state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
+                            ts_state.aimd.reset()
 
-                ts_state.set_historical_curve(historical_curve)
+                    ts_state.set_historical_curve(historical_curve)
 
             # Update elasticity tracker
-            if self.ENABLE_ELASTICITY:
-                elasticity_tracker.add_observation(
-                    fee_ppm=current_fee_ppm,
-                    volume_sats=volume_since_sats,
-                    revenue_rate=current_revenue_rate
-                )
-                ts_state.set_elasticity_tracker(elasticity_tracker)
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                if self.ENABLE_ELASTICITY:
+                    elasticity_tracker.add_observation(
+                        fee_ppm=current_fee_ppm,
+                        volume_sats=volume_since_sats,
+                        revenue_rate=current_revenue_rate
+                    )
+                    ts_state.set_elasticity_tracker(elasticity_tracker)
 
             # =====================================================================
             # P2 FLEET INTEGRATION: Elasticity & Curve Sharing
             # =====================================================================
             # Share observations with fleet and incorporate fleet-aggregated data
             # for better collective learning
-            if self.hive_bridge and self.hive_bridge.is_available():
-                # --- ELASTICITY SHARING ---
-                if self.ENABLE_ELASTICITY and elasticity_tracker.should_broadcast():
-                    try:
-                        broadcast_data = elasticity_tracker.get_broadcast_data()
-                        self.hive_bridge.broadcast_elasticity_observation(
-                            peer_id=peer_id,
-                            elasticity=broadcast_data["elasticity"],
-                            confidence=broadcast_data["confidence"],
-                            sample_count=broadcast_data["sample_count"]
-                        )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_ELASTICITY: Failed to broadcast elasticity: {e}",
-                            level='debug'
-                        )
-
-                # Query and incorporate fleet elasticity data
-                if self.ENABLE_ELASTICITY:
-                    try:
-                        fleet_elasticity = self.hive_bridge.query_fleet_elasticity(peer_id)
-                        if fleet_elasticity:
-                            elasticity_tracker.incorporate_fleet_data(
-                                fleet_elasticity=fleet_elasticity.get("elasticity", -1.0),
-                                fleet_confidence=fleet_elasticity.get("confidence", 0),
-                                fleet_weight=0.3  # 30% weight to fleet data
-                            )
-                            ts_state.set_elasticity_tracker(elasticity_tracker)
-                            self.plugin.log(
-                                f"P2_ELASTICITY: {channel_id[:12]}... incorporated fleet data "
-                                f"(fleet_e={fleet_elasticity.get('elasticity', -1.0):.2f}, "
-                                f"local_e={elasticity_tracker.current_elasticity:.2f})",
-                                level='debug'
-                            )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_ELASTICITY: Failed to query fleet elasticity: {e}",
-                            level='debug'
-                        )
-
-                # --- RESPONSE CURVE SHARING ---
-                if self.ENABLE_HISTORICAL_CURVE and historical_curve.should_broadcast_observation(
-                    fee_ppm=current_fee_ppm,
-                    revenue_rate=current_revenue_rate,
-                    forward_count=forward_count
-                ):
-                    try:
-                        self.hive_bridge.broadcast_curve_observation(
-                            peer_id=peer_id,
-                            fee_ppm=current_fee_ppm,
-                            revenue_rate=current_revenue_rate,
-                            forward_count=forward_count
-                        )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_CURVE: Failed to broadcast curve observation: {e}",
-                            level='debug'
-                        )
-
-                # Query and incorporate fleet aggregated curve
-                if self.ENABLE_HISTORICAL_CURVE:
-                    try:
-                        fleet_curve = self.hive_bridge.query_aggregated_curve(peer_id)
-                        if fleet_curve and fleet_curve.get("observations"):
-                            historical_curve.incorporate_fleet_curve(
-                                fleet_observations=fleet_curve["observations"],
-                                fleet_weight=0.25  # 25% weight to fleet curve
-                            )
-                            ts_state.set_historical_curve(historical_curve)
-                            self.plugin.log(
-                                f"P2_CURVE: {channel_id[:12]}... incorporated "
-                                f"{len(fleet_curve['observations'])} fleet observations",
-                                level='debug'
-                            )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_CURVE: Failed to query fleet curve: {e}",
-                            level='debug'
-                        )
-
-                # --- REGIME CHANGE DETECTION & COORDINATION ---
-                # M-12: Skip if already checked above in the Thompson block
-                if self.ENABLE_HISTORICAL_CURVE and not regime_already_checked:
-                    regime_changed = historical_curve.detect_regime_change(current_revenue_rate)
-                    if regime_changed:
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                if self.hive_bridge and self.hive_bridge.is_available():
+                    # --- ELASTICITY SHARING ---
+                    if self.ENABLE_ELASTICITY and elasticity_tracker.should_broadcast():
                         try:
-                            # Determine change type based on direction
-                            recent = historical_curve.observations[-10:] if len(historical_curve.observations) >= 10 else historical_curve.observations
-                            avg_revenue = sum(o.revenue_rate for o in recent) / len(recent) if recent else 0
-                            change_type = "expansion" if current_revenue_rate > avg_revenue else "contraction"
-
-                            self.hive_bridge.broadcast_regime_change(
+                            broadcast_data = elasticity_tracker.get_broadcast_data()
+                            self.hive_bridge.broadcast_elasticity_observation(
                                 peer_id=peer_id,
-                                change_type=change_type,
-                                old_regime={"avg_revenue": avg_revenue},
-                                new_regime={"current_revenue": current_revenue_rate},
-                                evidence={
-                                    "ratio": current_revenue_rate / max(1, avg_revenue),
-                                    "observation_count": len(historical_curve.observations)
-                                }
-                            )
-                            self.plugin.log(
-                                f"P2_REGIME: {channel_id[:12]}... detected {change_type} "
-                                f"(ratio={(current_revenue_rate / max(1, avg_revenue)):.2f})",
-                                level='info'
+                                elasticity=broadcast_data["elasticity"],
+                                confidence=broadcast_data["confidence"],
+                                sample_count=broadcast_data["sample_count"]
                             )
                         except Exception as e:
                             self.plugin.log(
-                                f"P2_REGIME: Failed to broadcast regime change: {e}",
+                                f"P2_ELASTICITY: Failed to broadcast elasticity: {e}",
                                 level='debug'
                             )
 
-                    # Query fleet regime status to detect coordinated shifts
-                    try:
-                        fleet_regime = self.hive_bridge.query_fleet_regime_status(peer_id)
-                        if fleet_regime and fleet_regime.get("regime_change_detected"):
-                            # Fleet detected regime change - reset our curve to adapt
-                            fleet_change_type = fleet_regime.get("change_type", "unknown")
-                            fleet_evidence_count = fleet_regime.get("evidence_count", 0)
+                    # Query and incorporate fleet elasticity data
+                    if self.ENABLE_ELASTICITY:
+                        try:
+                            fleet_elasticity = self.hive_bridge.query_fleet_elasticity(peer_id)
+                            if fleet_elasticity:
+                                elasticity_tracker.incorporate_fleet_data(
+                                    fleet_elasticity=fleet_elasticity.get("elasticity", -1.0),
+                                    fleet_confidence=fleet_elasticity.get("confidence", 0),
+                                    fleet_weight=0.3  # 30% weight to fleet data
+                                )
+                                ts_state.set_elasticity_tracker(elasticity_tracker)
+                                self.plugin.log(
+                                    f"P2_ELASTICITY: {channel_id[:12]}... incorporated fleet data "
+                                    f"(fleet_e={fleet_elasticity.get('elasticity', -1.0):.2f}, "
+                                    f"local_e={elasticity_tracker.current_elasticity:.2f})",
+                                    level='debug'
+                                )
+                        except Exception as e:
+                            self.plugin.log(
+                                f"P2_ELASTICITY: Failed to query fleet elasticity: {e}",
+                                level='debug'
+                            )
 
-                            if fleet_evidence_count >= 3 and not regime_changed:
-                                # Fleet has strong evidence, we should adapt even if we
-                                # didn't detect it locally
-                                historical_curve.reset_curve()
+                    # --- RESPONSE CURVE SHARING ---
+                    if self.ENABLE_HISTORICAL_CURVE and historical_curve.should_broadcast_observation(
+                        fee_ppm=current_fee_ppm,
+                        revenue_rate=current_revenue_rate,
+                        forward_count=forward_count
+                    ):
+                        try:
+                            self.hive_bridge.broadcast_curve_observation(
+                                peer_id=peer_id,
+                                fee_ppm=current_fee_ppm,
+                                revenue_rate=current_revenue_rate,
+                                forward_count=forward_count
+                            )
+                        except Exception as e:
+                            self.plugin.log(
+                                f"P2_CURVE: Failed to broadcast curve observation: {e}",
+                                level='debug'
+                            )
+
+                    # Query and incorporate fleet aggregated curve
+                    if self.ENABLE_HISTORICAL_CURVE:
+                        try:
+                            fleet_curve = self.hive_bridge.query_aggregated_curve(peer_id)
+                            if fleet_curve and fleet_curve.get("observations"):
+                                historical_curve.incorporate_fleet_curve(
+                                    fleet_observations=fleet_curve["observations"],
+                                    fleet_weight=0.25  # 25% weight to fleet curve
+                                )
                                 ts_state.set_historical_curve(historical_curve)
                                 self.plugin.log(
-                                    f"P2_REGIME: {channel_id[:12]}... resetting curve due to "
-                                    f"fleet {fleet_change_type} detection (evidence={fleet_evidence_count})",
+                                    f"P2_CURVE: {channel_id[:12]}... incorporated "
+                                    f"{len(fleet_curve['observations'])} fleet observations",
+                                    level='debug'
+                                )
+                        except Exception as e:
+                            self.plugin.log(
+                                f"P2_CURVE: Failed to query fleet curve: {e}",
+                                level='debug'
+                            )
+
+                    # --- REGIME CHANGE DETECTION & COORDINATION ---
+                    # M-12: Skip if already checked above in the Thompson block
+                    if self.ENABLE_HISTORICAL_CURVE and not regime_already_checked:
+                        regime_changed = historical_curve.detect_regime_change(current_revenue_rate)
+                        if regime_changed:
+                            try:
+                                # Determine change type based on direction
+                                recent = historical_curve.observations[-10:] if len(historical_curve.observations) >= 10 else historical_curve.observations
+                                avg_revenue = sum(o.revenue_rate for o in recent) / len(recent) if recent else 0
+                                change_type = "expansion" if current_revenue_rate > avg_revenue else "contraction"
+
+                                self.hive_bridge.broadcast_regime_change(
+                                    peer_id=peer_id,
+                                    change_type=change_type,
+                                    old_regime={"avg_revenue": avg_revenue},
+                                    new_regime={"current_revenue": current_revenue_rate},
+                                    evidence={
+                                        "ratio": current_revenue_rate / max(1, avg_revenue),
+                                        "observation_count": len(historical_curve.observations)
+                                    }
+                                )
+                                self.plugin.log(
+                                    f"P2_REGIME: {channel_id[:12]}... detected {change_type} "
+                                    f"(ratio={(current_revenue_rate / max(1, avg_revenue)):.2f})",
                                     level='info'
                                 )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_REGIME: Failed to query fleet regime status: {e}",
-                            level='debug'
-                        )
+                            except Exception as e:
+                                self.plugin.log(
+                                    f"P2_REGIME: Failed to broadcast regime change: {e}",
+                                    level='debug'
+                                )
+
+                        # Query fleet regime status to detect coordinated shifts
+                        try:
+                            fleet_regime = self.hive_bridge.query_fleet_regime_status(peer_id)
+                            if fleet_regime and fleet_regime.get("regime_change_detected"):
+                                # Fleet detected regime change - reset our curve to adapt
+                                fleet_change_type = fleet_regime.get("change_type", "unknown")
+                                fleet_evidence_count = fleet_regime.get("evidence_count", 0)
+
+                                if fleet_evidence_count >= 3 and not regime_changed:
+                                    # Fleet has strong evidence, we should adapt even if we
+                                    # didn't detect it locally
+                                    historical_curve.reset_curve()
+                                    ts_state.set_historical_curve(historical_curve)
+                                    self.plugin.log(
+                                        f"P2_REGIME: {channel_id[:12]}... resetting curve due to "
+                                        f"fleet {fleet_change_type} detection (evidence={fleet_evidence_count})",
+                                        level='info'
+                                    )
+                        except Exception as e:
+                            self.plugin.log(
+                                f"P2_REGIME: Failed to query fleet regime status: {e}",
+                                level='debug'
+                            )
 
             # =====================================================================
             # VOLATILITY & HYSTERESIS (preserved)
@@ -6130,11 +6133,12 @@ class HillClimbingFeeController:
             # =====================================================================
             # Bias the quadratic coefficient toward the curvature implied by
             # observed elasticity before the posterior update incorporates it.
-            if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
-                ts_state.thompson._apply_elasticity_to_prior(
-                    elasticity=elasticity_tracker.current_elasticity,
-                    confidence=elasticity_tracker.confidence
-                )
+            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
+                    ts_state.thompson._apply_elasticity_to_prior(
+                        elasticity=elasticity_tracker.current_elasticity,
+                        confidence=elasticity_tracker.confidence
+                    )
 
             # =====================================================================
             # THOMPSON SAMPLING: Update Posterior and Sample Fee
