@@ -2579,6 +2579,13 @@ def revenue_fee_anchor(plugin: Plugin,
     if fee_controller is None:
         return {"error": "Plugin not fully initialized"}
 
+    if getattr(fee_controller, 'ENABLE_SIMPLIFIED_FEE_PATH', False):
+        return {
+            "status": "deprecated",
+            "message": "Fee anchors are deprecated under simplified fee path. "
+                       "Use revenue-policy with fee_multiplier_min/fee_multiplier_max instead.",
+        }
+
     if action == "set":
         if not channel_id:
             return {"status": "error", "error": "channel_id is required for set"}
