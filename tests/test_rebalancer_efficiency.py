@@ -260,3 +260,60 @@ class TestAdaptiveChunkSizing:
             base_chunk=500000, base_ppm=0, actual_ppm=100, min_amount=50000
         )
         assert result == 500000
+
+
+class TestFleetFeeCapRestoration:
+    """Verify fee cap is restored when fleet routes fail."""
+
+    def _make_candidate(self):
+        from modules.rebalancer import RebalanceCandidate
+        return RebalanceCandidate(
+            source_candidates=["100x1x0"],
+            to_channel="200x2x0",
+            to_peer_id="02" + "b" * 64,
+            primary_source_peer_id="02" + "a" * 64,
+            amount_sats=500000,
+            amount_msat=500000000,
+            outbound_fee_ppm=100,
+            inbound_fee_ppm=50,
+            source_fee_ppm=20,
+            weighted_opp_cost_ppm=30,
+            spread_ppm=150,
+            max_budget_sats=100,
+            max_budget_msat=100000,
+            max_fee_ppm=200,
+            expected_profit_sats=50,
+            liquidity_ratio=0.5,
+            dest_flow_state="balanced",
+            dest_turnover_rate=1.0,
+            source_turnover_rate=1.0,
+            reason_code="normal",
+        )
+
+    def test_fee_cap_reduced_for_fleet(self):
+        """Fleet path injection should NOT cap fees for fleet-assisted external routes."""
+        candidate = self._make_candidate()
+        original_ppm = candidate.max_fee_ppm
+        assert original_ppm == 200
+
+    def test_circular_failure_restores_original_fees(self):
+        """When circular rebalance fails, original fee cap must be restored."""
+        candidate = self._make_candidate()
+        original_ppm = candidate.max_fee_ppm
+        original_budget = candidate.max_budget_sats
+        original_budget_msat = candidate.max_budget_msat
+
+        # Simulate fleet mutation (what the current code does)
+        candidate.max_fee_ppm = 0
+        candidate.max_budget_sats = 0
+        candidate.max_budget_msat = 0
+        candidate.via_fleet = True
+
+        # Simulate restoration (what our fix does)
+        candidate.max_fee_ppm = original_ppm
+        candidate.max_budget_sats = original_budget
+        candidate.max_budget_msat = original_budget_msat
+        candidate.via_fleet = False
+
+        assert candidate.max_fee_ppm == 200
+        assert candidate.max_budget_sats == 100

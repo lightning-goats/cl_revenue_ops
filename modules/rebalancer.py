@@ -4283,6 +4283,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                             fleet_peer_ids.append(member_pubkey)
 
                     if fleet_scids:
+                        # Snapshot originals before fleet mutation so we can
+                        # restore them if circular rebalance fails and we
+                        # fall back to sling external routing.
+                        _original_max_fee_ppm = candidate.max_fee_ppm
+                        _original_max_budget_sats = candidate.max_budget_sats
+                        _original_max_budget_msat = candidate.max_budget_msat
+
                         # Prepend fleet SCIDs — sling tries them first, falls back to originals
                         existing_sources = candidate.source_candidates
                         existing_peer_ids = getattr(candidate, "source_candidate_peer_ids", []) or []
@@ -4348,6 +4355,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         f"CIRCULAR REBALANCE: Failed, falling back to sling: {e}",
                         level='debug'
                     )
+                    # Restore original fee cap so sling can try external routes
+                    # without being crippled by the fleet-only 50 PPM cap.
+                    if candidate.via_fleet:
+                        candidate.max_fee_ppm = _original_max_fee_ppm
+                        candidate.max_budget_sats = _original_max_budget_sats
+                        candidate.max_budget_msat = _original_max_budget_msat
+                        candidate.via_fleet = False
 
         rebalance_id: Optional[int] = None
         reserved_budget = False
