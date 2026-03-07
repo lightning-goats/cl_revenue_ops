@@ -3294,7 +3294,7 @@ class HillClimbingFeeController:
     MAX_STEP_PPM = 200      # Maximum step size
     MAX_CONSECUTIVE = 5     # Max consecutive moves in same direction before reducing step
     DAMPENING_FACTOR = 0.5  # Step size decay factor on direction reversal (halve the step)
-    MIN_OBSERVATION_HOURS = 1.0  # Minimum hours between fee changes for valid signal
+    MIN_OBSERVATION_HOURS = 0.5  # Minimum hours between fee changes for valid signal
     VOLATILITY_THRESHOLD = 0.50  # 50% change in revenue rate triggers volatility reset
 
     # Deadband Hysteresis parameters (Phase 4: Stability & Scaling)
