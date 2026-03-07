@@ -1,8 +1,17 @@
 """Tests for DTS + PID fee controller components."""
+import json
 import math
 import time
+from unittest.mock import MagicMock
+
 import pytest
-from modules.fee_controller import GaussianThompsonState, PIDState, ThompsonAIMDState
+from modules.fee_controller import (
+    GaussianThompsonState,
+    FeeAdjustment,
+    HillClimbingFeeController,
+    PIDState,
+    ThompsonAIMDState,
+)
 
 
 class TestPIDState:
@@ -179,3 +188,205 @@ class TestPIDStatePersistence:
         assert isinstance(ts.pid, PIDState)
         assert ts.pid.kp == 2.0
         assert ts.pid.ewma_error == 0.0
+
+
+# =========================================================================
+# Integration tests for ENABLE_DTS_PID flag and full DTS+PID fee path
+# =========================================================================
+
+
+def _make_config_snapshot(**overrides):
+    defaults = {
+        "min_fee_ppm": 10,
+        "max_fee_ppm": 5000,
+        "hive_fee_ppm": 0,
+        "enable_reputation": False,
+        "enable_scarcity_pricing": True,
+        "scarcity_threshold": 0.30,
+        "enable_zero_fee_probe": False,
+        "dynamic_window_enabled": False,
+        "min_observation_window": 1800,
+        "fee_change_cooldown": 300,
+        "profitability_shield_enabled": False,
+        "ema_smoothing_alpha": 0.3,
+        "fee_interval": 1800,
+        "inbound_fee_estimate_ppm": 200,
+        "thompson_prior_std_fee": 200.0,
+        "hive_min_confidence_for_prior": 0.3,
+        "routing_intelligence_enabled": False,
+    }
+    defaults.update(overrides)
+    snap = MagicMock()
+    for k, v in defaults.items():
+        setattr(snap, k, v)
+    return snap
+
+
+def _make_fc_for_dts_pid(mock_plugin, mock_database, *, enable_dts_pid=True):
+    from modules.config import Config
+    config = MagicMock(spec=Config)
+    clboss = MagicMock()
+    fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+    cfg = _make_config_snapshot()
+    fc.config.snapshot.return_value = cfg
+
+    fc.ENABLE_THOMPSON_AIMD = True
+    fc.ENABLE_SIMPLIFIED_FEE_PATH = True
+    fc.ENABLE_DTS_PID = enable_dts_pid
+
+    mock_database.get_channel_probe.return_value = None
+    mock_database.get_volume_since.return_value = 50_000
+    mock_database.get_weighted_volume_since.return_value = 50_000
+    mock_database.get_forward_count_since.return_value = 10
+    mock_database.get_peer_uptime_percent.return_value = 99.5
+    mock_database.get_channel_state.return_value = {
+        "kalman_flow_ratio": 0.5,
+        "kalman_velocity": 0.0,
+        "state": "balanced",
+    }
+    mock_database.get_fee_strategy_state.return_value = {
+        "last_revenue_rate": 5.0,
+        "last_fee_ppm": 150,
+        "trend_direction": 1,
+        "step_ppm": 50,
+        "last_update": int(time.time()) - 7200,
+        "consecutive_same_direction": 0,
+        "is_sleeping": 0,
+        "sleep_until": 0,
+        "stable_cycles": 0,
+        "forward_count_since_update": 10,
+        "last_volume_sats": 50_000,
+        "v2_state_json": None,
+    }
+    mock_database.get_last_forward_time.return_value = int(time.time()) - 1800
+    mock_database.get_failure_count.return_value = (0, 0)
+    mock_database.get_channel_cost_history.return_value = []
+    mock_database.get_channel_rebalance_success_rate.return_value = None
+    mock_database.get_peer_latency_stats.return_value = {"avg": 0.0, "std": 0.0, "count": 0}
+    mock_database.update_fee_strategy_state = MagicMock()
+    mock_database.record_fee_change = MagicMock()
+    mock_plugin.rpc.setchannelfee.return_value = {}
+    mock_plugin.rpc.feerates.return_value = {"perkw": {"opening": 1000}}
+
+    return fc, cfg
+
+
+class TestDTSPIDIntegration:
+    def _channel_info(self, *, current_fee_ppm=150, outbound_pct=50.0):
+        capacity_sats = 2_000_000
+        spendable_sats = int(capacity_sats * (outbound_pct / 100.0))
+        return {
+            "fee_proportional_millionths": current_fee_ppm,
+            "capacity": capacity_sats,
+            "spendable_msat": f"{spendable_sats * 1000}msat",
+            "opener": "local",
+        }
+
+    def _state(self):
+        return {"state": "balanced", "forward_count": 50, "sats_out": 10000}
+
+    def test_flag_defaults_false(self):
+        assert HillClimbingFeeController.ENABLE_DTS_PID is False
+
+    def test_produces_fee_within_bounds(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64, self._state(),
+            self._channel_info(), cfg=cfg
+        )
+        assert result is not None
+        assert isinstance(result, FeeAdjustment)
+        assert result.new_fee_ppm >= cfg.min_fee_ppm
+        assert result.new_fee_ppm <= cfg.max_fee_ppm
+
+    def test_drained_channel_gets_higher_fee(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        ch_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # First call to initialise Thompson state
+        fc._adjust_channel_fee(
+            ch_id, peer_id, self._state(),
+            self._channel_info(outbound_pct=50.0), cfg=cfg
+        )
+
+        # Pin Thompson sample_fee to return a deterministic value
+        ts_state = fc._thompson_aimd_states[ch_id]
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 200
+
+        # Reset PID state for clean comparison
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = int(time.time()) - 1800
+
+        result_balanced = fc._adjust_channel_fee(
+            ch_id, peer_id, self._state(),
+            self._channel_info(outbound_pct=50.0), cfg=cfg
+        )
+
+        # Reset PID for the drained run
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = int(time.time()) - 1800
+
+        result_drained = fc._adjust_channel_fee(
+            ch_id, peer_id, self._state(),
+            self._channel_info(outbound_pct=10.0), cfg=cfg
+        )
+        assert result_balanced is not None and result_drained is not None
+        assert result_drained.new_fee_ppm >= result_balanced.new_fee_ppm
+
+    def test_saturated_channel_gets_lower_fee(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        ch_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # First call to initialise Thompson state
+        fc._adjust_channel_fee(
+            ch_id, peer_id, self._state(),
+            self._channel_info(outbound_pct=50.0), cfg=cfg
+        )
+
+        # Pin Thompson sample_fee to return a deterministic value
+        ts_state = fc._thompson_aimd_states[ch_id]
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 200
+
+        # Reset PID for balanced run
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = int(time.time()) - 1800
+
+        result_balanced = fc._adjust_channel_fee(
+            ch_id, peer_id, self._state(),
+            self._channel_info(outbound_pct=50.0), cfg=cfg
+        )
+
+        # Reset PID for saturated run
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = int(time.time()) - 1800
+
+        result_saturated = fc._adjust_channel_fee(
+            ch_id, peer_id, self._state(),
+            self._channel_info(outbound_pct=90.0), cfg=cfg
+        )
+        assert result_balanced is not None and result_saturated is not None
+        assert result_saturated.new_fee_ppm <= result_balanced.new_fee_ppm
+
+    def test_pid_state_persisted_after_adjustment(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64, self._state(),
+            self._channel_info(), cfg=cfg
+        )
+        assert result is not None
+        assert mock_database.update_fee_strategy_state.called
+        call_kwargs = mock_database.update_fee_strategy_state.call_args
+        v2_json = call_kwargs.kwargs.get("v2_state_json") or call_kwargs[1].get("v2_state_json", "{}")
+        v2_data = json.loads(v2_json)
+        assert "pid_state" in v2_data
+
+    def test_flag_false_uses_original_path(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database, enable_dts_pid=False)
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64, self._state(),
+            self._channel_info(), cfg=cfg
+        )
+        assert result is not None
+        assert isinstance(result, FeeAdjustment)
