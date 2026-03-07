@@ -1507,7 +1507,8 @@ class Database:
                                    stable_cycles: int = 0,
                                    forward_count_since_update: int = 0,
                                    last_volume_sats: int = 0,
-                                   v2_state_json: str = '{}'):
+                                   v2_state_json: str = '{}',
+                                   last_update: int = None):
         """
         Update Hill Climbing fee strategy state for a channel.
 
@@ -1531,7 +1532,7 @@ class Database:
             v2_state_json: v2.0 - JSON blob for historical curve, elasticity, Thompson state
         """
         conn = self._get_connection()
-        now = int(time.time())
+        ts = last_update if last_update is not None else int(time.time())
 
         conn.execute("""
             INSERT OR REPLACE INTO fee_strategy_state
@@ -1541,7 +1542,7 @@ class Database:
              forward_count_since_update, last_volume_sats, v2_state_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
-              step_ppm, consecutive_same_direction, now,
+              step_ppm, consecutive_same_direction, ts,
               last_broadcast_fee_ppm, last_state, is_sleeping, sleep_until, stable_cycles,
               forward_count_since_update, last_volume_sats, v2_state_json))
     

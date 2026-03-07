@@ -4131,7 +4131,8 @@ class HillClimbingFeeController:
             stable_cycles=state.stable_cycles,
             forward_count_since_update=state.forward_count_since_update,
             last_volume_sats=state.last_volume_sats,
-            v2_state_json=v2_json_str
+            v2_state_json=v2_json_str,
+            last_update=state.last_update
         )
 
     def _get_balance_based_floor(self, local_balance_pct: float, global_min: int) -> int:
@@ -8401,7 +8402,8 @@ class HillClimbingFeeController:
             # v2.0 fields
             forward_count_since_update=state.forward_count_since_update,
             last_volume_sats=state.last_volume_sats,
-            v2_state_json=v2_json_str
+            v2_state_json=v2_json_str,
+            last_update=state.last_update
         )
     
     # =========================================================================
