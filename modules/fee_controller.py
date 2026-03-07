@@ -2793,6 +2793,9 @@ class ThompsonAIMDState:
     # Vegas-Thompson interaction tracking
     last_vegas_multiplier: float = 1.0
 
+    # PID balance controller state
+    pid: PIDState = field(default_factory=PIDState)
+
     def get_historical_curve(self) -> HistoricalResponseCurve:
         """Deserialize historical curve from dict."""
         if self.historical_curve_data:
@@ -2852,7 +2855,9 @@ class ThompsonAIMDState:
             # Vegas-Thompson interaction
             "last_vegas_multiplier": self.last_vegas_multiplier,
             # F-R6-1 FIX: Persist gossip refresh cooldown so it survives restarts
-            "last_gossip_refresh": self.last_gossip_refresh
+            "last_gossip_refresh": self.last_gossip_refresh,
+            # PID balance controller state
+            "pid_state": self.pid.to_dict()
         }
 
     @classmethod
@@ -2917,6 +2922,9 @@ class ThompsonAIMDState:
         state.last_vegas_multiplier = d.get("last_vegas_multiplier", 1.0)
         # F-R6-1 FIX: Restore gossip refresh cooldown from persisted state
         state.last_gossip_refresh = d.get("last_gossip_refresh", 0)
+        # PID balance controller state
+        pid_data = d.get("pid_state", {})
+        state.pid = PIDState.from_dict(pid_data) if pid_data else PIDState()
 
         # Load legacy fields from main table if provided
         if legacy_state:
