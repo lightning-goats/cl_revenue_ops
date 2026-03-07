@@ -119,3 +119,51 @@ class TestFailureClassification:
     def test_empty_error_is_other(self):
         from modules.rebalancer import JobManager
         assert JobManager._classify_sling_error("") == "other"
+
+
+# =============================================================================
+# Task 4: Graduated fee escalation based on failure history
+# =============================================================================
+
+class TestGraduatedFeeEscalation:
+    """Verify fee escalation based on failure history."""
+
+    def test_no_failures_uses_ev_derived_ppm(self):
+        """First attempt should use the EV-derived maxppm unchanged."""
+        from modules.rebalancer import EVRebalancer
+        result = EVRebalancer._apply_fee_escalation(
+            ev_max_fee_ppm=100, fail_count=0, last_attempted_ppm=0
+        )
+        assert result == 100
+
+    def test_escalates_above_last_failure(self):
+        """After failing at 50ppm, next attempt should try 75ppm."""
+        from modules.rebalancer import EVRebalancer
+        result = EVRebalancer._apply_fee_escalation(
+            ev_max_fee_ppm=200, fail_count=1, last_attempted_ppm=50
+        )
+        assert result == 75  # 50 * 1.5
+
+    def test_escalation_capped_at_ev_max(self):
+        """Escalation should never exceed the EV-derived ceiling."""
+        from modules.rebalancer import EVRebalancer
+        result = EVRebalancer._apply_fee_escalation(
+            ev_max_fee_ppm=80, fail_count=3, last_attempted_ppm=70
+        )
+        assert result == 80  # 70 * 1.5 = 105, but capped at 80
+
+    def test_escalation_skipped_when_last_ppm_zero(self):
+        """If no previous ppm recorded, use EV-derived."""
+        from modules.rebalancer import EVRebalancer
+        result = EVRebalancer._apply_fee_escalation(
+            ev_max_fee_ppm=100, fail_count=5, last_attempted_ppm=0
+        )
+        assert result == 100
+
+    def test_escalation_skipped_when_last_ppm_above_ev(self):
+        """If last attempt was already at or above EV max, no escalation."""
+        from modules.rebalancer import EVRebalancer
+        result = EVRebalancer._apply_fee_escalation(
+            ev_max_fee_ppm=100, fail_count=2, last_attempted_ppm=120
+        )
+        assert result == 100

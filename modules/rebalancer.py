@@ -2019,6 +2019,20 @@ class EVRebalancer:
     def get_last_decision_summary(self) -> Dict[str, Any]:
         return dict(self._last_decision_summary)
 
+    @staticmethod
+    def _apply_fee_escalation(ev_max_fee_ppm: int, fail_count: int, last_attempted_ppm: int) -> int:
+        """
+        Escalate fee budget based on failure history.
+
+        If previous attempts failed at a lower fee, start above that fee
+        (1.5x multiplier). Capped at the EV-derived maximum.
+        """
+        if fail_count == 0 or last_attempted_ppm <= 0:
+            return ev_max_fee_ppm
+        if last_attempted_ppm >= ev_max_fee_ppm:
+            return ev_max_fee_ppm
+        return min(int(last_attempted_ppm * 1.5), ev_max_fee_ppm)
+
     def _parse_msat(self, v: Any) -> int:
         """Delegate to shared parse_msat in utils.py."""
         return _shared_parse_msat(v)
@@ -3028,9 +3042,20 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         max_budget_msat = capped_budget_msat
                         max_budget_sats = max(1, (max_budget_msat + 999) // 1000)
             
-        if max_fee_ppm <= 0: 
+        if max_fee_ppm <= 0:
             return None
-        
+
+        # Graduated fee escalation: if previous attempts failed at lower fees,
+        # start above the last failure point (capped at EV-derived max).
+        fail_count, _ = self.database.get_failure_count(dest_channel)
+        if fail_count > 0:
+            meta = self.database.get_failure_metadata(dest_channel)
+            max_fee_ppm = self._apply_fee_escalation(
+                ev_max_fee_ppm=max_fee_ppm,
+                fail_count=fail_count,
+                last_attempted_ppm=meta["last_attempted_ppm"],
+            )
+
         dest_turnover_rate = self._calculate_turnover_rate(dest_channel, capacity)
         cooldown_days = self.config.rebalance_cooldown_hours / 24.0
 
