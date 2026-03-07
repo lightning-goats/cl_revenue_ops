@@ -4818,7 +4818,10 @@ class Database:
             return (row["failure_count"], row["last_failure_time"])
         return (0, 0)
     
-    def increment_failure_count(self, channel_id: str) -> int:
+    def increment_failure_count(self, channel_id: str,
+                                attempted_ppm: int = 0,
+                                attempted_amount: int = 0,
+                                error_type: str = "") -> int:
         """
         Increment the failure count for a channel and update last failure time.
 
@@ -4827,6 +4830,9 @@ class Database:
 
         Args:
             channel_id: Channel that failed
+            attempted_ppm: Fee PPM used in the failed attempt
+            attempted_amount: Amount in msat of the failed attempt
+            error_type: Classification of the failure (e.g. "no_route", "timeout")
 
         Returns:
             New failure count
@@ -4836,19 +4842,24 @@ class Database:
 
         # Use RETURNING for atomic upsert+read (SQLite 3.35+)
         row = conn.execute("""
-            INSERT INTO channel_failures (channel_id, failure_count, last_failure_time)
-            VALUES (?, 1, ?)
+            INSERT INTO channel_failures (channel_id, failure_count, last_failure_time,
+                                          last_attempted_ppm, last_attempted_amount, last_error_type)
+            VALUES (?, 1, ?, ?, ?, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
                 failure_count = failure_count + 1,
-                last_failure_time = ?
+                last_failure_time = ?,
+                last_attempted_ppm = ?,
+                last_attempted_amount = ?,
+                last_error_type = ?
             RETURNING failure_count
-        """, (channel_id, now, now)).fetchone()
+        """, (channel_id, now, attempted_ppm, attempted_amount, error_type,
+              now, attempted_ppm, attempted_amount, error_type)).fetchone()
         return row[0] if row else 1
     
     def reset_failure_count(self, channel_id: str) -> None:
         """
         Reset the failure count for a channel (e.g., after successful rebalance).
-        
+
         Args:
             channel_id: Channel to reset
         """
@@ -4857,7 +4868,30 @@ class Database:
             "DELETE FROM channel_failures WHERE channel_id = ?",
             (channel_id,)
         )
-    
+
+    def get_failure_metadata(self, channel_id: str) -> dict:
+        """Get failure tracking metadata for a channel.
+
+        Args:
+            channel_id: Channel to query
+
+        Returns:
+            Dict with last_attempted_ppm, last_attempted_amount, last_error_type
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT last_attempted_ppm, last_attempted_amount, last_error_type "
+            "FROM channel_failures WHERE channel_id = ?",
+            (channel_id,)
+        ).fetchone()
+        if row:
+            return {
+                "last_attempted_ppm": row["last_attempted_ppm"],
+                "last_attempted_amount": row["last_attempted_amount"],
+                "last_error_type": row["last_error_type"],
+            }
+        return {"last_attempted_ppm": 0, "last_attempted_amount": 0, "last_error_type": ""}
+
     def get_all_failure_counts(self) -> Dict[str, Tuple[int, int]]:
         """
         Get failure counts for all channels with recorded failures.
