@@ -257,6 +257,18 @@ class JobManager:
         self._last_exclusion_sync: float = 0
         self._policy_manager_ref = None
 
+    @staticmethod
+    def _classify_sling_error(error_msg: str) -> str:
+        """Classify a sling error message for failure-informed routing."""
+        msg = error_msg.lower()
+        if any(s in msg for s in ("no route", "unknown_next_peer", "no path", "no channels")):
+            return "no_route"
+        if any(s in msg for s in ("timeout", "timed out", "deadline")):
+            return "timeout"
+        if any(s in msg for s in ("exceeded", "budget", "overpaid")):
+            return "budget_exceeded"
+        return "other"
+
     def get_active_rebalancing_peers(self) -> List[str]:
         """Get deduplicated peer IDs from all active jobs (source + dest peers)."""
         peers = set()
@@ -1152,8 +1164,14 @@ class JobManager:
             'failed',
             error_message=error_msg
         )
-        self.database.increment_failure_count(job.scid_normalized)
-        
+        error_type = self._classify_sling_error(error_msg)
+        self.database.increment_failure_count(
+            job.scid_normalized,
+            attempted_ppm=job.max_fee_ppm,
+            attempted_amount=job.candidate.amount_sats if job.candidate else 0,
+            error_type=error_type,
+        )
+
         # Track source failure for reliability scoring
         if job.candidate and job.candidate.source_candidates:
             # Penalize the primary source

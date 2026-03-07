@@ -87,3 +87,35 @@ class TestFailureMetadataPersistence:
         assert count == 1
         meta = db.get_failure_metadata("100x1x0")
         assert meta["last_attempted_ppm"] == 0
+
+
+# =============================================================================
+# Task 3: Classify sling failure messages
+# =============================================================================
+
+class TestFailureClassification:
+    """Verify sling error messages are classified correctly."""
+
+    def test_no_route_classified(self):
+        from modules.rebalancer import JobManager
+        assert JobManager._classify_sling_error("no route found") == "no_route"
+
+    def test_no_route_variant(self):
+        from modules.rebalancer import JobManager
+        assert JobManager._classify_sling_error("WIRE_UNKNOWN_NEXT_PEER") == "no_route"
+
+    def test_timeout_classified(self):
+        from modules.rebalancer import JobManager
+        assert JobManager._classify_sling_error("timeout waiting for response") == "timeout"
+
+    def test_budget_exceeded_classified(self):
+        from modules.rebalancer import JobManager
+        assert JobManager._classify_sling_error("exceeded fee budget") == "budget_exceeded"
+
+    def test_unknown_error_is_other(self):
+        from modules.rebalancer import JobManager
+        assert JobManager._classify_sling_error("something weird happened") == "other"
+
+    def test_empty_error_is_other(self):
+        from modules.rebalancer import JobManager
+        assert JobManager._classify_sling_error("") == "other"
