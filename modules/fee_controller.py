@@ -5756,6 +5756,7 @@ class HillClimbingFeeController:
         target_found = False
         is_cold_start = False  # Initialize here; may be set True in Hill Climbing branch
         heuristic_modifiers = HeuristicModifiers()  # Initialize early; populated in Hill Climbing branch
+        volatility_reset = False  # Default; set True only inside Hill Climbing/Thompson volatility paths
 
         # Priority 1: Congestion (Emergency High Fee)
         if is_congested:
@@ -6579,7 +6580,8 @@ class HillClimbingFeeController:
         # FALLBACK: Hill Climbing (Legacy Algorithm)
         # =====================================================================
         # Used when ENABLE_THOMPSON_AIMD is False
-        elif not target_found:
+        # Gated behind ENABLE_SIMPLIFIED_FEE_PATH — doubly unreachable when both flags are True
+        elif not target_found and not self.ENABLE_SIMPLIFIED_FEE_PATH:
             # HILL CLIMBING DECISION (Rate-Based)
             rate_change = current_revenue_rate - hc_state.last_revenue_rate
             last_direction = hc_state.trend_direction
