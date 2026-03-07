@@ -3,43 +3,55 @@ Fee Controller module for cl-revenue-ops
 
 MODULE 2: Revenue-Maximizing Fee Controller (Dynamic Pricing)
 
-This module implements a Thompson Sampling + AIMD fee optimization system
-for dynamically adjusting channel fees to maximize revenue.
+This module implements a three-concern fee optimization architecture:
 
-Primary Algorithm: Gaussian Thompson Sampling
-- Bayesian posterior over polynomial fee-revenue response curve
-- Contextual sampling (time-aware, pheromone-modulated)
-- Automatic exploration/exploitation balance via posterior uncertainty
+  Final_Fee = clamp(
+      DTS_market_fee × PID_multiplier,
+      max(min_fee, rebalance_floor, vegas_floor),
+      max_fee
+  ) × hive_defense_override
 
-Defense Layer: AIMD (Additive Increase / Multiplicative Decrease)
-- Rapid response to routing failures (multiplicative decrease 0.85x)
-- Gradual recovery on sustained success (+0.02 modifier per streak)
-- Coordinates with Thompson to avoid conflicting during exploration
+Concern 1 — Market Pricing: Discounted Gaussian Thompson Sampling (DTS)
+- Bayesian posterior over fee-revenue observations
+- Discount factor (gamma=0.95) decays posterior precision each cycle,
+  giving ~6.5h half-life to naturally forget stale data
+- Replaces polynomial regression, contextual posteriors, elasticity
+  tracking, and historical response curves
+
+Concern 2 — Balance Management: PID Controller
+- Produces a 0.1x–10.0x multiplier from channel outbound ratio
+- P-term: reacts to current imbalance (replaces scarcity pricing)
+- I-term: reacts to sustained imbalance (replaces saturation drain ceiling)
+- D-term: reacts to sudden changes (replaces AIMD defense)
+- EWMA-smoothed error (alpha=0.3) handles sparse Lightning feedback
+- Capacity-scaled gains: larger channels get less aggressive PID
+- Dynamic target ratio: source=0.7, sink=0.3, balanced=0.5
+
+Concern 3 — Hard Safety: Floor/ceiling clamps
+- Rebalance cost floor: SOURCE channels must cover rebalancing costs
+- Vegas Reflex floor: mempool spike → raise fee floor
+- Global bounds: min_fee_ppm, max_fee_ppm from configuration
+- These are economic constraints the PID has no signal for
 
 The Alpha Sequence (Fee Priority Chain):
 1. HIVE Safety: Fleet members always get configured hive_fee_ppm (usually 0)
 2. Congestion: HTLC slots saturated → ceiling fee
 3. Zero-Fee Probe: Defibrillator for dead channels → 0 PPM
-4. Thompson+AIMD: Primary fee optimization algorithm
+4. DTS+PID: Primary fee optimization (DTS samples market fee, PID adjusts for balance)
 
-Post-Thompson Modifiers (applied after sampling):
-- Scarcity Pricing: Linear multiplier (1.0x-3.0x) for low local balance
-- Vegas Reflex: Mempool spike defense (raises fee floor)
+Post-DTS+PID:
 - Hive Coordination: Fleet-aware fee blending
 - Competition Avoidance: Differentiate from fleet members
+- Gossip Hysteresis: Suppress sub-threshold changes
 
-Legacy Fallback: Hill Climbing (Perturb & Observe)
-- Used only when ENABLE_THOMPSON_AIMD is False
+Legacy Path (ENABLE_DTS_PID=False):
+- Thompson+AIMD with scarcity pricing, saturation floors/ceilings, cold-start
+- Hill Climbing fallback when ENABLE_THOMPSON_AIMD is False
 
 Revenue Calculation:
-- Revenue = Volume * Fee
+- Revenue = Volume × Fee
 - Revenue rate tracked over observation windows with EMA smoothing
 - Demand-adjusted via Kalman flow estimation
-
-Constraints:
-- Floor: max(chain cost, balance floor, rebalance cost floor, saturation floor, Vegas floor)
-- Ceiling: min(max_fee_ppm, flow-adjusted ceiling, profitability ceiling)
-- Bounds multipliers applied to floor/ceiling, not fee directly
 """
 
 import time
@@ -3241,25 +3253,34 @@ class FeeAdjustment:
 
 class HillClimbingFeeController:
     """
-    Thompson Sampling + AIMD fee controller for revenue maximization.
+    DTS+PID fee controller for revenue maximization.
 
-    Primary: Gaussian Thompson Sampling with polynomial posterior samples
-    fees from a Bayesian belief about the fee-revenue curve. Defense: AIMD
-    provides rapid response to routing failures via multiplicative decrease.
-    Legacy Hill Climbing (Perturb & Observe) serves as fallback when
-    ENABLE_THOMPSON_AIMD is False.
+    Architecture: Three independent concerns combined as
+    Final_Fee = clamp(DTS_fee × PID_multiplier, hard_floor, hard_ceiling)
+
+    - DTS (Discounted Thompson Sampling): Bayesian market fee discovery with
+      posterior forgetting (gamma=0.95). Samples from Normal posterior over
+      fee-revenue observations.
+    - PID Controller: Balance management multiplier (0.1x–10.0x) from channel
+      outbound ratio. Replaces scarcity pricing, AIMD defense, saturation
+      floor/drain, and balance-based floor with one unified mechanism.
+    - Hard Safety: Economic floors (rebalance cost, Vegas Reflex, min_fee)
+      and ceiling (max_fee) that the PID has no signal for.
 
     Key Principles:
-    1. Revenue Focus: Maximize Volume * Fee, not just volume
-    2. Bayesian: Maintains posterior over fee-revenue relationship
-    3. Bounded: Respects floor/ceiling constraints with multipliers
-    4. Liquidity-aware: Uses bucket multipliers as floor weights
+    1. Revenue Focus: Maximize Volume × Fee, not just volume
+    2. Bayesian: DTS maintains posterior over fee-revenue relationship
+    3. Feedback Control: PID manages balance via closed-loop multiplier
+    4. Separation of Concerns: Market pricing, balance mgmt, and safety are independent
     5. clboss override: Unmanages from clboss before setting fees
     6. Fleet-aware: Coordinates with cl-hive for competition avoidance
 
+    Legacy paths (ENABLE_DTS_PID=False):
+    - Thompson+AIMD with scarcity, saturation floors/ceilings, cold-start
+    - Hill Climbing fallback (ENABLE_THOMPSON_AIMD=False)
+
     Known Limitations (documented, not bugs):
     - I-12: No per-channel fee change rate limit — timer interval provides implicit limiting
-    - I-13: Slow AIMD recovery after demand drops — deliberate to prevent oscillation
     - I-14: RLock held across DB I/O in adjust_fees — architectural constraint, single-threaded cycle
     - I-15: Dual HC/Thompson state objects — legacy compatibility for HC fallback path
     - I-16: Non-atomic state save (Thompson + HC states) — single-threaded cycle mitigates
@@ -3446,24 +3467,20 @@ class HillClimbingFeeController:
     COMPETITION_DEFER_PCT = 0.05      # Stay within 5% of primary's fee when secondary
 
     # ==========================================================================
-    # Thompson Sampling + AIMD Fee Optimization (v1.7.0)
+    # Fee Algorithm Feature Flags
     # ==========================================================================
-    # Primary algorithm: Gaussian Thompson Sampling with continuous posteriors
-    # Defense layer: AIMD for rapid response to routing failures
+    # Evolution: Hill Climbing → Thompson+AIMD → Simplified → DTS+PID
     #
-    # Thompson Sampling is now the PRIMARY algorithm (not secondary to Hill Climbing)
-    # AIMD provides quick defensive adjustments when market conditions change
-    ENABLE_THOMPSON_AIMD = True       # Master switch for Thompson+AIMD (replaces Hill Climbing)
-
-    # Phase 1 simplification: skip unvalidated post-Thompson modifiers
-    # (elasticity, profitability weighting, cold-start, competition avoidance,
-    #  stigmergic modulation, fee anchors, historical response curve)
-    # Set False to restore legacy 13-modifier path for rollback.
+    # Current architecture (all three True):
+    #   DTS (Discounted Thompson) samples market fee from Bayesian posterior.
+    #   PID controller produces balance multiplier (0.1x–10.0x).
+    #   Final fee = clamp(DTS × PID, hard_floor, hard_ceiling).
+    #
+    # Set ENABLE_DTS_PID=False to fall back to simplified Thompson+AIMD.
+    # Set ENABLE_SIMPLIFIED_FEE_PATH=False to restore full 13-modifier path.
+    # Set ENABLE_THOMPSON_AIMD=False to fall back to Hill Climbing.
+    ENABLE_THOMPSON_AIMD = True
     ENABLE_SIMPLIFIED_FEE_PATH = True
-
-    # DTS+PID Architecture: Discounted Thompson + PID balance controller
-    # When True: DTS discount applied, PID multiplier replaces AIMD/scarcity/saturation
-    # When False: existing simplified Thompson+AIMD path runs
     ENABLE_DTS_PID = True
 
     THOMPSON_COLD_START_BONUS = 1.5   # Extra exploration for channels with few observations
@@ -5528,23 +5545,20 @@ class HillClimbingFeeController:
                            chain_costs: Optional[Dict[str, int]] = None,
                            cfg: Optional['ConfigSnapshot'] = None) -> Optional[FeeAdjustment]:
         """
-        Adjust fee for a single channel using Hill Climbing optimization.
+        Adjust fee for a single channel.
 
-        UPDATED: Rate-Based Feedback with Wiggle Dampening
+        DTS+PID path (default):
+        1. Update Thompson posterior with observed revenue rate
+        2. Apply DTS discount (gamma=0.95) to forget stale data
+        3. Sample market fee from posterior
+        4. Calculate PID multiplier from outbound ratio vs target
+        5. Final fee = clamp(DTS_fee × PID_mult, hard_floor, hard_ceiling)
 
-        Key Changes from Previous Version:
-        1. Rate-Based Feedback: Uses volume since last fee change (not 7-day average)
-           to measure revenue per hour, eliminating lag in the feedback loop.
-        2. Wiggle Dampening: When the algorithm reverses direction (overshot peak),
-           the step size is decayed by DAMPENING_FACTOR to converge on the optimum.
+        Hard floors = max(chain_cost, vegas_floor, rebalance_cost_floor, min_fee)
+        Hard ceiling = max_fee (before legacy saturation drain)
 
-        Hill Climbing (Perturb & Observe) Algorithm:
-        1. Get volume since last fee change via get_volume_since()
-        2. Calculate revenue RATE (sats/hour) = (volume * fee) / hours_elapsed
-        3. Compare current revenue rate to last period's rate
-        4. If rate increased: continue in same direction
-        5. If rate decreased: reverse direction AND reduce step (dampening)
-        6. Apply step change in calculated direction
+        Legacy path (ENABLE_DTS_PID=False):
+        - Thompson+AIMD with scarcity, saturation floors/ceilings, cold-start
 
         Args:
             channel_id: Channel to adjust
