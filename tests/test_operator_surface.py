@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import MagicMock
+from pathlib import Path
 
 from modules.config import Config
 from tests.plugin_test_utils import load_plugin_module
@@ -192,3 +193,15 @@ def test_revenue_policy_list_remains_available_for_transition_diagnostics():
     result = mod.revenue_policy(mod.plugin, "list")
 
     assert result["count"] == 1
+
+
+def test_readme_examples_no_longer_advertise_internal_knob_tuning():
+    readme = Path("README.md").read_text()
+
+    assert "paused" in readme
+    assert "daily_budget_sats" in readme
+    assert "min_fee_ppm" in readme
+    assert "max_fee_ppm" in readme
+    assert "decision explainability" in readme
+    assert "revenue-config set enable_vegas_reflex false" not in readme
+    assert "lightning-cli revenue-policy set" not in readme
