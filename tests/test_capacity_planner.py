@@ -62,11 +62,10 @@ class TestRebalanceDifficulty:
     def test_loser_escalated_by_high_difficulty(self):
         """Stagnant channel + difficulty > 0.7 → escalated to FIRE SALE."""
         plugin = MagicMock()
-        config = MagicMock()
         prof_analyzer = MagicMock()
         flow_analyzer = MagicMock()
 
-        planner = CapacityPlanner(plugin, config, prof_analyzer, flow_analyzer)
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
 
         scid = "111x222x0"
         prof = _mock_profitability(
@@ -107,11 +106,10 @@ class TestRebalanceDifficulty:
     def test_winner_penalized_by_difficulty(self):
         """Low success rate penalizes winner ROI score."""
         plugin = MagicMock()
-        config = MagicMock()
         prof_analyzer = MagicMock()
         flow_analyzer = MagicMock()
 
-        planner = CapacityPlanner(plugin, config, prof_analyzer, flow_analyzer)
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
 
         scid = "222x333x0"
         prof = _mock_profitability(
@@ -152,3 +150,11 @@ class TestRebalanceDifficulty:
         # ROI should be 40 - 10 = 30
         assert winners[0]["roi"] == 30.0
         assert winners[0]["rebal_difficulty"] == 0.7  # 1 - 0.3
+
+
+def test_no_config_parameter():
+    """CapacityPlanner should not accept a config parameter."""
+    import inspect
+    sig = inspect.signature(CapacityPlanner.__init__)
+    param_names = list(sig.parameters.keys())
+    assert "config" not in param_names

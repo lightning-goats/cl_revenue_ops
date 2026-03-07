@@ -197,10 +197,9 @@ class TestCapacityPlannerFireSale:
     def _make_planner(self):
         from modules.capacity_planner import CapacityPlanner
         plugin = MagicMock()
-        config = MagicMock()
         profitability = MagicMock()
         flow = MagicMock()
-        return CapacityPlanner(plugin, config, profitability, flow), profitability, flow
+        return CapacityPlanner(plugin, profitability, flow), profitability, flow
 
     def _make_prof(self, *, classification, days_open, roi_percent, marginal_roi_percent,
                    capacity_sats=1_000_000, peer_id="peer1"):

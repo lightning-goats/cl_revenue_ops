@@ -1343,7 +1343,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Initialize analysis modules with profitability analyzer and hive bridge
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
-    capacity_planner = CapacityPlanner(safe_plugin, config, profitability_analyzer, flow_analyzer)
+    capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager)
     fee_controller = PIDFeeController(safe_plugin, config, database, clboss_manager, policy_manager, profitability_analyzer, hive_bridge)
     rebalancer = EVRebalancer(
         safe_plugin, config, database, clboss_manager, policy_manager,

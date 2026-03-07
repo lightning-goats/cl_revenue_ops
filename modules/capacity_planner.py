@@ -25,11 +25,11 @@ class CapacityPlanner:
     Identifies capital redeployment opportunities to maximize yield.
     """
 
-    def __init__(self, plugin: Plugin, config, profitability_analyzer, flow_analyzer):
+    def __init__(self, plugin: Plugin, profitability_analyzer, flow_analyzer, policy_manager=None):
         self.plugin = plugin
-        self.config = config
         self.profitability = profitability_analyzer
         self.flow = flow_analyzer
+        self.policy_manager = policy_manager
 
     def generate_report(self) -> Dict[str, Any]:
         """
@@ -87,15 +87,16 @@ class CapacityPlanner:
     def _get_peer_splice_map(self) -> Dict[str, bool]:
         """Identify which peers support splicing (bits 62/63 for option_splice).
 
-        CP-1: Uses deprecated listpeers RPC (still functional in CLN v24+).
-        Migration to listpeerchannels is tracked as a separate effort.
+        Note: listpeers is the correct RPC for peer-level features.
+        The channels field moved to listpeerchannels in CLN v24+, but
+        peer connection info (including features) remains in listpeers.
         """
         splice_map = {}
         try:
             peers = self.plugin.rpc.listpeers().get("peers", [])
             for peer in peers:
                 peer_id = peer.get("id")
-                # CP-2: Guard against None peer_id from malformed listpeers responses
+                # Guard against None peer_id from malformed listpeers responses
                 if not peer_id:
                     continue
                 features = peer.get("features", "")
