@@ -3435,6 +3435,13 @@ class HillClimbingFeeController:
     #  stigmergic modulation, fee anchors, historical response curve)
     # Set False to restore legacy 13-modifier path for rollback.
     ENABLE_SIMPLIFIED_FEE_PATH = True
+
+    # DTS+PID Architecture: Discounted Thompson + PID balance controller
+    # When True: DTS discount applied, PID multiplier replaces AIMD/scarcity/saturation
+    # When False: existing simplified Thompson+AIMD path runs
+    # Default False for shadow-mode validation before live deployment.
+    ENABLE_DTS_PID = False
+
     THOMPSON_COLD_START_BONUS = 1.5   # Extra exploration for channels with few observations
     THOMPSON_CONTEXT_WEIGHT = 0.7     # Weight for contextual vs global posterior
     AIMD_DEFENSE_CEILING_BOOST = 0.1  # Allow 10% above ceiling when in defense mode
@@ -6472,6 +6479,12 @@ class HillClimbingFeeController:
             )
 
             # =====================================================================
+            # DTS: Apply discount factor before sampling (posterior forgetting)
+            # =====================================================================
+            if self.ENABLE_DTS_PID:
+                ts_state.thompson.apply_dts_discount(gamma=0.95)
+
+            # =====================================================================
             # VEGAS-THOMPSON INTERACTION
             # =====================================================================
             # When Vegas raises floor significantly, boost Thompson's uncertainty
@@ -6622,199 +6635,240 @@ class HillClimbingFeeController:
                 if differentiation_offset != 0:
                     thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
 
-            # =====================================================================
-            # WEIGHTED AIMD SUCCESS METRIC + AIMD-THOMPSON COORDINATION
-            # =====================================================================
-            # Compute continuous success score (not binary) and detect if Thompson
-            # is exploring so AIMD doesn't penalize exploratory fee experiments.
-            forward_rate = forward_count / max(hours_elapsed, 0.1)
-            # AIMD success score normalized against Kalman expected demand.
-            # The 10x multiplier is deliberate normalization (I-11): expected_demand is in
-            # forwards/hour from Kalman, but forward_rate spans the observation window.
-            # Dividing by 10x expected_demand normalizes score to ~[0,1] for typical windows.
-            success_score = forward_rate / max(expected_demand * 10.0, 0.1)
-            is_exploring = abs(thompson_fee - ts_state.thompson.posterior_mean) > ts_state.thompson.posterior_std * 0.5
-
-            # Topology depletion: suppress AIMD failure when downstream is depleted
-            # Uses a separate flag to avoid conflating exploration with depletion
-            topology_suppressed = False
-            if not is_exploring and success_score < 0.3:
-                capacity = channel_info.get("capacity", 1)
+            if self.ENABLE_DTS_PID:
+                # =============================================================
+                # DTS+PID PATH: PID multiplier replaces AIMD/scarcity/cold-start
+                # =============================================================
                 try:
-                    if self._is_topology_depleted(channel_id, capacity, cfg):
-                        topology_suppressed = True
-                except Exception as e:
-                    self.plugin.log(f"Topology depletion check failed: {e}", level='debug')
+                    ch_state_data = self.database.get_channel_state(channel_id)
+                    flow_state_str = (ch_state_data or {}).get("state", "balanced")
+                except Exception:
+                    flow_state_str = "balanced"
 
-            ts_state.aimd.record_outcome(
-                success_score=success_score,
-                is_exploring=is_exploring or topology_suppressed
-            )
+                capacity = channel_info.get("capacity", 2_000_000)
+                pid_multiplier = ts_state.pid.calculate_multiplier(
+                    current_outbound_ratio=outbound_ratio,
+                    capacity_sats=capacity,
+                    flow_state=flow_state_str,
+                )
+                new_fee_ppm = int(thompson_fee * pid_multiplier)
+                new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
 
-            # =====================================================================
-            # P2 PROFITABILITY-WEIGHTED THOMPSON SAMPLING
-            # =====================================================================
-            # Adjust Thompson fee based on channel profitability:
-            # - Profitable channels: Allow more aggressive exploration (wider range)
-            # - Underperforming channels: Constrain to proven ranges
-            # - Zombie/Fire Sale: Force low fees regardless of Thompson
-            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                profitability_adjustment = 0
-                if self.profitability:
+                decision_reason = (
+                    f"dts_pid (dts={thompson_fee}, pid={pid_multiplier:.2f}, "
+                    f"flow={flow_state_str})"
+                )
+
+                # Update volume tracking
+                ts_state.last_volume_sats = volume_since_sats
+
+                # Skip cold-start ceiling (not used in DTS+PID)
+                effective_ceiling = ceiling_ppm
+                base_new_fee = new_fee_ppm
+
+                # PID handles balance management; no cold-start needed
+                is_cold_start = False
+
+                # Mark target found
+                target_found = True
+            else:
+                # =============================================================
+                # LEGACY PATH: AIMD + scarcity + cold-start (unchanged)
+                # =============================================================
+
+                # =====================================================================
+                # WEIGHTED AIMD SUCCESS METRIC + AIMD-THOMPSON COORDINATION
+                # =====================================================================
+                # Compute continuous success score (not binary) and detect if Thompson
+                # is exploring so AIMD doesn't penalize exploratory fee experiments.
+                forward_rate = forward_count / max(hours_elapsed, 0.1)
+                # AIMD success score normalized against Kalman expected demand.
+                # The 10x multiplier is deliberate normalization (I-11): expected_demand is in
+                # forwards/hour from Kalman, but forward_rate spans the observation window.
+                # Dividing by 10x expected_demand normalizes score to ~[0,1] for typical windows.
+                success_score = forward_rate / max(expected_demand * 10.0, 0.1)
+                is_exploring = abs(thompson_fee - ts_state.thompson.posterior_mean) > ts_state.thompson.posterior_std * 0.5
+
+                # Topology depletion: suppress AIMD failure when downstream is depleted
+                # Uses a separate flag to avoid conflating exploration with depletion
+                topology_suppressed = False
+                if not is_exploring and success_score < 0.3:
+                    capacity = channel_info.get("capacity", 1)
                     try:
-                        from .profitability_analyzer import ProfitabilityClass
-                        prof_data = self.profitability.get_profitability(channel_id)
-                        if prof_data:
-                            # Calculate profitability weight
-                            if prof_data.classification == ProfitabilityClass.PROFITABLE:
-                                # Highly profitable - allow upward exploration
-                                if prof_data.roi_percent > 20:
-                                    # Very profitable - bias toward higher fees
-                                    profitability_adjustment = int(thompson_fee * 0.1)  # +10%
+                        if self._is_topology_depleted(channel_id, capacity, cfg):
+                            topology_suppressed = True
+                    except Exception as e:
+                        self.plugin.log(f"Topology depletion check failed: {e}", level='debug')
+
+                ts_state.aimd.record_outcome(
+                    success_score=success_score,
+                    is_exploring=is_exploring or topology_suppressed
+                )
+
+                # =====================================================================
+                # P2 PROFITABILITY-WEIGHTED THOMPSON SAMPLING
+                # =====================================================================
+                # Adjust Thompson fee based on channel profitability:
+                # - Profitable channels: Allow more aggressive exploration (wider range)
+                # - Underperforming channels: Constrain to proven ranges
+                # - Zombie/Fire Sale: Force low fees regardless of Thompson
+                if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                    profitability_adjustment = 0
+                    if self.profitability:
+                        try:
+                            from .profitability_analyzer import ProfitabilityClass
+                            prof_data = self.profitability.get_profitability(channel_id)
+                            if prof_data:
+                                # Calculate profitability weight
+                                if prof_data.classification == ProfitabilityClass.PROFITABLE:
+                                    # Highly profitable - allow upward exploration
+                                    if prof_data.roi_percent > 20:
+                                        # Very profitable - bias toward higher fees
+                                        profitability_adjustment = int(thompson_fee * 0.1)  # +10%
+                                        self.plugin.log(
+                                            f"P2_PROFIT: {channel_id[:12]}... profitable channel "
+                                            f"(ROI={prof_data.roi_percent:.1f}%), biasing up +{profitability_adjustment}ppm",
+                                            level='debug'
+                                        )
+                                elif prof_data.classification == ProfitabilityClass.MARGINAL:
+                                    # Marginal - stay conservative with Thompson
+                                    pass  # No adjustment
+                                elif prof_data.classification == ProfitabilityClass.UNDERWATER:
+                                    # Underwater - bias toward lower fees to increase flow
+                                    if prof_data.roi_percent < -20:
+                                        profitability_adjustment = -int(thompson_fee * 0.15)  # -15%
+                                        self.plugin.log(
+                                            f"P2_PROFIT: {channel_id[:12]}... underwater channel "
+                                            f"(ROI={prof_data.roi_percent:.1f}%), biasing down {abs(profitability_adjustment)}ppm",
+                                            level='debug'
+                                        )
+                                elif prof_data.classification == ProfitabilityClass.ZOMBIE:
+                                    # Zombie - aggressive low pricing
+                                    profitability_adjustment = floor_ppm - thompson_fee  # Force to floor
                                     self.plugin.log(
-                                        f"P2_PROFIT: {channel_id[:12]}... profitable channel "
-                                        f"(ROI={prof_data.roi_percent:.1f}%), biasing up +{profitability_adjustment}ppm",
-                                        level='debug'
+                                        f"P2_PROFIT: {channel_id[:12]}... zombie channel, "
+                                        f"forcing to floor ({floor_ppm}ppm)",
+                                        level='info'
                                     )
-                            elif prof_data.classification == ProfitabilityClass.MARGINAL:
-                                # Marginal - stay conservative with Thompson
-                                pass  # No adjustment
-                            elif prof_data.classification == ProfitabilityClass.UNDERWATER:
-                                # Underwater - bias toward lower fees to increase flow
-                                if prof_data.roi_percent < -20:
-                                    profitability_adjustment = -int(thompson_fee * 0.15)  # -15%
-                                    self.plugin.log(
-                                        f"P2_PROFIT: {channel_id[:12]}... underwater channel "
-                                        f"(ROI={prof_data.roi_percent:.1f}%), biasing down {abs(profitability_adjustment)}ppm",
-                                        level='debug'
-                                    )
-                            elif prof_data.classification == ProfitabilityClass.ZOMBIE:
-                                # Zombie - aggressive low pricing
-                                profitability_adjustment = floor_ppm - thompson_fee  # Force to floor
+
+                                # Apply profitability adjustment
+                                thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + profitability_adjustment))
+                        except Exception as e:
+                            self.plugin.log(
+                                f"P2_PROFIT: Failed to get profitability adjustment: {e}",
+                                level='debug'
+                            )
+
+                # =====================================================================
+                # FLEET DEFENSE COORDINATION
+                # =====================================================================
+                # Query hive MyceliumDefenseSystem for fleet-wide threat warnings
+                # This allows coordinated defensive response across all fleet channels
+                fleet_threat_info = None
+                if self.hive_bridge and self.hive_bridge.is_available():
+                    try:
+                        defense_status = self.hive_bridge.query_defense_status(peer_id)
+                        if defense_status:
+                            fleet_threat_info = defense_status.get("peer_threat")
+
+                            # Update AIMD state with fleet threat info
+                            ts_state.aimd.update_fleet_threat(fleet_threat_info)
+
+                            # Log if threat is active
+                            if fleet_threat_info and fleet_threat_info.get("is_threat"):
                                 self.plugin.log(
-                                    f"P2_PROFIT: {channel_id[:12]}... zombie channel, "
-                                    f"forcing to floor ({floor_ppm}ppm)",
+                                    f"FLEET_DEFENSE: {channel_id[:12]}... peer has active {fleet_threat_info.get('threat_type')} "
+                                    f"threat (severity={fleet_threat_info.get('severity', 0):.2f}, "
+                                    f"multiplier={fleet_threat_info.get('defensive_multiplier', 1.0):.2f})",
                                     level='info'
                                 )
-
-                            # Apply profitability adjustment
-                            thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + profitability_adjustment))
                     except Exception as e:
                         self.plugin.log(
-                            f"P2_PROFIT: Failed to get profitability adjustment: {e}",
+                            f"FLEET_DEFENSE: Failed to query defense status: {e}",
                             level='debug'
                         )
+                else:
+                    # Clear any stale fleet threat state when hive unavailable
+                    ts_state.aimd.update_fleet_threat(None)
 
-            # =====================================================================
-            # FLEET DEFENSE COORDINATION
-            # =====================================================================
-            # Query hive MyceliumDefenseSystem for fleet-wide threat warnings
-            # This allows coordinated defensive response across all fleet channels
-            fleet_threat_info = None
-            if self.hive_bridge and self.hive_bridge.is_available():
-                try:
-                    defense_status = self.hive_bridge.query_defense_status(peer_id)
-                    if defense_status:
-                        fleet_threat_info = defense_status.get("peer_threat")
+                # =====================================================================
+                # AIMD DEFENSE LAYER
+                # =====================================================================
+                # Apply AIMD modifier when in defense mode (after failure streak)
+                # Also applies fleet defensive multiplier for threat peers
+                new_fee_ppm = ts_state.aimd.apply_to_fee(thompson_fee, floor_ppm, ceiling_ppm)
 
-                        # Update AIMD state with fleet threat info
-                        ts_state.aimd.update_fleet_threat(fleet_threat_info)
+                # Build decision reason
+                effective_mod = ts_state.aimd.get_effective_modifier()
+                if ts_state.aimd.fleet_threat_active:
+                    decision_reason = (
+                        f"thompson_fleet_defense ({ts_state.aimd.fleet_threat_type}, "
+                        f"sev={ts_state.aimd.fleet_threat_severity:.2f}, "
+                        f"mod={effective_mod:.2f})"
+                    )
+                elif ts_state.aimd.is_active:
+                    decision_reason = f"thompson_aimd_defense (mod={effective_mod:.2f})"
+                else:
+                    decision_reason = f"thompson_sample (ctx={context_key})"
 
-                        # Log if threat is active
-                        if fleet_threat_info and fleet_threat_info.get("is_threat"):
+                # Cold-start mode: channels with very few forwards need lower fees
+                if not self.ENABLE_SIMPLIFIED_FEE_PATH:
+                    is_cold_start = False
+                    total_forwards = state.get("forward_count", 0) if state else 0
+                    if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
+                        if current_fee_ppm > cfg.min_fee_ppm:
+                            is_cold_start = True
+                            # Bias Thompson toward lower fees for cold channels
+                            cold_target = min(new_fee_ppm, floor_ppm + 50)
+                            new_fee_ppm = cold_target
+                            decision_reason = f"thompson_cold_start (fwds={total_forwards})"
                             self.plugin.log(
-                                f"FLEET_DEFENSE: {channel_id[:12]}... peer has active {fleet_threat_info.get('threat_type')} "
-                                f"threat (severity={fleet_threat_info.get('severity', 0):.2f}, "
-                                f"multiplier={fleet_threat_info.get('defensive_multiplier', 1.0):.2f})",
+                                f"THOMPSON COLD-START: {channel_id[:12]}... has {total_forwards} forwards. "
+                                f"Biasing toward floor ({new_fee_ppm} ppm).",
                                 level='info'
                             )
-                except Exception as e:
-                    self.plugin.log(
-                        f"FLEET_DEFENSE: Failed to query defense status: {e}",
-                        level='debug'
-                    )
-            else:
-                # Clear any stale fleet threat state when hive unavailable
-                ts_state.aimd.update_fleet_threat(None)
 
-            # =====================================================================
-            # AIMD DEFENSE LAYER
-            # =====================================================================
-            # Apply AIMD modifier when in defense mode (after failure streak)
-            # Also applies fleet defensive multiplier for threat peers
-            new_fee_ppm = ts_state.aimd.apply_to_fee(thompson_fee, floor_ppm, ceiling_ppm)
+                # Update volume tracking
+                ts_state.last_volume_sats = volume_since_sats
 
-            # Build decision reason
-            effective_mod = ts_state.aimd.get_effective_modifier()
-            if ts_state.aimd.fleet_threat_active:
-                decision_reason = (
-                    f"thompson_fleet_defense ({ts_state.aimd.fleet_threat_type}, "
-                    f"sev={ts_state.aimd.fleet_threat_severity:.2f}, "
-                    f"mod={effective_mod:.2f})"
-                )
-            elif ts_state.aimd.is_active:
-                decision_reason = f"thompson_aimd_defense (mod={effective_mod:.2f})"
-            else:
-                decision_reason = f"thompson_sample (ctx={context_key})"
+                # Phase 7: Scarcity Pricing (preserved)
+                opener = channel_info.get("opener", "local")
+                total_sats_out = state.get("sats_out", 0) if state else 0
+                is_virgin_remote = (opener == "remote" and total_sats_out == 0)
 
-            # Cold-start mode: channels with very few forwards need lower fees
-            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                is_cold_start = False
-                total_forwards = state.get("forward_count", 0) if state else 0
-                if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
-                    if current_fee_ppm > cfg.min_fee_ppm:
-                        is_cold_start = True
-                        # Bias Thompson toward lower fees for cold channels
-                        cold_target = min(new_fee_ppm, floor_ppm + 50)
-                        new_fee_ppm = cold_target
-                        decision_reason = f"thompson_cold_start (fwds={total_forwards})"
+                if cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
+                    if is_cold_start:
+                        # Cold-start channels need low fees to attract traffic.
+                        # Scarcity pricing would push fees up, contradicting cold-start intent.
                         self.plugin.log(
-                            f"THOMPSON COLD-START: {channel_id[:12]}... has {total_forwards} forwards. "
-                            f"Biasing toward floor ({new_fee_ppm} ppm).",
+                            f"SCARCITY_SKIP: {channel_id[:12]}... suppressing scarcity (cold-start active).",
+                            level='info'
+                        )
+                    elif is_virgin_remote:
+                        self.plugin.log(
+                            f"VIRGIN CHANNEL AMNESTY: {channel_id[:12]}... suppressing scarcity.",
+                            level='info'
+                        )
+                    elif not self.ENABLE_BOUNDS_MULTIPLIERS:
+                        # Only apply direct scarcity if floor multiplier wasn't already used
+                        scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
+                        original_fee = new_fee_ppm
+                        new_fee_ppm = int(new_fee_ppm * scarcity_mult)
+                        self.plugin.log(
+                            f"SCARCITY: {channel_id[:12]}... {original_fee}->{new_fee_ppm} ppm "
+                            f"({scarcity_mult:.2f}x)",
                             level='info'
                         )
 
-            # Update volume tracking
-            ts_state.last_volume_sats = volume_since_sats
-
-            # Phase 7: Scarcity Pricing (preserved)
-            opener = channel_info.get("opener", "local")
-            total_sats_out = state.get("sats_out", 0) if state else 0
-            is_virgin_remote = (opener == "remote" and total_sats_out == 0)
-
-            if cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
+                # Apply cold-start ceiling cap
+                effective_ceiling = ceiling_ppm
                 if is_cold_start:
-                    # Cold-start channels need low fees to attract traffic.
-                    # Scarcity pricing would push fees up, contradicting cold-start intent.
-                    self.plugin.log(
-                        f"SCARCITY_SKIP: {channel_id[:12]}... suppressing scarcity (cold-start active).",
-                        level='info'
-                    )
-                elif is_virgin_remote:
-                    self.plugin.log(
-                        f"VIRGIN CHANNEL AMNESTY: {channel_id[:12]}... suppressing scarcity.",
-                        level='info'
-                    )
-                elif not self.ENABLE_BOUNDS_MULTIPLIERS:
-                    # Only apply direct scarcity if floor multiplier wasn't already used
-                    scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
-                    original_fee = new_fee_ppm
-                    new_fee_ppm = int(new_fee_ppm * scarcity_mult)
-                    self.plugin.log(
-                        f"SCARCITY: {channel_id[:12]}... {original_fee}->{new_fee_ppm} ppm "
-                        f"({scarcity_mult:.2f}x)",
-                        level='info'
-                    )
+                    cold_start_ceiling = max(self.COLD_START_MAX_FEE_PPM, floor_ppm + 50)
+                    effective_ceiling = min(ceiling_ppm, cold_start_ceiling)
 
-            # Apply cold-start ceiling cap
-            effective_ceiling = ceiling_ppm
-            if is_cold_start:
-                cold_start_ceiling = max(self.COLD_START_MAX_FEE_PPM, floor_ppm + 50)
-                effective_ceiling = min(ceiling_ppm, cold_start_ceiling)
-
-            # Clamp to bounds
-            new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
-            base_new_fee = new_fee_ppm  # For logging compatibility
+                # Clamp to bounds
+                new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
+                base_new_fee = new_fee_ppm  # For logging compatibility
 
             # =====================================================================
             # Hive Coordination (preserved from Hill Climbing)
