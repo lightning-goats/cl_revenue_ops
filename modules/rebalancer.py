@@ -31,6 +31,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ConfigSnapshot
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
+from .hive_bridge import CoordinationInputs
 from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
 from .utils import parse_msat as _shared_parse_msat
 
@@ -2035,6 +2036,40 @@ class EVRebalancer:
             except Exception as e:
                 self.plugin.log(f"Global budget limit provider failed: {e}", level='warn')
         return max(0, int((cfg or self.config.snapshot()).daily_budget_sats))
+
+    def _get_coordination_inputs(self, peer_id: str = "") -> CoordinationInputs:
+        if not self.hive_bridge or not self.hive_bridge.is_available():
+            return CoordinationInputs(mode="local_only")
+
+        priors: Dict[str, Any] = {}
+        peer_quality = None
+
+        if peer_id:
+            try:
+                peer_quality = self.hive_bridge.get_single_peer_quality(peer_id)
+                if peer_quality:
+                    priors["peer_quality"] = peer_quality
+            except Exception as e:
+                self.plugin.log(
+                    f"COORD_INPUTS: peer quality lookup failed for {peer_id[:12]}...: {e}",
+                    level='debug'
+                )
+
+            try:
+                defense = self.hive_bridge.query_defense_status(peer_id=peer_id)
+                if defense:
+                    priors["peer_threat"] = defense.get("peer_threat")
+            except Exception as e:
+                self.plugin.log(
+                    f"COORD_INPUTS: defense lookup failed for {peer_id[:12]}...: {e}",
+                    level='debug'
+                )
+
+        return CoordinationInputs(
+            mode="fleet_augmented",
+            priors=priors,
+            peer_quality=peer_quality,
+        )
 
     def _get_our_node_id(self) -> str:
         if self._our_node_id is None:
@@ -5025,10 +5060,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         """
         cfg = self.config.snapshot()
 
-        if not getattr(cfg, 'hive_peer_quality_enabled', True) or not self.hive_bridge:
+        if not getattr(cfg, 'hive_peer_quality_enabled', True):
             return True, ""
 
-        if not self.hive_bridge.should_rebalance_into_peer(peer_id):
+        coordination = self._get_coordination_inputs(peer_id)
+        if coordination.mode == "local_only":
+            return True, ""
+
+        peer_quality = coordination.priors.get("peer_quality") or coordination.peer_quality
+        if peer_quality and peer_quality.get("quality") == "avoid":
             return False, "Peer marked as 'avoid' quality"
 
         return True, ""

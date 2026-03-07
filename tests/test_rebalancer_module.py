@@ -2162,3 +2162,38 @@ class TestLastDecisionSummary:
         assert summary["dominant_input"] == "daily_budget_sats"
         assert summary["safety_block"] is True
         assert summary["budget_blocked"] is True
+
+
+class TestCoordinationInputs:
+    def test_rebalancer_uses_empty_coordination_inputs_when_hive_unavailable(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database, MagicMock(), hive_bridge=None)
+
+        inputs = r._get_coordination_inputs("02" + "a" * 64)
+
+        assert inputs.mode == "local_only"
+        assert inputs.priors == {}
+
+    def test_rebalancer_uses_coordination_priors_when_hive_available(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        hive_bridge = MagicMock()
+        hive_bridge.is_available.return_value = True
+        hive_bridge.get_single_peer_quality.return_value = {
+            "quality": "good",
+            "quality_score": 0.9,
+        }
+        hive_bridge.query_defense_status.return_value = {
+            "peer_threat": {"is_threat": False}
+        }
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database, MagicMock(), hive_bridge=hive_bridge)
+
+        inputs = r._get_coordination_inputs("02" + "a" * 64)
+
+        assert inputs.mode == "fleet_augmented"
+        assert "peer_quality" in inputs.priors

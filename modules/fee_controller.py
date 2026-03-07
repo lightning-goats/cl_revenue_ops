@@ -56,6 +56,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .clboss_manager import ClbossManager, ClbossTags
+from .hive_bridge import CoordinationInputs
 from .policy_manager import PolicyManager, FeeStrategy
 from .utils import parse_msat
 
@@ -3449,6 +3450,56 @@ class HillClimbingFeeController:
         except Exception:
             pass  # AskRene is optional; silent on failure
 
+    def _get_coordination_inputs(self, channel_id: str, peer_id: str = "") -> CoordinationInputs:
+        if not self.hive_bridge or not self.hive_bridge.is_available():
+            return CoordinationInputs(mode="local_only")
+
+        priors: Dict[str, Any] = {}
+        peer_quality = None
+        corridor_hint = None
+
+        if peer_id:
+            try:
+                peer_quality = self.hive_bridge.get_single_peer_quality(peer_id)
+                if peer_quality:
+                    priors["peer_quality"] = peer_quality
+            except Exception as e:
+                self.plugin.log(
+                    f"COORD_INPUTS: peer quality lookup failed for {peer_id[:12]}...: {e}",
+                    level='debug'
+                )
+
+            try:
+                fee_intelligence = self.hive_bridge.query_fee_intelligence(peer_id)
+                if fee_intelligence:
+                    priors["fee_intelligence"] = fee_intelligence
+            except Exception as e:
+                self.plugin.log(
+                    f"COORD_INPUTS: fee intelligence lookup failed for {peer_id[:12]}...: {e}",
+                    level='debug'
+                )
+
+        try:
+            coordinated_fee = self.hive_bridge.query_coordinated_fee_recommendation(
+                channel_id=channel_id,
+                current_fee=0,
+            )
+            if coordinated_fee:
+                corridor_hint = coordinated_fee.get("corridor_role")
+                priors["coordinated_fee"] = coordinated_fee
+        except Exception as e:
+            self.plugin.log(
+                f"COORD_INPUTS: coordinated fee lookup failed for {channel_id[:12]}...: {e}",
+                level='debug'
+            )
+
+        return CoordinationInputs(
+            mode="fleet_augmented",
+            priors=priors,
+            corridor_hint=corridor_hint,
+            peer_quality=peer_quality,
+        )
+
     def _is_topology_depleted(self, channel_id: str, capacity_sats: int, cfg) -> bool:
         """Check if downstream topology for a channel is depleted via AskRene.
 
@@ -3725,9 +3776,11 @@ class HillClimbingFeeController:
         state = GaussianThompsonState()
         state.prior_std_fee = cfg.thompson_prior_std_fee
 
-        if self.hive_bridge and self.hive_bridge.is_available():
+        coordination = self._get_coordination_inputs(channel_id, peer_id)
+
+        if coordination.mode == "fleet_augmented":
             try:
-                intel = self.hive_bridge.query_fee_intelligence(peer_id)
+                intel = coordination.priors.get("fee_intelligence")
                 if intel and intel.get("confidence", 0) >= cfg.hive_min_confidence_for_prior:
                     # Use the full profile initialization
                     state.initialize_from_hive_profile(intel)
