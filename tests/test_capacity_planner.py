@@ -158,3 +158,145 @@ def test_no_config_parameter():
     sig = inspect.signature(CapacityPlanner.__init__)
     param_names = list(sig.parameters.keys())
     assert "config" not in param_names
+
+
+class TestHiveAwareness:
+    """Test fleet member handling in capacity planner."""
+
+    def test_hive_peer_excluded_from_losers(self):
+        """Fleet members should never appear in closure recommendations."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = True
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer, policy_manager=policy_manager)
+
+        scid = "111x222x0"
+        prof = _mock_profitability(
+            scid=scid,
+            marginal_roi_percent=-80.0,
+            roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE,
+            days_open=200,
+        )
+        flow = _mock_flow(daily_volume=2, flow_ratio=0.0)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            'total': 10, 'success_rate': 0.1,
+        }
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        assert len(losers) == 0
+
+    def test_hive_peer_tagged_in_winners(self):
+        """Fleet members should be tagged with is_fleet_member in winners."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = True
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer, policy_manager=policy_manager)
+
+        scid = "222x333x0"
+        prof = _mock_profitability(
+            scid=scid,
+            marginal_roi_percent=40.0,
+            roi_percent=40.0,
+            classification=ProfitabilityClass.PROFITABLE,
+            days_open=60,
+        )
+        flow = _mock_flow(daily_volume=1_500_000, flow_ratio=0.9)
+
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow}, {})
+        assert len(winners) == 1
+        assert winners[0]["is_fleet_member"] is True
+
+    def test_non_hive_peer_not_tagged_fleet(self):
+        """Non-fleet peers should have is_fleet_member=False."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = False
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer, policy_manager=policy_manager)
+
+        scid = "333x444x0"
+        prof = _mock_profitability(
+            scid=scid,
+            marginal_roi_percent=40.0,
+            roi_percent=40.0,
+            classification=ProfitabilityClass.PROFITABLE,
+            days_open=60,
+        )
+        flow = _mock_flow(daily_volume=1_500_000, flow_ratio=0.9)
+
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow}, {})
+        assert len(winners) == 1
+        assert winners[0]["is_fleet_member"] is False
+
+    def test_no_policy_manager_skips_hive_check(self):
+        """Without policy_manager, no fleet filtering (backwards compat)."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+
+        scid = "444x555x0"
+        prof = _mock_profitability(
+            scid=scid,
+            marginal_roi_percent=-80.0,
+            roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE,
+            days_open=200,
+        )
+        flow = _mock_flow(daily_volume=2, flow_ratio=0.0)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            'total': 10, 'success_rate': 0.1,
+        }
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        assert len(losers) == 1  # No filtering without policy_manager
+
+    def test_fleet_members_excluded_in_summary(self):
+        """Report summary should count excluded fleet members."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = True
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer, policy_manager=policy_manager)
+
+        scid = "555x666x0"
+        prof = _mock_profitability(
+            scid=scid,
+            marginal_roi_percent=-80.0,
+            roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE,
+            days_open=200,
+        )
+        flow = _mock_flow(daily_volume=2, flow_ratio=0.0)
+
+        prof_analyzer.analyze_all_channels.return_value = {scid: prof}
+        flow_analyzer.analyze_all_channels.return_value = {scid: flow}
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            'total': 10, 'success_rate': 0.1,
+        }
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 25000}}
+        plugin.rpc.listpeers.return_value = {"peers": []}
+
+        report = planner.generate_report()
+        assert report["summary"]["fleet_members_excluded"] >= 1

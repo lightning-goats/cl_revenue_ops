@@ -42,6 +42,12 @@ class CapacityPlanner:
         all_flow = self.flow.analyze_all_channels()
         peer_splice_map = self._get_peer_splice_map()
 
+        fleet_excluded = 0
+        if self.policy_manager:
+            for scid, prof in all_profitability.items():
+                if self.policy_manager.is_hive_peer(prof.peer_id):
+                    fleet_excluded += 1
+
         winners = self._identify_winners(all_profitability, all_flow, peer_splice_map)
         losers = self._identify_losers(all_profitability, all_flow, peer_splice_map)
 
@@ -55,6 +61,7 @@ class CapacityPlanner:
             "total_loser_capacity_sats": sum(l.get("capacity", 0) for l in losers),
             "actionable_closures": sum(1 for l in losers if l.get("action") == "CLOSE"),
             "pending_defibrillation": sum(1 for l in losers if l.get("action") == "DEFIBRILLATE"),
+            "fleet_members_excluded": fleet_excluded,
         }
 
         return {
@@ -153,6 +160,8 @@ class CapacityPlanner:
             sr_val = success_data.get('success_rate', 1.0) if success_data and success_data.get('total', 0) >= 3 else 1.0
             rebal_difficulty = round(1.0 - sr_val, 2)
 
+            is_fleet = bool(self.policy_manager and self.policy_manager.is_hive_peer(prof.peer_id))
+
             if (effective_roi > 20.0 and
                 turnover > 0.5 and
                 (flow_metrics.flow_ratio > 0.8 or flow_metrics.flow_ratio < -0.8)):
@@ -166,6 +175,7 @@ class CapacityPlanner:
                     "capacity": prof.capacity_sats,
                     "peer_supports_splice": peer_splice_map.get(prof.peer_id, False),
                     "rebal_difficulty": rebal_difficulty,
+                    "is_fleet_member": is_fleet,
                 })
 
         return winners
@@ -180,6 +190,10 @@ class CapacityPlanner:
 
         for scid, prof in all_profitability.items():
             flow_metrics = all_flow.get(scid)
+
+            # Fleet members should never appear in closure recommendations
+            if self.policy_manager and self.policy_manager.is_hive_peer(prof.peer_id):
+                continue
 
             # Fetch diagnostic stats from DB
             diag_stats = self.profitability.database.get_diagnostic_rebalance_stats(scid, days=14)
