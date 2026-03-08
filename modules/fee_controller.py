@@ -860,6 +860,130 @@ class ElasticityTracker:
         return tracker
 
 
+# ── Payment Size Bucket Profiling ──────────────────────────────────────
+# Per-channel payment size distribution tracking for fee elasticity.
+# Each channel maintains Gaussian posteriors per size bucket.
+# Graduated buckets (>=N obs) contribute to revenue-weighted composite fee.
+
+SIZE_BUCKET_BOUNDARIES = [10_000, 100_000, 500_000, 5_000_000]  # sats
+SIZE_BUCKET_LABELS = ["micro", "small", "medium", "large", "whale"]
+SIZE_BUCKET_GRADUATION_THRESHOLD = 10
+
+
+def classify_size_bucket(amount_sats: int) -> int:
+    """Classify a payment amount (sats) into a size bucket index (0-4)."""
+    for i, boundary in enumerate(SIZE_BUCKET_BOUNDARIES):
+        if amount_sats < boundary:
+            return i
+    return len(SIZE_BUCKET_BOUNDARIES)
+
+
+class BucketPosterior:
+    """Gaussian posterior for a single payment size bucket."""
+
+    def __init__(self, mu: float = 200.0, precision: float = 0.1,
+                 n_obs: int = 0, revenue_share: float = 0.0):
+        self.mu = mu
+        self.precision = precision
+        self.n_obs = n_obs
+        self.revenue_share = revenue_share
+
+    @property
+    def graduated(self) -> bool:
+        return self.n_obs >= SIZE_BUCKET_GRADUATION_THRESHOLD
+
+    def sample(self, floor: int, ceiling: int) -> float:
+        """Sample a fee from the posterior, clamped to [floor, ceiling]."""
+        std = 1.0 / max(self.precision, 1e-6) ** 0.5
+        sampled = random.gauss(self.mu, std)
+        return max(floor, min(ceiling, sampled))
+
+    def update(self, observed_fee: float, noise_variance: float = 1000.0):
+        """Bayesian Normal-Normal conjugate update."""
+        noise_variance = max(noise_variance, 1e-6)
+        obs_precision = 1.0 / noise_variance
+        new_precision = self.precision + obs_precision
+        self.mu = (self.precision * self.mu + obs_precision * observed_fee) / new_precision
+        self.precision = new_precision
+        self.n_obs += 1
+
+    def to_dict(self) -> dict:
+        return {
+            "mu": self.mu, "precision": self.precision,
+            "n_obs": self.n_obs, "revenue_share": self.revenue_share,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BucketPosterior":
+        return cls(
+            mu=d.get("mu", 200.0), precision=d.get("precision", 0.1),
+            n_obs=d.get("n_obs", 0), revenue_share=d.get("revenue_share", 0.0),
+        )
+
+
+class SizeBucketState:
+    """Per-channel payment size bucket state."""
+
+    def __init__(self):
+        self.buckets = {label: BucketPosterior() for label in SIZE_BUCKET_LABELS}
+
+    def update_bucket(self, amount_sats: int, fee_ppm: float,
+                      noise_variance: float = 1000.0):
+        """Update the appropriate bucket's posterior with an observation."""
+        idx = classify_size_bucket(amount_sats)
+        label = SIZE_BUCKET_LABELS[idx]
+        self.buckets[label].update(fee_ppm, noise_variance)
+
+    def update_revenue_shares(self, shares: dict):
+        """Update revenue shares from a {label: share} dict."""
+        for label, share in shares.items():
+            if label in self.buckets:
+                self.buckets[label].revenue_share = share
+
+    def composite_sample(self, channel_wide_sample: float,
+                         floor: int, ceiling: int) -> float:
+        """Revenue-weighted composite fee from graduated buckets.
+
+        Graduated buckets contribute proportional to their revenue_share.
+        Remaining weight goes to channel_wide_sample.
+        """
+        graduated_share = sum(
+            b.revenue_share for b in self.buckets.values() if b.graduated
+        )
+        if graduated_share <= 0:
+            return channel_wide_sample
+
+        composite = 0.0
+        for bucket in self.buckets.values():
+            if bucket.graduated:
+                composite += bucket.sample(floor, ceiling) * bucket.revenue_share
+
+        remaining = 1.0 - graduated_share
+        if remaining > 0:
+            composite += channel_wide_sample * remaining
+
+        return max(floor, min(ceiling, composite))
+
+    def to_dict(self) -> dict:
+        return {label: b.to_dict() for label, b in self.buckets.items()}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SizeBucketState":
+        state = cls()
+        for label in SIZE_BUCKET_LABELS:
+            if label in d:
+                state.buckets[label] = BucketPosterior.from_dict(d[label])
+        return state
+
+
+def compute_revenue_shares(bucket_totals: dict) -> dict:
+    """Convert {label: total_fee_msat} to {label: share} where shares sum to 1.0."""
+    total = sum(bucket_totals.values())
+    if total <= 0:
+        return {label: 0.0 for label in bucket_totals}
+    return {label: amt / total for label, amt in bucket_totals.items()}
+
+
 # =============================================================================
 # IMPROVEMENT #5: Thompson Sampling
 # =============================================================================
@@ -2832,6 +2956,9 @@ class ThompsonAIMDState:
     # PID balance controller state
     pid: PIDState = field(default_factory=PIDState)
 
+    # Payment size bucket profiling state
+    size_buckets: SizeBucketState = field(default_factory=SizeBucketState)
+
     def get_historical_curve(self) -> HistoricalResponseCurve:
         """Deserialize historical curve from dict."""
         if self.historical_curve_data:
@@ -2893,7 +3020,8 @@ class ThompsonAIMDState:
             # F-R6-1 FIX: Persist gossip refresh cooldown so it survives restarts
             "last_gossip_refresh": self.last_gossip_refresh,
             # PID balance controller state
-            "pid_state": self.pid.to_dict()
+            "pid_state": self.pid.to_dict(),
+            "size_buckets": self.size_buckets.to_dict(),
         }
 
     @classmethod
@@ -2961,6 +3089,10 @@ class ThompsonAIMDState:
         # PID balance controller state
         pid_data = d.get("pid_state", {})
         state.pid = PIDState.from_dict(pid_data) if pid_data else PIDState()
+
+        # Payment size bucket profiling state
+        size_buckets_data = d.get("size_buckets", {})
+        state.size_buckets = SizeBucketState.from_dict(size_buckets_data) if size_buckets_data else SizeBucketState()
 
         # Load legacy fields from main table if provided
         if legacy_state:
@@ -4013,6 +4145,37 @@ class HillClimbingFeeController:
                     )
 
         return state
+
+    def _update_size_bucket_posteriors(self, channel_id: str,
+                                       ts_state: ThompsonAIMDState) -> None:
+        """Update size bucket posteriors from recent forwards and refresh revenue shares."""
+        since_ts = ts_state.last_update or (int(time.time()) - 86400)
+        try:
+            conn = self.database._get_connection()
+            rows = conn.execute(
+                "SELECT out_msat, fee_msat FROM forwards "
+                "WHERE out_channel = ? AND timestamp > ?",
+                (channel_id, since_ts),
+            ).fetchall()
+        except Exception as e:
+            self.plugin.log(f"SIZE_BUCKETS: forwards query failed for {channel_id[:12]}...: {e}", level='debug')
+            return
+
+        for row in rows:
+            out_msat = row["out_msat"]
+            fee_msat = row["fee_msat"]
+            amount_sats = out_msat // 1000
+            if amount_sats > 0 and out_msat > 0:
+                fee_ppm = (fee_msat * 1_000_000) / out_msat
+                ts_state.size_buckets.update_bucket(amount_sats, fee_ppm)
+
+        try:
+            totals = self.database.get_revenue_by_size_bucket(channel_id, window_days=7)
+            shares = compute_revenue_shares(totals)
+            ts_state.size_buckets.update_revenue_shares(shares)
+        except Exception as e:
+            self.plugin.log(f"SIZE_BUCKETS: revenue share refresh failed for {channel_id[:12]}...: {e}", level='debug')
+
 
     def _get_thompson_aimd_state(
         self,
@@ -6234,6 +6397,9 @@ class HillClimbingFeeController:
             # Load Thompson+AIMD state
             ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
 
+            # Update payment size bucket posteriors from recent forwards
+            self._update_size_bucket_posteriors(channel_id, ts_state)
+
             # Track rate change for logging and hysteresis
             rate_change = current_revenue_rate - ts_state.last_revenue_rate
             previous_rate = ts_state.last_revenue_rate
@@ -6650,7 +6816,10 @@ class HillClimbingFeeController:
             # =====================================================================
             if self.ENABLE_SIMPLIFIED_FEE_PATH:
                 # Simplified: direct posterior sample, no stigmergic modulation
-                thompson_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
+                raw_thompson_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
+                thompson_fee = ts_state.size_buckets.composite_sample(
+                    raw_thompson_fee, floor_ppm, ceiling_ppm
+                )
             else:
                 # Legacy: stigmergic context + elasticity bias + competition offset
                 # Set context for exploration/exploitation balance based on:
@@ -6681,6 +6850,10 @@ class HillClimbingFeeController:
                 # Apply fleet differentiation offset (computed above, doesn't mutate posterior)
                 if differentiation_offset != 0:
                     thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
+
+                thompson_fee = ts_state.size_buckets.composite_sample(
+                    thompson_fee, floor_ppm, ceiling_ppm
+                )
 
             if self.ENABLE_DTS_PID:
                 # =============================================================
@@ -7718,7 +7891,13 @@ class HillClimbingFeeController:
                     "direction": new_direction,
                     "step_ppm": step_ppm,
                     "consecutive_same_direction": hc_state.consecutive_same_direction,
-                    "volatility_reset": volatility_reset
+                    "volatility_reset": volatility_reset,
+                    "size_bucket_weights": {
+                        label: {"share": round(b.revenue_share, 3), "mu": round(b.mu, 1),
+                                "n_obs": b.n_obs, "graduated": b.graduated}
+                        for label, b in self._thompson_aimd_states[channel_id].size_buckets.buckets.items()
+                        if b.n_obs > 0
+                    } if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states else {},
                 },
                 reason_code=fee_reason_code,
                 heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None

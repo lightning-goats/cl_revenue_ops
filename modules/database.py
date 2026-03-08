@@ -25,6 +25,46 @@ from pathlib import Path
 from .utils import normalize_scid
 
 
+# Size bucket labels matching fee_controller.SIZE_BUCKET_LABELS
+_SIZE_BUCKET_LABELS = ("micro", "small", "medium", "large", "whale")
+
+
+def _revenue_by_size_bucket_sql(conn, channel_id: str, window_days: int = 7) -> dict:
+    """Query forwards table and return {label: total_fee_msat} grouped by payment size bucket.
+
+    Note: Only accurate within the forwards retention window (~8 days).
+    Older forwards are pruned by cleanup_old_data() and rolled up into
+    daily_forwarding_stats which lacks per-payment size granularity.
+
+    This is a standalone function that accepts a raw sqlite3 connection so it
+    can be tested with in-memory databases without instantiating Database.
+    """
+    cutoff = int(time.time()) - window_days * 86400
+    cursor = conn.execute(
+        """
+        SELECT
+            CASE
+                WHEN out_msat / 1000 < 10000 THEN 0
+                WHEN out_msat / 1000 < 100000 THEN 1
+                WHEN out_msat / 1000 < 500000 THEN 2
+                WHEN out_msat / 1000 < 5000000 THEN 3
+                ELSE 4
+            END AS bucket_idx,
+            SUM(fee_msat) AS total_fee
+        FROM forwards
+        WHERE out_channel = ? AND timestamp >= ?
+        GROUP BY bucket_idx
+        """,
+        (channel_id, cutoff),
+    )
+    result = {label: 0 for label in _SIZE_BUCKET_LABELS}
+    for row in cursor:
+        idx, total_fee = row
+        if 0 <= idx < len(_SIZE_BUCKET_LABELS):
+            result[_SIZE_BUCKET_LABELS[idx]] = int(total_fee or 0)
+    return result
+
+
 class Database:
     """
     SQLite database manager for the Revenue Operations plugin.
@@ -2277,6 +2317,10 @@ class Database:
             revenue[cid]["sourced_forward_count"] = int(r["forward_count"] or 0)
 
         return revenue
+
+    def get_revenue_by_size_bucket(self, channel_id: str, window_days: int = 7) -> dict:
+        """Return {label: total_fee_msat} grouped by payment size bucket."""
+        return _revenue_by_size_bucket_sql(self._get_connection(), channel_id, window_days)
 
     # =========================================================================
     # Atomic Budget Reservation System (CRITICAL-01 fix)
