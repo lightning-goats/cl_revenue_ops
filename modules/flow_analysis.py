@@ -1360,6 +1360,9 @@ class FlowAnalyzer:
                 kalman_uncertainty=metrics.kalman_uncertainty
             )
 
+            # Update temporal flow profile
+            self._update_temporal_profile(channel_id)
+
         # Reconcile: remove stale channel_states entries for closed channels.
         # _get_channels() only returns CHANNELD_NORMAL, so any channel_states
         # entry not in our active set is from a closed/closing channel.
@@ -1385,7 +1388,56 @@ class FlowAnalyzer:
             self.plugin.log(f"Warning: failed to clean stale channel states: {e}")
 
         return results
-    
+
+    def _update_temporal_profile(self, channel_id: str) -> None:
+        """Update the temporal flow profile for a channel.
+
+        Computes hourly histogram from forwards table, EMA-blends with
+        existing profile, and persists to database.
+        """
+        try:
+            import json
+
+            # Get hourly histogram from forwards
+            histogram = self.database.get_hourly_forward_histogram(channel_id, window_days=7)
+
+            # Count today's forwards for graduation check
+            total_forwards_today = sum(h.get("count", 0) for h in histogram)
+
+            # Load existing profile
+            profile_json = self.database.load_temporal_profile(channel_id)
+            if profile_json:
+                existing = TemporalProfile.from_dict(json.loads(profile_json))
+            else:
+                existing = TemporalProfile()
+
+            # Read dominant bucket from fee controller state if available
+            try:
+                fee_state = self.database.get_fee_strategy_state(channel_id)
+                if fee_state and fee_state.get("v2_state_json"):
+                    v2 = json.loads(fee_state["v2_state_json"]) if isinstance(fee_state["v2_state_json"], str) else fee_state.get("v2_state_json", {})
+                    size_buckets = v2.get("size_buckets", {})
+                    # Find bucket with highest revenue_share
+                    max_share = 0.0
+                    dominant = "unknown"
+                    for label, data in size_buckets.items():
+                        share = data.get("revenue_share", 0.0) if isinstance(data, dict) else 0.0
+                        if share > max_share:
+                            max_share = share
+                            dominant = label
+                    existing.dominant_bucket = dominant
+            except Exception:
+                pass  # size profiling not available, keep existing dominant_bucket
+
+            # Update with EMA blending
+            updated = update_temporal_profile(existing, histogram, total_forwards_today)
+
+            # Persist
+            self.database.save_temporal_profile(channel_id, json.dumps(updated.to_dict()))
+
+        except Exception as e:
+            self.plugin.log(f"Temporal profile update failed for {channel_id}: {e}", level='debug')
+
     def analyze_channel(self, channel_id: str) -> Optional[FlowMetrics]:
         """
         Analyze flow for a specific channel.

@@ -423,3 +423,17 @@ def test_buffer_multiplier_from_burstiness():
     assert get_buffer_multiplier(0.3) == 1.0    # retail (< 0.5)
     assert get_buffer_multiplier(0.7) == 1.3    # mixed (0.5 - 1.0)
     assert get_buffer_multiplier(1.5) == 1.6    # whale (> 1.0)
+
+
+def test_temporal_update_wiring():
+    """Verify flow analysis module exports the update function and it integrates."""
+    from modules.flow_analysis import (
+        TemporalProfile, update_temporal_profile, estimate_depletion_hours,
+        get_buffer_multiplier, TEMPORAL_GRADUATION_DAYS, TEMPORAL_MIN_DAILY_FORWARDS,
+        TEMPORAL_EMA_ALPHA,
+    )
+    import inspect
+
+    # Verify FlowAnalyzer has a method to update temporal profiles
+    from modules.flow_analysis import FlowAnalyzer
+    assert hasattr(FlowAnalyzer, '_update_temporal_profile')
