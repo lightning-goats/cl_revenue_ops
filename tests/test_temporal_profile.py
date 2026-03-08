@@ -425,6 +425,66 @@ def test_buffer_multiplier_from_burstiness():
     assert get_buffer_multiplier(1.5) == 1.6    # whale (> 1.0)
 
 
+def test_update_channel_state_preserves_temporal_profile():
+    """INSERT ... ON CONFLICT must not wipe temporal_profile_json column."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE channel_states (
+            channel_id TEXT PRIMARY KEY,
+            peer_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            flow_ratio REAL NOT NULL,
+            sats_in INTEGER NOT NULL,
+            sats_out INTEGER NOT NULL,
+            capacity INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            confidence REAL DEFAULT 0.5,
+            velocity REAL DEFAULT 0.0,
+            flow_multiplier REAL DEFAULT 1.0,
+            ema_decay REAL DEFAULT 0.0,
+            forward_count INTEGER DEFAULT 0,
+            kalman_flow_ratio REAL DEFAULT 0.0,
+            kalman_velocity REAL DEFAULT 0.0,
+            kalman_uncertainty REAL DEFAULT 0.1,
+            temporal_profile_json TEXT DEFAULT NULL
+        )
+    """)
+    # Insert initial row with temporal profile
+    conn.execute(
+        "INSERT INTO channel_states (channel_id, peer_id, state, flow_ratio, "
+        "sats_in, sats_out, capacity, updated_at, temporal_profile_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("ch1", "peer1", "sink", 0.5, 100, 200, 1000000, int(time.time()),
+         '{"hourly_out": [100.0]}'),
+    )
+
+    # Simulate what update_channel_state does: INSERT ... ON CONFLICT DO UPDATE
+    now = int(time.time())
+    conn.execute("""
+        INSERT INTO channel_states
+        (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at,
+         confidence, velocity, flow_multiplier, ema_decay, forward_count,
+         kalman_flow_ratio, kalman_velocity, kalman_uncertainty)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(channel_id) DO UPDATE SET
+            peer_id=excluded.peer_id, state=excluded.state,
+            flow_ratio=excluded.flow_ratio, sats_in=excluded.sats_in,
+            sats_out=excluded.sats_out, capacity=excluded.capacity,
+            updated_at=excluded.updated_at, confidence=excluded.confidence,
+            velocity=excluded.velocity, flow_multiplier=excluded.flow_multiplier,
+            ema_decay=excluded.ema_decay, forward_count=excluded.forward_count,
+            kalman_flow_ratio=excluded.kalman_flow_ratio,
+            kalman_velocity=excluded.kalman_velocity,
+            kalman_uncertainty=excluded.kalman_uncertainty
+    """, ("ch1", "peer1", "source", 0.8, 300, 400, 1000000, now,
+          0.9, 0.1, 1.2, 0.5, 10, 0.6, 0.05, 0.08))
+
+    row = conn.execute("SELECT temporal_profile_json FROM channel_states WHERE channel_id = 'ch1'").fetchone()
+    assert row["temporal_profile_json"] == '{"hourly_out": [100.0]}', \
+        "temporal_profile_json was wiped by update_channel_state upsert"
+
+
 def test_temporal_update_wiring():
     """Verify flow analysis module exports the update function and it integrates."""
     from modules.flow_analysis import (

@@ -1401,8 +1401,8 @@ class FlowAnalyzer:
             # Get hourly histogram from forwards
             histogram = self.database.get_hourly_forward_histogram(channel_id, window_days=7)
 
-            # Count today's forwards for graduation check
-            total_forwards_today = sum(h.get("count", 0) for h in histogram)
+            # Average daily forwards across the histogram window for graduation check
+            avg_daily_forwards = sum(h.get("count", 0) for h in histogram)
 
             # Load existing profile
             profile_json = self.database.load_temporal_profile(channel_id)
@@ -1430,7 +1430,7 @@ class FlowAnalyzer:
                 pass  # size profiling not available, keep existing dominant_bucket
 
             # Update with EMA blending
-            updated = update_temporal_profile(existing, histogram, total_forwards_today)
+            updated = update_temporal_profile(existing, histogram, avg_daily_forwards)
 
             # Persist
             self.database.save_temporal_profile(channel_id, json.dumps(updated.to_dict()))

@@ -78,8 +78,7 @@ def should_pre_position(outbound_ratio: float, current_balance_sats: float,
 MAX_TEMPORAL_RATIO = 0.70  # never target more than 70% of capacity
 
 
-def compute_temporal_target(current_hour: int, kalman_velocity_per_hour: float,
-                             temporal_profile, capacity: int) -> int:
+def compute_temporal_target(current_hour: int, temporal_profile, capacity: int) -> int:
     """Compute demand-based rebalance target from temporal profile.
 
     Returns the predicted outflow until the next quiet window, multiplied
@@ -2977,10 +2976,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 from datetime import datetime, timezone
                 _tp = TemporalProfile.from_dict(json.loads(temporal_json))
                 _current_hour = datetime.now(timezone.utc).hour
-                _kalman = self.database.get_kalman_state(dest_channel)
-                _velocity = float((_kalman or {}).get("flow_velocity", 0.0))
                 temporal_target = compute_temporal_target(
-                    _current_hour, _velocity, _tp, capacity
+                    _current_hour, _tp, capacity
                 )
                 if temporal_target > raw_target:
                     self.plugin.log(

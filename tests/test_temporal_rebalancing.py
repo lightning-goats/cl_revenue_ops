@@ -135,7 +135,6 @@ def test_demand_sizing_covers_to_quiet():
     # Buffer 1.0x -> target = 12000
     target = compute_temporal_target(
         current_hour=18,
-        kalman_velocity_per_hour=2000.0,
         temporal_profile=tp,
         capacity=1_000_000,
     )
@@ -156,7 +155,6 @@ def test_demand_sizing_buffer_whale():
 
     target = compute_temporal_target(
         current_hour=18,
-        kalman_velocity_per_hour=2000.0,
         temporal_profile=tp,
         capacity=1_000_000,
     )
@@ -178,7 +176,6 @@ def test_demand_sizing_buffer_retail():
 
     target = compute_temporal_target(
         current_hour=18,
-        kalman_velocity_per_hour=1000.0,
         temporal_profile=tp,
         capacity=1_000_000,
     )
@@ -199,7 +196,6 @@ def test_demand_sizing_capped_at_max_ratio():
 
     target = compute_temporal_target(
         current_hour=18,
-        kalman_velocity_per_hour=100000.0,
         temporal_profile=tp,
         capacity=500_000,
     )
@@ -214,7 +210,6 @@ def test_demand_sizing_ungraduated_returns_zero():
 
     target = compute_temporal_target(
         current_hour=12,
-        kalman_velocity_per_hour=1000.0,
         temporal_profile=tp,
         capacity=1_000_000,
     )

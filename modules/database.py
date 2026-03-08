@@ -1377,11 +1377,21 @@ class Database:
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute("""
-                INSERT OR REPLACE INTO channel_states
+                INSERT INTO channel_states
                 (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at,
                  confidence, velocity, flow_multiplier, ema_decay, forward_count,
                  kalman_flow_ratio, kalman_velocity, kalman_uncertainty)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    peer_id=excluded.peer_id, state=excluded.state,
+                    flow_ratio=excluded.flow_ratio, sats_in=excluded.sats_in,
+                    sats_out=excluded.sats_out, capacity=excluded.capacity,
+                    updated_at=excluded.updated_at, confidence=excluded.confidence,
+                    velocity=excluded.velocity, flow_multiplier=excluded.flow_multiplier,
+                    ema_decay=excluded.ema_decay, forward_count=excluded.forward_count,
+                    kalman_flow_ratio=excluded.kalman_flow_ratio,
+                    kalman_velocity=excluded.kalman_velocity,
+                    kalman_uncertainty=excluded.kalman_uncertainty
             """, (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, now,
                   confidence, velocity, flow_multiplier, ema_decay, forward_count,
                   kalman_flow_ratio, kalman_velocity, kalman_uncertainty))
