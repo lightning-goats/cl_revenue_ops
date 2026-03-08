@@ -185,6 +185,167 @@ class KalmanFlowState:
         )
 
 
+# --- Temporal flow profiling constants ---
+TEMPORAL_GRADUATION_DAYS = 7
+TEMPORAL_MIN_DAILY_FORWARDS = 10
+TEMPORAL_EMA_ALPHA = 0.3
+TEMPORAL_PEAK_PERCENTILE = 0.75
+TEMPORAL_QUIET_PERCENTILE = 0.25
+
+
+@dataclass
+class TemporalProfile:
+    """Per-channel hourly flow histogram for temporal pattern detection.
+
+    Tracks rolling 7-day EMA of sats/forwards per hour of day (24 buckets).
+    Graduates after TEMPORAL_GRADUATION_DAYS days with sufficient data,
+    enabling predictive pre-positioning and demand-based sizing.
+    """
+    hourly_out: list = field(default_factory=lambda: [0.0] * 24)
+    hourly_in: list = field(default_factory=lambda: [0.0] * 24)
+    hourly_count: list = field(default_factory=lambda: [0.0] * 24)
+    peak_hours: list = field(default_factory=list)
+    quiet_hours: list = field(default_factory=list)
+    burstiness: float = 0.0
+    diurnal_strength: float = 0.0
+    dominant_bucket: str = "unknown"
+    observation_days: int = 0
+    last_updated: int = 0
+
+    @property
+    def graduated(self) -> bool:
+        return self.observation_days >= TEMPORAL_GRADUATION_DAYS
+
+    def _recompute_derived(self):
+        """Recompute peak/quiet hours, burstiness, diurnal strength from hourly_out."""
+        if all(v == 0.0 for v in self.hourly_out):
+            self.peak_hours = []
+            self.quiet_hours = []
+            self.burstiness = 0.0
+            self.diurnal_strength = 0.0
+            return
+
+        # Burstiness = coefficient of variation
+        import numpy as np
+        arr = np.array(self.hourly_out)
+        mean_val = np.mean(arr)
+        if mean_val > 0:
+            self.burstiness = float(np.std(arr) / mean_val)
+        else:
+            self.burstiness = 0.0
+
+        # Peak/quiet classification by percentile
+        sorted_vals = sorted(enumerate(self.hourly_out), key=lambda x: x[1])
+        n_quartile = max(1, len(sorted_vals) // 4)  # 6 for 24 hours
+        self.quiet_hours = sorted([h for h, _ in sorted_vals[:n_quartile]])
+        self.peak_hours = sorted([h for h, _ in sorted_vals[-n_quartile:]])
+
+        # Diurnal strength: normalized autocorrelation at lag 12
+        # (peak correlation with 12h offset indicates strong day/night)
+        if len(arr) == 24 and np.std(arr) > 0:
+            normalized = (arr - np.mean(arr)) / np.std(arr)
+            autocorr_12 = float(np.dot(normalized, np.roll(normalized, 12)) / 24)
+            # Strong diurnal = high negative correlation at lag 12
+            # (day is high when night is low and vice versa)
+            self.diurnal_strength = max(0.0, -autocorr_12)
+        else:
+            self.diurnal_strength = 0.0
+
+    def predicted_outflow(self, current_hour: int, horizon_hours: int) -> float:
+        """Sum expected outflow sats for the next horizon_hours."""
+        total = 0.0
+        for h in range(horizon_hours):
+            hour_idx = (current_hour + h) % 24
+            total += self.hourly_out[hour_idx]
+        return total
+
+    def predicted_inflow(self, current_hour: int, horizon_hours: int) -> float:
+        """Sum expected inflow sats for the next horizon_hours."""
+        total = 0.0
+        for h in range(horizon_hours):
+            hour_idx = (current_hour + h) % 24
+            total += self.hourly_in[hour_idx]
+        return total
+
+    def is_quiet_now(self, current_hour: int) -> bool:
+        """Whether current_hour falls in a quiet period."""
+        return current_hour in self.quiet_hours
+
+    def next_quiet_window(self, current_hour: int) -> tuple:
+        """Find the next quiet window: (start_hour, duration_hours).
+
+        If currently in a quiet window, returns the current window.
+        Returns (current_hour, 0) if no quiet hours defined.
+        """
+        if not self.quiet_hours:
+            return (current_hour, 0)
+
+        quiet_set = set(self.quiet_hours)
+
+        # Find the start of the next (or current) quiet window
+        # by scanning forward from current_hour
+        for offset in range(24):
+            h = (current_hour + offset) % 24
+            if h in quiet_set:
+                # Found a quiet hour — walk backward to find the true start
+                # of this contiguous quiet window
+                start = h
+                for back in range(1, 24):
+                    prev = (h - back) % 24
+                    if prev in quiet_set:
+                        start = prev
+                    else:
+                        break
+                # Count duration forward from start
+                duration = 0
+                for d in range(24):
+                    if (start + d) % 24 in quiet_set:
+                        duration += 1
+                    else:
+                        break
+                return (start, duration)
+
+        return (current_hour, 0)
+
+    def to_dict(self) -> dict:
+        return {
+            "hourly_out": list(self.hourly_out),
+            "hourly_in": list(self.hourly_in),
+            "hourly_count": list(self.hourly_count),
+            "peak_hours": list(self.peak_hours),
+            "quiet_hours": list(self.quiet_hours),
+            "burstiness": self.burstiness,
+            "diurnal_strength": self.diurnal_strength,
+            "dominant_bucket": self.dominant_bucket,
+            "observation_days": self.observation_days,
+            "last_updated": self.last_updated,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TemporalProfile":
+        tp = cls()
+        if not d:
+            return tp
+        tp.hourly_out = d.get("hourly_out", [0.0] * 24)[:24]
+        tp.hourly_in = d.get("hourly_in", [0.0] * 24)[:24]
+        tp.hourly_count = d.get("hourly_count", [0.0] * 24)[:24]
+        # Pad if short
+        while len(tp.hourly_out) < 24:
+            tp.hourly_out.append(0.0)
+        while len(tp.hourly_in) < 24:
+            tp.hourly_in.append(0.0)
+        while len(tp.hourly_count) < 24:
+            tp.hourly_count.append(0.0)
+        tp.peak_hours = d.get("peak_hours", [])
+        tp.quiet_hours = d.get("quiet_hours", [])
+        tp.burstiness = d.get("burstiness", 0.0)
+        tp.diurnal_strength = d.get("diurnal_strength", 0.0)
+        tp.dominant_bucket = d.get("dominant_bucket", "unknown")
+        tp.observation_days = d.get("observation_days", 0)
+        tp.last_updated = d.get("last_updated", 0)
+        return tp
+
+
 class KalmanFlowFilter:
     """
     Kalman Filter for optimal flow state estimation.
