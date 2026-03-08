@@ -313,3 +313,113 @@ def test_temporal_profile_first_update():
     # First update should set raw values, not blend with zeros
     assert updated.hourly_out[10] == 3000.0
     assert updated.hourly_in[10] == 500.0
+
+
+def test_depletion_estimate_basic():
+    """Known outflow rate → correct depletion hours."""
+    from modules.flow_analysis import TemporalProfile, estimate_depletion_hours
+
+    tp = TemporalProfile()
+    tp.hourly_out = [1000.0] * 24  # uniform 1000 sats/hour out
+    tp.hourly_in = [0.0] * 24
+    tp.observation_days = 10
+
+    # 5000 sats above threshold, draining at 1000/hour net → 5 hours
+    hours = estimate_depletion_hours(
+        current_balance_sats=5000,
+        depletion_target_sats=0,
+        current_hour=10,
+        kalman_velocity_per_hour=0.0,
+        temporal_profile=tp,
+    )
+    assert abs(hours - 5.0) < 0.1
+
+
+def test_depletion_estimate_with_inflow():
+    """Inflow slows depletion."""
+    from modules.flow_analysis import TemporalProfile, estimate_depletion_hours
+
+    tp = TemporalProfile()
+    tp.hourly_out = [1000.0] * 24
+    tp.hourly_in = [500.0] * 24  # half comes back
+    tp.observation_days = 10
+
+    # Net drain = 500/hour. 5000 sats → 10 hours
+    hours = estimate_depletion_hours(
+        current_balance_sats=5000,
+        depletion_target_sats=0,
+        current_hour=10,
+        kalman_velocity_per_hour=0.0,
+        temporal_profile=tp,
+    )
+    assert abs(hours - 10.0) < 0.1
+
+
+def test_depletion_estimate_infinite():
+    """Low outflow channel → inf."""
+    from modules.flow_analysis import TemporalProfile, estimate_depletion_hours
+
+    tp = TemporalProfile()
+    tp.hourly_out = [10.0] * 24
+    tp.hourly_in = [10.0] * 24  # net zero
+    tp.observation_days = 10
+
+    hours = estimate_depletion_hours(
+        current_balance_sats=100000,
+        depletion_target_sats=0,
+        current_hour=10,
+        kalman_velocity_per_hour=0.0,
+        temporal_profile=tp,
+    )
+    assert hours == float('inf')
+
+
+def test_depletion_estimate_with_trend():
+    """Kalman trend factor inflates forecast."""
+    from modules.flow_analysis import TemporalProfile, estimate_depletion_hours
+
+    tp = TemporalProfile()
+    tp.hourly_out = [1000.0] * 24  # base: 1000/hour
+    tp.hourly_in = [0.0] * 24
+    tp.observation_days = 10
+
+    # Kalman says velocity is 50% higher than historical average
+    # Historical avg = 1000/hour. kalman_velocity = 1500 sats/hour direction
+    # trend_factor = clamp((1500 - 1000) / 1000, -0.5, 1.0) = 0.5
+    # Effective drain = 1000 * 1.5 = 1500/hour
+    # 6000 sats / 1500 per hour = 4 hours
+    hours = estimate_depletion_hours(
+        current_balance_sats=6000,
+        depletion_target_sats=0,
+        current_hour=10,
+        kalman_velocity_per_hour=1500.0,
+        temporal_profile=tp,
+    )
+    assert abs(hours - 4.0) < 0.5
+
+
+def test_depletion_already_depleted():
+    """Balance already at or below target → 0 hours."""
+    from modules.flow_analysis import TemporalProfile, estimate_depletion_hours
+
+    tp = TemporalProfile()
+    tp.hourly_out = [1000.0] * 24
+    tp.observation_days = 10
+
+    hours = estimate_depletion_hours(
+        current_balance_sats=100,
+        depletion_target_sats=200,
+        current_hour=10,
+        kalman_velocity_per_hour=0.0,
+        temporal_profile=tp,
+    )
+    assert hours == 0.0
+
+
+def test_buffer_multiplier_from_burstiness():
+    """Burstiness score maps to correct buffer multiplier."""
+    from modules.flow_analysis import get_buffer_multiplier
+
+    assert get_buffer_multiplier(0.3) == 1.0    # retail (< 0.5)
+    assert get_buffer_multiplier(0.7) == 1.3    # mixed (0.5 - 1.0)
+    assert get_buffer_multiplier(1.5) == 1.6    # whale (> 1.0)

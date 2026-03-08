@@ -392,6 +392,76 @@ def update_temporal_profile(existing: TemporalProfile,
     return updated
 
 
+# --- Depletion forecast constants ---
+MAX_FORECAST_HORIZON = 24
+KALMAN_TREND_CLAMP_LOW = -0.5
+KALMAN_TREND_CLAMP_HIGH = 1.0
+BURSTINESS_LOW = 0.5
+BURSTINESS_HIGH = 1.0
+BUFFER_MULT_LOW = 1.0
+BUFFER_MULT_MED = 1.3
+BUFFER_MULT_HIGH = 1.6
+
+
+def get_buffer_multiplier(burstiness: float) -> float:
+    """Map burstiness score to forecast buffer multiplier."""
+    if burstiness < BURSTINESS_LOW:
+        return BUFFER_MULT_LOW
+    elif burstiness > BURSTINESS_HIGH:
+        return BUFFER_MULT_HIGH
+    else:
+        return BUFFER_MULT_MED
+
+
+def estimate_depletion_hours(current_balance_sats: float,
+                              depletion_target_sats: float,
+                              current_hour: int,
+                              kalman_velocity_per_hour: float,
+                              temporal_profile: TemporalProfile) -> float:
+    """Estimate hours until channel balance drops to depletion_target_sats.
+
+    Combines the hourly histogram (seasonal pattern) with Kalman velocity
+    (trend deviation). Returns float('inf') if no depletion within horizon.
+
+    Args:
+        current_balance_sats: Current outbound balance
+        depletion_target_sats: Balance level that triggers depletion
+        current_hour: Current hour UTC (0-23)
+        kalman_velocity_per_hour: Kalman-estimated outflow rate (sats/hour)
+        temporal_profile: The channel's TemporalProfile
+    """
+    drain_needed = current_balance_sats - depletion_target_sats
+    if drain_needed <= 0:
+        return 0.0
+
+    # Compute Kalman trend factor
+    # kalman_velocity_per_hour <= 0 means no Kalman signal available → no trend adjustment
+    historical_avg = sum(temporal_profile.hourly_out) / 24.0
+    if kalman_velocity_per_hour > 0 and historical_avg > 0:
+        trend_factor = (kalman_velocity_per_hour - historical_avg) / historical_avg
+        trend_factor = max(KALMAN_TREND_CLAMP_LOW, min(KALMAN_TREND_CLAMP_HIGH, trend_factor))
+    else:
+        trend_factor = 0.0
+
+    cumulative = 0.0
+    for h in range(MAX_FORECAST_HORIZON):
+        hour_idx = (current_hour + h) % 24
+        net_out = temporal_profile.hourly_out[hour_idx] - temporal_profile.hourly_in[hour_idx]
+        net_out *= (1.0 + trend_factor)
+        net_out = max(net_out, 0.0)  # only count net outflow
+
+        prev_cumulative = cumulative
+        cumulative += net_out
+
+        if cumulative >= drain_needed:
+            # Interpolate partial hour
+            remaining_in_hour = drain_needed - prev_cumulative
+            partial = remaining_in_hour / max(net_out, 1.0)
+            return float(h) + partial
+
+    return float('inf')
+
+
 class KalmanFlowFilter:
     """
     Kalman Filter for optimal flow state estimation.
