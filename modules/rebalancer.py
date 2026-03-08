@@ -2321,7 +2321,7 @@ class EVRebalancer:
                 self._set_last_decision_summary(
                     action="suppressed",
                     reason="capital_controls_blocked",
-                    dominant_input="daily_budget_sats",
+                    dominant_input=getattr(self, '_capital_control_blocker', 'daily_budget_sats'),
                     safety_block=True,
                     budget_blocked=True,
                 )
@@ -4424,20 +4424,36 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         )
                         rebalance_budget_limit = protected_limit
 
+                # Compute effective weekly budget for atomic reservation
+                _effective_weekly = cfg.weekly_budget_sats
+                if cfg.enable_proportional_budget:
+                    _weekly_rev = self.database.get_total_routing_revenue(now - 7 * 86400)
+                    _prop_weekly = int(_weekly_rev * cfg.proportional_budget_pct)
+                    _effective_weekly = max(cfg.weekly_budget_sats, _prop_weekly)
+
                 reserved, remaining = self.database.reserve_budget(
                     reservation_id=str(rebalance_id),
                     amount_sats=db_max_fee,
                     channel_id=db_to_channel,
                     budget_limit=rebalance_budget_limit,
-                    since_timestamp=since_24h
+                    since_timestamp=since_24h,
+                    weekly_budget_limit=_effective_weekly,
+                    weekly_since_timestamp=now - 7 * 86400,
                 )
                 reserved_budget = bool(reserved)
 
                 if not reserved_budget:
+                    # Determine which budget limit blocked the reservation:
+                    # remaining reflects the tighter of daily/weekly headroom.
+                    # If remaining > 0 but less than what daily alone would allow,
+                    # weekly was the binding constraint.
+                    _budget_blocker = "daily_budget_sats"
+                    if remaining > 0 and remaining < rebalance_budget_limit:
+                        _budget_blocker = "weekly_budget_sats"
                     self._set_last_decision_summary(
                         action="suppressed",
                         reason="budget_exhausted",
-                        dominant_input="daily_budget_sats",
+                        dominant_input=_budget_blocker,
                         safety_block=True,
                         budget_blocked=True,
                     )
@@ -4862,6 +4878,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     f"= {total_actual_spent} >= {effective_budget})",
                     level='warn'
                 )
+                self._capital_control_blocker = "daily_budget_sats"
                 return False
             if ext_reserved > 0:
                 self.plugin.log(
@@ -4869,6 +4886,32 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     f"(actual_spent={total_actual_spent}/{effective_budget})",
                     level='debug'
                 )
+
+            # --- Weekly budget check ---
+            effective_weekly = cfg.weekly_budget_sats
+
+            if cfg.enable_proportional_budget:
+                weekly_revenue = self.database.get_total_routing_revenue(now - 7 * 86400)
+                proportional_weekly = int(weekly_revenue * cfg.proportional_budget_pct)
+                effective_weekly = max(cfg.weekly_budget_sats, proportional_weekly)
+                self.plugin.log(
+                    f"CAPITAL CONTROL: Proportional weekly budget. "
+                    f"Revenue 7d: {weekly_revenue} sats, {cfg.proportional_budget_pct*100:.1f}% = {proportional_weekly} sats, "
+                    f"Effective weekly: {effective_weekly} sats (floor: {cfg.weekly_budget_sats})",
+                    level='debug'
+                )
+
+            weekly_fees_spent = self.database.get_total_rebalance_fees(now - 7 * 86400)
+            weekly_total_spent = weekly_fees_spent + ext_spent
+            if weekly_total_spent >= effective_weekly:
+                self.plugin.log(
+                    f"CAPITAL CONTROL: Weekly budget exceeded "
+                    f"(rebalance_fees_7d={weekly_fees_spent} + external_spent={ext_spent} "
+                    f"= {weekly_total_spent} >= {effective_weekly})",
+                    level='warn'
+                )
+                self._capital_control_blocker = "weekly_budget_sats"
+                return False
 
             return True
         except Exception as e:

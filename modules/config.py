@@ -43,6 +43,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'min_fee_ppm': int,
     'max_fee_ppm': int,
     'daily_budget_sats': int,
+    'weekly_budget_sats': int,
     'total_cost_budget_mode': str,
     'total_cost_budget_profit_pct': float,
     'total_cost_budget_profit_pct_cap': float,
@@ -170,6 +171,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
     'max_fee_ppm': (1, 100000),
     'daily_budget_sats': (0, 10000000),
+    'weekly_budget_sats': (0, 70_000_000),
     'total_cost_budget_profit_pct': (0.0, 1.0),
     'total_cost_budget_profit_pct_cap': (0.0, 1.0),
     'total_cost_budget_window_hours': (1, 168),
@@ -339,6 +341,7 @@ class Config:
     
     # Global Capital Controls
     daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period (fixed floor)
+    weekly_budget_sats: int = 35000        # Max rebalancing fees per 7-day window (hard ceiling)
     total_cost_budget_mode: str = 'fixed'  # 'fixed' or 'profit_pct' (global liquidity spend gate)
     total_cost_budget_profit_pct: float = 0.30  # Percent of net profit allocated to spend budget when mode=profit_pct
     total_cost_budget_profit_pct_cap: float = 0.75  # Hard cap for pct input (operator guard)
@@ -876,6 +879,9 @@ class ConfigSnapshot:
     # M-27: xpay/askrene parameters (were missing from snapshot)
     askrene_layer: str = 'xpay'
     askrene_max_age_sec: int = 900
+
+    # Weekly budget cap (hard ceiling over daily burst)
+    weekly_budget_sats: int = 35000
 
     # Version tracking
     version: int = 0

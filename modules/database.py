@@ -65,6 +65,95 @@ def _revenue_by_size_bucket_sql(conn, channel_id: str, window_days: int = 7) -> 
     return result
 
 
+def _reserve_budget_atomic(conn, reservation_id: str, amount_sats: int,
+                           channel_id: str, budget_limit: int,
+                           since_timestamp: int,
+                           weekly_budget_limit: int = None,
+                           weekly_since_timestamp: int = None) -> tuple:
+    """Atomically reserve budget, enforcing both daily and optional weekly limits.
+
+    This is a standalone function that accepts a raw sqlite3 connection so it
+    can be tested with in-memory databases without instantiating Database.
+
+    Args:
+        conn: sqlite3 connection (may have row_factory=sqlite3.Row or not)
+        reservation_id: Unique ID for this reservation
+        amount_sats: Amount to reserve
+        channel_id: Channel this reservation is for
+        budget_limit: Maximum daily budget in sats
+        since_timestamp: Start of daily budget period (e.g., 24h ago)
+        weekly_budget_limit: Optional maximum weekly budget in sats
+        weekly_since_timestamp: Optional start of weekly budget period (e.g., 7d ago)
+
+    Returns:
+        Tuple of (success: bool, remaining_budget: int)
+    """
+    now = int(time.time())
+
+    conn.execute("BEGIN IMMEDIATE")
+
+    # --- Daily check ---
+    spent_row = conn.execute(
+        "SELECT COALESCE(SUM(cost_sats), 0) FROM rebalance_costs WHERE timestamp >= ?",
+        (since_timestamp,),
+    ).fetchone()
+    daily_spent = spent_row[0] if spent_row else 0
+
+    reserved_row = conn.execute(
+        "SELECT COALESCE(SUM(reserved_sats), 0) FROM budget_reservations "
+        "WHERE status = 'active' AND reserved_at >= ?",
+        (since_timestamp,),
+    ).fetchone()
+    daily_reserved = reserved_row[0] if reserved_row else 0
+
+    daily_committed = daily_spent + daily_reserved
+    daily_remaining = budget_limit - daily_committed
+
+    if amount_sats > daily_remaining:
+        conn.execute("ROLLBACK")
+        return (False, daily_remaining)
+
+    # --- Weekly check (optional) ---
+    if weekly_budget_limit is not None and weekly_since_timestamp is not None:
+        weekly_spent_row = conn.execute(
+            "SELECT COALESCE(SUM(cost_sats), 0) FROM rebalance_costs WHERE timestamp >= ?",
+            (weekly_since_timestamp,),
+        ).fetchone()
+        weekly_spent = weekly_spent_row[0] if weekly_spent_row else 0
+
+        weekly_reserved_row = conn.execute(
+            "SELECT COALESCE(SUM(reserved_sats), 0) FROM budget_reservations "
+            "WHERE status = 'active' AND reserved_at >= ?",
+            (weekly_since_timestamp,),
+        ).fetchone()
+        weekly_reserved = weekly_reserved_row[0] if weekly_reserved_row else 0
+
+        weekly_committed = weekly_spent + weekly_reserved
+        weekly_remaining = weekly_budget_limit - weekly_committed
+
+        if amount_sats > weekly_remaining:
+            conn.execute("ROLLBACK")
+            return (False, weekly_remaining)
+    else:
+        weekly_remaining = None
+
+    # --- Insert reservation ---
+    conn.execute(
+        "INSERT INTO budget_reservations "
+        "(reservation_id, reserved_sats, reserved_at, job_channel_id, status) "
+        "VALUES (?, ?, ?, ?, 'active')",
+        (reservation_id, amount_sats, now, channel_id),
+    )
+    conn.execute("COMMIT")
+
+    # Return remaining as min(daily, weekly) - amount_sats
+    after_daily = daily_remaining - amount_sats
+    if weekly_remaining is not None:
+        after_weekly = weekly_remaining - amount_sats
+        return (True, min(after_daily, after_weekly))
+    return (True, after_daily)
+
+
 class Database:
     """
     SQLite database manager for the Revenue Operations plugin.
@@ -2328,7 +2417,9 @@ class Database:
 
     def reserve_budget(self, reservation_id: str, amount_sats: int,
                       channel_id: str, budget_limit: int,
-                      since_timestamp: int) -> Tuple[bool, int]:
+                      since_timestamp: int,
+                      weekly_budget_limit: int = None,
+                      weekly_since_timestamp: int = None) -> Tuple[bool, int]:
         """
         Atomically reserve budget for a rebalance operation.
 
@@ -2344,52 +2435,19 @@ class Database:
             channel_id: Channel this reservation is for
             budget_limit: Maximum daily budget in sats
             since_timestamp: Start of budget period (e.g., 24h ago)
+            weekly_budget_limit: Optional maximum weekly budget in sats
+            weekly_since_timestamp: Optional start of weekly budget period (e.g., 7d ago)
 
         Returns:
             Tuple of (success: bool, remaining_budget: int)
         """
         conn = self._get_connection()
-        now = int(time.time())
-
         try:
-            # Use a transaction to ensure atomicity
-            conn.execute("BEGIN IMMEDIATE")
-
-            # Get actual spent from rebalance_costs (source of truth for async sling jobs)
-            spent_row = conn.execute("""
-                SELECT COALESCE(SUM(cost_sats), 0) as spent
-                FROM rebalance_costs
-                WHERE timestamp >= ?
-            """, (since_timestamp,)).fetchone()
-            actual_spent = spent_row['spent'] if spent_row else 0
-
-            # Get active reservations (not yet spent or released)
-            reserved_row = conn.execute("""
-                SELECT COALESCE(SUM(reserved_sats), 0) as reserved
-                FROM budget_reservations
-                WHERE status = 'active' AND reserved_at >= ?
-            """, (since_timestamp,)).fetchone()
-            active_reserved = reserved_row['reserved'] if reserved_row else 0
-
-            # Calculate total committed budget
-            total_committed = actual_spent + active_reserved
-            remaining = budget_limit - total_committed
-
-            # Check if we have room for this reservation
-            if amount_sats > remaining:
-                conn.execute("ROLLBACK")
-                return (False, remaining)
-
-            # Create the reservation
-            conn.execute("""
-                INSERT INTO budget_reservations
-                (reservation_id, reserved_sats, reserved_at, job_channel_id, status)
-                VALUES (?, ?, ?, ?, 'active')
-            """, (reservation_id, amount_sats, now, channel_id))
-
-            conn.execute("COMMIT")
-            return (True, remaining - amount_sats)
-
+            return _reserve_budget_atomic(
+                conn, reservation_id, amount_sats, channel_id,
+                budget_limit, since_timestamp,
+                weekly_budget_limit, weekly_since_timestamp,
+            )
         except Exception as e:
             try:
                 conn.execute("ROLLBACK")

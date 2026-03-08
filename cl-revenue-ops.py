@@ -530,6 +530,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-weekly-budget-sats',
+    default='35000',
+    description='Max rebalancing fees to spend in 7 days - hard ceiling over daily burst limit (default: 35000)'
+)
+
+plugin.add_option(
     name='revenue-ops-total-cost-budget-mode',
     default='fixed',
     description="Unified spend gate mode for all liquidity costs: 'fixed' or 'profit_pct' (default: fixed)"
@@ -991,6 +997,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         rebalancer_plugin=options['revenue-ops-rebalancer'],
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
+        weekly_budget_sats=_safe_int('revenue-ops-weekly-budget-sats'),
         total_cost_budget_mode=options.get('revenue-ops-total-cost-budget-mode', 'fixed').lower(),
         total_cost_budget_profit_pct=_safe_float_opt('revenue-ops-total-cost-budget-profit-pct', '0.30'),
         total_cost_budget_profit_pct_cap=_safe_float_opt('revenue-ops-total-cost-budget-profit-pct-cap', '0.75'),
