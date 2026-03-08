@@ -439,7 +439,8 @@ class ChannelProfitabilityAnalyzer:
 
             self.plugin.log(
                 f"Profitability analysis complete: {len(results)} channels - "
-                f"{classifications}"
+                f"{classifications} [thread={threading.current_thread().name}, "
+                f"cache_age={int(time.time()) - old_timestamp}s]"
             )
 
             # Report health and liquidity to cl-hive for fleet coordination
