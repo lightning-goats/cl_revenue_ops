@@ -113,6 +113,37 @@ def compute_temporal_target(current_hour: int, kalman_velocity_per_hour: float,
     return min(target, max_target)
 
 
+# --- Temporal source selection constants ---
+SOURCE_TEMPORAL_WINDOW = 4
+SOURCE_QUIET_FACTOR = 0.85
+SOURCE_PEAK_FACTOR = 1.25
+SOURCE_QUIET_THRESHOLD = 0.1
+SOURCE_PEAK_THRESHOLD = 0.3
+
+
+def compute_temporal_source_factor(current_hour: int, available_balance: int,
+                                    temporal_profile) -> float:
+    """Compute temporal adjustment factor for source candidate opportunity cost.
+
+    Returns:
+        0.85 if source is in quiet period (cheap to drain)
+        1.25 if source is entering peak (expensive to drain)
+        1.0 otherwise or if profile not graduated
+    """
+    if not temporal_profile.graduated:
+        return 1.0
+
+    upcoming_demand = temporal_profile.predicted_outflow(current_hour, SOURCE_TEMPORAL_WINDOW)
+    demand_ratio = upcoming_demand / max(available_balance, 1)
+
+    if demand_ratio < SOURCE_QUIET_THRESHOLD:
+        return SOURCE_QUIET_FACTOR
+    elif demand_ratio > SOURCE_PEAK_THRESHOLD:
+        return SOURCE_PEAK_FACTOR
+    else:
+        return 1.0
+
+
 class JobStatus(Enum):
     """Status of a sling background job."""
     PENDING = "pending"
@@ -4007,7 +4038,24 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 # Balanced: neutral
                 flow_multiplier = 1.0
 
-            turnover_weight = base_turnover_weight * flow_multiplier
+            # Temporal source bias: prefer quiet-period sources
+            temporal_factor = 1.0
+            try:
+                temporal_json = self.database.load_temporal_profile(cid)
+                if temporal_json:
+                    import json
+                    from modules.flow_analysis import TemporalProfile
+                    from datetime import datetime, timezone
+                    _tp = TemporalProfile.from_dict(json.loads(temporal_json))
+                    _current_hour = datetime.now(timezone.utc).hour
+                    _balance_sats = int(info.get("to_us_msat", 0)) // 1000
+                    temporal_factor = compute_temporal_source_factor(
+                        _current_hour, _balance_sats, _tp
+                    )
+            except Exception:
+                temporal_factor = 1.0
+
+            turnover_weight = base_turnover_weight * flow_multiplier * temporal_factor
             weighted_opp_cost = int(source_fee_ppm * turnover_weight)
 
             # =================================================================

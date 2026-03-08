@@ -219,3 +219,74 @@ def test_demand_sizing_ungraduated_returns_zero():
         capacity=1_000_000,
     )
     assert target == 0
+
+
+def test_source_quiet_discount():
+    """Source in quiet period → 0.85x opportunity cost factor."""
+    from modules.rebalancer import compute_temporal_source_factor
+
+    tp = _make_temporal_profile(
+        graduated=True,
+        hourly_out=[100.0] * 24,  # low demand
+        hourly_in=[0.0] * 24,
+        quiet_hours=[0, 1, 2, 3, 4, 5],
+    )
+
+    factor = compute_temporal_source_factor(
+        current_hour=3,  # quiet hour
+        available_balance=100000,
+        temporal_profile=tp,
+    )
+    assert factor == 0.85
+
+
+def test_source_peak_penalty():
+    """Source entering peak → 1.25x opportunity cost factor."""
+    from modules.rebalancer import compute_temporal_source_factor
+
+    tp = _make_temporal_profile(
+        graduated=True,
+        hourly_out=[10000.0] * 24,  # high demand
+        hourly_in=[0.0] * 24,
+    )
+
+    # demand_ratio = (4 * 10000) / 50000 = 0.8 > 0.3 → peak
+    factor = compute_temporal_source_factor(
+        current_hour=12,
+        available_balance=50000,
+        temporal_profile=tp,
+    )
+    assert factor == 1.25
+
+
+def test_source_ungraduated_neutral():
+    """Ungraduated profile → 1.0x (no temporal adjustment)."""
+    from modules.rebalancer import compute_temporal_source_factor
+
+    tp = _make_temporal_profile(graduated=False)
+
+    factor = compute_temporal_source_factor(
+        current_hour=3,
+        available_balance=100000,
+        temporal_profile=tp,
+    )
+    assert factor == 1.0
+
+
+def test_source_moderate_demand_neutral():
+    """Moderate demand ratio → 1.0x."""
+    from modules.rebalancer import compute_temporal_source_factor
+
+    tp = _make_temporal_profile(
+        graduated=True,
+        hourly_out=[1000.0] * 24,
+        hourly_in=[0.0] * 24,
+    )
+
+    # demand_ratio = (4 * 1000) / 26666 ≈ 0.15
+    factor = compute_temporal_source_factor(
+        current_hour=12,
+        available_balance=26666,
+        temporal_profile=tp,
+    )
+    assert factor == 1.0  # between 0.1 and 0.3 → neutral
