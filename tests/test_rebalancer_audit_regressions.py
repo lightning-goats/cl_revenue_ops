@@ -106,8 +106,7 @@ class TestNNLBBudgetMultiplier:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=True, enable_proportional_budget=False)
-        clboss = MagicMock()
-        return EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        return EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
 
     # -- Healthy / stable tier -> 1.0 --
     def test_stable_tier_returns_1_0(self, mock_plugin, mock_database):
@@ -211,8 +210,7 @@ class TestNNLBProfitThresholdAdjustment:
             rebalance_min_profit=min_profit,
             rebalance_min_profit_ppm=min_profit_ppm,
         )
-        clboss = MagicMock()
-        return EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        return EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
 
     def test_struggling_node_gets_lower_threshold(self, mock_plugin, mock_database):
         """Struggling (multiplier=2.0) -> threshold is halved."""
@@ -591,8 +589,7 @@ class TestHotChannelProfitBudgetFloor:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=True, enable_proportional_budget=False)
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
         return r
 
     def test_small_daily_contrib_gets_floor_of_1(self, mock_plugin, mock_database):
@@ -644,8 +641,7 @@ class TestHotChannelProfitBudgetFloor:
 
         # Config defaults have hot_channel_protection_enabled=True
         cfg = Config(dry_run=True, enable_proportional_budget=False)
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         # Build a mock snapshot with the required attributes
         snap = MagicMock()

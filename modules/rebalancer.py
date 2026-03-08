@@ -4,8 +4,7 @@ EV-Based Rebalancer module for cl-revenue-ops
 MODULE 3: EV-Based Rebalancing (Profit-Aware with Opportunity Cost)
 
 This module implements Expected Value (EV) based rebalancing decisions.
-Unlike clboss which often makes negative EV rebalances, this module only
-triggers rebalances when the math shows positive expected profit.
+This module only triggers rebalances when the math shows positive expected profit.
 
 Architecture Pattern: "Strategist, Manager, and Driver"
 - STRATEGIST (EVRebalancer): Calculates EV, determines IF and HOW MUCH to rebalance
@@ -30,7 +29,6 @@ from pyln.client import Plugin, RpcError
 
 from .config import Config, ConfigSnapshot
 from .database import Database
-from .clboss_manager import ClbossManager, ClbossTags
 from .hive_bridge import CoordinationInputs
 from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
 from .utils import parse_msat as _shared_parse_msat
@@ -1992,13 +1990,11 @@ class EVRebalancer:
     """
 
     def __init__(self, plugin: Plugin, config: Config, database: Database,
-                 clboss_manager: ClbossManager,
                  policy_manager: Optional[PolicyManager] = None,
                  hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
         self.plugin = plugin
         self.config = config
         self.database = database
-        self.clboss = clboss_manager
         self.policy_manager = policy_manager
         self.hive_bridge = hive_bridge
         self._pending: Dict[str, int] = {}
@@ -4330,24 +4326,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         reserved_budget = False
         job_started = False
         try:
-            # Ensure channels are unmanaged from clboss.
-            # Unmanage ALL source candidates since Sling may use any of them.
-            source_peer_ids = getattr(candidate, "source_candidate_peer_ids", []) or []
-            seen_sources = set()
-            for i, source_scid in enumerate(candidate.source_candidates):
-                if source_scid in seen_sources:
-                    continue
-                seen_sources.add(source_scid)
-                peer_id = source_peer_ids[i] if i < len(source_peer_ids) and source_peer_ids[i] else candidate.primary_source_peer_id
-                self.clboss.ensure_unmanaged_for_channel(
-                    str(source_scid), str(peer_id),
-                    ClbossTags.FEE_AND_BALANCE, self.database
-                )
-            self.clboss.ensure_unmanaged_for_channel(
-                str(candidate.to_channel), str(candidate.to_peer_id),
-                ClbossTags.FEE_AND_BALANCE, self.database
-            )
-
             # Validation: Return error on empty/None channel IDs (HO-01)
             if not candidate.from_channel or not candidate.to_channel:
                 self._set_last_decision_summary(

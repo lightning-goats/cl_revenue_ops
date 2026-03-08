@@ -3,8 +3,6 @@
 
 # Core settings
 revenue-ops-dry-run=false
-revenue-ops-clboss-enabled=true
-
 # Fee management (competitive but profitable)
 revenue-ops-min-fee-ppm=100
 revenue-ops-max-fee-ppm=2500

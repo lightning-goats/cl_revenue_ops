@@ -2,21 +2,9 @@
 """
 cl-revenue-ops: A Revenue Operations Plugin for Core Lightning
 
-This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
-automated manager. While clboss handles channel creation and node reliability,
-this plugin overrides clboss for fee setting and rebalancing decisions to 
-maximize profitability based on economic principles rather than heuristics.
-
-MANAGER-OVERRIDE PATTERN:
--------------------------
-Before changing any channel state, this plugin checks if the peer is managed 
-by clboss. If it is, we issue the `clboss-unmanage` command for that specific 
-peer and tag (e.g., lnfee) to prevent clboss from reverting our changes.
-
-This allows us to:
-1. Let clboss handle what it's good at (channel creation, peer selection)
-2. Take over the economic decisions (fee setting, rebalancing) where we can
-   apply more sophisticated algorithms
+This plugin acts as a "Revenue Operations" layer for Lightning nodes,
+making data-driven decisions to maximize profitability based on economic
+principles rather than heuristics.
 
 Dependencies:
 - pyln-client: Core Lightning plugin framework
@@ -47,7 +35,6 @@ from pyln.client import Plugin, RpcError
 from modules.flow_analysis import FlowAnalyzer, ChannelState
 from modules.fee_controller import PIDFeeController
 from modules.rebalancer import EVRebalancer
-from modules.clboss_manager import ClbossManager
 from modules.config import Config
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -430,7 +417,6 @@ class ThreadSafePluginProxy:
 flow_analyzer: Optional[FlowAnalyzer] = None
 fee_controller: Optional[PIDFeeController] = None
 rebalancer: Optional[EVRebalancer] = None
-clboss_manager: Optional[ClbossManager] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
 profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
@@ -529,12 +515,6 @@ plugin.add_option(
     name='revenue-ops-flow-window-days',
     default='7',
     description='Number of days to analyze for flow calculation (default: 7)'
-)
-
-plugin.add_option(
-    name='revenue-ops-clboss-enabled',
-    default='true',
-    description='Whether to interact with clboss for unmanage commands (default: true)'
 )
 
 plugin.add_option(
@@ -895,7 +875,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, clboss_manager, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, boltz_manager
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, boltz_manager
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -1003,7 +983,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
-        clboss_enabled=options['revenue-ops-clboss-enabled'].lower() == 'true',
         rebalancer_plugin=options['revenue-ops-rebalancer'],
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
         total_cost_budget_mode=options.get('revenue-ops-total-cost-budget-mode', 'fixed').lower(),
@@ -1253,16 +1232,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log(f"Error snapshotting peer connections: {e}", level='warn')
         plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')  # SEC-2: Stack traces at debug level
     
-    # Initialize clboss manager (handles unmanage commands)
-    clboss_manager = ClbossManager(safe_plugin, config)
-    # P0-1 FIX: Reconcile orphaned unmanage records from prior crash/restart
-    try:
-        reconcile_result = clboss_manager.reconcile_unmanaged(database)
-        if not reconcile_result.get("skipped") and reconcile_result.get("orphaned_count", 0) > 0:
-            plugin.log(f"Clboss reconciliation: remanaged {reconcile_result.get('remanaged', 0)} orphaned peers")
-    except Exception as e:
-        plugin.log(f"Clboss reconciliation failed (non-fatal): {e}", level='warn')
-
     # Initialize policy manager (v1.4: Policy-Driven Architecture)
     policy_manager = PolicyManager(database, safe_plugin)
     plugin.log("PolicyManager initialized for peer-level fee/rebalance policies")
@@ -1344,9 +1313,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize analysis modules with profitability analyzer and hive bridge
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
     capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager)
-    fee_controller = PIDFeeController(safe_plugin, config, database, clboss_manager, policy_manager, profitability_analyzer, hive_bridge)
+    fee_controller = PIDFeeController(safe_plugin, config, database, policy_manager, profitability_analyzer, hive_bridge)
     rebalancer = EVRebalancer(
-        safe_plugin, config, database, clboss_manager, policy_manager,
+        safe_plugin, config, database, policy_manager,
         hive_bridge=hive_bridge
     )
     rebalancer.set_profitability_analyzer(profitability_analyzer)
@@ -1856,7 +1825,6 @@ def run_fee_adjustment():
     Module 2: Hill Climbing Fee Controller (Dynamic Pricing)
     
     Adjust channel fees using Perturb & Observe optimization.
-    Before setting fees, unmanage from clboss to prevent conflicts.
     """
     if fee_controller is None:
         plugin.log("Fee controller not initialized", level='error')
@@ -2542,7 +2510,7 @@ def revenue_capacity_report(plugin: Plugin, **kwargs):
 @plugin.method("revenue-set-fee")
 def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool = False) -> Dict[str, Any]:
     """
-    Manually set fee for a channel (with clboss unmanage).
+    Manually set fee for a channel.
 
     Usage: lightning-cli revenue-set-fee channel_id fee_ppm [force=false]
     """
@@ -2741,19 +2709,6 @@ def revenue_rebalance(plugin: Plugin,
         return {"status": "error", "error": str(e)}
 
 
-@plugin.method("revenue-clboss-status")
-def revenue_clboss_status(plugin: Plugin) -> Dict[str, Any]:
-    """
-    Check which channels are currently unmanaged from clboss.
-    
-    Usage: lightning-cli revenue-clboss-status
-    """
-    if clboss_manager is None:
-        return {"error": "Plugin not fully initialized"}
-    
-    return clboss_manager.get_unmanaged_status()
-
-
 @plugin.method("revenue-profitability")
 def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -2950,27 +2905,6 @@ def revenue_history(plugin: Plugin) -> Dict[str, Any]:
         return {"status": "error", "error": str(e)}
 
 
-@plugin.method("revenue-remanage")
-def revenue_remanage(plugin: Plugin, peer_id: str, tag: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Re-enable clboss management for a peer (release our override).
-    
-    Usage: lightning-cli revenue-remanage peer_id [tag]
-    """
-    if clboss_manager is None:
-        return {"error": "Plugin not fully initialized"}
-
-    # L-22: Validate peer_id format (66-char hex pubkey)
-    if not re.match(r'^[0-9a-fA-F]{66}$', peer_id):
-        return {"error": f"Invalid peer_id format: expected 66-character hex pubkey"}
-
-    try:
-        result = clboss_manager.remanage(peer_id, tag, database=database)
-        return {"status": "success", "peer_id": peer_id, **result}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
 @plugin.method("revenue-ignore")
 def revenue_ignore(plugin: Plugin, peer_id: str, reason: str = "manual") -> Dict[str, Any]:
     """
@@ -3111,7 +3045,7 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
       dynamic  - Hill Climbing + Scarcity Pricing (default)
       static   - Fixed fee (requires fee_ppm)
       hive     - Zero/low fee for fleet members (cl-hive integration)
-      passive  - Do not manage (CLBOSS/manual control)
+      passive  - Do not manage (manual control)
 
     Rebalance Modes:
       enabled     - Full rebalancing allowed (default)

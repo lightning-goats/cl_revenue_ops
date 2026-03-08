@@ -67,7 +67,6 @@ from pyln.client import Plugin, RpcError
 
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
-from .clboss_manager import ClbossManager, ClbossTags
 from .hive_bridge import CoordinationInputs
 from .policy_manager import PolicyManager, FeeStrategy
 from .utils import parse_msat
@@ -3272,8 +3271,7 @@ class HillClimbingFeeController:
     2. Bayesian: DTS maintains posterior over fee-revenue relationship
     3. Feedback Control: PID manages balance via closed-loop multiplier
     4. Separation of Concerns: Market pricing, balance mgmt, and safety are independent
-    5. clboss override: Unmanages from clboss before setting fees
-    6. Fleet-aware: Coordinates with cl-hive for competition avoidance
+    5. Fleet-aware: Coordinates with cl-hive for competition avoidance
 
     Legacy paths (ENABLE_DTS_PID=False):
     - Thompson+AIMD with scarcity, saturation floors/ceilings, cold-start
@@ -3512,7 +3510,6 @@ class HillClimbingFeeController:
     ABS_MAX_FEE_PPM = 100_000
 
     def __init__(self, plugin: Plugin, config: Config, database: Database,
-                 clboss_manager: ClbossManager,
                  policy_manager: Optional[PolicyManager] = None,
                  profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
                  hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
@@ -3523,7 +3520,6 @@ class HillClimbingFeeController:
             plugin: Reference to the pyln Plugin
             config: Configuration object
             database: Database instance
-            clboss_manager: ClbossManager for handling overrides
             policy_manager: Optional PolicyManager for peer-level fee policies
             profitability_analyzer: Optional profitability analyzer for ROI-based adjustments
             hive_bridge: Optional HiveFeeIntelligenceBridge for competitor intelligence
@@ -3531,7 +3527,6 @@ class HillClimbingFeeController:
         self.plugin = plugin
         self.config = config
         self.database = database
-        self.clboss = clboss_manager
         self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
         self.hive_bridge = hive_bridge
@@ -7790,14 +7785,13 @@ class HillClimbingFeeController:
                        enforce_limits: bool = True,
                        channel_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Set the fee for a channel, handling clboss override.
+        Set the fee for a channel.
 
-        MANAGER-OVERRIDE PATTERN:
+        Steps:
         1. Validate fee is within configured limits
         2. Get peer ID for the channel
-        3. Call clboss-unmanage to prevent conflicts
-        4. Set the fee using setchannelfee
-        5. Record the change
+        3. Set the fee using setchannelfee
+        4. Record the change
 
         Args:
             channel_id: Channel to update
@@ -7875,17 +7869,7 @@ class HillClimbingFeeController:
             peer_id = channel_info.get("peer_id", "")
             old_fee_ppm = channel_info.get("fee_proportional_millionths", 0)
             
-            # Step 1: Unmanage from clboss
-            # This is critical - we MUST do this before setting fees
-            if not self.clboss.ensure_unmanaged_for_channel(
-                channel_id, peer_id, ClbossTags.FEE_AND_BALANCE, self.database
-            ):
-                self.plugin.log(
-                    f"Warning: Could not unmanage {peer_id} from clboss, "
-                    "fee may be reverted", level='warn'
-                )
-            
-            # Step 2: Set the fee
+            # Set the fee
             if self.config.dry_run:
                 self.plugin.log(f"[DRY RUN] Would set fee for {channel_id} to {fee_ppm} PPM")
                 result["success"] = True

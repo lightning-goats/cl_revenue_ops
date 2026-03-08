@@ -284,8 +284,7 @@ class TestAdjustAllFeesSkipClassification:
         from modules.fee_controller import HillClimbingFeeController
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         cfg = MockConfigSnapshot(
             hive_fee_ppm=0,
@@ -610,9 +609,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -641,9 +638,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -668,9 +663,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -692,9 +685,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -721,9 +712,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -746,9 +735,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
         fc.ENABLE_REBALANCE_FLOOR = False  # Disable feature
 
         channel_id = "123x456x0"
@@ -769,9 +756,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -798,9 +783,7 @@ class TestSaturationProtectionFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         capacity_sats = 5_000_000
@@ -820,9 +803,7 @@ class TestSaturationProtectionFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         capacity_sats = 5_000_000  # 5M sats -> 25 ppm base floor
@@ -848,9 +829,7 @@ class TestSaturationProtectionFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         capacity_sats = 5_000_000
@@ -890,9 +869,7 @@ class TestSaturationProtectionFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         global_min = 5
@@ -928,9 +905,7 @@ class TestSaturationProtectionFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
         fc.ENABLE_SATURATION_FLOOR = False  # Disable feature
 
         channel_id = "123x456x0"
@@ -951,9 +926,7 @@ class TestSaturationProtectionFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
         fc.ENABLE_SATURATION_DRAIN = True  # Ensure drain ceiling is enabled
 
         channel_id = "123x456x0"
@@ -981,9 +954,7 @@ class TestSaturationProtectionFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
         fc.ENABLE_SATURATION_DRAIN = False
 
         channel_id = "123x456x0"
@@ -1014,9 +985,7 @@ class TestSaturation_Drain_Ceiling:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         current_fee = 500
@@ -1040,9 +1009,7 @@ class TestSaturation_Drain_Ceiling:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         current_fee = 500
@@ -1060,9 +1027,7 @@ class TestSaturation_Drain_Ceiling:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         current_fee = 500
@@ -1092,9 +1057,7 @@ class TestSaturation_Drain_Ceiling:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
         fc.ENABLE_SATURATION_DRAIN = False  # Disable feature
 
         channel_id = "123x456x0"
@@ -1110,9 +1073,7 @@ class TestSaturation_Drain_Ceiling:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         channel_id = "123x456x0"
         capacity_sats = 5_000_000
@@ -1148,12 +1109,10 @@ class TestSaturation_Drain_AdjustChannelFee:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
         fc = HillClimbingFeeController(
             mock_plugin,
             config,
             mock_database,
-            clboss,
             policy_manager=policy_manager,
             hive_bridge=hive_bridge,
         )
@@ -1473,8 +1432,7 @@ class TestSuccessRateAdjustedFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-        return HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        return HillClimbingFeeController(mock_plugin, config, mock_database)
 
     def _cost_history(self, cost_ppm=100, n=3):
         """Return n cost records that average to cost_ppm per 1M sats."""
@@ -1610,8 +1568,7 @@ class TestAuditRound8Regressions:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        clboss = MagicMock()
-        return HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        return HillClimbingFeeController(mock_plugin, config, mock_database)
 
     # --- P1-1: Flow-adjusted ceiling cannot return 0 ---
 
@@ -1817,8 +1774,7 @@ class TestCalculateFloorOpener:
     def test_remote_opener_lower_floor(self, mock_plugin, mock_database):
         from modules.fee_controller import HillClimbingFeeController
         config = MagicMock()
-        clboss = MagicMock()
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         chain_costs = {"open_cost_sats": 5000, "close_cost_sats": 3000, "sat_per_vbyte": 5.0}
         floor_local = fc._calculate_floor(5_000_000, chain_costs=chain_costs, opener="local")
@@ -1834,8 +1790,7 @@ class TestCalculateFloorOpener:
     def test_default_opener_is_local(self, mock_plugin, mock_database):
         from modules.fee_controller import HillClimbingFeeController
         config = MagicMock()
-        clboss = MagicMock()
-        fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, config, mock_database)
 
         chain_costs = {"open_cost_sats": 5000, "close_cost_sats": 3000, "sat_per_vbyte": 5.0}
         floor_default = fc._calculate_floor(5_000_000, chain_costs=chain_costs)
@@ -1849,12 +1804,11 @@ class TestLastDecisionSummary:
         from modules.fee_controller import PIDFeeController
 
         cfg = Config()
-        clboss = MagicMock()
         mock_database.prune_expired_fee_anchors.return_value = None
         mock_database.get_all_fee_anchors.return_value = []
         mock_database.get_all_channel_states.return_value = []
 
-        fc = PIDFeeController(mock_plugin, cfg, mock_database, clboss)
+        fc = PIDFeeController(mock_plugin, cfg, mock_database)
 
         adjustments = fc.adjust_all_fees()
         summary = fc.get_last_decision_summary()
@@ -1872,10 +1826,9 @@ class TestCoordinationInputs:
         from modules.fee_controller import PIDFeeController
 
         cfg = Config()
-        clboss = MagicMock()
         mock_database.prune_expired_fee_anchors.return_value = None
         mock_database.get_all_fee_anchors.return_value = []
-        return PIDFeeController(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        return PIDFeeController(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
 
     def test_fee_controller_uses_empty_coordination_inputs_when_hive_unavailable(self, mock_plugin, mock_database):
         fc = self._make_fc(mock_plugin, mock_database, hive_bridge=None)

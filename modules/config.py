@@ -153,15 +153,12 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'base_fee_msat': int,
     'flow_window_days': int,
     'estimated_open_cost_sats': int,
-    'clboss_unmanage_duration_hours': int,
     'target_flow': int,
     'source_threshold': float,
     'sink_threshold': float,
     'rebalancer_plugin': str,
     'enable_flow_asymmetry': bool,
     'enable_peer_sync': bool,
-    # AUDIT FIX C-1: clboss_enabled was missing, causing bool set as string
-    'clboss_enabled': bool,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -256,7 +253,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_cooldown_hours': (1, 168),
     'futility_cooldown_hours': (1, 168),
     'target_flow': (1000, 100000000),
-    'clboss_unmanage_duration_hours': (1, 168),
     'estimated_open_cost_sats': (0, 1000000),
     'expansion_treasury_max_actions': (1, 10),
     'expansion_treasury_min_deficit_sats': (0, 100000000),
@@ -334,10 +330,6 @@ class Config:
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
     futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
     inbound_fee_estimate_ppm: int = 200  # Network routing cost estimate in PPM
-    
-    # clboss integration
-    clboss_enabled: bool = True    # Whether to use clboss-unmanage
-    clboss_unmanage_duration_hours: int = 24  # Keep unmanaged after rebalance
     
     # Rebalancer plugin selection
     rebalancer_plugin: str = 'sling'  # Only sling is supported
@@ -765,10 +757,6 @@ class ConfigSnapshot:
     futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
 
-    # clboss integration
-    clboss_enabled: bool
-    clboss_unmanage_duration_hours: int
-    
     # Rebalancer plugin selection
     rebalancer_plugin: str
     

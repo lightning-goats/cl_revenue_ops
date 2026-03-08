@@ -53,10 +53,7 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=True, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
         r.job_manager.start_job = MagicMock(return_value={"success": True})
 
         mock_database.record_rebalance = MagicMock(return_value=123)
@@ -75,10 +72,7 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
         r.job_manager.start_job = MagicMock(return_value={"success": False, "error": "boom"})
 
         mock_database.record_rebalance = MagicMock(return_value=456)
@@ -94,42 +88,13 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
         mock_database.release_budget_reservation.assert_called_once_with('456')
 
 
-class TestMultiSourceClbossUnmanage:
-    def test_execute_rebalance_unmanages_each_source_with_its_peer_id(self, mock_plugin, mock_database):
-        from modules.config import Config
-        from modules.rebalancer import EVRebalancer
-
-        cfg = Config(dry_run=True, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
-
-        mock_database.record_rebalance = MagicMock(return_value=1)
-        mock_database.update_rebalance_result = MagicMock()
-
-        cand = _candidate(source_candidates=["111x222x0", "333x444x0"])
-        cand.source_candidate_peer_ids = ["02" + "c" * 64, "02" + "d" * 64]
-
-        r.execute_rebalance(cand)
-
-        # First two calls are for the sources; last is for destination.
-        assert clboss.ensure_unmanaged_for_channel.call_count >= 3
-        src_calls = clboss.ensure_unmanaged_for_channel.call_args_list[:2]
-        assert src_calls[0][0][0] == "111x222x0"
-        assert src_calls[0][0][1] == cand.source_candidate_peer_ids[0]
-        assert src_calls[1][0][0] == "333x444x0"
-        assert src_calls[1][0][1] == cand.source_candidate_peer_ids[1]
-
-
 class TestLastHopFeeUnits:
     def test_get_last_hop_fee_converts_base_fee_to_ppm(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=True)
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         peer_id = "02" + "e" * 64
         our_id = "02" + "f" * 64
@@ -156,10 +121,7 @@ class TestManualRebalanceBudgetBypass:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
         r._check_capital_controls = MagicMock(return_value=True)
         r._estimate_inbound_fee = MagicMock(return_value=0)
         r._get_channels_with_balances = MagicMock(return_value={
@@ -712,9 +674,7 @@ class TestPushCandidateDetection:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
         return r
 
     def test_push_candidates_generated_for_overfull_with_failures(self, mock_plugin, mock_database):
@@ -788,10 +748,7 @@ class TestExecuteOnceDiagnostic:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         channel_id = "111x222x0"
 
@@ -818,10 +775,7 @@ class TestExecuteOnceDiagnostic:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         channel_id = "111x222x0"
         r._get_channels_with_balances = MagicMock(return_value={
@@ -849,10 +803,7 @@ class TestExecuteOnceManual:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         from_ch = "111x222x0"
         to_ch = "333x444x0"
@@ -878,10 +829,7 @@ class TestExecuteOnceManual:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         from_ch = "111x222x0"
         to_ch = "333x444x0"
@@ -912,10 +860,7 @@ class TestFleetPathInjection:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=True, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
         r.job_manager.start_job = MagicMock(return_value={"success": True})
         mock_database.record_rebalance = MagicMock(return_value=100)
         mock_database.update_rebalance_result = MagicMock()
@@ -1077,10 +1022,7 @@ class TestFleetAwareSpread:
         cfg = Config(dry_run=True, enable_proportional_budget=False,
                      rebalance_min_profit=0, rebalance_min_profit_ppm=0,
                      hive_rebalance_tolerance=0.001)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         # Mock database methods used by _select_source_candidates
         mock_database.get_channel_state.return_value = {
@@ -1417,8 +1359,7 @@ class TestMutualBenefitScoring:
         cfg = Config(dry_run=True, enable_proportional_budget=False,
                      rebalance_min_profit=0, rebalance_min_profit_ppm=0,
                      hive_rebalance_tolerance=0.001)
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         mock_database.get_channel_state.return_value = {
             "state": "balanced", "sats_in": 0, "sats_out": 0
@@ -1578,9 +1519,6 @@ class TestCircularRebalance:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
         hive_bridge.check_circular_flow_risk.return_value = {"risk": False}
@@ -1598,7 +1536,7 @@ class TestCircularRebalance:
             "amount_sats": 50000
         }
 
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        r = EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
 
         # Both peers are hive
         r.policy_manager = MagicMock()
@@ -1622,9 +1560,6 @@ class TestCircularRebalance:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
         hive_bridge.check_circular_flow_risk.return_value = {"risk": False}
@@ -1638,7 +1573,7 @@ class TestCircularRebalance:
         # Circular rebalance fails
         hive_bridge.execute_circular_rebalance.side_effect = Exception("RPC not available")
 
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        r = EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
         r.policy_manager = MagicMock()
         r.policy_manager.is_hive_peer.return_value = True
 
@@ -1662,9 +1597,6 @@ class TestCircularRebalance:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
         hive_bridge.check_circular_flow_risk.return_value = {"risk": False}
@@ -1678,7 +1610,7 @@ class TestCircularRebalance:
 
         cand = _candidate()
 
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        r = EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
 
         # Dest is NOT hive, source IS hive
         r.policy_manager = MagicMock()
@@ -1828,9 +1760,6 @@ class TestCircularFlowRisk:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
         hive_bridge.check_circular_flow_risk.return_value = {
@@ -1839,7 +1768,7 @@ class TestCircularFlowRisk:
             "total_cost_sats": 500
         }
 
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        r = EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
         mock_database.record_rebalance = MagicMock(return_value=123)
         mock_database.update_rebalance_result = MagicMock()
 
@@ -1855,15 +1784,12 @@ class TestCircularFlowRisk:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=True, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
         hive_bridge.check_circular_flow_risk.return_value = {"risk": False}
         hive_bridge.query_fleet_rebalance_path.return_value = None
 
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        r = EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
         mock_database.record_rebalance = MagicMock(return_value=123)
         mock_database.update_rebalance_result = MagicMock()
         r.job_manager.start_job = MagicMock(return_value={"success": True})
@@ -1880,16 +1806,13 @@ class TestCircularFlowRisk:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=True, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
         hive_bridge = MagicMock()
         hive_bridge.check_rebalance_conflict.return_value = {"conflict": False}
         # Fails open
         hive_bridge.check_circular_flow_risk.return_value = {"risk": False, "reason": "exception"}
         hive_bridge.query_fleet_rebalance_path.return_value = None
 
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss, hive_bridge=hive_bridge)
+        r = EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
         mock_database.record_rebalance = MagicMock(return_value=123)
         mock_database.update_rebalance_result = MagicMock()
         r.job_manager.start_job = MagicMock(return_value={"success": True})
@@ -1917,8 +1840,7 @@ class TestAuditTurn2PushPeerIds:
             rebalance_max_amount=500_000,
             kelly_fraction=0.5,
         )
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         src_info = {"peer_id": "02" + "a" * 64, "fee_ppm": 500, "capacity": 1_000_000}
         dest_scids = ["100x1x0", "200x2x0"]
@@ -1941,8 +1863,7 @@ class TestAuditTurn2PushPeerIds:
             rebalance_max_amount=500_000,
             kelly_fraction=0.5,
         )
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         src_info = {"peer_id": "02" + "a" * 64, "fee_ppm": 500, "capacity": 1_000_000}
         dest_scids = ["100x1x0"]
@@ -1963,10 +1884,7 @@ class TestAuditTurn2ManualRebalanceZeroFee:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=True, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
         r._check_capital_controls = MagicMock(return_value=True)
         mock_database.record_rebalance = MagicMock(return_value=123)
         mock_database.update_rebalance_result = MagicMock()
@@ -1999,8 +1917,7 @@ class TestAuditTurn2HotChannelBudgetFilter:
             enable_proportional_budget=False,
             hot_channel_protection_enabled=True,
         )
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         # Simulate budget exceeded with hot-channel enabled
         mock_database.get_total_rebalance_fees = MagicMock(return_value=200)  # > 100 budget
@@ -2022,8 +1939,7 @@ class TestAuditTurn2HotChannelBudgetFilter:
             enable_proportional_budget=False,
             hot_channel_protection_enabled=False,
         )
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         mock_database.get_total_rebalance_fees = MagicMock(return_value=200)
         mock_plugin.rpc.listfunds.return_value = {
@@ -2042,8 +1958,7 @@ class TestAuditTurn2HotChannelBudgetFilter:
             daily_budget_sats=1000,
             enable_proportional_budget=False,
         )
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         mock_database.get_total_rebalance_fees = MagicMock(return_value=100)  # < 1000 budget
         mock_plugin.rpc.listfunds.return_value = {
@@ -2069,8 +1984,7 @@ class TestVolumeBasedSizingFix:
             flow_window_days=7,
             enable_velocity_gate=False,
         )
-        clboss = MagicMock()
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         # Mock channel state with low volume (10k sats/day * 7 days = 70k total)
         mock_database.get_channel_state.return_value = {
@@ -2133,10 +2047,9 @@ class TestNoDeplestedSourceDiagnostics:
             high_liquidity_threshold=0.80,
             sling_available=True,
         )
-        clboss = MagicMock()
         pm = MagicMock(spec=PolicyManager)
         pm.should_rebalance.return_value = True
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
         r.policy_manager = pm
         r.job_manager = MagicMock()
         r.job_manager.slots_available.return_value = 5
@@ -2206,10 +2119,7 @@ class TestLastDecisionSummary:
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel = MagicMock(return_value=True)
-
-        r = EVRebalancer(mock_plugin, cfg, mock_database, clboss)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
         mock_database.record_rebalance = MagicMock(return_value=456)
         mock_database.update_rebalance_result = MagicMock()
         mock_database.reserve_budget = MagicMock(return_value=(False, 0))

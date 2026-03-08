@@ -314,11 +314,6 @@ class TestRemoveClosedChannelDataCleanup:
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS clboss_unmanaged (
-                peer_id TEXT PRIMARY KEY
-            )
-        """)
-        conn.execute("""
             CREATE TABLE IF NOT EXISTS kalman_state (
                 channel_id TEXT PRIMARY KEY,
                 flow_ratio REAL DEFAULT 0.0,

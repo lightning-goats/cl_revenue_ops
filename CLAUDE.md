@@ -36,7 +36,7 @@ sling (Rebalancing Engine - required)
 Core Lightning
 ```
 
-### Module Organization (11 modules)
+### Module Organization (10 modules)
 
 | Module | Purpose |
 |--------|---------|
@@ -47,7 +47,6 @@ Core Lightning
 | `profitability_analyzer.py` | P&L calculation, ROC metrics, capacity recommendations |
 | `capacity_planner.py` | Channel sizing recommendations ("Winners & Losers") |
 | `hive_bridge.py` | cl-hive integration, MCF assignments, Kalman velocity sharing |
-| `clboss_manager.py` | Optional CLBoss integration for unmanage commands |
 | `database.py` | SQLite with WAL mode, 32 tables, accounting + Kalman state persistence |
 | `config.py` | Hot-reloadable configuration |
 | `utils.py` | Shared utility functions |
@@ -108,7 +107,7 @@ Core Lightning
 | `closed_channels` | P&L for closed channels |
 | `splice_events` | Splice tracking |
 | `peer_reputation` | Peer success rate tracking |
-| `ignored_peers` | CLBoss ignore list |
+| `ignored_peers` | Ignore list |
 | `kalman_state` | Kalman filter state persistence (flow ratio, velocity, covariance) |
 
 ## Dependencies
@@ -123,7 +122,6 @@ Core Lightning
 - **bookkeeper plugin**: For accurate on-chain cost tracking
 
 ### Optional
-- **CLBoss**: For base node management (fee management delegated to cl-revenue-ops)
 - **cl-hive**: For fleet coordination
 
 ## Configuration Categories
@@ -174,7 +172,7 @@ Core Lightning
 ```
 cl-revenue-ops/
 ├── cl-revenue-ops.py       # Main plugin entry point
-├── modules/                # 11 modules
+├── modules/                # 10 modules
 │   ├── fee_controller.py   # Thompson Sampling + Alpha Sequence
 │   ├── rebalancer.py       # EV-based rebalancing
 │   ├── flow_analysis.py    # Sink/Source detection + Kalman filter
@@ -182,7 +180,6 @@ cl-revenue-ops/
 │   ├── profitability_analyzer.py  # P&L and ROC
 │   ├── capacity_planner.py # Channel recommendations
 │   ├── hive_bridge.py      # cl-hive integration
-│   ├── clboss_manager.py   # Optional CLBoss integration
 │   ├── database.py         # SQLite layer (32 tables)
 │   ├── config.py           # Configuration
 │   └── utils.py            # Shared utilities

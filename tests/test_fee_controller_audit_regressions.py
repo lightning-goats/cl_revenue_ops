@@ -41,9 +41,8 @@ from modules.config import Config
 def _make_fc(mock_plugin, mock_database, policy_manager=None, hive_bridge=None):
     """Create a fee controller with mocked dependencies."""
     config = MagicMock(spec=Config)
-    clboss = MagicMock()
     return HillClimbingFeeController(
-        mock_plugin, config, mock_database, clboss,
+        mock_plugin, config, mock_database,
         policy_manager=policy_manager,
         hive_bridge=hive_bridge,
     )

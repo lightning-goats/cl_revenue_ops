@@ -225,8 +225,7 @@ def _make_config_snapshot(**overrides):
 def _make_fc_for_dts_pid(mock_plugin, mock_database, *, enable_dts_pid=True):
     from modules.config import Config
     config = MagicMock(spec=Config)
-    clboss = MagicMock()
-    fc = HillClimbingFeeController(mock_plugin, config, mock_database, clboss)
+    fc = HillClimbingFeeController(mock_plugin, config, mock_database)
     cfg = _make_config_snapshot()
     fc.config.snapshot.return_value = cfg
 

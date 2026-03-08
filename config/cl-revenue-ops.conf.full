@@ -3,7 +3,6 @@
 #
 # QUICK START (Production):
 #   revenue-ops-dry-run=false
-#   revenue-ops-clboss-enabled=true
 #   revenue-ops-min-fee-ppm=100
 #
 # All options shown with defaults (commented out)
@@ -11,9 +10,6 @@
 # ============================================================================
 # INTEGRATION
 # ============================================================================
-
-# Enable integration with CLBOSS (REQUIRED if running CLBOSS - prevents conflicts)
-#revenue-ops-clboss-enabled=false
 
 # Safety switch - log actions but don't execute (set false for production)
 #revenue-ops-dry-run=true
@@ -158,7 +154,6 @@
 # Maximize volume and market share
 #
 # revenue-ops-dry-run=false
-# revenue-ops-clboss-enabled=true
 # revenue-ops-min-fee-ppm=50
 # revenue-ops-max-fee-ppm=1500
 # revenue-ops-fee-interval=1800
@@ -172,7 +167,6 @@
 # Prioritize profitability over volume
 #
 # revenue-ops-dry-run=false
-# revenue-ops-clboss-enabled=true
 # revenue-ops-min-fee-ppm=150
 # revenue-ops-max-fee-ppm=5000
 # revenue-ops-fee-interval=3600
@@ -186,7 +180,6 @@
 # Optimized for coordinated hive routing
 #
 # revenue-ops-dry-run=false
-# revenue-ops-clboss-enabled=true
 # revenue-ops-hive-fee-ppm=0
 # revenue-ops-min-fee-ppm=100
 # revenue-ops-max-fee-ppm=2500

@@ -410,16 +410,6 @@ class Database:
         self._migrate_forwards_schema(conn)
 
         
-        # Clboss unmanage tracking
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS clboss_unmanaged (
-                peer_id TEXT NOT NULL,
-                tag TEXT NOT NULL,
-                unmanaged_at INTEGER NOT NULL,
-                PRIMARY KEY (peer_id, tag)
-            )
-        """)
-        
         # Channel open costs tracking (for profitability analysis)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS channel_costs (
@@ -894,6 +884,12 @@ class Database:
         # Drop portfolio_metrics table (module removed)
         try:
             conn.execute("DROP TABLE IF EXISTS portfolio_metrics")
+        except Exception as e:
+            self.plugin.log(f"DB migration warning: {e}", level='debug')
+
+        # Drop clboss_unmanaged table (clboss_manager module removed)
+        try:
+            conn.execute("DROP TABLE IF EXISTS clboss_unmanaged")
         except Exception as e:
             self.plugin.log(f"DB migration warning: {e}", level='debug')
 
@@ -3574,60 +3570,6 @@ class Database:
         return {'avg': avg, 'std': std}
     
     # =========================================================================
-    # Clboss Unmanage Tracking
-    # =========================================================================
-    
-    def record_unmanage(self, peer_id: str, tag):
-        """Record that we unmanaged a peer/tag from clboss."""
-        conn = self._get_connection()
-        now = int(time.time())
-
-        # Normalize tag: convert list to comma-separated string
-        tag_str = ",".join(tag) if isinstance(tag, list) else tag
-
-        conn.execute("""
-            INSERT OR REPLACE INTO clboss_unmanaged
-            (peer_id, tag, unmanaged_at)
-            VALUES (?, ?, ?)
-        """, (peer_id, tag_str, now))
-
-    def remove_unmanage(self, peer_id: str, tag=None):
-        """Remove unmanage record (when remanaging)."""
-        conn = self._get_connection()
-
-        if tag:
-            # Normalize tag: convert list to comma-separated string
-            tag_str = ",".join(tag) if isinstance(tag, list) else tag
-            conn.execute(
-                "DELETE FROM clboss_unmanaged WHERE peer_id = ? AND tag = ?",
-                (peer_id, tag_str)
-            )
-        else:
-            conn.execute(
-                "DELETE FROM clboss_unmanaged WHERE peer_id = ?",
-                (peer_id,)
-            )
-
-    def is_unmanaged(self, peer_id: str, tag) -> bool:
-        """Check if a peer/tag is currently unmanaged."""
-        conn = self._get_connection()
-
-        # Normalize tag: convert list to comma-separated string
-        tag_str = ",".join(tag) if isinstance(tag, list) else tag
-
-        row = conn.execute(
-            "SELECT 1 FROM clboss_unmanaged WHERE peer_id = ? AND tag = ?",
-            (peer_id, tag_str)
-        ).fetchone()
-        return row is not None
-    
-    def get_all_unmanaged(self) -> List[Dict[str, Any]]:
-        """Get all unmanaged peer/tag combinations."""
-        conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM clboss_unmanaged").fetchall()
-        return [dict(row) for row in rows]
-    
-    # =========================================================================
     # Profitability Tracking Methods
     # =========================================================================
     
@@ -4328,7 +4270,7 @@ class Database:
 
         Args:
             channel_id: The channel short ID
-            peer_id: Optional peer ID (used for clboss_unmanaged cleanup)
+            peer_id: Optional peer ID
 
         Returns:
             Dict with counts of deleted rows per table
@@ -4337,7 +4279,6 @@ class Database:
             "channel_states": 0,
             "channel_failures": 0,
             "channel_probes": 0,
-            "clboss_unmanaged": 0,
             "kalman_state": 0
         }
 
@@ -4365,14 +4306,6 @@ class Database:
                     (channel_id,)
                 )
                 deleted["channel_probes"] = cursor.rowcount
-
-                # Remove from clboss_unmanaged if peer_id provided
-                if peer_id:
-                    cursor = conn.execute(
-                        "DELETE FROM clboss_unmanaged WHERE peer_id = ?",
-                        (peer_id,)
-                    )
-                    deleted["clboss_unmanaged"] = cursor.rowcount
 
                 # Remove Kalman filter state for closed channel
                 cursor = conn.execute(

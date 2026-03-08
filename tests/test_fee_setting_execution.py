@@ -59,8 +59,6 @@ class TestSetChannelFeeLimits:
         peer_id = "02" + "a" * 64
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel.return_value = True
 
         mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
         mock_plugin.rpc.setchannel = MagicMock()
@@ -69,7 +67,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
 
         fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=True)
 
@@ -87,8 +85,6 @@ class TestSetChannelFeeLimits:
         peer_id = "02" + "a" * 64
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel.return_value = True
 
         mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
         mock_plugin.rpc.setchannel = MagicMock()
@@ -96,7 +92,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
 
         fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=False)
 
@@ -111,8 +107,6 @@ class TestSetChannelFeeLimits:
         peer_id = "02" + "a" * 64
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel.return_value = True
 
         mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
         mock_plugin.rpc.setchannel = MagicMock()
@@ -120,7 +114,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
 
         fc.set_channel_fee(
             channel_id,
@@ -143,8 +137,6 @@ class TestGossipRefreshExecution:
         peer_id = "02" + "a" * 64
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel.return_value = True
 
         # set_channel_fee verifies on-chain fee by calling listpeerchannels again.
         # Simulate that the fee actually changes after setchannel.
@@ -159,7 +151,7 @@ class TestGossipRefreshExecution:
         mock_database.record_fee_change = MagicMock()
         mock_database.get_last_forward_time.return_value = int(time.time()) - 86400 * 2
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
 
         # Provide a real-ish state and ensure the fee change will be applied.
         st = HillClimbState(
@@ -192,8 +184,6 @@ class TestZeroFeeProbeEndToEnd:
         peer_id = "02" + "a" * 64
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False, enable_reputation=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel.return_value = True
 
         # set_channel_fee verifies with listpeerchannels after setchannel.
         fee_holder = {"fee": 100}
@@ -219,7 +209,7 @@ class TestZeroFeeProbeEndToEnd:
         mock_database.get_channel_cost_history.return_value = []
         mock_database.get_historical_inbound_fee_ppm.return_value = None
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
         # Keep the test focused on probe behavior (avoid Thompson path complexity).
         fc.ENABLE_THOMPSON_AIMD = False
         fc.ENABLE_DYNAMIC_WINDOWS = False
@@ -255,8 +245,6 @@ class TestZeroFeeProbeEndToEnd:
         peer_id = "02" + "a" * 64
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False, enable_reputation=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel.return_value = True
 
         # Fee is currently 0 (probe already active), and we observed volume -> success.
         fee_holder = {"fee": 0}
@@ -282,7 +270,7 @@ class TestZeroFeeProbeEndToEnd:
         mock_database.get_channel_cost_history.return_value = []
         mock_database.get_historical_inbound_fee_ppm.return_value = None
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database, clboss)
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
         fc.ENABLE_THOMPSON_AIMD = False
         fc.ENABLE_DYNAMIC_WINDOWS = False
         fc.ENABLE_SATURATION_FLOOR = False
@@ -320,14 +308,12 @@ class TestSetInitialFee:
         from modules.fee_controller import HillClimbingFeeController
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
-        clboss = MagicMock()
-        clboss.ensure_unmanaged_for_channel.return_value = True
 
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
         fc = HillClimbingFeeController(
-            mock_plugin, cfg, mock_database, clboss, policy_manager
+            mock_plugin, cfg, mock_database, policy_manager
         )
         return fc
 

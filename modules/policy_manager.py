@@ -60,7 +60,7 @@ class FeeStrategy(Enum):
     DYNAMIC = "dynamic"   # Hill Climbing + Scarcity (Default)
     STATIC = "static"     # Fixed fee (User Override)
     HIVE = "hive"         # 0-Fee / Low Fee (Fleet Member)
-    PASSIVE = "passive"   # Do nothing (allow CLBOSS/Manual control)
+    PASSIVE = "passive"   # Do nothing (manual control)
 
 
 class RebalanceMode(Enum):
