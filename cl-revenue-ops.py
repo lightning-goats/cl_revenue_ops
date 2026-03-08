@@ -794,6 +794,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-boltz-routing-fee-limit-ppm',
+    default='0',
+    description='Max routing fee in PPM for reverse swaps (0 = no limit, boltzcli default)'
+)
+
+plugin.add_option(
     name='revenue-ops-boltz-auto-cycle-enabled',
     default='true',
     description='Enable in-plugin periodic profit-gated Boltz balance cycles (default: true)'
@@ -1049,6 +1055,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             enforce_budget=options.get('revenue-ops-boltz-enforce-budget', 'true').lower() == 'true',
             btc_wallet=options.get('revenue-ops-boltz-btc-wallet', 'CLN'),
             lbtc_wallet=options.get('revenue-ops-boltz-lbtc-wallet', 'LOOP-LBTC'),
+            routing_fee_limit_ppm=int(options.get('revenue-ops-boltz-routing-fee-limit-ppm', '0')),
         )
         boltz_manager = BoltzCliManager(safe_plugin, safe_plugin.rpc, boltz_cfg)
         if boltz_cfg.enabled:
@@ -5182,10 +5189,11 @@ def revenue_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reve
 
 @plugin.method("revenue-boltz-loop-out")
 def revenue_boltz_loop_out(plugin: Plugin, amount_sats: int, address: str = None, channel_id: str = None,
-                           peer_id: str = None, currency: str = None) -> Dict[str, Any]:
+                           peer_id: str = None, currency: str = None, routing_fee_limit_ppm: int = None) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().loop_out(
-            amount_sats=amount_sats, address=address, channel_id=channel_id, peer_id=peer_id, currency=currency
+            amount_sats=amount_sats, address=address, channel_id=channel_id, peer_id=peer_id, currency=currency,
+            routing_fee_limit_ppm=routing_fee_limit_ppm
         )
     except Exception as e:
         return {"error": str(e)}

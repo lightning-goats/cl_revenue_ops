@@ -36,6 +36,7 @@ class BoltzCliConfig:
     enforce_budget: bool = True
     btc_wallet: str = "CLN"
     lbtc_wallet: str = "LOOP-LBTC"
+    routing_fee_limit_ppm: int = 0  # 0 = no limit (boltzcli default)
 
 
 class BoltzCliManager:
@@ -686,11 +687,11 @@ class BoltzCliManager:
                 "state": s.get("state"),
                 "status": s.get("status"),
             })
-        # C2 FIX: Count pending (non-completed, non-error) swaps as reserved budget
+        # C2 FIX: Count pending (non-terminal) swaps as reserved budget
         reserved = 0
         reserved_count = 0
         for s in swaps:
-            if self._is_completed_swap(s) or self._is_error_swap(s):
+            if self._is_terminal_swap(s):
                 continue
             ts = self._swap_created_ts(s)
             if ts is None or ts < cutoff:
@@ -738,8 +739,17 @@ class BoltzCliManager:
             return False
         if self._swap_entry_error_text(swap):
             return True
-        st = str(swap.get("state") or "").strip().upper()
-        return st in ("ERROR", "FAILED")
+        st = self._swap_status_text(swap)
+        return any(token in st for token in ("error", "failed"))
+
+    def _is_terminal_swap(self, swap: Optional[Dict[str, Any]]) -> bool:
+        """Check if swap is in any terminal state (completed, error, refunded, abandoned)."""
+        if not isinstance(swap, dict):
+            return False
+        if self._is_completed_swap(swap) or self._is_error_swap(swap):
+            return True
+        st = self._swap_status_text(swap)
+        return any(token in st for token in ("refund", "abandon"))
 
     def _contains_chanids_cln_error(self, payload: Any) -> bool:
         needle = "chanids are not supported for cln"
@@ -1092,7 +1102,7 @@ class BoltzCliManager:
             "amount_sats": amount_sats,
             "currency": self._norm_currency(currency, "BTC" if st == "reverse" else "LBTC"),
             "quote": data,
-            "estimated_total_fee_sats": max(0, self._parse_int(data.get("boltzFee"), 0)) + max(0, self._parse_int(data.get("networkFee"), 0)),
+            "estimated_total_fee_sats": self._estimate_swap_fee_sats(data),
         }
 
     def loop_in(self, amount_sats: int, channel_id: Optional[str] = None, peer_id: Optional[str] = None,
@@ -1144,7 +1154,8 @@ class BoltzCliManager:
         }
 
     def loop_out(self, amount_sats: int, address: Optional[str] = None, channel_id: Optional[str] = None,
-                 peer_id: Optional[str] = None, currency: Optional[str] = None) -> Dict[str, Any]:
+                 peer_id: Optional[str] = None, currency: Optional[str] = None,
+                 routing_fee_limit_ppm: Optional[int] = None) -> Dict[str, Any]:
         amount_sats = int(amount_sats)
         if amount_sats <= 0:
             raise BoltzCliError("amount_sats must be > 0")
@@ -1152,10 +1163,11 @@ class BoltzCliManager:
 
         # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
         with self._swap_creation_lock:
-            return self._loop_out_locked(amount_sats, address, channel_id, peer_id, currency, target_cur)
+            return self._loop_out_locked(amount_sats, address, channel_id, peer_id, currency, target_cur, routing_fee_limit_ppm)
 
     def _loop_out_locked(self, amount_sats: int, address: Optional[str], channel_id: Optional[str],
-                         peer_id: Optional[str], currency: Optional[str], target_cur: str) -> Dict[str, Any]:
+                         peer_id: Optional[str], currency: Optional[str], target_cur: str,
+                         routing_fee_limit_ppm: Optional[int] = None) -> Dict[str, Any]:
         quote = self.quote(amount_sats=amount_sats, swap_type="reverse", currency=target_cur)
         budget_check = self._enforce_budget_for_quote(quote.get("quote", {}))
         if not budget_check["allowed"]:
@@ -1177,6 +1189,7 @@ class BoltzCliManager:
         warnings: List[str] = []
         wallet_name = None if address else self._resolve_wallet_name(target_cur)
         reverse_chanids_supported = self._detect_reverse_chanids_support()
+        effective_routing_fee_limit = int(routing_fee_limit_ppm) if routing_fee_limit_ppm else (self.cfg.routing_fee_limit_ppm or 0)
 
         # CLN backends that reject reverse chanIds can still be routed through a desired first hop by
         # creating the reverse swap with --external-pay and then paying the invoice from CLN while
@@ -1192,6 +1205,8 @@ class BoltzCliManager:
                 "CLN boltz backend does not support reverse-swap chanIds; using external-pay with CLN first-hop constrained payment"
             )
             cmd: List[str] = ["createreverseswap", "--json", "--external-pay"]
+            if effective_routing_fee_limit > 0:
+                cmd.extend(["--routing-fee-limit-ppm", str(effective_routing_fee_limit)])
             if address:
                 pass
             else:
@@ -1300,6 +1315,8 @@ class BoltzCliManager:
             if include_chanids:
                 for scid in chan_ids:
                     cmd.extend(["--chan-id", scid])
+            if effective_routing_fee_limit > 0:
+                cmd.extend(["--routing-fee-limit-ppm", str(effective_routing_fee_limit)])
             if address:
                 pass
             else:
