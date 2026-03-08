@@ -170,3 +170,94 @@ def test_next_quiet_window():
     start2, duration2 = tp.next_quiet_window(current_hour=2)
     assert start2 == 0
     assert duration2 == 6
+
+
+import sqlite3
+import time
+
+
+def _create_test_db():
+    """Create in-memory DB with forwards table for testing."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE forwards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            in_channel TEXT NOT NULL,
+            out_channel TEXT NOT NULL,
+            in_msat INTEGER NOT NULL,
+            out_msat INTEGER NOT NULL,
+            fee_msat INTEGER NOT NULL,
+            resolution_time REAL DEFAULT 0,
+            timestamp INTEGER NOT NULL,
+            resolved_time INTEGER DEFAULT 0
+        )
+    """)
+    return conn
+
+
+def _insert_forward_at_hour(conn, out_channel, out_msat, fee_msat, hour, days_ago=0):
+    """Insert a forward at a specific hour of day, N days ago."""
+    now = int(time.time())
+    # Calculate timestamp for the given hour today, then subtract days
+    from datetime import datetime, timezone
+    dt = datetime.now(timezone.utc).replace(hour=hour, minute=30, second=0, microsecond=0)
+    ts = int(dt.timestamp()) - days_ago * 86400
+    conn.execute(
+        "INSERT INTO forwards (in_channel, out_channel, in_msat, out_msat, fee_msat, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("in_ch", out_channel, out_msat, out_msat, fee_msat, ts),
+    )
+
+
+def test_get_hourly_forward_histogram_basic():
+    """Forwards grouped by hour produce correct histogram."""
+    from modules.database import _hourly_forward_histogram_sql
+    conn = _create_test_db()
+    # Insert 3 forwards at hour 10, 1 at hour 22
+    for _ in range(3):
+        _insert_forward_at_hour(conn, "ch1", 50_000_000, 100, hour=10, days_ago=1)
+    _insert_forward_at_hour(conn, "ch1", 100_000_000, 200, hour=22, days_ago=1)
+    conn.commit()
+
+    result = _hourly_forward_histogram_sql(conn, "ch1", window_days=7)
+    assert len(result) == 24
+    # Hour 10: 3 forwards * 50k sats = 150k sats out
+    assert result[10]["out_sats"] > 0
+    assert result[10]["count"] == 3
+    # Hour 22: 1 forward * 100k sats
+    assert result[22]["out_sats"] > 0
+    assert result[22]["count"] == 1
+    # Other hours should be zero
+    assert result[5]["count"] == 0
+
+
+def test_get_hourly_forward_histogram_window():
+    """Forwards outside window are excluded."""
+    from modules.database import _hourly_forward_histogram_sql
+    conn = _create_test_db()
+    _insert_forward_at_hour(conn, "ch1", 50_000_000, 100, hour=10, days_ago=1)   # in window
+    _insert_forward_at_hour(conn, "ch1", 50_000_000, 100, hour=10, days_ago=10)  # outside
+    conn.commit()
+
+    result = _hourly_forward_histogram_sql(conn, "ch1", window_days=7)
+    assert result[10]["count"] == 1  # only the recent one
+
+
+def test_get_hourly_forward_histogram_inflow():
+    """Inflow (channel as in_channel) tracked separately."""
+    from modules.database import _hourly_forward_histogram_sql
+    conn = _create_test_db()
+    # Insert forward where ch1 is the IN channel (receiving)
+    now = int(time.time()) - 3600
+    conn.execute(
+        "INSERT INTO forwards (in_channel, out_channel, in_msat, out_msat, fee_msat, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("ch1", "other_ch", 80_000_000, 80_000_000, 200, now),
+    )
+    conn.commit()
+
+    from datetime import datetime, timezone
+    hour = datetime.fromtimestamp(now, tz=timezone.utc).hour
+    result = _hourly_forward_histogram_sql(conn, "ch1", window_days=7)
+    assert result[hour]["in_sats"] > 0

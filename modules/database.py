@@ -154,6 +154,69 @@ def _reserve_budget_atomic(conn, reservation_id: str, amount_sats: int,
     return (True, after_daily)
 
 
+def _hourly_forward_histogram_sql(conn, channel_id: str, window_days: int = 7) -> list:
+    """Compute per-hour flow histogram for a channel from the forwards table.
+
+    Returns a list of 24 dicts (one per hour UTC), each with:
+        out_sats: average outflow sats per day at this hour
+        in_sats: average inflow sats per day at this hour
+        count: average forward count per day at this hour
+
+    Uses a 7-day window. Averages are per-day to normalize for varying window sizes.
+    """
+    now = int(time.time())
+    since = now - window_days * 86400
+
+    # Count distinct days with data for normalization
+    day_count_row = conn.execute(
+        "SELECT COUNT(DISTINCT timestamp / 86400) FROM forwards "
+        "WHERE timestamp >= ? AND (in_channel = ? OR out_channel = ?)",
+        (since, channel_id, channel_id),
+    ).fetchone()
+    days_with_data = max(1, day_count_row[0] if day_count_row else 1)
+
+    rows = conn.execute("""
+        SELECT
+            hour_utc,
+            SUM(out_sats) as total_out,
+            SUM(in_sats) as total_in,
+            SUM(cnt) as total_count
+        FROM (
+            SELECT
+                CAST(((timestamp % 86400) / 3600) AS INTEGER) AS hour_utc,
+                0 AS out_sats,
+                SUM(in_msat) / 1000 AS in_sats,
+                COUNT(*) AS cnt
+            FROM forwards
+            WHERE timestamp >= ? AND in_channel = ?
+            GROUP BY hour_utc
+
+            UNION ALL
+
+            SELECT
+                CAST(((timestamp % 86400) / 3600) AS INTEGER) AS hour_utc,
+                SUM(out_msat) / 1000 AS out_sats,
+                0 AS in_sats,
+                COUNT(*) AS cnt
+            FROM forwards
+            WHERE timestamp >= ? AND out_channel = ?
+            GROUP BY hour_utc
+        )
+        GROUP BY hour_utc
+        ORDER BY hour_utc
+    """, (since, channel_id, since, channel_id)).fetchall()
+
+    # Initialize 24 hourly buckets
+    result = [{"out_sats": 0, "in_sats": 0, "count": 0} for _ in range(24)]
+    for row in rows:
+        h = int(row[0]) % 24
+        result[h]["out_sats"] = int(row[1] or 0) // days_with_data
+        result[h]["in_sats"] = int(row[2] or 0) // days_with_data
+        result[h]["count"] = int(row[3] or 0) // days_with_data
+
+    return result
+
+
 class Database:
     """
     SQLite database manager for the Revenue Operations plugin.
@@ -1004,6 +1067,9 @@ class Database:
         # v2.0 Migration: Add Kalman filter columns and table
         self._migrate_kalman_schema(conn)
 
+        # v2.1 Migration: Add temporal profile column to channel_states
+        self._migrate_temporal_profile_schema(conn)
+
         # Flow analysis cleanup: remove dead flow_history table
         try:
             conn.execute("DROP TABLE IF EXISTS flow_history")
@@ -1274,6 +1340,17 @@ class Database:
         except Exception as e:
             self.plugin.log(f"DB migration warning: Kalman schema migration failed: {e}", level="warn")
 
+    def _migrate_temporal_profile_schema(self, conn: sqlite3.Connection) -> None:
+        """Add temporal_profile_json column to channel_states."""
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(channel_states)").fetchall()]
+            if "temporal_profile_json" not in cols:
+                self.plugin.log("DB migration: adding channel_states.temporal_profile_json", level="info")
+                conn.execute("ALTER TABLE channel_states ADD COLUMN temporal_profile_json TEXT DEFAULT NULL")
+                conn.commit()
+        except Exception as e:
+            self.plugin.log(f"Migration temporal_profile_json failed: {e}", level="warn")
+
 
     # =========================================================================
     # Channel State Methods
@@ -1352,6 +1429,35 @@ class Database:
                 (state,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Temporal Profile Methods (v2.1)
+    # =========================================================================
+
+    def save_temporal_profile(self, channel_id: str, profile_json: str) -> None:
+        """Save temporal profile JSON for a channel."""
+        conn = self._get_connection()
+        conn.execute(
+            "UPDATE channel_states SET temporal_profile_json = ? WHERE channel_id = ?",
+            (profile_json, channel_id),
+        )
+        conn.commit()
+
+    def load_temporal_profile(self, channel_id: str) -> Optional[str]:
+        """Load temporal profile JSON for a channel. Returns None if absent."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT temporal_profile_json FROM channel_states WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+        if row and row[0]:
+            return row[0]
+        return None
+
+    def get_hourly_forward_histogram(self, channel_id: str, window_days: int = 7) -> list:
+        """Get per-hour flow histogram for a channel."""
+        conn = self._get_connection()
+        return _hourly_forward_histogram_sql(conn, channel_id, window_days)
 
     # =========================================================================
     # Kalman Filter State Methods (v2.1)
