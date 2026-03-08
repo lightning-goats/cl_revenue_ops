@@ -75,6 +75,44 @@ def should_pre_position(outbound_ratio: float, current_balance_sats: float,
     return hours <= PRE_POSITION_HORIZON
 
 
+MAX_TEMPORAL_RATIO = 0.70  # never target more than 70% of capacity
+
+
+def compute_temporal_target(current_hour: int, kalman_velocity_per_hour: float,
+                             temporal_profile, capacity: int) -> int:
+    """Compute demand-based rebalance target from temporal profile.
+
+    Returns the predicted outflow until the next quiet window, multiplied
+    by a buffer based on traffic burstiness. Returns 0 if profile is not
+    graduated (caller should use existing volume-based target).
+    """
+    from modules.flow_analysis import get_buffer_multiplier
+
+    if not temporal_profile.graduated:
+        return 0
+
+    start, duration = temporal_profile.next_quiet_window(current_hour)
+    # Hours until quiet window starts
+    if current_hour in temporal_profile.quiet_hours:
+        # Already in quiet window — size to cover until end of quiet + next active period
+        # Use the next active period as the horizon
+        hours_to_next_active = duration
+        hours_active = 24 - duration
+        hours_ahead = hours_active  # cover the next active period
+    else:
+        hours_ahead = (start - current_hour) % 24
+        if hours_ahead == 0:
+            hours_ahead = 24  # full cycle
+
+    predicted = temporal_profile.predicted_outflow(current_hour, hours_ahead)
+    buffer = get_buffer_multiplier(temporal_profile.burstiness)
+    target = int(predicted * buffer)
+
+    # Cap at MAX_TEMPORAL_RATIO of capacity
+    max_target = int(capacity * MAX_TEMPORAL_RATIO)
+    return min(target, max_target)
+
+
 class JobStatus(Enum):
     """Status of a sling background job."""
     PENDING = "pending"
@@ -2899,7 +2937,30 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         
         # CRITICAL: Clamp raw_target to capacity (never exceed what's possible)
         raw_target = min(raw_target, capacity)
-        
+
+        # Temporal demand-based sizing: use predicted demand if higher
+        try:
+            temporal_json = self.database.load_temporal_profile(dest_channel)
+            if temporal_json:
+                from modules.flow_analysis import TemporalProfile
+                from datetime import datetime, timezone
+                _tp = TemporalProfile.from_dict(json.loads(temporal_json))
+                _current_hour = datetime.now(timezone.utc).hour
+                _kalman = self.database.get_kalman_state(dest_channel)
+                _velocity = float((_kalman or {}).get("flow_velocity", 0.0))
+                temporal_target = compute_temporal_target(
+                    _current_hour, _velocity, _tp, capacity
+                )
+                if temporal_target > raw_target:
+                    self.plugin.log(
+                        f"TEMPORAL SIZING: channel={dest_channel[:12]}... "
+                        f"temporal_target={temporal_target} > volume_target={raw_target}",
+                        level='debug'
+                    )
+                    raw_target = temporal_target
+        except Exception:
+            pass  # temporal sizing is advisory; never block rebalancing
+
         # Skip tiny channels that can't meet the minimum rebalance amount
         # Instead of force-filling them (which caused target > capacity), we skip them
         if raw_target < self.config.rebalance_min_amount:
