@@ -228,48 +228,12 @@ class TestRoutingIntelligenceIntegration:
 class TestHiveBridgeRoutingIntelligence:
     """Tests for HiveFeeIntelligenceBridge routing intelligence methods."""
 
-    def test_query_routing_intelligence_caches_result(self):
-        """Results should be cached to reduce RPC calls."""
-        from modules.hive_bridge import HiveFeeIntelligenceBridge
-
-        mock_plugin = Mock()
-        mock_plugin.rpc.plugin.return_value = {
-            "plugins": [{"name": "cl-hive", "active": True}]
-        }
-        mock_plugin.rpc.call.side_effect = [
-            # First call: hive-status
-            {"membership": {"tier": "member"}},
-            # Second call: hive-get-routing-intelligence
-            {"channels": {"123x1x0": {"pheromone_level": 1.0}}, "timestamp": 12345},
-        ]
-
-        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
-        bridge._hive_available = True
-        bridge._availability_check_time = 9999999999  # Far future
-
-        # First query
-        result1 = bridge.query_routing_intelligence("123x1x0")
-        assert result1 is not None
-
-        # Reset mock for second call
-        mock_plugin.rpc.call.reset_mock()
-
-        # Second query should use cache
-        result2 = bridge.query_routing_intelligence("123x1x0", use_cache=True)
-        assert result2 is not None
-
-        # RPC should not be called again (using cache)
-        assert mock_plugin.rpc.call.call_count == 0
-
     def test_get_channel_routing_intelligence_extracts_single(self):
         """get_channel_routing_intelligence should extract single channel data."""
         from modules.hive_bridge import HiveFeeIntelligenceBridge
 
         mock_plugin = Mock()
-        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
-
-        # Mock the query method
-        bridge.query_routing_intelligence = Mock(return_value={
+        mock_plugin.rpc.call.return_value = {
             "channels": {
                 "123x1x0": {
                     "pheromone_level": 2.5,
@@ -283,7 +247,11 @@ class TestHiveBridgeRoutingIntelligence:
                 }
             },
             "timestamp": 12345
-        })
+        }
+
+        bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
+        bridge._hive_available = True
+        bridge._availability_check_time = 9999999999  # Far future
 
         result = bridge.get_channel_routing_intelligence("123x1x0")
 

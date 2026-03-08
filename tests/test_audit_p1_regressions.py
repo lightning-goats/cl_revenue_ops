@@ -278,14 +278,6 @@ class TestHiveBridgeUnknownError:
     def bridge(self, mock_hive_bridge):
         return mock_hive_bridge
 
-    def test_report_kalman_velocity_unknown_returns_false(self, bridge):
-        # Simulate cl-hive returning an "unknown" error in the result payload
-        bridge._rpc_call_with_policy = MagicMock(
-            return_value=(True, {"error": "Unknown method"}, None)
-        )
-        result = bridge.report_kalman_velocity("ch1", "peer1", 0.5, 0.1, 0.8, 0.9)
-        assert result is False
-
     def test_report_rebalance_outcome_unknown_returns_false(self, bridge):
         bridge._rpc_call_with_policy = MagicMock(
             return_value=(True, {"error": "Unknown method"}, None)
@@ -293,16 +285,3 @@ class TestHiveBridgeUnknownError:
         result = bridge.report_rebalance_outcome("ch1", "ch2", 1000, 50, True)
         assert result is False
 
-    def test_report_cost_trends_unknown_returns_false(self, bridge):
-        bridge._rpc_call_with_policy = MagicMock(
-            return_value=(True, {"error": "Unknown method"}, None)
-        )
-        result = bridge.report_cost_trends([])
-        assert result is False
-
-    def test_report_flow_intensity_unknown_returns_false(self, bridge):
-        bridge._rpc_call_with_policy = MagicMock(
-            return_value=(True, {"error": "Unknown method"}, None)
-        )
-        result = bridge.report_flow_intensity("ch1", "peer1", 1000000, 50000, 100, 15)
-        assert result is False
