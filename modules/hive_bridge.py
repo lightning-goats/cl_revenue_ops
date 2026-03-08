@@ -52,7 +52,6 @@ STALE_CACHE_TTL_SECONDS = 86400   # 24 hours - reduced confidence
 
 # Cache size limits (prevent unbounded memory growth)
 MAX_CACHE_ENTRIES = 500           # Maximum peers to cache
-CACHE_CLEANUP_INTERVAL = 3600     # Cleanup stale entries every hour
 
 # Circuit breaker settings
 CIRCUIT_FAILURES_THRESHOLD = 3    # Failures before opening circuit
@@ -403,9 +402,8 @@ class HiveFeeIntelligenceBridge:
     def _policy_stats_inc(self, policy_name: str, field: str, value: int = 1) -> None:
         with self._rpc_policy_stats_lock:
             stats = self._rpc_policy_stats.get(policy_name)
-            if not stats:
-                return
-            setattr(stats, field, int(getattr(stats, field, 0) or 0) + value)
+            if stats and hasattr(stats, field):
+                setattr(stats, field, int(getattr(stats, field, 0) or 0) + value)
 
     def _policy_stats_error(self, policy_name: str, err: Any) -> None:
         with self._rpc_policy_stats_lock:
@@ -1056,8 +1054,15 @@ class HiveFeeIntelligenceBridge:
             {"risk": True/False, "flow": {...}} if risk detected
         """
         try:
-            status = self.query_circular_flow_status()
-            flows = status.get("circular_flows", [])
+            success, result, err = self._rpc_call_with_policy(
+                "hive-circular-flow-status",
+                {},
+                policy_key="optional_read",
+            )
+            if not success or not result:
+                return {"risk": False, "reason": err or "unavailable"}
+
+            flows = result.get("circular_flows", [])
 
             for flow in flows:
                 members = flow.get("members", [])
@@ -1150,9 +1155,8 @@ class HiveFeeIntelligenceBridge:
             try:
                 result['recommended_fee_ppm'] = int(result['recommended_fee_ppm'])
             except (TypeError, ValueError):
-                self._log(f"Invalid recommended_fee_ppm type: {type(result['recommended_fee_ppm'])}", level="warn")
-                del result['recommended_fee_ppm']
-                return result
+                self._log(f"Invalid recommended_fee_ppm type from hive: {type(result.get('recommended_fee_ppm'))}", level="warn")
+                return None
             min_fee = self.config.min_fee_ppm if self.config else 0
             max_fee = self.config.max_fee_ppm if self.config else 100000
             result['recommended_fee_ppm'] = max(min_fee, min(result['recommended_fee_ppm'], max_fee))
@@ -1273,7 +1277,10 @@ class HiveFeeIntelligenceBridge:
             return None
 
         if 'defensive_multiplier' in result:
-            result['defensive_multiplier'] = max(0.1, min(5.0, result['defensive_multiplier']))
+            try:
+                result['defensive_multiplier'] = max(0.1, min(5.0, float(result['defensive_multiplier'])))
+            except (TypeError, ValueError):
+                result['defensive_multiplier'] = 1.0
         return result
 
 
@@ -1894,10 +1901,10 @@ class HiveFeeIntelligenceBridge:
         try:
             amount_sats = int(amount_sats)
         except (TypeError, ValueError):
-            self.plugin.log(f"Invalid amount_sats type: {type(amount_sats)}", level='debug')
+            self._log(f"Invalid amount_sats type: {type(amount_sats)}", level="debug")
             return None
         if amount_sats <= 0 or amount_sats > 100_000_000:  # Cap at 1 BTC
-            self.plugin.log(f"amount_sats out of range: {amount_sats}", level='debug')
+            self._log(f"amount_sats out of range: {amount_sats}", level="debug")
             return None
 
         params = {
@@ -2286,50 +2293,6 @@ class HiveFeeIntelligenceBridge:
             self._log(f"Error claiming MCF assignment (unexpected): {e}", level="debug")
             return None
 
-    def should_use_mcf_path(
-        self,
-        from_channel: str,
-        to_channel: str,
-        amount_sats: int,
-        max_fee_ppm: int
-    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        """
-        Check if MCF-optimized path should be used for rebalancing.
-
-        Queries MCF for optimal path and validates it meets fee constraints.
-
-        Args:
-            from_channel: Source channel SCID
-            to_channel: Destination channel SCID
-            amount_sats: Amount to rebalance
-            max_fee_ppm: Maximum acceptable fee in ppm
-
-        Returns:
-            Tuple of (should_use, path_info)
-        """
-        path_info = self.query_mcf_optimized_path(
-            from_channel, to_channel, amount_sats
-        )
-
-        if not path_info:
-            return False, None
-
-        if not path_info.get("fleet_path_available"):
-            return False, path_info
-
-        # Check if cost is within budget
-        estimated_cost = path_info.get("estimated_fleet_cost_sats", 0)
-        estimated_ppm = (estimated_cost * 1_000_000) // amount_sats if amount_sats > 0 else 999999
-
-        if estimated_ppm > max_fee_ppm:
-            self._log(
-                f"MCF path too expensive: {estimated_ppm}ppm > {max_fee_ppm}ppm",
-                level="debug"
-            )
-            return False, path_info
-
-        return True, path_info
-
     # =========================================================================
     # DIAGNOSTIC METHODS
     # =========================================================================
@@ -2458,7 +2421,11 @@ class HiveFeeIntelligenceBridge:
         with self._period_costs_report_lock:
             # Coalesce duplicate values on a short interval; this call may be
             # made frequently from fee/yield loops and does not need exact ack.
-            total_costs = rebalance_costs_sats + max(0, int(boltz_costs_sats or 0))
+            try:
+                boltz_safe = max(0, int(boltz_costs_sats or 0))
+            except (TypeError, ValueError):
+                boltz_safe = 0
+            total_costs = rebalance_costs_sats + boltz_safe
             if (
                 self._last_reported_period_costs_sats == total_costs
                 and (now - self._last_period_costs_report_time) < self._period_costs_report_min_interval
