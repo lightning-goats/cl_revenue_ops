@@ -346,6 +346,52 @@ class TemporalProfile:
         return tp
 
 
+def update_temporal_profile(existing: TemporalProfile,
+                            histogram: list,
+                            daily_forwards: int) -> TemporalProfile:
+    """Update a temporal profile with new hourly histogram data using EMA blending.
+
+    Args:
+        existing: The previous TemporalProfile (may be empty/fresh)
+        histogram: List of 24 dicts from _hourly_forward_histogram_sql
+        daily_forwards: Total forwards today (for graduation check)
+
+    Returns:
+        Updated TemporalProfile with blended values and recomputed derived fields.
+    """
+    import time as _time
+    updated = TemporalProfile()
+    is_first = all(v == 0.0 for v in existing.hourly_out)
+    alpha = TEMPORAL_EMA_ALPHA
+
+    for h in range(24):
+        new_out = float(histogram[h].get("out_sats", 0))
+        new_in = float(histogram[h].get("in_sats", 0))
+        new_count = float(histogram[h].get("count", 0))
+
+        if is_first:
+            # First update: copy raw values (don't blend with zeros)
+            updated.hourly_out[h] = new_out
+            updated.hourly_in[h] = new_in
+            updated.hourly_count[h] = new_count
+        else:
+            updated.hourly_out[h] = alpha * new_out + (1 - alpha) * existing.hourly_out[h]
+            updated.hourly_in[h] = alpha * new_in + (1 - alpha) * existing.hourly_in[h]
+            updated.hourly_count[h] = alpha * new_count + (1 - alpha) * existing.hourly_count[h]
+
+    # Carry forward metadata
+    updated.dominant_bucket = existing.dominant_bucket
+    updated.observation_days = existing.observation_days
+    if daily_forwards >= TEMPORAL_MIN_DAILY_FORWARDS:
+        updated.observation_days += 1
+    updated.last_updated = int(_time.time())
+
+    # Recompute derived fields
+    updated._recompute_derived()
+
+    return updated
+
+
 class KalmanFlowFilter:
     """
     Kalman Filter for optimal flow state estimation.

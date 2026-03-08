@@ -261,3 +261,55 @@ def test_get_hourly_forward_histogram_inflow():
     hour = datetime.fromtimestamp(now, tz=timezone.utc).hour
     result = _hourly_forward_histogram_sql(conn, "ch1", window_days=7)
     assert result[hour]["in_sats"] > 0
+
+
+def test_temporal_profile_ema_blending():
+    """New data blends with existing via EMA alpha=0.3."""
+    from modules.flow_analysis import TemporalProfile, TEMPORAL_EMA_ALPHA, update_temporal_profile
+
+    existing = TemporalProfile()
+    existing.hourly_out = [1000.0] * 24  # existing: 1000 sats/hour everywhere
+    existing.observation_days = 5
+
+    # New histogram: hour 12 has 5000, rest 0
+    new_histogram = [{"out_sats": 0, "in_sats": 0, "count": 0} for _ in range(24)]
+    new_histogram[12] = {"out_sats": 5000, "in_sats": 100, "count": 10}
+
+    updated = update_temporal_profile(existing, new_histogram, daily_forwards=15)
+
+    # Hour 12: EMA = 0.3 * 5000 + 0.7 * 1000 = 2200
+    expected_h12 = TEMPORAL_EMA_ALPHA * 5000.0 + (1 - TEMPORAL_EMA_ALPHA) * 1000.0
+    assert abs(updated.hourly_out[12] - expected_h12) < 1.0
+
+    # Hour 0: EMA = 0.3 * 0 + 0.7 * 1000 = 700
+    expected_h0 = (1 - TEMPORAL_EMA_ALPHA) * 1000.0
+    assert abs(updated.hourly_out[0] - expected_h0) < 1.0
+
+    # Observation days incremented (daily_forwards >= TEMPORAL_MIN_DAILY_FORWARDS)
+    assert updated.observation_days == 6
+
+
+def test_temporal_profile_ema_skips_low_forward_day():
+    """Days with too few forwards don't increment observation_days."""
+    from modules.flow_analysis import TemporalProfile, update_temporal_profile
+
+    existing = TemporalProfile(observation_days=3)
+    new_histogram = [{"out_sats": 100, "in_sats": 0, "count": 0} for _ in range(24)]
+
+    updated = update_temporal_profile(existing, new_histogram, daily_forwards=5)
+    assert updated.observation_days == 3  # not incremented (5 < 10)
+
+
+def test_temporal_profile_first_update():
+    """First update on empty profile copies raw values (no EMA blend with zero)."""
+    from modules.flow_analysis import TemporalProfile, update_temporal_profile
+
+    fresh = TemporalProfile()  # all zeros
+    new_histogram = [{"out_sats": 0, "in_sats": 0, "count": 0} for _ in range(24)]
+    new_histogram[10] = {"out_sats": 3000, "in_sats": 500, "count": 8}
+
+    updated = update_temporal_profile(fresh, new_histogram, daily_forwards=15)
+
+    # First update should set raw values, not blend with zeros
+    assert updated.hourly_out[10] == 3000.0
+    assert updated.hourly_in[10] == 500.0
