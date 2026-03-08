@@ -38,6 +38,43 @@ if TYPE_CHECKING:
     from .hive_bridge import HiveFeeIntelligenceBridge
 
 
+# --- Temporal pre-positioning constants ---
+PRE_POSITION_HORIZON = 8   # hours ahead to check for depletion
+PRE_POSITION_MIN_RATIO = 0.35  # don't pre-position above this ratio
+
+
+def should_pre_position(outbound_ratio: float, current_balance_sats: float,
+                         capacity: int, current_hour: int,
+                         kalman_velocity_per_hour: float,
+                         temporal_profile, low_liquidity_threshold: float) -> bool:
+    """Check if a channel should be pre-positioned (rebalanced before depletion).
+
+    Returns True when ALL conditions are met:
+    1. Profile is graduated (enough temporal data)
+    2. Channel ratio is below PRE_POSITION_MIN_RATIO (getting low but not depleted)
+    3. Channel ratio is above low_liquidity_threshold (not already depleted)
+    4. Current hour is in a quiet period
+    5. Depletion forecast is within PRE_POSITION_HORIZON hours
+    """
+    from modules.flow_analysis import estimate_depletion_hours
+
+    if not temporal_profile.graduated:
+        return False
+    if outbound_ratio > PRE_POSITION_MIN_RATIO:
+        return False
+    if outbound_ratio <= low_liquidity_threshold:
+        return False  # already depleted, normal trigger handles this
+    if not temporal_profile.is_quiet_now(current_hour):
+        return False
+
+    depletion_target = capacity * low_liquidity_threshold
+    hours = estimate_depletion_hours(
+        current_balance_sats, depletion_target, current_hour,
+        kalman_velocity_per_hour, temporal_profile,
+    )
+    return hours <= PRE_POSITION_HORIZON
+
+
 class JobStatus(Enum):
     """Status of a sling background job."""
     PENDING = "pending"
@@ -2413,6 +2450,32 @@ class EVRebalancer:
                 
                 else:
                     effective_low_threshold = float(hot_override_depletion_thresholds.get(peer_id, cfg.low_liquidity_threshold))
+                    # Temporal pre-positioning: rebalance before depletion during quiet hours
+                    try:
+                        temporal_json = self.database.load_temporal_profile(channel_id)
+                        if temporal_json and isinstance(temporal_json, str):
+                            from modules.flow_analysis import TemporalProfile
+                            _tp = TemporalProfile.from_dict(json.loads(temporal_json))
+                            from datetime import datetime, timezone
+                            _current_hour = datetime.now(timezone.utc).hour
+                            _kalman = self.database.get_kalman_state(channel_id)
+                            _velocity = float((_kalman or {}).get("flow_velocity", 0.0))
+                            _balance_sats = int(info.get("to_us_msat", 0)) // 1000
+                            _capacity = int(info.get("total_msat", 0)) // 1000
+                            if should_pre_position(
+                                outbound_ratio, _balance_sats, _capacity,
+                                _current_hour, _velocity, _tp,
+                                effective_low_threshold
+                            ):
+                                depleted_channels.append((channel_id, info, outbound_ratio))
+                                self.plugin.log(
+                                    f"PRE-POSITION: channel={channel_id} ratio={outbound_ratio:.2f} "
+                                    f"quiet_hour={_current_hour} depletes_in<{PRE_POSITION_HORIZON}h",
+                                    level='info'
+                                )
+                                continue  # skip normal threshold check, already added
+                    except Exception:
+                        pass  # temporal pre-positioning is best-effort
                     if outbound_ratio < effective_low_threshold:
                         depleted_channels.append((channel_id, info, outbound_ratio))
                     elif outbound_ratio > cfg.high_liquidity_threshold:
