@@ -30,6 +30,7 @@ class CapacityPlanner:
         self.profitability = profitability_analyzer
         self.flow = flow_analyzer
         self.policy_manager = policy_manager
+        self.hive_bridge = None  # Set externally for fleet demand forecast
 
     def generate_report(self) -> Dict[str, Any]:
         """
@@ -40,6 +41,15 @@ class CapacityPlanner:
         # Fetch analyses once and pass to both identification methods
         all_profitability = self.profitability.analyze_all_channels()
         all_flow = self.flow.analyze_all_channels()
+
+        # Query fleet demand forecast if available
+        fleet_forecast = None
+        if self.hive_bridge:
+            try:
+                fleet_forecast = self.hive_bridge.query_fleet_demand_forecast()
+            except Exception:
+                pass
+
         peer_splice_map = self._get_peer_splice_map()
 
         fleet_excluded = 0
@@ -70,7 +80,8 @@ class CapacityPlanner:
             "summary": summary,
             "winners": winners,
             "losers": losers,
-            "recommendations": recommendations
+            "recommendations": recommendations,
+            "fleet_demand_forecast": fleet_forecast,
         }
 
     def _get_mempool_recommendation(self) -> str:

@@ -415,6 +415,58 @@ class TestLoserClassification:
         assert len(losers) == 1
 
 
+class TestFleetDemandForecast:
+    """Test fleet demand forecast integration in generate_report."""
+
+    def _make_planner_with_report_mocks(self):
+        """Create a CapacityPlanner with all mocks needed for generate_report()."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 25000}}
+        plugin.rpc.listpeers.return_value = {"peers": []}
+
+        prof_analyzer = MagicMock()
+        prof_analyzer.analyze_all_channels.return_value = {}
+        flow_analyzer = MagicMock()
+        flow_analyzer.analyze_all_channels.return_value = {}
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+        return planner
+
+    def test_fleet_forecast_included_when_hive_bridge_available(self):
+        """generate_report includes fleet_demand_forecast when hive_bridge is set."""
+        planner = self._make_planner_with_report_mocks()
+
+        mock_bridge = MagicMock()
+        forecast_data = {
+            "members": [{"peer_id": "02" + "a" * 64, "demand_score": 0.8}],
+            "fleet_summary": {"total_demand": 1000000},
+        }
+        mock_bridge.query_fleet_demand_forecast.return_value = forecast_data
+        planner.hive_bridge = mock_bridge
+
+        report = planner.generate_report()
+        assert report["fleet_demand_forecast"] == forecast_data
+        mock_bridge.query_fleet_demand_forecast.assert_called_once()
+
+    def test_fleet_forecast_none_without_hive_bridge(self):
+        """generate_report returns None for fleet_demand_forecast without hive_bridge."""
+        planner = self._make_planner_with_report_mocks()
+
+        report = planner.generate_report()
+        assert report["fleet_demand_forecast"] is None
+
+    def test_fleet_forecast_none_when_exception(self):
+        """generate_report returns None when query_fleet_demand_forecast raises."""
+        planner = self._make_planner_with_report_mocks()
+
+        mock_bridge = MagicMock()
+        mock_bridge.query_fleet_demand_forecast.side_effect = RuntimeError("rpc timeout")
+        planner.hive_bridge = mock_bridge
+
+        report = planner.generate_report()
+        assert report["fleet_demand_forecast"] is None
+
+
 class TestMempoolRecommendation:
     """Test mempool fee recommendation thresholds."""
 
