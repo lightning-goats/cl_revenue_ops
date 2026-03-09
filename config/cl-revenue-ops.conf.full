@@ -1,4 +1,4 @@
-# --- CL-REVENUE-OPS v2.0 CONFIGURATION ---
+# --- CL-REVENUE-OPS v2.1 CONFIGURATION ---
 # Copy to ~/.lightning/config or include via `include cl-revenue-ops.conf`
 #
 # QUICK START (Production):
@@ -90,6 +90,11 @@
 # Daily budget for rebalancing fees - acts as floor when proportional enabled
 # RECOMMENDATION: Start conservative (2000-5000), increase as you learn
 #revenue-ops-daily-budget-sats=5000
+
+# Weekly budget ceiling - hard cap on 7-day total rebalance spend
+# Both daily AND weekly must have room before a rebalance is authorized
+# RECOMMENDATION: 5x daily for tighter control, 7x (default) for loose
+#revenue-ops-weekly-budget-sats=35000
 
 # On-chain + Off-chain reserve threshold (abort rebalancing if below)
 #revenue-ops-min-wallet-reserve=1000000

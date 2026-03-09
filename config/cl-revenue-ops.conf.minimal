@@ -1,14 +1,15 @@
-# cl-revenue-ops v2.0 Production Config
+# cl-revenue-ops v2.1 Production Config
 # Copy to ~/.lightning/config or include via: include /path/to/cl-revenue-ops.conf
 
 # Core settings
 revenue-ops-dry-run=false
+
 # Fee management (competitive but profitable)
 revenue-ops-min-fee-ppm=100
 revenue-ops-max-fee-ppm=2500
 revenue-ops-fee-interval=3600
 
-# V2.0 features (correct option names)
+# V2.0 features
 revenue-ops-scarcity-pricing=true
 revenue-ops-scarcity-threshold=0.15
 revenue-ops-vegas-reflex=true
@@ -16,6 +17,7 @@ revenue-ops-vegas-reflex=true
 # Rebalancing
 revenue-ops-rebalance-min-profit=50
 revenue-ops-daily-budget-sats=5000
+revenue-ops-weekly-budget-sats=25000
 revenue-ops-proportional-budget=true
 revenue-ops-proportional-budget-pct=0.10
 
@@ -23,6 +25,9 @@ revenue-ops-proportional-budget-pct=0.10
 revenue-ops-enable-kelly=true
 revenue-ops-kelly-fraction=0.5
 revenue-ops-enable-reputation=true
+
+# Hot-channel protection
+revenue-ops-hot-channel-protection-enabled=true
 
 # cl-hive integration (0 = free routing between fleet members)
 revenue-ops-hive-fee-ppm=0
