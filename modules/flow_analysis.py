@@ -809,6 +809,8 @@ class FlowAnalyzer:
         except Exception:
             pass  # Non-critical — filters will still work from fresh defaults
 
+        self.hive_bridge = None  # Set externally for traffic profile reporting
+
     # =========================================================================
     # v2.1 KALMAN FILTER METHODS
     # =========================================================================
@@ -1887,3 +1889,72 @@ class FlowAnalyzer:
     def get_balanced(self) -> List[Dict[str, Any]]:
         """Get all channels classified as BALANCED."""
         return self.database.get_channels_by_state("balanced")
+
+    def report_graduated_profiles(self, all_flow: Dict[str, 'FlowMetrics']) -> int:
+        """
+        Report graduated temporal profiles to cl-hive for fleet sharing.
+
+        Called after analyze_all_channels(). Only reports profiles that have
+        graduated (7+ days observation). Maps flow_analysis fields to
+        hive traffic profile fields.
+
+        Args:
+            all_flow: Dict of channel_id -> FlowMetrics from analyze_all_channels()
+
+        Returns:
+            Number of profiles successfully reported
+        """
+        import json
+
+        if not self.hive_bridge:
+            return 0
+
+        reported = 0
+        for channel_id, metrics in all_flow.items():
+            # Load temporal profile from database
+            try:
+                profile_json = self.database.load_temporal_profile(channel_id)
+                if not profile_json:
+                    continue
+                profile = TemporalProfile.from_dict(json.loads(profile_json))
+            except Exception:
+                continue
+
+            if not profile.graduated:
+                continue
+
+            # Map flow_direction: source=outbound_heavy, sink=inbound_heavy
+            if metrics.flow_ratio > 0.1:
+                drain_direction = "outbound_heavy"
+            elif metrics.flow_ratio < -0.1:
+                drain_direction = "inbound_heavy"
+            else:
+                drain_direction = "balanced"
+
+            # Classify profile type by volume + forward size heuristic
+            avg_forward = metrics.daily_volume / max(metrics.forward_count, 1)
+            if metrics.daily_volume > 5_000_000 and avg_forward < 50_000:
+                profile_type = "retail"
+            elif metrics.daily_volume < 2_000_000 and avg_forward > 200_000:
+                profile_type = "wholesale"
+            else:
+                profile_type = "mixed"
+
+            try:
+                success = self.hive_bridge.report_traffic_profile(
+                    peer_id=metrics.peer_id,
+                    profile_type=profile_type,
+                    peak_hours_utc=profile.peak_hours,
+                    quiet_hours_utc=profile.quiet_hours,
+                    avg_forward_size_sats=float(avg_forward),
+                    daily_volume_sats=float(metrics.daily_volume),
+                    drain_direction=drain_direction,
+                    confidence=metrics.confidence,
+                    observation_window_hours=profile.observation_days * 24,
+                )
+                if success:
+                    reported += 1
+            except Exception:
+                pass
+
+        return reported
