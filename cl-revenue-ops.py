@@ -1326,7 +1326,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Initialize analysis modules with profitability analyzer and hive bridge
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
+    flow_analyzer.hive_bridge = hive_bridge
     capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager)
+    capacity_planner.hive_bridge = hive_bridge
     fee_controller = PIDFeeController(safe_plugin, config, database, policy_manager, profitability_analyzer, hive_bridge)
     rebalancer = EVRebalancer(
         safe_plugin, config, database, policy_manager,
@@ -1828,6 +1830,15 @@ def run_flow_analysis():
                     plugin.log(f"Flow observation report failed for {channel_id[:12]}...: {e}", level='debug')
             if reported > 0:
                 plugin.log(f"Reported {reported} flow observations to cl-hive")
+
+        # Report graduated traffic profiles to cl-hive for fleet sharing
+        if flow_analyzer and hasattr(flow_analyzer, 'report_graduated_profiles'):
+            try:
+                graduated = flow_analyzer.report_graduated_profiles(results)
+                if graduated > 0:
+                    plugin.log(f"Reported {graduated} graduated traffic profiles to cl-hive")
+            except Exception as e:
+                plugin.log(f"Traffic profile reporting failed: {e}", level='debug')
 
     except Exception as e:
         plugin.log(f"Flow analysis failed: {e}", level='error')
