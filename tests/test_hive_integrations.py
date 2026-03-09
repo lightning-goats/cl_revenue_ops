@@ -452,5 +452,128 @@ class TestGracefulDegradation:
         assert mock_hive_bridge.is_channel_excluded_from_optimization("test") is False
 
 
+class TestTrafficIntelligenceBridge:
+    """Tests for traffic intelligence bridge methods."""
+
+    def test_report_traffic_profile_success_async(self, mock_hive_bridge, mock_plugin):
+        """report_traffic_profile queues via fire_and_forget (telemetry policy)."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        # Telemetry policy uses async_preferred=True, so fire_and_forget is the primary path
+        mock_plugin.rpc.fire_and_forget = Mock(return_value=True)
+
+        result = mock_hive_bridge.report_traffic_profile(
+            peer_id="02" + "a" * 64,
+            profile_type="retail",
+            peak_hours_utc=[14, 15, 16, 17, 18, 19],
+            quiet_hours_utc=[2, 3, 4, 5, 6, 7],
+            avg_forward_size_sats=25000.0,
+            daily_volume_sats=5000000.0,
+            drain_direction="outbound_heavy",
+            confidence=0.85,
+            observation_window_hours=168,
+        )
+
+        assert result is True
+        mock_plugin.rpc.fire_and_forget.assert_called_once()
+        call_args = mock_plugin.rpc.fire_and_forget.call_args
+        assert call_args[0][0] == "hive-report-traffic-profile"
+        payload = call_args[0][1]
+        assert payload["peer_id"] == "02" + "a" * 64
+        assert payload["profile_type"] == "retail"
+        assert payload["avg_forward_size_sats"] == 25000.0
+
+    def test_report_traffic_profile_success_sync_fallback(self, mock_hive_bridge, mock_plugin):
+        """report_traffic_profile falls back to sync rpc.call when fire_and_forget unavailable."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        # Disable fire_and_forget so it falls through to synchronous rpc.call
+        mock_plugin.rpc.fire_and_forget = None
+        mock_plugin.rpc.call.return_value = {"status": "accepted", "peer_id": "02" + "a" * 64}
+
+        result = mock_hive_bridge.report_traffic_profile(
+            peer_id="02" + "a" * 64,
+            profile_type="retail",
+            peak_hours_utc=[14, 15, 16, 17, 18, 19],
+            quiet_hours_utc=[2, 3, 4, 5, 6, 7],
+            avg_forward_size_sats=25000.0,
+            daily_volume_sats=5000000.0,
+            drain_direction="outbound_heavy",
+            confidence=0.85,
+            observation_window_hours=168,
+        )
+
+        assert result is True
+        mock_plugin.rpc.call.assert_called_once()
+        call_args = mock_plugin.rpc.call.call_args
+        assert call_args[0][0] == "hive-report-traffic-profile"
+        payload = call_args[0][1]
+        assert payload["peer_id"] == "02" + "a" * 64
+        assert payload["profile_type"] == "retail"
+        assert payload["avg_forward_size_sats"] == 25000.0
+
+    def test_report_traffic_profile_hive_unavailable(self, mock_hive_bridge):
+        """report_traffic_profile returns False when hive is down."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = False
+
+        result = mock_hive_bridge.report_traffic_profile(
+            peer_id="02" + "a" * 64,
+            profile_type="retail",
+            peak_hours_utc=[14, 15],
+            quiet_hours_utc=[2, 3],
+            avg_forward_size_sats=25000.0,
+            daily_volume_sats=5000000.0,
+            drain_direction="balanced",
+            confidence=0.7,
+            observation_window_hours=168,
+        )
+
+        assert result is False
+
+    def test_report_traffic_profile_rpc_error(self, mock_hive_bridge, mock_plugin):
+        """report_traffic_profile returns False on RPC failure."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        # Disable fire_and_forget so it falls through to synchronous rpc.call
+        mock_plugin.rpc.fire_and_forget = None
+        mock_plugin.rpc.call.side_effect = Exception("connection refused")
+
+        result = mock_hive_bridge.report_traffic_profile(
+            peer_id="02" + "a" * 64,
+            profile_type="wholesale",
+            peak_hours_utc=[10, 11],
+            quiet_hours_utc=[0, 1],
+            avg_forward_size_sats=800000.0,
+            daily_volume_sats=20000000.0,
+            drain_direction="inbound_heavy",
+            confidence=0.9,
+            observation_window_hours=168,
+        )
+
+        assert result is False
+
+    def test_report_traffic_profile_async_queue_full(self, mock_hive_bridge, mock_plugin):
+        """report_traffic_profile returns False silently when async queue is full."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        # fire_and_forget returns False when queue is full
+        mock_plugin.rpc.fire_and_forget = Mock(return_value=False)
+
+        result = mock_hive_bridge.report_traffic_profile(
+            peer_id="02" + "a" * 64,
+            profile_type="retail",
+            peak_hours_utc=[14, 15],
+            quiet_hours_utc=[2, 3],
+            avg_forward_size_sats=25000.0,
+            daily_volume_sats=5000000.0,
+            drain_direction="balanced",
+            confidence=0.8,
+            observation_window_hours=168,
+        )
+
+        assert result is False
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

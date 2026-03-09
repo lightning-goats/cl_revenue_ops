@@ -1035,6 +1035,65 @@ class HiveFeeIntelligenceBridge:
             return {"conflict": False, "reason": "check_failed"}
         return result
 
+    def report_traffic_profile(
+        self,
+        peer_id: str,
+        profile_type: str,
+        peak_hours_utc: list,
+        quiet_hours_utc: list,
+        avg_forward_size_sats: float,
+        daily_volume_sats: float,
+        drain_direction: str,
+        confidence: float,
+        observation_window_hours: int,
+    ) -> bool:
+        """
+        Report local traffic profile to cl-hive for fleet sharing.
+
+        Called from flow_analysis after temporal profiles graduate (7+ days).
+        Uses telemetry policy — fire-and-forget, never blocks revenue-ops.
+
+        Args:
+            peer_id: External peer this profile describes
+            profile_type: retail/wholesale/mixed
+            peak_hours_utc: List of peak traffic hours (0-23)
+            quiet_hours_utc: List of quiet traffic hours (0-23)
+            avg_forward_size_sats: Average forward size in sats
+            daily_volume_sats: Average daily volume in sats
+            drain_direction: outbound_heavy/inbound_heavy/balanced
+            confidence: Profile confidence (0.0-1.0)
+            observation_window_hours: How long the profile was observed
+
+        Returns:
+            True if reported successfully, False otherwise
+        """
+        if not self.is_available():
+            return False
+
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-report-traffic-profile",
+            {
+                "peer_id": peer_id,
+                "profile_type": profile_type,
+                "peak_hours_utc": peak_hours_utc,
+                "quiet_hours_utc": quiet_hours_utc,
+                "avg_forward_size_sats": avg_forward_size_sats,
+                "daily_volume_sats": daily_volume_sats,
+                "drain_direction": drain_direction,
+                "confidence": confidence,
+                "observation_window_hours": observation_window_hours,
+            },
+            policy_key="telemetry",
+        )
+        if not ok:
+            if err not in ("async_queue_full",):
+                self._log(f"Failed to report traffic profile: {err}", level="debug")
+            return False
+        if result and result.get("error"):
+            self._log(f"Traffic profile report error: {result.get('error')}", level="debug")
+            return False
+        return True
+
 
     def check_circular_flow_risk(
         self,
