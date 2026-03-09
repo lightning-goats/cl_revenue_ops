@@ -4312,7 +4312,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # skip-fleet: two fleet members rebalancing to the same external peer
             # via different routes is fine — just don't inject fleet paths.
             skip_fleet_path = False
-            conflict = self.hive_bridge.check_rebalance_conflict(candidate.to_peer_id)
+            conflict = self.hive_bridge.check_rebalance_conflict(
+                peer_id=candidate.to_peer_id,
+                direction="outbound",
+                amount_sats=candidate.amount_sats,
+            )
             if conflict.get("conflict"):
                 reason = conflict.get("reason", "Fleet member rebalancing through same peer")
                 self.plugin.log(
@@ -4321,6 +4325,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     level='info'
                 )
                 skip_fleet_path = True
+
+            # Log traffic intelligence info (informational — does not block)
+            if conflict.get("peer_in_peak_hours"):
+                window = conflict.get("suggested_window_utc")
+                self.plugin.log(
+                    f"TRAFFIC_INTEL: {candidate.to_channel[:12]}... peer in peak hours"
+                    f"{f', suggested window: {window}' if window else ''}",
+                    level='info'
+                )
 
             if not skip_fleet_path:
                 # =====================================================================
