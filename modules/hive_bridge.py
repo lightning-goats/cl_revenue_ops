@@ -1002,29 +1002,44 @@ class HiveFeeIntelligenceBridge:
             return False
         return True
 
-    def check_rebalance_conflict(self, peer_id: str) -> Dict[str, Any]:
+    def check_rebalance_conflict(
+        self,
+        peer_id: str,
+        direction: str = "outbound",
+        amount_sats: int = 0,
+    ) -> Dict[str, Any]:
         """
         Check if another fleet member is rebalancing through a peer.
 
-        Avoids competing for the same routes, which wastes fees.
-        Information-based coordination - no fund transfer.
+        Enhanced with traffic intelligence: also checks peak hours and
+        returns suggested quiet-hour windows for optimal timing.
 
         Args:
             peer_id: The peer to check
+            direction: inbound or outbound (default: outbound)
+            amount_sats: Planned rebalance amount in sats
 
         Returns:
-            Conflict info dict:
+            Conflict info dict with traffic-aware fields:
             {
                 "conflict": True/False,
-                "member_id": "...",  # If conflict
-                "recommendation": "delay_rebalance"  # If conflict
+                "peer_in_peak_hours": True/False,
+                "suggested_window_utc": [start, end] or None,
+                "fleet_drain_forecast_sats": int,
             }
         """
         if self._is_circuit_open() or not self.is_available():
             return {"conflict": False, "reason": "hive_unavailable"}
 
         ok, result, err = self._rpc_call_with_policy(
-            "hive-check-rebalance-conflict", {"peer_id": peer_id}, policy_key="optional_read", require_available=False
+            "hive-check-rebalance-conflict",
+            {
+                "peer_id": peer_id,
+                "direction": direction,
+                "amount_sats": amount_sats,
+            },
+            policy_key="optional_read",
+            require_available=False,
         )
         if not ok or result is None:
             if err:
@@ -1151,6 +1166,48 @@ class HiveFeeIntelligenceBridge:
         self._set_in_cache(cache_key, result)
         return result
 
+    def query_fleet_demand_forecast(
+        self,
+        hours_ahead: int = 6,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query cl-hive for fleet demand forecast.
+
+        Returns per-member predictions of channel depletion, surplus,
+        and optimal rebalance windows based on Kalman velocity +
+        fleet traffic intelligence.
+
+        Args:
+            hours_ahead: Hours to forecast ahead (default: 6)
+
+        Returns:
+            Fleet demand forecast dict or None if unavailable
+        """
+        cache_key = f"fleet_demand_forecast:{hours_ahead}"
+
+        cached = self._get_from_cache(cache_key, ttl=1800.0)
+        if cached is not None:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-fleet-demand-forecast",
+            {"hours_ahead": hours_ahead},
+            policy_key="optional_read",
+            require_available=False,
+        )
+        if not ok:
+            if err:
+                self._log(f"Failed to query fleet demand forecast: {err}", level="debug")
+            return None
+
+        if result is None or result.get("error"):
+            return None
+
+        self._set_in_cache(cache_key, result)
+        return result
 
     def check_circular_flow_risk(
         self,

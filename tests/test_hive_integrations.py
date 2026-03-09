@@ -635,6 +635,71 @@ class TestTrafficIntelligenceBridge:
 
         assert result is None
 
+    def test_check_rebalance_conflict_traffic_aware(self, mock_hive_bridge):
+        """check_rebalance_conflict passes direction and amount to RPC."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        mock_hive_bridge.plugin.rpc.call.return_value = {
+            "conflict": False,
+            "peer_in_peak_hours": True,
+            "suggested_window_utc": [2, 6],
+            "fleet_drain_forecast_sats": 500000,
+        }
+
+        result = mock_hive_bridge.check_rebalance_conflict(
+            peer_id="02" + "a" * 64,
+            direction="outbound",
+            amount_sats=1000000,
+        )
+
+        assert result["peer_in_peak_hours"] is True
+        assert result["suggested_window_utc"] == [2, 6]
+        call_args = mock_hive_bridge.plugin.rpc.call.call_args
+        payload = call_args[0][1]
+        assert payload["direction"] == "outbound"
+        assert payload["amount_sats"] == 1000000
+
+    def test_check_rebalance_conflict_backwards_compat(self, mock_hive_bridge):
+        """check_rebalance_conflict still works with just peer_id."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        mock_hive_bridge.plugin.rpc.call.return_value = {"conflict": False}
+
+        result = mock_hive_bridge.check_rebalance_conflict(peer_id="02" + "a" * 64)
+
+        assert result["conflict"] is False
+
+    def test_query_fleet_demand_forecast_success(self, mock_hive_bridge):
+        """query_fleet_demand_forecast returns per-member predictions."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        forecast_data = {
+            "members": {
+                "02" + "a" * 64: {
+                    "predicted_depleted_channels": [],
+                    "predicted_surplus_channels": [],
+                    "rebalance_demand_sats": 500000,
+                    "optimal_rebalance_window_utc": [2, 6],
+                }
+            },
+            "fleet_summary": {"total_rebalance_demand_sats": 500000},
+        }
+        mock_hive_bridge.plugin.rpc.call.return_value = forecast_data
+
+        result = mock_hive_bridge.query_fleet_demand_forecast(hours_ahead=6)
+
+        assert result is not None
+        assert "members" in result
+
+    def test_query_fleet_demand_forecast_hive_down(self, mock_hive_bridge):
+        """query_fleet_demand_forecast returns None when hive unavailable."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = False
+
+        result = mock_hive_bridge.query_fleet_demand_forecast()
+
+        assert result is None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
