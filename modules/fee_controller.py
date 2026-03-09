@@ -4884,6 +4884,20 @@ class HillClimbingFeeController:
                 level="debug"
             )
 
+            # Query traffic intelligence for forward-size context (informational)
+            try:
+                traffic_intel = self.hive_bridge.query_traffic_intelligence(peer_id=peer_id)
+                if traffic_intel and traffic_intel.get("confidence", 0) > 0.3:
+                    avg_fwd = traffic_intel.get("avg_forward_size_sats", 0)
+                    daily_vol = traffic_intel.get("daily_volume_sats", 0)
+                    self.plugin.log(
+                        f"TRAFFIC_INTEL: {channel_id} -> {peer_id[:12]}... "
+                        f"avg_fwd={avg_fwd:.0f} daily_vol={daily_vol:.0f}",
+                        level="debug"
+                    )
+            except Exception:
+                pass  # Traffic intel unavailable, continue without it
+
             return recommended_fee
 
         except Exception as e:

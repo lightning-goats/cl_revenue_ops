@@ -1859,3 +1859,110 @@ class TestCoordinationInputs:
 
         assert inputs.mode == "fleet_augmented"
         assert "peer_quality" in inputs.priors
+
+
+class TestTrafficIntelligenceFees:
+    """Tests for traffic-intelligence-aware fee coordination."""
+
+    def _make_fc(self, mock_plugin, mock_database):
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        return HillClimbingFeeController(mock_plugin, config, mock_database)
+
+    def test_fee_recommendation_queries_traffic_intel(self, mock_database, mock_plugin):
+        """_get_coordinated_fee_recommendation queries traffic intelligence."""
+        fc = self._make_fc(mock_plugin, mock_database)
+        fc.hive_bridge = MagicMock()
+        fc.ENABLE_HIVE_COORDINATION = True
+        fc.HIVE_COORDINATION_MIN_CONFIDENCE = 0.5
+
+        fc.hive_bridge.query_coordinated_fee_recommendation.return_value = {
+            "recommended_fee_ppm": 150,
+            "confidence": 0.9,
+            "corridor_role": "primary",
+            "defense_multiplier": 1.0,
+            "pheromone_level": 0.7,
+            "adjustment_reason": "corridor primary"
+        }
+        fc.hive_bridge.query_traffic_intelligence.return_value = {
+            "avg_forward_size_sats": 50000,
+            "daily_volume_sats": 2000000,
+            "confidence": 0.8,
+        }
+
+        peer_id = "02" + "a" * 64
+        result = fc._get_coordinated_fee_recommendation(
+            channel_id="123x456x0",
+            peer_id=peer_id,
+            current_fee=100,
+            local_balance_pct=0.5
+        )
+
+        assert result == 150
+        fc.hive_bridge.query_traffic_intelligence.assert_called_once_with(peer_id=peer_id)
+
+    def test_fee_recommendation_works_without_traffic_intel(self, mock_database, mock_plugin):
+        """Fee coordination works when traffic intelligence is unavailable."""
+        fc = self._make_fc(mock_plugin, mock_database)
+        fc.hive_bridge = MagicMock()
+        fc.ENABLE_HIVE_COORDINATION = True
+        fc.HIVE_COORDINATION_MIN_CONFIDENCE = 0.5
+
+        fc.hive_bridge.query_coordinated_fee_recommendation.return_value = {
+            "recommended_fee_ppm": 200,
+            "confidence": 0.85,
+            "corridor_role": "secondary",
+            "defense_multiplier": 1.0,
+            "pheromone_level": 0.6,
+            "adjustment_reason": "corridor secondary"
+        }
+        fc.hive_bridge.query_traffic_intelligence.return_value = None
+
+        result = fc._get_coordinated_fee_recommendation(
+            channel_id="123x456x0",
+            peer_id="02" + "b" * 64,
+            current_fee=180,
+            local_balance_pct=0.4
+        )
+
+        assert result == 200
+        fc.hive_bridge.query_traffic_intelligence.assert_called_once()
+
+    def test_fee_recommendation_skips_low_confidence_traffic_intel(self, mock_database, mock_plugin):
+        """Traffic intel with low confidence is not logged."""
+        fc = self._make_fc(mock_plugin, mock_database)
+        fc.hive_bridge = MagicMock()
+        fc.ENABLE_HIVE_COORDINATION = True
+        fc.HIVE_COORDINATION_MIN_CONFIDENCE = 0.5
+
+        fc.hive_bridge.query_coordinated_fee_recommendation.return_value = {
+            "recommended_fee_ppm": 300,
+            "confidence": 0.9,
+            "corridor_role": "primary",
+            "defense_multiplier": 1.0,
+            "pheromone_level": 0.5,
+            "adjustment_reason": "corridor primary"
+        }
+        fc.hive_bridge.query_traffic_intelligence.return_value = {
+            "avg_forward_size_sats": 10000,
+            "daily_volume_sats": 500000,
+            "confidence": 0.2,  # Below 0.3 threshold
+        }
+
+        result = fc._get_coordinated_fee_recommendation(
+            channel_id="123x456x0",
+            peer_id="02" + "c" * 64,
+            current_fee=250,
+            local_balance_pct=0.6
+        )
+
+        assert result == 300
+        # Traffic intel was queried but the low confidence data should NOT
+        # produce a TRAFFIC_INTEL log line
+        traffic_logged = any(
+            "TRAFFIC_INTEL" in str(call)
+            for call in mock_plugin.log.call_args_list
+        )
+        assert not traffic_logged, "Low-confidence traffic intel should not be logged"
