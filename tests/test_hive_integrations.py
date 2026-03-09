@@ -574,6 +574,67 @@ class TestTrafficIntelligenceBridge:
 
         assert result is False
 
+    def test_query_traffic_intelligence_success(self, mock_hive_bridge):
+        """query_traffic_intelligence returns fleet data on success."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        fleet_data = {
+            "peer_id": "02" + "a" * 64,
+            "profile_type": "retail",
+            "avg_forward_size_sats": 30000.0,
+            "daily_volume_sats": 8000000.0,
+            "drain_direction": "outbound_heavy",
+            "reporters": 3,
+            "confidence": 0.82,
+        }
+        mock_hive_bridge.plugin.rpc.call.return_value = fleet_data
+
+        result = mock_hive_bridge.query_traffic_intelligence(peer_id="02" + "a" * 64)
+
+        assert result is not None
+        assert result["avg_forward_size_sats"] == 30000.0
+        assert result["reporters"] == 3
+
+    def test_query_traffic_intelligence_cached(self, mock_hive_bridge):
+        """query_traffic_intelligence returns cached data on second call."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        fleet_data = {
+            "peer_id": "02" + "a" * 64,
+            "avg_forward_size_sats": 30000.0,
+            "confidence": 0.82,
+        }
+        mock_hive_bridge.plugin.rpc.call.return_value = fleet_data
+
+        # First call populates cache
+        result1 = mock_hive_bridge.query_traffic_intelligence(peer_id="02" + "a" * 64)
+        assert result1 is not None
+
+        # Second call should use cache (no new RPC)
+        mock_hive_bridge.plugin.rpc.call.reset_mock()
+        result2 = mock_hive_bridge.query_traffic_intelligence(peer_id="02" + "a" * 64)
+        assert result2 is not None
+        mock_hive_bridge.plugin.rpc.call.assert_not_called()
+
+    def test_query_traffic_intelligence_no_data(self, mock_hive_bridge):
+        """query_traffic_intelligence returns None when no data available."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        mock_hive_bridge.plugin.rpc.call.return_value = {"error": "no_data"}
+
+        result = mock_hive_bridge.query_traffic_intelligence(peer_id="02" + "x" * 64)
+
+        assert result is None
+
+    def test_query_traffic_intelligence_hive_down(self, mock_hive_bridge):
+        """query_traffic_intelligence returns None when hive unavailable."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = False
+
+        result = mock_hive_bridge.query_traffic_intelligence(peer_id="02" + "a" * 64)
+
+        assert result is None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

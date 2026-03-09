@@ -1094,6 +1094,63 @@ class HiveFeeIntelligenceBridge:
             return False
         return True
 
+    def query_traffic_intelligence(
+        self,
+        peer_id: str = None,
+        profile_type: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query cl-hive for aggregated fleet traffic intelligence.
+
+        Follows query_fee_intelligence pattern: cache → breaker → RPC → cache.
+        Uses optional_read policy with stale cache fallback.
+
+        Args:
+            peer_id: Specific peer to query (optional — all if omitted)
+            profile_type: Filter by profile type (optional)
+
+        Returns:
+            Traffic intelligence dict or None if no data available
+        """
+        cache_key = f"traffic_intel:{peer_id or 'all'}:{profile_type or 'all'}"
+
+        # Check integration cache first (30-min TTL)
+        cached = self._get_from_cache(cache_key, ttl=1800.0)
+        if cached is not None:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        params = {}
+        if peer_id:
+            params["peer_id"] = peer_id
+        if profile_type:
+            params["profile_type"] = profile_type
+
+        ok, result, err = self._rpc_call_with_policy(
+            "hive-traffic-intelligence",
+            params,
+            policy_key="optional_read",
+            require_available=False,
+            count_error_response_failure=False,
+        )
+        if not ok:
+            if err and not err.startswith("rpc_error:no_data"):
+                self._log(f"Failed to query traffic intelligence: {err}", level="debug")
+            return None
+
+        if result is None:
+            return None
+        if result.get("error"):
+            if result.get("error") == "no_data":
+                return None
+            self._log(f"Traffic intelligence query error: {result.get('error')}", level="debug")
+            return None
+
+        self._set_in_cache(cache_key, result)
+        return result
+
 
     def check_circular_flow_risk(
         self,
