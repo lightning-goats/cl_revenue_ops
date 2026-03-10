@@ -212,6 +212,32 @@ class TestPeerQualityIntegration:
         assert mock_hive_bridge.should_rebalance_into_peer("03abc123") is False
 
 
+class TestGossipPriorityTargets:
+    """Tests for hive-backed gossip keepalive target discovery."""
+
+    def test_get_priority_gossip_targets_returns_member_pubkeys(self, mock_hive_bridge, mock_plugin):
+        """Hive members should be returned as ordered gossip targets."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        mock_plugin.rpc.call.return_value = {
+            "members": [
+                {"peer_id": "02" + "a" * 64, "tier": "member"},
+                {"peer_id": "03" + "b" * 64, "tier": "neophyte"},
+                {"peer_id": "02" + "a" * 64, "tier": "member"},  # duplicate should be removed
+            ]
+        }
+
+        result = mock_hive_bridge.get_priority_gossip_targets()
+
+        assert result == ["02" + "a" * 64, "03" + "b" * 64]
+
+    def test_get_priority_gossip_targets_returns_empty_when_unavailable(self, mock_hive_bridge):
+        """Unavailable hive bridge should degrade to an empty target list."""
+        mock_hive_bridge._hive_available = False
+
+        assert mock_hive_bridge.get_priority_gossip_targets() == []
+
+
 class TestChannelFlagsIntegration:
     """Tests for channel flags integration."""
 

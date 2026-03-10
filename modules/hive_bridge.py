@@ -2674,6 +2674,7 @@ class HiveFeeIntelligenceBridge:
     _MCF_TARGETS_CACHE_TTL = 300         # 5 minutes
     _NNLB_CACHE_TTL = 120                # 2 minutes
     _CHANNEL_AGES_CACHE_TTL = 3600       # 1 hour - ages change slowly
+    _GOSSIP_TARGETS_CACHE_TTL = 300      # 5 minutes
 
     def _get_from_cache(self, cache_key: str, ttl: float) -> Optional[Dict[str, Any]]:
         """Get data from integration cache if fresh."""
@@ -2867,6 +2868,52 @@ class HiveFeeIntelligenceBridge:
         if result and "peers" in result:
             return result["peers"].get(peer_id)
         return None
+
+    def get_priority_gossip_targets(self) -> List[str]:
+        """
+        Get hive member pubkeys suitable for gossip keepalive targeting.
+
+        Returns:
+            Ordered list of unique member pubkeys. Returns an empty list when
+            hive is unavailable or the RPC fails.
+        """
+        cache_key = "gossip_targets"
+        cached = self._get_from_cache(cache_key, self._GOSSIP_TARGETS_CACHE_TTL)
+        if cached and isinstance(cached, dict):
+            targets = cached.get("targets")
+            if isinstance(targets, list):
+                return list(targets)
+
+        if self._is_circuit_open() or not self.is_available():
+            return []
+
+        try:
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-members",
+                {},
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query hive members for gossip targets: {err}", level="debug")
+                return []
+
+            members = result.get("members", [])
+            targets: List[str] = []
+            seen = set()
+            for member in members:
+                peer_id = str(member.get("peer_id") or "").strip()
+                if not peer_id or peer_id in seen:
+                    continue
+                seen.add(peer_id)
+                targets.append(peer_id)
+
+            self._set_in_cache(cache_key, {"targets": targets})
+            return targets
+        except Exception as e:
+            self._log(f"Failed to query gossip targets (unexpected): {e}", level="debug")
+            return []
 
     def get_fee_change_outcomes(
         self,

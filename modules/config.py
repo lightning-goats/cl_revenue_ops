@@ -39,6 +39,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'flow_interval': int,
     'fee_interval': int,
     'rebalance_interval': int,
+    'enable_gossip_keepalives': bool,
+    'target_gossip_peers': int,
     'paused': bool,
     'min_fee_ppm': int,
     'max_fee_ppm': int,
@@ -241,6 +243,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
     'rebalance_interval': (60, 86400),
+    'target_gossip_peers': (0, 100),
     'max_concurrent_jobs': (1, 20),
     'sling_job_timeout_seconds': (60, 7200),
     'askrene_max_age_sec': (10, 86400),
@@ -293,6 +296,8 @@ class Config:
     flow_interval: int = 3600      # 1 hour
     fee_interval: int = 1800       # 30 minutes (matches option default)
     rebalance_interval: int = 900  # 15 minutes
+    enable_gossip_keepalives: bool = False
+    target_gossip_peers: int = 5
     # Hot-channel protection (Sling aggressiveness for fast-draining, high-profit channels)
     hot_channel_protection_enabled: bool = True
     hot_channel_protection_override_peers: str = ''  # CSV fallback; DB override table preferred
@@ -727,6 +732,8 @@ class ConfigSnapshot:
     flow_interval: int
     fee_interval: int
     rebalance_interval: int
+    enable_gossip_keepalives: bool
+    target_gossip_peers: int
     paused: bool
     hot_channel_protection_enabled: bool
     hot_channel_protection_override_peers: str
