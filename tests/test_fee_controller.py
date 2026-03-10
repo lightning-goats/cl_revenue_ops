@@ -1819,6 +1819,40 @@ class TestLastDecisionSummary:
         assert summary["dominant_input"] == "channel_state_data"
         assert summary["safety_block"] is False
 
+    def test_adjust_all_fees_skips_channels_with_temporary_overlay(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import PIDFeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        cfg = Config()
+        mock_database.prune_expired_fee_anchors.return_value = None
+        mock_database.get_all_fee_anchors.return_value = []
+        mock_database.get_all_channel_states.return_value = [
+            {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced"}
+        ]
+
+        fc = PIDFeeController(
+            mock_plugin,
+            cfg,
+            mock_database,
+            temporary_fee_overlay_active=lambda cid: cid == channel_id,
+        )
+        fc._get_channels_info = MagicMock(return_value={
+            channel_id: {"fee_proportional_millionths": 100}
+        })
+        fc._get_dynamic_chain_costs = MagicMock(return_value=None)
+        fc._adjust_channel_fee = MagicMock(side_effect=AssertionError("overlay-active channels must be skipped"))
+
+        adjustments = fc.adjust_all_fees()
+        summary = fc.get_last_decision_summary()
+
+        assert adjustments == []
+        assert summary["action"] == "suppressed"
+        assert summary["reason"] == "temporary_overlay"
+        assert summary["dominant_input"] == "temporary_overlay"
+        assert summary["safety_block"] is True
+
 
 class TestCoordinationInputs:
     def _make_fc(self, mock_plugin, mock_database, hive_bridge=None):

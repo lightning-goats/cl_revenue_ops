@@ -1,6 +1,7 @@
 from collections import defaultdict, deque
 from dataclasses import dataclass
 import math
+import threading
 import time
 from typing import Callable, Deque, Dict, Optional
 
@@ -74,211 +75,228 @@ class RealtimeSurgeDefense:
         self._states: Dict[str, SurgeOverlayState] = {}
         self._pending_actions: Deque[SurgeOverlayAction] = deque()
         self._trigger_history: Deque[float] = deque()
+        self._lock = threading.RLock()
 
     def ingest_sample(self, sample: SurgeSample) -> Optional[Dict[str, object]]:
-        if not self.enabled:
-            return None
-        if not sample.outgoing_channel_id or sample.amount_msat <= 0:
-            return None
+        with self._lock:
+            if not self.enabled:
+                return None
+            if not sample.outgoing_channel_id or sample.amount_msat <= 0:
+                return None
 
-        channel_id = sample.outgoing_channel_id
-        samples = self._samples[channel_id]
-        samples.append(sample)
-        self._prune_samples(channel_id, sample.ts)
+            channel_id = sample.outgoing_channel_id
+            samples = self._samples[channel_id]
+            samples.append(sample)
+            self._prune_samples(channel_id, sample.ts)
 
-        metrics = self._compute_window_metrics(channel_id)
-        if not self._should_trigger(metrics):
-            return None
+            metrics = self._compute_window_metrics(channel_id)
+            if not self._should_trigger(metrics):
+                return None
 
-        state = self._states.get(channel_id)
-        if state is None:
-            state = SurgeOverlayState()
-            self._states[channel_id] = state
+            state = self._states.get(channel_id)
+            if state is None:
+                state = SurgeOverlayState()
+                self._states[channel_id] = state
 
-        state.cooldown_until = max(
-            state.cooldown_until,
-            sample.ts + self.surge_cooldown_seconds,
-        )
-        state.last_trigger_reason = self._build_trigger_reason(metrics)
+            state.cooldown_until = max(
+                state.cooldown_until,
+                sample.ts + self.surge_cooldown_seconds,
+            )
+            state.last_trigger_reason = self._build_trigger_reason(metrics)
 
-        if state.pending_action == "revert":
-            self._clear_pending_action(channel_id)
+            if state.pending_action == "revert":
+                self._clear_pending_action(channel_id)
 
-        baseline_fee_ppm = self._resolve_baseline_fee(channel_id, state)
-        if baseline_fee_ppm is None:
-            self._cleanup_idle_channel(channel_id)
-            return None
+            baseline_fee_ppm = self._resolve_baseline_fee(channel_id, state)
+            if baseline_fee_ppm is None:
+                self._cleanup_idle_channel(channel_id)
+                return None
 
-        target_fee_ppm = self._compute_bounded_surge_fee(
-            baseline_fee_ppm,
-            metrics["moved_pct"],
-        )
+            target_fee_ppm = self._compute_bounded_surge_fee(
+                baseline_fee_ppm,
+                metrics["moved_pct"],
+            )
 
-        if sample.ts - state.last_attempt_ts < self.surge_setchannel_min_interval_seconds:
-            state.last_apply_result = "debounced"
+            if sample.ts - state.last_attempt_ts < self.surge_setchannel_min_interval_seconds:
+                state.last_apply_result = "debounced"
+                return {
+                    "channel_id": channel_id,
+                    "target_fee_ppm": target_fee_ppm,
+                    "result": state.last_apply_result,
+                }
+
+            if state.active and state.active_fee_ppm is not None and target_fee_ppm <= state.active_fee_ppm:
+                state.last_apply_result = "cooldown_extended"
+                return {
+                    "channel_id": channel_id,
+                    "target_fee_ppm": state.active_fee_ppm,
+                    "result": state.last_apply_result,
+                }
+
+            if (
+                state.pending_action == "apply"
+                and state.pending_fee_ppm is not None
+                and target_fee_ppm <= state.pending_fee_ppm
+            ):
+                state.last_apply_result = "queued"
+                return {
+                    "channel_id": channel_id,
+                    "target_fee_ppm": state.pending_fee_ppm,
+                    "result": state.last_apply_result,
+                }
+
+            self._enqueue_action(
+                SurgeOverlayAction(
+                    channel_id=channel_id,
+                    action="apply",
+                    fee_ppm=target_fee_ppm,
+                    baseline_fee_ppm=baseline_fee_ppm,
+                )
+            )
+            self._record_trigger(sample.ts)
+            state.last_apply_result = "queued"
+
             return {
                 "channel_id": channel_id,
                 "target_fee_ppm": target_fee_ppm,
                 "result": state.last_apply_result,
             }
 
-        if state.active and state.active_fee_ppm is not None and target_fee_ppm <= state.active_fee_ppm:
-            state.last_apply_result = "cooldown_extended"
-            return {
-                "channel_id": channel_id,
-                "target_fee_ppm": state.active_fee_ppm,
-                "result": state.last_apply_result,
-            }
-
-        if (
-            state.pending_action == "apply"
-            and state.pending_fee_ppm is not None
-            and target_fee_ppm <= state.pending_fee_ppm
-        ):
-            state.last_apply_result = "queued"
-            return {
-                "channel_id": channel_id,
-                "target_fee_ppm": state.pending_fee_ppm,
-                "result": state.last_apply_result,
-            }
-
-        self._enqueue_action(
-            SurgeOverlayAction(
-                channel_id=channel_id,
-                action="apply",
-                fee_ppm=target_fee_ppm,
-                baseline_fee_ppm=baseline_fee_ppm,
-            )
-        )
-        self._record_trigger(sample.ts)
-        state.last_apply_result = "queued"
-
-        return {
-            "channel_id": channel_id,
-            "target_fee_ppm": target_fee_ppm,
-            "result": state.last_apply_result,
-        }
-
     def process_pending_actions(self) -> None:
-        now = self.time_fn()
-        for channel_id in list(self._states):
-            self._prune_samples(channel_id, now)
-            state = self._states.get(channel_id)
-            if state is None:
-                continue
-
-            if (
-                state.active
-                and state.pending_action is None
-                and state.baseline_fee_ppm is not None
-                and now >= state.cooldown_until
-                and not self._should_trigger(self._compute_window_metrics(channel_id))
-            ):
-                self._enqueue_action(
-                    SurgeOverlayAction(
-                        channel_id=channel_id,
-                        action="revert",
-                        fee_ppm=state.baseline_fee_ppm,
-                    )
-                )
-
-            self._cleanup_idle_channel(channel_id)
-
-        pending_count = len(self._pending_actions)
-        for _ in range(pending_count):
-            action = self._pending_actions.popleft()
-            state = self._states.get(action.channel_id)
-            if state is None:
-                continue
-
-            if not self._is_current_pending_action(state, action):
-                continue
-
-            if now - state.last_attempt_ts < self.surge_setchannel_min_interval_seconds:
-                self._pending_actions.append(action)
-                continue
-
-            if action.action == "apply":
-                metrics = self._compute_window_metrics(action.channel_id)
-                if not self._should_trigger(metrics):
-                    self._clear_pending_action(action.channel_id)
-                    state.last_apply_result = "stale_dropped"
-                    self._cleanup_idle_channel(action.channel_id)
+        with self._lock:
+            now = self.time_fn()
+            for channel_id in list(self._states):
+                self._prune_samples(channel_id, now)
+                state = self._states.get(channel_id)
+                if state is None:
                     continue
 
-            state.last_attempt_ts = self.time_fn()
-            try:
-                ok = bool(self.apply_fee_callback(action.channel_id, action.fee_ppm))
-            except Exception:
-                ok = False
+                if (
+                    state.active
+                    and state.pending_action is None
+                    and state.baseline_fee_ppm is not None
+                    and now >= state.cooldown_until
+                    and not self._should_trigger(self._compute_window_metrics(channel_id))
+                ):
+                    self._enqueue_action(
+                        SurgeOverlayAction(
+                            channel_id=channel_id,
+                            action="revert",
+                            fee_ppm=state.baseline_fee_ppm,
+                        )
+                    )
 
-            if action.action == "apply":
-                self._clear_pending_action(action.channel_id)
-                if ok:
-                    state.active = True
-                    state.baseline_fee_ppm = action.baseline_fee_ppm
-                    state.active_fee_ppm = action.fee_ppm
-                    state.last_apply_result = "applied"
-                else:
-                    state.last_apply_result = "apply_failed"
-                    if not state.active:
+                self._cleanup_idle_channel(channel_id)
+
+            pending_count = len(self._pending_actions)
+            for _ in range(pending_count):
+                action = self._pending_actions.popleft()
+                state = self._states.get(action.channel_id)
+                if state is None:
+                    continue
+
+                if not self._is_current_pending_action(state, action):
+                    continue
+
+                if now - state.last_attempt_ts < self.surge_setchannel_min_interval_seconds:
+                    self._pending_actions.append(action)
+                    continue
+
+                if action.action == "apply":
+                    metrics = self._compute_window_metrics(action.channel_id)
+                    if not self._should_trigger(metrics):
+                        self._clear_pending_action(action.channel_id)
+                        state.last_apply_result = "stale_dropped"
+                        self._cleanup_idle_channel(action.channel_id)
+                        continue
+
+                state.last_attempt_ts = self.time_fn()
+                try:
+                    ok = bool(self.apply_fee_callback(action.channel_id, action.fee_ppm))
+                except Exception:
+                    ok = False
+
+                if action.action == "apply":
+                    if ok:
+                        self._clear_pending_action(action.channel_id)
+                        state.active = True
+                        state.baseline_fee_ppm = action.baseline_fee_ppm
+                        state.active_fee_ppm = action.fee_ppm
+                        state.last_apply_result = "applied"
+                    else:
+                        state.last_apply_result = "apply_failed"
+                        state.pending_action = action.action
+                        state.pending_fee_ppm = action.fee_ppm
+                        state.pending_baseline_fee_ppm = action.baseline_fee_ppm
+                        self._pending_actions.append(action)
+                        if not state.active:
+                            state.baseline_fee_ppm = None
+                            state.active_fee_ppm = None
+                elif action.action == "revert":
+                    if ok:
+                        self._clear_pending_action(action.channel_id)
+                        state.active = False
                         state.baseline_fee_ppm = None
                         state.active_fee_ppm = None
-            elif action.action == "revert":
-                if ok:
-                    self._clear_pending_action(action.channel_id)
-                    state.active = False
-                    state.baseline_fee_ppm = None
-                    state.active_fee_ppm = None
-                    state.cooldown_until = 0.0
-                    state.last_trigger_reason = ""
-                    state.last_apply_result = "reverted"
-                else:
-                    state.last_apply_result = "revert_failed"
-                    self._pending_actions.append(action)
+                        state.cooldown_until = 0.0
+                        state.last_trigger_reason = ""
+                        state.last_apply_result = "reverted"
+                    else:
+                        state.last_apply_result = "revert_failed"
+                        self._pending_actions.append(action)
 
-            self._cleanup_idle_channel(action.channel_id)
+                self._cleanup_idle_channel(action.channel_id)
 
     def get_status(self) -> Dict[str, object]:
-        now = self.time_fn()
-        self._prune_trigger_history(now)
-        channel_ids = set(self._samples) | set(self._states)
-        channels: Dict[str, Dict[str, object]] = {}
+        with self._lock:
+            now = self.time_fn()
+            self._prune_trigger_history(now)
+            channel_ids = set(self._samples) | set(self._states)
+            channels: Dict[str, Dict[str, object]] = {}
 
-        for channel_id in sorted(channel_ids):
-            self._prune_samples(channel_id, now)
-            self._cleanup_idle_channel(channel_id)
-            if channel_id not in self._samples and channel_id not in self._states:
-                continue
+            for channel_id in sorted(channel_ids):
+                self._prune_samples(channel_id, now)
+                self._cleanup_idle_channel(channel_id)
+                if channel_id not in self._samples and channel_id not in self._states:
+                    continue
 
-            metrics = self._compute_window_metrics(channel_id)
-            state = self._states.get(channel_id)
-            channels[channel_id] = {
-                "active": state.active if state else False,
-                "baseline_fee_ppm": state.baseline_fee_ppm if state else None,
-                "active_fee_ppm": state.active_fee_ppm if state else None,
-                "cooldown_until": state.cooldown_until if state else 0.0,
-                "cooldown_remaining_sec": (
-                    max(0.0, state.cooldown_until - now) if state else 0.0
+                metrics = self._compute_window_metrics(channel_id)
+                state = self._states.get(channel_id)
+                channels[channel_id] = {
+                    "active": state.active if state else False,
+                    "baseline_fee_ppm": state.baseline_fee_ppm if state else None,
+                    "active_fee_ppm": state.active_fee_ppm if state else None,
+                    "cooldown_until": state.cooldown_until if state else 0.0,
+                    "cooldown_remaining_sec": (
+                        max(0.0, state.cooldown_until - now) if state else 0.0
+                    ),
+                    "cooldown_remaining_seconds": (
+                        max(0.0, state.cooldown_until - now) if state else 0.0
+                    ),
+                    "last_trigger_reason": state.last_trigger_reason if state else "",
+                    "last_apply_result": state.last_apply_result if state else "idle",
+                    "last_attempt_ts": state.last_attempt_ts if state else 0.0,
+                    **metrics,
+                }
+
+            return {
+                "enabled": self.enabled,
+                "active_channel_count": sum(
+                    1 for state in self._states.values() if state.active
                 ),
-                "cooldown_remaining_seconds": (
-                    max(0.0, state.cooldown_until - now) if state else 0.0
-                ),
-                "last_trigger_reason": state.last_trigger_reason if state else "",
-                "last_apply_result": state.last_apply_result if state else "idle",
-                "last_attempt_ts": state.last_attempt_ts if state else 0.0,
-                **metrics,
+                "trigger_count_1h": self._count_recent_triggers(now, 3600),
+                "trigger_count_24h": self._count_recent_triggers(now, 86400),
+                "channels": channels,
             }
 
-        return {
-            "enabled": self.enabled,
-            "active_channel_count": sum(
-                1 for state in self._states.values() if state.active
-            ),
-            "trigger_count_1h": self._count_recent_triggers(now, 3600),
-            "trigger_count_24h": self._count_recent_triggers(now, 86400),
-            "channels": channels,
-        }
+    def is_overlay_active(self, channel_id: str) -> bool:
+        """Report whether a channel is currently surge-protected or has a queued overlay write."""
+        if not channel_id:
+            return False
+
+        with self._lock:
+            state = self._states.get(channel_id)
+            return bool(state and (state.active or state.pending_action is not None))
 
     def _resolve_baseline_fee(
         self,

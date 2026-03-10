@@ -60,7 +60,7 @@ import math
 import json
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Tuple, Union, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, Any, Tuple, Union, TYPE_CHECKING
 from enum import Enum
 
 from pyln.client import Plugin, RpcError
@@ -3652,7 +3652,8 @@ class HillClimbingFeeController:
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  policy_manager: Optional[PolicyManager] = None,
                  profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
-                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
+                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None,
+                 temporary_fee_overlay_active: Optional[Callable[[str], bool]] = None):
         """
         Initialize the fee controller.
 
@@ -3670,6 +3671,7 @@ class HillClimbingFeeController:
         self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
         self.hive_bridge = hive_bridge
+        self.temporary_fee_overlay_active = temporary_fee_overlay_active
 
         # In-memory cache of Hill Climbing states (also persisted to DB)
         # Note: This cache is used for both legacy HillClimbState and new ThompsonAIMDState
@@ -5300,6 +5302,7 @@ class HillClimbingFeeController:
             "policy_passive": 0,
             "policy_static": 0,
             "policy_hive": 0,
+            "temporary_overlay": 0,
             "sleeping": 0,
             "waiting_time": 0,
             "waiting_forwards": 0,
@@ -5352,6 +5355,17 @@ class HillClimbingFeeController:
             
             if not channel_id or not peer_id:
                 continue
+
+            if self.temporary_fee_overlay_active is not None:
+                try:
+                    if self.temporary_fee_overlay_active(channel_id):
+                        skip_reasons["temporary_overlay"] += 1
+                        continue
+                except Exception as e:
+                    self.plugin.log(
+                        f"TEMP_OVERLAY: Failed to query overlay state for {channel_id}: {e}",
+                        level='debug'
+                    )
             
             # Check policy for this peer (v1.4: Policy-Driven Architecture)
             if self.policy_manager:
@@ -5486,6 +5500,7 @@ class HillClimbingFeeController:
                     "policy_passive",
                     "policy_static",
                     "policy_hive",
+                    "temporary_overlay",
                     "sleeping",
                     "waiting_time",
                     "waiting_forwards",

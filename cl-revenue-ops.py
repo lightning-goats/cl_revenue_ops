@@ -263,6 +263,19 @@ def _apply_realtime_surge_fee_overlay(channel_id: str, fee_ppm: int) -> bool:
         return False
 
 
+def _is_realtime_surge_overlay_active(channel_id: str) -> bool:
+    """Let the scheduled fee controller skip channels under temporary surge control."""
+    if realtime_surge_defense is None or not channel_id:
+        return False
+
+    target_scid = normalize_scid(channel_id) or channel_id
+    try:
+        return bool(realtime_surge_defense.is_overlay_active(target_scid))
+    except Exception as e:
+        plugin.log(f"Realtime surge overlay-state check failed for {channel_id}: {e}", level="debug")
+        return False
+
+
 # Initialize the plugin
 plugin = Plugin()
 
@@ -1528,7 +1541,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     flow_analyzer.hive_bridge = hive_bridge
     capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager)
     capacity_planner.hive_bridge = hive_bridge
-    fee_controller = PIDFeeController(safe_plugin, config, database, policy_manager, profitability_analyzer, hive_bridge)
+    fee_controller = PIDFeeController(
+        safe_plugin,
+        config,
+        database,
+        policy_manager,
+        profitability_analyzer,
+        hive_bridge,
+        temporary_fee_overlay_active=_is_realtime_surge_overlay_active,
+    )
     rebalancer = EVRebalancer(
         safe_plugin, config, database, policy_manager,
         hive_bridge=hive_bridge

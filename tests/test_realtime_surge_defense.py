@@ -121,6 +121,25 @@ def test_status_reports_active_overlay_details():
     assert channel["last_apply_result"] == "applied"
 
 
+def test_is_overlay_active_reports_pending_and_active_overlay_states():
+    clock = FakeClock()
+    manager, _ = _make_manager(clock)
+
+    assert manager.is_overlay_active("2x2x2") is False
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    assert manager.is_overlay_active("2x2x2") is True
+
+    manager.process_pending_actions()
+
+    assert manager.is_overlay_active("2x2x2") is True
+
+
 def test_status_reports_trigger_counts_for_recent_windows():
     clock = FakeClock()
     manager, _ = _make_manager(clock)
@@ -311,13 +330,14 @@ def test_calm_window_reverts_to_exact_baseline_after_cooldown():
     assert "2x2x2" not in status["channels"]
 
 
-def test_failed_apply_does_not_mark_overlay_active():
+def test_failed_apply_is_retried_after_min_interval():
     clock = FakeClock()
     applied = []
+    outcomes = iter([False, True])
 
     def apply_fee(channel_id: str, fee_ppm: int) -> bool:
         applied.append((channel_id, fee_ppm))
-        return False
+        return next(outcomes)
 
     manager = RealtimeSurgeDefense(
         enabled=True,
@@ -341,15 +361,33 @@ def test_failed_apply_does_not_mark_overlay_active():
 
     manager.process_pending_actions()
 
-    status = manager.get_status()
-    channel = status["channels"]["2x2x2"]
+    first_status = manager.get_status()
+    first_channel = first_status["channels"]["2x2x2"]
 
     assert applied == [("2x2x2", 340)]
-    assert status["active_channel_count"] == 0
-    assert channel["active"] is False
-    assert channel["baseline_fee_ppm"] is None
-    assert channel["active_fee_ppm"] is None
-    assert channel["last_apply_result"] == "apply_failed"
+    assert first_status["active_channel_count"] == 0
+    assert first_channel["active"] is False
+    assert first_channel["baseline_fee_ppm"] is None
+    assert first_channel["active_fee_ppm"] is None
+    assert first_channel["last_apply_result"] == "apply_failed"
+    assert manager.is_overlay_active("2x2x2") is True
+
+    manager.process_pending_actions()
+
+    assert applied == [("2x2x2", 340)]
+
+    clock.advance(15)
+    manager.process_pending_actions()
+
+    final_status = manager.get_status()
+    final_channel = final_status["channels"]["2x2x2"]
+
+    assert applied == [("2x2x2", 340), ("2x2x2", 340)]
+    assert final_status["active_channel_count"] == 1
+    assert final_channel["active"] is True
+    assert final_channel["baseline_fee_ppm"] == 100
+    assert final_channel["active_fee_ppm"] == 340
+    assert final_channel["last_apply_result"] == "applied"
 
 
 def test_stale_queued_apply_is_dropped_after_window_goes_calm():
@@ -372,11 +410,15 @@ def test_stale_queued_apply_is_dropped_after_window_goes_calm():
     assert "2x2x2" not in status["channels"]
 
 
-def test_apply_callback_exception_fails_safe_without_phantom_pending_state():
+def test_apply_callback_exception_is_retried_after_min_interval():
     clock = FakeClock()
+    outcomes = iter([RuntimeError("rpc failed"), True])
 
     def apply_fee(channel_id: str, fee_ppm: int) -> bool:
-        raise RuntimeError("rpc failed")
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
     manager = RealtimeSurgeDefense(
         enabled=True,
@@ -400,14 +442,31 @@ def test_apply_callback_exception_fails_safe_without_phantom_pending_state():
 
     manager.process_pending_actions()
 
-    status = manager.get_status()
-    channel = status["channels"]["2x2x2"]
+    first_status = manager.get_status()
+    first_channel = first_status["channels"]["2x2x2"]
 
-    assert status["active_channel_count"] == 0
-    assert channel["active"] is False
-    assert channel["baseline_fee_ppm"] is None
-    assert channel["active_fee_ppm"] is None
-    assert channel["last_apply_result"] == "apply_failed"
+    assert first_status["active_channel_count"] == 0
+    assert first_channel["active"] is False
+    assert first_channel["baseline_fee_ppm"] is None
+    assert first_channel["active_fee_ppm"] is None
+    assert first_channel["last_apply_result"] == "apply_failed"
+    assert manager.is_overlay_active("2x2x2") is True
+
+    manager.process_pending_actions()
+
+    assert manager.get_status()["active_channel_count"] == 0
+
+    clock.advance(15)
+    manager.process_pending_actions()
+
+    final_status = manager.get_status()
+    final_channel = final_status["channels"]["2x2x2"]
+
+    assert final_status["active_channel_count"] == 1
+    assert final_channel["active"] is True
+    assert final_channel["baseline_fee_ppm"] == 100
+    assert final_channel["active_fee_ppm"] == 340
+    assert final_channel["last_apply_result"] == "applied"
 
 
 def test_failed_revert_keeps_overlay_active_for_retry():
