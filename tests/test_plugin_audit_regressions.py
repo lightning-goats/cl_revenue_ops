@@ -1,11 +1,52 @@
 from unittest.mock import MagicMock
 from types import SimpleNamespace
+import pytest
 from tests.plugin_test_utils import DummyPlugin, load_plugin_module
 from modules.config import Config, CONFIG_FIELD_TYPES, CONFIG_FIELD_RANGES
 
 
 def _load_plugin_module():
     return load_plugin_module()
+
+
+def _minimal_init_options(**overrides):
+    options = {
+        "revenue-ops-db-path": "~/.lightning/revenue_ops.db",
+        "revenue-ops-flow-interval": "3600",
+        "revenue-ops-fee-interval": "1800",
+        "revenue-ops-rebalance-interval": "900",
+        "revenue-ops-target-flow": "100000",
+        "revenue-ops-min-fee-ppm": "10",
+        "revenue-ops-max-fee-ppm": "2000",
+        "revenue-ops-rebalance-min-profit": "10",
+        "revenue-ops-futility-cooldown-hours": "48",
+        "revenue-ops-flow-window-days": "7",
+        "revenue-ops-rebalancer": "sling",
+        "revenue-ops-daily-budget-sats": "5000",
+        "revenue-ops-weekly-budget-sats": "35000",
+        "revenue-ops-min-wallet-reserve": "1000000",
+        "revenue-ops-proportional-budget": "true",
+        "revenue-ops-proportional-budget-pct": "0.30",
+        "revenue-ops-dry-run": "false",
+        "revenue-ops-htlc-congestion-threshold": "0.8",
+        "revenue-ops-enable-reputation": "true",
+        "revenue-ops-reputation-decay": "0.98",
+        "revenue-ops-enable-kelly": "false",
+        "revenue-ops-kelly-bypass-fleet": "true",
+        "revenue-ops-kelly-fraction": "0.5",
+        "revenue-ops-vegas-reflex": "true",
+        "revenue-ops-vegas-decay": "0.85",
+        "revenue-ops-scarcity-pricing": "true",
+        "revenue-ops-scarcity-threshold": "0.35",
+        "revenue-ops-rpc-timeout-seconds": "15",
+        "revenue-ops-rpc-circuit-breaker-seconds": "60",
+        "revenue-ops-reservation-timeout-hours": "4",
+        "revenue-ops-hive-enabled": "auto",
+        "revenue-ops-hive-fee-ppm": "0",
+        "revenue-ops-hive-rebalance-tolerance": "50",
+    }
+    options.update(overrides)
+    return options
 
 
 def test_threadsafe_rpc_call_keeps_hive_report_synchronous():
@@ -120,6 +161,25 @@ def test_config_supports_dynamic_htlcmin_field():
     assert cfg.enable_dynamic_htlcmin is True
     assert snapshot.enable_dynamic_htlcmin is True
     assert CONFIG_FIELD_TYPES["enable_dynamic_htlcmin"] is bool
+
+
+def test_init_wires_dynamic_htlcmin_plugin_option_into_config():
+    class _StopInit(Exception):
+        pass
+
+    mod = _load_plugin_module()
+    mod.plugin.rpc.plugin.return_value = {"plugins": []}
+    mod.plugin.rpc.listplugins.return_value = {"plugins": []}
+    mod.Database = MagicMock(side_effect=_StopInit("stop after config"))
+
+    with pytest.raises(_StopInit):
+        mod.init(
+            _minimal_init_options(**{"revenue-ops-enable-dynamic-htlcmin": "true"}),
+            {},
+            mod.plugin,
+        )
+
+    assert mod.config.enable_dynamic_htlcmin is True
 
 
 def test_run_gossip_maintenance_calls_manager_when_enabled():
