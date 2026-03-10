@@ -129,7 +129,7 @@ def test_plugin_registers_dynamic_htlcmin_option():
     assert "revenue-ops-enable-dynamic-htlcmin" in getattr(mod.plugin, "options", {})
 
 
-def test_init_maps_dynamic_htlcmin_option_into_config_kwargs():
+def test_init_maps_dynamic_htlcmin_option_into_config_kwargs(monkeypatch):
     mod = _load_plugin_module()
     options = {
         name: registration["default"]
@@ -138,6 +138,8 @@ def test_init_maps_dynamic_htlcmin_option_into_config_kwargs():
     }
     options["revenue-ops-enable-dynamic-htlcmin"] = "true"
     captured_kwargs = {}
+    signal_calls = []
+    atexit_calls = []
 
     class _StopInit(Exception):
         pass
@@ -147,12 +149,24 @@ def test_init_maps_dynamic_htlcmin_option_into_config_kwargs():
             captured_kwargs.update(kwargs)
             raise _StopInit()
 
+    monkeypatch.setattr(
+        mod.signal,
+        "signal",
+        lambda *args, **kwargs: signal_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        mod.atexit,
+        "register",
+        lambda *args, **kwargs: atexit_calls.append((args, kwargs)),
+    )
     mod.Config = _ConfigCapture
 
     with pytest.raises(_StopInit):
         mod.init(options, {}, mod.plugin)
 
     assert captured_kwargs["enable_dynamic_htlcmin"] is True
+    assert len(signal_calls) == 1
+    assert len(atexit_calls) == 1
 
 
 def test_run_gossip_maintenance_calls_manager_when_enabled():
