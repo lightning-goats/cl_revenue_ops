@@ -161,6 +161,112 @@ class TestSetChannelFeeLimits:
         assert _setchannel_kwargs(mock_plugin)["feeppm"] == 0
 
 
+class TestSetChannelFeeHtlcMin:
+    def _make_controller(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        return HillClimbingFeeController(mock_plugin, cfg, mock_database)
+
+    def test_set_channel_fee_omits_htlcmin_when_not_requested(self, mock_plugin, mock_database):
+        fc = self._make_controller(mock_plugin, mock_database)
+
+        fc.set_channel_fee("123x456x0", 125, manual=True)
+
+        assert "htlcmin" not in _setchannel_kwargs(mock_plugin)
+
+    def test_set_channel_fee_includes_htlcmin_when_requested(self, mock_plugin, mock_database):
+        fc = self._make_controller(mock_plugin, mock_database)
+
+        fc.set_channel_fee("123x456x0", 125, manual=True, htlcmin_msat=42_000)
+
+        assert _setchannel_kwargs(mock_plugin)["htlcmin"] == "42000msat"
+
+
+class TestDynamicHtlcMin:
+    def _make_controller(self, mock_plugin, mock_database, **cfg_overrides):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController
+
+        cfg = Config(
+            min_fee_ppm=10,
+            max_fee_ppm=5000,
+            base_fee_msat=0,
+            dry_run=False,
+            enable_dynamic_htlcmin=True,
+            htlc_congestion_threshold=0.8,
+            **cfg_overrides,
+        )
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        return HillClimbingFeeController(mock_plugin, cfg, mock_database), cfg
+
+    def test_dynamic_htlcmin_rises_under_congestion(self, mock_plugin, mock_database):
+        fc, cfg = self._make_controller(mock_plugin, mock_database)
+
+        htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
+            state={"htlc_utilization": 0.95},
+            channel_info={"htlc_minimum_msat": 42_000},
+            cfg=cfg.snapshot(),
+            vegas_multiplier=1.0,
+            htlcmax_msat=None,
+        )
+
+        assert htlcmin_msat > 42_000
+
+    def test_dynamic_htlcmin_rises_under_vegas_pressure(self, mock_plugin, mock_database):
+        fc, cfg = self._make_controller(mock_plugin, mock_database)
+        fc._vegas_state.intensity = 1.0
+
+        htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
+            state={"htlc_utilization": 0.0},
+            channel_info={"htlc_minimum_msat": 42_000},
+            cfg=cfg.snapshot(),
+            vegas_multiplier=fc._vegas_state.get_floor_multiplier(),
+            htlcmax_msat=None,
+        )
+
+        assert htlcmin_msat == 126_000
+
+    def test_dynamic_htlcmin_relaxes_back_to_baseline(self, mock_plugin, mock_database):
+        fc, cfg = self._make_controller(mock_plugin, mock_database)
+
+        htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
+            state={"htlc_utilization": 0.2},
+            channel_info={"htlc_minimum_msat": 42_000},
+            cfg=cfg.snapshot(),
+            vegas_multiplier=1.0,
+            htlcmax_msat=None,
+        )
+
+        assert htlcmin_msat == 42_000
+
+    def test_dynamic_htlcmin_clamps_below_active_htlcmax(self, mock_plugin, mock_database):
+        fc, cfg = self._make_controller(mock_plugin, mock_database)
+        fc._vegas_state.intensity = 1.0
+
+        htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
+            state={"htlc_utilization": 0.95},
+            channel_info={"htlc_minimum_msat": 42_000},
+            cfg=cfg.snapshot(),
+            vegas_multiplier=fc._vegas_state.get_floor_multiplier(),
+            htlcmax_msat=60_000,
+        )
+
+        assert htlcmin_msat == 59_000
+
+
 class TestGossipRefreshExecution:
     def test_gossip_refresh_executes_setchannel_and_returns_fee_adjustment(self, mock_plugin, mock_database):
         from modules.config import Config

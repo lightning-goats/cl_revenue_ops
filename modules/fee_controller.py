@@ -7852,6 +7852,14 @@ class HillClimbingFeeController:
                     level='debug'
                 )
 
+        htlcmin_msat = self._calculate_dynamic_htlcmin_msat(
+            state=state,
+            channel_info=channel_info,
+            cfg=cfg,
+            vegas_multiplier=vegas_multiplier,
+            htlcmax_msat=htlcmax_msat,
+        )
+
         # Apply the fee change (Significant change -> Broadcast)
         result = self.set_channel_fee(
             channel_id, new_fee_ppm, reason=reason,
@@ -7859,6 +7867,7 @@ class HillClimbingFeeController:
             heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None,
             enforce_limits=(fee_reason_code not in (FeeReasonCode.ZERO_FEE_PROBE.value, FeeReasonCode.POLICY_HIVE.value)),
             channel_info=channel_info,
+            htlcmin_msat=htlcmin_msat,
             htlcmax_msat=htlcmax_msat
         )
         
@@ -7994,6 +8003,49 @@ class HillClimbingFeeController:
             band_min_ppm, band_max_ppm = band_max_ppm, band_min_ppm
 
         return (band_min_ppm, band_max_ppm)
+
+    def _calculate_dynamic_htlcmin_msat(
+        self,
+        state: Dict[str, Any],
+        channel_info: Dict[str, Any],
+        cfg: 'ConfigSnapshot',
+        vegas_multiplier: float,
+        htlcmax_msat: Optional[int],
+    ) -> Optional[int]:
+        """Raise HTLC minimum defensively under congestion or Vegas pressure."""
+        if not getattr(cfg, 'enable_dynamic_htlcmin', False):
+            return None
+
+        try:
+            baseline = int(channel_info.get("htlc_minimum_msat", 0) or 0)
+            if baseline <= 0:
+                return None
+
+            utilization = float(state.get("htlc_utilization", 0.0) or 0.0)
+            utilization = max(0.0, min(1.0, utilization))
+            threshold = float(getattr(cfg, "htlc_congestion_threshold", 1.0) or 1.0)
+
+            congestion_value = baseline
+            if utilization > threshold and threshold < 1.0:
+                congestion_pressure = min(1.0, (utilization - threshold) / max(1e-9, 1.0 - threshold))
+                congestion_value = int(round(baseline * (1.0 + congestion_pressure)))
+
+            vegas_value = baseline
+            if vegas_multiplier > 1.0:
+                vegas_value = int(round(baseline * vegas_multiplier))
+
+            htlcmin_msat = max(baseline, congestion_value, vegas_value)
+
+            if htlcmax_msat is not None:
+                htlcmin_msat = min(htlcmin_msat, max(0, int(htlcmax_msat) - 1000))
+
+            return htlcmin_msat or None
+        except Exception as exc:
+            self.plugin.log(
+                f"DYNAMIC_HTLCMIN: failed to calculate for {channel_info.get('channel_id', 'unknown')}: {exc}",
+                level='debug'
+            )
+            return None
     
     def set_channel_fee(self, channel_id: str, fee_ppm: int,
                        reason: str = "manual", manual: bool = False,
@@ -8001,6 +8053,7 @@ class HillClimbingFeeController:
                        heuristic_modifiers: Optional[HeuristicModifiers] = None,
                        enforce_limits: bool = True,
                        channel_info: Optional[Dict[str, Any]] = None,
+                       htlcmin_msat: Optional[int] = None,
                        htlcmax_msat: Optional[int] = None) -> Dict[str, Any]:
         """
         Set the fee for a channel.
@@ -8100,6 +8153,8 @@ class HillClimbingFeeController:
                 "feebase": self.config.base_fee_msat,
                 "feeppm": fee_ppm
             }
+            if htlcmin_msat is not None:
+                rpc_params["htlcmin"] = f"{htlcmin_msat}msat"
             if htlcmax_msat is not None:
                 rpc_params["htlcmax"] = f"{htlcmax_msat}msat"
 
