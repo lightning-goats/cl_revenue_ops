@@ -448,6 +448,61 @@ def test_htlc_accepted_feeds_surge_manager_and_always_returns_continue(monkeypat
     assert sample.outgoing_channel_id == "4x5x6"
 
 
+def test_htlc_accepted_with_live_surge_manager_does_not_hit_rpc(monkeypatch):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod.time, "time", lambda: 1_234.5)
+    mod.safe_plugin = SimpleNamespace(rpc=MagicMock())
+    mod.safe_plugin.rpc.call.side_effect = AssertionError("hook should not call rpc")
+    mod._realtime_surge_channel_cache_refreshed_at = 1_234.5
+    mod._realtime_surge_channel_cache = {
+        "4x5x6": {
+            "short_channel_id": "4x5x6",
+            "total_msat": "1000000000msat",
+            "updates": {"local": {"fee_proportional_millionths": 100}},
+        }
+    }
+    mod.realtime_surge_defense = mod.RealtimeSurgeDefense(
+        enabled=True,
+        surge_window_seconds=60,
+        surge_trigger_pct=0.10,
+        surge_multiplier_min=3.0,
+        surge_multiplier_max=5.0,
+        surge_cooldown_seconds=120,
+        surge_setchannel_min_interval_seconds=15,
+        channel_capacity_msat=mod._get_realtime_surge_channel_capacity_msat,
+        current_fee_ppm=mod._get_realtime_surge_current_fee_ppm,
+        apply_fee_callback=lambda *args, **kwargs: True,
+        time_fn=mod.time.time,
+    )
+
+    result = mod.on_htlc_accepted(
+        {},
+        {"amount": "200000000msat", "short_channel_id": "1x2x3"},
+        mod.plugin,
+        peer_id="02" + ("c" * 64),
+        forward_to="4x5x6",
+    )
+
+    assert result == {"result": "continue"}
+    mod.safe_plugin.rpc.call.assert_not_called()
+
+
+def test_realtime_surge_callbacks_ignore_stale_channel_cache(monkeypatch):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod.time, "time", lambda: 1_234.5)
+    mod._realtime_surge_channel_cache_refreshed_at = 1_200.0
+    mod._realtime_surge_channel_cache = {
+        "4x5x6": {
+            "short_channel_id": "4x5x6",
+            "total_msat": "1000000000msat",
+            "updates": {"local": {"fee_proportional_millionths": 100}},
+        }
+    }
+
+    assert mod._get_realtime_surge_current_fee_ppm("4x5x6") is None
+    assert mod._get_realtime_surge_channel_capacity_msat("4x5x6") is None
+
+
 def test_htlc_accepted_fails_open_on_manager_exception():
     mod = _load_plugin_module()
     mod.realtime_surge_defense = MagicMock()

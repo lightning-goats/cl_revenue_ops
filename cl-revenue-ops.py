@@ -156,29 +156,54 @@ class ForceRateLimiter:
 
 # Global rate limiter for force operations (10 calls per 60 seconds)
 force_rate_limiter = ForceRateLimiter(max_calls=10, window_seconds=60)
+_realtime_surge_channel_cache: Dict[str, Dict[str, Any]] = {}
+_realtime_surge_channel_cache_lock = threading.Lock()
+_realtime_surge_channel_cache_refreshed_at = 0.0
+_REALTIME_SURGE_CHANNEL_CACHE_MAX_AGE_SECONDS = 5.0
 
 
 def _get_realtime_surge_channel_info(channel_id: str) -> Optional[Dict[str, Any]]:
-    """Fetch live channel details for surge-defense callbacks."""
-    if safe_plugin is None or not channel_id:
+    """Read cached live channel details for surge-defense callbacks."""
+    if not channel_id:
         return None
 
     target_scid = normalize_scid(channel_id)
     if not target_scid:
         return None
 
+    with _realtime_surge_channel_cache_lock:
+        if (time.time() - _realtime_surge_channel_cache_refreshed_at) > _REALTIME_SURGE_CHANNEL_CACHE_MAX_AGE_SECONDS:
+            return None
+        channel = _realtime_surge_channel_cache.get(target_scid)
+        if channel is None:
+            return None
+        return dict(channel)
+
+
+def _refresh_realtime_surge_channel_cache() -> int:
+    """Refresh surge-defense channel cache outside the hook path."""
+    global _realtime_surge_channel_cache_refreshed_at
+    if safe_plugin is None:
+        return 0
+
     try:
         result = safe_plugin.rpc.call("listpeerchannels")
     except Exception as e:
-        plugin.log(f"Realtime surge defense listpeerchannels failed for {channel_id}: {e}", level="debug")
-        return None
+        plugin.log(f"Realtime surge defense listpeerchannels refresh failed: {e}", level="debug")
+        return 0
 
+    refreshed: Dict[str, Dict[str, Any]] = {}
     for channel in result.get("channels", []):
         scid = normalize_scid(channel.get("short_channel_id", ""))
-        if scid == target_scid:
-            return channel
+        if scid:
+            refreshed[scid] = dict(channel)
 
-    return None
+    with _realtime_surge_channel_cache_lock:
+        _realtime_surge_channel_cache.clear()
+        _realtime_surge_channel_cache.update(refreshed)
+        _realtime_surge_channel_cache_refreshed_at = time.time()
+
+    return len(refreshed)
 
 
 def _get_realtime_surge_current_fee_ppm(channel_id: str) -> Optional[int]:
@@ -1205,6 +1230,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     plugin.log("Thread-safe RPC proxy initialized", level="info")
 
     if config.enable_realtime_surge_defense:
+        _refresh_realtime_surge_channel_cache()
         realtime_surge_defense = RealtimeSurgeDefense(
             enabled=True,
             surge_window_seconds=config.surge_window_seconds,
@@ -1935,6 +1961,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         while not shutdown_event.is_set():
             try:
                 if realtime_surge_defense is not None:
+                    _refresh_realtime_surge_channel_cache()
                     realtime_surge_defense.process_pending_actions()
             except Exception as e:
                 plugin.log(f"Error in realtime surge defense worker: {e}", level='warn')
