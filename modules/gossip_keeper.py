@@ -100,14 +100,32 @@ class GossipKeepaliveManager:
             candidates.append(peer_id)
 
         stats: dict[str, dict[str, int]] = {}
+        edge_map: dict[tuple[str, tuple[str, str]], dict[str, Any]] = {}
         for channel in channels_payload.get("channels", []):
-            if not channel.get("active"):
+            source = str(channel.get("source") or "").strip()
+            destination = str(channel.get("destination") or "").strip()
+            if not source or not destination:
                 continue
-            satoshis = int(channel.get("satoshis") or 0)
-            for key in ("source", "destination"):
-                peer_id = str(channel.get(key) or "").strip()
-                if not peer_id:
-                    continue
+
+            short_channel_id = str(channel.get("short_channel_id") or "").strip()
+            pair = tuple(sorted((source, destination)))
+            edge_key = (short_channel_id or f"{pair[0]}->{pair[1]}", pair)
+            entry = edge_map.setdefault(
+                edge_key,
+                {
+                    "peers": pair,
+                    "active": False,
+                    "capacity": 0,
+                },
+            )
+            entry["active"] = bool(entry["active"] or channel.get("active"))
+            entry["capacity"] = max(entry["capacity"], int(channel.get("satoshis") or 0))
+
+        for edge in edge_map.values():
+            if not edge["active"]:
+                continue
+            satoshis = int(edge["capacity"] or 0)
+            for peer_id in edge["peers"]:
                 entry = stats.setdefault(peer_id, {"active_edges": 0, "capacity": 0})
                 entry["active_edges"] += 1
                 entry["capacity"] += satoshis
@@ -127,6 +145,25 @@ class GossipKeepaliveManager:
 
         scored.sort(key=lambda item: (-item[1], -item[2], item[0]))
         return [peer_id for peer_id, _, _ in scored]
+
+    def extract_node_addresses(self, nodes_payload: dict) -> dict[str, tuple[str, int]]:
+        """Return the first explicit dialable address for each node id."""
+        addresses: dict[str, tuple[str, int]] = {}
+        for node in nodes_payload.get("nodes", []):
+            peer_id = str(node.get("nodeid") or "").strip()
+            if not peer_id:
+                continue
+            for address in node.get("addresses", []) or []:
+                host = str(address.get("address") or "").strip()
+                port = address.get("port")
+                if not host or port in (None, ""):
+                    continue
+                try:
+                    addresses[peer_id] = (host, int(port))
+                except (TypeError, ValueError):
+                    continue
+                break
+        return addresses
 
     def peer_in_backoff(self, peer_id: str, now: Optional[float] = None) -> bool:
         """Return True when the peer is still inside its retry backoff window."""
@@ -196,8 +233,10 @@ class GossipKeepaliveManager:
             return {"connected_count": connected_count, "target": target, "attempted": 0}
 
         channel_peer_ids = self.extract_channel_peer_ids(self.plugin.rpc.listpeerchannels())
+        nodes_payload = self.plugin.rpc.listnodes()
+        node_addresses = self.extract_node_addresses(nodes_payload)
         public_candidates = self.rank_public_graph_targets(
-            self.plugin.rpc.listnodes(),
+            nodes_payload,
             self.plugin.rpc.listchannels(),
             excluded_peer_ids=set(),
         )
@@ -216,7 +255,11 @@ class GossipKeepaliveManager:
                 continue
             attempted += 1
             try:
-                self.plugin.rpc.connect(peer_id)
+                address = node_addresses.get(peer_id)
+                if address:
+                    self.plugin.rpc.connect(peer_id, address[0], address[1])
+                else:
+                    self.plugin.rpc.connect(peer_id)
                 self.note_connect_success(peer_id)
                 connected += 1
             except Exception:

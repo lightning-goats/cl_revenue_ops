@@ -145,6 +145,51 @@ def test_public_targets_rank_by_active_edges_then_capacity():
     assert ranked == ["02" + "a" * 64, "02" + "b" * 64]
 
 
+def test_public_target_ranking_deduplicates_directional_channel_rows():
+    manager = _make_manager()
+    peer_a = "02" + "a" * 64
+    peer_b = "02" + "b" * 64
+    remote_x = "03" + "1" * 64
+    remote_y = "03" + "2" * 64
+
+    ranked = manager.rank_public_graph_targets(
+        {
+            "nodes": [
+                {"nodeid": peer_a},
+                {"nodeid": peer_b},
+            ]
+        },
+        {
+            "channels": [
+                {
+                    "short_channel_id": "1x1x0",
+                    "source": peer_a,
+                    "destination": remote_x,
+                    "satoshis": 5_000_000,
+                    "active": True,
+                },
+                {
+                    "short_channel_id": "1x1x0",
+                    "source": remote_x,
+                    "destination": peer_a,
+                    "satoshis": 5_000_000,
+                    "active": True,
+                },
+                {
+                    "short_channel_id": "2x1x0",
+                    "source": peer_b,
+                    "destination": remote_y,
+                    "satoshis": 6_000_000,
+                    "active": True,
+                },
+            ]
+        },
+        excluded_peer_ids=set(),
+    )
+
+    assert ranked == [peer_b, peer_a]
+
+
 def test_maintain_connections_connects_only_deficit():
     manager = _make_manager(target_gossip_peers=3)
     manager.plugin.rpc.listpeers.return_value = {
@@ -253,3 +298,35 @@ def test_failed_connect_adds_backoff():
 
     assert manager._connect_failures[target_peer_id] == 1
     assert manager._connect_backoff_until[target_peer_id] > time.time()
+
+
+def test_maintain_connections_uses_explicit_node_address_when_available():
+    manager = _make_manager(target_gossip_peers=1)
+    target_peer_id = "02" + "a" * 64
+    manager.plugin.rpc.listpeers.return_value = {"peers": []}
+    manager.plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    manager.plugin.rpc.listnodes.return_value = {
+        "nodes": [
+            {
+                "nodeid": target_peer_id,
+                "addresses": [
+                    {"type": "ipv4", "address": "1.2.3.4", "port": 9735},
+                ],
+            }
+        ]
+    }
+    manager.plugin.rpc.listchannels.return_value = {
+        "channels": [
+            {
+                "short_channel_id": "1x1x0",
+                "source": target_peer_id,
+                "destination": "03" + "1" * 64,
+                "satoshis": 5_000_000,
+                "active": True,
+            },
+        ]
+    }
+
+    manager.maintain_connections()
+
+    manager.plugin.rpc.connect.assert_called_once_with(target_peer_id, "1.2.3.4", 9735)
