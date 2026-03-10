@@ -2,6 +2,7 @@ import sys
 import os
 import time
 from unittest.mock import MagicMock
+from typing import Union
 
 import pytest
 
@@ -13,7 +14,7 @@ def _listpeerchannels_payload(
     channel_id: str,
     peer_id: str,
     fee_ppm: int = 100,
-    htlc_minimum_msat: int = 0,
+    htlc_minimum_msat: Union[int, str] = 0,
 ):
     return {
         "channels": [
@@ -67,7 +68,7 @@ class TestChannelInfoShaping:
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
-        advertised_htlc_minimum_msat = 42_000
+        advertised_htlc_minimum_msat = "42000msat"
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
         mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(
@@ -80,8 +81,8 @@ class TestChannelInfoShaping:
         fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
         channel_info = fc._get_channels_info()[channel_id]
 
-        assert channel_info["htlc_minimum_msat"] == advertised_htlc_minimum_msat
-        assert channel_info["htlc_min_msat"] == advertised_htlc_minimum_msat
+        assert channel_info["htlc_minimum_msat"] == 42_000
+        assert channel_info["htlc_min_msat"] == 42_000
 
 
 class TestSetChannelFeeLimits:
@@ -379,6 +380,28 @@ class TestSetInitialFee:
         applied_fee = _setchannel_kwargs(mock_plugin)["feeppm"]
         # Fee should be within configured bounds
         assert 10 <= applied_fee <= 5000
+
+    def test_initial_fee_passes_parsed_htlc_minimum_in_channel_info(self, mock_plugin, mock_database):
+        """Manual channel_info shaping preserves the advertised HTLC minimum."""
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(
+            channel_id,
+            peer_id,
+            fee_ppm=0,
+            htlc_minimum_msat="42000msat",
+        )
+
+        fc = self._make_controller(mock_plugin, mock_database)
+        fc.set_channel_fee = MagicMock(return_value={"success": True})
+
+        result = fc.set_initial_fee(channel_id, peer_id)
+
+        assert result == {"success": True}
+        channel_info = fc.set_channel_fee.call_args.kwargs["channel_info"]
+        assert channel_info["htlc_minimum_msat"] == 42_000
+        assert channel_info["htlc_min_msat"] == 42_000
 
     def test_initial_fee_respects_passive_policy(self, mock_plugin, mock_database):
         """PASSIVE policy channels are skipped entirely."""
