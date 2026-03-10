@@ -62,6 +62,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'boltz_auto_cycle_interval_minutes': int,
     'boltz_auto_cycle_max_actions': int,
     'boltz_auto_cycle_startup_delay_seconds': int,
+    'enable_dynamic_htlcmin': bool,
     'enable_dynamic_htlcmax': bool,
     'htlcmax_source_pct': float,
     'htlcmax_sink_pct': float,
@@ -311,6 +312,8 @@ class Config:
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
     boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
+    # Dynamic HTLC Min
+    enable_dynamic_htlcmin: bool = False
     # Dynamic HTLC Max
     enable_dynamic_htlcmax: bool = False
     htlcmax_source_pct: float = 0.10     # Sources restricted to 10% chunks
@@ -747,6 +750,7 @@ class ConfigSnapshot:
     boltz_auto_cycle_interval_minutes: int
     boltz_auto_cycle_max_actions: int
     boltz_auto_cycle_startup_delay_seconds: int
+    enable_dynamic_htlcmin: bool
     enable_dynamic_htlcmax: bool
     htlcmax_source_pct: float
     htlcmax_sink_pct: float

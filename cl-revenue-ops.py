@@ -605,6 +605,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-enable-dynamic-htlcmin',
+    default='false',
+    description='Enable dynamic htlcmin updates to shed small HTLCs during congestion and relax afterward (default: false)'
+)
+
+plugin.add_option(
     name='revenue-ops-enable-reputation',
     default='true',
     description='If true, weight volume by peer reputation (success rate) in fee decisions (default: true)'
@@ -1024,6 +1030,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         proportional_budget_pct=_safe_float('revenue-ops-proportional-budget-pct'),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
         htlc_congestion_threshold=_safe_float('revenue-ops-htlc-congestion-threshold'),
+        enable_dynamic_htlcmin=options.get('revenue-ops-enable-dynamic-htlcmin', 'false').lower() == 'true',
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
         reputation_decay=_safe_float('revenue-ops-reputation-decay'),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',

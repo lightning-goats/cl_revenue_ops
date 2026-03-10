@@ -13,6 +13,7 @@ revenue-ops-fee-interval=3600
 revenue-ops-scarcity-pricing=true
 revenue-ops-scarcity-threshold=0.15
 revenue-ops-vegas-reflex=true
+revenue-ops-enable-dynamic-htlcmin=false
 
 # Rebalancing
 revenue-ops-rebalance-min-profit=50

@@ -113,6 +113,15 @@ def test_config_supports_gossip_keepalive_fields():
     assert CONFIG_FIELD_RANGES["target_gossip_peers"] == (0, 100)
 
 
+def test_config_supports_dynamic_htlcmin_field():
+    cfg = Config(enable_dynamic_htlcmin=True)
+    snapshot = cfg.snapshot()
+
+    assert cfg.enable_dynamic_htlcmin is True
+    assert snapshot.enable_dynamic_htlcmin is True
+    assert CONFIG_FIELD_TYPES["enable_dynamic_htlcmin"] is bool
+
+
 def test_run_gossip_maintenance_calls_manager_when_enabled():
     mod = _load_plugin_module()
     mod.gossip_keeper = MagicMock()

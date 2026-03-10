@@ -75,6 +75,9 @@
 # Enable Vegas Reflex mempool-aware floor adjustment
 #revenue-ops-vegas-reflex=true
 
+# Dynamically raise htlcmin during congestion and relax it after pressure subsides
+#revenue-ops-enable-dynamic-htlcmin=false
+
 # ============================================================================
 # REBALANCING
 # ============================================================================
