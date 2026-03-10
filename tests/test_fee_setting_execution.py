@@ -260,18 +260,50 @@ class TestDynamicHtlcMin:
 
         assert htlcmin_msat == 3_000_000
 
-    def test_dynamic_htlcmin_relaxes_back_to_baseline(self, mock_plugin, mock_database):
+    def test_dynamic_htlcmin_relaxes_back_to_original_baseline_after_reread(self, mock_plugin, mock_database):
         fc, cfg = self._make_controller(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        defended_htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
+            state={"htlc_utilization": 0.95},
+            channel_info={
+                "channel_id": channel_id,
+                "htlc_minimum_msat": 42_000,
+                "capacity": 483_000,
+            },
+            cfg=cfg.snapshot(),
+            vegas_multiplier=1.0,
+            htlcmax_msat=None,
+        )
 
         htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
             state={"htlc_utilization": 0.2},
-            channel_info={"htlc_minimum_msat": 42_000, "capacity": 483_000},
+            channel_info={
+                "channel_id": channel_id,
+                "htlc_minimum_msat": defended_htlcmin_msat,
+                "capacity": 483_000,
+            },
             cfg=cfg.snapshot(),
             vegas_multiplier=1.0,
             htlcmax_msat=None,
         )
 
         assert htlcmin_msat == 42_000
+
+        fc.set_channel_fee(
+            channel_id,
+            125,
+            manual=True,
+            channel_info={
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "fee_proportional_millionths": 100,
+            },
+            htlcmin_msat=htlcmin_msat,
+        )
+
+        assert channel_id not in fc._dynamic_htlcmin_baselines
 
     def test_dynamic_htlcmin_clamps_below_active_htlcmax(self, mock_plugin, mock_database):
         fc, cfg = self._make_controller(mock_plugin, mock_database)

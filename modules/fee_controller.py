@@ -3674,6 +3674,9 @@ class HillClimbingFeeController:
         # Lock protecting state dict access across threads
         self._state_lock = threading.RLock()  # TS-1: RLock for re-entrant access from set_channel_fee
 
+        # Preserve operator-advertised HTLC minimums while temporary defenses are active.
+        self._dynamic_htlcmin_baselines: Dict[str, int] = {}
+
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
 
@@ -8017,15 +8020,26 @@ class HillClimbingFeeController:
             return None
 
         try:
-            baseline = int(channel_info.get("htlc_minimum_msat", 0) or 0)
+            channel_id = str(channel_info.get("channel_id", "") or "")
+            advertised_baseline = int(channel_info.get("htlc_minimum_msat", 0) or 0)
             utilization = float(state.get("htlc_utilization", 0.0) or 0.0)
             utilization = max(0.0, min(1.0, utilization))
             threshold = float(getattr(cfg, "htlc_congestion_threshold", 1.0) or 1.0)
             congestion_active = utilization > threshold and threshold < 1.0
             vegas_active = vegas_multiplier > 1.0
 
+            stored_baseline = None
+            if channel_id:
+                with self._state_lock:
+                    stored_baseline = self._dynamic_htlcmin_baselines.get(channel_id)
+                    if (congestion_active or vegas_active) and stored_baseline is None:
+                        self._dynamic_htlcmin_baselines[channel_id] = advertised_baseline
+                        stored_baseline = advertised_baseline
+
+            baseline = advertised_baseline if stored_baseline is None else stored_baseline
+
             if not congestion_active and not vegas_active:
-                return baseline or None
+                return baseline if stored_baseline is not None else (baseline or None)
 
             capacity_msat = int(channel_info.get("capacity", 0) or 0) * 1000
             protective_seed = capacity_msat // 483 if capacity_msat > 0 else 0
@@ -8171,6 +8185,12 @@ class HillClimbingFeeController:
                 rpc_params["htlcmax"] = f"{htlcmax_msat}msat"
 
             self.plugin.rpc.setchannel(**rpc_params)
+
+            if htlcmin_msat is not None:
+                with self._state_lock:
+                    stored_baseline = self._dynamic_htlcmin_baselines.get(channel_id)
+                    if stored_baseline is not None and int(htlcmin_msat) == int(stored_baseline):
+                        self._dynamic_htlcmin_baselines.pop(channel_id, None)
 
             # M-13: Removed per-channel sleep+verify+retry loop from hot path.
             # Fee verification is handled by the existing gossip refresh mechanism
