@@ -204,15 +204,17 @@ class TestDynamicHtlcMin:
         from modules.config import Config
         from modules.fee_controller import HillClimbingFeeController
 
-        cfg = Config(
-            min_fee_ppm=10,
-            max_fee_ppm=5000,
-            base_fee_msat=0,
-            dry_run=False,
-            enable_dynamic_htlcmin=True,
-            htlc_congestion_threshold=0.8,
-            **cfg_overrides,
-        )
+        config_kwargs = {
+            "min_fee_ppm": 10,
+            "max_fee_ppm": 5000,
+            "base_fee_msat": 0,
+            "dry_run": False,
+            "enable_dynamic_htlcmin": True,
+            "htlc_congestion_threshold": 0.8,
+        }
+        config_kwargs.update(cfg_overrides)
+
+        cfg = Config(**config_kwargs)
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
@@ -260,6 +262,19 @@ class TestDynamicHtlcMin:
 
         assert htlcmin_msat == 3_000_000
 
+    def test_dynamic_htlcmin_honors_zero_congestion_threshold(self, mock_plugin, mock_database):
+        fc, cfg = self._make_controller(mock_plugin, mock_database, htlc_congestion_threshold=0.0)
+
+        htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
+            state={"htlc_utilization": 1.0},
+            channel_info={"htlc_minimum_msat": 42_000, "capacity": 483_000},
+            cfg=cfg.snapshot(),
+            vegas_multiplier=1.0,
+            htlcmax_msat=None,
+        )
+
+        assert htlcmin_msat == 16_000_000
+
     def test_dynamic_htlcmin_relaxes_back_to_original_baseline_after_reread(self, mock_plugin, mock_database):
         fc, cfg = self._make_controller(mock_plugin, mock_database)
         channel_id = "123x456x0"
@@ -304,6 +319,119 @@ class TestDynamicHtlcMin:
         )
 
         assert channel_id not in fc._dynamic_htlcmin_baselines
+
+    def test_dynamic_htlcmin_relaxes_after_restart_from_persisted_state(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(
+            min_fee_ppm=10,
+            max_fee_ppm=5000,
+            base_fee_msat=0,
+            dry_run=False,
+            enable_dynamic_htlcmin=True,
+            htlc_congestion_threshold=0.8,
+            enable_reputation=False,
+        )
+
+        db_state = _fee_strategy_state_dict()
+        db_state["last_update"] = int(time.time()) - 7200
+        db_state["last_fee_ppm"] = 100
+        db_state["last_broadcast_fee_ppm"] = 100
+        db_state["last_revenue_rate"] = 1.0
+        db_state["last_state"] = "balanced"
+
+        def _load_state(_channel_id):
+            return dict(db_state)
+
+        def _save_state(**kwargs):
+            db_state.update(kwargs)
+
+        mock_database.get_fee_strategy_state.side_effect = _load_state
+        mock_database.update_fee_strategy_state.side_effect = _save_state
+        mock_database.record_fee_change = MagicMock()
+        mock_database.get_channel_probe.return_value = None
+        mock_database.get_volume_since.return_value = 0
+        mock_database.get_forward_count_since.return_value = 0
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_peer_latency_stats.return_value = {"avg": 0.0, "std": 0.0}
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_recent_fee_changes.return_value = []
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 3600
+        mock_database.get_channel_cost_history.return_value = []
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+
+        fc1 = HillClimbingFeeController(mock_plugin, cfg, mock_database)
+        fc1.ENABLE_THOMPSON_AIMD = False
+        fc1.ENABLE_SIMPLIFIED_FEE_PATH = False
+        fc1.ENABLE_DYNAMIC_WINDOWS = False
+        fc1.ENABLE_SATURATION_FLOOR = False
+        fc1.ENABLE_BALANCE_FLOOR = False
+        fc1.ENABLE_REBALANCE_FLOOR = False
+        fc1.ENABLE_FLOW_CEILING = False
+        fc1.ENABLE_THOMPSON_SAMPLING = False
+        fc1.MIN_STEP_PPM = 0
+        fc1.STEP_PPM = 0
+        fc1.MAX_STEP_PPM = 0
+        fc1.STEP_PERCENT = 0.0
+        fc1.set_channel_fee = MagicMock(return_value={"success": True})
+
+        channel_info = {
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "capacity": 483_000,
+            "spendable_msat": 241_500_000,
+            "receivable_msat": 241_500_000,
+            "fee_base_msat": 0,
+            "fee_proportional_millionths": 100,
+            "htlc_minimum_msat": 42_000,
+            "opener": "local",
+        }
+        congested_flow_state = {
+            "state": "balanced",
+            "forward_count": 0,
+            "sats_out": 0,
+            "htlc_utilization": 0.95,
+        }
+
+        fc1._adjust_channel_fee(
+            channel_id, peer_id, congested_flow_state, channel_info, chain_costs=None, cfg=cfg.snapshot()
+        )
+
+        defended_htlcmin_msat = fc1.set_channel_fee.call_args.kwargs["htlcmin_msat"]
+        assert defended_htlcmin_msat == 8_000_000
+
+        db_state["last_update"] = int(time.time()) - 7200
+
+        fc2 = HillClimbingFeeController(mock_plugin, cfg, mock_database)
+        fc2.ENABLE_THOMPSON_AIMD = False
+        fc2.ENABLE_SIMPLIFIED_FEE_PATH = False
+        fc2.ENABLE_DYNAMIC_WINDOWS = False
+        fc2.ENABLE_SATURATION_FLOOR = False
+        fc2.ENABLE_BALANCE_FLOOR = False
+        fc2.ENABLE_REBALANCE_FLOOR = False
+        fc2.ENABLE_FLOW_CEILING = False
+        fc2.ENABLE_THOMPSON_SAMPLING = False
+        fc2.MIN_STEP_PPM = 0
+        fc2.STEP_PPM = 0
+        fc2.MAX_STEP_PPM = 0
+        fc2.STEP_PERCENT = 0.0
+        fc2.set_channel_fee = MagicMock(return_value={"success": True})
+
+        calm_channel_info = dict(channel_info)
+        calm_channel_info["htlc_minimum_msat"] = defended_htlcmin_msat
+        calm_flow_state = dict(congested_flow_state)
+        calm_flow_state["htlc_utilization"] = 0.2
+
+        fc2._adjust_channel_fee(
+            channel_id, peer_id, calm_flow_state, calm_channel_info, chain_costs=None, cfg=cfg.snapshot()
+        )
+
+        fc2.set_channel_fee.assert_called_once()
+        assert fc2.set_channel_fee.call_args.kwargs["htlcmin_msat"] == 42_000
 
     def test_dynamic_htlcmin_clamps_below_active_htlcmax(self, mock_plugin, mock_database):
         fc, cfg = self._make_controller(mock_plugin, mock_database)
@@ -418,6 +546,22 @@ class TestAdjustChannelFeeDynamicHtlcMin:
         fc.set_channel_fee.assert_called_once()
         assert fc.set_channel_fee.call_args.args[:2] == (channel_id, 100)
         assert fc.set_channel_fee.call_args.kwargs["htlcmin_msat"] == 42_000
+
+
+class TestDynamicHtlcMinPersistence:
+    def test_thompson_state_roundtrip_preserves_dynamic_htlcmin_baseline(self):
+        from modules.fee_controller import ThompsonAIMDState
+
+        state = ThompsonAIMDState()
+        state.dynamic_htlcmin_baseline_msat = 42_000
+
+        v2_data = state.to_v2_dict()
+
+        assert v2_data["dynamic_htlcmin_baseline_msat"] == 42_000
+
+        roundtrip = ThompsonAIMDState.from_v2_dict(v2_data, {"v2_state_json": "{}"})
+
+        assert roundtrip.dynamic_htlcmin_baseline_msat == 42_000
 
 
 class TestGossipRefreshExecution:

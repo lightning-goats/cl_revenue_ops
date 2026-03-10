@@ -2959,6 +2959,9 @@ class ThompsonAIMDState:
     # Payment size bucket profiling state
     size_buckets: SizeBucketState = field(default_factory=SizeBucketState)
 
+    # Restore target for temporary dynamic HTLC minimum defenses
+    dynamic_htlcmin_baseline_msat: Optional[int] = None
+
     def get_historical_curve(self) -> HistoricalResponseCurve:
         """Deserialize historical curve from dict."""
         if self.historical_curve_data:
@@ -3022,6 +3025,7 @@ class ThompsonAIMDState:
             # PID balance controller state
             "pid_state": self.pid.to_dict(),
             "size_buckets": self.size_buckets.to_dict(),
+            "dynamic_htlcmin_baseline_msat": self.dynamic_htlcmin_baseline_msat,
         }
 
     @classmethod
@@ -3093,6 +3097,7 @@ class ThompsonAIMDState:
         # Payment size bucket profiling state
         size_buckets_data = d.get("size_buckets", {})
         state.size_buckets = SizeBucketState.from_dict(size_buckets_data) if size_buckets_data else SizeBucketState()
+        state.dynamic_htlcmin_baseline_msat = d.get("dynamic_htlcmin_baseline_msat")
 
         # Load legacy fields from main table if provided
         if legacy_state:
@@ -3172,6 +3177,9 @@ class HillClimbState:
 
     # Gossip refresh tracking
     last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
+
+    # Restore target for temporary dynamic HTLC minimum defenses
+    dynamic_htlcmin_baseline_msat: Optional[int] = None
 
     def get_historical_curve(self) -> HistoricalResponseCurve:
         """Deserialize historical curve from dict."""
@@ -8012,6 +8020,49 @@ class HillClimbingFeeController:
 
         return (band_min_ppm, band_max_ppm)
 
+    def _get_dynamic_htlcmin_baseline_msat(self, channel_id: str) -> Optional[int]:
+        """Return the persisted operator baseline for temporary htlcmin defenses."""
+        if not channel_id:
+            return None
+
+        with self._state_lock:
+            cached_baseline = self._dynamic_htlcmin_baselines.get(channel_id)
+            if cached_baseline is not None:
+                return int(cached_baseline)
+
+            for state in (
+                self._thompson_aimd_states.get(channel_id),
+                self._hill_climb_states.get(channel_id),
+            ):
+                baseline_msat = getattr(state, "dynamic_htlcmin_baseline_msat", None)
+                if baseline_msat is not None:
+                    baseline_msat = int(baseline_msat)
+                    self._dynamic_htlcmin_baselines[channel_id] = baseline_msat
+                    return baseline_msat
+
+        return None
+
+    def _set_dynamic_htlcmin_baseline_msat(self, channel_id: str, baseline_msat: Optional[int]) -> None:
+        """Mirror the temporary htlcmin restore target into all active state caches."""
+        if not channel_id:
+            return
+
+        baseline_value = None if baseline_msat is None else int(baseline_msat)
+
+        with self._state_lock:
+            if baseline_value is None:
+                self._dynamic_htlcmin_baselines.pop(channel_id, None)
+            else:
+                self._dynamic_htlcmin_baselines[channel_id] = baseline_value
+
+            hc_state = self._hill_climb_states.get(channel_id)
+            if hc_state is not None:
+                hc_state.dynamic_htlcmin_baseline_msat = baseline_value
+
+            ts_state = self._thompson_aimd_states.get(channel_id)
+            if ts_state is not None:
+                ts_state.dynamic_htlcmin_baseline_msat = baseline_value
+
     def _calculate_dynamic_htlcmin_msat(
         self,
         state: Dict[str, Any],
@@ -8029,17 +8080,16 @@ class HillClimbingFeeController:
             advertised_baseline = int(channel_info.get("htlc_minimum_msat", 0) or 0)
             utilization = float(state.get("htlc_utilization", 0.0) or 0.0)
             utilization = max(0.0, min(1.0, utilization))
-            threshold = float(getattr(cfg, "htlc_congestion_threshold", 1.0) or 1.0)
+            raw_threshold = getattr(cfg, "htlc_congestion_threshold", 1.0)
+            threshold = 1.0 if raw_threshold is None else float(raw_threshold)
+            threshold = max(0.0, min(1.0, threshold))
             congestion_active = utilization > threshold and threshold < 1.0
             vegas_active = vegas_multiplier > 1.0
 
-            stored_baseline = None
-            if channel_id:
-                with self._state_lock:
-                    stored_baseline = self._dynamic_htlcmin_baselines.get(channel_id)
-                    if (congestion_active or vegas_active) and stored_baseline is None:
-                        self._dynamic_htlcmin_baselines[channel_id] = advertised_baseline
-                        stored_baseline = advertised_baseline
+            stored_baseline = self._get_dynamic_htlcmin_baseline_msat(channel_id)
+            if channel_id and (congestion_active or vegas_active) and stored_baseline is None:
+                self._set_dynamic_htlcmin_baseline_msat(channel_id, advertised_baseline)
+                stored_baseline = advertised_baseline
 
             baseline = advertised_baseline if stored_baseline is None else stored_baseline
 
@@ -8192,10 +8242,9 @@ class HillClimbingFeeController:
             self.plugin.rpc.setchannel(**rpc_params)
 
             if htlcmin_msat is not None:
-                with self._state_lock:
-                    stored_baseline = self._dynamic_htlcmin_baselines.get(channel_id)
-                    if stored_baseline is not None and int(htlcmin_msat) == int(stored_baseline):
-                        self._dynamic_htlcmin_baselines.pop(channel_id, None)
+                stored_baseline = self._get_dynamic_htlcmin_baseline_msat(channel_id)
+                if stored_baseline is not None and int(htlcmin_msat) == int(stored_baseline):
+                    self._set_dynamic_htlcmin_baseline_msat(channel_id, None)
 
             # M-13: Removed per-channel sleep+verify+retry loop from hot path.
             # Fee verification is handled by the existing gossip refresh mechanism
@@ -8657,7 +8706,8 @@ class HillClimbingFeeController:
             last_volume_sats=db_state.get("last_volume_sats", 0),
             historical_curve_data=v2_data.get("historical_curve", {}),
             elasticity_data=v2_data.get("elasticity", {}),
-            thompson_data=v2_data.get("thompson", {})
+            thompson_data=v2_data.get("thompson", {}),
+            dynamic_htlcmin_baseline_msat=v2_data.get("dynamic_htlcmin_baseline_msat"),
         )
 
         # Issue #32: Check for desync when loading from database
@@ -8686,7 +8736,8 @@ class HillClimbingFeeController:
             "historical_curve": state.historical_curve_data,
             "elasticity": state.elasticity_data,
             "thompson": state.thompson_data,
-            "ema_revenue_rate": state.ema_revenue_rate  # Issue #28
+            "ema_revenue_rate": state.ema_revenue_rate,  # Issue #28
+            "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
         }
         v2_json_str = json.dumps(v2_data)
 
