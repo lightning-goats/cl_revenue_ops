@@ -54,4 +54,7 @@ data/
 # Vendor directory (bundled dependencies)
 vendor/
 
+# Local git worktrees
+.worktrees/
+
 #TODO.md
