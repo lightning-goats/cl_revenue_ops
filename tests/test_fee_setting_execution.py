@@ -15,6 +15,7 @@ def _listpeerchannels_payload(
     peer_id: str,
     fee_ppm: int = 100,
     htlc_minimum_msat: Union[int, str] = 0,
+    htlc_maximum_msat: Union[int, str] = 0,
 ):
     return {
         "channels": [
@@ -26,6 +27,7 @@ def _listpeerchannels_payload(
                 "receivable_msat": 500_000_000,
                 "total_msat": 1_000_000_000,
                 "htlc_minimum_msat": htlc_minimum_msat,
+                "htlc_maximum_msat": htlc_maximum_msat,
                 "updates": {
                     "local": {
                         "fee_base_msat": 0,
@@ -62,13 +64,14 @@ def _setchannel_kwargs(mock_plugin):
 
 
 class TestChannelInfoShaping:
-    def test_get_channels_info_preserves_htlc_minimum_msat(self, mock_plugin, mock_database):
+    def test_get_channels_info_preserves_htlc_minimum_and_maximum_msat(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.fee_controller import HillClimbingFeeController
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
         advertised_htlc_minimum_msat = "42000msat"
+        advertised_htlc_maximum_msat = "21000000msat"
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
         mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(
@@ -76,6 +79,7 @@ class TestChannelInfoShaping:
             peer_id,
             fee_ppm=100,
             htlc_minimum_msat=advertised_htlc_minimum_msat,
+            htlc_maximum_msat=advertised_htlc_maximum_msat,
         )
 
         fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
@@ -83,6 +87,8 @@ class TestChannelInfoShaping:
 
         assert channel_info["htlc_minimum_msat"] == 42_000
         assert channel_info["htlc_min_msat"] == 42_000
+        assert channel_info["htlc_maximum_msat"] == 21_000_000
+        assert channel_info["htlc_max_msat"] == 21_000_000
 
 
 class TestSetChannelFeeLimits:
@@ -212,39 +218,54 @@ class TestDynamicHtlcMin:
 
         return HillClimbingFeeController(mock_plugin, cfg, mock_database), cfg
 
-    def test_dynamic_htlcmin_rises_under_congestion(self, mock_plugin, mock_database):
+    def test_dynamic_htlcmin_rises_under_congestion_exponentially(self, mock_plugin, mock_database):
         fc, cfg = self._make_controller(mock_plugin, mock_database)
+        capacity_sats = 483_000
+        protective_seed_msat = (capacity_sats * 1000) // 483
 
         htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
             state={"htlc_utilization": 0.95},
-            channel_info={"htlc_minimum_msat": 42_000},
+            channel_info={"htlc_minimum_msat": 42_000, "capacity": capacity_sats},
             cfg=cfg.snapshot(),
             vegas_multiplier=1.0,
             htlcmax_msat=None,
         )
 
-        assert htlcmin_msat > 42_000
+        assert htlcmin_msat == protective_seed_msat * 8
 
-    def test_dynamic_htlcmin_rises_under_vegas_pressure(self, mock_plugin, mock_database):
+    def test_dynamic_htlcmin_zero_baseline_congestion_yields_non_zero_value(self, mock_plugin, mock_database):
+        fc, cfg = self._make_controller(mock_plugin, mock_database)
+
+        htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
+            state={"htlc_utilization": 0.95},
+            channel_info={"htlc_minimum_msat": 0, "capacity": 483_000},
+            cfg=cfg.snapshot(),
+            vegas_multiplier=1.0,
+            htlcmax_msat=None,
+        )
+
+        assert htlcmin_msat == 8_000_000
+
+    def test_dynamic_htlcmin_zero_baseline_vegas_yields_non_zero_value(self, mock_plugin, mock_database):
         fc, cfg = self._make_controller(mock_plugin, mock_database)
         fc._vegas_state.intensity = 1.0
 
         htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
             state={"htlc_utilization": 0.0},
-            channel_info={"htlc_minimum_msat": 42_000},
+            channel_info={"htlc_minimum_msat": 0, "capacity": 483_000},
             cfg=cfg.snapshot(),
             vegas_multiplier=fc._vegas_state.get_floor_multiplier(),
             htlcmax_msat=None,
         )
 
-        assert htlcmin_msat == 126_000
+        assert htlcmin_msat == 3_000_000
 
     def test_dynamic_htlcmin_relaxes_back_to_baseline(self, mock_plugin, mock_database):
         fc, cfg = self._make_controller(mock_plugin, mock_database)
 
         htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
             state={"htlc_utilization": 0.2},
-            channel_info={"htlc_minimum_msat": 42_000},
+            channel_info={"htlc_minimum_msat": 42_000, "capacity": 483_000},
             cfg=cfg.snapshot(),
             vegas_multiplier=1.0,
             htlcmax_msat=None,
@@ -262,6 +283,23 @@ class TestDynamicHtlcMin:
             cfg=cfg.snapshot(),
             vegas_multiplier=fc._vegas_state.get_floor_multiplier(),
             htlcmax_msat=60_000,
+        )
+
+        assert htlcmin_msat == 59_000
+
+    def test_dynamic_htlcmin_clamps_below_advertised_htlcmax_when_explicit_max_missing(self, mock_plugin, mock_database):
+        fc, cfg = self._make_controller(mock_plugin, mock_database)
+
+        htlcmin_msat = fc._calculate_dynamic_htlcmin_msat(
+            state={"htlc_utilization": 0.95},
+            channel_info={
+                "htlc_minimum_msat": 0,
+                "htlc_maximum_msat": "60000msat",
+                "capacity": 483_000,
+            },
+            cfg=cfg.snapshot(),
+            vegas_multiplier=1.0,
+            htlcmax_msat=None,
         )
 
         assert htlcmin_msat == 59_000
@@ -487,8 +525,8 @@ class TestSetInitialFee:
         # Fee should be within configured bounds
         assert 10 <= applied_fee <= 5000
 
-    def test_initial_fee_passes_parsed_htlc_minimum_in_channel_info(self, mock_plugin, mock_database):
-        """Manual channel_info shaping preserves the advertised HTLC minimum."""
+    def test_initial_fee_passes_parsed_htlc_bounds_in_channel_info(self, mock_plugin, mock_database):
+        """Manual channel_info shaping preserves the advertised HTLC bounds."""
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
@@ -497,6 +535,7 @@ class TestSetInitialFee:
             peer_id,
             fee_ppm=0,
             htlc_minimum_msat="42000msat",
+            htlc_maximum_msat="21000000msat",
         )
 
         fc = self._make_controller(mock_plugin, mock_database)
@@ -508,6 +547,8 @@ class TestSetInitialFee:
         channel_info = fc.set_channel_fee.call_args.kwargs["channel_info"]
         assert channel_info["htlc_minimum_msat"] == 42_000
         assert channel_info["htlc_min_msat"] == 42_000
+        assert channel_info["htlc_maximum_msat"] == 21_000_000
+        assert channel_info["htlc_max_msat"] == 21_000_000
 
     def test_initial_fee_respects_passive_policy(self, mock_plugin, mock_database):
         """PASSIVE policy channels are skipped entirely."""

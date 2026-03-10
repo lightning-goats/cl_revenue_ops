@@ -8018,26 +8018,38 @@ class HillClimbingFeeController:
 
         try:
             baseline = int(channel_info.get("htlc_minimum_msat", 0) or 0)
-            if baseline <= 0:
-                return None
-
             utilization = float(state.get("htlc_utilization", 0.0) or 0.0)
             utilization = max(0.0, min(1.0, utilization))
             threshold = float(getattr(cfg, "htlc_congestion_threshold", 1.0) or 1.0)
+            congestion_active = utilization > threshold and threshold < 1.0
+            vegas_active = vegas_multiplier > 1.0
+
+            if not congestion_active and not vegas_active:
+                return baseline or None
+
+            capacity_msat = int(channel_info.get("capacity", 0) or 0) * 1000
+            protective_seed = capacity_msat // 483 if capacity_msat > 0 else 0
+            defensive_baseline = max(baseline, protective_seed)
 
             congestion_value = baseline
-            if utilization > threshold and threshold < 1.0:
+            if congestion_active:
                 congestion_pressure = min(1.0, (utilization - threshold) / max(1e-9, 1.0 - threshold))
-                congestion_value = int(round(baseline * (1.0 + congestion_pressure)))
+                congestion_multiplier = 2.0 ** (4.0 * congestion_pressure)
+                congestion_value = int(round(defensive_baseline * congestion_multiplier))
 
             vegas_value = baseline
-            if vegas_multiplier > 1.0:
-                vegas_value = int(round(baseline * vegas_multiplier))
+            if vegas_active:
+                vegas_value = int(round(defensive_baseline * vegas_multiplier))
 
             htlcmin_msat = max(baseline, congestion_value, vegas_value)
 
-            if htlcmax_msat is not None:
-                htlcmin_msat = min(htlcmin_msat, max(0, int(htlcmax_msat) - 1000))
+            active_htlcmax_msat = htlcmax_msat
+            if active_htlcmax_msat is None:
+                active_htlcmax_msat = parse_msat(
+                    channel_info.get("htlc_maximum_msat", channel_info.get("htlc_max_msat", 0))
+                )
+            if active_htlcmax_msat:
+                htlcmin_msat = min(htlcmin_msat, max(0, int(active_htlcmax_msat) - 1000))
 
             return htlcmin_msat or None
         except Exception as exc:
@@ -8310,6 +8322,7 @@ class HillClimbingFeeController:
             fee_ppm_val = local_updates.get('fee_proportional_millionths')
             fee_ppm = fee_ppm_val if fee_ppm_val is not None else target_ch.get('fee_proportional_millionths', 0)
             htlc_minimum_msat = parse_msat(target_ch.get('htlc_minimum_msat', 0))
+            htlc_maximum_msat = parse_msat(target_ch.get('htlc_maximum_msat', 0))
             channel_info = {
                 'channel_id': scid,
                 'peer_id': peer_id,
@@ -8320,6 +8333,8 @@ class HillClimbingFeeController:
                 'fee_proportional_millionths': fee_ppm,
                 'htlc_minimum_msat': htlc_minimum_msat,
                 'htlc_min_msat': htlc_minimum_msat,
+                'htlc_maximum_msat': htlc_maximum_msat,
+                'htlc_max_msat': htlc_maximum_msat,
                 'opener': target_ch.get('opener', 'local'),
             }
 
@@ -8840,6 +8855,7 @@ class HillClimbingFeeController:
                     fee_ppm_val = local_updates.get("fee_proportional_millionths")
                     fee_ppm = fee_ppm_val if fee_ppm_val is not None else channel.get("fee_proportional_millionths", 0)
                     htlc_minimum_msat = parse_msat(channel.get("htlc_minimum_msat", 0))
+                    htlc_maximum_msat = parse_msat(channel.get("htlc_maximum_msat", 0))
 
                     channels[channel_id] = {
                         "channel_id": channel_id,
@@ -8851,6 +8867,8 @@ class HillClimbingFeeController:
                         "fee_proportional_millionths": fee_ppm,
                         "htlc_minimum_msat": htlc_minimum_msat,
                         "htlc_min_msat": htlc_minimum_msat,
+                        "htlc_maximum_msat": htlc_maximum_msat,
+                        "htlc_max_msat": htlc_maximum_msat,
                         "opener": channel.get("opener", "local"),
                     }
                     
