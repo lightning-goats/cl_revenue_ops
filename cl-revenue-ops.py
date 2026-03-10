@@ -50,6 +50,7 @@ from modules.policy_manager import (
 from modules.hive_bridge import HiveFeeIntelligenceBridge
 from modules.gossip_keeper import GossipKeepaliveManager
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
+from modules.realtime_surge_defense import RealtimeSurgeDefense, SurgeSample
 from modules.utils import normalize_scid, parse_msat
 
 
@@ -155,6 +156,86 @@ class ForceRateLimiter:
 
 # Global rate limiter for force operations (10 calls per 60 seconds)
 force_rate_limiter = ForceRateLimiter(max_calls=10, window_seconds=60)
+
+
+def _get_realtime_surge_channel_info(channel_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch live channel details for surge-defense callbacks."""
+    if safe_plugin is None or not channel_id:
+        return None
+
+    target_scid = normalize_scid(channel_id)
+    if not target_scid:
+        return None
+
+    try:
+        result = safe_plugin.rpc.call("listpeerchannels")
+    except Exception as e:
+        plugin.log(f"Realtime surge defense listpeerchannels failed for {channel_id}: {e}", level="debug")
+        return None
+
+    for channel in result.get("channels", []):
+        scid = normalize_scid(channel.get("short_channel_id", ""))
+        if scid == target_scid:
+            return channel
+
+    return None
+
+
+def _get_realtime_surge_current_fee_ppm(channel_id: str) -> Optional[int]:
+    """Read the live fee so surge overlays capture the exact pre-surge baseline."""
+    channel = _get_realtime_surge_channel_info(channel_id)
+    if not channel:
+        return None
+
+    updates = channel.get("updates")
+    if isinstance(updates, dict):
+        local_updates = updates.get("local")
+        if isinstance(local_updates, dict):
+            fee_ppm = local_updates.get("fee_proportional_millionths")
+            if fee_ppm is not None:
+                try:
+                    return int(fee_ppm)
+                except (TypeError, ValueError):
+                    return None
+
+    fee_ppm = channel.get("fee_proportional_millionths")
+    if fee_ppm is None:
+        return None
+
+    try:
+        return int(fee_ppm)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_realtime_surge_channel_capacity_msat(channel_id: str) -> Optional[int]:
+    """Read live channel capacity outside the hook path for burst sizing."""
+    channel = _get_realtime_surge_channel_info(channel_id)
+    if not channel:
+        return None
+
+    total_msat = channel.get("total_msat", channel.get("total_msatoshi", 0))
+    try:
+        return parse_msat(total_msat)
+    except Exception:
+        return None
+
+
+def _apply_realtime_surge_fee_overlay(channel_id: str, fee_ppm: int) -> bool:
+    """Apply surge fee overlays with raw setchannel outside the hook path."""
+    if safe_plugin is None or not channel_id:
+        return False
+
+    payload = {
+        "id": normalize_scid(channel_id),
+        "feeppm": int(fee_ppm),
+    }
+    try:
+        safe_plugin.rpc.call("setchannel", payload)
+        return True
+    except Exception as e:
+        plugin.log(f"Realtime surge defense setchannel failed for {channel_id}: {e}", level="debug")
+        return False
 
 
 # Initialize the plugin
@@ -1123,6 +1204,24 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     safe_plugin = ThreadSafePluginProxy(plugin)
     plugin.log("Thread-safe RPC proxy initialized", level="info")
 
+    if config.enable_realtime_surge_defense:
+        realtime_surge_defense = RealtimeSurgeDefense(
+            enabled=True,
+            surge_window_seconds=config.surge_window_seconds,
+            surge_trigger_pct=config.surge_trigger_pct,
+            surge_multiplier_min=config.surge_multiplier_min,
+            surge_multiplier_max=config.surge_multiplier_max,
+            surge_cooldown_seconds=config.surge_cooldown_seconds,
+            surge_setchannel_min_interval_seconds=config.surge_setchannel_min_interval_seconds,
+            channel_capacity_msat=_get_realtime_surge_channel_capacity_msat,
+            current_fee_ppm=_get_realtime_surge_current_fee_ppm,
+            apply_fee_callback=_apply_realtime_surge_fee_overlay,
+        )
+        plugin.log("Realtime surge defense enabled", level="info")
+    else:
+        realtime_surge_defense = None
+        plugin.log("Realtime surge defense disabled", level="debug")
+
     # Optional Boltz CLI integration (manual quotes/swaps, wallet ops).
     try:
         boltz_cfg = BoltzCliConfig(
@@ -1829,6 +1928,22 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 plugin.log("Gossip maintenance loop stopping due to shutdown signal")
                 break
 
+    def realtime_surge_defense_loop():
+        """Background loop that executes queued surge-defense fee overlays."""
+        interval_seconds = 1
+
+        while not shutdown_event.is_set():
+            try:
+                if realtime_surge_defense is not None:
+                    realtime_surge_defense.process_pending_actions()
+            except Exception as e:
+                plugin.log(f"Error in realtime surge defense worker: {e}", level='warn')
+                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+
+            if shutdown_event.wait(interval_seconds):
+                plugin.log("Realtime surge defense loop stopping due to shutdown signal", level='debug')
+                break
+
     # =========================================================================
     # STARTUP HYGIENE: Clean up orphan jobs from previous runs
     # =========================================================================
@@ -1867,6 +1982,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
     threading.Thread(target=gossip_maintenance_loop, daemon=True, name="gossip-maintenance").start()
     threading.Thread(target=boltz_auto_cycle_loop, daemon=True, name="boltz-auto-cycle").start()
+    if realtime_surge_defense is not None:
+        threading.Thread(target=realtime_surge_defense_loop, daemon=True, name="realtime-surge-defense").start()
 
     # Signal that init is complete — hive bridge can now make plugin-to-plugin
     # RPCs safely (CLN releases its lock after init returns).
@@ -4008,14 +4125,44 @@ def revenue_clear_reservations(plugin: Plugin) -> Dict[str, Any]:
 def on_htlc_accepted(onion: Dict, htlc: Dict, plugin: Plugin, **kwargs) -> Dict[str, str]:
     """
     Hook called when an HTLC is accepted.
-    
-    We can use this to track live routing activity and update our flow metrics
-    in real-time rather than waiting for periodic analysis.
-    
-    For now, we just let it pass through. Periodic flow analysis is computed from
-    the local forwards table (and hydrated on startup if needed).
+
+    This hook must stay fail-open and constant-time. It only extracts the live
+    forwarding fields already present on the hook payload and hands them to the
+    in-memory surge-defense manager.
     """
-    # Just continue - we don't want to interfere with routing
+    try:
+        if realtime_surge_defense is None:
+            return {"result": "continue"}
+
+        incoming_peer_id = (
+            kwargs.get("peer_id")
+            or kwargs.get("incoming_peer_id")
+            or kwargs.get("peer")
+            or htlc.get("peer_id")
+        )
+        incoming_channel_id = htlc.get("short_channel_id") or htlc.get("channel_id")
+        outgoing_channel_id = kwargs.get("forward_to") or onion.get("forward_to")
+        amount_raw = (
+            htlc.get("amount")
+            or htlc.get("amount_msat")
+            or htlc.get("amount_msatoshi")
+        )
+        amount_msat = _parse_msat(amount_raw or 0)
+
+        if incoming_peer_id and incoming_channel_id and outgoing_channel_id and amount_msat > 0:
+            realtime_surge_defense.ingest_sample(
+                SurgeSample(
+                    ts=time.time(),
+                    amount_msat=amount_msat,
+                    incoming_peer_id=str(incoming_peer_id),
+                    incoming_channel_id=normalize_scid(incoming_channel_id),
+                    outgoing_channel_id=normalize_scid(outgoing_channel_id),
+                )
+            )
+    except Exception as e:
+        plugin.log(f"Realtime surge defense htlc_accepted failed open: {e}", level="debug")
+        plugin.log(f"Traceback: {traceback.format_exc()}", level="debug")
+
     return {"result": "continue"}
 
 

@@ -9,6 +9,14 @@ def _load_plugin_module():
     return load_plugin_module()
 
 
+def _default_plugin_options(mod):
+    return {
+        name: registration["default"]
+        for name, registration in mod.plugin.options.items()
+        if "default" in registration
+    }
+
+
 def test_threadsafe_rpc_call_keeps_hive_report_synchronous():
     mod = _load_plugin_module()
     plugin = DummyPlugin()
@@ -181,11 +189,7 @@ def test_plugin_registers_realtime_surge_defense_options():
 
 def test_init_maps_dynamic_htlcmin_option_into_config_kwargs(monkeypatch):
     mod = _load_plugin_module()
-    options = {
-        name: registration["default"]
-        for name, registration in mod.plugin.options.items()
-        if "default" in registration
-    }
+    options = _default_plugin_options(mod)
     options["revenue-ops-enable-dynamic-htlcmin"] = "true"
     captured_kwargs = {}
     signal_calls = []
@@ -221,11 +225,7 @@ def test_init_maps_dynamic_htlcmin_option_into_config_kwargs(monkeypatch):
 
 def test_init_maps_realtime_surge_defense_options_into_config_kwargs(monkeypatch):
     mod = _load_plugin_module()
-    options = {
-        name: registration["default"]
-        for name, registration in mod.plugin.options.items()
-        if "default" in registration
-    }
+    options = _default_plugin_options(mod)
     options["revenue-ops-enable-realtime-surge-defense"] = "true"
     options["revenue-ops-surge-window-seconds"] = "90"
     options["revenue-ops-surge-trigger-pct"] = "0.25"
@@ -267,6 +267,203 @@ def test_init_maps_realtime_surge_defense_options_into_config_kwargs(monkeypatch
     assert captured_kwargs["surge_multiplier_max"] == 8.0
     assert captured_kwargs["surge_cooldown_seconds"] == 300
     assert captured_kwargs["surge_setchannel_min_interval_seconds"] == 20
+
+
+def test_init_creates_realtime_surge_defense_when_enabled(monkeypatch):
+    mod = _load_plugin_module()
+    options = _default_plugin_options(mod)
+    options["revenue-ops-enable-realtime-surge-defense"] = "true"
+    safe_rpc = MagicMock()
+    safe_rpc.plugin.return_value = {"plugins": []}
+    safe_rpc.listpeers.return_value = {"peers": []}
+    safe_rpc.listforwards.return_value = {"forwards": []}
+
+    def _rpc_call(method, payload=None):
+        key = (method, None if payload is None else (payload.get("id"), payload.get("feeppm")))
+        responses = {
+            ("listpeerchannels", None): {
+                "channels": [
+                    {
+                        "short_channel_id": "123x1x0",
+                        "total_msat": "4200000msat",
+                        "updates": {
+                            "local": {"fee_proportional_millionths": 321},
+                        },
+                    }
+                ]
+            },
+            ("setchannel", ("123x1x0", 777)): {"status": "ok"},
+        }
+        return responses.get(key, {})
+
+    safe_rpc.call.side_effect = _rpc_call
+
+    class _StopInit(Exception):
+        pass
+
+    captured = {}
+    safe_plugin = SimpleNamespace(rpc=safe_rpc, log=mod.plugin.log)
+
+    class _DummyDatabase:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def initialize(self):
+            return None
+
+        def cleanup_stale_reservations(self, *args, **kwargs):
+            return 0
+
+        def get_latest_forward_timestamp(self):
+            return int(mod.time.time())
+
+        def get_all_config_overrides(self):
+            return {}
+
+        def get_config_version(self):
+            return 0
+
+        def has_recent_connection_history(self, *args, **kwargs):
+            return True
+
+        def close_all_connections(self):
+            return None
+
+        def close_main_connection(self):
+            return None
+
+    class _DummyThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            return None
+
+    def _capture_manager(**kwargs):
+        captured.update(kwargs)
+        raise _StopInit()
+
+    monkeypatch.setattr(mod.signal, "signal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mod.atexit, "register", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mod, "ThreadSafePluginProxy", lambda plugin: safe_plugin)
+    monkeypatch.setattr(mod, "RealtimeSurgeDefense", _capture_manager, raising=False)
+    monkeypatch.setattr(mod, "Database", _DummyDatabase)
+    monkeypatch.setattr(mod, "PolicyManager", lambda *args, **kwargs: SimpleNamespace(cleanup_expired_policies=lambda: None))
+    monkeypatch.setattr(
+        mod,
+        "HiveFeeIntelligenceBridge",
+        lambda *args, **kwargs: SimpleNamespace(
+            _init_complete=False,
+            is_available=lambda: False,
+            mark_init_complete=lambda: None,
+            report_yield_and_costs=lambda **kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "ChannelProfitabilityAnalyzer",
+        lambda *args, **kwargs: SimpleNamespace(
+            get_tlv=lambda: {
+                "tlv_sats": 0,
+                "local_balance_sats": 0,
+                "remote_balance_sats": 0,
+                "channel_count": 0,
+                "onchain_sats": 0,
+            },
+            get_pnl_summary=lambda window_days=30: {
+                "opex_sats": 0,
+                "gross_revenue_sats": 0,
+                "rebalance_cost_sats": 0,
+            },
+        ),
+    )
+    monkeypatch.setattr(mod, "FlowAnalyzer", lambda *args, **kwargs: SimpleNamespace(hive_bridge=None))
+    monkeypatch.setattr(mod, "CapacityPlanner", lambda *args, **kwargs: SimpleNamespace(hive_bridge=None))
+    monkeypatch.setattr(
+        mod,
+        "PIDFeeController",
+        lambda *args, **kwargs: SimpleNamespace(
+            ENABLE_SIMPLIFIED_FEE_PATH=True,
+            get_last_decision_summary=lambda: {},
+            set_initial_fee=lambda *a, **k: None,
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "EVRebalancer",
+        lambda *args, **kwargs: SimpleNamespace(
+            job_manager=SimpleNamespace(
+                cleanup_orphans=lambda: None,
+                stop_all_jobs=lambda reason=None: 0,
+                sync_peer_exclusions=lambda policy_manager: None,
+            ),
+            set_profitability_analyzer=lambda *a, **k: None,
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "GossipKeepaliveManager",
+        lambda *args, **kwargs: SimpleNamespace(maintain_connections=lambda: None),
+    )
+    monkeypatch.setattr(
+        mod,
+        "BoltzCliManager",
+        lambda *args, **kwargs: SimpleNamespace(
+            enabled=False,
+            get_boltz_cost_components=lambda window_hours=0: {"spent_24h_sats": 0},
+        ),
+    )
+    monkeypatch.setattr(mod.threading, "Thread", _DummyThread)
+
+    with pytest.raises(_StopInit):
+        mod.init(options, {}, mod.plugin)
+
+    assert captured["enabled"] is True
+    assert captured["current_fee_ppm"]("123x1x0") == 321
+    assert captured["channel_capacity_msat"]("123x1x0") == 4_200_000
+    assert captured["apply_fee_callback"]("123x1x0", 777) is True
+    safe_rpc.call.assert_any_call("setchannel", {"id": "123x1x0", "feeppm": 777})
+
+
+def test_htlc_accepted_feeds_surge_manager_and_always_returns_continue(monkeypatch):
+    mod = _load_plugin_module()
+    mod.realtime_surge_defense = MagicMock()
+    monkeypatch.setattr(mod.time, "time", lambda: 1_234.5)
+
+    result = mod.on_htlc_accepted(
+        {},
+        {"amount": "2500msat", "short_channel_id": "1x2x3"},
+        mod.plugin,
+        peer_id="02" + ("a" * 64),
+        forward_to="4x5x6",
+    )
+
+    assert result == {"result": "continue"}
+    mod.realtime_surge_defense.ingest_sample.assert_called_once()
+    sample = mod.realtime_surge_defense.ingest_sample.call_args.args[0]
+    assert sample.ts == 1_234.5
+    assert sample.amount_msat == 2_500
+    assert sample.incoming_peer_id == "02" + ("a" * 64)
+    assert sample.incoming_channel_id == "1x2x3"
+    assert sample.outgoing_channel_id == "4x5x6"
+
+
+def test_htlc_accepted_fails_open_on_manager_exception():
+    mod = _load_plugin_module()
+    mod.realtime_surge_defense = MagicMock()
+    mod.realtime_surge_defense.ingest_sample.side_effect = RuntimeError("boom")
+
+    result = mod.on_htlc_accepted(
+        {},
+        {"amount": "2500msat", "short_channel_id": "1x2x3"},
+        mod.plugin,
+        peer_id="02" + ("b" * 64),
+        forward_to="4x5x6",
+    )
+
+    assert result == {"result": "continue"}
+    mod.realtime_surge_defense.ingest_sample.assert_called_once()
+    mod.plugin.log.assert_called()
 
 
 def test_runtime_update_rejects_inverted_realtime_surge_multiplier_bounds():
