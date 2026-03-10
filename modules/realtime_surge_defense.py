@@ -182,7 +182,8 @@ class RealtimeSurgeDefense:
 
             self._cleanup_idle_channel(channel_id)
 
-        while self._pending_actions:
+        pending_count = len(self._pending_actions)
+        for _ in range(pending_count):
             action = self._pending_actions.popleft()
             state = self._states.get(action.channel_id)
             if state is None:
@@ -191,11 +192,26 @@ class RealtimeSurgeDefense:
             if not self._is_current_pending_action(state, action):
                 continue
 
-            state.last_attempt_ts = self.time_fn()
-            ok = bool(self.apply_fee_callback(action.channel_id, action.fee_ppm))
-            self._clear_pending_action(action.channel_id)
+            if now - state.last_attempt_ts < self.surge_setchannel_min_interval_seconds:
+                self._pending_actions.append(action)
+                continue
 
             if action.action == "apply":
+                metrics = self._compute_window_metrics(action.channel_id)
+                if not self._should_trigger(metrics):
+                    self._clear_pending_action(action.channel_id)
+                    state.last_apply_result = "stale_dropped"
+                    self._cleanup_idle_channel(action.channel_id)
+                    continue
+
+            state.last_attempt_ts = self.time_fn()
+            try:
+                ok = bool(self.apply_fee_callback(action.channel_id, action.fee_ppm))
+            except Exception:
+                ok = False
+
+            if action.action == "apply":
+                self._clear_pending_action(action.channel_id)
                 if ok:
                     state.active = True
                     state.baseline_fee_ppm = action.baseline_fee_ppm
@@ -208,6 +224,7 @@ class RealtimeSurgeDefense:
                         state.active_fee_ppm = None
             elif action.action == "revert":
                 if ok:
+                    self._clear_pending_action(action.channel_id)
                     state.active = False
                     state.baseline_fee_ppm = None
                     state.active_fee_ppm = None
@@ -216,6 +233,7 @@ class RealtimeSurgeDefense:
                     state.last_apply_result = "reverted"
                 else:
                     state.last_apply_result = "revert_failed"
+                    self._pending_actions.append(action)
 
             self._cleanup_idle_channel(action.channel_id)
 

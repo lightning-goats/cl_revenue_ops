@@ -298,6 +298,64 @@ def test_failed_apply_does_not_mark_overlay_active():
     assert channel["last_apply_result"] == "apply_failed"
 
 
+def test_stale_queued_apply_is_dropped_after_window_goes_calm():
+    clock = FakeClock()
+    manager, applied = _make_manager(clock)
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    clock.advance(180)
+    manager.process_pending_actions()
+
+    status = manager.get_status()
+
+    assert applied == []
+    assert status["active_channel_count"] == 0
+    assert "2x2x2" not in status["channels"]
+
+
+def test_apply_callback_exception_fails_safe_without_phantom_pending_state():
+    clock = FakeClock()
+
+    def apply_fee(channel_id: str, fee_ppm: int) -> bool:
+        raise RuntimeError("rpc failed")
+
+    manager = RealtimeSurgeDefense(
+        enabled=True,
+        surge_window_seconds=60,
+        surge_trigger_pct=0.10,
+        surge_multiplier_min=3.0,
+        surge_multiplier_max=5.0,
+        surge_cooldown_seconds=120,
+        surge_setchannel_min_interval_seconds=15,
+        channel_capacity_msat=lambda channel_id: 1_000_000_000,
+        current_fee_ppm=lambda channel_id: 100,
+        apply_fee_callback=apply_fee,
+        time_fn=clock.time,
+    )
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    manager.process_pending_actions()
+
+    status = manager.get_status()
+    channel = status["channels"]["2x2x2"]
+
+    assert status["active_channel_count"] == 0
+    assert channel["active"] is False
+    assert channel["baseline_fee_ppm"] is None
+    assert channel["active_fee_ppm"] is None
+    assert channel["last_apply_result"] == "apply_failed"
+
+
 def test_failed_revert_keeps_overlay_active_for_retry():
     clock = FakeClock()
     applied = []
@@ -342,7 +400,13 @@ def test_failed_revert_keeps_overlay_active_for_retry():
     assert failed_revert_channel["last_apply_result"] == "revert_failed"
 
     manager.process_pending_actions()
+    still_failed_status = manager.get_status()
 
+    assert applied == [("2x2x2", 340), ("2x2x2", 100)]
+    assert still_failed_status["active_channel_count"] == 1
+
+    clock.advance(15)
+    manager.process_pending_actions()
     final_status = manager.get_status()
 
     assert applied == [("2x2x2", 340), ("2x2x2", 100), ("2x2x2", 100)]
