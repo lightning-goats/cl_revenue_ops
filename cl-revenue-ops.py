@@ -2153,6 +2153,59 @@ def run_rebalance_check():
 # RPC METHODS - Exposed to lightning-cli
 # =============================================================================
 
+
+def _default_realtime_surge_defense_status() -> Dict[str, Any]:
+    """Return a stable status payload even when surge defense is unavailable."""
+    return {
+        "enabled": bool(config and getattr(config, "enable_realtime_surge_defense", False)),
+        "active_channel_count": 0,
+        "trigger_count_1h": 0,
+        "trigger_count_24h": 0,
+        "channels": {},
+    }
+
+
+def _normalize_realtime_surge_defense_status(raw_status: Any) -> Dict[str, Any]:
+    """Ensure revenue-status always returns the full surge-defense surface."""
+    status = _default_realtime_surge_defense_status()
+    if not isinstance(raw_status, dict):
+        return status
+
+    status["enabled"] = bool(raw_status.get("enabled", status["enabled"]))
+
+    for key in ("active_channel_count", "trigger_count_1h", "trigger_count_24h"):
+        try:
+            status[key] = max(0, int(raw_status.get(key, status[key])))
+        except (TypeError, ValueError):
+            continue
+
+    raw_channels = raw_status.get("channels")
+    if isinstance(raw_channels, dict):
+        normalized_channels = {}
+        for channel_id, raw_channel in raw_channels.items():
+            channel_status = dict(raw_channel) if isinstance(raw_channel, dict) else {}
+
+            cooldown_remaining_sec = channel_status.get(
+                "cooldown_remaining_sec",
+                channel_status.get("cooldown_remaining_seconds", 0.0),
+            )
+            try:
+                cooldown_remaining_sec = max(0.0, float(cooldown_remaining_sec))
+            except (TypeError, ValueError):
+                cooldown_remaining_sec = 0.0
+
+            channel_status.setdefault("active", False)
+            channel_status.setdefault("baseline_fee_ppm", None)
+            channel_status.setdefault("active_fee_ppm", None)
+            channel_status.setdefault("last_trigger_reason", "")
+            channel_status.setdefault("last_apply_result", "idle")
+            channel_status["cooldown_remaining_sec"] = cooldown_remaining_sec
+            normalized_channels[str(channel_id)] = channel_status
+
+        status["channels"] = normalized_channels
+
+    return status
+
 @plugin.method("revenue-status")
 def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     """
@@ -2179,12 +2232,9 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
             "values": config.public_runtime_dict() if config else {},
         },
         "realtime_surge_defense": (
-            realtime_surge_defense.get_status()
+            _normalize_realtime_surge_defense_status(realtime_surge_defense.get_status())
             if realtime_surge_defense and hasattr(realtime_surge_defense, "get_status")
-            else {
-                "enabled": bool(config and getattr(config, "enable_realtime_surge_defense", False)),
-                "active_channels": [],
-            }
+            else _default_realtime_surge_defense_status()
         ),
         "fee_decision": (
             fee_controller.get_last_decision_summary()

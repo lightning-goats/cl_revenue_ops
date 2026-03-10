@@ -487,6 +487,69 @@ def test_htlc_accepted_with_live_surge_manager_does_not_hit_rpc(monkeypatch):
     mod.safe_plugin.rpc.call.assert_not_called()
 
 
+def test_htlc_accepted_surge_lifecycle_reverts_to_exact_baseline_after_cooldown(monkeypatch):
+    mod = _load_plugin_module()
+    now = {"value": 1_234.5}
+    applied = []
+
+    def _rpc_call(method, payload=None):
+        if method == "setchannel":
+            applied.append(dict(payload))
+            return {"status": "ok"}
+        raise AssertionError(f"unexpected rpc call: {method}")
+
+    monkeypatch.setattr(mod.time, "time", lambda: now["value"])
+    mod.safe_plugin = SimpleNamespace(
+        rpc=SimpleNamespace(call=_rpc_call),
+        log=mod.plugin.log,
+    )
+    mod._realtime_surge_channel_cache_refreshed_at = now["value"]
+    mod._realtime_surge_channel_cache = {
+        "4x5x6": {
+            "short_channel_id": "4x5x6",
+            "total_msat": "1000000000msat",
+            "updates": {"local": {"fee_proportional_millionths": 125}},
+        }
+    }
+    mod.realtime_surge_defense = mod.RealtimeSurgeDefense(
+        enabled=True,
+        surge_window_seconds=60,
+        surge_trigger_pct=0.10,
+        surge_multiplier_min=3.0,
+        surge_multiplier_max=5.0,
+        surge_cooldown_seconds=120,
+        surge_setchannel_min_interval_seconds=15,
+        channel_capacity_msat=mod._get_realtime_surge_channel_capacity_msat,
+        current_fee_ppm=mod._get_realtime_surge_current_fee_ppm,
+        apply_fee_callback=mod._apply_realtime_surge_fee_overlay,
+        time_fn=mod.time.time,
+    )
+
+    for _ in range(4):
+        result = mod.on_htlc_accepted(
+            {},
+            {"amount": "30000000msat", "short_channel_id": "1x2x3"},
+            mod.plugin,
+            peer_id="02" + ("d" * 64),
+            forward_to="4x5x6",
+        )
+        assert result == {"result": "continue"}
+        now["value"] += 1
+
+    mod.realtime_surge_defense.process_pending_actions()
+    mod._realtime_surge_channel_cache["4x5x6"]["updates"]["local"][
+        "fee_proportional_millionths"
+    ] = 500
+    now["value"] += 180
+    mod.realtime_surge_defense.process_pending_actions()
+
+    assert applied == [
+        {"id": "4x5x6", "feeppm": 425},
+        {"id": "4x5x6", "feeppm": 125},
+    ]
+    assert mod.realtime_surge_defense.get_status()["channels"] == {}
+
+
 def test_realtime_surge_callbacks_ignore_stale_channel_cache(monkeypatch):
     mod = _load_plugin_module()
     monkeypatch.setattr(mod.time, "time", lambda: 1_234.5)
@@ -554,6 +617,30 @@ def test_revenue_status_includes_realtime_surge_section():
 
     assert result["realtime_surge_defense"]["enabled"] is True
     mod.realtime_surge_defense.get_status.assert_called_once_with()
+
+
+def test_revenue_status_defaults_realtime_surge_observability_when_manager_unavailable():
+    mod = _load_plugin_module()
+    mod.database = MagicMock()
+    mod.database.get_all_channel_states.return_value = []
+    mod.database.get_recent_fee_changes.return_value = []
+    mod.database.get_recent_rebalances.return_value = []
+    mod.config = SimpleNamespace(
+        enable_realtime_surge_defense=True,
+        public_runtime_keys=lambda: [],
+        public_runtime_dict=lambda: {},
+    )
+    mod.realtime_surge_defense = None
+
+    result = mod.revenue_status(mod.plugin)
+
+    assert result["realtime_surge_defense"] == {
+        "enabled": True,
+        "active_channel_count": 0,
+        "trigger_count_1h": 0,
+        "trigger_count_24h": 0,
+        "channels": {},
+    }
 
 
 def test_run_gossip_maintenance_calls_manager_when_enabled():

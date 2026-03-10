@@ -73,6 +73,7 @@ class RealtimeSurgeDefense:
         self._samples: Dict[str, Deque[SurgeSample]] = defaultdict(deque)
         self._states: Dict[str, SurgeOverlayState] = {}
         self._pending_actions: Deque[SurgeOverlayAction] = deque()
+        self._trigger_history: Deque[float] = deque()
 
     def ingest_sample(self, sample: SurgeSample) -> Optional[Dict[str, object]]:
         if not self.enabled:
@@ -149,6 +150,7 @@ class RealtimeSurgeDefense:
                 baseline_fee_ppm=baseline_fee_ppm,
             )
         )
+        self._record_trigger(sample.ts)
         state.last_apply_result = "queued"
 
         return {
@@ -239,6 +241,7 @@ class RealtimeSurgeDefense:
 
     def get_status(self) -> Dict[str, object]:
         now = self.time_fn()
+        self._prune_trigger_history(now)
         channel_ids = set(self._samples) | set(self._states)
         channels: Dict[str, Dict[str, object]] = {}
 
@@ -255,6 +258,9 @@ class RealtimeSurgeDefense:
                 "baseline_fee_ppm": state.baseline_fee_ppm if state else None,
                 "active_fee_ppm": state.active_fee_ppm if state else None,
                 "cooldown_until": state.cooldown_until if state else 0.0,
+                "cooldown_remaining_sec": (
+                    max(0.0, state.cooldown_until - now) if state else 0.0
+                ),
                 "cooldown_remaining_seconds": (
                     max(0.0, state.cooldown_until - now) if state else 0.0
                 ),
@@ -269,6 +275,8 @@ class RealtimeSurgeDefense:
             "active_channel_count": sum(
                 1 for state in self._states.values() if state.active
             ),
+            "trigger_count_1h": self._count_recent_triggers(now, 3600),
+            "trigger_count_24h": self._count_recent_triggers(now, 86400),
             "channels": channels,
         }
 
@@ -348,6 +356,17 @@ class RealtimeSurgeDefense:
 
         if not samples:
             self._samples.pop(channel_id, None)
+
+    def _record_trigger(self, ts: float) -> None:
+        self._trigger_history.append(ts)
+        self._prune_trigger_history(ts)
+
+    def _prune_trigger_history(self, now: float) -> None:
+        while self._trigger_history and now - self._trigger_history[0] > 86400:
+            self._trigger_history.popleft()
+
+    def _count_recent_triggers(self, now: float, window_seconds: int) -> int:
+        return sum(1 for ts in self._trigger_history if now - ts <= window_seconds)
 
     def _compute_window_metrics(self, channel_id: str) -> Dict[str, float]:
         samples = self._samples.get(channel_id, ())

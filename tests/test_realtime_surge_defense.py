@@ -96,6 +96,60 @@ def test_burst_trigger_fires_when_moved_pct_and_peer_concentration_cross_thresho
     assert channel["top_incoming_peer_htlc_share"] == pytest.approx(1.0)
 
 
+def test_status_reports_active_overlay_details():
+    clock = FakeClock()
+    manager, applied = _make_manager(clock)
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    manager.process_pending_actions()
+
+    status = manager.get_status()
+    channel = status["channels"]["2x2x2"]
+
+    assert status["enabled"] is True
+    assert status["active_channel_count"] == 1
+    assert channel["active"] is True
+    assert channel["baseline_fee_ppm"] == 100
+    assert channel["active_fee_ppm"] == applied[0][1]
+    assert channel["cooldown_remaining_sec"] == pytest.approx(119.0)
+    assert channel["last_trigger_reason"].startswith("moved_pct=")
+    assert channel["last_apply_result"] == "applied"
+
+
+def test_status_reports_trigger_counts_for_recent_windows():
+    clock = FakeClock()
+    manager, _ = _make_manager(clock)
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    manager.process_pending_actions()
+    clock.advance(180)
+    manager.process_pending_actions()
+    clock.advance(3_601)
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    manager.process_pending_actions()
+
+    status = manager.get_status()
+
+    assert status["trigger_count_1h"] == 1
+    assert status["trigger_count_24h"] == 2
+
+
 def test_does_not_trigger_on_normal_mixed_flow():
     clock = FakeClock()
     manager, applied = _make_manager(clock)
