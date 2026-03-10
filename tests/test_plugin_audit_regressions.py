@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock
+from types import SimpleNamespace
 from tests.plugin_test_utils import DummyPlugin, load_plugin_module
+from modules.config import Config, CONFIG_FIELD_TYPES, CONFIG_FIELD_RANGES
 
 
 def _load_plugin_module():
@@ -96,3 +98,36 @@ def test_channel_state_changed_resolves_txid_to_scid_before_closure_accounting()
     assert kwargs["channel_id"] == scid
     assert kwargs["peer_id"] == peer_id
     mod._archive_closed_channel.assert_called_once_with(scid, peer_id, "remote_unilateral", None)
+
+
+def test_config_supports_gossip_keepalive_fields():
+    cfg = Config(enable_gossip_keepalives=True, target_gossip_peers=7)
+    snapshot = cfg.snapshot()
+
+    assert cfg.enable_gossip_keepalives is True
+    assert cfg.target_gossip_peers == 7
+    assert snapshot.enable_gossip_keepalives is True
+    assert snapshot.target_gossip_peers == 7
+    assert CONFIG_FIELD_TYPES["enable_gossip_keepalives"] is bool
+    assert CONFIG_FIELD_TYPES["target_gossip_peers"] is int
+    assert CONFIG_FIELD_RANGES["target_gossip_peers"] == (0, 100)
+
+
+def test_run_gossip_maintenance_calls_manager_when_enabled():
+    mod = _load_plugin_module()
+    mod.gossip_keeper = MagicMock()
+    mod.config = SimpleNamespace(enable_gossip_keepalives=True)
+
+    mod.run_gossip_maintenance()
+
+    mod.gossip_keeper.maintain_connections.assert_called_once_with()
+
+
+def test_run_gossip_maintenance_skips_when_disabled():
+    mod = _load_plugin_module()
+    mod.gossip_keeper = MagicMock()
+    mod.config = SimpleNamespace(enable_gossip_keepalives=False)
+
+    mod.run_gossip_maintenance()
+
+    mod.gossip_keeper.maintain_connections.assert_not_called()

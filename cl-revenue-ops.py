@@ -48,6 +48,7 @@ from modules.policy_manager import (
     TACTICAL_POLICY_ACTIONS,
 )
 from modules.hive_bridge import HiveFeeIntelligenceBridge
+from modules.gossip_keeper import GossipKeepaliveManager
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.utils import normalize_scid, parse_msat
 
@@ -424,6 +425,7 @@ capacity_planner: Optional[CapacityPlanner] = None
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligence
+gossip_keeper: Optional[GossipKeepaliveManager] = None  # Gossip keepalive target discovery
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
@@ -479,6 +481,19 @@ plugin.add_option(
     name='revenue-ops-rebalance-interval',
     default='900',
     description='Interval in seconds for rebalance checks (default: 15 min)'
+)
+
+plugin.add_option(
+    name='revenue-ops-enable-gossip-keepalives',
+    default='false',
+    description='Maintain extra pure P2P peers when total connected peers fall below target (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-target-gossip-peers',
+    default='5',
+    description='Target total connected peers before gossip keepalive dialing stops (default: 5)',
+    opt_type='int'
 )
 
 plugin.add_option(
@@ -887,7 +902,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, boltz_manager
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, gossip_keeper, boltz_manager
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -970,6 +985,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_interval=_safe_int('revenue-ops-flow-interval'),
         fee_interval=_safe_int('revenue-ops-fee-interval'),
         rebalance_interval=_safe_int('revenue-ops-rebalance-interval'),
+        enable_gossip_keepalives=options.get('revenue-ops-enable-gossip-keepalives', 'false').lower() == 'true',
+        target_gossip_peers=_safe_int_opt('revenue-ops-target-gossip-peers', '5'),
         hot_channel_protection_enabled=options.get('revenue-ops-hot-channel-protection-enabled', 'true').lower() == 'true',
         hot_channel_protection_override_peers=str(options.get('revenue-ops-hot-channel-protection-override-peers', '') or ''),
         hot_channel_protection_min_velocity=_safe_float_opt('revenue-ops-hot-channel-protection-min-velocity', '0.20'),
@@ -1334,6 +1351,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         safe_plugin, config, database, policy_manager,
         hive_bridge=hive_bridge
     )
+    gossip_keeper = GossipKeepaliveManager(safe_plugin, config, hive_bridge=hive_bridge)
     rebalancer.set_profitability_analyzer(profitability_analyzer)
     # Unified liquidity-cost accounting:
     # - Rebalancer sees Boltz spend as external liquidity cost
@@ -1734,6 +1752,26 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             f"channels={tlv_data.get('channel_count', 0)}"
         )
 
+    def gossip_maintenance_loop():
+        """Background loop for gossip keepalive maintenance."""
+        startup_delay = 60
+        interval_seconds = 300
+
+        if shutdown_event.wait(startup_delay):
+            plugin.log("Gossip maintenance loop cancelled during startup delay")
+            return
+
+        while not shutdown_event.is_set():
+            try:
+                run_gossip_maintenance()
+            except Exception as e:
+                plugin.log(f"Error in gossip maintenance loop: {e}", level='warn')
+                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+
+            if shutdown_event.wait(interval_seconds):
+                plugin.log("Gossip maintenance loop stopping due to shutdown signal")
+                break
+
     # =========================================================================
     # STARTUP HYGIENE: Clean up orphan jobs from previous runs
     # =========================================================================
@@ -1770,6 +1808,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
+    threading.Thread(target=gossip_maintenance_loop, daemon=True, name="gossip-maintenance").start()
     threading.Thread(target=boltz_auto_cycle_loop, daemon=True, name="boltz-auto-cycle").start()
 
     # Signal that init is complete — hive bridge can now make plugin-to-plugin
@@ -1843,6 +1882,28 @@ def run_flow_analysis():
     except Exception as e:
         plugin.log(f"Flow analysis failed: {e}", level='error')
         raise
+
+
+def run_gossip_maintenance():
+    """Run one gossip keepalive maintenance cycle."""
+    if gossip_keeper is None or config is None:
+        return
+
+    cfg = config.snapshot() if hasattr(config, 'snapshot') else config
+    if not getattr(cfg, 'enable_gossip_keepalives', False):
+        return
+
+    gossip_keeper.config = cfg
+    result = gossip_keeper.maintain_connections()
+    if isinstance(result, dict):
+        attempted = int(result.get('attempted', 0) or 0)
+        connected = int(result.get('connected', 0) or 0)
+        if attempted > 0 or connected > 0:
+            plugin.log(
+                f"Gossip maintenance: attempted={attempted} connected={connected} "
+                f"target={result.get('target')} connected_count={result.get('connected_count')}",
+                level='debug',
+            )
 
 
 def run_fee_adjustment():

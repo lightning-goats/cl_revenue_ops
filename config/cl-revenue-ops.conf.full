@@ -32,6 +32,12 @@
 # Flow analysis interval in seconds (1 hour default)
 #revenue-ops-flow-interval=3600
 
+# Maintain extra pure P2P peers when total connectivity falls below target
+#revenue-ops-enable-gossip-keepalives=false
+
+# Target total connected peers (channel peers count toward this target)
+#revenue-ops-target-gossip-peers=5
+
 # Historical window for flow averaging (days)
 #revenue-ops-flow-window-days=7
 
