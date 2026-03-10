@@ -337,6 +337,89 @@ class TestDynamicHtlcMin:
         assert htlcmin_msat == 59_000
 
 
+class TestAdjustChannelFeeDynamicHtlcMin:
+    def test_adjust_channel_fee_restores_htlcmin_even_when_fee_would_otherwise_skip_broadcast(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(
+            min_fee_ppm=10,
+            max_fee_ppm=5000,
+            base_fee_msat=0,
+            dry_run=False,
+            enable_dynamic_htlcmin=True,
+            enable_reputation=False,
+        )
+
+        db_state = _fee_strategy_state_dict()
+        db_state["last_update"] = int(time.time()) - 7200
+        db_state["last_fee_ppm"] = 100
+        db_state["last_broadcast_fee_ppm"] = 100
+        db_state["last_revenue_rate"] = 1.0
+        db_state["last_state"] = "balanced"
+        mock_database.get_fee_strategy_state.return_value = db_state
+        mock_database.update_fee_strategy_state = MagicMock()
+        mock_database.record_fee_change = MagicMock()
+        mock_database.get_channel_probe.return_value = None
+        mock_database.get_volume_since.return_value = 0
+        mock_database.get_forward_count_since.return_value = 0
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_peer_latency_stats.return_value = {"avg": 0.0, "std": 0.0}
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_recent_fee_changes.return_value = []
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 3600
+        mock_database.get_channel_cost_history.return_value = []
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
+        fc.ENABLE_THOMPSON_AIMD = False
+        fc.ENABLE_SIMPLIFIED_FEE_PATH = False
+        fc.ENABLE_DYNAMIC_WINDOWS = False
+        fc.ENABLE_SATURATION_FLOOR = False
+        fc.ENABLE_BALANCE_FLOOR = False
+        fc.ENABLE_REBALANCE_FLOOR = False
+        fc.ENABLE_FLOW_CEILING = False
+        fc.ENABLE_THOMPSON_SAMPLING = False
+        fc.MIN_STEP_PPM = 0
+        fc.STEP_PPM = 0
+        fc.MAX_STEP_PPM = 0
+        fc.STEP_PERCENT = 0.0
+        fc.set_channel_fee = MagicMock(return_value={"success": True})
+
+        fc._dynamic_htlcmin_baselines[channel_id] = 42_000
+
+        channel_info = {
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "capacity": 483_000,
+            "spendable_msat": 241_500_000,
+            "receivable_msat": 241_500_000,
+            "fee_base_msat": 0,
+            "fee_proportional_millionths": 100,
+            "htlc_minimum_msat": 8_000_000,
+            "opener": "local",
+        }
+        flow_state = {
+            "state": "balanced",
+            "forward_count": 0,
+            "sats_out": 0,
+            "htlc_utilization": 0.2,
+        }
+
+        fc._adjust_channel_fee(
+            channel_id, peer_id, flow_state, channel_info, chain_costs=None, cfg=cfg.snapshot()
+        )
+
+        fc.set_channel_fee.assert_called_once()
+        assert fc.set_channel_fee.call_args.args[:2] == (channel_id, 100)
+        assert fc.set_channel_fee.call_args.kwargs["htlcmin_msat"] == 42_000
+
+
 class TestGossipRefreshExecution:
     def test_gossip_refresh_executes_setchannel_and_returns_fee_adjustment(self, mock_plugin, mock_database):
         from modules.config import Config

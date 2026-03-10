@@ -7642,6 +7642,42 @@ class HillClimbingFeeController:
                     # Re-clamp after competition adjustment
                     new_fee_ppm = max(floor_ppm, min(effective_ceiling, competition_adjusted))
 
+        # =====================================================================
+        # DYNAMIC HTLC POLICY TARGETS
+        # =====================================================================
+        htlcmax_msat = None
+        if getattr(cfg, 'enable_dynamic_htlcmax', False):
+            capacity_msat = channel_info.get("capacity", 0) * 1000
+            if capacity_msat > 0:
+                if flow_state == "source":
+                    target_msat = int(capacity_msat * cfg.htlcmax_source_pct)
+                elif flow_state == "sink":
+                    target_msat = int(capacity_msat * cfg.htlcmax_sink_pct)
+                else:
+                    target_msat = int(capacity_msat * cfg.htlcmax_balanced_pct)
+
+                # Safety Bounds: Never go below 10,000 sats or above capacity
+                htlcmax_msat = max(10_000_000, min(target_msat, capacity_msat))
+
+                self.plugin.log(
+                    f"DYNAMIC_HTLCMAX: {channel_id[:12]}... is {flow_state}. "
+                    f"Set limit to {htlcmax_msat // 1000:,} sats",
+                    level='debug'
+                )
+
+        htlcmin_msat = self._calculate_dynamic_htlcmin_msat(
+            state=state,
+            channel_info=channel_info,
+            cfg=cfg,
+            vegas_multiplier=vegas_multiplier,
+            htlcmax_msat=htlcmax_msat,
+        )
+        current_htlcmin_msat = parse_msat(
+            channel_info.get("htlc_minimum_msat", channel_info.get("htlc_min_msat", 0))
+        )
+        htlcmin_policy_change = (
+            htlcmin_msat is not None and int(htlcmin_msat) != int(current_htlcmin_msat)
+        )
 
         # Check if fee changed meaningfully (Alpha Guard)
         fee_change = abs(new_fee_ppm - current_fee_ppm)
@@ -7650,7 +7686,7 @@ class HillClimbingFeeController:
         else:
             min_change = max(5, current_fee_ppm * 0.03)
             
-        if fee_change < min_change and not is_congested:
+        if fee_change < min_change and not is_congested and not htlcmin_policy_change:
             # CRITICAL: Reset observation timer so the next cycle doesn't
             # double-count the current window's data.  Thompson posteriors,
             # AIMD outcomes, demand baselines, and elasticity trackers were
@@ -7696,7 +7732,7 @@ class HillClimbingFeeController:
                              (target_found and last_state_category != current_state_category) or \
                              (not target_found and hc_state.last_state == "CONGESTION")
 
-        if not significant_change:
+        if not significant_change and not htlcmin_policy_change:
             # =========================================================================
             # GOSSIP REFRESH CHECK: Must run BEFORE last_update reset so we can
             # detect 24h+ staleness. After reset, last_update=now defeats the check.
@@ -7789,7 +7825,7 @@ class HillClimbingFeeController:
             )
         
         # IDEMPOTENCY GUARD: Skip RPC if target is physically set (Phase 5.5)
-        if new_fee_ppm == raw_chain_fee:
+        if new_fee_ppm == raw_chain_fee and not htlcmin_policy_change:
             hc_state.last_revenue_rate = current_revenue_rate
             hc_state.last_fee_ppm = raw_chain_fee
             hc_state.last_broadcast_fee_ppm = new_fee_ppm
@@ -7831,37 +7867,6 @@ class HillClimbingFeeController:
             fee_reason_code = FeeReasonCode.SCARCITY.value
         else:
             fee_reason_code = FeeReasonCode.THOMPSON_SAMPLE.value
-
-        # =====================================================================
-        # DYNAMIC HTLC MAX SIZING (Flow-Based)
-        # =====================================================================
-        htlcmax_msat = None
-        if getattr(cfg, 'enable_dynamic_htlcmax', False):
-            capacity_msat = channel_info.get("capacity", 0) * 1000
-            if capacity_msat > 0:
-                if flow_state == "source":
-                    target_msat = int(capacity_msat * cfg.htlcmax_source_pct)
-                elif flow_state == "sink":
-                    target_msat = int(capacity_msat * cfg.htlcmax_sink_pct)
-                else:
-                    target_msat = int(capacity_msat * cfg.htlcmax_balanced_pct)
-                
-                # Safety Bounds: Never go below 10,000 sats or above capacity
-                htlcmax_msat = max(10_000_000, min(target_msat, capacity_msat))
-                
-                self.plugin.log(
-                    f"DYNAMIC_HTLCMAX: {channel_id[:12]}... is {flow_state}. "
-                    f"Set limit to {htlcmax_msat // 1000:,} sats",
-                    level='debug'
-                )
-
-        htlcmin_msat = self._calculate_dynamic_htlcmin_msat(
-            state=state,
-            channel_info=channel_info,
-            cfg=cfg,
-            vegas_multiplier=vegas_multiplier,
-            htlcmax_msat=htlcmax_msat,
-        )
 
         # Apply the fee change (Significant change -> Broadcast)
         result = self.set_channel_fee(
