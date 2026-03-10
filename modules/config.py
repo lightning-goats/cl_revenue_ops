@@ -63,6 +63,13 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'boltz_auto_cycle_max_actions': int,
     'boltz_auto_cycle_startup_delay_seconds': int,
     'enable_dynamic_htlcmin': bool,
+    'enable_realtime_surge_defense': bool,
+    'surge_window_seconds': int,
+    'surge_trigger_pct': float,
+    'surge_multiplier_min': float,
+    'surge_multiplier_max': float,
+    'surge_cooldown_seconds': int,
+    'surge_setchannel_min_interval_seconds': int,
     'enable_dynamic_htlcmax': bool,
     'htlcmax_source_pct': float,
     'htlcmax_sink_pct': float,
@@ -189,6 +196,12 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
     'htlc_congestion_threshold': (0.0, 1.0),
+    'surge_window_seconds': (1, 3600),
+    'surge_trigger_pct': (0.0, 1.0),
+    'surge_multiplier_min': (1.0, 100.0),
+    'surge_multiplier_max': (1.0, 100.0),
+    'surge_cooldown_seconds': (1, 86400),
+    'surge_setchannel_min_interval_seconds': (1, 3600),
     'reputation_decay': (0.0, 1.0),
     'proportional_budget_pct': (0.0, 1.0),
     'kelly_fraction': (0.0, 1.0),
@@ -314,6 +327,14 @@ class Config:
     boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
     # Dynamic HTLC Min
     enable_dynamic_htlcmin: bool = False
+    # Real-time surge defense
+    enable_realtime_surge_defense: bool = False
+    surge_window_seconds: int = 60
+    surge_trigger_pct: float = 0.10
+    surge_multiplier_min: float = 3.0
+    surge_multiplier_max: float = 5.0
+    surge_cooldown_seconds: int = 120
+    surge_setchannel_min_interval_seconds: int = 15
     # Dynamic HTLC Max
     enable_dynamic_htlcmax: bool = False
     htlcmax_source_pct: float = 0.10     # Sources restricted to 10% chunks
@@ -521,6 +542,14 @@ class Config:
     _version: int = field(default=0, repr=False, compare=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     _override_warnings: list = field(default_factory=list, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Validate cross-field invariants on direct construction."""
+        if self.surge_multiplier_min > self.surge_multiplier_max:
+            raise ValueError(
+                f"surge_multiplier_min ({self.surge_multiplier_min}) cannot exceed "
+                f"surge_multiplier_max ({self.surge_multiplier_max})"
+            )
     
     def snapshot(self) -> 'ConfigSnapshot':
         """
@@ -574,6 +603,9 @@ class Config:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
                 # high_liquidity_threshold is very small (e.g., < 0.05).
                 self.low_liquidity_threshold = max(0.0, self.high_liquidity_threshold - 0.05)
+        if hasattr(self, 'surge_multiplier_min') and hasattr(self, 'surge_multiplier_max'):
+            if self.surge_multiplier_min > self.surge_multiplier_max:
+                self.surge_multiplier_min = self.surge_multiplier_max
         return list(self._override_warnings)
 
     def _apply_override(self, key: str, value: str) -> None:
@@ -680,6 +712,10 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
+            if key == 'surge_multiplier_min' and typed_value > self.surge_multiplier_max:
+                return {"error": f"surge_multiplier_min ({typed_value}) cannot exceed surge_multiplier_max ({self.surge_multiplier_max})"}
+            if key == 'surge_multiplier_max' and typed_value < self.surge_multiplier_min:
+                return {"error": f"surge_multiplier_max ({typed_value}) cannot be less than surge_multiplier_min ({self.surge_multiplier_min})"}
             # AUDIT FIX I-5: Validate sink/source threshold cross-field consistency
             if key == 'sink_threshold' and typed_value >= self.source_threshold:
                 return {"error": f"sink_threshold ({typed_value}) must be less than source_threshold ({self.source_threshold})"}
@@ -751,6 +787,13 @@ class ConfigSnapshot:
     boltz_auto_cycle_max_actions: int
     boltz_auto_cycle_startup_delay_seconds: int
     enable_dynamic_htlcmin: bool
+    enable_realtime_surge_defense: bool
+    surge_window_seconds: int
+    surge_trigger_pct: float
+    surge_multiplier_min: float
+    surge_multiplier_max: float
+    surge_cooldown_seconds: int
+    surge_setchannel_min_interval_seconds: int
     enable_dynamic_htlcmax: bool
     htlcmax_source_pct: float
     htlcmax_sink_pct: float

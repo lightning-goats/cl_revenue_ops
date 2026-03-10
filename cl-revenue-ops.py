@@ -426,6 +426,7 @@ safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrap
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligence
 gossip_keeper: Optional[GossipKeepaliveManager] = None  # Gossip keepalive target discovery
+realtime_surge_defense: Optional[Any] = None  # Issue #67: temporary fee overlay manager
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
@@ -608,6 +609,48 @@ plugin.add_option(
     name='revenue-ops-enable-dynamic-htlcmin',
     default='false',
     description='Enable dynamic htlcmin updates to shed small HTLCs during congestion and relax afterward (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-enable-realtime-surge-defense',
+    default='false',
+    description='Enable real-time toxic-flow surge defense with temporary fee overlays on bursty channels (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-surge-window-seconds',
+    default='60',
+    description='Rolling detection window in seconds for real-time surge defense (default: 60)'
+)
+
+plugin.add_option(
+    name='revenue-ops-surge-trigger-pct',
+    default='0.10',
+    description='Moved-capacity threshold in the rolling window that can trigger surge defense (default: 0.10)'
+)
+
+plugin.add_option(
+    name='revenue-ops-surge-multiplier-min',
+    default='3.0',
+    description='Minimum fee multiplier applied when surge defense activates (default: 3.0)'
+)
+
+plugin.add_option(
+    name='revenue-ops-surge-multiplier-max',
+    default='5.0',
+    description='Maximum fee multiplier applied when surge defense activates (default: 5.0)'
+)
+
+plugin.add_option(
+    name='revenue-ops-surge-cooldown-seconds',
+    default='120',
+    description='Cooldown period before reverting a surge overlay after pressure subsides (default: 120)'
+)
+
+plugin.add_option(
+    name='revenue-ops-surge-setchannel-min-interval-seconds',
+    default='15',
+    description='Minimum seconds between surge-defense setchannel writes per channel (default: 15)'
 )
 
 plugin.add_option(
@@ -908,7 +951,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, gossip_keeper, boltz_manager
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, gossip_keeper, realtime_surge_defense, boltz_manager
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -1031,6 +1074,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
         htlc_congestion_threshold=_safe_float('revenue-ops-htlc-congestion-threshold'),
         enable_dynamic_htlcmin=options.get('revenue-ops-enable-dynamic-htlcmin', 'false').lower() == 'true',
+        enable_realtime_surge_defense=options.get('revenue-ops-enable-realtime-surge-defense', 'false').lower() == 'true',
+        surge_window_seconds=_safe_int_opt('revenue-ops-surge-window-seconds', '60'),
+        surge_trigger_pct=_safe_float_opt('revenue-ops-surge-trigger-pct', '0.10'),
+        surge_multiplier_min=_safe_float_opt('revenue-ops-surge-multiplier-min', '3.0'),
+        surge_multiplier_max=_safe_float_opt('revenue-ops-surge-multiplier-max', '5.0'),
+        surge_cooldown_seconds=_safe_int_opt('revenue-ops-surge-cooldown-seconds', '120'),
+        surge_setchannel_min_interval_seconds=_safe_int_opt('revenue-ops-surge-setchannel-min-interval-seconds', '15'),
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
         reputation_decay=_safe_float('revenue-ops-reputation-decay'),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
@@ -1984,6 +2034,14 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
             "public_keys": config.public_runtime_keys() if config else [],
             "values": config.public_runtime_dict() if config else {},
         },
+        "realtime_surge_defense": (
+            realtime_surge_defense.get_status()
+            if realtime_surge_defense and hasattr(realtime_surge_defense, "get_status")
+            else {
+                "enabled": bool(config and getattr(config, "enable_realtime_surge_defense", False)),
+                "active_channels": [],
+            }
+        ),
         "fee_decision": (
             fee_controller.get_last_decision_summary()
             if fee_controller and hasattr(fee_controller, "get_last_decision_summary")

@@ -123,10 +123,60 @@ def test_config_supports_dynamic_htlcmin_field():
     assert CONFIG_FIELD_TYPES["enable_dynamic_htlcmin"] is bool
 
 
+def test_config_supports_realtime_surge_defense_fields():
+    cfg = Config(
+        enable_realtime_surge_defense=True,
+        surge_window_seconds=60,
+        surge_trigger_pct=0.10,
+        surge_multiplier_min=3.0,
+        surge_multiplier_max=5.0,
+        surge_cooldown_seconds=120,
+        surge_setchannel_min_interval_seconds=15,
+    )
+    snapshot = cfg.snapshot()
+
+    assert cfg.enable_realtime_surge_defense is True
+    assert cfg.surge_window_seconds == 60
+    assert cfg.surge_trigger_pct == 0.10
+    assert cfg.surge_multiplier_min == 3.0
+    assert cfg.surge_multiplier_max == 5.0
+    assert cfg.surge_cooldown_seconds == 120
+    assert cfg.surge_setchannel_min_interval_seconds == 15
+    assert snapshot.enable_realtime_surge_defense is True
+    assert snapshot.surge_window_seconds == 60
+    assert CONFIG_FIELD_TYPES["enable_realtime_surge_defense"] is bool
+    assert CONFIG_FIELD_TYPES["surge_window_seconds"] is int
+    assert CONFIG_FIELD_TYPES["surge_trigger_pct"] is float
+    assert CONFIG_FIELD_TYPES["surge_multiplier_min"] is float
+    assert CONFIG_FIELD_TYPES["surge_multiplier_max"] is float
+    assert CONFIG_FIELD_TYPES["surge_cooldown_seconds"] is int
+    assert CONFIG_FIELD_TYPES["surge_setchannel_min_interval_seconds"] is int
+    assert CONFIG_FIELD_RANGES["surge_window_seconds"] == (1, 3600)
+    assert CONFIG_FIELD_RANGES["surge_trigger_pct"] == (0.0, 1.0)
+    assert CONFIG_FIELD_RANGES["surge_multiplier_min"] == (1.0, 100.0)
+    assert CONFIG_FIELD_RANGES["surge_multiplier_max"] == (1.0, 100.0)
+    assert CONFIG_FIELD_RANGES["surge_cooldown_seconds"] == (1, 86400)
+    assert CONFIG_FIELD_RANGES["surge_setchannel_min_interval_seconds"] == (1, 3600)
+
+
 def test_plugin_registers_dynamic_htlcmin_option():
     mod = _load_plugin_module()
 
     assert "revenue-ops-enable-dynamic-htlcmin" in getattr(mod.plugin, "options", {})
+
+
+def test_plugin_registers_realtime_surge_defense_options():
+    mod = _load_plugin_module()
+
+    options = getattr(mod.plugin, "options", {})
+
+    assert "revenue-ops-enable-realtime-surge-defense" in options
+    assert "revenue-ops-surge-window-seconds" in options
+    assert "revenue-ops-surge-trigger-pct" in options
+    assert "revenue-ops-surge-multiplier-min" in options
+    assert "revenue-ops-surge-multiplier-max" in options
+    assert "revenue-ops-surge-cooldown-seconds" in options
+    assert "revenue-ops-surge-setchannel-min-interval-seconds" in options
 
 
 def test_init_maps_dynamic_htlcmin_option_into_config_kwargs(monkeypatch):
@@ -167,6 +217,91 @@ def test_init_maps_dynamic_htlcmin_option_into_config_kwargs(monkeypatch):
     assert captured_kwargs["enable_dynamic_htlcmin"] is True
     assert len(signal_calls) == 1
     assert len(atexit_calls) == 1
+
+
+def test_init_maps_realtime_surge_defense_options_into_config_kwargs(monkeypatch):
+    mod = _load_plugin_module()
+    options = {
+        name: registration["default"]
+        for name, registration in mod.plugin.options.items()
+        if "default" in registration
+    }
+    options["revenue-ops-enable-realtime-surge-defense"] = "true"
+    options["revenue-ops-surge-window-seconds"] = "90"
+    options["revenue-ops-surge-trigger-pct"] = "0.25"
+    options["revenue-ops-surge-multiplier-min"] = "4.5"
+    options["revenue-ops-surge-multiplier-max"] = "8.0"
+    options["revenue-ops-surge-cooldown-seconds"] = "300"
+    options["revenue-ops-surge-setchannel-min-interval-seconds"] = "20"
+    captured_kwargs = {}
+    signal_calls = []
+    atexit_calls = []
+
+    class _StopInit(Exception):
+        pass
+
+    class _ConfigCapture:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            raise _StopInit()
+
+    monkeypatch.setattr(
+        mod.signal,
+        "signal",
+        lambda *args, **kwargs: signal_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        mod.atexit,
+        "register",
+        lambda *args, **kwargs: atexit_calls.append((args, kwargs)),
+    )
+    mod.Config = _ConfigCapture
+
+    with pytest.raises(_StopInit):
+        mod.init(options, {}, mod.plugin)
+
+    assert captured_kwargs["enable_realtime_surge_defense"] is True
+    assert captured_kwargs["surge_window_seconds"] == 90
+    assert captured_kwargs["surge_trigger_pct"] == 0.25
+    assert captured_kwargs["surge_multiplier_min"] == 4.5
+    assert captured_kwargs["surge_multiplier_max"] == 8.0
+    assert captured_kwargs["surge_cooldown_seconds"] == 300
+    assert captured_kwargs["surge_setchannel_min_interval_seconds"] == 20
+
+
+def test_runtime_update_rejects_inverted_realtime_surge_multiplier_bounds():
+    cfg = Config(surge_multiplier_min=3.0, surge_multiplier_max=5.0)
+    database = MagicMock()
+
+    result = cfg.update_runtime(database, "surge_multiplier_min", "8.0")
+
+    assert "error" in result
+    assert "surge_multiplier_min" in result["error"]
+    assert cfg.surge_multiplier_min == 3.0
+    database.set_config_override.assert_not_called()
+
+
+def test_config_rejects_inverted_realtime_surge_multiplier_bounds_on_init():
+    with pytest.raises(ValueError):
+        Config(surge_multiplier_min=8.0, surge_multiplier_max=3.0)
+
+
+def test_revenue_status_includes_realtime_surge_section():
+    mod = _load_plugin_module()
+    mod.database = MagicMock()
+    mod.database.get_all_channel_states.return_value = []
+    mod.database.get_recent_fee_changes.return_value = []
+    mod.database.get_recent_rebalances.return_value = []
+    mod.realtime_surge_defense = MagicMock()
+    mod.realtime_surge_defense.get_status.return_value = {
+        "enabled": True,
+        "active_channels": [],
+    }
+
+    result = mod.revenue_status(mod.plugin)
+
+    assert result["realtime_surge_defense"]["enabled"] is True
+    mod.realtime_surge_defense.get_status.assert_called_once_with()
 
 
 def test_run_gossip_maintenance_calls_manager_when_enabled():

@@ -78,6 +78,27 @@
 # Dynamically raise htlcmin during congestion and relax it after pressure subsides
 #revenue-ops-enable-dynamic-htlcmin=false
 
+# Enable real-time toxic-flow surge defense with temporary fee overlays
+#revenue-ops-enable-realtime-surge-defense=false
+
+# Rolling detection window in seconds for surge-defense burst analysis
+#revenue-ops-surge-window-seconds=60
+
+# Fraction of channel capacity moved in the window required before triggering
+#revenue-ops-surge-trigger-pct=0.10
+
+# Minimum multiplier applied to the current fee when surge defense activates
+#revenue-ops-surge-multiplier-min=3.0
+
+# Maximum multiplier applied to the current fee when surge defense activates
+#revenue-ops-surge-multiplier-max=5.0
+
+# Cooldown before reverting the exact pre-surge fee after pressure subsides
+#revenue-ops-surge-cooldown-seconds=120
+
+# Minimum interval between setchannel writes for surge defense on one channel
+#revenue-ops-surge-setchannel-min-interval-seconds=15
+
 # ============================================================================
 # REBALANCING
 # ============================================================================
