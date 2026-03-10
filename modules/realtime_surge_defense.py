@@ -16,13 +16,24 @@ class SurgeSample:
 
 @dataclass
 class SurgeOverlayState:
-    baseline_fee_ppm: int
-    active_fee_ppm: int
+    baseline_fee_ppm: Optional[int] = None
+    active_fee_ppm: Optional[int] = None
     active: bool = False
     cooldown_until: float = 0.0
     last_trigger_reason: str = ""
     last_apply_result: str = "idle"
     last_attempt_ts: float = 0.0
+    pending_action: Optional[str] = None
+    pending_fee_ppm: Optional[int] = None
+    pending_baseline_fee_ppm: Optional[int] = None
+
+
+@dataclass
+class SurgeOverlayAction:
+    channel_id: str
+    action: str
+    fee_ppm: int
+    baseline_fee_ppm: Optional[int] = None
 
 
 class RealtimeSurgeDefense:
@@ -38,7 +49,7 @@ class RealtimeSurgeDefense:
         surge_setchannel_min_interval_seconds: int,
         channel_capacity_msat: Callable[[str], Optional[int]],
         current_fee_ppm: Callable[[str], Optional[int]],
-        apply_fee: Callable[[str, int], bool],
+        apply_fee_callback: Callable[[str, int], bool],
         time_fn: Callable[[], float] = time.time,
         peer_volume_share_threshold: float = 0.80,
         peer_htlc_share_threshold: float = 0.80,
@@ -53,7 +64,7 @@ class RealtimeSurgeDefense:
         self.surge_setchannel_min_interval_seconds = surge_setchannel_min_interval_seconds
         self.channel_capacity_msat = channel_capacity_msat
         self.current_fee_ppm = current_fee_ppm
-        self.apply_fee = apply_fee
+        self.apply_fee_callback = apply_fee_callback
         self.time_fn = time_fn
         self.peer_volume_share_threshold = peer_volume_share_threshold
         self.peer_htlc_share_threshold = peer_htlc_share_threshold
@@ -61,6 +72,7 @@ class RealtimeSurgeDefense:
 
         self._samples: Dict[str, Deque[SurgeSample]] = defaultdict(deque)
         self._states: Dict[str, SurgeOverlayState] = {}
+        self._pending_actions: Deque[SurgeOverlayAction] = deque()
 
     def ingest_sample(self, sample: SurgeSample) -> Optional[Dict[str, object]]:
         if not self.enabled:
@@ -79,13 +91,7 @@ class RealtimeSurgeDefense:
 
         state = self._states.get(channel_id)
         if state is None:
-            baseline_fee_ppm = self.current_fee_ppm(channel_id)
-            if baseline_fee_ppm is None:
-                return None
-            state = SurgeOverlayState(
-                baseline_fee_ppm=int(baseline_fee_ppm),
-                active_fee_ppm=int(baseline_fee_ppm),
-            )
+            state = SurgeOverlayState()
             self._states[channel_id] = state
 
         state.cooldown_until = max(
@@ -94,8 +100,16 @@ class RealtimeSurgeDefense:
         )
         state.last_trigger_reason = self._build_trigger_reason(metrics)
 
+        if state.pending_action == "revert":
+            self._clear_pending_action(channel_id)
+
+        baseline_fee_ppm = self._resolve_baseline_fee(channel_id, state)
+        if baseline_fee_ppm is None:
+            self._cleanup_idle_channel(channel_id)
+            return None
+
         target_fee_ppm = self._compute_bounded_surge_fee(
-            state.baseline_fee_ppm,
+            baseline_fee_ppm,
             metrics["moved_pct"],
         )
 
@@ -107,7 +121,7 @@ class RealtimeSurgeDefense:
                 "result": state.last_apply_result,
             }
 
-        if state.active and target_fee_ppm <= state.active_fee_ppm:
+        if state.active and state.active_fee_ppm is not None and target_fee_ppm <= state.active_fee_ppm:
             state.last_apply_result = "cooldown_extended"
             return {
                 "channel_id": channel_id,
@@ -115,20 +129,95 @@ class RealtimeSurgeDefense:
                 "result": state.last_apply_result,
             }
 
-        state.last_attempt_ts = sample.ts
-        ok = bool(self.apply_fee(channel_id, target_fee_ppm))
-        if ok:
-            state.active = True
-            state.active_fee_ppm = target_fee_ppm
-            state.last_apply_result = "applied"
-        else:
-            state.last_apply_result = "apply_failed"
+        if (
+            state.pending_action == "apply"
+            and state.pending_fee_ppm is not None
+            and target_fee_ppm <= state.pending_fee_ppm
+        ):
+            state.last_apply_result = "queued"
+            return {
+                "channel_id": channel_id,
+                "target_fee_ppm": state.pending_fee_ppm,
+                "result": state.last_apply_result,
+            }
+
+        self._enqueue_action(
+            SurgeOverlayAction(
+                channel_id=channel_id,
+                action="apply",
+                fee_ppm=target_fee_ppm,
+                baseline_fee_ppm=baseline_fee_ppm,
+            )
+        )
+        state.last_apply_result = "queued"
 
         return {
             "channel_id": channel_id,
             "target_fee_ppm": target_fee_ppm,
             "result": state.last_apply_result,
         }
+
+    def process_pending_actions(self) -> None:
+        now = self.time_fn()
+        for channel_id in list(self._states):
+            self._prune_samples(channel_id, now)
+            state = self._states.get(channel_id)
+            if state is None:
+                continue
+
+            if (
+                state.active
+                and state.pending_action is None
+                and state.baseline_fee_ppm is not None
+                and now >= state.cooldown_until
+                and not self._should_trigger(self._compute_window_metrics(channel_id))
+            ):
+                self._enqueue_action(
+                    SurgeOverlayAction(
+                        channel_id=channel_id,
+                        action="revert",
+                        fee_ppm=state.baseline_fee_ppm,
+                    )
+                )
+
+            self._cleanup_idle_channel(channel_id)
+
+        while self._pending_actions:
+            action = self._pending_actions.popleft()
+            state = self._states.get(action.channel_id)
+            if state is None:
+                continue
+
+            if not self._is_current_pending_action(state, action):
+                continue
+
+            state.last_attempt_ts = self.time_fn()
+            ok = bool(self.apply_fee_callback(action.channel_id, action.fee_ppm))
+            self._clear_pending_action(action.channel_id)
+
+            if action.action == "apply":
+                if ok:
+                    state.active = True
+                    state.baseline_fee_ppm = action.baseline_fee_ppm
+                    state.active_fee_ppm = action.fee_ppm
+                    state.last_apply_result = "applied"
+                else:
+                    state.last_apply_result = "apply_failed"
+                    if not state.active:
+                        state.baseline_fee_ppm = None
+                        state.active_fee_ppm = None
+            elif action.action == "revert":
+                if ok:
+                    state.active = False
+                    state.baseline_fee_ppm = None
+                    state.active_fee_ppm = None
+                    state.cooldown_until = 0.0
+                    state.last_trigger_reason = ""
+                    state.last_apply_result = "reverted"
+                else:
+                    state.last_apply_result = "revert_failed"
+
+            self._cleanup_idle_channel(action.channel_id)
 
     def get_status(self) -> Dict[str, object]:
         now = self.time_fn()
@@ -137,6 +226,10 @@ class RealtimeSurgeDefense:
 
         for channel_id in sorted(channel_ids):
             self._prune_samples(channel_id, now)
+            self._cleanup_idle_channel(channel_id)
+            if channel_id not in self._samples and channel_id not in self._states:
+                continue
+
             metrics = self._compute_window_metrics(channel_id)
             state = self._states.get(channel_id)
             channels[channel_id] = {
@@ -161,6 +254,72 @@ class RealtimeSurgeDefense:
             "channels": channels,
         }
 
+    def _resolve_baseline_fee(
+        self,
+        channel_id: str,
+        state: SurgeOverlayState,
+    ) -> Optional[int]:
+        if state.baseline_fee_ppm is not None:
+            return state.baseline_fee_ppm
+        if state.pending_action == "apply" and state.pending_baseline_fee_ppm is not None:
+            return state.pending_baseline_fee_ppm
+
+        baseline_fee_ppm = self.current_fee_ppm(channel_id)
+        if baseline_fee_ppm is None:
+            return None
+        return int(baseline_fee_ppm)
+
+    def _enqueue_action(self, action: SurgeOverlayAction) -> None:
+        self._pending_actions = deque(
+            queued
+            for queued in self._pending_actions
+            if queued.channel_id != action.channel_id
+        )
+        self._pending_actions.append(action)
+
+        state = self._states.setdefault(action.channel_id, SurgeOverlayState())
+        state.pending_action = action.action
+        state.pending_fee_ppm = action.fee_ppm
+        state.pending_baseline_fee_ppm = action.baseline_fee_ppm
+
+    def _clear_pending_action(self, channel_id: str) -> None:
+        self._pending_actions = deque(
+            queued
+            for queued in self._pending_actions
+            if queued.channel_id != channel_id
+        )
+        state = self._states.get(channel_id)
+        if state is None:
+            return
+        state.pending_action = None
+        state.pending_fee_ppm = None
+        state.pending_baseline_fee_ppm = None
+
+    @staticmethod
+    def _is_current_pending_action(
+        state: SurgeOverlayState,
+        action: SurgeOverlayAction,
+    ) -> bool:
+        return (
+            state.pending_action == action.action
+            and state.pending_fee_ppm == action.fee_ppm
+            and state.pending_baseline_fee_ppm == action.baseline_fee_ppm
+        )
+
+    def _cleanup_idle_channel(self, channel_id: str) -> None:
+        state = self._states.get(channel_id)
+        if state is None:
+            if channel_id in self._samples and not self._samples[channel_id]:
+                self._samples.pop(channel_id, None)
+            return
+
+        has_samples = bool(self._samples.get(channel_id))
+        if state.active or state.pending_action is not None or has_samples:
+            return
+
+        self._states.pop(channel_id, None)
+        self._samples.pop(channel_id, None)
+
     def _prune_samples(self, channel_id: str, now: float) -> None:
         samples = self._samples.get(channel_id)
         if samples is None:
@@ -169,7 +328,7 @@ class RealtimeSurgeDefense:
         while samples and now - samples[0].ts > self.surge_window_seconds:
             samples.popleft()
 
-        if not samples and channel_id not in self._states:
+        if not samples:
             self._samples.pop(channel_id, None)
 
     def _compute_window_metrics(self, channel_id: str) -> Dict[str, float]:

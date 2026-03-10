@@ -21,12 +21,16 @@ def _make_manager(
     baseline_fee_ppm: int = 100,
     cooldown_seconds: int = 120,
     min_interval_seconds: int = 15,
+    apply_fee_callback=None,
 ):
     applied = []
 
     def apply_fee(channel_id: str, fee_ppm: int) -> bool:
         applied.append((channel_id, fee_ppm))
         return True
+
+    if apply_fee_callback is None:
+        apply_fee_callback = apply_fee
 
     manager = RealtimeSurgeDefense(
         enabled=True,
@@ -38,7 +42,7 @@ def _make_manager(
         surge_setchannel_min_interval_seconds=min_interval_seconds,
         channel_capacity_msat=lambda channel_id: capacity_msat,
         current_fee_ppm=lambda channel_id: baseline_fee_ppm,
-        apply_fee=apply_fee,
+        apply_fee_callback=apply_fee_callback,
         time_fn=clock.time,
     )
     return manager, applied
@@ -70,6 +74,8 @@ def test_burst_trigger_fires_when_moved_pct_and_peer_concentration_cross_thresho
             _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
         )
         clock.advance(1)
+
+    manager.process_pending_actions()
 
     assert len(applied) == 1
     assert applied[0][0] == "2x2x2"
@@ -122,6 +128,8 @@ def test_trigger_is_debounced_by_min_setchannel_interval():
         )
         clock.advance(1)
 
+    manager.process_pending_actions()
+
     clock.advance(5)
 
     for _ in range(2):
@@ -149,6 +157,7 @@ def test_cooldown_extends_while_burst_continues():
         )
         clock.advance(1)
 
+    manager.process_pending_actions()
     first_cooldown_until = manager.get_status()["channels"]["2x2x2"]["cooldown_until"]
 
     clock.advance(30)
@@ -162,3 +171,179 @@ def test_cooldown_extends_while_burst_continues():
     assert len(applied) == 1
     assert channel["active"] is True
     assert channel["cooldown_until"] > first_cooldown_until
+
+
+def test_trigger_captures_exact_baseline_and_applies_surge_fee():
+    clock = FakeClock()
+    current_fee = {"value": 100}
+    applied = []
+
+    def apply_fee(channel_id: str, fee_ppm: int) -> bool:
+        applied.append((channel_id, fee_ppm))
+        return True
+
+    manager = RealtimeSurgeDefense(
+        enabled=True,
+        surge_window_seconds=60,
+        surge_trigger_pct=0.10,
+        surge_multiplier_min=3.0,
+        surge_multiplier_max=5.0,
+        surge_cooldown_seconds=120,
+        surge_setchannel_min_interval_seconds=15,
+        channel_capacity_msat=lambda channel_id: 1_000_000_000,
+        current_fee_ppm=lambda channel_id: current_fee["value"],
+        apply_fee_callback=apply_fee,
+        time_fn=clock.time,
+    )
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    assert applied == []
+
+    current_fee["value"] = 250
+    manager.process_pending_actions()
+
+    status = manager.get_status()
+    channel = status["channels"]["2x2x2"]
+
+    assert applied == [("2x2x2", 340)]
+    assert channel["active"] is True
+    assert channel["baseline_fee_ppm"] == 100
+    assert channel["active_fee_ppm"] == 340
+
+
+def test_calm_window_reverts_to_exact_baseline_after_cooldown():
+    clock = FakeClock()
+    current_fee = {"value": 125}
+    applied = []
+
+    def apply_fee(channel_id: str, fee_ppm: int) -> bool:
+        applied.append((channel_id, fee_ppm))
+        return True
+
+    manager = RealtimeSurgeDefense(
+        enabled=True,
+        surge_window_seconds=60,
+        surge_trigger_pct=0.10,
+        surge_multiplier_min=3.0,
+        surge_multiplier_max=5.0,
+        surge_cooldown_seconds=120,
+        surge_setchannel_min_interval_seconds=15,
+        channel_capacity_msat=lambda channel_id: 1_000_000_000,
+        current_fee_ppm=lambda channel_id: current_fee["value"],
+        apply_fee_callback=apply_fee,
+        time_fn=clock.time,
+    )
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    manager.process_pending_actions()
+    clock.advance(180)
+    current_fee["value"] = 500
+    manager.process_pending_actions()
+
+    status = manager.get_status()
+
+    assert applied == [("2x2x2", 425), ("2x2x2", 125)]
+    assert status["active_channel_count"] == 0
+    assert "2x2x2" not in status["channels"]
+
+
+def test_failed_apply_does_not_mark_overlay_active():
+    clock = FakeClock()
+    applied = []
+
+    def apply_fee(channel_id: str, fee_ppm: int) -> bool:
+        applied.append((channel_id, fee_ppm))
+        return False
+
+    manager = RealtimeSurgeDefense(
+        enabled=True,
+        surge_window_seconds=60,
+        surge_trigger_pct=0.10,
+        surge_multiplier_min=3.0,
+        surge_multiplier_max=5.0,
+        surge_cooldown_seconds=120,
+        surge_setchannel_min_interval_seconds=15,
+        channel_capacity_msat=lambda channel_id: 1_000_000_000,
+        current_fee_ppm=lambda channel_id: 100,
+        apply_fee_callback=apply_fee,
+        time_fn=clock.time,
+    )
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    manager.process_pending_actions()
+
+    status = manager.get_status()
+    channel = status["channels"]["2x2x2"]
+
+    assert applied == [("2x2x2", 340)]
+    assert status["active_channel_count"] == 0
+    assert channel["active"] is False
+    assert channel["baseline_fee_ppm"] is None
+    assert channel["active_fee_ppm"] is None
+    assert channel["last_apply_result"] == "apply_failed"
+
+
+def test_failed_revert_keeps_overlay_active_for_retry():
+    clock = FakeClock()
+    applied = []
+    outcomes = iter([True, False, True])
+
+    def apply_fee(channel_id: str, fee_ppm: int) -> bool:
+        applied.append((channel_id, fee_ppm))
+        return next(outcomes)
+
+    manager = RealtimeSurgeDefense(
+        enabled=True,
+        surge_window_seconds=60,
+        surge_trigger_pct=0.10,
+        surge_multiplier_min=3.0,
+        surge_multiplier_max=5.0,
+        surge_cooldown_seconds=120,
+        surge_setchannel_min_interval_seconds=15,
+        channel_capacity_msat=lambda channel_id: 1_000_000_000,
+        current_fee_ppm=lambda channel_id: 100,
+        apply_fee_callback=apply_fee,
+        time_fn=clock.time,
+    )
+
+    for _ in range(4):
+        manager.ingest_sample(
+            _sample(clock, amount_msat=30_000_000, incoming_peer_id="peer-a")
+        )
+        clock.advance(1)
+
+    manager.process_pending_actions()
+    clock.advance(180)
+    manager.process_pending_actions()
+
+    failed_revert_status = manager.get_status()
+    failed_revert_channel = failed_revert_status["channels"]["2x2x2"]
+
+    assert applied == [("2x2x2", 340), ("2x2x2", 100)]
+    assert failed_revert_status["active_channel_count"] == 1
+    assert failed_revert_channel["active"] is True
+    assert failed_revert_channel["active_fee_ppm"] == 340
+    assert failed_revert_channel["baseline_fee_ppm"] == 100
+    assert failed_revert_channel["last_apply_result"] == "revert_failed"
+
+    manager.process_pending_actions()
+
+    final_status = manager.get_status()
+
+    assert applied == [("2x2x2", 340), ("2x2x2", 100), ("2x2x2", 100)]
+    assert final_status["active_channel_count"] == 0
