@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock
 from types import SimpleNamespace
+import pytest
 from tests.plugin_test_utils import DummyPlugin, load_plugin_module
 from modules.config import Config, CONFIG_FIELD_TYPES, CONFIG_FIELD_RANGES
 
@@ -126,6 +127,32 @@ def test_plugin_registers_dynamic_htlcmin_option():
     mod = _load_plugin_module()
 
     assert "revenue-ops-enable-dynamic-htlcmin" in getattr(mod.plugin, "options", {})
+
+
+def test_init_maps_dynamic_htlcmin_option_into_config_kwargs():
+    mod = _load_plugin_module()
+    options = {
+        name: registration["default"]
+        for name, registration in mod.plugin.options.items()
+        if "default" in registration
+    }
+    options["revenue-ops-enable-dynamic-htlcmin"] = "true"
+    captured_kwargs = {}
+
+    class _StopInit(Exception):
+        pass
+
+    class _ConfigCapture:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            raise _StopInit()
+
+    mod.Config = _ConfigCapture
+
+    with pytest.raises(_StopInit):
+        mod.init(options, {}, mod.plugin)
+
+    assert captured_kwargs["enable_dynamic_htlcmin"] is True
 
 
 def test_run_gossip_maintenance_calls_manager_when_enabled():
