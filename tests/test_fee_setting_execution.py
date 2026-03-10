@@ -50,6 +50,10 @@ def _fee_strategy_state_dict():
     }
 
 
+def _setchannel_kwargs(mock_plugin):
+    return mock_plugin.rpc.setchannel.call_args.kwargs
+
+
 class TestSetChannelFeeLimits:
     def test_set_channel_fee_enforces_limits_by_default(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -73,9 +77,9 @@ class TestSetChannelFeeLimits:
 
         # Should clamp up to min_fee_ppm
         mock_plugin.rpc.setchannel.assert_called()
-        _, feebase_msat, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
-        assert feebase_msat == 0
-        assert applied_fee == 10
+        call_kwargs = _setchannel_kwargs(mock_plugin)
+        assert call_kwargs["feebase"] == 0
+        assert call_kwargs["feeppm"] == 10
 
     def test_set_channel_fee_can_bypass_limits_for_force(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -96,8 +100,7 @@ class TestSetChannelFeeLimits:
 
         fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=False)
 
-        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
-        assert applied_fee == 1
+        assert _setchannel_kwargs(mock_plugin)["feeppm"] == 1
 
     def test_set_channel_fee_allows_zero_for_hive_policy(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -124,8 +127,7 @@ class TestSetChannelFeeLimits:
             enforce_limits=False
         )
 
-        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
-        assert applied_fee == 0
+        assert _setchannel_kwargs(mock_plugin)["feeppm"] == 0
 
 
 class TestGossipRefreshExecution:
@@ -187,7 +189,9 @@ class TestZeroFeeProbeEndToEnd:
 
         # set_channel_fee verifies with listpeerchannels after setchannel.
         fee_holder = {"fee": 100}
-        mock_plugin.rpc.setchannel = MagicMock(side_effect=lambda _cid, _base, fee: fee_holder.__setitem__("fee", fee))
+        mock_plugin.rpc.setchannel = MagicMock(
+            side_effect=lambda *args, **kwargs: fee_holder.__setitem__("fee", kwargs["feeppm"])
+        )
         mock_plugin.rpc.listpeerchannels = MagicMock(side_effect=lambda: _listpeerchannels_payload(channel_id, peer_id, fee_ppm=fee_holder["fee"]))
 
         # Minimal DB stubs used by _adjust_channel_fee
@@ -234,8 +238,7 @@ class TestZeroFeeProbeEndToEnd:
         assert adj is not None
         assert adj.reason_code == FeeReasonCode.ZERO_FEE_PROBE.value
 
-        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
-        assert applied_fee == 0
+        assert _setchannel_kwargs(mock_plugin)["feeppm"] == 0
 
     def test_zero_fee_probe_success_exits_to_floor_and_clears_probe(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -248,7 +251,9 @@ class TestZeroFeeProbeEndToEnd:
 
         # Fee is currently 0 (probe already active), and we observed volume -> success.
         fee_holder = {"fee": 0}
-        mock_plugin.rpc.setchannel = MagicMock(side_effect=lambda _cid, _base, fee: fee_holder.__setitem__("fee", fee))
+        mock_plugin.rpc.setchannel = MagicMock(
+            side_effect=lambda *args, **kwargs: fee_holder.__setitem__("fee", kwargs["feeppm"])
+        )
         mock_plugin.rpc.listpeerchannels = MagicMock(side_effect=lambda: _listpeerchannels_payload(channel_id, peer_id, fee_ppm=fee_holder["fee"]))
 
         db_state = _fee_strategy_state_dict()
@@ -296,8 +301,7 @@ class TestZeroFeeProbeEndToEnd:
         assert adj.new_fee_ppm >= 10
 
         mock_database.clear_channel_probe.assert_called()
-        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
-        assert applied_fee == adj.new_fee_ppm
+        assert _setchannel_kwargs(mock_plugin)["feeppm"] == adj.new_fee_ppm
 
 
 class TestSetInitialFee:
@@ -330,7 +334,7 @@ class TestSetInitialFee:
 
         def fake_listpeerchannels(*args, **kwargs):
             if mock_plugin.rpc.setchannel.called:
-                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+                last_fee = _setchannel_kwargs(mock_plugin)["feeppm"]
                 return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=last_fee)
             return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=0)
 
@@ -342,7 +346,7 @@ class TestSetInitialFee:
         assert result is not None
         assert result["success"] is True
         mock_plugin.rpc.setchannel.assert_called()
-        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        applied_fee = _setchannel_kwargs(mock_plugin)["feeppm"]
         # Fee should be within configured bounds
         assert 10 <= applied_fee <= 5000
 
@@ -380,7 +384,7 @@ class TestSetInitialFee:
 
         def fake_listpeerchannels(*args, **kwargs):
             if mock_plugin.rpc.setchannel.called:
-                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+                last_fee = _setchannel_kwargs(mock_plugin)["feeppm"]
                 return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=last_fee)
             return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=0)
 
@@ -396,7 +400,7 @@ class TestSetInitialFee:
 
         assert result is not None
         assert result["success"] is True
-        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        applied_fee = _setchannel_kwargs(mock_plugin)["feeppm"]
         assert applied_fee == 250
 
     def test_initial_fee_respects_hive_policy(self, mock_plugin, mock_database):
@@ -410,7 +414,7 @@ class TestSetInitialFee:
 
         def fake_listpeerchannels(*args, **kwargs):
             if mock_plugin.rpc.setchannel.called:
-                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+                last_fee = _setchannel_kwargs(mock_plugin)["feeppm"]
                 return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=last_fee)
             return _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
 
@@ -426,7 +430,7 @@ class TestSetInitialFee:
 
         assert result is not None
         assert result["success"] is True
-        _, _, applied_fee = mock_plugin.rpc.setchannel.call_args[0]
+        applied_fee = _setchannel_kwargs(mock_plugin)["feeppm"]
         assert applied_fee == 0
 
     def test_initial_fee_matches_by_funding_txid(self, mock_plugin, mock_database):
@@ -439,7 +443,7 @@ class TestSetInitialFee:
 
         def fake_listpeerchannels(*args, **kwargs):
             if mock_plugin.rpc.setchannel.called:
-                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+                last_fee = _setchannel_kwargs(mock_plugin)["feeppm"]
             else:
                 last_fee = 0
             return {
@@ -463,7 +467,7 @@ class TestSetInitialFee:
         assert result is not None
         assert result["success"] is True
         # Should use the SCID for the setchannel call
-        called_id = mock_plugin.rpc.setchannel.call_args[0][0]
+        called_id = _setchannel_kwargs(mock_plugin)["id"]
         assert called_id == scid
 
     def test_initial_fee_fallback_single_normal_channel(self, mock_plugin, mock_database):
@@ -476,7 +480,7 @@ class TestSetInitialFee:
 
         def fake_listpeerchannels(*args, **kwargs):
             if mock_plugin.rpc.setchannel.called:
-                last_fee = mock_plugin.rpc.setchannel.call_args[0][2]
+                last_fee = _setchannel_kwargs(mock_plugin)["feeppm"]
             else:
                 last_fee = 0
             return {
