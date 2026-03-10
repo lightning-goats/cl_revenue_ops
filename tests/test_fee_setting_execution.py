@@ -9,7 +9,12 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _listpeerchannels_payload(channel_id: str, peer_id: str, fee_ppm: int = 100):
+def _listpeerchannels_payload(
+    channel_id: str,
+    peer_id: str,
+    fee_ppm: int = 100,
+    htlc_minimum_msat: int = 0,
+):
     return {
         "channels": [
             {
@@ -19,6 +24,7 @@ def _listpeerchannels_payload(channel_id: str, peer_id: str, fee_ppm: int = 100)
                 "spendable_msat": 500_000_000,
                 "receivable_msat": 500_000_000,
                 "total_msat": 1_000_000_000,
+                "htlc_minimum_msat": htlc_minimum_msat,
                 "updates": {
                     "local": {
                         "fee_base_msat": 0,
@@ -52,6 +58,30 @@ def _fee_strategy_state_dict():
 
 def _setchannel_kwargs(mock_plugin):
     return mock_plugin.rpc.setchannel.call_args.kwargs
+
+
+class TestChannelInfoShaping:
+    def test_get_channels_info_preserves_htlc_minimum_msat(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import HillClimbingFeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        advertised_htlc_minimum_msat = 42_000
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(
+            channel_id,
+            peer_id,
+            fee_ppm=100,
+            htlc_minimum_msat=advertised_htlc_minimum_msat,
+        )
+
+        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
+        channel_info = fc._get_channels_info()[channel_id]
+
+        assert channel_info["htlc_minimum_msat"] == advertised_htlc_minimum_msat
+        assert channel_info["htlc_min_msat"] == advertised_htlc_minimum_msat
 
 
 class TestSetChannelFeeLimits:

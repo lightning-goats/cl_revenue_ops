@@ -8254,6 +8254,7 @@ class HillClimbingFeeController:
             fee_base = fee_base_val if fee_base_val is not None else target_ch.get('fee_base_msat', 0)
             fee_ppm_val = local_updates.get('fee_proportional_millionths')
             fee_ppm = fee_ppm_val if fee_ppm_val is not None else target_ch.get('fee_proportional_millionths', 0)
+            htlc_minimum_msat = parse_msat(target_ch.get('htlc_minimum_msat', 0))
             channel_info = {
                 'channel_id': scid,
                 'peer_id': peer_id,
@@ -8262,6 +8263,8 @@ class HillClimbingFeeController:
                 'receivable_msat': receivable_msat,
                 'fee_base_msat': fee_base,
                 'fee_proportional_millionths': fee_ppm,
+                'htlc_minimum_msat': htlc_minimum_msat,
+                'htlc_min_msat': htlc_minimum_msat,
                 'opener': target_ch.get('opener', 'local'),
             }
 
@@ -8781,6 +8784,7 @@ class HillClimbingFeeController:
                     fee_base = fee_base_val if fee_base_val is not None else channel.get("fee_base_msat", 0)
                     fee_ppm_val = local_updates.get("fee_proportional_millionths")
                     fee_ppm = fee_ppm_val if fee_ppm_val is not None else channel.get("fee_proportional_millionths", 0)
+                    htlc_minimum_msat = parse_msat(channel.get("htlc_minimum_msat", 0))
 
                     channels[channel_id] = {
                         "channel_id": channel_id,
@@ -8790,6 +8794,8 @@ class HillClimbingFeeController:
                         "receivable_msat": receivable_msat,
                         "fee_base_msat": fee_base,
                         "fee_proportional_millionths": fee_ppm,
+                        "htlc_minimum_msat": htlc_minimum_msat,
+                        "htlc_min_msat": htlc_minimum_msat,
                         "opener": channel.get("opener", "local"),
                     }
                     
