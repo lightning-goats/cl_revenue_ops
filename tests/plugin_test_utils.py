@@ -17,8 +17,14 @@ class DummyPlugin:
     def __init__(self):
         self.rpc = MagicMock()
         self.log = MagicMock()
+        self.options = {}
 
     def add_option(self, *args, **kwargs):
+        name = kwargs.get("name")
+        if name is None and args:
+            name = args[0]
+        if name is not None:
+            self.options[name] = dict(kwargs)
         return None
 
     def method(self, *args, **kwargs):
