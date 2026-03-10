@@ -7829,13 +7829,37 @@ class HillClimbingFeeController:
         else:
             fee_reason_code = FeeReasonCode.THOMPSON_SAMPLE.value
 
+        # =====================================================================
+        # DYNAMIC HTLC MAX SIZING (Flow-Based)
+        # =====================================================================
+        htlcmax_msat = None
+        if getattr(cfg, 'enable_dynamic_htlcmax', False):
+            capacity_msat = channel_info.get("capacity", 0) * 1000
+            if capacity_msat > 0:
+                if flow_state == "source":
+                    target_msat = int(capacity_msat * cfg.htlcmax_source_pct)
+                elif flow_state == "sink":
+                    target_msat = int(capacity_msat * cfg.htlcmax_sink_pct)
+                else:
+                    target_msat = int(capacity_msat * cfg.htlcmax_balanced_pct)
+                
+                # Safety Bounds: Never go below 10,000 sats or above capacity
+                htlcmax_msat = max(10_000_000, min(target_msat, capacity_msat))
+                
+                self.plugin.log(
+                    f"DYNAMIC_HTLCMAX: {channel_id[:12]}... is {flow_state}. "
+                    f"Set limit to {htlcmax_msat // 1000:,} sats",
+                    level='debug'
+                )
+
         # Apply the fee change (Significant change -> Broadcast)
         result = self.set_channel_fee(
             channel_id, new_fee_ppm, reason=reason,
             reason_code=fee_reason_code,
             heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None,
             enforce_limits=(fee_reason_code not in (FeeReasonCode.ZERO_FEE_PROBE.value, FeeReasonCode.POLICY_HIVE.value)),
-            channel_info=channel_info
+            channel_info=channel_info,
+            htlcmax_msat=htlcmax_msat
         )
         
         if result.get("success"):
@@ -7976,7 +8000,8 @@ class HillClimbingFeeController:
                        reason_code: Optional[str] = None,
                        heuristic_modifiers: Optional[HeuristicModifiers] = None,
                        enforce_limits: bool = True,
-                       channel_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                       channel_info: Optional[Dict[str, Any]] = None,
+                       htlcmax_msat: Optional[int] = None) -> Dict[str, Any]:
         """
         Set the fee for a channel.
 
@@ -8070,12 +8095,15 @@ class HillClimbingFeeController:
                 return result
             
             # Use setchannel command
-            # setchannel id [feebase] [feeppm] [htlcmin] [htlcmax] [enforcedelay] [ignorefeelimits]
-            self.plugin.rpc.setchannel(
-                channel_id,                    # id
-                self.config.base_fee_msat,     # feebase (msat)
-                fee_ppm                        # feeppm
-            )
+            rpc_params = {
+                "id": channel_id,
+                "feebase": self.config.base_fee_msat,
+                "feeppm": fee_ppm
+            }
+            if htlcmax_msat is not None:
+                rpc_params["htlcmax"] = f"{htlcmax_msat}msat"
+
+            self.plugin.rpc.setchannel(**rpc_params)
 
             # M-13: Removed per-channel sleep+verify+retry loop from hot path.
             # Fee verification is handled by the existing gossip refresh mechanism

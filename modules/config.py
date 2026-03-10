@@ -60,6 +60,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'boltz_auto_cycle_interval_minutes': int,
     'boltz_auto_cycle_max_actions': int,
     'boltz_auto_cycle_startup_delay_seconds': int,
+    'enable_dynamic_htlcmax': bool,
+    'htlcmax_source_pct': float,
+    'htlcmax_sink_pct': float,
+    'htlcmax_balanced_pct': float,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -187,6 +191,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'kelly_fraction': (0.0, 1.0),
     'vegas_decay_rate': (0.0, 1.0),
     'scarcity_threshold': (0.0, 1.0),
+    'htlcmax_source_pct': (0.01, 1.0),
+    'htlcmax_sink_pct': (0.01, 1.0),
+    'htlcmax_balanced_pct': (0.01, 1.0),
     'hive_fee_ppm': (0, 100000),
     'hive_rebalance_tolerance': (0, 100000),
     'sling_chunk_size_sats': (1, 50000000),
@@ -299,6 +306,11 @@ class Config:
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
     boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
+    # Dynamic HTLC Max
+    enable_dynamic_htlcmax: bool = False
+    htlcmax_source_pct: float = 0.10     # Sources restricted to 10% chunks
+    htlcmax_sink_pct: float = 1.0        # Sinks wide open (100%)
+    htlcmax_balanced_pct: float = 0.50   # Balanced channels restricted to 50%
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens/splices)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
@@ -635,7 +647,7 @@ class Config:
         if key in STRING_ENUM_VALID_VALUES:
             valid_values = STRING_ENUM_VALID_VALUES[key]
             # Case-insensitive comparison for string enums
-            if typed_value not in valid_values and (not isinstance(typed_value, str) or typed_value.lower() not in [v.lower() for v in valid_values]):
+            if typed_value not in valid_values and (not isinstance(typed_value, str) or typed_value.lower() not in[v.lower() for v in valid_values]):
                 valid = ', '.join(valid_values)
                 return {"error": f"Invalid value '{typed_value}' for {key}. Valid values: {valid}"}
             # Normalize string enums to lowercase for consistent consumer comparisons
@@ -728,6 +740,10 @@ class ConfigSnapshot:
     boltz_auto_cycle_interval_minutes: int
     boltz_auto_cycle_max_actions: int
     boltz_auto_cycle_startup_delay_seconds: int
+    enable_dynamic_htlcmax: bool
+    htlcmax_source_pct: float
+    htlcmax_sink_pct: float
+    htlcmax_balanced_pct: float
     expansion_treasury_enabled: bool
     expansion_treasury_onchain_target_sats: int
     expansion_treasury_min_deficit_sats: int
