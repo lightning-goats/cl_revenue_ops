@@ -635,6 +635,39 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-auto-band-enabled',
+    default='true',
+    description='Enable automatic posterior-driven fee autobands for observed dynamic channels (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-auto-band-min-observations',
+    default='20',
+    description='Minimum Thompson observations before auto-band calibration activates (default: 20)',
+    opt_type='int'
+)
+
+plugin.add_option(
+    name='revenue-ops-auto-band-sigma',
+    default='2.0',
+    description='Posterior standard deviation multiplier used to size auto bands (default: 2.0)'
+)
+
+plugin.add_option(
+    name='revenue-ops-auto-band-min-width-ppm',
+    default='50',
+    description='Minimum width in PPM for auto-calibrated fee bands (default: 50)',
+    opt_type='int'
+)
+
+plugin.add_option(
+    name='revenue-ops-auto-band-recalibrate-interval',
+    default='10',
+    description='Recalibrate automatic fee bands every N fee intervals (default: 10)',
+    opt_type='int'
+)
+
+plugin.add_option(
     name='revenue-ops-rebalance-min-profit',
     default='10',
     description='Minimum profit in sats to trigger rebalance (default: 10)'
@@ -1177,6 +1210,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         target_flow=_safe_int('revenue-ops-target-flow'),
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
+        auto_band_enabled=options.get('revenue-ops-auto-band-enabled', 'true').lower() == 'true',
+        auto_band_min_observations=_safe_int_opt('revenue-ops-auto-band-min-observations', '20'),
+        auto_band_sigma=_safe_float_opt('revenue-ops-auto-band-sigma', '2.0'),
+        auto_band_min_width_ppm=_safe_int_opt('revenue-ops-auto-band-min-width-ppm', '50'),
+        auto_band_recalibrate_interval=_safe_int_opt('revenue-ops-auto-band-recalibrate-interval', '10'),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
@@ -2727,7 +2765,12 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "min_observation_hours": min_obs_hours,
             "min_forwards_for_signal": min_forwards,
             "max_observation_hours": max_obs_hours,
-            "enable_dynamic_windows": enable_dyn_windows
+            "enable_dynamic_windows": enable_dyn_windows,
+            "auto_band_enabled": bool(getattr(config, "auto_band_enabled", False)) if config else False,
+            "auto_band_min_observations": int(getattr(config, "auto_band_min_observations", 20)) if config else 20,
+            "auto_band_sigma": float(getattr(config, "auto_band_sigma", 2.0)) if config else 2.0,
+            "auto_band_min_width_ppm": int(getattr(config, "auto_band_min_width_ppm", 50)) if config else 50,
+            "auto_band_recalibrate_interval": int(getattr(config, "auto_band_recalibrate_interval", 10)) if config else 10,
         },
         "channels": [],
         "summary": {
@@ -2791,6 +2834,35 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             result["summary"]["ready"] += 1
 
         chan_state = state_lookup.get(channel_id, {})
+        peer_id = chan_state.get("peer_id")
+        effective_autoband = None
+        auto_band = None
+        if fee_controller is not None:
+            if peer_id and hasattr(fee_controller, "_get_effective_dynamic_fee_autoband_ppm"):
+                band_min_ppm, band_max_ppm, band_source = fee_controller._get_effective_dynamic_fee_autoband_ppm(
+                    channel_id,
+                    peer_id,
+                )
+                if band_min_ppm is not None or band_max_ppm is not None:
+                    effective_autoband = {
+                        "min_ppm": band_min_ppm,
+                        "max_ppm": band_max_ppm,
+                        "source": band_source,
+                    }
+            if hasattr(fee_controller, "_get_channel_auto_band"):
+                auto_band_state = fee_controller._get_channel_auto_band(channel_id)
+                if auto_band_state is not None:
+                    auto_band = {
+                        "min_ppm": auto_band_state.min_ppm,
+                        "max_ppm": auto_band_state.max_ppm,
+                        "optimal_fee_ppm": auto_band_state.optimal_fee_ppm,
+                        "posterior_std": auto_band_state.posterior_std,
+                        "observation_count": auto_band_state.observation_count,
+                        "sigma": auto_band_state.sigma,
+                        "min_width_ppm": auto_band_state.min_width_ppm,
+                        "last_calibrated": auto_band_state.last_calibrated,
+                        "source": auto_band_state.source,
+                    }
 
         result["channels"].append({
             "channel_id": channel_id[:12] + "..." if len(channel_id) > 12 else channel_id,
@@ -2801,7 +2873,9 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "forwards_since_update": forward_count,
             "last_broadcast_fee_ppm": last_broadcast_fee,
             "last_revenue_rate": round(last_revenue_rate, 2),
-            "flow_state": chan_state.get("state", "unknown")
+            "flow_state": chan_state.get("state", "unknown"),
+            "effective_autoband": effective_autoband,
+            "auto_band": auto_band,
         })
         result["summary"]["total"] += 1
 

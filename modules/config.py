@@ -44,6 +44,11 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'paused': bool,
     'min_fee_ppm': int,
     'max_fee_ppm': int,
+    'auto_band_enabled': bool,
+    'auto_band_min_observations': int,
+    'auto_band_sigma': float,
+    'auto_band_min_width_ppm': int,
+    'auto_band_recalibrate_interval': int,
     'daily_budget_sats': int,
     'weekly_budget_sats': int,
     'total_cost_budget_mode': str,
@@ -184,6 +189,10 @@ DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset()
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
     'max_fee_ppm': (1, 100000),
+    'auto_band_min_observations': (1, 500),
+    'auto_band_sigma': (0.1, 10.0),
+    'auto_band_min_width_ppm': (1, 10000),
+    'auto_band_recalibrate_interval': (1, 1000),
     'daily_budget_sats': (0, 10000000),
     'weekly_budget_sats': (0, 70_000_000),
     'total_cost_budget_profit_pct': (0.0, 1.0),
@@ -361,6 +370,11 @@ class Config:
     min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)
     max_fee_ppm: int = 5000        # Ceiling fee in PPM
     base_fee_msat: int = 0         # Base fee (we focus on PPM)
+    auto_band_enabled: bool = True
+    auto_band_min_observations: int = 20
+    auto_band_sigma: float = 2.0
+    auto_band_min_width_ppm: int = 50
+    auto_band_recalibrate_interval: int = 10
     
     # Rebalancing parameters
     rebalance_min_profit: int = 10     # Min profit in sats to trigger (legacy, used when ppm=0)
@@ -818,6 +832,11 @@ class ConfigSnapshot:
     min_fee_ppm: int
     max_fee_ppm: int
     base_fee_msat: int
+    auto_band_enabled: bool
+    auto_band_min_observations: int
+    auto_band_sigma: float
+    auto_band_min_width_ppm: int
+    auto_band_recalibrate_interval: int
     
     # Rebalancing parameters
     rebalance_min_profit: int

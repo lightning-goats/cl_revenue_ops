@@ -6298,15 +6298,36 @@ class HillClimbingFeeController:
         # If the autoband conflicts with a protective floor (e.g. scarcity / cost
         # recovery), safety wins and the ceiling is lifted to the floor.
         # =====================================================================
-        band_min_ppm, band_max_ppm = self._get_dynamic_policy_fee_autoband_ppm(peer_id)
+        if self.ENABLE_THOMPSON_AIMD:
+            ts_state_for_band = self._get_thompson_aimd_state(
+                channel_id,
+                peer_id,
+                actual_fee_ppm=raw_chain_fee,
+            )
+            self._maybe_auto_calibrate_channel_fee_band(
+                channel_id,
+                peer_id,
+                ts_state_for_band,
+                cfg,
+                now=now,
+            )
+        band_min_ppm, band_max_ppm, band_source = self._get_effective_dynamic_fee_autoband_ppm(
+            channel_id,
+            peer_id,
+            cfg=cfg,
+        )
         if band_min_ppm is not None or band_max_ppm is not None:
             old_floor_ppm = base_floor_ppm
             old_ceiling_ppm = base_ceiling_ppm
+            old_hard_floor_ppm = _hard_floor_ppm
+            old_hard_ceiling_ppm = _hard_ceiling_ppm
 
             if band_min_ppm is not None:
                 base_floor_ppm = max(base_floor_ppm, band_min_ppm)
+                _hard_floor_ppm = max(_hard_floor_ppm, band_min_ppm)
             if band_max_ppm is not None:
                 base_ceiling_ppm = min(base_ceiling_ppm, band_max_ppm)
+                _hard_ceiling_ppm = min(_hard_ceiling_ppm, band_max_ppm)
 
             if base_floor_ppm > base_ceiling_ppm:
                 self.plugin.log(
@@ -6316,11 +6337,14 @@ class HillClimbingFeeController:
                     level='warn'
                 )
                 base_ceiling_ppm = base_floor_ppm
+                _hard_ceiling_ppm = max(_hard_ceiling_ppm, _hard_floor_ppm)
             elif old_floor_ppm != base_floor_ppm or old_ceiling_ppm != base_ceiling_ppm:
                 self.plugin.log(
-                    f"POLICY_AUTOBAND: {channel_id[:12]}... "
+                    f"{band_source.upper()}_AUTOBAND: {channel_id[:12]}... "
                     f"floor={old_floor_ppm}->{base_floor_ppm}, "
                     f"ceiling={old_ceiling_ppm}->{base_ceiling_ppm}, "
+                    f"hard_floor={old_hard_floor_ppm}->{_hard_floor_ppm}, "
+                    f"hard_ceiling={old_hard_ceiling_ppm}->{_hard_ceiling_ppm}, "
                     f"band={band_min_ppm or '-'}-{band_max_ppm or '-'} ppm",
                     level='debug'
                 )
@@ -6512,6 +6536,13 @@ class HillClimbingFeeController:
 
             # Load Thompson+AIMD state
             ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+            self._maybe_auto_calibrate_channel_fee_band(
+                channel_id,
+                peer_id,
+                ts_state,
+                cfg,
+                now=now,
+            )
 
             # Update payment size bucket posteriors from recent forwards
             self._update_size_bucket_posteriors(channel_id, ts_state)
@@ -6703,6 +6734,11 @@ class HillClimbingFeeController:
                                     # Fleet has strong evidence, we should adapt even if we
                                     # didn't detect it locally
                                     historical_curve.reset_curve()
+                                    ts_state = self._reset_channel_after_regime_change(
+                                        channel_id,
+                                        peer_id,
+                                        ts_state,
+                                    )
                                     ts_state.set_historical_curve(historical_curve)
                                     self.plugin.log(
                                         f"P2_REGIME: {channel_id[:12]}... resetting curve due to "
@@ -8163,11 +8199,19 @@ class HillClimbingFeeController:
         self,
         channel_id: str,
         peer_id: str,
+        cfg: Optional[Config] = None,
     ) -> Tuple[Optional[int], Optional[int], str]:
         """Resolve the active autoband with precedence manual > auto > none."""
+        cfg_obj = cfg
+        if cfg_obj is None:
+            cfg_obj = self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
+
         band_min_ppm, band_max_ppm = self._get_dynamic_policy_fee_autoband_ppm(peer_id)
         if band_min_ppm is not None or band_max_ppm is not None:
             return (band_min_ppm, band_max_ppm, "manual")
+
+        if not getattr(cfg_obj, "auto_band_enabled", False):
+            return (None, None, "none")
 
         auto_band = self._get_channel_auto_band(channel_id)
         if auto_band is None:
@@ -8199,6 +8243,7 @@ class HillClimbingFeeController:
         if policy and (
             policy.fee_multiplier_min is not None or policy.fee_multiplier_max is not None
         ):
+            self._clear_channel_auto_band(channel_id)
             return False
 
         observation_count = len(getattr(ts_state.thompson, "observations", []))
@@ -8242,6 +8287,28 @@ class HillClimbingFeeController:
             min_width_ppm=min_width_ppm,
         )
         return True
+
+    def _maybe_auto_calibrate_channel_fee_band(
+        self,
+        channel_id: str,
+        peer_id: str,
+        ts_state: ThompsonAIMDState,
+        cfg: Config,
+        *,
+        now: Optional[int] = None,
+    ) -> bool:
+        """Calibrate automatic fee bands only when the configured interval has elapsed."""
+        if not getattr(cfg, "auto_band_enabled", False):
+            return False
+
+        now_ts = int(now if now is not None else time.time())
+        auto_band = ts_state.get_auto_band()
+        recalibrate_every = max(1, int(getattr(cfg, "auto_band_recalibrate_interval", 10)))
+        min_interval_seconds = max(1, int(getattr(cfg, "fee_interval", 1800))) * recalibrate_every
+        if auto_band is not None and (now_ts - int(auto_band.last_calibrated)) < min_interval_seconds:
+            return False
+
+        return self._auto_calibrate_channel_fee_band(channel_id, peer_id, ts_state, cfg)
 
     def _reset_channel_after_regime_change(
         self,
@@ -8691,7 +8758,11 @@ class HillClimbingFeeController:
                 # Fallback: use the configured prior mean, clamped to bounds
                 initial_fee = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, 200))
 
-            band_min_ppm, band_max_ppm = self._get_dynamic_policy_fee_autoband_ppm(peer_id)
+            band_min_ppm, band_max_ppm, _ = self._get_effective_dynamic_fee_autoband_ppm(
+                scid,
+                peer_id,
+                cfg=cfg,
+            )
             if band_min_ppm is not None or band_max_ppm is not None:
                 original_initial_fee = initial_fee
                 if band_min_ppm is not None:
