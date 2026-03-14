@@ -1567,6 +1567,127 @@ class TestAutoBandCalibration:
         assert updated is False
         assert fc._get_channel_auto_band("123x456x0") is None
 
+    def test_auto_band_calibration_enforces_minimum_width(
+        self, mock_database, mock_plugin
+    ):
+        from modules.fee_controller import ThompsonAIMDState
+
+        peer_id = "02" + "e" * 64
+        policy_manager = MagicMock()
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id,
+            strategy=FeeStrategy.DYNAMIC,
+        )
+        fc, cfg = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+
+        ts_state = ThompsonAIMDState()
+        ts_state.thompson.observations = [
+            (200, 10.0, 1.0, int(time.time()), "normal")
+            for _ in range(cfg.auto_band_min_observations)
+        ]
+        ts_state.thompson.posterior_std = 5.0
+        ts_state.thompson.predict_optimal_fee = MagicMock(return_value=200)
+
+        updated = fc._auto_calibrate_channel_fee_band(
+            "123x456x0",
+            peer_id,
+            ts_state,
+            cfg,
+        )
+
+        auto_band = fc._get_channel_auto_band("123x456x0")
+        assert updated is True
+        assert auto_band is not None
+        assert (auto_band.min_ppm, auto_band.max_ppm) == (175, 225)
+
+    def test_auto_band_calibration_clamps_to_global_fee_bounds(
+        self, mock_database, mock_plugin
+    ):
+        from modules.fee_controller import ThompsonAIMDState
+
+        peer_id = "02" + "f" * 64
+        policy_manager = MagicMock()
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id,
+            strategy=FeeStrategy.DYNAMIC,
+        )
+        fc, cfg = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+
+        ts_state = ThompsonAIMDState()
+        ts_state.thompson.observations = [
+            (200, 10.0, 1.0, int(time.time()), "normal")
+            for _ in range(cfg.auto_band_min_observations)
+        ]
+        ts_state.thompson.posterior_std = 1000.0
+        ts_state.thompson.predict_optimal_fee = MagicMock(return_value=4800)
+
+        updated = fc._auto_calibrate_channel_fee_band(
+            "123x456x0",
+            peer_id,
+            ts_state,
+            cfg,
+        )
+
+        auto_band = fc._get_channel_auto_band("123x456x0")
+        assert updated is True
+        assert auto_band is not None
+        assert auto_band.min_ppm >= cfg.min_fee_ppm
+        assert auto_band.max_ppm <= cfg.max_fee_ppm
+
+    def test_regime_change_reset_clears_auto_band(
+        self, mock_database, mock_plugin
+    ):
+        from modules.fee_controller import GaussianThompsonState, ThompsonAIMDState
+
+        peer_id = "02" + "1" * 64
+        policy_manager = MagicMock()
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id,
+            strategy=FeeStrategy.DYNAMIC,
+        )
+        fc, _ = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+
+        ts_state = ThompsonAIMDState()
+        ts_state.aimd.reset = MagicMock()
+        replacement_thompson = GaussianThompsonState()
+        fc._set_channel_auto_band(
+            "123x456x0",
+            min_ppm=200,
+            max_ppm=300,
+            optimal_fee_ppm=250,
+            posterior_std=25.0,
+            observation_count=25,
+            sigma=2.0,
+            min_width_ppm=50,
+        )
+
+        with patch.object(
+            fc,
+            "_initialize_thompson_from_hive",
+            return_value=replacement_thompson,
+        ):
+            fc._reset_channel_after_regime_change(
+                "123x456x0",
+                peer_id,
+                ts_state,
+            )
+
+        assert ts_state.thompson is replacement_thompson
+        assert fc._get_channel_auto_band("123x456x0") is None
+        ts_state.aimd.reset.assert_called_once()
+
 
 # =============================================================================
 # Success-Rate-Adjusted Cost Floor Tests (Change 9)

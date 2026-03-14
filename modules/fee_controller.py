@@ -6555,9 +6555,11 @@ class HillClimbingFeeController:
                                 level='info'
                             )
                             historical_curve.reset_curve()
-                            # Reset Thompson and AIMD on regime change
-                            ts_state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
-                            ts_state.aimd.reset()
+                            ts_state = self._reset_channel_after_regime_change(
+                                channel_id,
+                                peer_id,
+                                ts_state,
+                            )
 
                     ts_state.set_historical_curve(historical_curve)
 
@@ -8240,6 +8242,19 @@ class HillClimbingFeeController:
             min_width_ppm=min_width_ppm,
         )
         return True
+
+    def _reset_channel_after_regime_change(
+        self,
+        channel_id: str,
+        peer_id: str,
+        ts_state: ThompsonAIMDState,
+    ) -> ThompsonAIMDState:
+        """Reset Thompson beliefs and clear any learned autoband after regime change."""
+        ts_state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
+        ts_state.aimd.reset()
+        ts_state.set_auto_band(None)
+        self._save_thompson_aimd_state(channel_id, ts_state)
+        return ts_state
 
     def _get_dynamic_htlcmin_baseline_msat(self, channel_id: str) -> Optional[int]:
         """Return the persisted operator baseline for temporary htlcmin defenses."""
