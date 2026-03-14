@@ -1526,7 +1526,7 @@ class TestAutoBandCalibration:
         }
         return fc, cfg, channel_info
 
-    def test_effective_autoband_prefers_manual_policy_over_auto_band(
+    def test_effective_autoband_prefers_auto_band_over_manual_policy_when_available(
         self, mock_database, mock_plugin
     ):
         peer_id = "02" + "b" * 64
@@ -1553,6 +1553,31 @@ class TestAutoBandCalibration:
             observation_count=25,
             sigma=2.0,
             min_width_ppm=50,
+        )
+
+        band_min, band_max, source = fc._get_effective_dynamic_fee_autoband_ppm(
+            "123x456x0",
+            peer_id,
+        )
+
+        assert (band_min, band_max, source) == (200, 300, "auto")
+
+    def test_effective_autoband_uses_manual_policy_as_fallback_when_auto_band_missing(
+        self, mock_database, mock_plugin
+    ):
+        peer_id = "02" + "d" * 64
+        policy_manager = MagicMock()
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id,
+            strategy=FeeStrategy.DYNAMIC,
+            fee_ppm_target=500,
+            fee_multiplier_min=1.0,
+            fee_multiplier_max=2.0,
+        )
+        fc, _ = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
         )
 
         band_min, band_max, source = fc._get_effective_dynamic_fee_autoband_ppm(
@@ -1704,7 +1729,7 @@ class TestAutoBandCalibration:
         assert auto_band.min_ppm >= cfg.min_fee_ppm
         assert auto_band.max_ppm <= cfg.max_fee_ppm
 
-    def test_manual_policy_band_clears_stale_auto_band(
+    def test_manual_policy_band_does_not_block_auto_band_calibration(
         self, mock_database, mock_plugin
     ):
         from modules.fee_controller import ThompsonAIMDState
@@ -1748,8 +1773,10 @@ class TestAutoBandCalibration:
             cfg,
         )
 
-        assert updated is False
-        assert fc._get_channel_auto_band("123x456x0") is None
+        auto_band = fc._get_channel_auto_band("123x456x0")
+        assert updated is True
+        assert auto_band is not None
+        assert auto_band.optimal_fee_ppm == 250
 
     def test_regime_change_reset_clears_auto_band(
         self, mock_database, mock_plugin
@@ -1892,6 +1919,51 @@ class TestAutoBandCalibration:
         assert result is not None
         assert result.new_fee_ppm == 1000
 
+    def test_adjust_channel_fee_prefers_auto_band_over_manual_peer_fallback(
+        self, mock_database, mock_plugin
+    ):
+        from modules.fee_controller import ThompsonAIMDState
+
+        peer_id = "02" + "5" * 64
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = False
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id,
+            strategy=FeeStrategy.DYNAMIC,
+            fee_ppm_target=500,
+            fee_multiplier_min=1.0,
+            fee_multiplier_max=2.0,
+        )
+        fc, cfg, channel_info = self._make_adjustment_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+        channel_info["peer_id"] = peer_id
+
+        ts_state = ThompsonAIMDState()
+        ts_state.thompson.observations = [
+            (200, 10.0, 1.0, int(time.time()), "normal")
+            for _ in range(cfg.auto_band_min_observations)
+        ]
+        ts_state.thompson.posterior_std = 10.0
+        ts_state.thompson.predict_optimal_fee = MagicMock(return_value=300)
+        ts_state.thompson.sample_fee = MagicMock(return_value=1000)
+        ts_state.size_buckets.composite_sample = MagicMock(side_effect=lambda fee, floor, ceiling: fee)
+        ts_state.pid.calculate_multiplier = MagicMock(return_value=1.0)
+        fc._thompson_aimd_states[channel_info["channel_id"]] = ts_state
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            peer_id,
+            {"state": "balanced", "forward_count": 50, "sats_out": 10000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.new_fee_ppm == 325
+
     def test_initial_fee_uses_effective_auto_band(
         self, mock_database, mock_plugin
     ):
@@ -1900,6 +1972,62 @@ class TestAutoBandCalibration:
         policy_manager.get_policy.return_value = PeerPolicy(
             peer_id=peer_id,
             strategy=FeeStrategy.DYNAMIC,
+        )
+        fc, _ = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+        fc.set_channel_fee = MagicMock(return_value={"success": True})
+        fc._set_channel_auto_band(
+            "123x456x0",
+            min_ppm=250,
+            max_ppm=325,
+            optimal_fee_ppm=300,
+            posterior_std=20.0,
+            observation_count=25,
+            sigma=2.0,
+            min_width_ppm=50,
+        )
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "state": "CHANNELD_NORMAL",
+                    "short_channel_id": "123x456x0",
+                    "channel_id": "123x456x0",
+                    "spendable_msat": 500_000_000,
+                    "receivable_msat": 500_000_000,
+                    "total_msat": 1_000_000_000,
+                    "updates": {
+                        "local": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 100,
+                        }
+                    },
+                    "htlc_minimum_msat": 0,
+                    "htlc_maximum_msat": 1_000_000_000,
+                    "opener": "local",
+                }
+            ]
+        }
+
+        with patch.object(fc, "_initialize_thompson_from_hive") as init_ts:
+            init_ts.return_value.sample_fee.return_value = 100
+            fc.set_initial_fee("123x456x0", peer_id)
+
+        assert fc.set_channel_fee.call_args[0][1] == 250
+
+    def test_initial_fee_prefers_auto_band_over_manual_peer_fallback(
+        self, mock_database, mock_plugin
+    ):
+        peer_id = "02" + "6" * 64
+        policy_manager = MagicMock()
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id,
+            strategy=FeeStrategy.DYNAMIC,
+            fee_ppm_target=500,
+            fee_multiplier_min=1.0,
+            fee_multiplier_max=2.0,
         )
         fc, _ = self._make_fc(
             mock_plugin,

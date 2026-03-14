@@ -8201,23 +8201,21 @@ class HillClimbingFeeController:
         peer_id: str,
         cfg: Optional[Config] = None,
     ) -> Tuple[Optional[int], Optional[int], str]:
-        """Resolve the active autoband with precedence manual > auto > none."""
+        """Resolve the active autoband with precedence auto > manual > none."""
         cfg_obj = cfg
         if cfg_obj is None:
             cfg_obj = self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
+
+        if getattr(cfg_obj, "auto_band_enabled", False):
+            auto_band = self._get_channel_auto_band(channel_id)
+            if auto_band is not None:
+                return (auto_band.min_ppm, auto_band.max_ppm, auto_band.source)
 
         band_min_ppm, band_max_ppm = self._get_dynamic_policy_fee_autoband_ppm(peer_id)
         if band_min_ppm is not None or band_max_ppm is not None:
             return (band_min_ppm, band_max_ppm, "manual")
 
-        if not getattr(cfg_obj, "auto_band_enabled", False):
-            return (None, None, "none")
-
-        auto_band = self._get_channel_auto_band(channel_id)
-        if auto_band is None:
-            return (None, None, "none")
-
-        return (auto_band.min_ppm, auto_band.max_ppm, auto_band.source)
+        return (None, None, "none")
 
     def _auto_calibrate_channel_fee_band(
         self,
@@ -8238,12 +8236,6 @@ class HillClimbingFeeController:
                 policy = None
 
         if policy and policy.strategy != FeeStrategy.DYNAMIC:
-            return False
-
-        if policy and (
-            policy.fee_multiplier_min is not None or policy.fee_multiplier_max is not None
-        ):
-            self._clear_channel_auto_band(channel_id)
             return False
 
         observation_count = len(getattr(ts_state.thompson, "observations", []))
