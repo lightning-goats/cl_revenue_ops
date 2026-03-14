@@ -3766,6 +3766,7 @@ class HillClimbingFeeController:
 
         # Preserve operator-advertised HTLC minimums while temporary defenses are active.
         self._dynamic_htlcmin_baselines: Dict[str, int] = {}
+        self._last_hive_egress_desaturation_bias: Dict[str, Dict[str, Any]] = {}
 
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
@@ -5212,6 +5213,131 @@ class HillClimbingFeeController:
             )
             return proposed_fee
 
+    def _clear_last_hive_egress_desaturation_bias(self, channel_id: str) -> None:
+        self._last_hive_egress_desaturation_bias.pop(channel_id, None)
+
+    def _set_last_hive_egress_desaturation_bias(self, channel_id: str, payload: Dict[str, Any]) -> None:
+        self._last_hive_egress_desaturation_bias[channel_id] = dict(payload)
+
+    def _get_last_hive_egress_desaturation_bias(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        payload = self._last_hive_egress_desaturation_bias.get(channel_id)
+        return dict(payload) if payload is not None else None
+
+    def _apply_hive_egress_desaturation_bias(
+        self,
+        channel_id: str,
+        peer_id: str,
+        proposed_fee_ppm: int,
+        effective_ceiling_ppm: int,
+        cfg: Optional["ConfigSnapshot"] = None,
+    ) -> int:
+        """
+        Add a bounded surcharge to dynamic non-hive exits that compete with a
+        locally saturated hive egress.
+
+        Hive-member channels themselves remain untouched at the hive fee.
+        """
+        self._clear_last_hive_egress_desaturation_bias(channel_id)
+
+        if cfg is None:
+            cfg = self.config.snapshot()
+        if not getattr(cfg, "enable_hive_egress_desaturation_bias", True):
+            return proposed_fee_ppm
+        if not self.hive_bridge:
+            return proposed_fee_ppm
+
+        if self.policy_manager:
+            try:
+                if self.policy_manager.is_hive_peer(peer_id):
+                    return proposed_fee_ppm
+            except Exception:
+                pass
+            try:
+                policy = self.policy_manager.get_policy(peer_id)
+            except Exception:
+                policy = None
+            if policy is not None and policy.strategy != FeeStrategy.DYNAMIC:
+                return proposed_fee_ppm
+
+        try:
+            bias = self.hive_bridge.query_hive_egress_desaturation_bias(
+                channel_id=channel_id,
+                peer_id=peer_id,
+            )
+        except Exception as e:
+            self.plugin.log(
+                f"HIVE_EGRESS_BIAS: Failed to query bias for {channel_id[:12]}...: {e}",
+                level="debug",
+            )
+            return proposed_fee_ppm
+
+        if not bias:
+            return proposed_fee_ppm
+        matched = bool(bias.get("matched"))
+        competes_with_hive_egress = bool(
+            bias.get("competes_with_hive_egress", matched)
+        )
+        if not matched or not competes_with_hive_egress:
+            return proposed_fee_ppm
+
+        saturated_local_pct = float(bias.get("saturated_local_pct", 0.0) or 0.0)
+        severity = bias.get("severity")
+        if severity is None:
+            if saturated_local_pct >= 97.0:
+                severity = "critical"
+            elif saturated_local_pct >= 94.0:
+                severity = "high"
+            else:
+                severity = "medium"
+
+        recommended_surcharge_ppm = max(0, int(bias.get("recommended_surcharge_ppm", 0) or 0))
+        if recommended_surcharge_ppm <= 0:
+            self._set_last_hive_egress_desaturation_bias(
+                channel_id,
+                {
+                    "matched": True,
+                    "applied": False,
+                    "recommended_surcharge_ppm": 0,
+                    "applied_surcharge_ppm": 0,
+                    "confidence": float(bias.get("confidence", 0.0) or 0.0),
+                    "severity": severity,
+                    "reason": bias.get("reason"),
+                    "saturated_hive_channel_id": bias.get("saturated_hive_channel_id"),
+                },
+            )
+            return proposed_fee_ppm
+
+        weight = float(getattr(cfg, "hive_egress_desaturation_bias_weight", 0.5) or 0.0)
+        weight = max(0.0, min(1.0, weight))
+        max_surcharge_ppm = max(0, int(getattr(cfg, "hive_egress_desaturation_bias_max_ppm", 100) or 0))
+        weighted_surcharge_ppm = int(round(recommended_surcharge_ppm * weight))
+        bounded_surcharge_ppm = min(max_surcharge_ppm, weighted_surcharge_ppm)
+        applied_surcharge_ppm = max(0, min(bounded_surcharge_ppm, effective_ceiling_ppm - proposed_fee_ppm))
+        adjusted_fee_ppm = proposed_fee_ppm + applied_surcharge_ppm
+
+        payload = {
+            "matched": True,
+            "applied": applied_surcharge_ppm > 0,
+            "recommended_surcharge_ppm": recommended_surcharge_ppm,
+            "applied_surcharge_ppm": applied_surcharge_ppm,
+            "confidence": float(bias.get("confidence", 0.0) or 0.0),
+            "severity": severity,
+            "reason": bias.get("reason"),
+            "saturated_hive_channel_id": bias.get("saturated_hive_channel_id"),
+        }
+        self._set_last_hive_egress_desaturation_bias(channel_id, payload)
+
+        if applied_surcharge_ppm > 0:
+            self.plugin.log(
+                f"HIVE_EGRESS_BIAS: {channel_id[:12]}... competing with saturated hive egress "
+                f"{(bias.get('saturated_hive_channel_id') or 'unknown')}; "
+                f"+{applied_surcharge_ppm} ppm (recommended={recommended_surcharge_ppm}, "
+                f"weight={weight:.2f}, severity={severity})",
+                level="info",
+            )
+
+        return adjusted_fee_ppm
+
     def _prune_stale_states(self, active_channel_ids: set) -> int:
         """
         Remove in-memory state for channels that no longer exist.
@@ -5916,6 +6042,7 @@ class HillClimbingFeeController:
                 )
             # Fee is correct, no adjustment needed
             return None
+        self._clear_last_hive_egress_desaturation_bias(channel_id)
 
         # Detect critical state (Phase 5.5)
         is_congested = (state and state.get("state") == "congested")
@@ -7356,6 +7483,17 @@ class HillClimbingFeeController:
                 if competition_adjusted != new_fee_ppm:
                     new_fee_ppm = max(floor_ppm, min(effective_ceiling, competition_adjusted))
 
+            if self.hive_bridge and not is_congested:
+                biased_fee = self._apply_hive_egress_desaturation_bias(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    proposed_fee_ppm=new_fee_ppm,
+                    effective_ceiling_ppm=effective_ceiling,
+                    cfg=cfg,
+                )
+                if biased_fee != new_fee_ppm:
+                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, biased_fee))
+
             # =====================================================================
             # Thompson+AIMD State Saving and Result Preparation
             # =====================================================================
@@ -7801,6 +7939,17 @@ class HillClimbingFeeController:
                 if competition_adjusted != new_fee_ppm:
                     # Re-clamp after competition adjustment
                     new_fee_ppm = max(floor_ppm, min(effective_ceiling, competition_adjusted))
+
+            if self.hive_bridge and not is_congested:
+                biased_fee = self._apply_hive_egress_desaturation_bias(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    proposed_fee_ppm=new_fee_ppm,
+                    effective_ceiling_ppm=effective_ceiling,
+                    cfg=cfg,
+                )
+                if biased_fee != new_fee_ppm:
+                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, biased_fee))
 
         # =====================================================================
         # DYNAMIC HTLC POLICY TARGETS

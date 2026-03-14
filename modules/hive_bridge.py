@@ -2675,6 +2675,7 @@ class HiveFeeIntelligenceBridge:
     _NNLB_CACHE_TTL = 120                # 2 minutes
     _CHANNEL_AGES_CACHE_TTL = 3600       # 1 hour - ages change slowly
     _GOSSIP_TARGETS_CACHE_TTL = 300      # 5 minutes
+    _HIVE_EGRESS_BIAS_CACHE_TTL = 60     # 1 minute - saturation state can change quickly
 
     def _get_from_cache(self, cache_key: str, ttl: float) -> Optional[Dict[str, Any]]:
         """Get data from integration cache if fresh."""
@@ -3227,6 +3228,58 @@ class HiveFeeIntelligenceBridge:
 
         except Exception as e:
             self._log(f"Failed to query channel ages (unexpected): {e}", level="debug")
+            return None
+
+    def query_hive_egress_desaturation_bias(
+        self,
+        channel_id: Optional[str] = None,
+        peer_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query cl-hive for a bounded surcharge on non-hive exits that compete
+        with a locally saturated hive egress.
+
+        Returns the raw bias payload from cl-hive or None when unavailable.
+        This is an optional read and always fails open.
+        """
+        cache_key = f"hive_egress_bias_{channel_id or 'none'}_{peer_id or 'none'}"
+        cached = self._get_from_cache(cache_key, self._HIVE_EGRESS_BIAS_CACHE_TTL)
+        if cached:
+            return cached
+
+        if self._is_circuit_open() or not self.is_available():
+            return None
+
+        try:
+            params: Dict[str, Any] = {}
+            if channel_id:
+                params["channel_id"] = channel_id
+            if peer_id:
+                params["peer_id"] = peer_id
+
+            ok, result, err = self._rpc_call_with_policy(
+                "hive-egress-desaturation-bias",
+                params,
+                policy_key="optional_read",
+                require_available=False,
+            )
+            if not ok or result is None:
+                if err:
+                    self._log(f"Failed to query hive egress desaturation bias: {err}", level="debug")
+                return None
+
+            if result.get("error"):
+                self._log(
+                    f"Hive egress desaturation bias query error: {result.get('error')}",
+                    level="debug",
+                )
+                return None
+
+            self._set_in_cache(cache_key, result)
+            return result
+
+        except Exception as e:
+            self._log(f"Failed to query hive egress desaturation bias (unexpected): {e}", level="debug")
             return None
 
     def get_single_channel_age(self, scid: str) -> Optional[Dict[str, Any]]:

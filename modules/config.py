@@ -169,6 +169,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hive_nnlb_auto_execute': bool,
     'hive_channel_ages_enabled': bool,
     'hive_channel_ages_cache_seconds': int,
+    'enable_hive_egress_desaturation_bias': bool,
+    'hive_egress_desaturation_bias_max_ppm': int,
+    'hive_egress_desaturation_bias_weight': float,
     # Fields present in CONFIG_FIELD_RANGES that need type registration
     'base_fee_msat': int,
     'flow_window_days': int,
@@ -262,6 +265,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hive_mcf_targets_cache_seconds': (60, 1800),      # 1 min to 30 min
     'hive_nnlb_min_amount': (10000, 10000000),         # 10k to 10M sats
     'hive_channel_ages_cache_seconds': (300, 86400),   # 5 min to 24 hours
+    'hive_egress_desaturation_bias_max_ppm': (0, 1000),
+    'hive_egress_desaturation_bias_weight': (0.0, 1.0),
     # Additional range validations
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
@@ -551,6 +556,9 @@ class Config:
     # Channel ages: Exploration/exploitation based on maturity
     hive_channel_ages_enabled: bool = True
     hive_channel_ages_cache_seconds: int = 3600     # 1 hour cache - ages change slowly
+    enable_hive_egress_desaturation_bias: bool = True
+    hive_egress_desaturation_bias_max_ppm: int = 100
+    hive_egress_desaturation_bias_weight: float = 0.5
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -964,6 +972,9 @@ class ConfigSnapshot:
     hive_nnlb_auto_execute: bool = False
     hive_channel_ages_enabled: bool = True
     hive_channel_ages_cache_seconds: int = 3600
+    enable_hive_egress_desaturation_bias: bool = True
+    hive_egress_desaturation_bias_max_ppm: int = 100
+    hive_egress_desaturation_bias_weight: float = 0.5
 
     # M-27: xpay/askrene parameters (were missing from snapshot)
     askrene_layer: str = 'xpay'

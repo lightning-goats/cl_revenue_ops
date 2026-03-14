@@ -727,5 +727,50 @@ class TestTrafficIntelligenceBridge:
         assert result is None
 
 
+class TestHiveEgressDesaturationBiasBridge:
+    """Tests for saturated hive-egress bias bridge methods."""
+
+    def test_query_hive_egress_desaturation_bias_success(self, mock_hive_bridge, mock_plugin):
+        """Bridge returns the bias payload when cl-hive provides one."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        mock_plugin.rpc.call.return_value = {
+            "matched": True,
+            "channel_id": "123x456x0",
+            "peer_id": "02" + "a" * 64,
+            "competes_with_hive_egress": True,
+            "saturated_hive_channel_id": "999x1x0",
+            "recommended_surcharge_ppm": 80,
+            "confidence": 0.9,
+            "reason": "Competes with critical saturated hive egress",
+        }
+
+        result = mock_hive_bridge.query_hive_egress_desaturation_bias(
+            channel_id="123x456x0",
+            peer_id="02" + "a" * 64,
+        )
+
+        assert result is not None
+        assert result["matched"] is True
+        assert result["recommended_surcharge_ppm"] == 80
+        mock_plugin.rpc.call.assert_called_once_with(
+            "hive-egress-desaturation-bias",
+            {"channel_id": "123x456x0", "peer_id": "02" + "a" * 64},
+        )
+
+    def test_query_hive_egress_desaturation_bias_fails_open(self, mock_hive_bridge, mock_plugin):
+        """Bridge degrades to None when the optional read fails."""
+        mock_hive_bridge._init_complete = True
+        mock_hive_bridge._hive_available = True
+        mock_plugin.rpc.call.side_effect = RuntimeError("bridge read failed")
+
+        result = mock_hive_bridge.query_hive_egress_desaturation_bias(
+            channel_id="123x456x0",
+            peer_id="02" + "a" * 64,
+        )
+
+        assert result is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

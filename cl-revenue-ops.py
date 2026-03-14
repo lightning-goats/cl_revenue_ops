@@ -668,6 +668,25 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-enable-hive-egress-desaturation-bias',
+    default='true',
+    description='Bias dynamic non-hive exits upward when they compete with a saturated local hive egress (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-hive-egress-desaturation-bias-max-ppm',
+    default='100',
+    description='Maximum surcharge applied from the hive egress desaturation bias (default: 100)',
+    opt_type='int'
+)
+
+plugin.add_option(
+    name='revenue-ops-hive-egress-desaturation-bias-weight',
+    default='0.5',
+    description='Blend weight applied to the hive-recommended egress surcharge, 0.0-1.0 (default: 0.5)'
+)
+
+plugin.add_option(
     name='revenue-ops-rebalance-min-profit',
     default='10',
     description='Minimum profit in sats to trigger rebalance (default: 10)'
@@ -1215,6 +1234,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         auto_band_sigma=_safe_float_opt('revenue-ops-auto-band-sigma', '2.0'),
         auto_band_min_width_ppm=_safe_int_opt('revenue-ops-auto-band-min-width-ppm', '50'),
         auto_band_recalibrate_interval=_safe_int_opt('revenue-ops-auto-band-recalibrate-interval', '10'),
+        enable_hive_egress_desaturation_bias=options.get('revenue-ops-enable-hive-egress-desaturation-bias', 'true').lower() == 'true',
+        hive_egress_desaturation_bias_max_ppm=_safe_int_opt('revenue-ops-hive-egress-desaturation-bias-max-ppm', '100'),
+        hive_egress_desaturation_bias_weight=_safe_float_opt('revenue-ops-hive-egress-desaturation-bias-weight', '0.5'),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
@@ -2771,6 +2793,9 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "auto_band_sigma": float(getattr(config, "auto_band_sigma", 2.0)) if config else 2.0,
             "auto_band_min_width_ppm": int(getattr(config, "auto_band_min_width_ppm", 50)) if config else 50,
             "auto_band_recalibrate_interval": int(getattr(config, "auto_band_recalibrate_interval", 10)) if config else 10,
+            "enable_hive_egress_desaturation_bias": bool(getattr(config, "enable_hive_egress_desaturation_bias", True)) if config else True,
+            "hive_egress_desaturation_bias_max_ppm": int(getattr(config, "hive_egress_desaturation_bias_max_ppm", 100)) if config else 100,
+            "hive_egress_desaturation_bias_weight": float(getattr(config, "hive_egress_desaturation_bias_weight", 0.5)) if config else 0.5,
         },
         "channels": [],
         "summary": {
@@ -2837,6 +2862,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         peer_id = chan_state.get("peer_id")
         effective_autoband = None
         auto_band = None
+        hive_egress_desaturation_bias = None
         if fee_controller is not None:
             if peer_id and hasattr(fee_controller, "_get_effective_dynamic_fee_autoband_ppm"):
                 band_min_ppm, band_max_ppm, band_source = fee_controller._get_effective_dynamic_fee_autoband_ppm(
@@ -2863,6 +2889,8 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
                         "last_calibrated": auto_band_state.last_calibrated,
                         "source": auto_band_state.source,
                     }
+            if hasattr(fee_controller, "_get_last_hive_egress_desaturation_bias"):
+                hive_egress_desaturation_bias = fee_controller._get_last_hive_egress_desaturation_bias(channel_id)
 
         result["channels"].append({
             "channel_id": channel_id[:12] + "..." if len(channel_id) > 12 else channel_id,
@@ -2876,6 +2904,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "flow_state": chan_state.get("state", "unknown"),
             "effective_autoband": effective_autoband,
             "auto_band": auto_band,
+            "hive_egress_desaturation_bias": hive_egress_desaturation_bias,
         })
         result["summary"]["total"] += 1
 

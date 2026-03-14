@@ -2233,6 +2233,298 @@ class TestAutoBandCalibration:
         assert fc.set_channel_fee.call_args[0][1] == 250
 
 
+class TestHiveEgressDesaturationBias:
+    """Tests for dynamic fee bias toward saturated hive egress."""
+
+    def _make_adjustment_fc(self, mock_plugin, mock_database, *, policy_manager=None, hive_bridge=None):
+        from modules.fee_controller import HillClimbingFeeController
+        from modules.config import Config
+
+        config = MagicMock(spec=Config)
+        fc = HillClimbingFeeController(
+            mock_plugin,
+            config,
+            mock_database,
+            policy_manager=policy_manager,
+            hive_bridge=hive_bridge,
+        )
+
+        cfg = MockConfigSnapshot(
+            hive_fee_ppm=0,
+            min_fee_ppm=10,
+            max_fee_ppm=5000,
+            fee_interval=1800,
+            enable_reputation=False,
+            enable_scarcity_pricing=False,
+            scarcity_threshold=0.30,
+            ema_smoothing_alpha=0.3,
+            inbound_fee_estimate_ppm=200,
+            thompson_prior_std_fee=200.0,
+            hive_min_confidence_for_prior=0.3,
+            routing_intelligence_enabled=False,
+            enable_dynamic_htlcmax=False,
+            enable_dynamic_htlcmin=False,
+            enable_vegas_reflex=False,
+            htlc_congestion_threshold=0.8,
+            auto_band_enabled=False,
+            enable_hive_egress_desaturation_bias=True,
+            hive_egress_desaturation_bias_max_ppm=100,
+            hive_egress_desaturation_bias_weight=0.5,
+        )
+        fc.config.snapshot.return_value = cfg
+
+        fc.ENABLE_THOMPSON_AIMD = True
+        fc.ENABLE_SIMPLIFIED_FEE_PATH = True
+        fc.ENABLE_HIVE_COORDINATION = False
+        fc.ENABLE_COMPETITION_AVOIDANCE = False
+        fc.ENABLE_HISTORICAL_CURVE = False
+        fc.ENABLE_ELASTICITY = False
+        fc._calculate_floor = MagicMock(return_value=cfg.min_fee_ppm)
+        fc._get_channel_age_days = MagicMock(return_value=120)
+        fc._get_fee_volatility = MagicMock(return_value=0.0)
+        fc._get_channel_failure_rate = MagicMock(return_value=0.0)
+        fc._apply_fee_anchor = MagicMock(side_effect=lambda cid, fee, floor, ceiling: (fee, None))
+        fc._get_competitor_adjusted_bounds = MagicMock(side_effect=lambda peer, floor, ceiling: (floor, ceiling))
+        fc._get_fleet_aware_fee_adjustment = MagicMock(side_effect=lambda peer, fee: fee)
+        fc.set_channel_fee = MagicMock(return_value={"success": True})
+
+        mock_database.get_channel_probe.return_value = None
+        mock_database.get_volume_since.return_value = 100_000
+        mock_database.get_weighted_volume_since.return_value = 100_000
+        mock_database.get_forward_count_since.return_value = 10
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_channel_state.return_value = {
+            "state": "balanced",
+            "kalman_flow_ratio": 0.5,
+            "kalman_velocity": 0.0,
+        }
+        mock_database.get_last_forward_time.return_value = int(time.time()) - 1800
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_channel_cost_history.return_value = []
+        mock_database.get_channel_rebalance_success_rate.return_value = None
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+        mock_database.get_recent_fee_changes.return_value = []
+        mock_database.record_fee_change = MagicMock()
+        mock_database.get_fee_strategy_state.return_value = {
+            "last_revenue_rate": 0.0,
+            "last_fee_ppm": 0,
+            "trend_direction": 1,
+            "step_ppm": 50,
+            "last_update": 0,
+            "consecutive_same_direction": 0,
+            "is_sleeping": 0,
+            "sleep_until": 0,
+            "stable_cycles": 0,
+            "forward_count_since_update": 0,
+            "last_volume_sats": 0,
+            "v2_state_json": None,
+        }
+        mock_database.update_fee_strategy_state = MagicMock()
+
+        channel_info = {
+            "channel_id": "123x456x0",
+            "peer_id": "02" + "a" * 64,
+            "capacity": 1_000_000,
+            "spendable_msat": "500000000msat",
+            "receivable_msat": "500000000msat",
+            "fee_base_msat": 0,
+            "fee_proportional_millionths": 100,
+            "opener": "local",
+        }
+        return fc, cfg, channel_info
+
+    def _install_ts_state(self, fc, channel_id: str, sample_fee: int):
+        from modules.fee_controller import ThompsonAIMDState
+
+        ts_state = ThompsonAIMDState()
+        ts_state.thompson.observations = [
+            (200, 10.0, 1.0, int(time.time()), "normal")
+            for _ in range(5)
+        ]
+        ts_state.thompson.sample_fee = MagicMock(return_value=sample_fee)
+        ts_state.size_buckets.composite_sample = MagicMock(side_effect=lambda fee, floor, ceiling: fee)
+        ts_state.pid.calculate_multiplier = MagicMock(return_value=1.0)
+        fc._thompson_aimd_states[channel_id] = ts_state
+
+    def test_adjust_channel_fee_applies_hive_egress_desaturation_bias(
+        self, mock_database, mock_plugin
+    ):
+        peer_id = "02" + "3" * 64
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = False
+        policy_manager.get_policy.return_value = PeerPolicy(peer_id=peer_id, strategy=FeeStrategy.DYNAMIC)
+        hive_bridge = MagicMock()
+        hive_bridge.query_hive_egress_desaturation_bias.return_value = {
+            "matched": True,
+            "competes_with_hive_egress": True,
+            "saturated_hive_channel_id": "999x1x0",
+            "recommended_surcharge_ppm": 80,
+            "confidence": 0.9,
+            "severity": "critical",
+            "reason": "Competes with critical saturated hive egress",
+        }
+        fc, cfg, channel_info = self._make_adjustment_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+            hive_bridge=hive_bridge,
+        )
+        channel_info["peer_id"] = peer_id
+        self._install_ts_state(fc, channel_info["channel_id"], sample_fee=200)
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            peer_id,
+            {"state": "balanced", "forward_count": 50, "sats_out": 10_000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.new_fee_ppm == 240
+        assert fc._get_last_hive_egress_desaturation_bias(channel_info["channel_id"]) == {
+            "matched": True,
+            "applied": True,
+            "recommended_surcharge_ppm": 80,
+            "applied_surcharge_ppm": 40,
+            "confidence": 0.9,
+            "severity": "critical",
+            "reason": "Competes with critical saturated hive egress",
+            "saturated_hive_channel_id": "999x1x0",
+        }
+
+    def test_adjust_channel_fee_clamps_hive_egress_desaturation_bias_to_ceiling(
+        self, mock_database, mock_plugin
+    ):
+        peer_id = "02" + "4" * 64
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = False
+        policy_manager.get_policy.return_value = PeerPolicy(peer_id=peer_id, strategy=FeeStrategy.DYNAMIC)
+        hive_bridge = MagicMock()
+        hive_bridge.query_hive_egress_desaturation_bias.return_value = {
+            "matched": True,
+            "competes_with_hive_egress": True,
+            "saturated_hive_channel_id": "999x1x0",
+            "recommended_surcharge_ppm": 80,
+            "confidence": 0.9,
+            "severity": "critical",
+            "reason": "Competes with critical saturated hive egress",
+        }
+        fc, cfg, channel_info = self._make_adjustment_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+            hive_bridge=hive_bridge,
+        )
+        cfg.max_fee_ppm = 225
+        channel_info["peer_id"] = peer_id
+        self._install_ts_state(fc, channel_info["channel_id"], sample_fee=200)
+
+        result = fc._adjust_channel_fee(
+            channel_info["channel_id"],
+            peer_id,
+            {"state": "balanced", "forward_count": 50, "sats_out": 10_000},
+            channel_info,
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.new_fee_ppm == 225
+        assert fc._get_last_hive_egress_desaturation_bias(channel_info["channel_id"])["applied_surcharge_ppm"] == 25
+
+    def test_apply_hive_egress_bias_accepts_live_cl_hive_payload_shape(
+        self, mock_database, mock_plugin
+    ):
+        peer_id = "02" + "7" * 64
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = False
+        policy_manager.get_policy.return_value = PeerPolicy(peer_id=peer_id, strategy=FeeStrategy.DYNAMIC)
+        hive_bridge = MagicMock()
+        hive_bridge.query_hive_egress_desaturation_bias.return_value = {
+            "matched": True,
+            "recommended_surcharge_ppm": 90,
+            "confidence": 0.86,
+            "reason": "competes_with_saturated_hive_egress",
+            "signal_source": "peer_topology",
+            "saturated_hive_channel_id": "999x1x0",
+            "saturated_local_pct": 98.0,
+        }
+        fc, cfg, _ = self._make_adjustment_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+            hive_bridge=hive_bridge,
+        )
+
+        adjusted = fc._apply_hive_egress_desaturation_bias(
+            channel_id="123x456x0",
+            peer_id=peer_id,
+            proposed_fee_ppm=200,
+            effective_ceiling_ppm=500,
+            cfg=cfg,
+        )
+
+        assert adjusted == 245
+        assert fc._get_last_hive_egress_desaturation_bias("123x456x0")["severity"] == "critical"
+
+    @pytest.mark.parametrize("strategy", [FeeStrategy.STATIC, FeeStrategy.PASSIVE])
+    def test_apply_hive_egress_bias_skips_non_dynamic_policies(
+        self, mock_database, mock_plugin, strategy
+    ):
+        peer_id = "02" + "5" * 64
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = False
+        if strategy == FeeStrategy.STATIC:
+            policy_manager.get_policy.return_value = PeerPolicy(
+                peer_id=peer_id,
+                strategy=strategy,
+                fee_ppm_target=500,
+            )
+        else:
+            policy_manager.get_policy.return_value = PeerPolicy(peer_id=peer_id, strategy=strategy)
+        hive_bridge = MagicMock()
+        fc, cfg, _ = self._make_adjustment_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+            hive_bridge=hive_bridge,
+        )
+
+        adjusted = fc._apply_hive_egress_desaturation_bias(
+            channel_id="123x456x0",
+            peer_id=peer_id,
+            proposed_fee_ppm=200,
+            effective_ceiling_ppm=500,
+            cfg=cfg,
+        )
+
+        assert adjusted == 200
+        hive_bridge.query_hive_egress_desaturation_bias.assert_not_called()
+
+    def test_apply_hive_egress_bias_skips_hive_peers(self, mock_database, mock_plugin):
+        peer_id = "02" + "6" * 64
+        policy_manager = MagicMock()
+        policy_manager.is_hive_peer.return_value = True
+        hive_bridge = MagicMock()
+        fc, cfg, _ = self._make_adjustment_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+            hive_bridge=hive_bridge,
+        )
+
+        adjusted = fc._apply_hive_egress_desaturation_bias(
+            channel_id="123x456x0",
+            peer_id=peer_id,
+            proposed_fee_ppm=200,
+            effective_ceiling_ppm=500,
+            cfg=cfg,
+        )
+
+        assert adjusted == 200
+        hive_bridge.query_hive_egress_desaturation_bias.assert_not_called()
+
+
 # =============================================================================
 # Success-Rate-Adjusted Cost Floor Tests (Change 9)
 # =============================================================================
