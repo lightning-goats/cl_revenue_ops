@@ -2524,6 +2524,68 @@ class TestHiveEgressDesaturationBias:
         assert adjusted == 200
         hive_bridge.query_hive_egress_desaturation_bias.assert_not_called()
 
+    def test_adjust_all_fees_clears_stale_hive_egress_bias_for_overlay_channels(
+        self, mock_database, mock_plugin
+    ):
+        peer_id = "02" + "8" * 64
+        policy_manager = MagicMock()
+        policy_manager.get_policy.return_value = PeerPolicy(peer_id=peer_id, strategy=FeeStrategy.DYNAMIC)
+        hive_bridge = MagicMock()
+        fc, cfg, _ = self._make_adjustment_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+            hive_bridge=hive_bridge,
+        )
+        fc.temporary_fee_overlay_active = MagicMock(return_value=True)
+        fc._set_last_hive_egress_desaturation_bias(
+            "123x456x0",
+            {
+                "matched": True,
+                "applied": True,
+                "recommended_surcharge_ppm": 80,
+                "applied_surcharge_ppm": 40,
+            },
+        )
+        mock_database.get_all_channel_states.return_value = [
+            {"channel_id": "123x456x0", "peer_id": peer_id, "state": "balanced", "forward_count": 3}
+        ]
+        fc._get_channels_info = MagicMock(return_value={
+            "123x456x0": {
+                "channel_id": "123x456x0",
+                "peer_id": peer_id,
+                "fee_proportional_millionths": 100,
+            }
+        })
+        mock_database.get_forward_count_since.return_value = 3
+
+        fc._adjust_all_fees_inner()
+
+        assert fc._get_last_hive_egress_desaturation_bias("123x456x0") is None
+
+    def test_prune_stale_states_clears_hive_egress_bias_cache(self, mock_database, mock_plugin):
+        fc, _, _ = self._make_adjustment_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=None,
+            hive_bridge=MagicMock(),
+        )
+        fc._set_last_hive_egress_desaturation_bias(
+            "stale-channel",
+            {
+                "matched": True,
+                "applied": True,
+                "recommended_surcharge_ppm": 80,
+                "applied_surcharge_ppm": 40,
+            },
+        )
+        mock_database.get_all_fee_strategy_states.return_value = []
+        mock_database.prune_expired_fee_anchors.return_value = 0
+
+        fc._prune_stale_states({"active-channel"})
+
+        assert fc._get_last_hive_egress_desaturation_bias("stale-channel") is None
+
 
 # =============================================================================
 # Success-Rate-Adjusted Cost Floor Tests (Change 9)

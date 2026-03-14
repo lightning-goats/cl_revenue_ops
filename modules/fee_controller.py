@@ -5365,6 +5365,14 @@ class HillClimbingFeeController:
             del self._thompson_aimd_states[key]
             pruned += 1
 
+        # Prune cached hive egress bias debug state for closed channels
+        stale_bias_keys = [
+            k for k in self._last_hive_egress_desaturation_bias.keys()
+            if k not in active_channel_ids
+        ]
+        for key in stale_bias_keys:
+            del self._last_hive_egress_desaturation_bias[key]
+
         # Also prune from database to prevent stale entries in debug output
         # Get all fee states from database and remove those for closed channels
         try:
@@ -5580,6 +5588,8 @@ class HillClimbingFeeController:
             
             if not channel_id or not peer_id:
                 continue
+
+            self._clear_last_hive_egress_desaturation_bias(channel_id)
 
             if self.temporary_fee_overlay_active is not None:
                 try:
