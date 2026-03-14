@@ -1726,6 +1726,44 @@ class TestAutoBandCalibration:
         assert auto_band is not None
         assert (auto_band.min_ppm, auto_band.max_ppm) == (175, 225)
 
+    def test_auto_band_calibration_uses_gaussian_thompson_posterior_optimum(
+        self, mock_database, mock_plugin
+    ):
+        from modules.fee_controller import ThompsonAIMDState
+
+        peer_id = "02" + "1" * 64
+        policy_manager = MagicMock()
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id,
+            strategy=FeeStrategy.DYNAMIC,
+        )
+        fc, cfg = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+
+        ts_state = ThompsonAIMDState()
+        ts_state.thompson.observations = [
+            (200, 10.0, 1.0, int(time.time()), "normal")
+            for _ in range(cfg.auto_band_min_observations)
+        ]
+        ts_state.thompson.posterior_mean = 300.0
+        ts_state.thompson.posterior_std = 10.0
+
+        updated = fc._auto_calibrate_channel_fee_band(
+            "123x456x0",
+            peer_id,
+            ts_state,
+            cfg,
+        )
+
+        auto_band = fc._get_channel_auto_band("123x456x0")
+        assert updated is True
+        assert auto_band is not None
+        assert auto_band.optimal_fee_ppm == 300
+        assert (auto_band.min_ppm, auto_band.max_ppm) == (275, 325)
+
     def test_auto_band_calibration_clamps_to_global_fee_bounds(
         self, mock_database, mock_plugin
     ):

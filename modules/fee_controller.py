@@ -1536,6 +1536,24 @@ class GaussianThompsonState:
         self.posterior_mean = float(self.prior_mean_fee)
         self.posterior_std = float(self.prior_std_fee)
 
+    def predict_optimal_fee(self, floor_ppm: int, ceiling_ppm: int) -> Optional[int]:
+        """
+        Return the current posterior optimum, clamped to caller bounds.
+
+        Auto-band calibration needs a deterministic best-fee estimate rather than
+        a Thompson sample. The Gaussian state already maintains that estimate in
+        posterior_mean, so expose it through the same accessor shape used by the
+        controller.
+        """
+        if len(self.observations) < self.MIN_OBSERVATIONS:
+            return None
+
+        optimal_fee = self.posterior_mean
+        if optimal_fee is None or not math.isfinite(optimal_fee):
+            return None
+
+        return int(max(floor_ppm, min(ceiling_ppm, round(optimal_fee))))
+
     def set_context_modulation(
         self,
         pheromone_level: float = 0.0,
