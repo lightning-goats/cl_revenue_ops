@@ -24,7 +24,7 @@ Sling (required rebalance engine)
 Core Lightning
 ```
 
-With `cl-hive`, the same local executor gets better priors: coordinated corridor hints, peer quality, competition signals, and saturated-hive egress bias. Without `cl-hive`, decisions stay local.
+With `cl-hive`, the same local executor gets better fleet signals: coordinated corridor hints, peer quality, competition signals, and saturated-hive egress bias. Without `cl-hive`, decisions stay local.
 
 ## Install
 
@@ -102,5 +102,4 @@ Those inputs adjust local decisions, but local execution still happens here.
 
 - Minimal config example: [config/cl-revenue-ops.conf.minimal](config/cl-revenue-ops.conf.minimal)
 - Full config example: [config/cl-revenue-ops.conf.full](config/cl-revenue-ops.conf.full)
-- Executor purpose and operator surface: [docs/plans/2026-03-06-autonomous-executor-purpose.md](docs/plans/2026-03-06-autonomous-executor-purpose.md)
 - Roadmap: [docs/planning/ROADMAP.md](docs/planning/ROADMAP.md)
