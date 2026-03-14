@@ -1587,6 +1587,41 @@ class TestAutoBandCalibration:
 
         assert (band_min, band_max, source) == (500, 1000, "manual")
 
+    def test_effective_autoband_mixes_auto_and_manual_fallback_per_channel(
+        self, mock_database, mock_plugin
+    ):
+        peer_id = "02" + "7" * 64
+        policy_manager = MagicMock()
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id,
+            strategy=FeeStrategy.DYNAMIC,
+            fee_ppm_target=500,
+            fee_multiplier_min=1.0,
+            fee_multiplier_max=2.0,
+        )
+        fc, _ = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+
+        fc._set_channel_auto_band(
+            "123x456x0",
+            min_ppm=200,
+            max_ppm=300,
+            optimal_fee_ppm=250,
+            posterior_std=25.0,
+            observation_count=25,
+            sigma=2.0,
+            min_width_ppm=50,
+        )
+
+        learned = fc._get_effective_dynamic_fee_autoband_ppm("123x456x0", peer_id)
+        fallback = fc._get_effective_dynamic_fee_autoband_ppm("123x456x1", peer_id)
+
+        assert learned == (200, 300, "auto")
+        assert fallback == (500, 1000, "manual")
+
     def test_effective_autoband_uses_auto_band_when_manual_missing(
         self, mock_database, mock_plugin
     ):
@@ -1777,6 +1812,92 @@ class TestAutoBandCalibration:
         assert updated is True
         assert auto_band is not None
         assert auto_band.optimal_fee_ppm == 250
+
+    def test_policy_change_to_static_clears_auto_bands_for_peer_channels(
+        self, mock_database, mock_plugin
+    ):
+        peer_id = "02" + "8" * 64
+        policy_manager = MagicMock()
+        fc, _ = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+
+        fc._set_channel_auto_band(
+            "123x456x0",
+            min_ppm=200,
+            max_ppm=300,
+            optimal_fee_ppm=250,
+            posterior_std=25.0,
+            observation_count=25,
+            sigma=2.0,
+            min_width_ppm=50,
+        )
+        fc._set_channel_auto_band(
+            "123x456x1",
+            min_ppm=210,
+            max_ppm=310,
+            optimal_fee_ppm=260,
+            posterior_std=20.0,
+            observation_count=25,
+            sigma=2.0,
+            min_width_ppm=50,
+        )
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"short_channel_id": "123x456x0", "channel_id": "123x456x0"},
+                {"short_channel_id": "123x456x1", "channel_id": "123x456x1"},
+            ]
+        }
+
+        fc._handle_policy_change(
+            peer_id,
+            PeerPolicy(peer_id=peer_id, strategy=FeeStrategy.STATIC, fee_ppm_target=500),
+        )
+
+        assert fc._get_channel_auto_band("123x456x0") is None
+        assert fc._get_channel_auto_band("123x456x1") is None
+
+    def test_policy_change_to_manual_fallback_clears_stale_auto_bands(
+        self, mock_database, mock_plugin
+    ):
+        peer_id = "02" + "0" * 64
+        policy_manager = MagicMock()
+        fc, _ = self._make_fc(
+            mock_plugin,
+            mock_database,
+            policy_manager=policy_manager,
+        )
+
+        fc._set_channel_auto_band(
+            "123x456x0",
+            min_ppm=200,
+            max_ppm=300,
+            optimal_fee_ppm=250,
+            posterior_std=25.0,
+            observation_count=25,
+            sigma=2.0,
+            min_width_ppm=50,
+        )
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"short_channel_id": "123x456x0", "channel_id": "123x456x0"},
+            ]
+        }
+
+        fc._handle_policy_change(
+            peer_id,
+            PeerPolicy(
+                peer_id=peer_id,
+                strategy=FeeStrategy.DYNAMIC,
+                fee_ppm_target=500,
+                fee_multiplier_min=1.0,
+                fee_multiplier_max=2.0,
+            ),
+        )
+
+        assert fc._get_channel_auto_band("123x456x0") is None
 
     def test_regime_change_reset_clears_auto_band(
         self, mock_database, mock_plugin

@@ -34,6 +34,7 @@ Modify only effective band resolution and operator/debug visibility. Do not chan
 - The manual peer band remains in policy storage and continues to act as fallback for other channels to the same peer.
 - If auto bands are disabled, manual peer bands continue to behave as before.
 - Initial fee setting for a newly normal channel also uses the same effective precedence.
+- If a peer leaves `dynamic` mode or an operator explicitly sets a new manual fallback band, persisted auto bands for that peer are cleared so stale learned state does not unexpectedly retake control later.
 
 ## Risks
 

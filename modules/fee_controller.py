@@ -68,7 +68,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .hive_bridge import CoordinationInputs
-from .policy_manager import PolicyManager, FeeStrategy
+from .policy_manager import PolicyManager, FeeStrategy, PeerPolicy
 from .utils import parse_msat
 
 if TYPE_CHECKING:
@@ -3729,6 +3729,11 @@ class HillClimbingFeeController:
         self.profitability = profitability_analyzer
         self.hive_bridge = hive_bridge
         self.temporary_fee_overlay_active = temporary_fee_overlay_active
+        if self.policy_manager and hasattr(self.policy_manager, "register_on_change"):
+            try:
+                self.policy_manager.register_on_change(self._handle_policy_change)
+            except Exception as e:
+                self.plugin.log(f"POLICY_CHANGE: Failed to register callback: {e}", level='debug')
 
         # In-memory cache of Hill Climbing states (also persisted to DB)
         # Note: This cache is used for both legacy HillClimbState and new ThompsonAIMDState
@@ -8148,6 +8153,50 @@ class HillClimbingFeeController:
             band_min_ppm, band_max_ppm = band_max_ppm, band_min_ppm
 
         return (band_min_ppm, band_max_ppm)
+
+    def _handle_policy_change(self, peer_id: str, policy: PeerPolicy) -> None:
+        """Invalidate stale auto-band state when policy changes supersede learning."""
+        if not peer_id or policy is None:
+            return
+
+        invalidate_auto_band = (
+            policy.strategy != FeeStrategy.DYNAMIC
+            or policy.fee_multiplier_min is not None
+            or policy.fee_multiplier_max is not None
+        )
+        if not invalidate_auto_band:
+            return
+
+        try:
+            result = self.plugin.rpc.listpeerchannels(peer_id)
+        except Exception as e:
+            self.plugin.log(
+                f"POLICY_CHANGE: Failed to list channels for {peer_id[:12]}...: {e}",
+                level='debug'
+            )
+            return
+
+        cleared = 0
+        seen_channel_ids = set()
+        for channel in result.get("channels", []):
+            for channel_key in ("short_channel_id", "channel_id"):
+                channel_id = channel.get(channel_key)
+                if not channel_id:
+                    continue
+                normalized_channel_id = str(channel_id).replace(":", "x")
+                if normalized_channel_id in seen_channel_ids:
+                    continue
+                seen_channel_ids.add(normalized_channel_id)
+                if self._get_channel_auto_band(normalized_channel_id) is None:
+                    continue
+                self._clear_channel_auto_band(normalized_channel_id)
+                cleared += 1
+
+        if cleared:
+            self.plugin.log(
+                f"POLICY_CHANGE: Cleared {cleared} auto band(s) for {peer_id[:12]}...",
+                level='info'
+            )
 
     def _get_channel_auto_band(self, channel_id: str) -> Optional[AutoFeeBandState]:
         """Return persisted per-channel automatic autoband metadata, if any."""
