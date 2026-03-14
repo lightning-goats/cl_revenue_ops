@@ -2886,6 +2886,48 @@ class PIDState:
         return state
 
 
+@dataclass
+class AutoFeeBandState:
+    """Persisted posterior-derived dynamic fee autoband for a channel."""
+
+    min_ppm: int
+    max_ppm: int
+    optimal_fee_ppm: int
+    posterior_std: float
+    observation_count: int
+    sigma: float
+    min_width_ppm: int
+    last_calibrated: int
+    source: str = "auto"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "min_ppm": self.min_ppm,
+            "max_ppm": self.max_ppm,
+            "optimal_fee_ppm": self.optimal_fee_ppm,
+            "posterior_std": self.posterior_std,
+            "observation_count": self.observation_count,
+            "sigma": self.sigma,
+            "min_width_ppm": self.min_width_ppm,
+            "last_calibrated": self.last_calibrated,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AutoFeeBandState":
+        return cls(
+            min_ppm=int(d.get("min_ppm", 0)),
+            max_ppm=int(d.get("max_ppm", 0)),
+            optimal_fee_ppm=int(d.get("optimal_fee_ppm", 0)),
+            posterior_std=float(d.get("posterior_std", 0.0)),
+            observation_count=int(d.get("observation_count", 0)),
+            sigma=float(d.get("sigma", 2.0)),
+            min_width_ppm=int(d.get("min_width_ppm", 0)),
+            last_calibrated=int(d.get("last_calibrated", 0)),
+            source=str(d.get("source", "auto")),
+        )
+
+
 # =============================================================================
 # IMPROVEMENT #8: Combined Thompson+AIMD State
 # =============================================================================
@@ -2962,6 +3004,9 @@ class ThompsonAIMDState:
     # Restore target for temporary dynamic HTLC minimum defenses
     dynamic_htlcmin_baseline_msat: Optional[int] = None
 
+    # Posterior-derived dynamic fee autoband
+    auto_band_data: Optional[Dict[str, Any]] = None
+
     def get_historical_curve(self) -> HistoricalResponseCurve:
         """Deserialize historical curve from dict."""
         if self.historical_curve_data:
@@ -2981,6 +3026,16 @@ class ThompsonAIMDState:
     def set_elasticity_tracker(self, tracker: ElasticityTracker) -> None:
         """Serialize elasticity tracker to dict."""
         self.elasticity_data = tracker.to_dict()
+
+    def get_auto_band(self) -> Optional["AutoFeeBandState"]:
+        """Deserialize persisted auto-band metadata."""
+        if not self.auto_band_data:
+            return None
+        return AutoFeeBandState.from_dict(self.auto_band_data)
+
+    def set_auto_band(self, auto_band: Optional["AutoFeeBandState"]) -> None:
+        """Serialize auto-band metadata into v2 state."""
+        self.auto_band_data = auto_band.to_dict() if auto_band is not None else None
 
     def update_ema_revenue_rate(self, current_rate: float, alpha: float = 0.3) -> float:
         """
@@ -3026,6 +3081,7 @@ class ThompsonAIMDState:
             "pid_state": self.pid.to_dict(),
             "size_buckets": self.size_buckets.to_dict(),
             "dynamic_htlcmin_baseline_msat": self.dynamic_htlcmin_baseline_msat,
+            "auto_band": self.auto_band_data,
         }
 
     @classmethod
@@ -3098,6 +3154,7 @@ class ThompsonAIMDState:
         size_buckets_data = d.get("size_buckets", {})
         state.size_buckets = SizeBucketState.from_dict(size_buckets_data) if size_buckets_data else SizeBucketState()
         state.dynamic_htlcmin_baseline_msat = d.get("dynamic_htlcmin_baseline_msat")
+        state.auto_band_data = d.get("auto_band")
 
         # Load legacy fields from main table if provided
         if legacy_state:
@@ -4305,6 +4362,25 @@ class HillClimbingFeeController:
             v2_state_json=v2_json_str,
             last_update=state.last_update
         )
+
+    def _get_or_create_thompson_aimd_state_for_channel(self, channel_id: str) -> ThompsonAIMDState:
+        """Return cached Thompson+AIMD state or a minimal persisted state shell."""
+        import json
+
+        cached_state = self._thompson_aimd_states.get(channel_id)
+        if cached_state is not None:
+            return cached_state
+
+        db_state = self.database.get_fee_strategy_state(channel_id) if self.database else {}
+        v2_json_str = db_state.get("v2_state_json", "{}") if db_state else "{}"
+        try:
+            v2_data = json.loads(v2_json_str) if v2_json_str else {}
+        except json.JSONDecodeError:
+            v2_data = {}
+
+        state = ThompsonAIMDState.from_v2_dict(v2_data, db_state or {})
+        self._thompson_aimd_states[channel_id] = state
+        return state
 
     def _get_balance_based_floor(self, local_balance_pct: float, global_min: int) -> int:
         """
@@ -8034,6 +8110,136 @@ class HillClimbingFeeController:
             band_min_ppm, band_max_ppm = band_max_ppm, band_min_ppm
 
         return (band_min_ppm, band_max_ppm)
+
+    def _get_channel_auto_band(self, channel_id: str) -> Optional[AutoFeeBandState]:
+        """Return persisted per-channel automatic autoband metadata, if any."""
+        if not channel_id:
+            return None
+        state = self._get_or_create_thompson_aimd_state_for_channel(channel_id)
+        return state.get_auto_band()
+
+    def _set_channel_auto_band(
+        self,
+        channel_id: str,
+        *,
+        min_ppm: int,
+        max_ppm: int,
+        optimal_fee_ppm: int,
+        posterior_std: float,
+        observation_count: int,
+        sigma: float,
+        min_width_ppm: int,
+        last_calibrated: Optional[int] = None,
+    ) -> AutoFeeBandState:
+        """Persist a per-channel automatic autoband in Thompson state."""
+        state = self._get_or_create_thompson_aimd_state_for_channel(channel_id)
+        auto_band = AutoFeeBandState(
+            min_ppm=int(min_ppm),
+            max_ppm=int(max_ppm),
+            optimal_fee_ppm=int(optimal_fee_ppm),
+            posterior_std=float(posterior_std),
+            observation_count=int(observation_count),
+            sigma=float(sigma),
+            min_width_ppm=int(min_width_ppm),
+            last_calibrated=int(last_calibrated or time.time()),
+        )
+        state.set_auto_band(auto_band)
+        self._save_thompson_aimd_state(channel_id, state)
+        return auto_band
+
+    def _clear_channel_auto_band(self, channel_id: str) -> None:
+        """Remove persisted per-channel automatic autoband metadata."""
+        if not channel_id:
+            return
+        state = self._get_or_create_thompson_aimd_state_for_channel(channel_id)
+        if state.get_auto_band() is None:
+            return
+        state.set_auto_band(None)
+        self._save_thompson_aimd_state(channel_id, state)
+
+    def _get_effective_dynamic_fee_autoband_ppm(
+        self,
+        channel_id: str,
+        peer_id: str,
+    ) -> Tuple[Optional[int], Optional[int], str]:
+        """Resolve the active autoband with precedence manual > auto > none."""
+        band_min_ppm, band_max_ppm = self._get_dynamic_policy_fee_autoband_ppm(peer_id)
+        if band_min_ppm is not None or band_max_ppm is not None:
+            return (band_min_ppm, band_max_ppm, "manual")
+
+        auto_band = self._get_channel_auto_band(channel_id)
+        if auto_band is None:
+            return (None, None, "none")
+
+        return (auto_band.min_ppm, auto_band.max_ppm, auto_band.source)
+
+    def _auto_calibrate_channel_fee_band(
+        self,
+        channel_id: str,
+        peer_id: str,
+        ts_state: ThompsonAIMDState,
+        cfg: Config,
+    ) -> bool:
+        """Compute and persist an automatic autoband from posterior uncertainty."""
+        if not getattr(cfg, "auto_band_enabled", False):
+            return False
+
+        policy = None
+        if self.policy_manager:
+            try:
+                policy = self.policy_manager.get_policy(peer_id)
+            except Exception:
+                policy = None
+
+        if policy and policy.strategy != FeeStrategy.DYNAMIC:
+            return False
+
+        if policy and (
+            policy.fee_multiplier_min is not None or policy.fee_multiplier_max is not None
+        ):
+            return False
+
+        observation_count = len(getattr(ts_state.thompson, "observations", []))
+        min_observations = int(getattr(cfg, "auto_band_min_observations", 20))
+        if observation_count < min_observations:
+            return False
+
+        optimal_fee = ts_state.thompson.predict_optimal_fee(
+            int(getattr(cfg, "min_fee_ppm", 1)),
+            int(getattr(cfg, "max_fee_ppm", 5000)),
+        )
+        if optimal_fee is None:
+            return False
+
+        sigma = float(getattr(cfg, "auto_band_sigma", 2.0))
+        min_width_ppm = int(getattr(cfg, "auto_band_min_width_ppm", 50))
+        posterior_std = float(getattr(ts_state.thompson, "posterior_std", 0.0))
+        half_width = int(round(max(0.0, sigma * posterior_std)))
+
+        min_fee_ppm = int(getattr(cfg, "min_fee_ppm", 1))
+        max_fee_ppm = int(getattr(cfg, "max_fee_ppm", 5000))
+        band_min_ppm = max(min_fee_ppm, int(round(optimal_fee - half_width)))
+        band_max_ppm = min(max_fee_ppm, int(round(optimal_fee + half_width)))
+
+        if band_max_ppm - band_min_ppm < min_width_ppm:
+            half_min_width = min_width_ppm / 2.0
+            band_min_ppm = max(min_fee_ppm, int(math.floor(optimal_fee - half_min_width)))
+            band_max_ppm = min(max_fee_ppm, int(math.ceil(optimal_fee + half_min_width)))
+
+        if band_min_ppm > band_max_ppm:
+            band_min_ppm, band_max_ppm = band_max_ppm, band_min_ppm
+
+        self._set_channel_auto_band(
+            channel_id,
+            min_ppm=band_min_ppm,
+            max_ppm=band_max_ppm,
+            optimal_fee_ppm=int(optimal_fee),
+            posterior_std=posterior_std,
+            observation_count=observation_count,
+            sigma=sigma,
+            min_width_ppm=min_width_ppm,
+        )
+        return True
 
     def _get_dynamic_htlcmin_baseline_msat(self, channel_id: str) -> Optional[int]:
         """Return the persisted operator baseline for temporary htlcmin defenses."""
