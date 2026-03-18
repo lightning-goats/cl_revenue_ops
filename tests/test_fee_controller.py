@@ -825,14 +825,14 @@ class TestCalculateFloorOpener:
 class TestLastDecisionSummary:
     def test_adjust_all_fees_records_hold_reason_when_no_channel_state_data(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import PIDFeeController
+        from modules.fee_controller import FeeController
 
         cfg = Config()
         mock_database.prune_expired_fee_anchors.return_value = None
         mock_database.get_all_fee_anchors.return_value = []
         mock_database.get_all_channel_states.return_value = []
 
-        fc = PIDFeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database)
 
         adjustments = fc.adjust_all_fees()
         summary = fc.get_last_decision_summary()
@@ -845,7 +845,7 @@ class TestLastDecisionSummary:
 
     def test_adjust_all_fees_skips_channels_with_temporary_overlay(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import PIDFeeController
+        from modules.fee_controller import FeeController
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -856,7 +856,7 @@ class TestLastDecisionSummary:
             {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced"}
         ]
 
-        fc = PIDFeeController(
+        fc = FeeController(
             mock_plugin,
             cfg,
             mock_database,

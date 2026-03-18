@@ -66,7 +66,7 @@ def _setchannel_kwargs(mock_plugin):
 class TestChannelInfoShaping:
     def test_get_channels_info_preserves_htlc_minimum_and_maximum_msat(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import HillClimbingFeeController
+        from modules.fee_controller import FeeController
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -82,7 +82,7 @@ class TestChannelInfoShaping:
             htlc_maximum_msat=advertised_htlc_maximum_msat,
         )
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database)
         channel_info = fc._get_channels_info()[channel_id]
 
         assert channel_info["htlc_minimum_msat"] == 42_000
@@ -94,7 +94,7 @@ class TestChannelInfoShaping:
 class TestSetChannelFeeLimits:
     def test_set_channel_fee_enforces_limits_by_default(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import HillClimbingFeeController
+        from modules.fee_controller import FeeController
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -108,7 +108,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database)
 
         fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=True)
 
@@ -120,7 +120,7 @@ class TestSetChannelFeeLimits:
 
     def test_set_channel_fee_can_bypass_limits_for_force(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import HillClimbingFeeController
+        from modules.fee_controller import FeeController
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -133,7 +133,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database)
 
         fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=False)
 
@@ -142,7 +142,7 @@ class TestSetChannelFeeLimits:
 class TestSetChannelFeeHtlcMin:
     def _make_controller(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import HillClimbingFeeController
+        from modules.fee_controller import FeeController
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -154,7 +154,7 @@ class TestSetChannelFeeHtlcMin:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        return HillClimbingFeeController(mock_plugin, cfg, mock_database)
+        return FeeController(mock_plugin, cfg, mock_database)
 
     def test_set_channel_fee_omits_htlcmin_when_not_requested(self, mock_plugin, mock_database):
         fc = self._make_controller(mock_plugin, mock_database)
@@ -173,16 +173,16 @@ class TestSetChannelFeeHtlcMin:
 
 class TestDynamicHtlcMinPersistence:
     def test_thompson_state_roundtrip_preserves_dynamic_htlcmin_baseline(self):
-        from modules.fee_controller import ThompsonAIMDState
+        from modules.fee_controller import ChannelFeeState
 
-        state = ThompsonAIMDState()
+        state = ChannelFeeState()
         state.dynamic_htlcmin_baseline_msat = 42_000
 
         v2_data = state.to_v2_dict()
 
         assert v2_data["dynamic_htlcmin_baseline_msat"] == 42_000
 
-        roundtrip = ThompsonAIMDState.from_v2_dict(v2_data, {"v2_state_json": "{}"})
+        roundtrip = ChannelFeeState.from_v2_dict(v2_data, {"v2_state_json": "{}"})
 
         assert roundtrip.dynamic_htlcmin_baseline_msat == 42_000
 
@@ -190,7 +190,7 @@ class TestDynamicHtlcMinPersistence:
 class TestGossipRefreshExecution:
     def test_gossip_refresh_executes_setchannel_and_returns_fee_adjustment(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import HillClimbingFeeController, HillClimbState, FeeReasonCode
+        from modules.fee_controller import FeeController, HillClimbState, FeeReasonCode
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -210,7 +210,7 @@ class TestGossipRefreshExecution:
         mock_database.record_fee_change = MagicMock()
         mock_database.get_last_forward_time.return_value = int(time.time()) - 86400 * 2
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database)
 
         # Provide a real-ish state and ensure the fee change will be applied.
         st = HillClimbState(
@@ -237,7 +237,7 @@ class TestGossipRefreshExecution:
 class TestZeroFeeProbeEndToEnd:
     def test_zero_fee_probe_sets_fee_to_zero_bypassing_min_fee(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import HillClimbingFeeController, FeeReasonCode
+        from modules.fee_controller import FeeController, FeeReasonCode
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -270,14 +270,7 @@ class TestZeroFeeProbeEndToEnd:
         mock_database.get_channel_cost_history.return_value = []
         mock_database.get_historical_inbound_fee_ppm.return_value = None
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
-        # Keep the test focused on probe behavior (avoid Thompson path complexity).
-        fc.ENABLE_THOMPSON_AIMD = False
-        fc.ENABLE_DYNAMIC_WINDOWS = False
-        fc.ENABLE_SATURATION_FLOOR = False
-        fc.ENABLE_BALANCE_FLOOR = False
-        fc.ENABLE_REBALANCE_FLOOR = False
-        fc.ENABLE_FLOW_CEILING = False
+        fc = FeeController(mock_plugin, cfg, mock_database)
 
         channel_info = {
             "channel_id": channel_id,
@@ -299,7 +292,7 @@ class TestZeroFeeProbeEndToEnd:
 
     def test_zero_fee_probe_success_exits_to_floor_and_clears_probe(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import HillClimbingFeeController, FeeReasonCode
+        from modules.fee_controller import FeeController, FeeReasonCode
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -332,13 +325,7 @@ class TestZeroFeeProbeEndToEnd:
         mock_database.get_channel_cost_history.return_value = []
         mock_database.get_historical_inbound_fee_ppm.return_value = None
 
-        fc = HillClimbingFeeController(mock_plugin, cfg, mock_database)
-        fc.ENABLE_THOMPSON_AIMD = False
-        fc.ENABLE_DYNAMIC_WINDOWS = False
-        fc.ENABLE_SATURATION_FLOOR = False
-        fc.ENABLE_BALANCE_FLOOR = False
-        fc.ENABLE_REBALANCE_FLOOR = False
-        fc.ENABLE_FLOW_CEILING = False
+        fc = FeeController(mock_plugin, cfg, mock_database)
 
         channel_info = {
             "channel_id": channel_id,
@@ -366,14 +353,14 @@ class TestSetInitialFee:
 
     def _make_controller(self, mock_plugin, mock_database, policy_manager=None):
         from modules.config import Config
-        from modules.fee_controller import HillClimbingFeeController
+        from modules.fee_controller import FeeController
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
 
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = HillClimbingFeeController(
+        fc = FeeController(
             mock_plugin, cfg, mock_database, policy_manager
         )
         return fc

@@ -1,4 +1,4 @@
-# cl-revenue-ops v2.1 Production Config
+# cl-revenue-ops Production Config
 # Copy to ~/.lightning/config or include via: include /path/to/cl-revenue-ops.conf
 
 # Core settings
@@ -9,12 +9,8 @@ revenue-ops-min-fee-ppm=100
 revenue-ops-max-fee-ppm=2500
 revenue-ops-fee-interval=3600
 
-# V2.0 features
-revenue-ops-scarcity-pricing=true
-revenue-ops-scarcity-threshold=0.15
+# Fee defense
 revenue-ops-vegas-reflex=true
-revenue-ops-enable-dynamic-htlcmin=false
-revenue-ops-enable-realtime-surge-defense=false
 
 # Rebalancing
 revenue-ops-rebalance-min-profit=50
@@ -30,7 +26,3 @@ revenue-ops-enable-reputation=true
 
 # Hot-channel protection
 revenue-ops-hot-channel-protection-enabled=true
-
-# Gossip keepalives
-revenue-ops-enable-gossip-keepalives=false
-revenue-ops-target-gossip-peers=5

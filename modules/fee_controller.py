@@ -1180,7 +1180,7 @@ class ChannelFeeState:
     last_volume_sats: int = 0
 
     # Algorithm tracking
-    algorithm_version: str = "thompson_aimd_v1"
+    algorithm_version: str = "dts_pid_v1"
 
     # Gossip refresh tracking
     last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
@@ -1249,8 +1249,11 @@ class ChannelFeeState:
         """
         state = cls()
 
-        # Check if this is new format or needs migration
-        if d.get("algorithm_version") == "thompson_aimd_v1":
+        # Check if this is a known format or needs migration.
+        # Accept both legacy "thompson_aimd_v1" and current "dts_pid_v1" for
+        # backward compatibility with databases written before the rename.
+        known_versions = {"thompson_aimd_v1", "dts_pid_v1"}
+        if d.get("algorithm_version") in known_versions:
             state.thompson = GaussianThompsonState.from_dict(
                 d.get("thompson_state", {})
             )
@@ -1577,8 +1580,11 @@ class FeeController:
             except Exception as e:
                 self.plugin.log(f"POLICY_CHANGE: Failed to register callback: {e}", level='debug')
 
-        # In-memory cache of Hill Climbing states (also persisted to DB)
-        # Legacy HillClimbState cache (kept for observation timer compatibility)
+        # HillClimbState cache: still actively used for observation timers,
+        # sleep/wake cycles, broadcast fee tracking, trend direction, and
+        # dynamic HTLC minimum baselines.  A future Phase 3 refactor may
+        # extract these into a dedicated ChannelCycleState, but for now
+        # HillClimbState remains the canonical per-channel cycle tracker.
         self._hill_climb_states: Dict[str, HillClimbState] = {}
 
         # Per-channel fee state cache
@@ -1756,8 +1762,10 @@ class FeeController:
         except json.JSONDecodeError:
             v2_data = {}
 
-        # Check if this is current format or needs migration
-        if v2_data.get("algorithm_version") == "thompson_aimd_v1":
+        # Check if this is a known format or needs migration.
+        # Accept both legacy "thompson_aimd_v1" and current "dts_pid_v1".
+        known_versions = {"thompson_aimd_v1", "dts_pid_v1"}
+        if v2_data.get("algorithm_version") in known_versions:
             # Load directly
             state = ChannelFeeState.from_v2_dict(v2_data, db_state)
         else:
@@ -1765,13 +1773,13 @@ class FeeController:
             state = ChannelFeeState.from_v2_dict(v2_data, db_state)
 
             # Stamp as migrated so we don't re-migrate on next restart
-            state.algorithm_version = "thompson_aimd_v1"
+            state.algorithm_version = "dts_pid_v1"
             self._save_channel_fee_state(channel_id, state)
 
             if channel_id not in self._migrated_channels:
                 self._migrated_channels.add(channel_id)
                 self.plugin.log(
-                    f"THOMPSON_MIGRATE: {channel_id[:12]}... migrated from Hill Climbing "
+                    f"DTS_PID_MIGRATE: {channel_id[:12]}... migrated from legacy state "
                     f"({len(state.thompson.observations)} observations from history)",
                     level='info'
                 )
@@ -4009,7 +4017,7 @@ class FeeController:
 
         # Serialize v2.0 state to JSON
         v2_data = {
-            "algorithm_version": "thompson_aimd_v1",
+            "algorithm_version": "dts_pid_v1",
             "ema_revenue_rate": state.ema_revenue_rate,  # Issue #28
             "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
         }
@@ -4229,7 +4237,3 @@ class FeeController:
     
 
 
-# Keep aliases for backward compatibility
-PIDFeeController = FeeController
-HillClimbingFeeController = FeeController
-ThompsonAIMDState = ChannelFeeState

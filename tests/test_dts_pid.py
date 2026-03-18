@@ -8,9 +8,9 @@ import pytest
 from modules.fee_controller import (
     GaussianThompsonState,
     FeeAdjustment,
-    HillClimbingFeeController,
+    FeeController,
     PIDState,
-    ThompsonAIMDState,
+    ChannelFeeState,
 )
 
 
@@ -156,23 +156,21 @@ class TestDTSDiscountFactor:
 
 
 class TestPIDStatePersistence:
-    """Tests for PID state serialization in ThompsonAIMDState."""
+    """Tests for PID state serialization in ChannelFeeState."""
 
     def test_v2_dict_includes_pid_state(self):
-        ts = ThompsonAIMDState()
-        ts.algorithm_version = "thompson_aimd_v1"
+        ts = ChannelFeeState()
         d = ts.to_v2_dict()
         assert "pid_state" in d
 
     def test_pid_state_roundtrip(self):
-        ts = ThompsonAIMDState()
-        ts.algorithm_version = "thompson_aimd_v1"
+        ts = ChannelFeeState()
         ts.pid = PIDState(kp=3.0, ki=0.2, kd=4.0)
         ts.pid.ewma_error = 0.25
         ts.pid.integral_error = 1.5
         ts.pid.last_update_time = 1000000
         d = ts.to_v2_dict()
-        restored = ThompsonAIMDState.from_v2_dict(d)
+        restored = ChannelFeeState.from_v2_dict(d)
         assert restored.pid.kp == 3.0
         assert abs(restored.pid.ewma_error - 0.25) < 1e-9
         assert abs(restored.pid.integral_error - 1.5) < 1e-9
@@ -184,7 +182,7 @@ class TestPIDStatePersistence:
             "thompson_state": {},
             "aimd_state": {},
         }
-        ts = ThompsonAIMDState.from_v2_dict(d)
+        ts = ChannelFeeState.from_v2_dict(d)
         assert isinstance(ts.pid, PIDState)
         assert ts.pid.kp == 2.0
         assert ts.pid.ewma_error == 0.0
@@ -216,7 +214,7 @@ def _make_config_snapshot(**overrides):
 def _make_fc_for_dts_pid(mock_plugin, mock_database):
     from modules.config import Config
     config = MagicMock(spec=Config)
-    fc = HillClimbingFeeController(mock_plugin, config, mock_database)
+    fc = FeeController(mock_plugin, config, mock_database)
     cfg = _make_config_snapshot()
     fc.config.snapshot.return_value = cfg
 

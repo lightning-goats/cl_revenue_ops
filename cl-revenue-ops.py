@@ -62,9 +62,9 @@ from modules.utils import normalize_scid, parse_msat
 #   - Confidence-weighted measurement noise
 #   - Velocity tracking built into state vector
 #   - Persistent filter state across restarts
-# v2.0.0: Thompson Sampling + AIMD Fee Controller
-#   - Replaces Hill Climbing with Gaussian Thompson Sampling
-#   - AIMD defense layer for rapid failure response
+# v2.0.0: DTS+PID Fee Controller
+#   - DTS (Dynamic Thompson Sampling) for Bayesian fee exploration
+#   - PID control loop for smooth convergence
 #   - Contextual posteriors (balance, time, corridor role)
 PLUGIN_VERSION = "2.2.4"
 
@@ -534,12 +534,6 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-kelly-bypass-fleet',
-    default='true',
-    description='If true, bypass Kelly Criterion for fleet destinations (default: true)'
-)
-
-plugin.add_option(
     name='revenue-ops-kelly-fraction',
     default='0.5',
     description='Multiplier for Kelly fraction (default: 0.5 = Half Kelly). Full Kelly (1.0) maximizes growth but has high volatility.'
@@ -899,7 +893,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
         reputation_decay=_safe_float('revenue-ops-reputation-decay'),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
-        kelly_bypass_for_fleet=options['revenue-ops-kelly-bypass-fleet'].lower() == 'true',
         kelly_fraction=_safe_float('revenue-ops-kelly-fraction'),
         # Phase 7 options (v1.3.0)
         enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
@@ -1585,9 +1578,9 @@ def run_flow_analysis():
 
 def run_fee_adjustment():
     """
-    Module 2: Hill Climbing Fee Controller (Dynamic Pricing)
-    
-    Adjust channel fees using Perturb & Observe optimization.
+    Module 2: DTS+PID Fee Controller (Dynamic Pricing)
+
+    Adjust channel fees using DTS+PID optimization.
     """
     if fee_controller is None:
         plugin.log("Fee controller not initialized", level='error')
@@ -2630,7 +2623,7 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
       expires_in_hours=N       Optional auto-expiry for policy (revert to defaults)
 
     Strategies:
-      dynamic  - Hill Climbing + Scarcity Pricing (default)
+      dynamic  - DTS+PID fee optimization (default)
       static   - Fixed fee (requires fee_ppm)
       passive  - Do not manage (manual control)
 
