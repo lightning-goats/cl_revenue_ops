@@ -15,14 +15,6 @@
 #revenue-ops-dry-run=true
 
 # ============================================================================
-# CL-HIVE INTEGRATION
-# ============================================================================
-
-# Fee rate for hive member channels (0 = free routing between fleet)
-# When cl-hive sets a peer's strategy to HIVE, this fee is applied
-#revenue-ops-hive-fee-ppm=0
-
-# ============================================================================
 # FLOW ANALYSIS
 # ============================================================================
 
@@ -211,14 +203,3 @@
 # revenue-ops-enable-kelly=true
 # revenue-ops-kelly-fraction=0.3
 
-# --- CL-HIVE FLEET MEMBER ---
-# Optimized for coordinated hive routing
-#
-# revenue-ops-dry-run=false
-# revenue-ops-hive-fee-ppm=0
-# revenue-ops-min-fee-ppm=100
-# revenue-ops-max-fee-ppm=2500
-# revenue-ops-fee-interval=1800
-# revenue-ops-scarcity-pricing=true
-# revenue-ops-proportional-budget=true
-# revenue-ops-proportional-budget-pct=0.10

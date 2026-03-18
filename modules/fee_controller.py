@@ -9,7 +9,7 @@ This module implements a three-concern fee optimization architecture:
       DTS_market_fee × PID_multiplier,
       max(min_fee, rebalance_floor, vegas_floor),
       max_fee
-  ) × hive_defense_override
+  )
 
 Concern 1 — Market Pricing: Discounted Gaussian Thompson Sampling (DTS)
 - Bayesian posterior over fee-revenue observations
@@ -34,14 +34,11 @@ Concern 3 — Hard Safety: Floor/ceiling clamps
 - These are economic constraints the PID has no signal for
 
 The Alpha Sequence (Fee Priority Chain):
-1. HIVE Safety: Fleet members always get configured hive_fee_ppm (usually 0)
-2. Congestion: HTLC slots saturated → ceiling fee
-3. Zero-Fee Probe: Defibrillator for dead channels → 0 PPM
-4. DTS+PID: Primary fee optimization (DTS samples market fee, PID adjusts for balance)
+1. Congestion: HTLC slots saturated → ceiling fee
+2. Zero-Fee Probe: Defibrillator for dead channels → 0 PPM
+3. DTS+PID: Primary fee optimization (DTS samples market fee, PID adjusts for balance)
 
 Post-DTS+PID:
-- Hive Coordination: Fleet-aware fee blending
-- Competition Avoidance: Differentiate from fleet members
 - Gossip Hysteresis: Suppress sub-threshold changes
 
 Legacy Path (ENABLE_DTS_PID=False):
@@ -67,13 +64,11 @@ from pyln.client import Plugin, RpcError
 
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
-from .hive_bridge import CoordinationInputs
 from .policy_manager import PolicyManager, FeeStrategy, PeerPolicy
 from .utils import parse_msat
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
-    from .hive_bridge import HiveFeeIntelligenceBridge
 
 
 # =============================================================================
@@ -96,7 +91,6 @@ class FeeReasonCode(Enum):
     # Policy overrides
     POLICY_PASSIVE = "policy_passive"     # Peer has passive fee strategy
     POLICY_STATIC = "policy_static"       # Peer has static fee target
-    POLICY_HIVE = "policy_hive"           # Fleet member with 0 ppm covenant
 
     # Algorithm decisions
     THOMPSON_SAMPLE = "thompson_sample"               # Normal Thompson posterior sample
@@ -1150,7 +1144,7 @@ class GaussianThompsonState:
     Gaussian Thompson Sampling for continuous fee optimization.
 
     Uses Normal-Normal conjugate prior for continuous fee space:
-    - Prior: N(mu_0, sigma_0^2) from hive intelligence or defaults
+    - Prior: N(mu_0, sigma_0^2) from defaults
     - Likelihood: N(fee, sigma_obs^2) for observed revenue
     - Posterior: N(mu_n, sigma_n^2) updated via Bayesian inference
 
@@ -1167,7 +1161,7 @@ class GaussianThompsonState:
     MIN_OBSERVATIONS = 3            # Minimum before trusting posterior
     MIN_STD = 10                    # Never let uncertainty go below 10 ppm
 
-    # Prior parameters (initialized from hive intelligence or defaults)
+    # Prior parameters
     prior_mean_fee: int = 200       # Default prior mean: 200 ppm
     prior_std_fee: int = 100        # Default prior uncertainty: 100 ppm
 
@@ -1198,33 +1192,9 @@ class GaussianThompsonState:
     # Context-specific posteriors: {context_key: (mean, std, count)}
     contextual_posteriors: Dict[str, Tuple[float, float, int]] = field(default_factory=dict)
 
-    # Fleet-informed data (from hive aggregated profiles)
-    fleet_optimal_estimate: Optional[int] = None
-    fleet_confidence: float = 0.0
-    fleet_avg_fee: Optional[int] = None          # Average fee peer charges
-    fleet_fee_volatility: float = 0.0            # How much peer's fees vary
-    fleet_min_fee: Optional[int] = None          # Minimum observed fee
-    fleet_max_fee: Optional[int] = None          # Maximum observed fee
-    fleet_reporters: int = 0                     # Number of hive members reporting
-    fleet_elasticity: float = -1.0               # Estimated demand elasticity
-
     # Tracking
     last_sampled_fee: int = 0
     last_sample_time: int = 0
-
-    # Stigmergic modulation parameters
-    PHEROMONE_EXPLOIT_THRESHOLD = 10     # Above this, reduce exploration
-    PHEROMONE_EXPLORE_BOOST = 1.5        # Exploration multiplier when no pheromone
-    PHEROMONE_EXPLOIT_FACTOR = 0.6       # Reduce std to this fraction when exploiting
-
-    # Corridor role parameters
-    SECONDARY_EXPLORE_BOOST = 1.3        # Secondary corridors explore more
-    PRIMARY_EXPLOIT_FACTOR = 0.85        # Primary corridors exploit more
-
-    # Current modulation state (set before sampling)
-    current_pheromone_level: float = 0.0
-    current_corridor_role: str = "P"     # P=Primary, S=Secondary
-    current_time_bucket: str = "normal"  # low/normal/peak
 
     # -----------------------------------------------------------------
     # 3x3 matrix helpers (inline to avoid external deps)
@@ -1292,250 +1262,6 @@ class GaussianThompsonState:
                     L[i][j] = (m[i][j] - s) / L[j][j]
         return L
 
-    def initialize_from_hive(self, optimal_fee: int, confidence: float,
-                            elasticity: float) -> None:
-        """
-        Initialize prior from hive intelligence (simple version).
-
-        For richer initialization, use initialize_from_hive_profile() instead.
-
-        Args:
-            optimal_fee: Hive's estimate of optimal fee for this peer
-            confidence: Confidence in the estimate (0-1)
-            elasticity: Estimated demand elasticity (negative for elastic)
-        """
-        self.fleet_optimal_estimate = optimal_fee
-        self.fleet_confidence = confidence
-        self.fleet_elasticity = elasticity
-
-        # Blend hive prior with default based on confidence
-        if confidence > 0.3:
-            # Higher confidence = trust hive estimate more
-            blend_weight = min(0.8, confidence)  # Cap at 80% hive weight
-            self.prior_mean_fee = int(
-                optimal_fee * blend_weight +
-                self.prior_mean_fee * (1 - blend_weight)
-            )
-
-            # Higher confidence = lower prior uncertainty
-            # High elasticity = higher uncertainty (market is sensitive)
-            elasticity_factor = min(2.0, max(0.5, abs(elasticity)))
-            self.prior_std_fee = int(
-                self.prior_std_fee * (1 - confidence * 0.3) * elasticity_factor
-            )
-            self.prior_std_fee = max(self.MIN_STD, self.prior_std_fee)
-
-        # Initialize posterior to prior
-        self.posterior_mean = float(self.prior_mean_fee)
-        self.posterior_std = float(self.prior_std_fee)
-
-    def initialize_from_hive_profile(self, profile: Dict[str, Any]) -> None:
-        """
-        Initialize prior from full hive aggregated profile.
-
-        Uses the complete fee intelligence profile from cl-hive's
-        FeeIntelligenceManager for better prior calibration:
-        - avg_fee_charged: Grounds prior mean on observed market rates
-        - fee_volatility: Scales uncertainty based on market stability
-        - hive_reporters: Boosts confidence when multiple nodes report
-        - min_fee/max_fee: Informs reasonable fee bounds
-
-        Args:
-            profile: Full fee intelligence dict from query_fee_intelligence()
-                {
-                    "avg_fee_charged": 250,
-                    "min_fee": 100,
-                    "max_fee": 500,
-                    "fee_volatility": 0.15,
-                    "estimated_elasticity": -0.8,
-                    "optimal_fee_estimate": 180,
-                    "confidence": 0.75,
-                    "hive_reporters": 3,
-                    ...
-                }
-        """
-        if not profile:
-            return
-
-        # Store all fleet data
-        self.fleet_optimal_estimate = profile.get("optimal_fee_estimate")
-        self.fleet_confidence = profile.get("confidence", 0.0)
-        self.fleet_avg_fee = profile.get("avg_fee_charged")
-        self.fleet_fee_volatility = profile.get("fee_volatility", 0.0)
-        self.fleet_min_fee = profile.get("min_fee")
-        self.fleet_max_fee = profile.get("max_fee")
-        self.fleet_reporters = profile.get("hive_reporters", 0)
-        self.fleet_elasticity = profile.get("estimated_elasticity", -1.0)
-
-        confidence = self.fleet_confidence
-
-        # Boost confidence if multiple reporters agree
-        if self.fleet_reporters >= 3:
-            confidence = min(0.95, confidence * 1.15)
-        elif self.fleet_reporters >= 2:
-            confidence = min(0.9, confidence * 1.05)
-
-        # Only apply hive priors if confidence threshold met
-        if confidence < 0.3:
-            return
-
-        # Determine best prior mean:
-        # - Prefer optimal_fee_estimate (hive's computed optimal)
-        # - Fall back to avg_fee_charged (market observation)
-        optimal = self.fleet_optimal_estimate
-        avg = self.fleet_avg_fee
-
-        if optimal and optimal > 0:
-            # Use optimal, but validate against market average
-            base_fee = optimal
-            if avg and avg > 0:
-                # If optimal differs hugely from avg, blend them
-                if abs(optimal - avg) > avg * 0.5:
-                    base_fee = int(optimal * 0.7 + avg * 0.3)
-        elif avg and avg > 0:
-            base_fee = avg
-        else:
-            base_fee = self.prior_mean_fee
-
-        # Blend with current prior based on confidence
-        blend_weight = min(0.85, confidence)
-        self.prior_mean_fee = int(
-            base_fee * blend_weight +
-            self.prior_mean_fee * (1 - blend_weight)
-        )
-
-        # Calculate prior std from volatility and elasticity
-        # Base uncertainty from config (default 100 ppm)
-        base_std = self.prior_std_fee
-
-        # Volatility factor: higher volatility = more uncertainty
-        # fee_volatility is typically 0.0-1.0 (0 = stable, 1 = highly variable)
-        volatility = self.fleet_fee_volatility
-        volatility_factor = 1.0 + volatility * 1.5  # Range 1.0-2.5
-
-        # Elasticity factor: higher elasticity = more price sensitive = more uncertainty
-        elasticity_factor = min(2.0, max(0.5, abs(self.fleet_elasticity)))
-
-        # Confidence factor: higher confidence = less uncertainty
-        confidence_factor = 1.0 - confidence * 0.4  # Range 0.6-1.0
-
-        # Reporters factor: more reporters = less uncertainty
-        reporters_factor = 1.0
-        if self.fleet_reporters >= 5:
-            reporters_factor = 0.8
-        elif self.fleet_reporters >= 3:
-            reporters_factor = 0.9
-
-        # Combine factors
-        self.prior_std_fee = int(
-            base_std * volatility_factor * elasticity_factor *
-            confidence_factor * reporters_factor
-        )
-
-        # Bound the std
-        self.prior_std_fee = max(self.MIN_STD, min(200, self.prior_std_fee))
-
-        # If we have min/max bounds, constrain std to reasonable range
-        if self.fleet_min_fee and self.fleet_max_fee:
-            observed_range = self.fleet_max_fee - self.fleet_min_fee
-            # Std shouldn't be much larger than observed market range
-            self.prior_std_fee = min(self.prior_std_fee, observed_range // 2)
-            self.prior_std_fee = max(self.MIN_STD, self.prior_std_fee)
-
-        # Initialize posterior to prior
-        self.posterior_mean = float(self.prior_mean_fee)
-        self.posterior_std = float(self.prior_std_fee)
-
-    def apply_routing_intelligence(self, intel: Dict[str, Any]) -> None:
-        """
-        Apply routing intelligence to adjust Thompson sampling prior.
-
-        Uses pheromone levels, trends, and corridor membership to weight the prior:
-        - Hot channels (high pheromone): optimistic prior (can sustain higher fees)
-        - Warm channels: slightly optimistic
-        - Cold channels (no pheromone): pessimistic (needs lower fees to attract flow)
-        - Corridor bonus: channels on proven routes get extra confidence
-
-        This method should be called after initialize_from_hive_profile() if
-        routing intelligence is available.
-
-        Args:
-            intel: Routing intelligence dict from hive-get-routing-intelligence:
-                {
-                    "pheromone_level": 3.98,
-                    "pheromone_trend": "stable",  # rising/falling/stable
-                    "last_forward_age_hours": 2.5,
-                    "marker_count": 3,
-                    "on_active_corridor": true
-                }
-        """
-        if not intel:
-            return
-
-        pheromone = intel.get('pheromone_level', 0.0)
-        trend = intel.get('pheromone_trend', 'stable')
-        on_corridor = intel.get('on_active_corridor', False)
-        marker_count = intel.get('marker_count', 0)
-        last_forward_age = intel.get('last_forward_age_hours')
-
-        # MA-3: Accumulate adjustments as floats and convert to int only at the end
-        # to avoid cascaded truncation error from repeated int() conversions.
-        mean_fee = float(self.prior_mean_fee)
-        std_fee = float(self.prior_std_fee)
-
-        # Adjust prior mean based on pheromone level
-        # Hot channels: shift prior mean higher (can sustain higher fees)
-        # Cold channels: shift prior mean lower (needs competitive fees)
-        if pheromone >= 2.0:
-            # Hot channel: +15-25% fee adjustment based on strength
-            pheromone_factor = min(0.25, 0.15 + (pheromone - 2.0) * 0.02)
-            mean_fee *= (1 + pheromone_factor)
-        elif pheromone >= 0.5:
-            # Warm channel: +5-15% adjustment
-            pheromone_factor = 0.05 + (pheromone - 0.5) * 0.067
-            mean_fee *= (1 + pheromone_factor)
-        elif pheromone < 0.1 and pheromone >= 0:
-            # Cold channel: -10% (needs lower fees to attract flow)
-            mean_fee *= 0.90
-
-        # Trend adjustments
-        if trend == "rising":
-            # Recent activity, confidence is higher
-            std_fee *= 0.85
-        elif trend == "falling":
-            # Decaying interest, increase uncertainty
-            std_fee *= 1.15
-
-        # Corridor bonus: channels on proven routes get extra confidence
-        if on_corridor:
-            # Reduce uncertainty (exploit more)
-            std_fee *= 0.90
-            # Slight fee premium for being on a working corridor
-            mean_fee *= 1.05
-
-        # Marker count bonus: more markers = more confident data
-        if marker_count >= 5:
-            std_fee *= 0.85
-        elif marker_count >= 2:
-            std_fee *= 0.92
-
-        # Recency factor: if last forward was recent, we have better data
-        if last_forward_age is not None:
-            if last_forward_age < 2:
-                # Very recent: high confidence
-                std_fee *= 0.90
-            elif last_forward_age > 48:
-                # Stale data: increase uncertainty
-                std_fee *= 1.10
-
-        # Convert to int once at the end and enforce bounds
-        self.prior_std_fee = max(self.MIN_STD, min(200, int(std_fee)))
-        self.prior_mean_fee = max(1, int(mean_fee))
-
-        # Update posterior to match adjusted prior
-        self.posterior_mean = float(self.prior_mean_fee)
-        self.posterior_std = float(self.prior_std_fee)
-
     def predict_optimal_fee(self, floor_ppm: int, ceiling_ppm: int) -> Optional[int]:
         """
         Return the current posterior optimum, clamped to caller bounds.
@@ -1554,73 +1280,6 @@ class GaussianThompsonState:
 
         return int(max(floor_ppm, min(ceiling_ppm, round(optimal_fee))))
 
-    def set_context_modulation(
-        self,
-        pheromone_level: float = 0.0,
-        corridor_role: str = "P",
-        time_bucket: str = "normal"
-    ) -> None:
-        """
-        Set context for stigmergic modulation before sampling.
-
-        This allows the sampling to be modulated by:
-        - Pheromone level: High pheromone = exploit, low = explore
-        - Corridor role: Primary = exploit, secondary = explore
-        - Time bucket: For time-weighted posterior selection
-
-        Args:
-            pheromone_level: Pheromone strength (0-20+)
-            corridor_role: "P" for primary, "S" for secondary
-            time_bucket: "low", "normal", or "peak"
-        """
-        self.current_pheromone_level = pheromone_level
-        self.current_corridor_role = corridor_role
-        self.current_time_bucket = time_bucket
-
-    def _get_exploration_modifier(self) -> float:
-        """
-        Compute exploration/exploitation modifier based on stigmergic signals.
-
-        Returns a multiplier for posterior_std:
-        - > 1.0: More exploration (widen distribution)
-        - < 1.0: More exploitation (narrow distribution)
-        - = 1.0: No modification
-
-        Combines:
-        - Pheromone level: Strong pheromone = exploit (good corridor found)
-        - Corridor role: Secondary = explore (find niche pricing)
-
-        Returns:
-            Multiplier for posterior standard deviation
-        """
-        modifier = 1.0
-
-        # Pheromone modulation: strong pheromone = exploit
-        if self.current_pheromone_level >= self.PHEROMONE_EXPLOIT_THRESHOLD:
-            # Strong pheromone: this is a proven good corridor, exploit
-            pheromone_factor = self.PHEROMONE_EXPLOIT_FACTOR
-        elif self.current_pheromone_level <= 1:
-            # No/weak pheromone: unknown territory, explore more
-            pheromone_factor = self.PHEROMONE_EXPLORE_BOOST
-        else:
-            # Medium pheromone: interpolate
-            ratio = self.current_pheromone_level / self.PHEROMONE_EXPLOIT_THRESHOLD
-            pheromone_factor = self.PHEROMONE_EXPLORE_BOOST - (
-                (self.PHEROMONE_EXPLORE_BOOST - self.PHEROMONE_EXPLOIT_FACTOR) * ratio
-            )
-
-        modifier *= pheromone_factor
-
-        # Corridor role modulation
-        if self.current_corridor_role == "S":
-            # Secondary corridor: explore more to find niche
-            modifier *= self.SECONDARY_EXPLORE_BOOST
-        else:
-            # Primary corridor: exploit more, we're the main route
-            modifier *= self.PRIMARY_EXPLOIT_FACTOR
-
-        return modifier
-
     def sample_fee(self, floor: int, ceiling: int) -> int:
         """
         Sample a fee from the posterior distribution.
@@ -1629,11 +1288,6 @@ class GaussianThompsonState:
         This naturally balances exploration (high uncertainty) vs
         exploitation (low uncertainty around known good fees).
 
-        Applies stigmergic modulation based on current context:
-        - High pheromone: reduce std (exploit known good fee)
-        - Low pheromone: increase std (explore more)
-        - Secondary corridor: increase std (find niche)
-
         Args:
             floor: Minimum allowed fee (ppm)
             ceiling: Maximum allowed fee (ppm)
@@ -1641,24 +1295,21 @@ class GaussianThompsonState:
         Returns:
             Sampled fee in ppm, clamped to [floor, ceiling]
         """
-        # Get stigmergic exploration modifier
-        explore_mod = self._get_exploration_modifier()
-
         # If not enough observations, explore more widely
         if len(self.observations) < self.MIN_OBSERVATIONS:
             # Use prior with extra exploration (clamped to MIN_STD like normal path)
-            explore_std = max(self.MIN_STD, self.prior_std_fee * 1.5 * explore_mod)
+            explore_std = max(self.MIN_STD, self.prior_std_fee * 1.5)
             sampled = random.gauss(self.prior_mean_fee, explore_std)
         else:
             # Try polynomial posterior sampling; fall back to Gaussian
-            sampled = self._sample_from_polynomial_posterior(floor, ceiling, explore_mod)
+            sampled = self._sample_from_polynomial_posterior(floor, ceiling)
             if sampled is not None:
                 sampled_fee = int(max(floor, min(ceiling, sampled)))
                 self.last_sampled_fee = sampled_fee
                 self.last_sample_time = int(time.time())
                 return sampled_fee
-            # Fallback: sample from Gaussian posterior with stigmergic modulation
-            modulated_std = max(self.MIN_STD, self.posterior_std * explore_mod)
+            # Fallback: sample from Gaussian posterior
+            modulated_std = max(self.MIN_STD, self.posterior_std)
             sampled = random.gauss(self.posterior_mean, modulated_std)
 
         # Clamp to bounds
@@ -1672,26 +1323,18 @@ class GaussianThompsonState:
         """
         Sample fee using context-specific posterior if available.
 
-        Context keys encode balance state, pheromone level, time bucket,
-        and corridor role. This allows learning different optimal fees
-        for different market conditions.
-
-        Applies stigmergic modulation to both contextual and global posteriors:
-        - High pheromone: exploit (narrow distribution)
-        - Low pheromone: explore (wide distribution)
-        - Secondary corridor: explore more
+        Context keys encode balance state, time bucket, and corridor role.
+        This allows learning different optimal fees for different market
+        conditions.
 
         Args:
-            context_key: Context identifier (e.g., "low:strong:peak:P")
+            context_key: Context identifier (e.g., "low:normal:P")
             floor: Minimum allowed fee
             ceiling: Maximum allowed fee
 
         Returns:
             Sampled fee in ppm
         """
-        # Get stigmergic exploration modifier
-        explore_mod = self._get_exploration_modifier()
-
         if context_key in self.contextual_posteriors:
             ctx = self.contextual_posteriors[context_key]
 
@@ -1704,19 +1347,19 @@ class GaussianThompsonState:
                 ctx_mean, ctx_std, ctx_count = ctx[:3]
 
             if ctx_count >= self.MIN_OBSERVATIONS:
-                # Use contextual posterior with stigmergic modulation
-                modulated_std = max(self.MIN_STD, ctx_std * explore_mod)
+                # Use contextual posterior
+                modulated_std = max(self.MIN_STD, ctx_std)
                 sampled = random.gauss(ctx_mean, modulated_std)
                 sampled_fee = int(max(floor, min(ceiling, sampled)))
                 self.last_sampled_fee = sampled_fee
                 self.last_sample_time = int(time.time())
                 return sampled_fee
 
-        # Fall back to global posterior (which also applies modulation)
+        # Fall back to global posterior
         return self.sample_fee(floor, ceiling)
 
     def _sample_from_polynomial_posterior(
-        self, floor: int, ceiling: int, explore_mod: float
+        self, floor: int, ceiling: int
     ) -> Optional[float]:
         """
         Sample optimal fee from the polynomial posterior.
@@ -1738,15 +1381,11 @@ class GaussianThompsonState:
         if Sigma is None:
             return None
 
-        # Scale covariance by explore_mod^2
-        em2 = explore_mod * explore_mod
-        Sigma_scaled = [[Sigma[i][j] * em2 for j in range(3)] for i in range(3)]
-
         # Cholesky decompose for sampling
-        L = self._cholesky3(Sigma_scaled)
+        L = self._cholesky3(Sigma)
         if L is None:
             # Fallback: diagonal approximation
-            diag = [max(1e-6, Sigma_scaled[i][i]) for i in range(3)]
+            diag = [max(1e-6, Sigma[i][i]) for i in range(3)]
             z = [random.gauss(0, 1) for _ in range(3)]
             beta_sampled = [
                 self.posterior_coeffs[i] + z[i] * math.sqrt(diag[i])
@@ -1961,10 +1600,10 @@ class GaussianThompsonState:
             observed_time: Time bucket that was actually observed
         """
         parts = context_key.split(":")
-        if len(parts) != 4:
+        if len(parts) != 3:
             return
 
-        balance, pheromone, _, role = parts
+        balance, _, role = parts
         now = int(time.time())
 
         # Determine adjacent time buckets
@@ -1976,7 +1615,7 @@ class GaussianThompsonState:
 
         # Update adjacent time contexts with very small cross-pollination precision
         for adj_time in adjacent:
-            adj_key = f"{balance}:{pheromone}:{adj_time}:{role}"
+            adj_key = f"{balance}:{adj_time}:{role}"
             if adj_key in self.contextual_posteriors:
                 adj = self.contextual_posteriors[adj_key]
 
@@ -2309,31 +1948,6 @@ class GaussianThompsonState:
         precision = max(precision, self.MIN_PRECISION)
         self.posterior_std = math.sqrt(1.0 / precision)
 
-    def initialize_dts_from_hive(
-        self,
-        optimal_fee: int | None,
-        confidence: float,
-    ) -> None:
-        """Initialize DTS posterior from Hive fleet intelligence.
-
-        Seeds posterior mean from fleet's optimal fee estimate and
-        sets posterior width based on confidence. Higher confidence →
-        tighter posterior.
-
-        Args:
-            optimal_fee: Fleet's estimated optimal fee in ppm, or None.
-            confidence: Hive confidence score (0.0–1.0).
-        """
-        if optimal_fee is not None and optimal_fee > 0:
-            self.posterior_mean = float(optimal_fee)
-            self.prior_mean_fee = optimal_fee
-
-        confidence = max(0.0, min(1.0, confidence))
-        target_std = self.prior_std_fee * (1.0 - confidence * 0.7)
-        target_std = max(self.MIN_STD, target_std)
-        max_std = math.sqrt(1.0 / self.MIN_PRECISION)
-        self.posterior_std = min(target_std, max_std)
-
     def inject_synthetic_observation(self, fee, revenue_rate, weight_scale=0.3, time_bucket="normal"):
         """
         Inject a reduced-weight synthetic observation from Alpha Sequence bypasses.
@@ -2403,14 +2017,6 @@ class GaussianThompsonState:
             "_last_fee_min": self._last_fee_min,
             "_last_fee_max": self._last_fee_max,
             "contextual_posteriors": self.contextual_posteriors,
-            "fleet_optimal_estimate": self.fleet_optimal_estimate,
-            "fleet_confidence": self.fleet_confidence,
-            "fleet_avg_fee": self.fleet_avg_fee,
-            "fleet_fee_volatility": self.fleet_fee_volatility,
-            "fleet_min_fee": self.fleet_min_fee,
-            "fleet_max_fee": self.fleet_max_fee,
-            "fleet_reporters": self.fleet_reporters,
-            "fleet_elasticity": self.fleet_elasticity,
             "last_sampled_fee": self.last_sampled_fee,
             "last_sample_time": self.last_sample_time
         }
@@ -2438,14 +2044,6 @@ class GaussianThompsonState:
             else:
                 converted_ctx[k] = t
         state.contextual_posteriors = converted_ctx
-        state.fleet_optimal_estimate = d.get("fleet_optimal_estimate")
-        state.fleet_confidence = d.get("fleet_confidence", 0.0)
-        state.fleet_avg_fee = d.get("fleet_avg_fee")
-        state.fleet_fee_volatility = d.get("fleet_fee_volatility", 0.0)
-        state.fleet_min_fee = d.get("fleet_min_fee")
-        state.fleet_max_fee = d.get("fleet_max_fee")
-        state.fleet_reporters = d.get("fleet_reporters", 0)
-        state.fleet_elasticity = d.get("fleet_elasticity", -1.0)
         # M1: Validate posterior_coeffs length and type
         _default_coeffs = [0.0, 1.0, 0.0]
         raw_coeffs = d.get("posterior_coeffs")
@@ -2567,13 +2165,6 @@ class AIMDDefenseState:
     total_decreases: int = 0         # Count for diagnostics
     total_increases: int = 0         # Count for diagnostics
 
-    # Fleet defense coordination (from hive MyceliumDefenseSystem)
-    fleet_threat_active: bool = False           # True when hive reports threat
-    fleet_threat_type: Optional[str] = None     # "drain", "unreliable", etc.
-    fleet_threat_severity: float = 0.0          # 0.0 to 1.0
-    fleet_defensive_multiplier: float = 1.0     # From hive defense system
-    fleet_threat_expires: int = 0               # When threat warning expires
-
     def record_outcome(self, was_success=None, success_score=None, is_exploring=False) -> None:
         """
         Record a routing outcome using continuous success score or binary flag.
@@ -2640,13 +2231,9 @@ class AIMDDefenseState:
 
     def apply_to_fee(self, thompson_fee: int, floor: int, ceiling: int) -> int:
         """
-        Apply AIMD and fleet defense modifiers to Thompson's sampled fee.
+        Apply AIMD modifier to Thompson's sampled fee.
 
-        Combines:
-        - Local AIMD modifier: Reduces fee after failure streaks
-        - Fleet defensive multiplier: Increases fee for threat peers
-
-        When neither is active, passes through Thompson's fee unchanged.
+        When AIMD is not active, passes through Thompson's fee unchanged.
 
         Args:
             thompson_fee: Fee sampled by Thompson Sampling
@@ -2656,102 +2243,28 @@ class AIMDDefenseState:
         Returns:
             Adjusted fee in ppm
         """
-        # Get combined modifier (local AIMD + fleet defense)
         modifier = self.get_effective_modifier()
 
         if modifier == 1.0:
             return thompson_fee
 
-        # Apply combined modifier
+        # Apply modifier
         adjusted = int(thompson_fee * modifier)
 
         # Clamp to bounds
         return max(floor, min(ceiling, adjusted))
 
-    def update_fleet_threat(self, threat_info: Optional[Dict[str, Any]]) -> None:
-        """
-        Update fleet threat state from hive MyceliumDefenseSystem.
-
-        The hive's defense system aggregates threat signals across the fleet,
-        detecting drain attacks, unreliable peers, and other threats.
-        This allows coordinated defensive response across all fleet channels.
-
-        Args:
-            threat_info: Threat data from query_defense_status(), e.g.:
-                {
-                    "is_threat": True,
-                    "threat_type": "drain",
-                    "severity": 0.8,
-                    "defensive_multiplier": 2.6,
-                    "expires_at": 1705100000
-                }
-                Or None to clear threat state.
-        """
-        if not threat_info:
-            # Clear threat state
-            self.fleet_threat_active = False
-            self.fleet_threat_type = None
-            self.fleet_threat_severity = 0.0
-            self.fleet_defensive_multiplier = 1.0
-            self.fleet_threat_expires = 0
-            return
-
-        # Check if threat is still valid
-        now = int(time.time())
-        expires = threat_info.get("expires_at", 0)
-        if expires > 0 and now > expires:
-            # Threat has expired
-            self.fleet_threat_active = False
-            self.fleet_threat_type = None
-            self.fleet_threat_severity = 0.0
-            self.fleet_defensive_multiplier = 1.0
-            self.fleet_threat_expires = 0
-            return
-
-        # Update threat state
-        if threat_info.get("is_threat", False):
-            self.fleet_threat_active = True
-            self.fleet_threat_type = threat_info.get("threat_type", "unknown")
-            self.fleet_threat_severity = threat_info.get("severity", 0.0)
-            self.fleet_defensive_multiplier = max(1.0, min(3.0, threat_info.get("defensive_multiplier", 1.0)))
-            self.fleet_threat_expires = expires
-
-            # For drain attacks, also trigger local AIMD defense mode
-            if self.fleet_threat_type == "drain" and self.fleet_threat_severity > 0.5:
-                self.is_active = True
-        else:
-            self.fleet_threat_active = False
-            self.fleet_threat_type = None
-            self.fleet_threat_severity = 0.0
-            self.fleet_defensive_multiplier = 1.0
-            self.fleet_threat_expires = 0
-
     def get_effective_modifier(self) -> float:
         """
-        Get the effective fee modifier combining local AIMD and fleet defense.
-
-        Combines:
-        - Local AIMD modifier (based on consecutive failures)
-        - Fleet defensive multiplier (from hive threat detection)
-
-        The fleet multiplier INCREASES fees (>1.0 for threats), while
-        AIMD modifier DECREASES fees (<1.0 on failures). We apply both.
+        Get the effective AIMD fee modifier.
 
         Returns:
-            Combined modifier to apply to Thompson's sampled fee
+            Modifier to apply to Thompson's sampled fee
         """
-        if not self.is_active and not self.fleet_threat_active:
+        if not self.is_active:
             return 1.0
 
-        # Start with AIMD modifier (typically <= 1.0 when active)
-        modifier = self.aimd_modifier if self.is_active else 1.0
-
-        # Apply fleet defensive multiplier if threat is active
-        # This INCREASES fees when peer is a threat
-        if self.fleet_threat_active and self.fleet_defensive_multiplier > 1.0:
-            modifier *= self.fleet_defensive_multiplier
-
-        return modifier
+        return self.aimd_modifier if self.is_active else 1.0
 
     def reset(self) -> None:
         """Reset AIMD state (used on regime change or manual intervention)."""
@@ -2759,7 +2272,6 @@ class AIMDDefenseState:
         self.consecutive_successes = 0
         self.aimd_modifier = 1.0
         self.is_active = False
-        # Note: Does NOT reset fleet threat state (that comes from hive)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dict for database storage."""
@@ -2770,13 +2282,7 @@ class AIMDDefenseState:
             "is_active": self.is_active,
             "last_decrease_time": self.last_decrease_time,
             "total_decreases": self.total_decreases,
-            "total_increases": self.total_increases,
-            # Fleet defense state
-            "fleet_threat_active": self.fleet_threat_active,
-            "fleet_threat_type": self.fleet_threat_type,
-            "fleet_threat_severity": self.fleet_threat_severity,
-            "fleet_defensive_multiplier": self.fleet_defensive_multiplier,
-            "fleet_threat_expires": self.fleet_threat_expires
+            "total_increases": self.total_increases
         }
 
     @classmethod
@@ -2790,12 +2296,6 @@ class AIMDDefenseState:
         state.last_decrease_time = d.get("last_decrease_time", 0)
         state.total_decreases = d.get("total_decreases", 0)
         state.total_increases = d.get("total_increases", 0)
-        # Fleet defense state
-        state.fleet_threat_active = d.get("fleet_threat_active", False)
-        state.fleet_threat_type = d.get("fleet_threat_type")
-        state.fleet_threat_severity = d.get("fleet_threat_severity", 0.0)
-        state.fleet_defensive_multiplier = d.get("fleet_defensive_multiplier", 1.0)
-        state.fleet_threat_expires = d.get("fleet_threat_expires", 0)
         return state
 
 
@@ -3486,7 +2986,6 @@ class HillClimbingFeeController:
     2. Bayesian: DTS maintains posterior over fee-revenue relationship
     3. Feedback Control: PID manages balance via closed-loop multiplier
     4. Separation of Concerns: Market pricing, balance mgmt, and safety are independent
-    5. Fleet-aware: Coordinates with cl-hive for competition avoidance
 
     Legacy paths (ENABLE_DTS_PID=False):
     - Thompson+AIMD with scarcity, saturation floors/ceilings, cold-start
@@ -3497,7 +2996,6 @@ class HillClimbingFeeController:
     - I-14: RLock held across DB I/O in adjust_fees — architectural constraint, single-threaded cycle
     - I-15: Dual HC/Thompson state objects — legacy compatibility for HC fallback path
     - I-16: Non-atomic state save (Thompson + HC states) — single-threaded cycle mitigates
-    - I-17: HIVE_COORDINATED strategy — future feature, placeholder only
     """
     
     # Hill Climbing parameters
@@ -3650,36 +3148,6 @@ class HillClimbingFeeController:
     COLD_START_MAX_FEE_PPM = 100      # Force ceiling down during cold-start
 
     # ==========================================================================
-    # Hive Fee Intelligence Integration (Phase 1)
-    # ==========================================================================
-    # Query cl-hive for competitor fee data to inform bounds calculation.
-    # Gracefully degrades to local-only mode if cl-hive unavailable.
-    ENABLE_HIVE_INTELLIGENCE = True   # Feature flag
-    HIVE_INTELLIGENCE_WEIGHT = 0.25   # How much to weight hive data (0-1)
-    HIVE_MIN_CONFIDENCE = 0.3         # Ignore data below this confidence
-
-    # ==========================================================================
-    # Hive Fee Coordination Integration (Yield Optimization Phase 2)
-    # ==========================================================================
-    # Query cl-hive for coordinated fee recommendations that consider:
-    # - Corridor ownership (primary vs secondary member)
-    # - Pheromone signals (historical success)
-    # - Stigmergic markers (fleet observations)
-    # - Defense status (threat peer multipliers)
-    ENABLE_HIVE_COORDINATION = True   # Feature flag for coordinated fees
-    HIVE_COORDINATION_WEIGHT = 0.5    # Weight for coordinated recommendations (0-1)
-    HIVE_COORDINATION_MIN_CONFIDENCE = 0.5  # Minimum confidence to use recommendation
-
-    # Phase 15: Enhanced Hive Intelligence
-    # - Pheromone-biased step: Use historical success to influence step direction
-    # - Internal competition avoidance: Don't undercut fleet members
-    ENABLE_PHEROMONE_BIAS = True      # Use pheromone data to bias step direction
-    PHEROMONE_BIAS_THRESHOLD = 5.0    # Min pheromone level to apply bias
-    PHEROMONE_BIAS_WEIGHT = 0.3       # How much pheromone influences step (0-1)
-    ENABLE_COMPETITION_AVOIDANCE = True  # Avoid undercutting fleet members
-    COMPETITION_DEFER_PCT = 0.05      # Stay within 5% of primary's fee when secondary
-
-    # ==========================================================================
     # Fee Algorithm Feature Flags
     # ==========================================================================
     # Evolution: Hill Climbing → Thompson+AIMD → Simplified → DTS+PID
@@ -3727,7 +3195,6 @@ class HillClimbingFeeController:
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  policy_manager: Optional[PolicyManager] = None,
                  profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
-                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None,
                  temporary_fee_overlay_active: Optional[Callable[[str], bool]] = None):
         """
         Initialize the fee controller.
@@ -3738,14 +3205,12 @@ class HillClimbingFeeController:
             database: Database instance
             policy_manager: Optional PolicyManager for peer-level fee policies
             profitability_analyzer: Optional profitability analyzer for ROI-based adjustments
-            hive_bridge: Optional HiveFeeIntelligenceBridge for competitor intelligence
         """
         self.plugin = plugin
         self.config = config
         self.database = database
         self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
-        self.hive_bridge = hive_bridge
         self.temporary_fee_overlay_active = temporary_fee_overlay_active
         if self.policy_manager and hasattr(self.policy_manager, "register_on_change"):
             try:
@@ -3766,7 +3231,6 @@ class HillClimbingFeeController:
 
         # Preserve operator-advertised HTLC minimums while temporary defenses are active.
         self._dynamic_htlcmin_baselines: Dict[str, int] = {}
-        self._last_hive_egress_desaturation_bias: Dict[str, Dict[str, Any]] = {}
 
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
@@ -3860,56 +3324,6 @@ class HillClimbingFeeController:
                 self._askrene_cache_ts = now
         except Exception:
             pass  # AskRene is optional; silent on failure
-
-    def _get_coordination_inputs(self, channel_id: str, peer_id: str = "") -> CoordinationInputs:
-        if not self.hive_bridge or not self.hive_bridge.is_available():
-            return CoordinationInputs(mode="local_only")
-
-        priors: Dict[str, Any] = {}
-        peer_quality = None
-        corridor_hint = None
-
-        if peer_id:
-            try:
-                peer_quality = self.hive_bridge.get_single_peer_quality(peer_id)
-                if peer_quality:
-                    priors["peer_quality"] = peer_quality
-            except Exception as e:
-                self.plugin.log(
-                    f"COORD_INPUTS: peer quality lookup failed for {peer_id[:12]}...: {e}",
-                    level='debug'
-                )
-
-            try:
-                fee_intelligence = self.hive_bridge.query_fee_intelligence(peer_id)
-                if fee_intelligence:
-                    priors["fee_intelligence"] = fee_intelligence
-            except Exception as e:
-                self.plugin.log(
-                    f"COORD_INPUTS: fee intelligence lookup failed for {peer_id[:12]}...: {e}",
-                    level='debug'
-                )
-
-        try:
-            coordinated_fee = self.hive_bridge.query_coordinated_fee_recommendation(
-                channel_id=channel_id,
-                current_fee=0,
-            )
-            if coordinated_fee:
-                corridor_hint = coordinated_fee.get("corridor_role")
-                priors["coordinated_fee"] = coordinated_fee
-        except Exception as e:
-            self.plugin.log(
-                f"COORD_INPUTS: coordinated fee lookup failed for {channel_id[:12]}...: {e}",
-                level='debug'
-            )
-
-        return CoordinationInputs(
-            mode="fleet_augmented",
-            priors=priors,
-            corridor_hint=corridor_hint,
-            peer_quality=peer_quality,
-        )
 
     def _is_topology_depleted(self, channel_id: str, capacity_sats: int, cfg) -> bool:
         """Check if downstream topology for a channel is depleted via AskRene.
@@ -4081,12 +3495,9 @@ class HillClimbingFeeController:
         channel_id: str,
         peer_id: str,
         outbound_ratio: float
-    ) -> Tuple[str, float, str, str]:
+    ) -> Tuple[str, str, str]:
         """
         Extract context features and return both the key and raw values.
-
-        Used for stigmergic modulation where we need the raw pheromone level,
-        not just the bucket name.
 
         Args:
             channel_id: Channel SCID
@@ -4094,7 +3505,7 @@ class HillClimbingFeeController:
             outbound_ratio: Current outbound liquidity ratio (0.0-1.0)
 
         Returns:
-            Tuple of (context_key, pheromone_level, time_bucket, corridor_role)
+            Tuple of (context_key, time_bucket, corridor_role)
         """
         # Balance bucket
         if outbound_ratio < 0.15:
@@ -4108,137 +3519,11 @@ class HillClimbingFeeController:
         else:
             balance = "saturated"
 
-        # Pheromone level (raw value for modulation)
-        pheromone_level = 0.0
-        pheromone_bucket = "none"
-        if self.hive_bridge:
-            try:
-                level_data = self.hive_bridge.query_pheromone_level(channel_id)
-                if level_data:
-                    pheromone_level = level_data.get("level", 0)
-                    if pheromone_level >= 15:
-                        pheromone_bucket = "strong"
-                    elif pheromone_level >= 5:
-                        pheromone_bucket = "medium"
-                    elif pheromone_level >= 2:
-                        pheromone_bucket = "weak"
-            except Exception:
-                pass
-
-        # Time bucket
         time_bucket = "normal"
-        if self.hive_bridge:
-            try:
-                adj = self.hive_bridge.query_time_fee_adjustment(channel_id)
-                if adj:
-                    intensity = adj.get("intensity", 0.5)
-                    if intensity > 0.7:
-                        time_bucket = "peak"
-                    elif intensity < 0.3:
-                        time_bucket = "low"
-            except Exception:
-                pass
-
-        # Corridor role
         role = "P"  # Primary by default
-        if self.hive_bridge:
-            try:
-                coord = self.hive_bridge.query_coordinated_fee_recommendation(
-                    channel_id=channel_id,
-                    current_fee=0
-                )
-                if coord and not coord.get("is_primary", True):
-                    role = "S"
-            except Exception:
-                pass
 
-        context_key = f"{balance}:{pheromone_bucket}:{time_bucket}:{role}"
-        return (context_key, pheromone_level, time_bucket, role)
-
-    def _initialize_thompson_from_hive(
-        self,
-        channel_id: str,
-        peer_id: str
-    ) -> GaussianThompsonState:
-        """
-        Initialize Thompson state with hive-informed priors.
-
-        Queries cl-hive for full fee intelligence profile:
-        - optimal_fee_estimate: Hive's computed optimal fee
-        - avg_fee_charged: Market observation of peer's typical fees
-        - fee_volatility: How much peer's fees vary (uncertainty signal)
-        - min_fee/max_fee: Observed fee bounds
-        - hive_reporters: Number of fleet nodes with data
-        - confidence: Overall confidence in the estimate
-        - estimated_elasticity: Demand elasticity
-
-        These inform the Thompson prior, giving new channels a better
-        starting point based on fleet intelligence.
-
-        Args:
-            channel_id: Channel SCID
-            peer_id: Peer pubkey
-
-        Returns:
-            Initialized GaussianThompsonState
-        """
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-
-        state = GaussianThompsonState()
-        state.prior_std_fee = cfg.thompson_prior_std_fee
-
-        coordination = self._get_coordination_inputs(channel_id, peer_id)
-
-        if coordination.mode == "fleet_augmented":
-            try:
-                intel = coordination.priors.get("fee_intelligence")
-                if intel and intel.get("confidence", 0) >= cfg.hive_min_confidence_for_prior:
-                    # Use the full profile initialization
-                    state.initialize_from_hive_profile(intel)
-
-                    # Log detailed initialization
-                    reporters = intel.get("hive_reporters", 0)
-                    volatility = intel.get("fee_volatility", 0)
-                    self.plugin.log(
-                        f"THOMPSON_INIT: {channel_id[:12]}... initialized from hive profile "
-                        f"(optimal={intel.get('optimal_fee_estimate')}, "
-                        f"avg={intel.get('avg_fee_charged')}, "
-                        f"volatility={volatility:.2f}, "
-                        f"reporters={reporters}, "
-                        f"conf={intel.get('confidence', 0):.2f}) -> "
-                        f"prior_mean={state.prior_mean_fee}, prior_std={state.prior_std_fee}",
-                        level='debug'
-                    )
-            except Exception as e:
-                self.plugin.log(
-                    f"THOMPSON_INIT: Failed to get hive intel for {peer_id[:12]}...: {e}",
-                    level='debug'
-                )
-
-            # Apply routing intelligence if enabled
-            routing_intel_enabled = getattr(cfg, 'routing_intelligence_enabled', False)
-            if routing_intel_enabled:
-                try:
-                    routing_intel = self.hive_bridge.get_channel_routing_intelligence(channel_id)
-                    if routing_intel:
-                        # Apply routing intelligence to adjust priors
-                        state.apply_routing_intelligence(routing_intel)
-
-                        self.plugin.log(
-                            f"THOMPSON_INIT: {channel_id[:12]}... routing intelligence applied "
-                            f"(pheromone={routing_intel.get('pheromone_level', 0):.2f}, "
-                            f"trend={routing_intel.get('pheromone_trend', 'stable')}, "
-                            f"on_corridor={routing_intel.get('on_active_corridor', False)}) -> "
-                            f"prior_mean={state.prior_mean_fee}, prior_std={state.prior_std_fee}",
-                            level='debug'
-                        )
-                except Exception as e:
-                    self.plugin.log(
-                        f"THOMPSON_INIT: Failed to get routing intel for {channel_id[:12]}...: {e}",
-                        level='debug'
-                    )
-
-        return state
+        context_key = f"{balance}:{time_bucket}:{role}"
+        return (context_key, time_bucket, role)
 
     def _update_size_bucket_posteriors(self, channel_id: str,
                                        ts_state: ThompsonAIMDState) -> None:
@@ -4285,7 +3570,7 @@ class HillClimbingFeeController:
 
         Args:
             channel_id: Channel ID
-            peer_id: Peer ID (for hive prior initialization)
+            peer_id: Peer ID
             actual_fee_ppm: Optional actual fee from chain for desync detection
 
         Returns:
@@ -4326,10 +3611,6 @@ class HillClimbingFeeController:
         else:
             # Migration from HillClimbState
             state = ThompsonAIMDState.from_v2_dict(v2_data, db_state)
-
-            # Initialize Thompson from hive if no prior observations
-            if not state.thompson.observations:
-                state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
 
             # Stamp as migrated so we don't re-migrate on next restart
             state.algorithm_version = "thompson_aimd_v1"
@@ -4749,595 +4030,6 @@ class HillClimbingFeeController:
             )
             return base_ceiling
 
-    def _get_competitor_adjusted_bounds(
-        self,
-        peer_id: str,
-        base_floor: int,
-        base_ceiling: int,
-        our_market_share: float = 0.0
-    ) -> Tuple[int, int]:
-        """
-        Adjust fee bounds based on competitor intelligence from cl-hive.
-
-        Strategy:
-        1. High competitor fees + low market share -> opportunity to undercut
-        2. Low competitor fees + elastic demand -> must stay competitive
-        3. Use optimal_fee_estimate to guide ceiling
-
-        All adjustments are weighted by confidence score to prevent
-        low-quality data from causing large swings.
-
-        Args:
-            peer_id: External peer we're setting fees toward
-            base_floor: Calculated floor from liquidity/balance
-            base_ceiling: Calculated ceiling from config
-            our_market_share: Our share of this peer's capacity (0-1)
-
-        Returns:
-            (adjusted_floor, adjusted_ceiling)
-        """
-        if not self.ENABLE_HIVE_INTELLIGENCE or not self.hive_bridge:
-            return base_floor, base_ceiling
-
-        intel = self.hive_bridge.query_fee_intelligence(peer_id)
-        if not intel:
-            return base_floor, base_ceiling
-
-        confidence = intel.get("confidence", 0)
-        if confidence < self.HIVE_MIN_CONFIDENCE:
-            return base_floor, base_ceiling
-
-        their_avg_fee = intel.get("avg_fee_charged", 0)
-        optimal_estimate = intel.get("optimal_fee_estimate", 0)
-        market_share = intel.get("market_share", our_market_share)
-        elasticity = intel.get("estimated_elasticity", -1.0)
-
-        # Weight = base weight * confidence
-        weight = self.HIVE_INTELLIGENCE_WEIGHT * confidence
-
-        adjusted_floor = base_floor
-        adjusted_ceiling = base_ceiling
-
-        # STRATEGY 1: Undercut opportunity
-        # If competitor charges high fees and we have low market share,
-        # we can capture flow by being slightly cheaper
-        if their_avg_fee > 0 and market_share < 0.20:
-            if their_avg_fee > base_ceiling * 0.8:
-                # Their fees are near our ceiling - undercut by 10%
-                undercut_ceiling = int(their_avg_fee * 0.90)
-                adjusted_ceiling = int(
-                    undercut_ceiling * weight + base_ceiling * (1 - weight)
-                )
-                self.plugin.log(
-                    f"HIVE_INTEL: {peer_id[:12]}... undercut opportunity "
-                    f"(their_avg={their_avg_fee}, ceiling={base_ceiling}->{adjusted_ceiling})",
-                    level='debug'
-                )
-
-        # STRATEGY 2: Competitive pressure
-        # If competitor charges low fees and demand is elastic,
-        # we need to lower our floor to stay competitive
-        if their_avg_fee > 0 and their_avg_fee < base_floor:
-            if elasticity < -0.5:  # Elastic demand (negative elasticity)
-                competitive_floor = int(their_avg_fee * 0.90)
-                adjusted_floor = int(
-                    competitive_floor * weight + base_floor * (1 - weight)
-                )
-                # Never go below global minimum
-                adjusted_floor = max(adjusted_floor, self.config.min_fee_ppm)
-                self.plugin.log(
-                    f"HIVE_INTEL: {peer_id[:12]}... competitive pressure "
-                    f"(their_avg={their_avg_fee}, floor={base_floor}->{adjusted_floor})",
-                    level='debug'
-                )
-
-        # STRATEGY 3: Use optimal estimate
-        # If we have high-confidence optimal fee estimate, use it to guide ceiling
-        if optimal_estimate > 0 and confidence > 0.5:
-            # Set ceiling at 120% of optimal (room for Hill Climbing)
-            suggested_ceiling = int(optimal_estimate * 1.20)
-            adjusted_ceiling = int(
-                suggested_ceiling * weight + adjusted_ceiling * (1 - weight)
-            )
-
-        # Ensure floor <= ceiling with 10ppm buffer
-        if adjusted_floor >= adjusted_ceiling:
-            adjusted_floor = max(1, adjusted_ceiling - 10)
-
-        return adjusted_floor, adjusted_ceiling
-
-    # =========================================================================
-    # PHASE 2: Fleet-Aware Fee Adjustment
-    # =========================================================================
-    # Adjust fees considering fleet liquidity state.
-    # INFORMATION ONLY - no fund transfers between nodes.
-
-    def _get_fleet_aware_fee_adjustment(
-        self,
-        peer_id: str,
-        base_fee: int
-    ) -> int:
-        """
-        Adjust fee considering fleet liquidity state.
-
-        If a struggling member needs flow toward this peer,
-        we might lower our fees slightly to help direct traffic.
-        This is indirect help through the public network - no fund transfer.
-
-        Args:
-            peer_id: External peer we're setting fees toward
-            base_fee: The fee we would otherwise set
-
-        Returns:
-            Potentially adjusted fee (or original if no adjustment needed)
-        """
-        if not self.hive_bridge:
-            return base_fee
-
-        fleet_needs = self.hive_bridge.query_fleet_liquidity_needs()
-        if not fleet_needs:
-            return base_fee
-
-        # Check if any struggling member needs outbound to this peer
-        for need in fleet_needs:
-            if need.get("peer_id") != peer_id:
-                continue
-
-            # Only adjust for high-severity needs from struggling/vulnerable members
-            if need.get("severity") not in ("high", "critical"):
-                continue
-
-            member_tier = need.get("member_health_tier", "stable")
-            if member_tier not in ("struggling", "vulnerable"):
-                continue
-
-            need_type = need.get("need_type")
-
-            if need_type == "outbound":
-                # Member needs outbound to this peer
-                # Slightly lower our fee to attract flow toward this peer
-                # This routes through the public network, potentially helping
-                adjusted = int(base_fee * 0.95)  # 5% reduction
-
-                self.plugin.log(
-                    f"FLEET_AWARE: Lowering fee to {peer_id[:12]}... "
-                    f"from {base_fee} to {adjusted} ppm "
-                    f"(fleet member {need.get('member_id', 'unknown')[:8]}... "
-                    f"needs outbound, tier={member_tier})",
-                    level='debug'
-                )
-                return max(adjusted, self.config.min_fee_ppm)
-
-            elif need_type == "inbound":
-                # Member needs inbound from this peer
-                # Slightly raise our fee to discourage drain away from them
-                adjusted = int(base_fee * 1.05)  # 5% increase
-
-                self.plugin.log(
-                    f"FLEET_AWARE: Raising fee to {peer_id[:12]}... "
-                    f"from {base_fee} to {adjusted} ppm "
-                    f"(fleet member needs inbound, tier={member_tier})",
-                    level='debug'
-                )
-                return min(adjusted, self.config.max_fee_ppm)
-
-        return base_fee
-
-    # =========================================================================
-    # Yield Optimization Phase 2: Coordinated Fee Recommendations
-    # =========================================================================
-
-    def _get_coordinated_fee_recommendation(
-        self,
-        channel_id: str,
-        peer_id: str,
-        current_fee: int,
-        local_balance_pct: float
-    ) -> Optional[int]:
-        """
-        Query cl-hive for coordinated fee recommendation.
-
-        The coordinated fee considers:
-        - Corridor ownership (primary vs secondary role)
-        - Pheromone signals (historical success at this fee)
-        - Stigmergic markers (fleet routing observations)
-        - Defense status (threat peer multipliers)
-        - Fleet fee floor/ceiling
-
-        This enables fleet-wide fee coordination without direct messaging,
-        using swarm intelligence principles.
-
-        Args:
-            channel_id: Channel SCID
-            peer_id: Peer pubkey
-            current_fee: Current fee in ppm
-            local_balance_pct: Current local balance percentage (0.0-1.0)
-
-        Returns:
-            Recommended fee in ppm, or None if no recommendation available
-        """
-        if not self.ENABLE_HIVE_COORDINATION or not self.hive_bridge:
-            return None
-
-        try:
-            rec = self.hive_bridge.query_coordinated_fee_recommendation(
-                channel_id=channel_id,
-                current_fee=current_fee,
-                local_balance_pct=local_balance_pct
-            )
-
-            if not rec:
-                return None
-
-            # Check confidence threshold
-            confidence = rec.get("confidence", 0)
-            if confidence < self.HIVE_COORDINATION_MIN_CONFIDENCE:
-                self.plugin.log(
-                    f"HIVE_COORD: Skipping low-confidence ({confidence:.2f}) "
-                    f"recommendation for {channel_id}",
-                    level="debug"
-                )
-                return None
-
-            recommended_fee = rec.get("recommended_fee_ppm")
-            if recommended_fee is None:
-                return None
-
-            # Log the recommendation details
-            corridor_role = rec.get("corridor_role", "unknown")
-            defense_mult = rec.get("defense_multiplier", 1.0)
-            pheromone = rec.get("pheromone_level", 0)
-            reason = rec.get("adjustment_reason", "")
-
-            self.plugin.log(
-                f"HIVE_COORD: {channel_id} -> {peer_id[:12]}... "
-                f"recommended={recommended_fee} ppm (current={current_fee}) "
-                f"role={corridor_role} defense={defense_mult:.2f} "
-                f"pheromone={pheromone:.2f} reason='{reason}'",
-                level="debug"
-            )
-
-            # Query traffic intelligence for forward-size context (informational)
-            try:
-                traffic_intel = self.hive_bridge.query_traffic_intelligence(peer_id=peer_id)
-                if traffic_intel and traffic_intel.get("confidence", 0) > 0.3:
-                    avg_fwd = traffic_intel.get("avg_forward_size_sats", 0)
-                    daily_vol = traffic_intel.get("daily_volume_sats", 0)
-                    self.plugin.log(
-                        f"TRAFFIC_INTEL: {channel_id} -> {peer_id[:12]}... "
-                        f"avg_fwd={avg_fwd:.0f} daily_vol={daily_vol:.0f}",
-                        level="debug"
-                    )
-            except Exception:
-                pass  # Traffic intel unavailable, continue without it
-
-            return recommended_fee
-
-        except Exception as e:
-            self.plugin.log(
-                f"HIVE_COORD: Failed to get recommendation for {channel_id}: {e}",
-                level="debug"
-            )
-            return None
-
-    def _apply_defense_multiplier(
-        self,
-        peer_id: str,
-        base_fee: int
-    ) -> int:
-        """
-        Apply defensive fee multiplier if peer is flagged as a threat.
-
-        Part of the Mycelium Defense System - when one fleet member
-        detects a drain or unreliable peer, all members raise fees.
-
-        Args:
-            peer_id: Peer pubkey
-            base_fee: Base fee before defense adjustment
-
-        Returns:
-            Fee with defense multiplier applied (or original if no threat)
-        """
-        if not self.ENABLE_HIVE_COORDINATION or not self.hive_bridge:
-            return base_fee
-
-        try:
-            defense_status = self.hive_bridge.query_defense_status(peer_id=peer_id)
-            if not defense_status:
-                return base_fee
-
-            peer_threat = defense_status.get("peer_threat")
-            if not peer_threat or not peer_threat.get("is_threat"):
-                return base_fee
-
-            multiplier = max(1.0, min(3.0, peer_threat.get("defensive_multiplier", 1.0)))
-            threat_type = peer_threat.get("threat_type", "unknown")
-            severity = peer_threat.get("severity", 0)
-
-            if multiplier <= 1.0:
-                return base_fee
-
-            adjusted_fee = int(base_fee * multiplier)
-
-            self.plugin.log(
-                f"HIVE_DEFENSE: Applying {multiplier:.2f}x multiplier to {peer_id[:12]}... "
-                f"({threat_type} threat, severity={severity:.2f}): "
-                f"{base_fee} -> {adjusted_fee} ppm",
-                level="info"
-            )
-
-            return adjusted_fee
-
-        except Exception as e:
-            self.plugin.log(
-                f"HIVE_DEFENSE: Failed to check defense status for {peer_id[:12]}...: {e}",
-                level="debug"
-            )
-            return base_fee
-
-    def _get_pheromone_bias(
-        self,
-        channel_id: str,
-        current_fee: int,
-        proposed_direction: int
-    ) -> int:
-        """
-        Get pheromone-biased step direction.
-
-        Pheromones represent memory of successful fee levels. If a channel
-        has strong pheromone signal (lots of successful routing at a certain
-        fee), we bias our step toward that fee level.
-
-        Args:
-            channel_id: Channel SCID
-            current_fee: Current fee in ppm
-            proposed_direction: Hill Climbing's proposed direction (+1 up, -1 down)
-
-        Returns:
-            Biased direction (+1, -1, or 0 if pheromone suggests holding)
-        """
-        if not self.ENABLE_PHEROMONE_BIAS or not self.hive_bridge:
-            return proposed_direction
-
-        try:
-            pheromone = self.hive_bridge.query_pheromone_level(channel_id)
-            if not pheromone:
-                return proposed_direction
-
-            level = pheromone.get("level", 0)
-            if level < self.PHEROMONE_BIAS_THRESHOLD:
-                # Not enough signal - trust Hill Climbing
-                return proposed_direction
-
-            # Strong pheromone signal - we have historical success data
-            # The coordinated fee recommendation already incorporates this,
-            # but we can use the signal strength to reduce step volatility
-            # when we're near a known-good fee
-
-            # If pheromone is very strong (above_threshold), reduce step magnitude
-            # by potentially suggesting to hold if we're already doing well
-            if pheromone.get("above_threshold", False) and level > 10.0:
-                self.plugin.log(
-                    f"PHEROMONE_BIAS: {channel_id[:12]}... has strong signal "
-                    f"(level={level:.1f}). Maintaining direction but "
-                    f"suggesting smaller steps.",
-                    level="debug"
-                )
-
-            return proposed_direction
-
-        except Exception as e:
-            self.plugin.log(
-                f"PHEROMONE_BIAS: Failed to get pheromone for {channel_id[:12]}...: {e}",
-                level="debug"
-            )
-            return proposed_direction
-
-    def _check_internal_competition(
-        self,
-        peer_id: str,
-        proposed_fee: int,
-        channel_id: str
-    ) -> int:
-        """
-        Check for internal competition and adjust fee to avoid undercutting.
-
-        When multiple fleet members have channels to the same peer, the
-        member with more routing activity (primary) should set the fee,
-        while others (secondary) should stay slightly above to avoid
-        internal fee wars.
-
-        Args:
-            peer_id: Peer pubkey
-            proposed_fee: Fee we're proposing
-            channel_id: Our channel ID
-
-        Returns:
-            Adjusted fee (may be same as proposed if no competition)
-        """
-        if not self.ENABLE_COMPETITION_AVOIDANCE or not self.hive_bridge:
-            return proposed_fee
-
-        try:
-            competition = self.hive_bridge.check_internal_competition_for_peer(peer_id)
-            if not competition or not competition.get("is_competing"):
-                return proposed_fee
-
-            # We're competing with other fleet members
-            member_count = competition.get("member_count", 0)
-
-            # Query coordinated fee to get corridor role
-            coord = self.hive_bridge.query_coordinated_fee_recommendation(
-                channel_id=channel_id,
-                current_fee=proposed_fee
-            )
-
-            if not coord:
-                return proposed_fee
-
-            corridor_role = coord.get("corridor_role", "unknown")
-            is_primary = coord.get("is_primary", False)
-
-            if is_primary or corridor_role == "primary":
-                # We're the primary - our fee sets the benchmark
-                self.plugin.log(
-                    f"COMPETITION: {channel_id[:12]}... to {peer_id[:12]}... - "
-                    f"We are PRIMARY among {member_count} members. "
-                    f"Setting benchmark fee={proposed_fee} ppm.",
-                    level="debug"
-                )
-                return proposed_fee
-
-            # We're secondary - don't undercut the primary
-            recommended_fee = coord.get("recommended_fee_ppm")
-            if recommended_fee and proposed_fee < recommended_fee:
-                # Stay within COMPETITION_DEFER_PCT of primary's fee
-                min_fee = int(recommended_fee * (1 - self.COMPETITION_DEFER_PCT))
-                if proposed_fee < min_fee:
-                    adjusted_fee = min_fee
-                    self.plugin.log(
-                        f"COMPETITION: {channel_id[:12]}... to {peer_id[:12]}... - "
-                        f"We are SECONDARY. Avoiding undercut: "
-                        f"{proposed_fee} -> {adjusted_fee} ppm "
-                        f"(primary benchmark: {recommended_fee} ppm)",
-                        level="info"
-                    )
-                    return adjusted_fee
-
-            return proposed_fee
-
-        except Exception as e:
-            self.plugin.log(
-                f"COMPETITION: Failed to check competition for {peer_id[:12]}...: {e}",
-                level="debug"
-            )
-            return proposed_fee
-
-    def _clear_last_hive_egress_desaturation_bias(self, channel_id: str) -> None:
-        self._last_hive_egress_desaturation_bias.pop(channel_id, None)
-
-    def _set_last_hive_egress_desaturation_bias(self, channel_id: str, payload: Dict[str, Any]) -> None:
-        self._last_hive_egress_desaturation_bias[channel_id] = dict(payload)
-
-    def _get_last_hive_egress_desaturation_bias(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        payload = self._last_hive_egress_desaturation_bias.get(channel_id)
-        return dict(payload) if payload is not None else None
-
-    def _apply_hive_egress_desaturation_bias(
-        self,
-        channel_id: str,
-        peer_id: str,
-        proposed_fee_ppm: int,
-        effective_ceiling_ppm: int,
-        cfg: Optional["ConfigSnapshot"] = None,
-    ) -> int:
-        """
-        Add a bounded surcharge to dynamic non-hive exits that compete with a
-        locally saturated hive egress.
-
-        Hive-member channels themselves remain untouched at the hive fee.
-        """
-        self._clear_last_hive_egress_desaturation_bias(channel_id)
-
-        if cfg is None:
-            cfg = self.config.snapshot()
-        if not getattr(cfg, "enable_hive_egress_desaturation_bias", True):
-            return proposed_fee_ppm
-        if not self.hive_bridge:
-            return proposed_fee_ppm
-
-        if self.policy_manager:
-            try:
-                if self.policy_manager.is_hive_peer(peer_id):
-                    return proposed_fee_ppm
-            except Exception:
-                pass
-            try:
-                policy = self.policy_manager.get_policy(peer_id)
-            except Exception:
-                policy = None
-            if policy is not None and policy.strategy != FeeStrategy.DYNAMIC:
-                return proposed_fee_ppm
-
-        try:
-            bias = self.hive_bridge.query_hive_egress_desaturation_bias(
-                channel_id=channel_id,
-                peer_id=peer_id,
-            )
-        except Exception as e:
-            self.plugin.log(
-                f"HIVE_EGRESS_BIAS: Failed to query bias for {channel_id[:12]}...: {e}",
-                level="debug",
-            )
-            return proposed_fee_ppm
-
-        if not bias:
-            return proposed_fee_ppm
-        matched = bool(bias.get("matched"))
-        competes_with_hive_egress = bool(
-            bias.get("competes_with_hive_egress", matched)
-        )
-        if not matched or not competes_with_hive_egress:
-            return proposed_fee_ppm
-
-        saturated_local_pct = float(bias.get("saturated_local_pct", 0.0) or 0.0)
-        severity = bias.get("severity")
-        if severity is None:
-            if saturated_local_pct >= 97.0:
-                severity = "critical"
-            elif saturated_local_pct >= 94.0:
-                severity = "high"
-            else:
-                severity = "medium"
-
-        recommended_surcharge_ppm = max(0, int(bias.get("recommended_surcharge_ppm", 0) or 0))
-        if recommended_surcharge_ppm <= 0:
-            self._set_last_hive_egress_desaturation_bias(
-                channel_id,
-                {
-                    "matched": True,
-                    "applied": False,
-                    "recommended_surcharge_ppm": 0,
-                    "applied_surcharge_ppm": 0,
-                    "confidence": float(bias.get("confidence", 0.0) or 0.0),
-                    "severity": severity,
-                    "reason": bias.get("reason"),
-                    "saturated_hive_channel_id": bias.get("saturated_hive_channel_id"),
-                },
-            )
-            return proposed_fee_ppm
-
-        weight = float(getattr(cfg, "hive_egress_desaturation_bias_weight", 0.5) or 0.0)
-        weight = max(0.0, min(1.0, weight))
-        max_surcharge_ppm = max(0, int(getattr(cfg, "hive_egress_desaturation_bias_max_ppm", 100) or 0))
-        weighted_surcharge_ppm = int(round(recommended_surcharge_ppm * weight))
-        bounded_surcharge_ppm = min(max_surcharge_ppm, weighted_surcharge_ppm)
-        applied_surcharge_ppm = max(0, min(bounded_surcharge_ppm, effective_ceiling_ppm - proposed_fee_ppm))
-        adjusted_fee_ppm = proposed_fee_ppm + applied_surcharge_ppm
-
-        payload = {
-            "matched": True,
-            "applied": applied_surcharge_ppm > 0,
-            "recommended_surcharge_ppm": recommended_surcharge_ppm,
-            "applied_surcharge_ppm": applied_surcharge_ppm,
-            "confidence": float(bias.get("confidence", 0.0) or 0.0),
-            "severity": severity,
-            "reason": bias.get("reason"),
-            "saturated_hive_channel_id": bias.get("saturated_hive_channel_id"),
-        }
-        self._set_last_hive_egress_desaturation_bias(channel_id, payload)
-
-        if applied_surcharge_ppm > 0:
-            self.plugin.log(
-                f"HIVE_EGRESS_BIAS: {channel_id[:12]}... competing with saturated hive egress "
-                f"{(bias.get('saturated_hive_channel_id') or 'unknown')}; "
-                f"+{applied_surcharge_ppm} ppm (recommended={recommended_surcharge_ppm}, "
-                f"weight={weight:.2f}, severity={severity})",
-                level="info",
-            )
-
-        return adjusted_fee_ppm
-
     def _prune_stale_states(self, active_channel_ids: set) -> int:
         """
         Remove in-memory state for channels that no longer exist.
@@ -5364,14 +4056,6 @@ class HillClimbingFeeController:
         for key in stale_thompson_keys:
             del self._thompson_aimd_states[key]
             pruned += 1
-
-        # Prune cached hive egress bias debug state for closed channels
-        stale_bias_keys = [
-            k for k in self._last_hive_egress_desaturation_bias.keys()
-            if k not in active_channel_ids
-        ]
-        for key in stale_bias_keys:
-            del self._last_hive_egress_desaturation_bias[key]
 
         # Also prune from database to prevent stale entries in debug output
         # Get all fee states from database and remove those for closed channels
@@ -5534,7 +4218,6 @@ class HillClimbingFeeController:
         skip_reasons = {
             "policy_passive": 0,
             "policy_static": 0,
-            "policy_hive": 0,
             "temporary_overlay": 0,
             "sleeping": 0,
             "waiting_time": 0,
@@ -5589,8 +4272,6 @@ class HillClimbingFeeController:
             if not channel_id or not peer_id:
                 continue
 
-            self._clear_last_hive_egress_desaturation_bias(channel_id)
-
             if self.temporary_fee_overlay_active is not None:
                 try:
                     if self.temporary_fee_overlay_active(channel_id):
@@ -5639,37 +4320,6 @@ class HillClimbingFeeController:
                             skip_reasons["policy_static"] += 1
                     continue
 
-                # Handle HIVE strategy: set low/zero fee (cl-hive fleet member)
-                if policy.strategy == FeeStrategy.HIVE:
-                    channel_info = channels.get(channel_id)
-                    if channel_info:
-                        hive_fee = cfg.hive_fee_ppm  # Use ConfigSnapshot for thread-safety
-                        current_fee = channel_info.get("fee_proportional_millionths", 0)
-                        if current_fee != hive_fee:
-                            try:
-                                # Hive fees may be 0 even when min_fee_ppm is higher.
-                                self.set_channel_fee(
-                                    channel_id,
-                                    hive_fee,
-                                    reason="Policy: HIVE",
-                                    reason_code=FeeReasonCode.POLICY_HIVE.value,
-                                    enforce_limits=False
-                                )
-                                adjustments.append(FeeAdjustment(
-                                    channel_id=channel_id,
-                                    peer_id=peer_id,
-                                    old_fee_ppm=current_fee,
-                                    new_fee_ppm=hive_fee,
-                                    reason="Policy: HIVE fleet member",
-                                    hill_climb_values={"policy": "hive"}
-                                ))
-                            except Exception as e:
-                                self.plugin.log(f"Error setting hive fee for {channel_id}: {e}", level='error')
-                                skip_reasons["error"] += 1
-                        else:
-                            skip_reasons["policy_hive"] += 1
-                    continue
-                
                 # DYNAMIC strategy continues to normal Hill Climbing below
 
             # Get channel info
@@ -5734,7 +4384,6 @@ class HillClimbingFeeController:
                 suppressed_reasons = {
                     "policy_passive",
                     "policy_static",
-                    "policy_hive",
                     "temporary_overlay",
                     "sleeping",
                     "waiting_time",
@@ -6012,47 +4661,6 @@ class HillClimbingFeeController:
         # Used for structured logs. Hill Climb sets this before applying modifiers;
         # Thompson uses step_ppm as the absolute fee delta, so original==step.
         original_step_ppm = 0
-
-        # =====================================================================
-        # HIVE PEER SAFETY CHECK (Phase 7)
-        # =====================================================================
-        # Fleet members must ALWAYS have 0 PPM fees. This is a safety backup
-        # in case the policy wasn't set correctly. The hive covenant requires
-        # zero fees between fleet members for efficient internal routing.
-        # =====================================================================
-        if self.policy_manager and self.policy_manager.is_hive_peer(peer_id):
-            raw_chain_fee = channel_info.get("fee_proportional_millionths", 0)
-            hive_fee = cfg.hive_fee_ppm  # Should be 0
-
-            if raw_chain_fee != hive_fee:
-                self.plugin.log(
-                    f"HIVE_SAFETY: Channel {channel_id[:12]}... to fleet member "
-                    f"has fee {raw_chain_fee}, enforcing {hive_fee} PPM",
-                    level='info'
-                )
-                # Must be executed on-chain; returning a FeeAdjustment object alone
-                # does not change the channel policy.
-                result = self.set_channel_fee(
-                    channel_id,
-                    hive_fee,
-                    reason="HIVE_SAFETY",
-                    reason_code=FeeReasonCode.POLICY_HIVE.value,
-                    enforce_limits=False
-                )
-                if not result.get("success"):
-                    return None
-                return FeeAdjustment(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    old_fee_ppm=raw_chain_fee,
-                    new_fee_ppm=hive_fee,
-                    reason="HIVE_SAFETY: Fleet member fee enforced",
-                    hill_climb_values={"policy": "hive_safety"},
-                    reason_code=FeeReasonCode.POLICY_HIVE.value
-                )
-            # Fee is correct, no adjustment needed
-            return None
-        self._clear_last_hive_egress_desaturation_bias(channel_id)
 
         # Detect critical state (Phase 5.5)
         is_congested = (state and state.get("state") == "congested")
@@ -6438,17 +5046,6 @@ class HillClimbingFeeController:
                 base_ceiling_ppm = min_ceiling_for_floor
 
         # =====================================================================
-        # HIVE FEE INTELLIGENCE INTEGRATION
-        # =====================================================================
-        # Query cl-hive for competitor fee data and adjust bounds accordingly.
-        # This allows network-aware fee optimization based on collective
-        # intelligence from the hive fleet.
-        if self.hive_bridge:
-            base_floor_ppm, base_ceiling_ppm = self._get_competitor_adjusted_bounds(
-                peer_id, base_floor_ppm, base_ceiling_ppm
-            )
-
-        # =====================================================================
         # Per-Peer Dynamic Fee Autoband (Policy-Driven)
         # =====================================================================
         # Autoband constrains dynamic pricing to a range derived from:
@@ -6712,8 +5309,7 @@ class HillClimbingFeeController:
             previous_rate = ts_state.last_revenue_rate
 
             # Get context key and raw values for contextual Thompson Sampling
-            # This also returns raw pheromone level for stigmergic modulation
-            context_key, pheromone_level, time_bucket, corridor_role = self._get_context_with_values(
+            context_key, time_bucket, corridor_role = self._get_context_with_values(
                 channel_id, peer_id, outbound_ratio
             )
 
@@ -6763,153 +5359,6 @@ class HillClimbingFeeController:
                         revenue_rate=current_revenue_rate
                     )
                     ts_state.set_elasticity_tracker(elasticity_tracker)
-
-            # =====================================================================
-            # P2 FLEET INTEGRATION: Elasticity & Curve Sharing
-            # =====================================================================
-            # Share observations with fleet and incorporate fleet-aggregated data
-            # for better collective learning
-            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                if self.hive_bridge and self.hive_bridge.is_available():
-                    # --- ELASTICITY SHARING ---
-                    if self.ENABLE_ELASTICITY and elasticity_tracker.should_broadcast():
-                        try:
-                            broadcast_data = elasticity_tracker.get_broadcast_data()
-                            self.hive_bridge.broadcast_elasticity_observation(
-                                peer_id=peer_id,
-                                elasticity=broadcast_data["elasticity"],
-                                confidence=broadcast_data["confidence"],
-                                sample_count=broadcast_data["sample_count"]
-                            )
-                        except Exception as e:
-                            self.plugin.log(
-                                f"P2_ELASTICITY: Failed to broadcast elasticity: {e}",
-                                level='debug'
-                            )
-
-                    # Query and incorporate fleet elasticity data
-                    if self.ENABLE_ELASTICITY:
-                        try:
-                            fleet_elasticity = self.hive_bridge.query_fleet_elasticity(peer_id)
-                            if fleet_elasticity:
-                                elasticity_tracker.incorporate_fleet_data(
-                                    fleet_elasticity=fleet_elasticity.get("elasticity", -1.0),
-                                    fleet_confidence=fleet_elasticity.get("confidence", 0),
-                                    fleet_weight=0.3  # 30% weight to fleet data
-                                )
-                                ts_state.set_elasticity_tracker(elasticity_tracker)
-                                self.plugin.log(
-                                    f"P2_ELASTICITY: {channel_id[:12]}... incorporated fleet data "
-                                    f"(fleet_e={fleet_elasticity.get('elasticity', -1.0):.2f}, "
-                                    f"local_e={elasticity_tracker.current_elasticity:.2f})",
-                                    level='debug'
-                                )
-                        except Exception as e:
-                            self.plugin.log(
-                                f"P2_ELASTICITY: Failed to query fleet elasticity: {e}",
-                                level='debug'
-                            )
-
-                    # --- RESPONSE CURVE SHARING ---
-                    if self.ENABLE_HISTORICAL_CURVE and historical_curve.should_broadcast_observation(
-                        fee_ppm=current_fee_ppm,
-                        revenue_rate=current_revenue_rate,
-                        forward_count=forward_count
-                    ):
-                        try:
-                            self.hive_bridge.broadcast_curve_observation(
-                                peer_id=peer_id,
-                                fee_ppm=current_fee_ppm,
-                                revenue_rate=current_revenue_rate,
-                                forward_count=forward_count
-                            )
-                        except Exception as e:
-                            self.plugin.log(
-                                f"P2_CURVE: Failed to broadcast curve observation: {e}",
-                                level='debug'
-                            )
-
-                    # Query and incorporate fleet aggregated curve
-                    if self.ENABLE_HISTORICAL_CURVE:
-                        try:
-                            fleet_curve = self.hive_bridge.query_aggregated_curve(peer_id)
-                            if fleet_curve and fleet_curve.get("observations"):
-                                historical_curve.incorporate_fleet_curve(
-                                    fleet_observations=fleet_curve["observations"],
-                                    fleet_weight=0.25  # 25% weight to fleet curve
-                                )
-                                ts_state.set_historical_curve(historical_curve)
-                                self.plugin.log(
-                                    f"P2_CURVE: {channel_id[:12]}... incorporated "
-                                    f"{len(fleet_curve['observations'])} fleet observations",
-                                    level='debug'
-                                )
-                        except Exception as e:
-                            self.plugin.log(
-                                f"P2_CURVE: Failed to query fleet curve: {e}",
-                                level='debug'
-                            )
-
-                    # --- REGIME CHANGE DETECTION & COORDINATION ---
-                    # M-12: Skip if already checked above in the Thompson block
-                    if self.ENABLE_HISTORICAL_CURVE and not regime_already_checked:
-                        regime_changed = historical_curve.detect_regime_change(current_revenue_rate)
-                        if regime_changed:
-                            try:
-                                # Determine change type based on direction
-                                recent = historical_curve.observations[-10:] if len(historical_curve.observations) >= 10 else historical_curve.observations
-                                avg_revenue = sum(o.revenue_rate for o in recent) / len(recent) if recent else 0
-                                change_type = "expansion" if current_revenue_rate > avg_revenue else "contraction"
-
-                                self.hive_bridge.broadcast_regime_change(
-                                    peer_id=peer_id,
-                                    change_type=change_type,
-                                    old_regime={"avg_revenue": avg_revenue},
-                                    new_regime={"current_revenue": current_revenue_rate},
-                                    evidence={
-                                        "ratio": current_revenue_rate / max(1, avg_revenue),
-                                        "observation_count": len(historical_curve.observations)
-                                    }
-                                )
-                                self.plugin.log(
-                                    f"P2_REGIME: {channel_id[:12]}... detected {change_type} "
-                                    f"(ratio={(current_revenue_rate / max(1, avg_revenue)):.2f})",
-                                    level='info'
-                                )
-                            except Exception as e:
-                                self.plugin.log(
-                                    f"P2_REGIME: Failed to broadcast regime change: {e}",
-                                    level='debug'
-                                )
-
-                        # Query fleet regime status to detect coordinated shifts
-                        try:
-                            fleet_regime = self.hive_bridge.query_fleet_regime_status(peer_id)
-                            if fleet_regime and fleet_regime.get("regime_change_detected"):
-                                # Fleet detected regime change - reset our curve to adapt
-                                fleet_change_type = fleet_regime.get("change_type", "unknown")
-                                fleet_evidence_count = fleet_regime.get("evidence_count", 0)
-
-                                if fleet_evidence_count >= 3 and not regime_changed:
-                                    # Fleet has strong evidence, we should adapt even if we
-                                    # didn't detect it locally
-                                    historical_curve.reset_curve()
-                                    ts_state = self._reset_channel_after_regime_change(
-                                        channel_id,
-                                        peer_id,
-                                        ts_state,
-                                    )
-                                    ts_state.set_historical_curve(historical_curve)
-                                    self.plugin.log(
-                                        f"P2_REGIME: {channel_id[:12]}... resetting curve due to "
-                                        f"fleet {fleet_change_type} detection (evidence={fleet_evidence_count})",
-                                        level='info'
-                                    )
-                        except Exception as e:
-                            self.plugin.log(
-                                f"P2_REGIME: Failed to query fleet regime status: {e}",
-                                level='debug'
-                            )
 
             # =====================================================================
             # VOLATILITY & HYSTERESIS (preserved)
@@ -7024,108 +5473,6 @@ class HillClimbingFeeController:
             # BROADCAST FEE DISCOVERIES (P1 Integration)
             # + P2 COMPETITION AVOIDANCE: Thompson Posterior Sharing
             # =====================================================================
-            # Gated: fee discovery broadcasts and competition avoidance require
-            # stigmergic context and fleet coordination (not needed in simplified path)
-            fleet_posteriors = None
-            differentiation_offset = 0
-            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                # Check if this observation represents a significant discovery
-                # that should be shared with the fleet
-                if self.hive_bridge and self.hive_bridge.is_available():
-                    discovery = ts_state.thompson.check_for_discovery(
-                        fee=current_fee_ppm,
-                        revenue_rate=current_revenue_rate,
-                        min_revenue_rate=50.0,
-                        min_observations=5
-                    )
-                    if discovery:
-                        self.hive_bridge.broadcast_fee_observation(
-                            peer_id=peer_id,
-                            fee_ppm=discovery["fee_ppm"],
-                            revenue_rate=discovery["revenue_rate"],
-                            confidence=discovery["confidence"],
-                            discovery_type=discovery["discovery_type"],
-                            metadata={
-                                "posterior_mean": ts_state.thompson.posterior_mean,
-                                "posterior_std": ts_state.thompson.posterior_std,
-                                "observation_count": discovery.get("observation_count", 0),
-                                "context": context_key
-                            }
-                        )
-                        self.plugin.log(
-                            f"THOMPSON_DISCOVERY: {channel_id[:12]}... broadcasting "
-                            f"{discovery['discovery_type']} at {discovery['fee_ppm']}ppm "
-                            f"(revenue={discovery['revenue_rate']:.1f}sats/hr, "
-                            f"conf={discovery['confidence']:.2f})",
-                            level='info'
-                        )
-
-                # Share our Thompson posterior summary with fleet and query other
-                # members' posteriors. If our posterior overlaps significantly with
-                # fleet members, differentiate by biasing away from crowded regions.
-                if self.hive_bridge and self.hive_bridge.is_available():
-                    # Share our posterior summary for fleet coordination
-                    try:
-                        obs_count = len(ts_state.thompson.observations)
-                        if obs_count >= 5:  # Only share if we have meaningful data
-                            self.hive_bridge.share_posterior_summary(
-                                peer_id=peer_id,
-                                posterior_mean=ts_state.thompson.posterior_mean,
-                                posterior_std=ts_state.thompson.posterior_std,
-                                observation_count=obs_count,
-                                corridor_role=corridor_role
-                            )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_COMPETE: Failed to share posterior: {e}",
-                            level='debug'
-                        )
-
-                    # Query fleet posteriors for competition avoidance
-                    try:
-                        fleet_posteriors = self.hive_bridge.query_fleet_posteriors(peer_id)
-                        if fleet_posteriors and fleet_posteriors.get("members"):
-                            # Analyze if we're in a crowded region
-                            our_mean = ts_state.thompson.posterior_mean
-                            crowded_region = False
-                            differentiation_direction = 0  # -1 = lower, 1 = higher
-
-                            for member in fleet_posteriors["members"]:
-                                member_mean = member.get("mean", 0)
-                                member_std = member.get("std", 100)
-
-                                # Check if posteriors significantly overlap
-                                # (means within 1.5 std of each other)
-                                overlap_threshold = 1.5 * max(ts_state.thompson.posterior_std, member_std)
-                                if abs(our_mean - member_mean) < overlap_threshold:
-                                    crowded_region = True
-
-                                    # Determine differentiation direction based on corridor role
-                                    # Primary corridors go slightly lower (volume capture)
-                                    # Secondary corridors go slightly higher (margin capture)
-                                    if corridor_role == "P":
-                                        differentiation_direction = -1  # Primary goes lower
-                                    else:
-                                        differentiation_direction = 1   # Secondary goes higher
-                                    break
-
-                            if crowded_region:
-                                # Compute differentiation offset (applied to sampled fee, NOT posterior)
-                                diff_amount = int(ts_state.thompson.posterior_std * 0.3)
-                                differentiation_offset = differentiation_direction * diff_amount
-                                self.plugin.log(
-                                    f"P2_COMPETE: {channel_id[:12]}... differentiating "
-                                    f"from crowded region (mean: {ts_state.thompson.posterior_mean:.0f}, "
-                                    f"offset={differentiation_offset:+d}, role={corridor_role})",
-                                    level='info'
-                                )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"P2_COMPETE: Failed to query fleet posteriors: {e}",
-                            level='debug'
-                        )
-
-            # =====================================================================
             # THOMPSON SAMPLING: Sample Fee
             # =====================================================================
             if self.ENABLE_SIMPLIFIED_FEE_PATH:
@@ -7135,19 +5482,8 @@ class HillClimbingFeeController:
                     raw_thompson_fee, floor_ppm, ceiling_ppm
                 )
             else:
-                # Legacy: stigmergic context + elasticity bias + competition offset
-                # Set context for exploration/exploitation balance based on:
-                # - Pheromone level: High = exploit, low = explore
-                # - Corridor role: Primary = exploit, secondary = explore
-                # - Time bucket: For time-aware posterior selection
-                ts_state.thompson.set_context_modulation(
-                    pheromone_level=pheromone_level,
-                    corridor_role=corridor_role,
-                    time_bucket=time_bucket
-                )
-
+                # Legacy: contextual + elasticity bias
                 # Sample fee from Thompson posterior (contextual if enough data)
-                # Now applies stigmergic modulation to exploration/exploitation
                 thompson_fee = ts_state.thompson.sample_fee_contextual(
                     context_key=context_key,
                     floor=floor_ppm,
@@ -7200,8 +5536,7 @@ class HillClimbingFeeController:
                 # Update volume tracking
                 ts_state.last_volume_sats = volume_since_sats
 
-                # Align downstream vars to hard constraints so Hive coordination
-                # doesn't re-apply legacy heuristic bounds
+                # Align downstream vars to hard constraints
                 effective_ceiling = _hard_ceiling_ppm
                 floor_ppm = _hard_floor_ppm
                 base_new_fee = new_fee_ppm
@@ -7300,53 +5635,14 @@ class HillClimbingFeeController:
                             )
 
                 # =====================================================================
-                # FLEET DEFENSE COORDINATION
-                # =====================================================================
-                # Query hive MyceliumDefenseSystem for fleet-wide threat warnings
-                # This allows coordinated defensive response across all fleet channels
-                fleet_threat_info = None
-                if self.hive_bridge and self.hive_bridge.is_available():
-                    try:
-                        defense_status = self.hive_bridge.query_defense_status(peer_id)
-                        if defense_status:
-                            fleet_threat_info = defense_status.get("peer_threat")
-
-                            # Update AIMD state with fleet threat info
-                            ts_state.aimd.update_fleet_threat(fleet_threat_info)
-
-                            # Log if threat is active
-                            if fleet_threat_info and fleet_threat_info.get("is_threat"):
-                                self.plugin.log(
-                                    f"FLEET_DEFENSE: {channel_id[:12]}... peer has active {fleet_threat_info.get('threat_type')} "
-                                    f"threat (severity={fleet_threat_info.get('severity', 0):.2f}, "
-                                    f"multiplier={fleet_threat_info.get('defensive_multiplier', 1.0):.2f})",
-                                    level='info'
-                                )
-                    except Exception as e:
-                        self.plugin.log(
-                            f"FLEET_DEFENSE: Failed to query defense status: {e}",
-                            level='debug'
-                        )
-                else:
-                    # Clear any stale fleet threat state when hive unavailable
-                    ts_state.aimd.update_fleet_threat(None)
-
-                # =====================================================================
                 # AIMD DEFENSE LAYER
                 # =====================================================================
                 # Apply AIMD modifier when in defense mode (after failure streak)
-                # Also applies fleet defensive multiplier for threat peers
                 new_fee_ppm = ts_state.aimd.apply_to_fee(thompson_fee, floor_ppm, ceiling_ppm)
 
                 # Build decision reason
                 effective_mod = ts_state.aimd.get_effective_modifier()
-                if ts_state.aimd.fleet_threat_active:
-                    decision_reason = (
-                        f"thompson_fleet_defense ({ts_state.aimd.fleet_threat_type}, "
-                        f"sev={ts_state.aimd.fleet_threat_severity:.2f}, "
-                        f"mod={effective_mod:.2f})"
-                    )
-                elif ts_state.aimd.is_active:
+                if ts_state.aimd.is_active:
                     decision_reason = f"thompson_aimd_defense (mod={effective_mod:.2f})"
                 else:
                     decision_reason = f"thompson_sample (ctx={context_key})"
@@ -7445,28 +5741,6 @@ class HillClimbingFeeController:
                         level='debug'
                     )
 
-            # =====================================================================
-            # Hive Coordination (preserved from Hill Climbing)
-            # =====================================================================
-            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not is_congested:
-                coord_rec = self._get_coordinated_fee_recommendation(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    current_fee=new_fee_ppm,
-                    local_balance_pct=outbound_ratio
-                )
-                if coord_rec is not None:
-                    weight = self.HIVE_COORDINATION_WEIGHT
-                    blended_fee = int(new_fee_ppm * (1 - weight) + coord_rec * weight)
-                    blended_fee = max(floor_ppm, min(effective_ceiling, blended_fee))
-                    if blended_fee != new_fee_ppm:
-                        self.plugin.log(
-                            f"THOMPSON_HIVE: {channel_id[:12]}... blending "
-                            f"{new_fee_ppm}->{blended_fee} ppm",
-                            level='debug'
-                        )
-                        new_fee_ppm = blended_fee
-
             # Fee anchor blend (advisor soft target)
             if not self.ENABLE_SIMPLIFIED_FEE_PATH:
                 new_fee_ppm, anchor_reason = self._apply_fee_anchor(
@@ -7474,35 +5748,6 @@ class HillClimbingFeeController:
                 )
                 if anchor_reason:
                     decision_reason = f"{decision_reason}+{anchor_reason}"
-
-            # Defense multiplier -- skip in Thompson path: already applied inside aimd.apply_to_fee()
-            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not self.ENABLE_THOMPSON_AIMD:
-                defense_fee = self._apply_defense_multiplier(peer_id, new_fee_ppm)
-                if defense_fee != new_fee_ppm:
-                    new_fee_ppm = max(floor_ppm, defense_fee)
-
-            # Fleet-aware adjustment
-            if self.hive_bridge and not is_congested:
-                fleet_adjusted_fee = self._get_fleet_aware_fee_adjustment(peer_id, new_fee_ppm)
-                if fleet_adjusted_fee != new_fee_ppm:
-                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, fleet_adjusted_fee))
-
-            # Internal competition avoidance
-            if self.hive_bridge and self.ENABLE_COMPETITION_AVOIDANCE and not is_congested:
-                competition_adjusted = self._check_internal_competition(peer_id, new_fee_ppm, channel_id)
-                if competition_adjusted != new_fee_ppm:
-                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, competition_adjusted))
-
-            if self.hive_bridge and not is_congested:
-                biased_fee = self._apply_hive_egress_desaturation_bias(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    proposed_fee_ppm=new_fee_ppm,
-                    effective_ceiling_ppm=effective_ceiling,
-                    cfg=cfg,
-                )
-                if biased_fee != new_fee_ppm:
-                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, biased_fee))
 
             # =====================================================================
             # Thompson+AIMD State Saving and Result Preparation
@@ -7793,18 +6038,6 @@ class HillClimbingFeeController:
                         level='debug'
                     )
 
-            # =================================================================
-            # PHASE 15: Pheromone-Biased Direction
-            # Use historical routing success (pheromone levels) to influence
-            # the step direction. Strong pheromone = we're near a good fee.
-            # =================================================================
-            if self.hive_bridge and self.ENABLE_PHEROMONE_BIAS:
-                biased_direction = self._get_pheromone_bias(
-                    channel_id, current_fee_ppm, new_direction
-                )
-                if biased_direction != new_direction:
-                    new_direction = biased_direction
-
             # Calculate base new fee (Hill Climbing step)
             base_new_fee = current_fee_ppm + (new_direction * step_ppm)
 
@@ -7874,92 +6107,12 @@ class HillClimbingFeeController:
 
             new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
 
-            # =================================================================
-            # YIELD OPTIMIZATION PHASE 2: Coordinated Fee Recommendation
-            # Query cl-hive for coordinated fee that considers corridors,
-            # pheromones, stigmergic markers, and defense status.
-            # =================================================================
-            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION and not is_congested:
-                coord_rec = self._get_coordinated_fee_recommendation(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    current_fee=new_fee_ppm,
-                    local_balance_pct=outbound_ratio  # 0.0-1.0
-                )
-                if coord_rec is not None:
-                    # Blend coordinated recommendation with local decision
-                    weight = self.HIVE_COORDINATION_WEIGHT
-                    blended_fee = int(new_fee_ppm * (1 - weight) + coord_rec * weight)
-
-                    # Clamp to bounds
-                    blended_fee = max(floor_ppm, min(effective_ceiling, blended_fee))
-
-                    if blended_fee != new_fee_ppm:
-                        self.plugin.log(
-                            f"HIVE_COORD: Blending recommendation for {channel_id[:12]}... "
-                            f"local={new_fee_ppm} coord={coord_rec} -> blended={blended_fee} "
-                            f"(weight={weight})",
-                            level='debug'
-                        )
-                        new_fee_ppm = blended_fee
-
             # Fee anchor blend (advisor soft target)
             new_fee_ppm, anchor_reason = self._apply_fee_anchor(
                 channel_id, new_fee_ppm, floor_ppm, effective_ceiling
             )
             if anchor_reason:
                 decision_reason = f"{decision_reason}+{anchor_reason}"
-
-            # =================================================================
-            # YIELD OPTIMIZATION PHASE 2: Defense Multiplier
-            # Apply defensive fee multiplier if peer is flagged as a threat.
-            # Part of the Mycelium Defense System.
-            # =================================================================
-            if self.hive_bridge and self.ENABLE_HIVE_COORDINATION:
-                defense_fee = self._apply_defense_multiplier(peer_id, new_fee_ppm)
-                if defense_fee != new_fee_ppm:
-                    # Defense multiplier can exceed normal ceiling for threats
-                    if saturation_drain_ceiling is not None:
-                        new_fee_ppm = max(floor_ppm, min(effective_ceiling, defense_fee))
-                    else:
-                        new_fee_ppm = max(floor_ppm, defense_fee)
-
-            # =================================================================
-            # PHASE 2: Fleet-Aware Fee Adjustment
-            # Apply minor adjustments based on fleet liquidity needs.
-            # INFORMATION ONLY - no fund transfers between nodes.
-            # =================================================================
-            if self.hive_bridge and not is_congested:
-                fleet_adjusted_fee = self._get_fleet_aware_fee_adjustment(
-                    peer_id, new_fee_ppm
-                )
-                if fleet_adjusted_fee != new_fee_ppm:
-                    # Re-clamp to bounds after fleet adjustment
-                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, fleet_adjusted_fee))
-
-            # =================================================================
-            # PHASE 15: Internal Competition Avoidance
-            # Check if we're competing with other fleet members for this peer.
-            # If we're secondary, don't undercut the primary member.
-            # =================================================================
-            if self.hive_bridge and self.ENABLE_COMPETITION_AVOIDANCE and not is_congested:
-                competition_adjusted = self._check_internal_competition(
-                    peer_id, new_fee_ppm, channel_id
-                )
-                if competition_adjusted != new_fee_ppm:
-                    # Re-clamp after competition adjustment
-                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, competition_adjusted))
-
-            if self.hive_bridge and not is_congested:
-                biased_fee = self._apply_hive_egress_desaturation_bias(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    proposed_fee_ppm=new_fee_ppm,
-                    effective_ceiling_ppm=effective_ceiling,
-                    cfg=cfg,
-                )
-                if biased_fee != new_fee_ppm:
-                    new_fee_ppm = max(floor_ppm, min(effective_ceiling, biased_fee))
 
         # =====================================================================
         # DYNAMIC HTLC POLICY TARGETS
@@ -8192,7 +6345,7 @@ class HillClimbingFeeController:
             channel_id, new_fee_ppm, reason=reason,
             reason_code=fee_reason_code,
             heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None,
-            enforce_limits=(fee_reason_code not in (FeeReasonCode.ZERO_FEE_PROBE.value, FeeReasonCode.POLICY_HIVE.value)),
+            enforce_limits=(fee_reason_code != FeeReasonCode.ZERO_FEE_PROBE.value),
             channel_info=channel_info,
             htlcmin_msat=htlcmin_msat,
             htlcmax_msat=htlcmax_msat
@@ -8218,24 +6371,6 @@ class HillClimbingFeeController:
                 ts_state.last_state = decision_reason
                 ts_state.last_update = now
                 self._save_thompson_aimd_state(channel_id, ts_state)
-
-            # Report observation to cl-hive for collective intelligence (Phase 2)
-            if self.hive_bridge:
-                try:
-                    self.hive_bridge.report_observation(
-                        peer_id=peer_id,
-                        our_fee_ppm=new_fee_ppm,
-                        their_fee_ppm=None,  # Could be fetched from listchannels
-                        volume_sats=volume_since_sats,
-                        forward_count=forward_count,
-                        period_hours=hours_elapsed
-                    )
-                except Exception as e:
-                    # Fire-and-forget - don't let reporting errors affect fee changes
-                    self.plugin.log(
-                        f"HIVE_INTEL: Failed to report observation for {peer_id[:12]}...: {e}",
-                        level='debug'
-                    )
 
             # Build structured log line (fee_reason_code already computed above)
             modifiers_summary = ""
@@ -8535,7 +6670,9 @@ class HillClimbingFeeController:
         ts_state: ThompsonAIMDState,
     ) -> ThompsonAIMDState:
         """Reset Thompson beliefs and clear any learned autoband after regime change."""
-        ts_state.thompson = self._initialize_thompson_from_hive(channel_id, peer_id)
+        ts_state.thompson = GaussianThompsonState()
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+        ts_state.thompson.prior_std_fee = cfg.thompson_prior_std_fee
         ts_state.aimd.reset()
         ts_state.set_auto_band(None)
         self._save_thompson_aimd_state(channel_id, ts_state)
@@ -8683,8 +6820,7 @@ class HillClimbingFeeController:
         original_fee_ppm = fee_ppm
         # Absolute safety clamp always applies.
         fee_ppm = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, int(fee_ppm)))
-        # Economic policy clamp applies unless explicitly bypassed (force/manual overrides,
-        # hive 0-fee covenant, etc).
+        # Economic policy clamp applies unless explicitly bypassed (force/manual overrides, etc).
         if enforce_limits:
             fee_ppm = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, fee_ppm))
         if fee_ppm != original_fee_ppm:
@@ -8787,7 +6923,6 @@ class HillClimbingFeeController:
             # (algorithm-driven changes update their own state post-call).
             should_sync_state = manual or reason_code in (
                 FeeReasonCode.POLICY_STATIC.value,
-                FeeReasonCode.POLICY_HIVE.value,
                 FeeReasonCode.ZERO_FEE_PROBE.value,
                 FeeReasonCode.GOSSIP_REFRESH.value,
                 FeeReasonCode.CHANNEL_OPEN.value,
@@ -8851,8 +6986,7 @@ class HillClimbingFeeController:
         Decision priority:
         1. PASSIVE policy  -> skip (no fee management)
         2. STATIC policy   -> set fixed target fee
-        3. HIVE policy     -> set hive fee (typically 0)
-        4. DYNAMIC policy  -> Thompson prior sample (or prior mean)
+        3. DYNAMIC policy  -> Thompson prior sample (or prior mean)
 
         Args:
             channel_id: Channel ID from the channel_state_changed event
@@ -8955,22 +7089,10 @@ class HillClimbingFeeController:
                         channel_info=channel_info
                     )
 
-                if policy.strategy == FeeStrategy.HIVE:
-                    hive_fee = cfg.hive_fee_ppm
-                    self.plugin.log(
-                        f"INITIAL_FEE: {scid[:16]}... -> {hive_fee} PPM (HIVE policy)"
-                    )
-                    return self.set_channel_fee(
-                        scid, hive_fee,
-                        reason="Initial fee: HIVE policy",
-                        reason_code=FeeReasonCode.POLICY_HIVE.value,
-                        enforce_limits=False,
-                        channel_info=channel_info
-                    )
-
             # ── DYNAMIC: Thompson prior sample ────────────────────────
             if self.ENABLE_THOMPSON_AIMD:
-                ts = self._initialize_thompson_from_hive(scid, peer_id)
+                ts = GaussianThompsonState()
+                ts.prior_std_fee = cfg.thompson_prior_std_fee
                 initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
             else:
                 # Fallback: use the configured prior mean, clamped to bounds
@@ -9489,233 +7611,6 @@ class HillClimbingFeeController:
         self._save_hill_climb_state(channel_id, hc_state)
         self.plugin.log(f"Reset Hill Climbing state for {channel_id}")
 
-    # =========================================================================
-    # Comprehensive Hive Data Integration (v1.8.0)
-    # =========================================================================
-    # These methods integrate with cl-hive for enhanced fee optimization
-    # and rebalancing decisions.
-
-    def should_skip_optimization(self, scid: str, peer_id: str = None) -> tuple:
-        """
-        Check if channel should be skipped for fee optimization.
-
-        Uses multiple hive data sources:
-        - Defense status: Skip if under defensive fee protection
-        - Channel flags: Skip if hive-internal (always 0 fee)
-
-        Args:
-            scid: Channel short_channel_id
-            peer_id: Optional peer ID for additional checks
-
-        Returns:
-            Tuple of (should_skip: bool, reason: str)
-        """
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-
-        # Check defense status
-        if getattr(cfg, 'hive_defense_status_enabled', True) and self.hive_bridge:
-            if self.hive_bridge.is_channel_under_defense(scid):
-                defense = self.hive_bridge.get_channel_defense_status(scid)
-                defense_type = defense.get('defense_type', 'unknown') if defense else 'unknown'
-                return True, f"Under {defense_type} defense"
-
-        # Check channel flags (hive-internal)
-        if getattr(cfg, 'hive_channel_flags_enabled', True) and self.hive_bridge:
-            if self.hive_bridge.is_channel_excluded_from_optimization(scid):
-                return True, "Hive-internal channel"
-
-        return False, ""
-
-    def get_fee_bounds_with_defense(
-        self,
-        scid: str,
-        base_floor: int,
-        base_ceiling: int
-    ) -> tuple:
-        """
-        Get fee bounds adjusted for defensive status.
-
-        If channel is under defense, the floor is raised to the defensive fee.
-
-        Args:
-            scid: Channel short_channel_id
-            base_floor: Base calculated floor
-            base_ceiling: Base calculated ceiling
-
-        Returns:
-            Tuple of (floor: int, ceiling: int)
-        """
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-
-        if not getattr(cfg, 'hive_defense_status_enabled', True) or not self.hive_bridge:
-            return base_floor, base_ceiling
-
-        defensive_floor = self.hive_bridge.get_defensive_fee_floor(scid)
-        if defensive_floor and defensive_floor > base_floor:
-            self.plugin.log(
-                f"DEFENSE FLOOR: {scid[:16]}... raising floor from {base_floor} to {defensive_floor} ppm",
-                level='info'
-            )
-            return defensive_floor, max(base_ceiling, defensive_floor + 100)
-
-        return base_floor, base_ceiling
-
-    def get_optimization_intensity(self, scid: str, peer_id: str) -> float:
-        """
-        Get optimization intensity based on peer quality.
-
-        High-quality peers get more aggressive optimization.
-        Avoid-quality peers get skipped or minimal optimization.
-
-        Args:
-            scid: Channel short_channel_id
-            peer_id: Peer public key
-
-        Returns:
-            Optimization intensity multiplier (0.0-1.5)
-        """
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-
-        if not getattr(cfg, 'hive_peer_quality_enabled', True) or not self.hive_bridge:
-            return 1.0
-
-        quality = self.hive_bridge.get_single_peer_quality(peer_id)
-        if not quality:
-            return 1.0
-
-        q = quality.get('quality', 'neutral')
-        if q == 'avoid':
-            self.plugin.log(
-                f"PEER QUALITY: {peer_id[:16]}... marked as 'avoid' - reducing optimization",
-                level='debug'
-            )
-            return 0.0  # Don't optimize - flag for review
-        elif q == 'good':
-            return 1.2  # More aggressive optimization
-        return 1.0
-
-    def get_exploration_rate(self, scid: str, default_rate: float = 0.15) -> float:
-        """
-        Get exploration rate for Thompson sampling based on channel maturity.
-
-        New channels need more exploration, mature channels should mostly
-        exploit known-good fees.
-
-        Args:
-            scid: Channel short_channel_id
-            default_rate: Default rate if no data available
-
-        Returns:
-            Exploration rate (0.0-1.0)
-        """
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-
-        if not getattr(cfg, 'hive_channel_ages_enabled', True) or not self.hive_bridge:
-            return default_rate
-
-        return self.hive_bridge.get_exploration_rate_for_channel(scid, default_rate)
-
-    def get_channels_to_optimize(
-        self,
-        all_channels: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """
-        Filter channels to exclude hive-internal and defense-protected channels.
-
-        Args:
-            all_channels: List of all channel info dicts
-
-        Returns:
-            Filtered list of channels suitable for optimization
-        """
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-
-        if not getattr(cfg, 'hive_channel_flags_enabled', True) or not self.hive_bridge:
-            return all_channels
-
-        filtered = []
-        for ch in all_channels:
-            scid = ch.get('channel_id') or ch.get('short_channel_id')
-            if not scid:
-                filtered.append(ch)
-                continue
-
-            # Check if excluded
-            should_skip, reason = self.should_skip_optimization(scid, ch.get('peer_id'))
-            if should_skip:
-                self.plugin.log(
-                    f"SKIP OPT: {scid[:16]}... - {reason}",
-                    level='debug'
-                )
-                continue
-
-            filtered.append(ch)
-
-        return filtered
-
-    def update_priors_from_history(self, scid: str, thompson_state) -> None:
-        """
-        Update Thompson sampling priors from historical fee change outcomes.
-
-        Uses cl-hive's fee change outcome data to adjust the Thompson
-        posterior based on what's worked in the past.
-
-        Args:
-            scid: Channel short_channel_id
-            thompson_state: The ThompsonAIMDState or GaussianThompsonState to update
-        """
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-
-        if not getattr(cfg, 'hive_decision_history_enabled', True) or not self.hive_bridge:
-            return
-
-        days = getattr(cfg, 'hive_decision_history_days', 30)
-        history = self.hive_bridge.get_fee_change_outcomes(scid, days)
-
-        if not history or not history.get('changes'):
-            return
-
-        # Count positive and negative outcomes
-        positive = 0
-        negative = 0
-        total_revenue_gain = 0
-
-        for change in history.get('changes', []):
-            outcome = change.get('outcome', {})
-            verdict = outcome.get('verdict', 'unknown')
-
-            if verdict == 'positive':
-                positive += 1
-                # Learn from the successful fee
-                fee = change.get('new_fee_ppm', 0)
-                revenue_after = outcome.get('revenue_after_24h', 0)
-                if fee > 0 and revenue_after > 0:
-                    total_revenue_gain += revenue_after - outcome.get('revenue_before_24h', 0)
-            elif verdict == 'negative':
-                negative += 1
-
-        if positive + negative == 0:
-            return
-
-        # Adjust Thompson state based on track record
-        # If more positive outcomes, lower the posterior std (more confident)
-        # If more negative outcomes, increase the posterior std (less confident)
-        if hasattr(thompson_state, 'thompson'):
-            ts = thompson_state.thompson
-            if positive > negative * 2:
-                # Strong positive track record - exploit more
-                ts.posterior_std = max(ts.MIN_STD, ts.posterior_std * 0.9)
-                self.plugin.log(
-                    f"HISTORY PRIOR: {scid[:16]}... positive track record, reducing exploration",
-                    level='debug'
-                )
-            elif negative > positive * 2:
-                # Strong negative track record - explore more
-                ts.posterior_std = min(200, ts.posterior_std * 1.1)
-                self.plugin.log(
-                    f"HISTORY PRIOR: {scid[:16]}... negative track record, increasing exploration",
-                    level='debug'
-                )
 
 
 # Keep alias for backward compatibility

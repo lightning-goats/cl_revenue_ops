@@ -29,13 +29,11 @@ from pyln.client import Plugin, RpcError
 
 from .config import Config, ConfigSnapshot
 from .database import Database
-from .hive_bridge import CoordinationInputs
 from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
 from .utils import parse_msat as _shared_parse_msat
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
-    from .hive_bridge import HiveFeeIntelligenceBridge
 
 
 # --- Temporal pre-positioning constants ---
@@ -157,7 +155,7 @@ class JobStatus(Enum):
 # REASON CODES FOR EXPLAINABILITY
 # =============================================================================
 # Structured reason codes for rebalance decisions. These codes enable
-# debugging, auditing, and fleet-wide analysis of rebalancer behavior.
+# debugging and auditing of rebalancer behavior.
 # =============================================================================
 
 class RebalanceReasonCode(Enum):
@@ -232,9 +230,6 @@ class RebalanceCandidate:
     # Direction: "pull" fills to_channel from sources; "push" drains to_channel to destinations
     direction: str = "pull"
 
-    # I-17 FIX: Track whether this rebalance was routed via fleet channels
-    via_fleet: bool = False
-
     # Multi-source peer IDs aligned with source_candidates (best-first).
     # Optional for backward compatibility; when absent, callers may fall back to primary_source_peer_id.
     source_candidate_peer_ids: List[str] = field(default_factory=list)
@@ -283,7 +278,6 @@ class RebalanceCandidate:
             "dynamic_channel_profit_budget_sats": self.dynamic_channel_profit_budget_sats,
             "recommended_cooldown_hours": round(self.recommended_cooldown_hours, 2) if self.recommended_cooldown_hours else 0.0,
             "expected_fee_sats": self.expected_fee_sats,
-            "via_fleet": self.via_fleet
         }
 
 
@@ -318,7 +312,6 @@ class JobManager:
     - Monitor job progress via sling-stats
     - Stop jobs on success, timeout, or error
     - Record results to database
-    - Report outcomes to hive for fleet coordination (Phase 7)
 
     Key Design Decision:
     We use sling-job for TACTICAL rebalancing (one-off moves), not permanent
@@ -329,12 +322,10 @@ class JobManager:
     # Default timeout: 2 hours (configurable)
     DEFAULT_JOB_TIMEOUT_SECONDS = 7200
 
-    def __init__(self, plugin: Plugin, config: Config, database: Database,
-                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
+    def __init__(self, plugin: Plugin, config: Config, database: Database):
         self.plugin = plugin
         self.config = config
         self.database = database
-        self.hive_bridge = hive_bridge
 
         # Active jobs indexed by target channel SCID (normalized format)
         self._active_jobs: Dict[str, ActiveJob] = {}
@@ -397,72 +388,6 @@ class JobManager:
                     peers.add(job.candidate.to_peer_id)
                     peers.add(job.candidate.primary_source_peer_id)
         return list(peers)
-
-    def _report_rebalancing_activity(self):
-        """Push current rebalancing state to cl-hive. Non-fatal on failure."""
-        if not self.hive_bridge:
-            return
-        try:
-            # L-1: Read both values under a single lock for consistency
-            with self._jobs_lock:
-                active = len(self._active_jobs) > 0
-                peers = set()
-                for job in self._active_jobs.values():
-                    if job is not None and job.candidate:
-                        peers.add(job.candidate.to_peer_id)
-                        peers.add(job.candidate.primary_source_peer_id)
-            self.hive_bridge.update_rebalancing_activity(
-                rebalancing_active=active,
-                rebalancing_peers=list(peers)
-            )
-        except Exception as e:
-            self.plugin.log(f"Hive rebalancing activity update failed: {e}", level='debug')
-
-    def _report_outcome_to_hive(self, job: ActiveJob, success: bool, cost_sats: int,
-                                 amount_transferred: int = 0, failure_reason: str = "") -> None:
-        """
-        Report rebalance outcome to hive for fleet coordination.
-
-        This enables:
-        - Circular flow detection (A→B→C→A wastes fees)
-        - Better rebalance coordination across fleet members
-        - Learning from successful/failed routes
-
-        Args:
-            job: The completed job
-            success: Whether rebalance succeeded
-            cost_sats: Fee cost of the rebalance
-            amount_transferred: Amount successfully moved (0 if failed)
-            failure_reason: Error description if failed
-        """
-        if not self.hive_bridge:
-            return
-
-        try:
-            # Determine if this was routed via fleet (check candidate metadata)
-            via_fleet = getattr(job.candidate, 'via_fleet', False) if job.candidate else False
-
-            self.hive_bridge.report_rebalance_outcome(
-                from_channel=job.from_scid,
-                to_channel=job.scid,
-                amount_sats=amount_transferred if success else job.target_amount_sats,
-                cost_sats=cost_sats,
-                success=success,
-                via_fleet=via_fleet,
-                failure_reason=failure_reason
-            )
-
-            self.plugin.log(
-                f"Reported rebalance outcome to hive: {job.scid} "
-                f"success={success} cost={cost_sats}sats",
-                level='debug'
-            )
-        except Exception as e:
-            # Non-fatal - don't fail the job handling for hive reporting
-            self.plugin.log(
-                f"Failed to report rebalance outcome to hive: {e}",
-                level='debug'
-            )
 
     def prune_stale_source_failures(self, active_channel_ids: set) -> int:
         """
@@ -753,9 +678,6 @@ class JobManager:
                 f"with {len(source_scids_sling)} source candidates"
             )
 
-            # Report updated rebalancing activity to fleet
-            self._report_rebalancing_activity()
-
             return {
                 "success": True,
                 "message": f"Job started for {to_scid} with {len(source_scids_sling)} source candidates"
@@ -831,9 +753,6 @@ class JobManager:
                             level='warn'
                         )
                 return False
-
-        # Report updated rebalancing activity to fleet
-        self._report_rebalancing_activity()
 
         return True
     
@@ -1269,10 +1188,6 @@ class JobManager:
         # H-4: Ensure reservation_id is str to match DB column type
         self.database.mark_budget_spent(str(job.rebalance_id), fee_sats)
 
-        # Report outcome to hive for fleet coordination (Phase 7)
-        self._report_outcome_to_hive(job, success=True, cost_sats=fee_sats,
-                                     amount_transferred=amount_transferred)
-
         # Stop the job
         self.stop_job(job.scid_normalized, reason="success")
 
@@ -1312,10 +1227,6 @@ class JobManager:
         # Release budget reservation (CRITICAL-01 fix)
         # H-4: Ensure reservation_id is str to match DB column type
         self.database.release_budget_reservation(str(job.rebalance_id))
-
-        # Report outcome to hive for fleet coordination (Phase 7)
-        self._report_outcome_to_hive(job, success=False, cost_sats=0, amount_transferred=0,
-                                     failure_reason=error_msg)
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
@@ -1368,11 +1279,6 @@ class JobManager:
         # L-17: Budget was actually spent (overspent), mark as spent not released
         # H-4: Ensure reservation_id is str to match DB column type
         self.database.mark_budget_spent(str(job.rebalance_id), actual_cost_sats)
-
-        # Report outcome to hive for fleet coordination (Phase 7)
-        self._report_outcome_to_hive(job, success=False, cost_sats=actual_cost_sats,
-                                     amount_transferred=0,
-                                     failure_reason=f"exceeded_budget: {msg}")
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="exceeded_budget")
@@ -1443,17 +1349,6 @@ class JobManager:
             self.database.mark_budget_spent(str(job.rebalance_id), fee_sats)
         else:
             self.database.release_budget_reservation(str(job.rebalance_id))
-
-        # Report outcome to hive for fleet coordination (Phase 7)
-        # MA-9: Use computed fee_sats instead of hardcoded 0
-        # Partial success is still reported as success to help fleet learning
-        self._report_outcome_to_hive(
-            job,
-            success=(amount_transferred > 0),
-            cost_sats=fee_sats,
-            amount_transferred=amount_transferred,
-            failure_reason="" if amount_transferred > 0 else "timeout"
-        )
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="timeout")
@@ -1811,19 +1706,6 @@ class JobManager:
                 except Exception as e:
                     self.plugin.log(f"Could not get policies for exclusion sync: {e}", level='debug')
 
-            # From hive defense system (high-severity threats)
-            if self.hive_bridge:
-                try:
-                    defense = self.hive_bridge.query_defense_status()
-                    if defense:
-                        for warning in defense.get("active_warnings", []):
-                            peer_id = warning.get("peer_id")
-                            severity = warning.get("severity", 0)
-                            if peer_id and severity >= 0.7:
-                                peers_to_exclude.add(peer_id)
-                except Exception as e:
-                    self.plugin.log(f"Failed to fetch hive defense warnings: {e}", level='debug')
-
             # Add new exclusions to sling
             for peer_id in peers_to_exclude:
                 if peer_id not in current_exclusions:
@@ -2041,27 +1923,6 @@ class JobManager:
             return self.source_failure_counts.get(channel_id, 0.0)
 
 
-# =============================================================================
-# NNLB Health-Aware Rebalancing Constants
-# =============================================================================
-# Each node adjusts its OWN rebalancing based on its health tier.
-# No sats transfer between nodes - purely local optimization.
-ENABLE_NNLB_BUDGET_SCALING = True
-DEFAULT_BUDGET_MULTIPLIER = 1.0
-
-# Tier multipliers for OWN operations
-NNLB_BUDGET_MULTIPLIERS = {
-    "struggling": 2.0,    # Accept higher costs to recover own channels
-    "vulnerable": 1.5,    # Elevated priority for own recovery
-    "stable": 1.0,        # Normal operation
-    "thriving": 0.75      # Be selective, save on routing fees
-}
-
-MIN_BUDGET_MULTIPLIER = 0.5
-MAX_BUDGET_MULTIPLIER = 2.5
-HEALTH_CACHE_TTL_SECONDS = 300  # 5 minutes
-
-
 class EVRebalancer:
     """
     Expected Value based rebalancer with async job queue support.
@@ -2077,11 +1938,6 @@ class EVRebalancer:
     a time. The _pending dict is the only shared state (accessed by async job
     callbacks) and is protected by _pending_lock.
 
-    NNLB Integration:
-    When cl-hive is available, the rebalancer adjusts its EV threshold
-    based on our health tier. Struggling nodes accept lower EV to recover
-    faster; thriving nodes are more selective to conserve routing fees.
-
     Known Limitations (documented, not bugs):
     - I-5: Balance delta can false-positive under concurrent forwarding — a forward
       completing during the measurement window inflates/deflates the delta. Fixing
@@ -2090,26 +1946,19 @@ class EVRebalancer:
       changes the SCID. A future migration to peer_id-keyed tracking would fix this.
     - I-18: Predictive rebalancing (pre-position liquidity before demand spikes) is a
       future feature requiring demand forecasting integration.
-    - I-19: HIVE_COORDINATED strategy is a placeholder for future fleet-coordinated
-      rebalancing where cl-hive directs liquidity flows.
     """
 
     def __init__(self, plugin: Plugin, config: Config, database: Database,
-                 policy_manager: Optional[PolicyManager] = None,
-                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
+                 policy_manager: Optional[PolicyManager] = None):
         self.plugin = plugin
         self.config = config
         self.database = database
         self.policy_manager = policy_manager
-        self.hive_bridge = hive_bridge
         self._pending: Dict[str, int] = {}
         self._pending_lock = threading.Lock()  # L-14: Protect _pending dict
         self._our_node_id: Optional[str] = None
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
 
-        # NNLB health caching
-        self._cached_health: Optional[Dict] = None
-        self._health_cache_time: float = 0
         # Optional callback injected by cl-revenue-ops to report external liquidity
         # costs (e.g. Boltz swap fees) for unified budget gating.
         self.external_liquidity_cost_provider = None
@@ -2124,8 +1973,8 @@ class EVRebalancer:
             "budget_blocked": False,
         }
 
-        # Initialize job manager for async execution (pass hive_bridge for outcome reporting)
-        self.job_manager = JobManager(plugin, config, database, hive_bridge=hive_bridge)
+        # Initialize job manager for async execution
+        self.job_manager = JobManager(plugin, config, database)
 
     def _set_last_decision_summary(
         self,
@@ -2175,19 +2024,6 @@ class EVRebalancer:
             return ev_max_fee_ppm
         return min(int(last_attempted_ppm * 1.5), ev_max_fee_ppm)
 
-    @staticmethod
-    def _fleet_fee_cap(ev_max_fee_ppm: int, both_hive: bool) -> int:
-        """
-        Determine fee cap based on fleet route topology.
-
-        Pure fleet (both hive): 0 PPM — all hops are fleet members at hive_fee_ppm=0.
-        Fleet-assisted (external dest): EV-derived maxppm — fleet hops are free,
-        only external hops cost. No reason to penalize.
-        """
-        if both_hive:
-            return 0
-        return ev_max_fee_ppm
-
     def _parse_msat(self, v: Any) -> int:
         """Delegate to shared parse_msat in utils.py."""
         return _shared_parse_msat(v)
@@ -2224,40 +2060,6 @@ class EVRebalancer:
                 self.plugin.log(f"Global budget limit provider failed: {e}", level='warn')
         return max(0, int((cfg or self.config.snapshot()).daily_budget_sats))
 
-    def _get_coordination_inputs(self, peer_id: str = "") -> CoordinationInputs:
-        if not self.hive_bridge or not self.hive_bridge.is_available():
-            return CoordinationInputs(mode="local_only")
-
-        priors: Dict[str, Any] = {}
-        peer_quality = None
-
-        if peer_id:
-            try:
-                peer_quality = self.hive_bridge.get_single_peer_quality(peer_id)
-                if peer_quality:
-                    priors["peer_quality"] = peer_quality
-            except Exception as e:
-                self.plugin.log(
-                    f"COORD_INPUTS: peer quality lookup failed for {peer_id[:12]}...: {e}",
-                    level='debug'
-                )
-
-            try:
-                defense = self.hive_bridge.query_defense_status(peer_id=peer_id)
-                if defense:
-                    priors["peer_threat"] = defense.get("peer_threat")
-            except Exception as e:
-                self.plugin.log(
-                    f"COORD_INPUTS: defense lookup failed for {peer_id[:12]}...: {e}",
-                    level='debug'
-                )
-
-        return CoordinationInputs(
-            mode="fleet_augmented",
-            priors=priors,
-            peer_quality=peer_quality,
-        )
-
     def _get_our_node_id(self) -> str:
         if self._our_node_id is None:
             try:
@@ -2267,12 +2069,6 @@ class EVRebalancer:
                 self.plugin.log(f"Error getting our node ID: {e}", level='error')
                 self._our_node_id = ""
         return self._our_node_id
-
-    def _is_hive_peer(self, peer_id: str) -> bool:
-        """Check if a peer is a hive fleet member via policy manager."""
-        if not peer_id or not self.policy_manager:
-            return False
-        return self.policy_manager.is_hive_peer(peer_id)
 
     def _get_channel_age_days(self, channel_id: str, channel_info: Dict = None) -> int:
         """
@@ -2318,51 +2114,6 @@ class EVRebalancer:
 
     def set_profitability_analyzer(self, analyzer: 'ChannelProfitabilityAnalyzer') -> None:
         self._profitability_analyzer = analyzer
-
-    def _calculate_nnlb_budget_multiplier(self) -> float:
-        """
-        Calculate OUR rebalance budget multiplier based on OUR health.
-
-        This adjusts how aggressively WE rebalance OUR OWN channels.
-        No sats transfer to other nodes - purely local optimization.
-
-        When struggling: accept lower EV (more willing to pay fees to recover)
-        When thriving: require higher EV (be selective, save on fees)
-
-        Returns:
-            Budget multiplier (0.5 - 2.5)
-        """
-        if not ENABLE_NNLB_BUDGET_SCALING or not self.hive_bridge:
-            return DEFAULT_BUDGET_MULTIPLIER
-
-        # Check cache
-        now = time.time()
-        if (self._cached_health is not None and
-                now - self._health_cache_time < HEALTH_CACHE_TTL_SECONDS):
-            return self._cached_health.get("budget_multiplier", DEFAULT_BUDGET_MULTIPLIER)
-
-        # Query hive for OUR health (None = self)
-        health = self.hive_bridge.query_member_health()
-        if not health:
-            return DEFAULT_BUDGET_MULTIPLIER
-
-        tier = health.get("health_tier", "stable")
-        multiplier = NNLB_BUDGET_MULTIPLIERS.get(tier, DEFAULT_BUDGET_MULTIPLIER)
-
-        # Clamp to bounds
-        multiplier = max(MIN_BUDGET_MULTIPLIER, min(MAX_BUDGET_MULTIPLIER, multiplier))
-
-        # Cache the computed multiplier (not just the raw health dict)
-        health["budget_multiplier"] = multiplier
-        self._cached_health = health
-        self._health_cache_time = now
-
-        self.plugin.log(
-            f"NNLB: Our health tier={tier}, budget_multiplier={multiplier:.2f}",
-            level='debug'
-        )
-
-        return multiplier
 
     def find_rebalance_candidates(self) -> List[RebalanceCandidate]:
         """
@@ -2448,21 +2199,6 @@ class EVRebalancer:
             
             # Hoist peer connection status call - do it once instead of per-candidate
             peer_status = self._get_peer_connection_status()
-
-            # Query fleet balance state for mutual-benefit detection
-            self._fleet_mutual_benefit = {}  # {member_peer_id: set of need_types toward us}
-            if self.hive_bridge:
-                try:
-                    fleet_needs = self.hive_bridge.query_fleet_liquidity_needs()
-                    our_id = self._get_our_node_id()
-                    for need in fleet_needs:
-                        if need.get("peer_id") == our_id:
-                            member_id = need.get("member_id", "")
-                            need_type = need.get("need_type", "")
-                            if member_id:
-                                self._fleet_mutual_benefit.setdefault(member_id, set()).add(need_type)
-                except Exception as e:
-                    self.plugin.log(f"Failed to fetch fleet liquidity needs: {e}", level='debug')
 
             # Get set of channels with active jobs
             active_channels = set(self.job_manager.active_channels)
@@ -3056,27 +2792,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         outbound_fee_ppm = broadcast_fee_ppm
         inbound_fee_ppm = self._estimate_inbound_fee(dest_info.get("peer_id", ""))
 
-        # Check if destination is a hive peer (relax profitability requirements)
-        is_hive_destination = False
         dest_peer_id = dest_info.get("peer_id", "")
-        if self.policy_manager:
-            if dest_peer_id:
-                policy = self.policy_manager.get_policy(dest_peer_id)
-                if policy.strategy == FeeStrategy.HIVE:
-                    is_hive_destination = True
-
-        # MUTUAL BENEFIT: Check if dest hive peer has complementary imbalance
-        dest_mutual_benefit = False
-        if is_hive_destination and dest_peer_id:
-            dest_needs = getattr(self, '_fleet_mutual_benefit', {}).get(dest_peer_id, set())
-            if "inbound" in dest_needs:
-                dest_mutual_benefit = True
 
         # Get ALL profitable source candidates (sorted by score, best first)
         source_candidates = self._select_source_candidates(
             sources, rebalance_amount, dest_channel, outbound_fee_ppm, inbound_fee_ppm,
-            peer_status=peer_status, is_hive_destination=is_hive_destination,
-            dest_mutual_benefit=dest_mutual_benefit
+            peer_status=peer_status,
         )
         
         if not source_candidates: 
@@ -3096,21 +2817,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         weighted_opp_cost = primary_opp_cost
         spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
         
-        # Allow slightly negative spread only for hive destinations (strategic).
-        # For non-hive peers we require non-negative spread to avoid consistent leakage.
-        if is_hive_destination:
-            tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(rebalance_amount, 1))
-            tolerance_ppm = min(tolerance_ppm, self.config.max_fee_ppm)
-            if spread_ppm < -tolerance_ppm:
-                return None
-        else:
-            if spread_ppm < 0:
-                return None
-            tolerance_ppm = 0
+        # Require non-negative spread to avoid consistent leakage.
+        if spread_ppm < 0:
+            return None
 
-        # When spread is negative (within tolerance, hive only), budget is the tolerance amount
-        # we're willing to spend. When positive, budget is the spread itself.
-        effective_spread_ppm = max(1, spread_ppm) if spread_ppm > 0 else max(1, tolerance_ppm)
+        effective_spread_ppm = max(1, spread_ppm)
         raw_budget_msat = (effective_spread_ppm * amount_msat) // 1_000_000
         # ZERO-TOLERANCE: Avoid a zero-sats budget due to integer truncation.
         # We clamp to at least 1 sat (1000 msat). This is conservative: it makes EV slightly worse,
@@ -3136,13 +2847,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         #
         # Note: This applies to max_budget_sats (the fee cap for this trade), not
         # total routing capital. For daily budget management, see reserve_budget().
-        # Bypass Kelly for fleet/hive destinations when enabled.
-        # Fleet paths use zero-fee internal channels, so Kelly's EV gate
-        # (which sizes budget based on routing fee risk) is counterproductive —
-        # it kills candidates before the fleet path optimizer can apply free routing.
-        skip_kelly = (is_hive_destination and self.config.kelly_bypass_for_fleet)
 
-        if self.config.enable_kelly and not skip_kelly:
+        if self.config.enable_kelly:
             reputation = self.database.get_peer_reputation(dest_info.get("peer_id", ""))
             historical_p = reputation.get('score', 0.5)  # Historical success probability
 
@@ -3174,12 +2880,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # MA-5: Ensure at least 1 sat budget when Kelly fraction is positive but small
             max_budget_sats = max(1, int(max_budget_sats * kelly_safe))
             max_budget_msat = max_budget_sats * 1000
-        elif skip_kelly:
-            self.plugin.log(
-                f"KELLY_BYPASS: Skipping Kelly for hive destination {dest_channel[:12]}... "
-                f"(fleet path may provide zero-fee routing)",
-                level='info'
-            )
 
         # HOT CHANNEL PROTECTION: budget override tied to channel profitability.
         hot_budget_override_sats = 0
@@ -3208,14 +2908,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             budget_ppm = (max_budget_msat * 1_000_000) // amount_msat if amount_msat > 0 else 0
 
             # Optional heuristic upper bound, but ALWAYS clamp to the sats-budget-derived ppm.
-            # When spread_ppm is negative (hive tolerance exemption), the heuristic
-            # would produce a sub-1 ppm cap, making the route unexecutable. In that
-            # case, defer to the budget-derived cap which already accounts for the
-            # tolerance-based budget.
-            if spread_ppm >= 0:
-                heuristic_ppm = inbound_fee_ppm + (spread_ppm // 2)
-            else:
-                heuristic_ppm = budget_ppm
+            heuristic_ppm = inbound_fee_ppm + (spread_ppm // 2)
             max_fee_ppm = max(1, min(heuristic_ppm, budget_ppm)) if budget_ppm > 0 else 0
         else:
             max_fee_ppm = 0
@@ -3316,10 +3009,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # (the worst-case ceiling). max_budget_sats is still passed to Sling as the
         # hard cap, but EV should reflect the likely cost, not the worst case.
         # =================================================================
-        # I-3 FIX: Cap budget ceiling at utilization-adjusted income for non-hive peers.
+        # I-3 FIX: Cap budget ceiling at utilization-adjusted income.
         # Without this, Sling can spend up to the full-spread budget even though
         # utilization < 1.0 means we won't earn the full spread before next rebalance.
-        if not is_hive_destination and expected_income > 0:
+        if expected_income > 0:
             max_budget_sats = min(max_budget_sats, max(1, expected_income))
             max_budget_msat = max_budget_sats * 1000
 
@@ -3329,7 +3022,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         expected_profit = expected_income - expected_fee_sats - expected_source_loss
         
-        # Strategic Rebalance Exemption: Dynamic threshold based on destination policy
         # PPM-BASED PROFIT GATE: When rebalance_min_profit_ppm > 0, the threshold
         # scales linearly with rebalance_amount, decoupling acceptance from chunk size.
         if self.config.rebalance_min_profit_ppm > 0:
@@ -3337,43 +3029,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         else:
             profit_threshold = self.config.rebalance_min_profit
 
-        # NNLB Health-Aware Threshold Adjustment:
-        # When struggling: accept lower profit (threshold / multiplier)
-        # When thriving: require higher profit (threshold / multiplier)
-        # This adjusts OUR OWN rebalancing aggression - no fund transfers.
-        nnlb_multiplier = self._calculate_nnlb_budget_multiplier()
-        if nnlb_multiplier != 1.0 and profit_threshold > 0:
-            # Divide threshold by multiplier:
-            # - Struggling (2.0x): threshold becomes 50% -> accept lower profit
-            # - Thriving (0.75x): threshold becomes 133% -> require higher profit
-            profit_threshold = int(profit_threshold / nnlb_multiplier)
-
-        is_hive_transfer = bool(is_hive_destination)
-        if is_hive_transfer:
-            # Allow negative profit (cost) up to tolerance for hive transfers (strategic).
-            # A depleted channel earns nothing — small rebalance loss is worth it for fleet coordination.
-            profit_threshold = min(profit_threshold, -(self.config.hive_rebalance_tolerance))
-
         # Check Profit against Dynamic Threshold
         if expected_profit < profit_threshold:
-            if is_hive_transfer:
-                msg = (
-                    f"REBALANCE SKIPPED: Profit {expected_profit} < Threshold {profit_threshold} "
-                    f"(tolerance={self.config.hive_rebalance_tolerance})"
-                )
-            else:
-                msg = f"REBALANCE SKIPPED: Profit {expected_profit} < Threshold {profit_threshold}"
-            self.plugin.log(msg, level='debug')
-            return None
-        
-        # Log Success (Strategic override)
-        if is_hive_transfer and expected_profit < 0:
             self.plugin.log(
-                f"STRATEGIC EXEMPTION: Allowing negative EV rebalance to Hive Peer {dest_channel}. "
-                f"Cost: {abs(expected_profit)} sats (Tolerance: {self.config.hive_rebalance_tolerance})",
-                level='info'
+                f"REBALANCE SKIPPED: Profit {expected_profit} < Threshold {profit_threshold}",
+                level='debug'
             )
-        
+            return None
+
         return RebalanceCandidate(
             source_candidates=source_scids,
             to_channel=dest_channel,
@@ -3668,11 +3331,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         """
         Estimate the inbound routing fee to reach a peer.
 
-        ENHANCED (Phase 6): Prioritizes historical actual costs over heuristics.
-        ENHANCED (Phase 7): Zero fee for hive fleet members.
+        Prioritizes historical actual costs over heuristics.
 
         Priority order:
-        0. HIVE peer - Zero fee (fleet members have 0 fee channels)
         1. Historical data (high confidence) - Use median, most accurate
         2. Historical data (medium) - Blend with last-hop fee
         3. Historical data (low) - Use with buffer
@@ -3684,22 +3345,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             Estimated inbound fee in PPM
         """
         # =====================================================================
-        # PHASE 7: HIVE Fleet Zero-Fee Priority
-        # =====================================================================
-        # Hive fleet members have 0 fee channels between them. When routing
-        # through a hive peer, the cost is zero. This is the highest priority
-        # check to ensure we utilize fleet connectivity efficiently.
-        # =====================================================================
-
-        if self.policy_manager and self.policy_manager.is_hive_peer(peer_id):
-            self.plugin.log(
-                f"INBOUND FEE EST [{peer_id[:12]}...]: HIVE peer - 0 PPM (fleet zero-fee)",
-                level='debug'
-            )
-            return 0
-
-        # =====================================================================
-        # PHASE 6: Historical-First Fee Estimation
+        # Historical-First Fee Estimation
         # =====================================================================
         # Real rebalance costs are the ground truth. Use them when available.
         # Historical data accounts for actual multi-hop routes, not just last hop.
@@ -3887,15 +3533,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         dest_outbound_fee_ppm: int,
         dest_inbound_fee_ppm: int,
         peer_status: Optional[Dict] = None,
-        is_hive_destination: bool = False,
-        dest_mutual_benefit: bool = False
     ) -> List[Tuple[str, Dict[str, Any], int, float]]:
         """
         Select all profitable source channels for a rebalance.
 
         Instead of returning a single "best" source, this returns ALL sources
         that have a positive spread (EV > 0), sorted by score (highest first).
-        For hive destinations, allows negative spread up to hive_rebalance_tolerance.
         This allows Sling to handle pathfinding failover automatically.
         
         Args:
@@ -4055,43 +3698,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             turnover_weight = base_turnover_weight * flow_multiplier * temporal_factor
             weighted_opp_cost = int(source_fee_ppm * turnover_weight)
 
-            # =================================================================
-            # FLEET-AWARE INBOUND FEE (Phase 7 Enhancement)
-            # =================================================================
-            # When the source is a hive member, the route goes through zero-fee
-            # fleet channels: us -> fleet_member -> ... -> destination.
-            # The first hop(s) are free, so the effective inbound cost is much
-            # lower than the global estimate which assumes external multi-hop routing.
-            # =================================================================
-            effective_inbound = dest_inbound_fee_ppm
-            source_is_hive = bool(
-                pid and self.policy_manager
-                and self.policy_manager.is_hive_peer(pid)
-            )
-            if source_is_hive:
-                if is_hive_destination:
-                    # Pure fleet route: us -> fleet_src -> fleet_dest, all zero-fee
-                    effective_inbound = 0
-                else:
-                    # Fleet covers most of the route; only the last hop(s) to the
-                    # external destination cost fees.  Use 10% of the external
-                    # estimate as a conservative floor.
-                    effective_inbound = max(dest_inbound_fee_ppm // 10, 0)
-
             # Calculate spread: what we earn minus what it costs
-            spread_ppm = dest_outbound_fee_ppm - effective_inbound - weighted_opp_cost
+            spread_ppm = dest_outbound_fee_ppm - dest_inbound_fee_ppm - weighted_opp_cost
 
-            # Allow slightly negative spread only for hive destinations (strategic).
-            # For non-hive peers we require non-negative spread to avoid consistent leakage.
-            if is_hive_destination:
-                tolerance_ppm = int((self.config.hive_rebalance_tolerance * 1_000_000) / max(amount_needed, 1))
-                tolerance_ppm = min(tolerance_ppm, self.config.max_fee_ppm)
-                min_spread = -tolerance_ppm
-            else:
-                min_spread = 0
-
-            # Only include sources meeting spread threshold
-            if spread_ppm < min_spread:
+            # Require non-negative spread to avoid consistent leakage.
+            if spread_ppm < 0:
                 rejections['negative_spread'] += 1
                 # Track the best rejected spread for diagnostics
                 if best_rejected_spread is None or spread_ppm > best_rejected_spread['spread']:
@@ -4099,11 +3710,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         'channel': cid,
                         'spread': spread_ppm,
                         'dest_fee': dest_outbound_fee_ppm,
-                        'inbound_fee': effective_inbound,
+                        'inbound_fee': dest_inbound_fee_ppm,
                         'opp_cost': weighted_opp_cost,
                         'flow_state': flow_state,
-                        'is_hive': is_hive_destination,
-                        'source_is_hive': source_is_hive
                     }
                 continue
 
@@ -4131,41 +3740,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     self.plugin.log(f"STAGNANT BONUS: Applying +10 priority to stagnant channel {cid[:12]}...", level='info')
 
                 score += 20
-            
-            # HIVE PRIORITY: Prefer fleet channels for zero-fee internal routing
-            # This ensures sling tries hive routes first before external paths
-            if source_is_hive:
-                score += 150
-                self.plugin.log(f"HIVE BONUS: Applying +150 priority to fleet channel {cid[:12]}...", level='debug')
-
-            # MUTUAL BENEFIT: Rebalance benefits both us and the destination hive peer
-            if dest_mutual_benefit and source_is_hive:
-                score += 200
-                self.plugin.log(
-                    f"MUTUAL BENEFIT: +200 for {cid[:12]}... "
-                    f"(fleet peer's reverse channel is complementary)",
-                    level='info'
-                )
-
-            # Source-side mutual benefit: source hive peer is depleted toward us
-            if source_is_hive and pid:
-                source_needs = getattr(self, '_fleet_mutual_benefit', {}).get(pid, set())
-                if "outbound" in source_needs:
-                    score += 200
-                    self.plugin.log(
-                        f"MUTUAL BENEFIT: +200 for source {cid[:12]}... "
-                        f"(fleet peer depleted toward us, draining them helps both)",
-                        level='info'
-                    )
-
-            # MULTI-PEER ROUTE: Route traverses 2+ hive members
-            if source_is_hive and is_hive_destination:
-                score += 100
-                self.plugin.log(
-                    f"MULTI-PEER ROUTE: +100 for {cid[:12]}... "
-                    f"(route includes 2+ hive members)",
-                    level='info'
-                )
 
             # RELIABILITY PENALTY: Penalize sources with recent failures
             fails = self.job_manager.get_source_failure_count(cid)
@@ -4300,209 +3874,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         # Thread-safe config snapshot for this execution
         cfg = self.config.snapshot()
-
-        # =====================================================================
-        # PHASE 2: Check for Fleet Rebalancing Conflict
-        # Avoid competing for same routes as other hive members.
-        # INFORMATION ONLY - no fund transfers between nodes.
-        # =====================================================================
-        fleet_path_info = None
-        if self.hive_bridge:
-            # Check for fleet member conflicts. Downgraded from hard block to
-            # skip-fleet: two fleet members rebalancing to the same external peer
-            # via different routes is fine — just don't inject fleet paths.
-            skip_fleet_path = False
-            conflict = self.hive_bridge.check_rebalance_conflict(
-                peer_id=candidate.to_peer_id,
-                direction="outbound",
-                amount_sats=candidate.amount_sats,
-            )
-            if conflict.get("conflict"):
-                reason = conflict.get("reason", "Fleet member rebalancing through same peer")
-                self.plugin.log(
-                    f"FLEET_CONFLICT: {candidate.to_channel[:12]}... skipping fleet path "
-                    f"({reason}), using normal routing",
-                    level='info'
-                )
-                skip_fleet_path = True
-
-            # Log traffic intelligence info (informational — does not block)
-            if conflict.get("peer_in_peak_hours"):
-                window = conflict.get("suggested_window_utc")
-                self.plugin.log(
-                    f"TRAFFIC_INTEL: {candidate.to_channel[:12]}... peer in peak hours"
-                    f"{f', suggested window: {window}' if window else ''}",
-                    level='info'
-                )
-
-            if not skip_fleet_path:
-                # =====================================================================
-                # PHASE 9: Circular Flow Prevention
-                # Check if source or dest peer is in a known circular flow pattern.
-                # Fails open — if check fails, rebalance proceeds.
-                # =====================================================================
-                circular_risk = self.hive_bridge.check_circular_flow_risk(
-                    source_peer_id=candidate.primary_source_peer_id,
-                    dest_peer_id=candidate.to_peer_id
-                )
-                if circular_risk.get("risk"):
-                    self._set_last_decision_summary(
-                        action="suppressed",
-                        reason="circular_flow_risk",
-                        dominant_input="circular_flow_risk",
-                        safety_block=True,
-                        budget_blocked=False,
-                    )
-                    flow_members = circular_risk.get("flow_members", [])
-                    cost = circular_risk.get("total_cost_sats", 0)
-                    self.plugin.log(
-                        f"CIRCULAR_FLOW_RISK: Skipping rebalance to {candidate.to_channel[:12]}... "
-                        f"Peers in circular flow: {flow_members}, cost: {cost} sats",
-                        level='info'
-                    )
-                    result["message"] = "Skipped due to circular flow risk"
-                    result["circular_flow_risk"] = True
-                    with self._pending_lock:
-                        self._pending.pop(candidate.to_channel, None)
-                    return result
-
-                # =====================================================================
-                # PHASE 7: Query Fleet Rebalance Path
-                # Check if routing through fleet members is cheaper.
-                # Fleet channels have 0 fees, so internal paths may save significantly.
-                # =====================================================================
-                fleet_path_info = self.hive_bridge.query_fleet_rebalance_path(
-                    from_channel=candidate.from_channel,
-                    to_channel=candidate.to_channel,
-                    amount_sats=candidate.amount_sats
-                )
-
-                if fleet_path_info and fleet_path_info.get("fleet_path_available"):
-                    savings_pct = fleet_path_info.get("savings_pct", 0)
-                    fleet_cost = fleet_path_info.get("estimated_fleet_cost_sats", 0)
-                    external_cost = fleet_path_info.get("estimated_external_cost_sats", 0)
-
-                    self.plugin.log(
-                        f"FLEET_PATH: Internal route available for {candidate.to_channel[:12]}... "
-                        f"Fleet cost: {fleet_cost} sats vs External: {external_cost} sats "
-                        f"(savings: {savings_pct:.0f}%)",
-                        level='info'
-                    )
-
-                    # Store fleet path info for outcome reporting
-                    result["fleet_path_available"] = True
-                    result["fleet_savings_pct"] = savings_pct
-
-                    # Inject fleet member channels as sling source candidates
-                    # so sling tries zero-fee fleet routes first.
-                    # source_eligible_members: fleet peers we have channels with
-                    # that are also connected to to_peer (ideal 2-hop zero-fee routes).
-                    fleet_members = fleet_path_info.get("source_eligible_members", [])
-                    if fleet_members:
-                        channels = self._get_channels_with_balances()
-                        peer_to_scid = {}
-                        for scid, info in channels.items():
-                            pid = info.get("peer_id", "")
-                            if pid and pid not in peer_to_scid:
-                                peer_to_scid[pid] = scid
-
-                        fleet_scids = []
-                        fleet_peer_ids = []
-                        for member_pubkey in fleet_members:
-                            scid = peer_to_scid.get(member_pubkey)
-                            if scid:
-                                fleet_scids.append(scid)
-                                fleet_peer_ids.append(member_pubkey)
-
-                        if fleet_scids:
-                            # Snapshot originals before fleet mutation so we can
-                            # restore them if circular rebalance fails and we
-                            # fall back to sling external routing.
-                            _original_max_fee_ppm = candidate.max_fee_ppm
-                            _original_max_budget_sats = candidate.max_budget_sats
-                            _original_max_budget_msat = candidate.max_budget_msat
-
-                            # Prepend fleet SCIDs — sling tries them first, falls back to originals
-                            existing_sources = candidate.source_candidates
-                            existing_peer_ids = getattr(candidate, "source_candidate_peer_ids", []) or []
-                            candidate.source_candidates = fleet_scids + [
-                                s for s in existing_sources if s not in fleet_scids
-                            ]
-                            candidate.source_candidate_peer_ids = fleet_peer_ids + [
-                                p for p in existing_peer_ids if p not in fleet_peer_ids
-                            ]
-
-                            # Fleet-aware fee cap based on route topology
-                            both_hive = (self._is_hive_peer(candidate.to_peer_id)
-                                         and self._is_hive_peer(candidate.primary_source_peer_id))
-                            fleet_cap = self._fleet_fee_cap(candidate.max_fee_ppm, both_hive)
-                            if fleet_cap < candidate.max_fee_ppm:
-                                candidate.max_fee_ppm = fleet_cap
-                                if fleet_cap == 0:
-                                    candidate.max_budget_sats = 0
-                                    candidate.max_budget_msat = 0
-                                elif candidate.max_budget_sats > 0:
-                                    candidate.max_budget_sats = min(
-                                        candidate.max_budget_sats,
-                                        max(1, candidate.amount_sats * fleet_cap // 1_000_000)
-                                    )
-                                    candidate.max_budget_msat = candidate.max_budget_sats * 1000
-
-                            # I-17 FIX: Mark candidate as fleet-routed for hive outcome reporting
-                            candidate.via_fleet = True
-
-                            self.plugin.log(
-                                f"FLEET_PATH: Injected {len(fleet_scids)} fleet SCIDs as source candidates "
-                                f"for {candidate.to_channel[:12]}..., max_fee_ppm capped to {candidate.max_fee_ppm}",
-                                level='info'
-                            )
-
-                # =====================================================================
-                # PHASE 8: Circular Rebalance Attempt
-                # When both source and dest are hive peers with a fleet path available,
-                # attempt a zero-fee circular rebalance before falling back to sling.
-                # =====================================================================
-                if (fleet_path_info and fleet_path_info.get("fleet_path_available")
-                        and self._is_hive_peer(candidate.to_peer_id)
-                        and self._is_hive_peer(candidate.primary_source_peer_id)):
-                    try:
-                        circular_result = self.hive_bridge.execute_circular_rebalance(
-                            from_channel=candidate.from_channel,
-                            to_channel=candidate.to_channel,
-                            amount_sats=candidate.amount_sats,
-                        )
-                        if circular_result and circular_result.get("success"):
-                            self._set_last_decision_summary(
-                                action="rebalance",
-                                reason="circular_rebalance",
-                                dominant_input="fleet_path",
-                                safety_block=False,
-                                budget_blocked=False,
-                            )
-                            result["success"] = True
-                            result["message"] = "Circular rebalance executed via hive"
-                            result["circular_rebalance"] = True
-                            result["cost_sats"] = circular_result.get("cost_sats", 0)
-                            self.plugin.log(
-                                f"CIRCULAR REBALANCE: {candidate.amount_sats} sats via hive "
-                                f"({candidate.from_channel[:12]} → {candidate.to_channel[:12]})",
-                                level='info'
-                            )
-                            with self._pending_lock:
-                                self._pending.pop(candidate.to_channel, None)
-                            return result
-                    except Exception as e:
-                        self.plugin.log(
-                            f"CIRCULAR REBALANCE: Failed, falling back to sling: {e}",
-                            level='debug'
-                        )
-                        # Restore original fee cap so sling can try external routes
-                        # without being crippled by the fleet-only 50 PPM cap.
-                        if candidate.via_fleet:
-                            candidate.max_fee_ppm = _original_max_fee_ppm
-                            candidate.max_budget_sats = _original_max_budget_sats
-                            candidate.max_budget_msat = _original_max_budget_msat
-                            candidate.via_fleet = False
 
         rebalance_id: Optional[int] = None
         reserved_budget = False
@@ -5140,209 +4511,3 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         count = self.job_manager.stop_all_jobs(reason="manual_stop_all")
         return {"success": True, "stopped": count}
 
-    # =========================================================================
-    # Comprehensive Hive Data Integration (v1.8.0)
-    # =========================================================================
-    # MCF targets and NNLB opportunities from cl-hive
-
-    def get_mcf_rebalance_targets(self) -> List[Dict[str, Any]]:
-        """
-        Get MCF-guided rebalance targets from cl-hive.
-
-        Uses Multi-Commodity Flow analysis to determine globally optimal
-        balance distribution across the fleet.
-
-        Returns:
-            List of rebalance targets sorted by priority:
-            [
-                {
-                    'scid': '932263x1883x0',
-                    'direction': 'inbound',
-                    'amount': 150000,
-                    'priority': 'high'
-                },
-                ...
-            ]
-        """
-        cfg = self.config.snapshot()
-
-        if not getattr(cfg, 'hive_mcf_targets_enabled', False) or not self.hive_bridge:
-            return []
-
-        mcf = self.hive_bridge.get_mcf_targets()
-        if not mcf:
-            return []
-
-        targets = []
-        for scid, target in mcf.get('targets', {}).items():
-            delta_sats = target.get('delta_sats', 0)
-
-            # Skip small deltas
-            if abs(delta_sats) < 50000:
-                continue
-
-            direction = 'inbound' if delta_sats > 0 else 'outbound'
-            amount = abs(delta_sats)
-
-            targets.append({
-                'scid': scid,
-                'direction': direction,
-                'amount': amount,
-                'priority': target.get('priority', 'medium'),
-                'optimal_local_pct': target.get('optimal_local_pct'),
-                'current_local_pct': target.get('current_local_pct'),
-            })
-
-        # Sort by priority (high first)
-        priority_order = {'high': 0, 'medium': 1, 'low': 2}
-        targets.sort(key=lambda x: priority_order.get(x['priority'], 1))
-
-        self.plugin.log(
-            f"MCF TARGETS: Found {len(targets)} channels needing rebalancing",
-            level='debug'
-        )
-
-        return targets
-
-    def get_nnlb_opportunities(self, min_amount: int = None) -> List[Dict[str, Any]]:
-        """
-        Get Nearest-Neighbor Load Balancing opportunities from cl-hive.
-
-        Returns low-cost rebalance opportunities between fleet members
-        where the rebalance can be done at zero or minimal fee.
-
-        Args:
-            min_amount: Minimum amount in sats (defaults to config)
-
-        Returns:
-            List of NNLB opportunities:
-            [
-                {
-                    'source_scid': '932263x1883x0',
-                    'sink_scid': '931308x1256x0',
-                    'amount_sats': 200000,
-                    'estimated_cost_sats': 0,
-                    'is_hive_internal': true
-                },
-                ...
-            ]
-        """
-        cfg = self.config.snapshot()
-
-        if not getattr(cfg, 'hive_nnlb_enabled', False) or not self.hive_bridge:
-            return []
-
-        if min_amount is None:
-            min_amount = getattr(cfg, 'hive_nnlb_min_amount', 50000)
-
-        result = self.hive_bridge.get_nnlb_opportunities(min_amount)
-        if not result:
-            return []
-
-        opportunities = result.get('opportunities', [])
-
-        self.plugin.log(
-            f"NNLB: Found {len(opportunities)} low-cost rebalance opportunities",
-            level='debug'
-        )
-
-        return opportunities
-
-    def execute_nnlb_opportunities(self, max_opportunities: int = 5) -> Dict[str, Any]:
-        """
-        Execute low-cost NNLB rebalance opportunities.
-
-        Only executes if hive_nnlb_auto_execute is enabled.
-
-        Args:
-            max_opportunities: Maximum number to execute in one cycle
-
-        Returns:
-            Dict with execution results
-        """
-        cfg = self.config.snapshot()
-
-        if not getattr(cfg, 'hive_nnlb_auto_execute', False):
-            return {
-                'executed': 0,
-                'skipped': 'auto_execute_disabled',
-                'message': 'Set hive_nnlb_auto_execute=true to enable'
-            }
-
-        opportunities = self.get_nnlb_opportunities()
-        if not opportunities:
-            return {'executed': 0, 'opportunities_found': 0}
-
-        executed = 0
-        errors = []
-
-        for opp in opportunities[:max_opportunities]:
-            # Only execute zero-cost hive-internal rebalances automatically
-            if opp.get('estimated_cost_sats', 1) > 10 or not opp.get('is_hive_internal', False):
-                continue
-
-            source_scid = opp.get('source_scid')
-            sink_scid = opp.get('sink_scid')
-            amount = opp.get('amount_sats', 0)
-
-            if not source_scid or not sink_scid or amount < 10000:
-                continue
-
-            # Check if jobs already active for these channels
-            if self.job_manager.has_active_job(sink_scid):
-                continue
-
-            try:
-                # Build a minimal sling job for the NNLB rebalance
-                result = self.job_manager.execute_once(
-                    scid=sink_scid,
-                    direction="pull",
-                    amount=amount,
-                    maxppm=10,  # NNLB should be near-zero cost
-                    candidates=[source_scid]
-                )
-                if result and result.get("success"):
-                    executed += 1
-                    self.plugin.log(
-                        f"NNLB AUTO: Started {source_scid} -> {sink_scid} for {amount} sats",
-                        level='info'
-                    )
-                else:
-                    err_msg = result.get("error", "unknown") if result else "no result"
-                    errors.append(f"{sink_scid}: {err_msg}")
-
-            except Exception as e:
-                errors.append(f"{sink_scid}: {e}")
-
-        return {
-            'executed': executed,
-            'opportunities_found': len(opportunities),
-            'errors': errors if errors else None
-        }
-
-    def should_rebalance_into_peer(self, peer_id: str) -> tuple:
-        """
-        Check if we should rebalance liquidity toward a peer.
-
-        Uses peer quality assessment to avoid investing in bad peers.
-
-        Args:
-            peer_id: Peer public key
-
-        Returns:
-            Tuple of (should_rebalance: bool, reason: str)
-        """
-        cfg = self.config.snapshot()
-
-        if not getattr(cfg, 'hive_peer_quality_enabled', True):
-            return True, ""
-
-        coordination = self._get_coordination_inputs(peer_id)
-        if coordination.mode == "local_only":
-            return True, ""
-
-        peer_quality = coordination.priors.get("peer_quality") or coordination.peer_quality
-        if peer_quality and peer_quality.get("quality") == "avoid":
-            return False, "Peer marked as 'avoid' quality"
-
-        return True, ""

@@ -123,14 +123,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'vegas_decay_rate': float,
     'enable_scarcity_pricing': bool,
     'scarcity_threshold': float,
-    # Hive Parameters
-    'hive_enabled': str,  # "auto", "true", "false"
-    'hive_fee_ppm': int,
-    'hive_rebalance_tolerance': int,
     # Phase 1: Operational Hardening
     'rpc_timeout_seconds': int,
     'rpc_circuit_breaker_seconds': int,
-    'hive_bridge_circuit_breaker_enabled': bool,
     'rpc_pool_size': int,
     'reservation_timeout_hours': int,
     # Issue #28: Revenue rate smoothing
@@ -149,29 +144,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'aimd_multiplicative_decrease': float,
     'aimd_additive_increase_ppm': int,
     'aimd_min_decrease_interval': int,
-    'hive_prior_weight': float,
-    'hive_min_confidence_for_prior': float,
     # Routing Intelligence Integration
     'routing_intelligence_enabled': bool,
     'routing_intelligence_cache_seconds': int,
-    # Comprehensive Hive Data Integration
-    'hive_defense_status_enabled': bool,
-    'hive_defense_status_cache_seconds': int,
-    'hive_peer_quality_enabled': bool,
-    'hive_peer_quality_cache_seconds': int,
-    'hive_decision_history_enabled': bool,
-    'hive_decision_history_days': int,
-    'hive_channel_flags_enabled': bool,
-    'hive_mcf_targets_enabled': bool,
-    'hive_mcf_targets_cache_seconds': int,
-    'hive_nnlb_enabled': bool,
-    'hive_nnlb_min_amount': int,
-    'hive_nnlb_auto_execute': bool,
-    'hive_channel_ages_enabled': bool,
-    'hive_channel_ages_cache_seconds': int,
-    'enable_hive_egress_desaturation_bias': bool,
-    'hive_egress_desaturation_bias_max_ppm': int,
-    'hive_egress_desaturation_bias_weight': float,
     # Fields present in CONFIG_FIELD_RANGES that need type registration
     'base_fee_msat': int,
     'flow_window_days': int,
@@ -222,8 +197,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'htlcmax_source_pct': (0.01, 1.0),
     'htlcmax_sink_pct': (0.01, 1.0),
     'htlcmax_balanced_pct': (0.01, 1.0),
-    'hive_fee_ppm': (0, 100000),
-    'hive_rebalance_tolerance': (0, 100000),
     'sling_chunk_size_sats': (1, 50000000),
     'sling_max_hops': (2, 20),
     'sling_parallel_jobs': (1, 10),
@@ -254,19 +227,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'aimd_multiplicative_decrease': (0.5, 0.95),
     'aimd_additive_increase_ppm': (1, 20),
     'aimd_min_decrease_interval': (300, 86400),  # 5 min to 24 hours
-    'hive_prior_weight': (0.0, 1.0),
-    'hive_min_confidence_for_prior': (0.0, 1.0),
     # Routing Intelligence Integration
     'routing_intelligence_cache_seconds': (60, 3600),  # 1 min to 1 hour
-    # Comprehensive Hive Data Integration
-    'hive_defense_status_cache_seconds': (10, 300),    # 10 sec to 5 min
-    'hive_peer_quality_cache_seconds': (60, 1800),     # 1 min to 30 min
-    'hive_decision_history_days': (1, 90),             # 1 to 90 days
-    'hive_mcf_targets_cache_seconds': (60, 1800),      # 1 min to 30 min
-    'hive_nnlb_min_amount': (10000, 10000000),         # 10k to 10M sats
-    'hive_channel_ages_cache_seconds': (300, 86400),   # 5 min to 24 hours
-    'hive_egress_desaturation_bias_max_ppm': (0, 1000),
-    'hive_egress_desaturation_bias_weight': (0.0, 1.0),
     # Additional range validations
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
@@ -302,7 +264,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 
 # Valid values for string enum fields
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
-    'hive_enabled': ('auto', 'true', 'false'),
     'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
     'total_cost_budget_mode': ('fixed', 'profit_pct'),
     'rebalancer_plugin': ('sling',),
@@ -416,7 +377,6 @@ class Config:
     # Phase 1: Operational Hardening
     rpc_timeout_seconds: int = 15
     rpc_circuit_breaker_seconds: int = 60
-    hive_bridge_circuit_breaker_enabled: bool = False  # Global hive bridge circuit breaker (disabled by default)
     rpc_pool_size: int = 5             # Number of RPC worker processes (Phase 2)
     reservation_timeout_hours: int = 4  # Hours before stale budget reservations auto-release
     
@@ -430,10 +390,7 @@ class Config:
 
     # Kelly Criterion Position Sizing (Phase 4: Risk Management)
     enable_kelly: bool = False       # If True, scale rebalance budget by Kelly fraction (opt-in)
-    kelly_bypass_for_fleet: bool = True  # If True, skip Kelly for hive/fleet destinations
-                                          # Fleet paths are ~free (0 ppm internal), so Kelly's
-                                          # EV gate is counterproductive — it kills candidates
-                                          # before the fleet path optimizer can apply zero-fee routing.
+    kelly_bypass_for_fleet: bool = True  # If True, skip Kelly for fleet destinations
     kelly_fraction: float = 0.5      # Multiplier for Kelly fraction (0.5 = Half Kelly)
                                       # Full Kelly (1.0) maximizes growth but has high volatility
                                       # Half Kelly (0.5) reduces volatility drag significantly
@@ -471,12 +428,6 @@ class Config:
     enable_scarcity_pricing: bool = True   # HTLC slot scarcity pricing
     scarcity_threshold: float = 0.35       # Start pricing at 35% utilization
     
-    # Hive Parameters (v1.4.0 - Strategic Rebalance Exemption)
-    # v1.6.0 - Added hive_enabled for standalone/hive mode control
-    hive_enabled: str = 'auto'         # "auto" = detect cl-hive, "true" = require hive, "false" = standalone
-    hive_fee_ppm: int = 0              # The fee we charge fleet members (default 0)
-    hive_rebalance_tolerance: int = 50 # Max sats loss allowed per rebalance to keep channels earning
-    
     # Deferred (v1.4.0)
     enable_flow_asymmetry: bool = False    # Rare liquidity premium
     enable_peer_sync: bool = False         # Peer-level fee syncing
@@ -511,54 +462,11 @@ class Config:
     aimd_additive_increase_ppm: int = 5       # +5 ppm per success streak
     aimd_min_decrease_interval: int = 3600    # 1 hour cooldown between decreases
 
-    # Hive Prior Integration
-    hive_prior_weight: float = 0.6            # Weight for hive-informed priors
-    hive_min_confidence_for_prior: float = 0.3  # Min confidence to use hive data
-
     # ==========================================================================
-    # Routing Intelligence Integration (cl-hive pheromone/corridor data)
+    # Routing Intelligence Integration
     # ==========================================================================
-    # When enabled, Thompson sampling priors are weighted by pheromone data
-    # from cl-hive's routing intelligence system.
     routing_intelligence_enabled: bool = False    # Opt-in feature (off by default)
     routing_intelligence_cache_seconds: int = 300  # Cache TTL for routing intel
-
-    # ==========================================================================
-    # Comprehensive Hive Data Integration (v1.8.0)
-    # ==========================================================================
-    # Integration with cl-hive for enhanced fee optimization and rebalancing.
-    # Each integration can be individually enabled/disabled.
-
-    # Defense status: Prevent overriding defensive fees during attacks
-    hive_defense_status_enabled: bool = True
-    hive_defense_status_cache_seconds: int = 60     # Short TTL - attacks are time-sensitive
-
-    # Peer quality: Adjust optimization intensity based on peer quality
-    hive_peer_quality_enabled: bool = True
-    hive_peer_quality_cache_seconds: int = 300      # 5 minute cache
-
-    # Decision history: Learn from past fee changes
-    hive_decision_history_enabled: bool = True
-    hive_decision_history_days: int = 30            # Days of history to consider
-
-    # Channel flags: Identify hive-internal channels
-    hive_channel_flags_enabled: bool = True
-
-    # MCF targets: Use multi-commodity flow analysis for rebalancing
-    hive_mcf_targets_enabled: bool = False          # Opt-in, may conflict with manual rebalancing
-    hive_mcf_targets_cache_seconds: int = 300       # 5 minute cache
-
-    # NNLB opportunities: Low-cost hive-internal rebalancing
-    hive_nnlb_enabled: bool = False                 # Opt-in
-    hive_nnlb_min_amount: int = 50000               # Minimum sats to consider
-    hive_nnlb_auto_execute: bool = False            # Require manual trigger by default
-
-    # Channel ages: Exploration/exploitation based on maturity
-    hive_channel_ages_enabled: bool = True
-    hive_channel_ages_cache_seconds: int = 3600     # 1 hour cache - ages change slowly
-    enable_hive_egress_desaturation_bias: bool = True
-    hive_egress_desaturation_bias_max_ppm: int = 100
-    hive_egress_desaturation_bias_weight: float = 0.5
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -922,15 +830,8 @@ class ConfigSnapshot:
     # Phase 1: Operational Hardening
     rpc_timeout_seconds: int
     rpc_circuit_breaker_seconds: int
-    hive_bridge_circuit_breaker_enabled: bool
     rpc_pool_size: int
     reservation_timeout_hours: int
-
-    # Hive Parameters (v1.4.0) - MAJOR-12 FIX: Added missing fields
-    # v1.6.0 - Added hive_enabled for standalone/hive mode control
-    hive_enabled: str
-    hive_fee_ppm: int
-    hive_rebalance_tolerance: int
 
     # Issue #28: Revenue rate EMA smoothing
     ema_smoothing_alpha: float
@@ -950,31 +851,9 @@ class ConfigSnapshot:
     aimd_multiplicative_decrease: float
     aimd_additive_increase_ppm: int
     aimd_min_decrease_interval: int
-    hive_prior_weight: float
-    hive_min_confidence_for_prior: float
-
     # Routing Intelligence Integration
     routing_intelligence_enabled: bool
     routing_intelligence_cache_seconds: int
-
-    # Comprehensive Hive Data Integration (v1.8.0)
-    hive_defense_status_enabled: bool = True
-    hive_defense_status_cache_seconds: int = 60
-    hive_peer_quality_enabled: bool = True
-    hive_peer_quality_cache_seconds: int = 300
-    hive_decision_history_enabled: bool = True
-    hive_decision_history_days: int = 30
-    hive_channel_flags_enabled: bool = True
-    hive_mcf_targets_enabled: bool = False
-    hive_mcf_targets_cache_seconds: int = 300
-    hive_nnlb_enabled: bool = False
-    hive_nnlb_min_amount: int = 50000
-    hive_nnlb_auto_execute: bool = False
-    hive_channel_ages_enabled: bool = True
-    hive_channel_ages_cache_seconds: int = 3600
-    enable_hive_egress_desaturation_bias: bool = True
-    hive_egress_desaturation_bias_max_ppm: int = 100
-    hive_egress_desaturation_bias_weight: float = 0.5
 
     # M-27: xpay/askrene parameters (were missing from snapshot)
     askrene_layer: str = 'xpay'

@@ -18,10 +18,9 @@ class GossipKeepaliveManager:
     _BACKOFF_BASE_SECONDS = 60
     _BACKOFF_CAP_SECONDS = 3600
 
-    def __init__(self, plugin: Any, config: Any, hive_bridge: Any = None):
+    def __init__(self, plugin: Any, config: Any):
         self.plugin = plugin
         self.config = config
-        self.hive_bridge = hive_bridge
         self._our_node_id: Optional[str] = None
         self._connect_failures: dict[str, int] = {}
         self._connect_backoff_until: dict[str, float] = {}
@@ -193,33 +192,12 @@ class GossipKeepaliveManager:
         channel_peer_ids: Set[str],
         public_candidates: Optional[Iterable[str]] = None,
     ) -> List[str]:
-        """Return hive targets first, then public candidates, both filtered."""
-        ordered: List[str] = []
-        seen: Set[str] = set()
-
-        hive_candidates: Iterable[str] = []
-        if self.hive_bridge and hasattr(self.hive_bridge, "get_priority_gossip_targets"):
-            hive_candidates = self.hive_bridge.get_priority_gossip_targets() or []
-
-        for group in (
-            self.filter_candidates(
-                hive_candidates,
-                connected_peer_ids=connected_peer_ids,
-                channel_peer_ids=channel_peer_ids,
-            ),
-            self.filter_candidates(
-                public_candidates or [],
-                connected_peer_ids=connected_peer_ids,
-                channel_peer_ids=channel_peer_ids,
-            ),
-        ):
-            for peer_id in group:
-                if peer_id in seen:
-                    continue
-                seen.add(peer_id)
-                ordered.append(peer_id)
-
-        return ordered
+        """Return public candidates, filtered."""
+        return self.filter_candidates(
+            public_candidates or [],
+            connected_peer_ids=connected_peer_ids,
+            channel_peer_ids=channel_peer_ids,
+        )
 
     def maintain_connections(self) -> dict[str, Any]:
         """Connect enough pure P2P peers to restore the configured target."""

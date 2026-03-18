@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 
-def _make_manager(hive_bridge=None, target_gossip_peers=3):
+def _make_manager(target_gossip_peers=3):
     from modules.gossip_keeper import GossipKeepaliveManager
 
     plugin = MagicMock()
@@ -17,7 +17,7 @@ def _make_manager(hive_bridge=None, target_gossip_peers=3):
         enable_gossip_keepalives=True,
         target_gossip_peers=target_gossip_peers,
     )
-    manager = GossipKeepaliveManager(plugin=plugin, config=cfg, hive_bridge=hive_bridge)
+    manager = GossipKeepaliveManager(plugin=plugin, config=cfg)
     return manager
 
 
@@ -71,13 +71,8 @@ def test_filter_candidates_removes_self_connected_and_channel_peers():
     assert filtered == ["02" + "c" * 64]
 
 
-def test_get_ranked_targets_prefers_hive_candidates_before_public_candidates():
-    hive_bridge = MagicMock()
-    hive_bridge.get_priority_gossip_targets.return_value = [
-        "02" + "a" * 64,
-        "03" + "b" * 64,
-    ]
-    manager = _make_manager(hive_bridge=hive_bridge)
+def test_get_ranked_targets_returns_filtered_public_candidates():
+    manager = _make_manager()
 
     ranked = manager.get_ranked_targets(
         connected_peer_ids=set(),
@@ -89,8 +84,6 @@ def test_get_ranked_targets_prefers_hive_candidates_before_public_candidates():
     )
 
     assert ranked == [
-        "02" + "a" * 64,
-        "03" + "b" * 64,
         "02" + "c" * 64,
         "03" + "d" * 64,
     ]

@@ -34,6 +34,3 @@ revenue-ops-hot-channel-protection-enabled=true
 # Gossip keepalives
 revenue-ops-enable-gossip-keepalives=false
 revenue-ops-target-gossip-peers=5
-
-# cl-hive integration (0 = free routing between fleet members)
-revenue-ops-hive-fee-ppm=0

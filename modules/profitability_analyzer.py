@@ -18,7 +18,7 @@ Classifications:
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Any, Optional, Tuple
 from enum import Enum
 import time
 import threading
@@ -26,9 +26,6 @@ import threading
 from pyln.client import Plugin, RpcError
 
 from .utils import parse_msat as _shared_parse_msat
-
-if TYPE_CHECKING:
-    from .hive_bridge import HiveFeeIntelligenceBridge
 
 
 class ProfitabilityClass(Enum):
@@ -342,8 +339,7 @@ class ChannelProfitabilityAnalyzer:
     ZOMBIE_DAYS_INACTIVE = 30          # No routing for 30 days
     ZOMBIE_MIN_LOSS_SATS = 1000        # Minimum loss to be zombie
     
-    def __init__(self, plugin: Plugin, config, database,
-                 hive_bridge: Optional["HiveFeeIntelligenceBridge"] = None):
+    def __init__(self, plugin: Plugin, config, database):
         """
         Initialize the profitability analyzer.
 
@@ -351,12 +347,10 @@ class ChannelProfitabilityAnalyzer:
             plugin: Reference to the pyln Plugin
             config: Configuration object
             database: Database instance for persistence
-            hive_bridge: Optional bridge to cl-hive for NNLB health reporting
         """
         self.plugin = plugin
         self.config = config
         self.database = database
-        self.hive_bridge = hive_bridge
 
         # Cache for profitability data (refreshed periodically)
         # TS-7: Cache reads without lock are safe under CPython GIL (dict reads are atomic).
@@ -365,11 +359,6 @@ class ChannelProfitabilityAnalyzer:
         self._cache_timestamp: int = 0
         self._cache_ttl: int = 300  # 5 minutes
         self._analysis_lock = threading.Lock()  # Prevent concurrent analysis stampede
-
-        # Track last health/liquidity reports to avoid spam
-        self._last_health_report: int = 0
-        self._last_liquidity_report: int = 0
-        self._health_report_interval: int = 300  # Report every 5 minutes max
 
         # Bleeder classification cache (avoids re-running full analysis per channel)
         # TS-7: Same GIL-safety note: dict/None reads are atomic under CPython.
@@ -442,15 +431,6 @@ class ChannelProfitabilityAnalyzer:
                 f"{classifications} [thread={threading.current_thread().name}, "
                 f"cache_age={int(time.time()) - old_timestamp}s]"
             )
-
-            # Report health and liquidity to cl-hive for fleet coordination
-            # INFORMATION ONLY - no fund transfers between nodes
-            # Non-critical: failures here should not invalidate the analysis
-            try:
-                self._report_health_to_hive()
-                self._report_liquidity_state_to_hive()
-            except Exception as e:
-                self.plugin.log(f"Hive reporting failed (non-critical): {e}", level='debug')
 
         except Exception as e:
             self.plugin.log(f"Error in profitability analysis: {e}", level='error')
@@ -931,301 +911,6 @@ class ChannelProfitabilityAnalyzer:
             "total_sourced_contribution_sats": total_sourced_contribution,
             "role_distribution": role_distribution
         }
-
-    def _report_health_to_hive(self) -> bool:
-        """
-        Report our health status to cl-hive for NNLB coordination.
-
-        This shares INFORMATION only - no sats move between nodes.
-        The health data is used by cl-hive to calculate our NNLB health tier,
-        which affects how aggressively we rebalance our own channels.
-
-        Returns:
-            True if reported successfully, False otherwise
-        """
-        if not self.hive_bridge:
-            return False
-
-        # Rate limit health reports
-        now = int(time.time())
-        if (now - self._last_health_report) < self._health_report_interval:
-            return False
-
-        # Get current summary
-        summary = self.get_summary()
-        classifications = summary.get("classifications", {})
-        total_channels = summary.get("total_channels", 0)
-
-        # Extract classification counts
-        profitable = classifications.get("profitable", 0)
-        underwater = classifications.get("underwater", 0)
-        stagnant = classifications.get("stagnant_candidate", 0)
-        zombie = classifications.get("zombie", 0)
-
-        # Determine revenue trend from ROI
-        roi = summary.get("overall_roi_percent", 0)
-        if roi > 5:
-            revenue_trend = "improving"
-        elif roi < -5:
-            revenue_trend = "declining"
-        else:
-            revenue_trend = "stable"
-
-        # Calculate liquidity score from channel balance distribution
-        # Build balance map once — will be reused by _report_liquidity_state_to_hive()
-        self._cached_balance_map = self._build_balance_map()
-        liquidity_score = self._calculate_liquidity_score(self._cached_balance_map)
-
-        # Report to hive
-        success = self.hive_bridge.report_health_update(
-            profitable_channels=profitable,
-            underwater_channels=underwater + zombie,  # Combine underwater + zombie
-            stagnant_channels=stagnant,
-            total_channels=total_channels,
-            revenue_trend=revenue_trend,
-            liquidity_score=liquidity_score
-        )
-
-        if success:
-            self._last_health_report = now
-            self.plugin.log(
-                f"NNLB: Reported health to hive - profitable={profitable}, "
-                f"underwater={underwater + zombie}, stagnant={stagnant}, "
-                f"trend={revenue_trend}",
-                level='debug'
-            )
-
-        return success
-
-    def _report_liquidity_state_to_hive(self) -> bool:
-        """
-        Report our liquidity state to cl-hive for fleet coordination.
-
-        This shares INFORMATION only - no sats move between nodes.
-        The liquidity state helps other hive members make coordinated
-        decisions about fees and rebalancing.
-
-        Returns:
-            True if reported successfully, False otherwise
-        """
-        if not self.hive_bridge:
-            return False
-
-        # Rate limit liquidity reports independently from health reports
-        now = int(time.time())
-        if (now - self._last_liquidity_report) < self._health_report_interval:
-            return True  # Already reported recently
-
-        depleted_channels = []
-        saturated_channels = []
-
-        # Reuse balance map from _report_health_to_hive() if available (same cycle),
-        # otherwise build fresh. Avoids duplicate listfunds() RPC calls.
-        balance_map = getattr(self, '_cached_balance_map', None)
-        self._cached_balance_map = None  # Consume once
-        if balance_map is None:
-            balance_map = self._build_balance_map()
-            if balance_map is None:
-                return False
-
-        for channel_id, prof in self._profitability_cache.items():
-            bal = balance_map.get(channel_id)
-            if not bal:
-                continue
-
-            local = bal["local_sats"]
-            capacity = bal["capacity_sats"]
-            peer_id = bal["peer_id"]
-
-            if capacity <= 0 or not peer_id:
-                continue
-
-            local_pct = local / capacity
-
-            if local_pct < 0.20:
-                depleted_channels.append({
-                    "peer_id": peer_id,
-                    "local_pct": round(local_pct, 3),
-                    "capacity_sats": capacity
-                })
-            elif local_pct > 0.80:
-                saturated_channels.append({
-                    "peer_id": peer_id,
-                    "local_pct": round(local_pct, 3),
-                    "capacity_sats": capacity
-                })
-
-        # Build flow-aware enriched liquidity needs
-        liquidity_needs = []
-        for channel_id, prof in self._profitability_cache.items():
-            bal = balance_map.get(channel_id)
-            if not bal:
-                continue
-
-            local = bal["local_sats"]
-            capacity = bal["capacity_sats"]
-            peer_id = bal["peer_id"]
-
-            if capacity <= 0 or not peer_id:
-                continue
-
-            local_pct = local / capacity
-
-            # Get flow state from channel_states (flow analysis data)
-            state = self.database.get_channel_state(channel_id)
-            flow_state = state.get("state", "balanced") if state else "balanced"
-            flow_ratio = state.get("flow_ratio", 0.5) if state else 0.5
-
-            # Flow-aware thresholds:
-            # Source channels earn revenue — need more outbound sooner
-            # Sink channels fill naturally — need inbound sooner
-            if flow_state == "source":
-                depleted_thresh, saturated_thresh = 0.30, 0.80
-            elif flow_state == "sink":
-                depleted_thresh, saturated_thresh = 0.20, 0.70
-            else:
-                depleted_thresh, saturated_thresh = 0.20, 0.80
-
-            need = None
-            if local_pct < depleted_thresh:
-                urgency = "critical" if local_pct < 0.10 else "high"
-                amount_needed = int(capacity * 0.5 - local)
-                need = {
-                    "need_type": "outbound",
-                    "target_peer_id": peer_id,
-                    "amount_sats": max(0, amount_needed),
-                    "urgency": urgency,
-                    "reason": "channel_depleted",
-                    "current_balance_pct": round(local_pct, 3),
-                    "flow_state": flow_state,
-                    "flow_ratio": round(flow_ratio, 3),
-                }
-            elif local_pct > saturated_thresh:
-                urgency = "critical" if local_pct > 0.95 else "high"
-                amount_needed = int(local - capacity * 0.5)
-                need = {
-                    "need_type": "inbound",
-                    "target_peer_id": peer_id,
-                    "amount_sats": max(0, amount_needed),
-                    "urgency": urgency,
-                    "reason": "channel_saturated",
-                    "current_balance_pct": round(local_pct, 3),
-                    "flow_state": flow_state,
-                    "flow_ratio": round(flow_ratio, 3),
-                }
-
-            if need:
-                liquidity_needs.append(need)
-
-        # Sort by urgency (critical > high > medium > low), take top 10
-        urgency_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        liquidity_needs.sort(key=lambda n: urgency_order.get(n.get("urgency", "low"), 3))
-        liquidity_needs = liquidity_needs[:10]
-
-        # Report to hive
-        success = self.hive_bridge.report_liquidity_state(
-            depleted_channels=depleted_channels,
-            saturated_channels=saturated_channels,
-            rebalancing_active=False,  # Will be updated by rebalancer when active
-            rebalancing_peers=[],
-            liquidity_needs=liquidity_needs if liquidity_needs else None
-        )
-
-        if success:
-            self._last_liquidity_report = now
-            self.plugin.log(
-                f"LIQUIDITY: Reported to hive - depleted={len(depleted_channels)}, "
-                f"saturated={len(saturated_channels)}, "
-                f"enriched_needs={len(liquidity_needs)}",
-                level='debug'
-            )
-
-        return success
-
-    def _build_balance_map(self) -> Optional[Dict[str, Dict[str, Any]]]:
-        """
-        Build a balance map from listfunds() keyed by short_channel_id.
-
-        Returns:
-            Dict mapping scid -> {local_sats, capacity_sats, peer_id}, or None on failure
-        """
-        balance_map = {}
-        try:
-            funds = self.plugin.rpc.listfunds()
-            for ch in funds.get("channels", []):
-                if ch.get("state") != "CHANNELD_NORMAL":
-                    continue
-                scid = ch.get("short_channel_id")
-                if not scid:
-                    continue
-                our_msat = self._parse_msat(ch.get("our_amount_msat", 0))
-                total_msat = self._parse_msat(ch.get("amount_msat", 0))
-                balance_map[scid] = {
-                    "local_sats": our_msat // 1000,
-                    "capacity_sats": total_msat // 1000,
-                    "peer_id": ch.get("peer_id", ""),
-                }
-            return balance_map
-        except Exception as e:
-            self.plugin.log(f"LIQUIDITY: listfunds failed: {e}", level='warn')
-            return None
-
-    def _calculate_liquidity_score(self, balance_map: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
-        """
-        Calculate liquidity balance score from channel data.
-
-        A well-balanced node has channels near 50% local balance.
-        Depleted (<20%) or saturated (>80%) channels hurt the score.
-
-        Args:
-            balance_map: Pre-built balance map to avoid duplicate listfunds() calls.
-                         If None, builds one internally.
-
-        Returns:
-            Liquidity score (0-100, higher is better)
-        """
-        if not self._profitability_cache:
-            return 50  # Default to neutral
-
-        total_penalty = 0
-        count = 0
-
-        if balance_map is None:
-            balance_map = self._build_balance_map()
-            if balance_map is None:
-                return 50  # Can't compute without balance data
-
-        for channel_id, prof in self._profitability_cache.items():
-            bal = balance_map.get(channel_id)
-            if not bal:
-                continue
-
-            local = bal["local_sats"]
-            capacity = bal["capacity_sats"]
-            if capacity <= 0:
-                continue
-
-            local_pct = local / capacity
-
-            # Calculate distance from ideal (50%)
-            distance = abs(local_pct - 0.5)
-
-            # Penalty increases with distance from 50%
-            # 0% or 100% local = 50 penalty points (worst)
-            # 50% local = 0 penalty points (ideal)
-            penalty = distance * 100
-            total_penalty += penalty
-            count += 1
-
-        if count == 0:
-            return 50
-
-        # Average penalty across channels
-        avg_penalty = total_penalty / count
-
-        # Convert to score (0-100, higher is better)
-        score = int(max(0, min(100, 100 - avg_penalty)))
-        return score
 
     def get_channels_by_role(self, role: ChannelRole) -> List[ChannelProfitability]:
         """
