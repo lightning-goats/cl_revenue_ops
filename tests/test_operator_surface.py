@@ -1,9 +1,6 @@
 import pytest
-import time
 from unittest.mock import MagicMock
 from pathlib import Path
-from types import SimpleNamespace
-
 from modules.config import Config
 from tests.plugin_test_utils import load_plugin_module
 
@@ -25,24 +22,6 @@ def test_internal_knobs_are_not_public():
     assert "enable_vegas_reflex" not in cfg.public_runtime_keys()
     assert "thompson_prior_std_fee" not in cfg.public_runtime_keys()
     assert "sling_target_sink" not in cfg.public_runtime_keys()
-
-
-def test_auto_band_config_defaults_enabled():
-    cfg = Config()
-
-    assert cfg.auto_band_enabled is True
-    assert cfg.auto_band_min_observations == 20
-    assert cfg.auto_band_sigma == 2.0
-    assert cfg.auto_band_min_width_ppm == 50
-    assert cfg.auto_band_recalibrate_interval == 10
-
-
-def test_hive_egress_desaturation_bias_defaults_enabled():
-    cfg = Config()
-
-    assert cfg.enable_hive_egress_desaturation_bias is True
-    assert cfg.hive_egress_desaturation_bias_max_ppm == 100
-    assert cfg.hive_egress_desaturation_bias_weight == 0.5
 
 
 def test_public_runtime_dict_returns_only_public_keys():
@@ -182,107 +161,6 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "max_fee_ppm": 2500,
     }
     assert "config" not in result
-
-
-def test_revenue_fee_debug_reports_effective_auto_band_details():
-    peer_id = "02" + "a" * 64
-    mod = load_plugin_module()
-    mod.database = MagicMock()
-    mod.config = Config()
-    mod.fee_controller = MagicMock()
-    mod.database.get_all_fee_strategy_states.return_value = [
-        {
-            "channel_id": "123x456x0",
-            "is_sleeping": 0,
-            "sleep_until": 0,
-            "last_update": int(time.time()) - 3600,
-            "forward_count_since_update": 5,
-            "last_broadcast_fee_ppm": 220,
-            "last_revenue_rate": 1.5,
-        }
-    ]
-    mod.database.get_all_channel_states.return_value = [
-        {
-            "channel_id": "123x456x0",
-            "peer_id": peer_id,
-            "state": "balanced",
-        }
-    ]
-    mod.fee_controller._get_effective_dynamic_fee_autoband_ppm.return_value = (200, 300, "auto")
-    mod.fee_controller._get_channel_auto_band.return_value = SimpleNamespace(
-        min_ppm=200,
-        max_ppm=300,
-        optimal_fee_ppm=250,
-        posterior_std=25.0,
-        observation_count=27,
-        sigma=2.0,
-        min_width_ppm=50,
-        last_calibrated=1_773_506_400,
-        source="auto",
-    )
-
-    result = mod.revenue_fee_debug(mod.plugin)
-
-    channel = result["channels"][0]
-    assert channel["effective_autoband"] == {
-        "min_ppm": 200,
-        "max_ppm": 300,
-        "source": "auto",
-    }
-    assert channel["auto_band"]["optimal_fee_ppm"] == 250
-    assert channel["auto_band"]["observation_count"] == 27
-
-
-def test_revenue_fee_debug_reports_hive_egress_desaturation_bias_details():
-    peer_id = "02" + "b" * 64
-    mod = load_plugin_module()
-    mod.database = MagicMock()
-    mod.config = Config()
-    mod.fee_controller = MagicMock()
-    mod.database.get_all_fee_strategy_states.return_value = [
-        {
-            "channel_id": "123x456x0",
-            "is_sleeping": 0,
-            "sleep_until": 0,
-            "last_update": int(time.time()) - 3600,
-            "forward_count_since_update": 5,
-            "last_broadcast_fee_ppm": 220,
-            "last_revenue_rate": 1.5,
-        }
-    ]
-    mod.database.get_all_channel_states.return_value = [
-        {
-            "channel_id": "123x456x0",
-            "peer_id": peer_id,
-            "state": "balanced",
-        }
-    ]
-    mod.fee_controller._get_effective_dynamic_fee_autoband_ppm.return_value = (None, None, None)
-    mod.fee_controller._get_channel_auto_band.return_value = None
-    mod.fee_controller._get_last_hive_egress_desaturation_bias.return_value = {
-        "matched": True,
-        "applied": True,
-        "recommended_surcharge_ppm": 80,
-        "applied_surcharge_ppm": 40,
-        "confidence": 0.9,
-        "severity": "critical",
-        "reason": "Competes with critical saturated hive egress",
-        "saturated_hive_channel_id": "999x1x0",
-    }
-
-    result = mod.revenue_fee_debug(mod.plugin)
-
-    channel = result["channels"][0]
-    assert channel["hive_egress_desaturation_bias"] == {
-        "matched": True,
-        "applied": True,
-        "recommended_surcharge_ppm": 80,
-        "applied_surcharge_ppm": 40,
-        "confidence": 0.9,
-        "severity": "critical",
-        "reason": "Competes with critical saturated hive egress",
-        "saturated_hive_channel_id": "999x1x0",
-    }
 
 
 @pytest.mark.parametrize(

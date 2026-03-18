@@ -3007,13 +3007,6 @@ class FeeController:
                 channel_id, peer_id, outbound_ratio
             )
 
-            # =====================================================================
-            # Historical Response Curve & Elasticity (preserved from HC for data)
-            # =====================================================================
-            historical_curve = ts_state.get_historical_curve()
-            elasticity_tracker = ts_state.get_elasticity_tracker()
-
-
 
             # =====================================================================
             # VOLATILITY & HYSTERESIS (preserved)
@@ -3980,7 +3973,7 @@ class FeeController:
             ema_revenue_rate=v2_data.get("ema_revenue_rate"),  # Issue #28: None if absent, preserves 0.0
             last_fee_ppm=db_state.get("last_fee_ppm", 0),
             trend_direction=db_state.get("trend_direction", 1),
-            step_ppm=db_state.get("step_ppm", self.STEP_PPM),
+            step_ppm=db_state.get("step_ppm", 50),
             last_update=db_state.get("last_update", 0),
             consecutive_same_direction=db_state.get("consecutive_same_direction", 0),
             is_sleeping=bool(db_state.get("is_sleeping", 0)),
@@ -3991,9 +3984,6 @@ class FeeController:
             # v2.0 fields
             forward_count_since_update=db_state.get("forward_count_since_update", 0),
             last_volume_sats=db_state.get("last_volume_sats", 0),
-            historical_curve_data=v2_data.get("historical_curve", {}),
-            elasticity_data=v2_data.get("elasticity", {}),
-            thompson_data=v2_data.get("thompson", {}),
             dynamic_htlcmin_baseline_msat=v2_data.get("dynamic_htlcmin_baseline_msat"),
         )
 
@@ -4020,9 +4010,6 @@ class FeeController:
         # Serialize v2.0 state to JSON
         v2_data = {
             "algorithm_version": "thompson_aimd_v1",
-            "historical_curve": state.historical_curve_data,
-            "elasticity": state.elasticity_data,
-            "thompson": state.thompson_data,
             "ema_revenue_rate": state.ema_revenue_rate,  # Issue #28
             "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
         }

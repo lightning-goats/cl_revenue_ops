@@ -5,10 +5,7 @@ Covers:
   C-2: Sentinel cleanup in monitor_jobs
   C-3: Stop job re-add on sling failure
   C-4: Channel close detection in monitor_jobs
-  C-5: NNLB budget multiplier
-  C-6: NNLB profit threshold adjustment
   I-12: Hot channel profit budget floor
-  I-17: via_fleet field on RebalanceCandidate
 """
 
 import math
@@ -41,7 +38,6 @@ def _candidate(
     primary_source_peer_id="02" + "a" * 64,
     to_peer_id="02" + "b" * 64,
     amount_sats=50000,
-    via_fleet=False,
 ):
     from modules.rebalancer import RebalanceCandidate
 
@@ -69,7 +65,6 @@ def _candidate(
         dest_flow_state="balanced",
         dest_turnover_rate=0.0,
         source_turnover_rate=0.0,
-        via_fleet=via_fleet,
     )
 
 
@@ -94,186 +89,7 @@ def _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=1,
 
 
 # ============================================================================
-# 1. NNLB Budget Multiplier (C-5)
-# ============================================================================
-
-
-class TestNNLBBudgetMultiplier:
-    """C-5: _calculate_nnlb_budget_multiplier respects hive health tiers."""
-
-    def _make_rebalancer(self, mock_plugin, mock_database, hive_bridge=None):
-        from modules.config import Config
-        from modules.rebalancer import EVRebalancer
-
-        cfg = Config(dry_run=True, enable_proportional_budget=False)
-        return EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
-
-    # -- Healthy / stable tier -> 1.0 --
-    def test_stable_tier_returns_1_0(self, mock_plugin, mock_database):
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = {"health_tier": "stable"}
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge)
-        assert r._calculate_nnlb_budget_multiplier() == 1.0
-
-    # -- Struggling tier -> 2.0 --
-    def test_struggling_tier_returns_2_0(self, mock_plugin, mock_database):
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = {"health_tier": "struggling"}
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge)
-        assert r._calculate_nnlb_budget_multiplier() == 2.0
-
-    # -- Thriving tier -> 0.75 --
-    def test_thriving_tier_returns_0_75(self, mock_plugin, mock_database):
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = {"health_tier": "thriving"}
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge)
-        assert r._calculate_nnlb_budget_multiplier() == 0.75
-
-    # -- Vulnerable tier -> 1.5 --
-    def test_vulnerable_tier_returns_1_5(self, mock_plugin, mock_database):
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = {"health_tier": "vulnerable"}
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge)
-        assert r._calculate_nnlb_budget_multiplier() == 1.5
-
-    # -- No hive_bridge -> fallback 1.0 --
-    def test_no_hive_bridge_returns_default(self, mock_plugin, mock_database):
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=None)
-        assert r._calculate_nnlb_budget_multiplier() == 1.0
-
-    # -- hive_bridge returns None from query_member_health -> fallback 1.0 --
-    def test_health_query_returns_none(self, mock_plugin, mock_database):
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = None
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge)
-        assert r._calculate_nnlb_budget_multiplier() == 1.0
-
-    # -- Cache TTL: second call within TTL returns cached value, no RPC --
-    def test_cache_ttl_returns_cached_value(self, mock_plugin, mock_database):
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = {"health_tier": "struggling"}
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge)
-
-        # First call -> queries hive
-        result1 = r._calculate_nnlb_budget_multiplier()
-        assert result1 == 2.0
-        assert bridge.query_member_health.call_count == 1
-
-        # Second call within TTL -> uses cache
-        result2 = r._calculate_nnlb_budget_multiplier()
-        assert result2 == 2.0
-        assert bridge.query_member_health.call_count == 1  # not called again
-
-    # -- Cache expires after TTL --
-    def test_cache_expires_after_ttl(self, mock_plugin, mock_database):
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = {"health_tier": "struggling"}
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge)
-
-        # First call
-        r._calculate_nnlb_budget_multiplier()
-        assert bridge.query_member_health.call_count == 1
-
-        # Expire cache by setting cache time far in the past
-        r._health_cache_time = time.time() - 600  # 10 minutes ago (TTL is 300s)
-
-        # Change return for second call
-        bridge.query_member_health.return_value = {"health_tier": "thriving"}
-        result = r._calculate_nnlb_budget_multiplier()
-        assert result == 0.75
-        assert bridge.query_member_health.call_count == 2
-
-
-# ============================================================================
-# 2. NNLB Profit Threshold Adjustment (C-6)
-# ============================================================================
-
-
-class TestNNLBProfitThresholdAdjustment:
-    """C-6: Profit threshold is adjusted by NNLB multiplier."""
-
-    def _make_rebalancer(self, mock_plugin, mock_database, hive_bridge=None,
-                         min_profit=100, min_profit_ppm=0):
-        from modules.config import Config
-        from modules.rebalancer import EVRebalancer
-
-        cfg = Config(
-            dry_run=True,
-            enable_proportional_budget=False,
-            rebalance_min_profit=min_profit,
-            rebalance_min_profit_ppm=min_profit_ppm,
-        )
-        return EVRebalancer(mock_plugin, cfg, mock_database, hive_bridge=hive_bridge)
-
-    def test_struggling_node_gets_lower_threshold(self, mock_plugin, mock_database):
-        """Struggling (multiplier=2.0) -> threshold is halved."""
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = {"health_tier": "struggling"}
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge,
-                                  min_profit=100)
-
-        # Patch internals to isolate the EV path: we only care about the threshold check.
-        # _calculate_ev_for_channel calls _calculate_nnlb_budget_multiplier internally.
-        # We test the multiplier's effect on the threshold math directly:
-        # threshold = 100 / 2.0 = 50
-        mult = r._calculate_nnlb_budget_multiplier()
-        assert mult == 2.0
-        # Threshold would be int(100 / 2.0) = 50
-        adjusted = int(100 / mult)
-        assert adjusted == 50
-
-    def test_thriving_node_gets_higher_threshold(self, mock_plugin, mock_database):
-        """Thriving (multiplier=0.75) -> threshold is raised."""
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = {"health_tier": "thriving"}
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge,
-                                  min_profit=100)
-
-        mult = r._calculate_nnlb_budget_multiplier()
-        assert mult == 0.75
-        # Threshold would be int(100 / 0.75) = 133
-        adjusted = int(100 / mult)
-        assert adjusted == 133
-
-    def test_default_multiplier_leaves_threshold_unchanged(self, mock_plugin, mock_database):
-        """Default (multiplier=1.0) -> threshold unchanged."""
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=None,
-                                  min_profit=100)
-
-        mult = r._calculate_nnlb_budget_multiplier()
-        assert mult == 1.0
-        # When mult == 1.0 the code skips adjustment entirely
-        # Verify no division happens: threshold remains 100
-
-    def test_ppm_based_threshold_also_adjusted(self, mock_plugin, mock_database):
-        """When rebalance_min_profit_ppm > 0, ppm-derived threshold is also adjusted."""
-        bridge = MagicMock()
-        bridge.query_member_health.return_value = {"health_tier": "struggling"}
-
-        r = self._make_rebalancer(mock_plugin, mock_database, hive_bridge=bridge,
-                                  min_profit_ppm=1000)  # 1000 ppm
-
-        # For amount=100_000 sats: threshold = (100_000 * 1000) // 1_000_000 = 100
-        amount = 100_000
-        base_threshold = (amount * 1000) // 1_000_000
-        assert base_threshold == 100
-
-        mult = r._calculate_nnlb_budget_multiplier()
-        adjusted = int(base_threshold / mult)
-        assert adjusted == 50  # struggling halves it
-
-
-# ============================================================================
-# 3. Sentinel Cleanup (C-2 fix)
+# 1. Sentinel Cleanup (C-2 fix)
 # ============================================================================
 
 
@@ -285,7 +101,7 @@ class TestSentinelCleanup:
         from modules.rebalancer import JobManager
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        jm = JobManager(mock_plugin, cfg, mock_database)
 
         # Insert a None sentinel (simulates stuck start_job)
         with jm._jobs_lock:
@@ -330,7 +146,7 @@ class TestSentinelCleanup:
         from modules.rebalancer import JobManager
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        jm = JobManager(mock_plugin, cfg, mock_database)
 
         with jm._jobs_lock:
             jm._active_jobs["111x222x0"] = None
@@ -344,7 +160,7 @@ class TestSentinelCleanup:
 
 
 # ============================================================================
-# 4. Channel Close Detection (C-4 fix)
+# 2. Channel Close Detection (C-4 fix)
 # ============================================================================
 
 
@@ -356,7 +172,7 @@ class TestChannelCloseDetection:
         from modules.rebalancer import JobManager
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        jm = JobManager(mock_plugin, cfg, mock_database)
 
         job = _active_job(scid="222x333x0", initial_local_sats=100_000)
         with jm._jobs_lock:
@@ -382,7 +198,7 @@ class TestChannelCloseDetection:
         from modules.rebalancer import JobManager
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        jm = JobManager(mock_plugin, cfg, mock_database)
 
         mock_plugin.rpc.listfunds.return_value = {
             "channels": [
@@ -419,7 +235,7 @@ class TestChannelCloseDetection:
 
 
 # ============================================================================
-# 5. Stop Job Re-add on Failure (C-3 fix)
+# 3. Stop Job Re-add on Failure (C-3 fix)
 # ============================================================================
 
 
@@ -439,7 +255,7 @@ class TestStopJobReAddOnFailure:
         original_rpc_error = _mod.RpcError
         _mod.RpcError = _TestRpcError
         try:
-            jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+            jm = JobManager(mock_plugin, cfg, mock_database)
 
             job = _active_job(scid="222x333x0")
             with jm._jobs_lock:
@@ -469,7 +285,7 @@ class TestStopJobReAddOnFailure:
         from modules.rebalancer import JobManager
 
         cfg = Config(dry_run=False, enable_proportional_budget=False)
-        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+        jm = JobManager(mock_plugin, cfg, mock_database)
 
         job = _active_job(scid="222x333x0")
         with jm._jobs_lock:
@@ -497,7 +313,7 @@ class TestStopJobReAddOnFailure:
         original_rpc_error = _mod.RpcError
         _mod.RpcError = _TestRpcError
         try:
-            jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=None)
+            jm = JobManager(mock_plugin, cfg, mock_database)
 
             job = _active_job(scid="222x333x0")
             with jm._jobs_lock:
@@ -522,62 +338,7 @@ class TestStopJobReAddOnFailure:
 
 
 # ============================================================================
-# 6. via_fleet Field (I-17 fix)
-# ============================================================================
-
-
-class TestViaFleetField:
-    """I-17: RebalanceCandidate.via_fleet defaults to False and is included in to_dict."""
-
-    def test_via_fleet_defaults_to_false(self):
-        cand = _candidate()
-        assert cand.via_fleet is False
-
-    def test_via_fleet_can_be_set_true(self):
-        cand = _candidate(via_fleet=True)
-        assert cand.via_fleet is True
-
-    def test_to_dict_includes_via_fleet(self):
-        cand = _candidate(via_fleet=True)
-        d = cand.to_dict()
-        assert "via_fleet" in d
-        assert d["via_fleet"] is True
-
-    def test_to_dict_includes_via_fleet_false(self):
-        cand = _candidate(via_fleet=False)
-        d = cand.to_dict()
-        assert "via_fleet" in d
-        assert d["via_fleet"] is False
-
-    def test_to_dict_includes_expected_fee_sats(self):
-        cand = _candidate()
-        cand.expected_fee_sats = 42
-        d = cand.to_dict()
-        assert "expected_fee_sats" in d
-        assert d["expected_fee_sats"] == 42
-
-    def test_report_outcome_to_hive_uses_via_fleet(self, mock_plugin, mock_database):
-        """_report_outcome_to_hive reads via_fleet from candidate."""
-        from modules.config import Config
-        from modules.rebalancer import JobManager
-
-        bridge = MagicMock()
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
-        jm = JobManager(mock_plugin, cfg, mock_database, hive_bridge=bridge)
-
-        cand = _candidate(via_fleet=True)
-        job = _active_job(scid="222x333x0", candidate=cand)
-
-        jm._report_outcome_to_hive(job, success=True, cost_sats=5, amount_transferred=50_000)
-
-        bridge.report_rebalance_outcome.assert_called_once()
-        call_kwargs = bridge.report_rebalance_outcome.call_args
-        # Check via_fleet was passed through
-        assert call_kwargs[1]["via_fleet"] is True or call_kwargs.kwargs.get("via_fleet") is True
-
-
-# ============================================================================
-# 7. Hot Channel Profit Budget Floor (I-12 fix)
+# 4. Hot Channel Profit Budget Floor (I-12 fix)
 # ============================================================================
 
 

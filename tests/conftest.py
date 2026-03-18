@@ -111,12 +111,12 @@ def sample_policy_updates(sample_peer_ids):
     return [
         {
             "peer_id": sample_peer_ids[0],
-            "strategy": "hive",
+            "strategy": "dynamic",
             "rebalance_mode": "enabled"
         },
         {
             "peer_id": sample_peer_ids[1],
-            "strategy": "hive",
+            "strategy": "static",
             "rebalance_mode": "sink_only"
         },
         {

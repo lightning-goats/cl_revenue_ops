@@ -199,20 +199,11 @@ def _make_config_snapshot(**overrides):
     defaults = {
         "min_fee_ppm": 10,
         "max_fee_ppm": 5000,
-        "hive_fee_ppm": 0,
         "enable_reputation": False,
-        "enable_scarcity_pricing": True,
-        "scarcity_threshold": 0.30,
-        "enable_zero_fee_probe": False,
-        "dynamic_window_enabled": False,
-        "min_observation_window": 1800,
-        "fee_change_cooldown": 300,
-        "profitability_shield_enabled": False,
         "ema_smoothing_alpha": 0.3,
         "fee_interval": 1800,
         "inbound_fee_estimate_ppm": 200,
         "thompson_prior_std_fee": 200.0,
-        "hive_min_confidence_for_prior": 0.3,
         "routing_intelligence_enabled": False,
     }
     defaults.update(overrides)
@@ -222,16 +213,12 @@ def _make_config_snapshot(**overrides):
     return snap
 
 
-def _make_fc_for_dts_pid(mock_plugin, mock_database, *, enable_dts_pid=True):
+def _make_fc_for_dts_pid(mock_plugin, mock_database):
     from modules.config import Config
     config = MagicMock(spec=Config)
     fc = HillClimbingFeeController(mock_plugin, config, mock_database)
     cfg = _make_config_snapshot()
     fc.config.snapshot.return_value = cfg
-
-    fc.ENABLE_THOMPSON_AIMD = True
-    fc.ENABLE_SIMPLIFIED_FEE_PATH = True
-    fc.ENABLE_DTS_PID = enable_dts_pid
 
     mock_database.get_channel_probe.return_value = None
     mock_database.get_volume_since.return_value = 50_000
@@ -284,9 +271,6 @@ class TestDTSPIDIntegration:
     def _state(self):
         return {"state": "balanced", "forward_count": 50, "sats_out": 10000}
 
-    def test_flag_defaults_true(self):
-        assert HillClimbingFeeController.ENABLE_DTS_PID is True
-
     def test_produces_fee_within_bounds(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         result = fc._adjust_channel_fee(
@@ -310,7 +294,7 @@ class TestDTSPIDIntegration:
         )
 
         # Pin Thompson sample_fee to return a deterministic value
-        ts_state = fc._thompson_aimd_states[ch_id]
+        ts_state = fc._channel_fee_states[ch_id]
         ts_state.thompson.sample_fee = lambda floor, ceiling: 200
 
         # Reset PID state for clean comparison
@@ -347,7 +331,7 @@ class TestDTSPIDIntegration:
         )
 
         # Pin Thompson sample_fee to return a deterministic value
-        ts_state = fc._thompson_aimd_states[ch_id]
+        ts_state = fc._channel_fee_states[ch_id]
         ts_state.thompson.sample_fee = lambda floor, ceiling: 200
 
         # Reset PID for balanced run
@@ -383,120 +367,14 @@ class TestDTSPIDIntegration:
         v2_data = json.loads(v2_json)
         assert "pid_state" in v2_data
 
-    def test_flag_false_uses_original_path(self, mock_plugin, mock_database):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database, enable_dts_pid=False)
+    def test_produces_fee_adjustment_instance(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         result = fc._adjust_channel_fee(
             "123x456x0", "02" + "a" * 64, self._state(),
             self._channel_info(), cfg=cfg
         )
         assert result is not None
         assert isinstance(result, FeeAdjustment)
-
-
-class TestHivePriorIntegration:
-    def test_hive_prior_sets_mean(self):
-        ts = GaussianThompsonState()
-        ts.initialize_dts_from_hive(optimal_fee=350, confidence=0.8)
-        assert ts.posterior_mean == 350.0
-
-    def test_hive_prior_narrows_posterior(self):
-        ts_high = GaussianThompsonState()
-        ts_high.initialize_dts_from_hive(optimal_fee=200, confidence=0.9)
-        ts_low = GaussianThompsonState()
-        ts_low.initialize_dts_from_hive(optimal_fee=200, confidence=0.1)
-        assert ts_high.posterior_std < ts_low.posterior_std
-
-    def test_hive_prior_respects_min_precision(self):
-        ts = GaussianThompsonState()
-        ts.initialize_dts_from_hive(optimal_fee=200, confidence=0.0)
-        max_std = math.sqrt(1.0 / GaussianThompsonState.MIN_PRECISION)
-        assert ts.posterior_std <= max_std + 0.01
-
-    def test_hive_prior_no_data_keeps_defaults(self):
-        ts = GaussianThompsonState()
-        default_mean = ts.posterior_mean
-        ts.initialize_dts_from_hive(optimal_fee=None, confidence=0.0)
-        assert ts.posterior_mean == default_mean
-
-
-class TestDTSPIDShadowMode:
-    def test_shadow_mode_logs_proposed_fee(self, mock_plugin, mock_database):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database, enable_dts_pid=False)
-        result = fc._adjust_channel_fee(
-            "123x456x0", "02" + "a" * 64,
-            {"state": "balanced", "forward_count": 50, "sats_out": 10000},
-            {
-                "fee_proportional_millionths": 150,
-                "capacity": 2_000_000,
-                "spendable_msat": "1000000000msat",
-                "opener": "local",
-            },
-            cfg=cfg,
-        )
-        assert result is not None
-        log_calls = [str(c) for c in mock_plugin.log.call_args_list]
-        shadow_logs = [c for c in log_calls if "DTS_PID_SHADOW" in c]
-        assert len(shadow_logs) > 0, (
-            f"Expected DTS_PID_SHADOW log. Last 5 logs: {log_calls[-5:]}"
-        )
-
-
-class TestDTSPIDHiveIntegration:
-    def _channel_info(self, *, current_fee_ppm=150, outbound_pct=50.0):
-        capacity_sats = 2_000_000
-        spendable_sats = int(capacity_sats * (outbound_pct / 100.0))
-        return {
-            "fee_proportional_millionths": current_fee_ppm,
-            "capacity": capacity_sats,
-            "spendable_msat": f"{spendable_sats * 1000}msat",
-            "opener": "local",
-        }
-
-    def test_hive_blend_applies_to_dts_pid(self, mock_plugin, mock_database):
-        """Hive coordination should blend with DTS+PID result."""
-        from modules.hive_bridge import HiveFeeIntelligenceBridge
-        hive = MagicMock(spec=HiveFeeIntelligenceBridge)
-        hive.is_available.return_value = True
-        hive.query_fee_intelligence.return_value = None
-        hive.query_defense_status.return_value = None
-        hive.query_coordinated_fee_recommendation.return_value = {
-            "recommended_fee": 100,
-            "confidence": 0.8,
-        }
-
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        fc.hive_bridge = hive
-        fc.ENABLE_HIVE_COORDINATION = True
-        fc.HIVE_COORDINATION_WEIGHT = 0.3
-
-        result = fc._adjust_channel_fee(
-            "123x456x0", "02" + "a" * 64,
-            {"state": "balanced", "forward_count": 50, "sats_out": 10000},
-            self._channel_info(), cfg=cfg,
-        )
-        assert result is not None
-        assert isinstance(result, FeeAdjustment)
-
-    def test_hive_safety_shortcircuit_unchanged(self, mock_plugin, mock_database):
-        """Hive fleet members should still get hive_fee_ppm, not DTS+PID."""
-        from modules.policy_manager import PolicyManager
-        policy_mgr = MagicMock(spec=PolicyManager)
-        policy_mgr.is_hive_peer.return_value = True
-
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        fc.policy_manager = policy_mgr
-        cfg.hive_fee_ppm = 0
-
-        # Mock set_channel_fee to succeed so the safety path returns a FeeAdjustment
-        fc.set_channel_fee = MagicMock(return_value={"success": True})
-
-        result = fc._adjust_channel_fee(
-            "123x456x0", "02" + "a" * 64,
-            {"state": "balanced", "forward_count": 50, "sats_out": 10000},
-            self._channel_info(), cfg=cfg,
-        )
-        assert result is not None
-        assert result.new_fee_ppm == 0
 
 
 class TestPIDEdgeCases:

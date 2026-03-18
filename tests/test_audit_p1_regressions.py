@@ -267,21 +267,4 @@ class TestCapacityPlannerFireSale:
         assert len(fire_sale_losers) == 0
 
 
-# =========================================================================
-# Fix #23: hive_bridge methods return False on unknown error
-# =========================================================================
-
-class TestHiveBridgeUnknownError:
-    """RPC methods must return False (not True) when the remote method is unknown."""
-
-    @pytest.fixture
-    def bridge(self, mock_hive_bridge):
-        return mock_hive_bridge
-
-    def test_report_rebalance_outcome_unknown_returns_false(self, bridge):
-        bridge._rpc_call_with_policy = MagicMock(
-            return_value=(True, {"error": "Unknown method"}, None)
-        )
-        result = bridge.report_rebalance_outcome("ch1", "ch2", 1000, 50, True)
-        assert result is False
 
