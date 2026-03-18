@@ -17,16 +17,16 @@ def _default_plugin_options(mod):
     }
 
 
-def test_threadsafe_rpc_call_keeps_hive_report_synchronous():
+def test_threadsafe_rpc_call_keeps_synchronous_semantics():
     mod = _load_plugin_module()
     plugin = DummyPlugin()
     plugin.rpc.call = MagicMock(return_value={"status": "ok"})
     proxy = mod.ThreadSafeRpcProxy(plugin)
 
     try:
-        result = proxy.call("hive-report-health", {"foo": "bar"})
+        result = proxy.call("getinfo", {"foo": "bar"})
         assert result == {"status": "ok"}
-        plugin.rpc.call.assert_called_once_with("hive-report-health", {"foo": "bar"})
+        plugin.rpc.call.assert_called_once_with("getinfo", {"foo": "bar"})
     finally:
         proxy._executor.shutdown(wait=True)
         proxy._async_executor.shutdown(wait=True)
@@ -48,7 +48,7 @@ def test_threadsafe_rpc_fire_and_forget_drops_when_async_queue_full():
     proxy._async_executor.submit = MagicMock(side_effect=AssertionError("submit should not be called"))
 
     try:
-        ok = proxy.fire_and_forget("hive-channel-opened", {"channel_id": "1x1x1"})
+        ok = proxy.fire_and_forget("getinfo", {"channel_id": "1x1x1"})
         assert ok is False
         proxy._async_executor.submit.assert_not_called()
     finally:

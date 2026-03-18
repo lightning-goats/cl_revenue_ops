@@ -1,10 +1,6 @@
 """
 Tests for FeeController - strategy handling, skip classification, rebalance floor,
 audit regressions, and decision summary.
-
-Refactored: Removed tests for deleted features (hive, autoband, scarcity,
-saturation floor/drain, Thompson+AIMD, cold start, size buckets, elasticity,
-historical curves, hive egress bias, coordination inputs, traffic intelligence).
 """
 
 import pytest

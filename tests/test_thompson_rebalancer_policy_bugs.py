@@ -56,7 +56,7 @@ class TestRebalancerTimeoutKwarg:
         # Mock _get_channel_local_balance to simulate partial transfer
         jm._get_channel_local_balance = MagicMock(return_value=510000)
         jm.stop_job = MagicMock(return_value=True)
-        jm._report_outcome_to_hive = MagicMock()
+        jm._report_outcome = MagicMock()
         # E3 FIX: Mock _get_sling_stats and _parse_msat to return proper values
         # so fee_sats stays an int (prevents MagicMock propagation through arithmetic)
         jm._get_sling_stats = MagicMock(return_value={})
@@ -101,7 +101,7 @@ class TestRebalancerTimeoutKwarg:
         # No transfer
         jm._get_channel_local_balance = MagicMock(return_value=500000)
         jm.stop_job = MagicMock(return_value=True)
-        jm._report_outcome_to_hive = MagicMock()
+        jm._report_outcome = MagicMock()
 
         # Should not raise
         jm._handle_job_timeout(job)
@@ -338,7 +338,7 @@ class TestPolicyBatchValidation:
             pm.set_policies_batch([{
                 "peer_id": "02" + "a" * 64,
                 "fee_ppm_target": 500,
-                "tags": ["hive", "test"],
+                "tags": ["priority", "test"],
                 "fee_multiplier_min": 0.5,
                 "fee_multiplier_max": 3.0,
                 "strategy": "dynamic",

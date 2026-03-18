@@ -1,4 +1,4 @@
-"""Tests for rebalancer efficiency improvements (failure-informed routing + hive fixes)."""
+"""Tests for rebalancer efficiency improvements (failure-informed routing)."""
 import time
 import pytest
 from unittest.mock import MagicMock

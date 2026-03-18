@@ -170,7 +170,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         ("delete", "02" + "a" * 64, {}),
         ("tag", "02" + "a" * 64, {"tag": "whale"}),
         ("untag", "02" + "a" * 64, {"tag": "whale"}),
-        ("batch", None, {"updates": [{"peer_id": "02" + "a" * 64, "strategy": "hive"}]}),
+        ("batch", None, {"updates": [{"peer_id": "02" + "a" * 64, "strategy": "dynamic"}]}),
     ],
 )
 def test_revenue_policy_mutations_are_deprecated_for_normal_operator_use(action, peer_id, kwargs):
@@ -186,7 +186,7 @@ def test_revenue_policy_mutations_are_deprecated_for_normal_operator_use(action,
 def test_revenue_policy_list_remains_available_for_transition_diagnostics():
     mod = _load_policy_surface_module()
     policy = MagicMock()
-    policy.to_dict.return_value = {"peer_id": "02" + "a" * 64, "strategy": "hive"}
+    policy.to_dict.return_value = {"peer_id": "02" + "a" * 64, "strategy": "dynamic"}
     mod.policy_manager.get_all_policies.return_value = [policy]
 
     result = mod.revenue_policy(mod.plugin, "list")
