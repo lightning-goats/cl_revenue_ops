@@ -7,7 +7,6 @@ for the Revenue Operations plugin.
 Phase 7 additions:
 - ConfigSnapshot: Immutable snapshot for thread-safe cycle execution
 - Runtime configuration updates via RPC
-- Vegas Reflex and Scarcity Pricing settings
 """
 
 import math
@@ -39,16 +38,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'flow_interval': int,
     'fee_interval': int,
     'rebalance_interval': int,
-    'enable_gossip_keepalives': bool,
-    'target_gossip_peers': int,
     'paused': bool,
     'min_fee_ppm': int,
     'max_fee_ppm': int,
-    'auto_band_enabled': bool,
-    'auto_band_min_observations': int,
-    'auto_band_sigma': float,
-    'auto_band_min_width_ppm': int,
-    'auto_band_recalibrate_interval': int,
     'daily_budget_sats': int,
     'weekly_budget_sats': int,
     'total_cost_budget_mode': str,
@@ -67,18 +59,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'boltz_auto_cycle_interval_minutes': int,
     'boltz_auto_cycle_max_actions': int,
     'boltz_auto_cycle_startup_delay_seconds': int,
-    'enable_dynamic_htlcmin': bool,
-    'enable_realtime_surge_defense': bool,
-    'surge_window_seconds': int,
-    'surge_trigger_pct': float,
-    'surge_multiplier_min': float,
-    'surge_multiplier_max': float,
-    'surge_cooldown_seconds': int,
-    'surge_setchannel_min_interval_seconds': int,
-    'enable_dynamic_htlcmax': bool,
-    'htlcmax_source_pct': float,
-    'htlcmax_sink_pct': float,
-    'htlcmax_balanced_pct': float,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -121,8 +101,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Phase 7 additions
     'enable_vegas_reflex': bool,
     'vegas_decay_rate': float,
-    'enable_scarcity_pricing': bool,
-    'scarcity_threshold': float,
     # Phase 1: Operational Hardening
     'rpc_timeout_seconds': int,
     'rpc_circuit_breaker_seconds': int,
@@ -134,16 +112,11 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'enable_velocity_gate': bool,
     'min_velocity_threshold': float,
     'new_channel_grace_days': int,
-    # Thompson Sampling + AIMD (v1.7.0)
+    # Thompson Sampling (v1.7.0)
     'thompson_prior_std_fee': int,
     'thompson_observation_decay_hours': int,
     'thompson_max_observations': int,
     'thompson_min_observations': int,
-    'aimd_failure_threshold': int,
-    'aimd_success_threshold': int,
-    'aimd_multiplicative_decrease': float,
-    'aimd_additive_increase_ppm': int,
-    'aimd_min_decrease_interval': int,
     # Routing Intelligence Integration
     'routing_intelligence_enabled': bool,
     'routing_intelligence_cache_seconds': int,
@@ -167,10 +140,6 @@ DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset()
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
     'max_fee_ppm': (1, 100000),
-    'auto_band_min_observations': (1, 500),
-    'auto_band_sigma': (0.1, 10.0),
-    'auto_band_min_width_ppm': (1, 10000),
-    'auto_band_recalibrate_interval': (1, 1000),
     'daily_budget_sats': (0, 10000000),
     'weekly_budget_sats': (0, 70_000_000),
     'total_cost_budget_profit_pct': (0.0, 1.0),
@@ -183,20 +152,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
     'htlc_congestion_threshold': (0.0, 1.0),
-    'surge_window_seconds': (1, 3600),
-    'surge_trigger_pct': (0.0, 1.0),
-    'surge_multiplier_min': (1.0, 100.0),
-    'surge_multiplier_max': (1.0, 100.0),
-    'surge_cooldown_seconds': (1, 86400),
-    'surge_setchannel_min_interval_seconds': (1, 3600),
     'reputation_decay': (0.0, 1.0),
     'proportional_budget_pct': (0.0, 1.0),
     'kelly_fraction': (0.0, 1.0),
     'vegas_decay_rate': (0.0, 1.0),
-    'scarcity_threshold': (0.0, 1.0),
-    'htlcmax_source_pct': (0.01, 1.0),
-    'htlcmax_sink_pct': (0.01, 1.0),
-    'htlcmax_balanced_pct': (0.01, 1.0),
     'sling_chunk_size_sats': (1, 50000000),
     'sling_max_hops': (2, 20),
     'sling_parallel_jobs': (1, 10),
@@ -217,23 +176,17 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # Issue #30: Velocity gate for rebalancing
     'min_velocity_threshold': (0.0, 1.0),
     'new_channel_grace_days': (0, 30),
-    # Thompson Sampling + AIMD (v1.7.0)
+    # Thompson Sampling (v1.7.0)
     'thompson_prior_std_fee': (10, 500),
     'thompson_observation_decay_hours': (24, 720),  # 1 day to 30 days
     'thompson_max_observations': (50, 500),
     'thompson_min_observations': (1, 20),
-    'aimd_failure_threshold': (1, 10),
-    'aimd_success_threshold': (3, 30),
-    'aimd_multiplicative_decrease': (0.5, 0.95),
-    'aimd_additive_increase_ppm': (1, 20),
-    'aimd_min_decrease_interval': (300, 86400),  # 5 min to 24 hours
     # Routing Intelligence Integration
     'routing_intelligence_cache_seconds': (60, 3600),  # 1 min to 1 hour
     # Additional range validations
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
     'rebalance_interval': (60, 86400),
-    'target_gossip_peers': (0, 100),
     'max_concurrent_jobs': (1, 20),
     'sling_job_timeout_seconds': (60, 7200),
     'askrene_max_age_sec': (10, 86400),
@@ -285,8 +238,6 @@ class Config:
     flow_interval: int = 3600      # 1 hour
     fee_interval: int = 1800       # 30 minutes (matches option default)
     rebalance_interval: int = 900  # 15 minutes
-    enable_gossip_keepalives: bool = False
-    target_gossip_peers: int = 5
     # Hot-channel protection (Sling aggressiveness for fast-draining, high-profit channels)
     hot_channel_protection_enabled: bool = True
     hot_channel_protection_override_peers: str = ''  # CSV fallback; DB override table preferred
@@ -300,21 +251,6 @@ class Config:
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
     boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
-    # Dynamic HTLC Min
-    enable_dynamic_htlcmin: bool = False
-    # Real-time surge defense
-    enable_realtime_surge_defense: bool = False
-    surge_window_seconds: int = 60
-    surge_trigger_pct: float = 0.10
-    surge_multiplier_min: float = 3.0
-    surge_multiplier_max: float = 5.0
-    surge_cooldown_seconds: int = 120
-    surge_setchannel_min_interval_seconds: int = 15
-    # Dynamic HTLC Max
-    enable_dynamic_htlcmax: bool = False
-    htlcmax_source_pct: float = 0.10     # Sources restricted to 10% chunks
-    htlcmax_sink_pct: float = 1.0        # Sinks wide open (100%)
-    htlcmax_balanced_pct: float = 0.50   # Balanced channels restricted to 50%
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens/splices)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
@@ -336,11 +272,6 @@ class Config:
     min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)
     max_fee_ppm: int = 5000        # Ceiling fee in PPM
     base_fee_msat: int = 0         # Base fee (we focus on PPM)
-    auto_band_enabled: bool = True
-    auto_band_min_observations: int = 20
-    auto_band_sigma: float = 2.0
-    auto_band_min_width_ppm: int = 50
-    auto_band_recalibrate_interval: int = 10
     
     # Rebalancing parameters
     rebalance_min_profit: int = 10     # Min profit in sats to trigger (legacy, used when ppm=0)
@@ -425,8 +356,6 @@ class Config:
     # Phase 7 additions (v1.3.0)
     enable_vegas_reflex: bool = True       # Mempool spike defense
     vegas_decay_rate: float = 0.85         # Per-cycle decay (~30min half-life)
-    enable_scarcity_pricing: bool = True   # HTLC slot scarcity pricing
-    scarcity_threshold: float = 0.35       # Start pricing at 35% utilization
     
     # Deferred (v1.4.0)
     enable_flow_asymmetry: bool = False    # Rare liquidity premium
@@ -444,23 +373,13 @@ class Config:
     new_channel_grace_days: int = 7        # Days before velocity gate applies to new channels
 
     # ==========================================================================
-    # Thompson Sampling + AIMD Fee Optimization (v1.7.0)
+    # Thompson Sampling Parameters (v1.7.0)
     # ==========================================================================
-    # Primary algorithm: Gaussian Thompson Sampling with contextual bandits
-    # Defense layer: AIMD for rapid response to routing failures
-    #
-    # Thompson Sampling parameters
     thompson_prior_std_fee: int = 100         # Default prior uncertainty in ppm
     thompson_observation_decay_hours: int = 168  # 7-day half-life for observations
     thompson_max_observations: int = 200      # Bounded memory per channel
     thompson_min_observations: int = 3        # Minimum before trusting posterior
 
-    # AIMD Defense parameters
-    aimd_failure_threshold: int = 3           # Failures before multiplicative decrease
-    aimd_success_threshold: int = 10          # Successes before additive increase
-    aimd_multiplicative_decrease: float = 0.85  # 15% reduction on failure streak
-    aimd_additive_increase_ppm: int = 5       # +5 ppm per success streak
-    aimd_min_decrease_interval: int = 3600    # 1 hour cooldown between decreases
 
     # ==========================================================================
     # Routing Intelligence Integration
@@ -475,11 +394,7 @@ class Config:
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants on direct construction."""
-        if self.surge_multiplier_min > self.surge_multiplier_max:
-            raise ValueError(
-                f"surge_multiplier_min ({self.surge_multiplier_min}) cannot exceed "
-                f"surge_multiplier_max ({self.surge_multiplier_max})"
-            )
+        pass
     
     def snapshot(self) -> 'ConfigSnapshot':
         """
@@ -533,9 +448,6 @@ class Config:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
                 # high_liquidity_threshold is very small (e.g., < 0.05).
                 self.low_liquidity_threshold = max(0.0, self.high_liquidity_threshold - 0.05)
-        if hasattr(self, 'surge_multiplier_min') and hasattr(self, 'surge_multiplier_max'):
-            if self.surge_multiplier_min > self.surge_multiplier_max:
-                self.surge_multiplier_min = self.surge_multiplier_max
         return list(self._override_warnings)
 
     def _apply_override(self, key: str, value: str) -> None:
@@ -642,10 +554,6 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
-            if key == 'surge_multiplier_min' and typed_value > self.surge_multiplier_max:
-                return {"error": f"surge_multiplier_min ({typed_value}) cannot exceed surge_multiplier_max ({self.surge_multiplier_max})"}
-            if key == 'surge_multiplier_max' and typed_value < self.surge_multiplier_min:
-                return {"error": f"surge_multiplier_max ({typed_value}) cannot be less than surge_multiplier_min ({self.surge_multiplier_min})"}
             # AUDIT FIX I-5: Validate sink/source threshold cross-field consistency
             if key == 'sink_threshold' and typed_value >= self.source_threshold:
                 return {"error": f"sink_threshold ({typed_value}) must be less than source_threshold ({self.source_threshold})"}
@@ -701,8 +609,6 @@ class ConfigSnapshot:
     flow_interval: int
     fee_interval: int
     rebalance_interval: int
-    enable_gossip_keepalives: bool
-    target_gossip_peers: int
     paused: bool
     hot_channel_protection_enabled: bool
     hot_channel_protection_override_peers: str
@@ -716,18 +622,6 @@ class ConfigSnapshot:
     boltz_auto_cycle_interval_minutes: int
     boltz_auto_cycle_max_actions: int
     boltz_auto_cycle_startup_delay_seconds: int
-    enable_dynamic_htlcmin: bool
-    enable_realtime_surge_defense: bool
-    surge_window_seconds: int
-    surge_trigger_pct: float
-    surge_multiplier_min: float
-    surge_multiplier_max: float
-    surge_cooldown_seconds: int
-    surge_setchannel_min_interval_seconds: int
-    enable_dynamic_htlcmax: bool
-    htlcmax_source_pct: float
-    htlcmax_sink_pct: float
-    htlcmax_balanced_pct: float
     expansion_treasury_enabled: bool
     expansion_treasury_onchain_target_sats: int
     expansion_treasury_min_deficit_sats: int
@@ -748,11 +642,6 @@ class ConfigSnapshot:
     min_fee_ppm: int
     max_fee_ppm: int
     base_fee_msat: int
-    auto_band_enabled: bool
-    auto_band_min_observations: int
-    auto_band_sigma: float
-    auto_band_min_width_ppm: int
-    auto_band_recalibrate_interval: int
     
     # Rebalancing parameters
     rebalance_min_profit: int
@@ -820,8 +709,6 @@ class ConfigSnapshot:
     # Phase 7 additions (v1.3.0)
     enable_vegas_reflex: bool
     vegas_decay_rate: float
-    enable_scarcity_pricing: bool
-    scarcity_threshold: float
     
     # Deferred (v1.4.0)
     enable_flow_asymmetry: bool
@@ -841,16 +728,11 @@ class ConfigSnapshot:
     min_velocity_threshold: float
     new_channel_grace_days: int
 
-    # Thompson Sampling + AIMD (v1.7.0)
+    # Thompson Sampling (v1.7.0)
     thompson_prior_std_fee: int
     thompson_observation_decay_hours: int
     thompson_max_observations: int
     thompson_min_observations: int
-    aimd_failure_threshold: int
-    aimd_success_threshold: int
-    aimd_multiplicative_decrease: float
-    aimd_additive_increase_ppm: int
-    aimd_min_decrease_interval: int
     # Routing Intelligence Integration
     routing_intelligence_enabled: bool
     routing_intelligence_cache_seconds: int

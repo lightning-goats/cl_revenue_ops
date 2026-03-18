@@ -47,9 +47,7 @@ from modules.policy_manager import (
     READ_ONLY_POLICY_ACTIONS,
     TACTICAL_POLICY_ACTIONS,
 )
-from modules.gossip_keeper import GossipKeepaliveManager
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
-from modules.realtime_surge_defense import RealtimeSurgeDefense, SurgeSample
 from modules.utils import normalize_scid, parse_msat
 
 
@@ -151,125 +149,6 @@ class ForceRateLimiter:
 
 # Global rate limiter for force operations (10 calls per 60 seconds)
 force_rate_limiter = ForceRateLimiter(max_calls=10, window_seconds=60)
-_realtime_surge_channel_cache: Dict[str, Dict[str, Any]] = {}
-_realtime_surge_channel_cache_lock = threading.Lock()
-_realtime_surge_channel_cache_refreshed_at = 0.0
-_REALTIME_SURGE_CHANNEL_CACHE_MAX_AGE_SECONDS = 5.0
-
-
-def _get_realtime_surge_channel_info(channel_id: str) -> Optional[Dict[str, Any]]:
-    """Read cached live channel details for surge-defense callbacks."""
-    if not channel_id:
-        return None
-
-    target_scid = normalize_scid(channel_id)
-    if not target_scid:
-        return None
-
-    with _realtime_surge_channel_cache_lock:
-        if (time.time() - _realtime_surge_channel_cache_refreshed_at) > _REALTIME_SURGE_CHANNEL_CACHE_MAX_AGE_SECONDS:
-            return None
-        channel = _realtime_surge_channel_cache.get(target_scid)
-        if channel is None:
-            return None
-        return dict(channel)
-
-
-def _refresh_realtime_surge_channel_cache() -> int:
-    """Refresh surge-defense channel cache outside the hook path."""
-    global _realtime_surge_channel_cache_refreshed_at
-    if safe_plugin is None:
-        return 0
-
-    try:
-        result = safe_plugin.rpc.call("listpeerchannels")
-    except Exception as e:
-        plugin.log(f"Realtime surge defense listpeerchannels refresh failed: {e}", level="debug")
-        return 0
-
-    refreshed: Dict[str, Dict[str, Any]] = {}
-    for channel in result.get("channels", []):
-        scid = normalize_scid(channel.get("short_channel_id", ""))
-        if scid:
-            refreshed[scid] = dict(channel)
-
-    with _realtime_surge_channel_cache_lock:
-        _realtime_surge_channel_cache.clear()
-        _realtime_surge_channel_cache.update(refreshed)
-        _realtime_surge_channel_cache_refreshed_at = time.time()
-
-    return len(refreshed)
-
-
-def _get_realtime_surge_current_fee_ppm(channel_id: str) -> Optional[int]:
-    """Read the live fee so surge overlays capture the exact pre-surge baseline."""
-    channel = _get_realtime_surge_channel_info(channel_id)
-    if not channel:
-        return None
-
-    updates = channel.get("updates")
-    if isinstance(updates, dict):
-        local_updates = updates.get("local")
-        if isinstance(local_updates, dict):
-            fee_ppm = local_updates.get("fee_proportional_millionths")
-            if fee_ppm is not None:
-                try:
-                    return int(fee_ppm)
-                except (TypeError, ValueError):
-                    return None
-
-    fee_ppm = channel.get("fee_proportional_millionths")
-    if fee_ppm is None:
-        return None
-
-    try:
-        return int(fee_ppm)
-    except (TypeError, ValueError):
-        return None
-
-
-def _get_realtime_surge_channel_capacity_msat(channel_id: str) -> Optional[int]:
-    """Read live channel capacity outside the hook path for burst sizing."""
-    channel = _get_realtime_surge_channel_info(channel_id)
-    if not channel:
-        return None
-
-    total_msat = channel.get("total_msat", channel.get("total_msatoshi", 0))
-    try:
-        return parse_msat(total_msat)
-    except Exception:
-        return None
-
-
-def _apply_realtime_surge_fee_overlay(channel_id: str, fee_ppm: int) -> bool:
-    """Apply surge fee overlays with raw setchannel outside the hook path."""
-    if safe_plugin is None or not channel_id:
-        return False
-
-    payload = {
-        "id": normalize_scid(channel_id),
-        "feeppm": int(fee_ppm),
-    }
-    try:
-        safe_plugin.rpc.call("setchannel", payload)
-        return True
-    except Exception as e:
-        plugin.log(f"Realtime surge defense setchannel failed for {channel_id}: {e}", level="debug")
-        return False
-
-
-def _is_realtime_surge_overlay_active(channel_id: str) -> bool:
-    """Let the scheduled fee controller skip channels under temporary surge control."""
-    if realtime_surge_defense is None or not channel_id:
-        return False
-
-    target_scid = normalize_scid(channel_id) or channel_id
-    try:
-        return bool(realtime_surge_defense.is_overlay_active(target_scid))
-    except Exception as e:
-        plugin.log(f"Realtime surge overlay-state check failed for {channel_id}: {e}", level="debug")
-        return False
-
 
 # Initialize the plugin
 plugin = Plugin()
@@ -468,8 +347,6 @@ profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
 capacity_planner: Optional[CapacityPlanner] = None
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
-gossip_keeper: Optional[GossipKeepaliveManager] = None  # Gossip keepalive target discovery
-realtime_surge_defense: Optional[Any] = None  # Issue #67: temporary fee overlay manager
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
@@ -527,18 +404,6 @@ plugin.add_option(
     description='Interval in seconds for rebalance checks (default: 15 min)'
 )
 
-plugin.add_option(
-    name='revenue-ops-enable-gossip-keepalives',
-    default='false',
-    description='Maintain extra pure P2P peers when total connected peers fall below target (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-target-gossip-peers',
-    default='5',
-    description='Target total connected peers before gossip keepalive dialing stops (default: 5)',
-    opt_type='int'
-)
 
 plugin.add_option(
     name='revenue-ops-target-flow',
@@ -558,38 +423,6 @@ plugin.add_option(
     description='Maximum fee ceiling in PPM (default: 2000)'
 )
 
-plugin.add_option(
-    name='revenue-ops-auto-band-enabled',
-    default='true',
-    description='Enable automatic posterior-driven fee autobands for observed dynamic channels (default: true)'
-)
-
-plugin.add_option(
-    name='revenue-ops-auto-band-min-observations',
-    default='20',
-    description='Minimum Thompson observations before auto-band calibration activates (default: 20)',
-    opt_type='int'
-)
-
-plugin.add_option(
-    name='revenue-ops-auto-band-sigma',
-    default='2.0',
-    description='Posterior standard deviation multiplier used to size auto bands (default: 2.0)'
-)
-
-plugin.add_option(
-    name='revenue-ops-auto-band-min-width-ppm',
-    default='50',
-    description='Minimum width in PPM for auto-calibrated fee bands (default: 50)',
-    opt_type='int'
-)
-
-plugin.add_option(
-    name='revenue-ops-auto-band-recalibrate-interval',
-    default='10',
-    description='Recalibrate automatic fee bands every N fee intervals (default: 10)',
-    opt_type='int'
-)
 
 plugin.add_option(
     name='revenue-ops-rebalance-min-profit',
@@ -681,53 +514,6 @@ plugin.add_option(
     description='HTLC slot utilization threshold (0.0-1.0) above which channel is considered congested (default: 0.8)'
 )
 
-plugin.add_option(
-    name='revenue-ops-enable-dynamic-htlcmin',
-    default='false',
-    description='Enable dynamic htlcmin updates to shed small HTLCs during congestion and relax afterward (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-enable-realtime-surge-defense',
-    default='false',
-    description='Enable real-time toxic-flow surge defense with temporary fee overlays on bursty channels (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-window-seconds',
-    default='60',
-    description='Rolling detection window in seconds for real-time surge defense (default: 60)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-trigger-pct',
-    default='0.10',
-    description='Moved-capacity threshold in the rolling window that can trigger surge defense (default: 0.10)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-multiplier-min',
-    default='3.0',
-    description='Minimum fee multiplier applied when surge defense activates (default: 3.0)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-multiplier-max',
-    default='5.0',
-    description='Maximum fee multiplier applied when surge defense activates (default: 5.0)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-cooldown-seconds',
-    default='120',
-    description='Cooldown period before reverting a surge overlay after pressure subsides (default: 120)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-setchannel-min-interval-seconds',
-    default='15',
-    description='Minimum seconds between surge-defense setchannel writes per channel (default: 15)'
-)
 
 plugin.add_option(
     name='revenue-ops-enable-reputation',
@@ -772,17 +558,6 @@ plugin.add_option(
     description='Vegas Reflex decay rate per cycle, 0.0-1.0 (default: 0.85 = ~30min half-life)'
 )
 
-plugin.add_option(
-    name='revenue-ops-scarcity-pricing',
-    default='true',
-    description='Enable HTLC slot scarcity pricing (default: true)'
-)
-
-plugin.add_option(
-    name='revenue-ops-scarcity-threshold',
-    default='0.35',
-    description='Utilization threshold to start scarcity pricing, 0.0-1.0 (default: 0.35)'
-)
 
 plugin.add_option(
     name='revenue-ops-rpc-timeout-seconds',
@@ -1001,7 +776,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, gossip_keeper, realtime_surge_defense, boltz_manager
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -1084,8 +859,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_interval=_safe_int('revenue-ops-flow-interval'),
         fee_interval=_safe_int('revenue-ops-fee-interval'),
         rebalance_interval=_safe_int('revenue-ops-rebalance-interval'),
-        enable_gossip_keepalives=options.get('revenue-ops-enable-gossip-keepalives', 'false').lower() == 'true',
-        target_gossip_peers=_safe_int_opt('revenue-ops-target-gossip-peers', '5'),
         hot_channel_protection_enabled=options.get('revenue-ops-hot-channel-protection-enabled', 'true').lower() == 'true',
         hot_channel_protection_override_peers=str(options.get('revenue-ops-hot-channel-protection-override-peers', '') or ''),
         hot_channel_protection_min_velocity=_safe_float_opt('revenue-ops-hot-channel-protection-min-velocity', '0.20'),
@@ -1108,11 +881,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         target_flow=_safe_int('revenue-ops-target-flow'),
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
-        auto_band_enabled=options.get('revenue-ops-auto-band-enabled', 'true').lower() == 'true',
-        auto_band_min_observations=_safe_int_opt('revenue-ops-auto-band-min-observations', '20'),
-        auto_band_sigma=_safe_float_opt('revenue-ops-auto-band-sigma', '2.0'),
-        auto_band_min_width_ppm=_safe_int_opt('revenue-ops-auto-band-min-width-ppm', '50'),
-        auto_band_recalibrate_interval=_safe_int_opt('revenue-ops-auto-band-recalibrate-interval', '10'),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
@@ -1128,14 +896,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         proportional_budget_pct=_safe_float('revenue-ops-proportional-budget-pct'),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
         htlc_congestion_threshold=_safe_float('revenue-ops-htlc-congestion-threshold'),
-        enable_dynamic_htlcmin=options.get('revenue-ops-enable-dynamic-htlcmin', 'false').lower() == 'true',
-        enable_realtime_surge_defense=options.get('revenue-ops-enable-realtime-surge-defense', 'false').lower() == 'true',
-        surge_window_seconds=_safe_int_opt('revenue-ops-surge-window-seconds', '60'),
-        surge_trigger_pct=_safe_float_opt('revenue-ops-surge-trigger-pct', '0.10'),
-        surge_multiplier_min=_safe_float_opt('revenue-ops-surge-multiplier-min', '3.0'),
-        surge_multiplier_max=_safe_float_opt('revenue-ops-surge-multiplier-max', '5.0'),
-        surge_cooldown_seconds=_safe_int_opt('revenue-ops-surge-cooldown-seconds', '120'),
-        surge_setchannel_min_interval_seconds=_safe_int_opt('revenue-ops-surge-setchannel-min-interval-seconds', '15'),
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
         reputation_decay=_safe_float('revenue-ops-reputation-decay'),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
@@ -1144,8 +904,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # Phase 7 options (v1.3.0)
         enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
         vegas_decay_rate=_safe_float('revenue-ops-vegas-decay'),
-        enable_scarcity_pricing=options['revenue-ops-scarcity-pricing'].lower() == 'true',
-        scarcity_threshold=_safe_float('revenue-ops-scarcity-threshold'),
         rpc_timeout_seconds=_safe_int('revenue-ops-rpc-timeout-seconds'),
         rpc_circuit_breaker_seconds=_safe_int('revenue-ops-rpc-circuit-breaker-seconds'),
         reservation_timeout_hours=_safe_int('revenue-ops-reservation-timeout-hours'),
@@ -1172,25 +930,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # ThreadSafeRpcProxy adds timeout protection via ThreadPoolExecutor.
     safe_plugin = ThreadSafePluginProxy(plugin)
     plugin.log("Thread-safe RPC proxy initialized", level="info")
-
-    if config.enable_realtime_surge_defense:
-        _refresh_realtime_surge_channel_cache()
-        realtime_surge_defense = RealtimeSurgeDefense(
-            enabled=True,
-            surge_window_seconds=config.surge_window_seconds,
-            surge_trigger_pct=config.surge_trigger_pct,
-            surge_multiplier_min=config.surge_multiplier_min,
-            surge_multiplier_max=config.surge_multiplier_max,
-            surge_cooldown_seconds=config.surge_cooldown_seconds,
-            surge_setchannel_min_interval_seconds=config.surge_setchannel_min_interval_seconds,
-            channel_capacity_msat=_get_realtime_surge_channel_capacity_msat,
-            current_fee_ppm=_get_realtime_surge_current_fee_ppm,
-            apply_fee_callback=_apply_realtime_surge_fee_overlay,
-        )
-        plugin.log("Realtime surge defense enabled", level="info")
-    else:
-        realtime_surge_defense = None
-        plugin.log("Realtime surge defense disabled", level="debug")
 
     # Optional Boltz CLI integration (manual quotes/swaps, wallet ops).
     try:
@@ -1407,12 +1146,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database,
         policy_manager,
         profitability_analyzer,
-        temporary_fee_overlay_active=_is_realtime_surge_overlay_active,
     )
     rebalancer = EVRebalancer(
         safe_plugin, config, database, policy_manager,
     )
-    gossip_keeper = GossipKeepaliveManager(safe_plugin, config)
     rebalancer.set_profitability_analyzer(profitability_analyzer)
     # Unified liquidity-cost accounting:
     # - Rebalancer sees Boltz spend as external liquidity cost
@@ -1764,43 +1501,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             f"channels={tlv_data.get('channel_count', 0)}"
         )
 
-    def gossip_maintenance_loop():
-        """Background loop for gossip keepalive maintenance."""
-        startup_delay = 60
-        interval_seconds = 300
-
-        if shutdown_event.wait(startup_delay):
-            plugin.log("Gossip maintenance loop cancelled during startup delay")
-            return
-
-        while not shutdown_event.is_set():
-            try:
-                run_gossip_maintenance()
-            except Exception as e:
-                plugin.log(f"Error in gossip maintenance loop: {e}", level='warn')
-                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-
-            if shutdown_event.wait(interval_seconds):
-                plugin.log("Gossip maintenance loop stopping due to shutdown signal")
-                break
-
-    def realtime_surge_defense_loop():
-        """Background loop that executes queued surge-defense fee overlays."""
-        interval_seconds = 1
-
-        while not shutdown_event.is_set():
-            try:
-                if realtime_surge_defense is not None:
-                    _refresh_realtime_surge_channel_cache()
-                    realtime_surge_defense.process_pending_actions()
-            except Exception as e:
-                plugin.log(f"Error in realtime surge defense worker: {e}", level='warn')
-                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-
-            if shutdown_event.wait(interval_seconds):
-                plugin.log("Realtime surge defense loop stopping due to shutdown signal", level='debug')
-                break
-
     # =========================================================================
     # STARTUP HYGIENE: Clean up orphan jobs from previous runs
     # =========================================================================
@@ -1837,10 +1537,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
-    threading.Thread(target=gossip_maintenance_loop, daemon=True, name="gossip-maintenance").start()
     threading.Thread(target=boltz_auto_cycle_loop, daemon=True, name="boltz-auto-cycle").start()
-    if realtime_surge_defense is not None:
-        threading.Thread(target=realtime_surge_defense_loop, daemon=True, name="realtime-surge-defense").start()
 
     plugin.log("cl-revenue-ops plugin initialized successfully!")
     return None
@@ -1884,27 +1581,6 @@ def run_flow_analysis():
         plugin.log(f"Flow analysis failed: {e}", level='error')
         raise
 
-
-def run_gossip_maintenance():
-    """Run one gossip keepalive maintenance cycle."""
-    if gossip_keeper is None or config is None:
-        return
-
-    cfg = config.snapshot() if hasattr(config, 'snapshot') else config
-    if not getattr(cfg, 'enable_gossip_keepalives', False):
-        return
-
-    gossip_keeper.config = cfg
-    result = gossip_keeper.maintain_connections()
-    if isinstance(result, dict):
-        attempted = int(result.get('attempted', 0) or 0)
-        connected = int(result.get('connected', 0) or 0)
-        if attempted > 0 or connected > 0:
-            plugin.log(
-                f"Gossip maintenance: attempted={attempted} connected={connected} "
-                f"target={result.get('target')} connected_count={result.get('connected_count')}",
-                level='debug',
-            )
 
 
 def run_fee_adjustment():
@@ -1954,58 +1630,6 @@ def run_rebalance_check():
 # =============================================================================
 
 
-def _default_realtime_surge_defense_status() -> Dict[str, Any]:
-    """Return a stable status payload even when surge defense is unavailable."""
-    return {
-        "enabled": bool(config and getattr(config, "enable_realtime_surge_defense", False)),
-        "active_channel_count": 0,
-        "trigger_count_1h": 0,
-        "trigger_count_24h": 0,
-        "channels": {},
-    }
-
-
-def _normalize_realtime_surge_defense_status(raw_status: Any) -> Dict[str, Any]:
-    """Ensure revenue-status always returns the full surge-defense surface."""
-    status = _default_realtime_surge_defense_status()
-    if not isinstance(raw_status, dict):
-        return status
-
-    status["enabled"] = bool(raw_status.get("enabled", status["enabled"]))
-
-    for key in ("active_channel_count", "trigger_count_1h", "trigger_count_24h"):
-        try:
-            status[key] = max(0, int(raw_status.get(key, status[key])))
-        except (TypeError, ValueError):
-            continue
-
-    raw_channels = raw_status.get("channels")
-    if isinstance(raw_channels, dict):
-        normalized_channels = {}
-        for channel_id, raw_channel in raw_channels.items():
-            channel_status = dict(raw_channel) if isinstance(raw_channel, dict) else {}
-
-            cooldown_remaining_sec = channel_status.get(
-                "cooldown_remaining_sec",
-                channel_status.get("cooldown_remaining_seconds", 0.0),
-            )
-            try:
-                cooldown_remaining_sec = max(0.0, float(cooldown_remaining_sec))
-            except (TypeError, ValueError):
-                cooldown_remaining_sec = 0.0
-
-            channel_status.setdefault("active", False)
-            channel_status.setdefault("baseline_fee_ppm", None)
-            channel_status.setdefault("active_fee_ppm", None)
-            channel_status.setdefault("last_trigger_reason", "")
-            channel_status.setdefault("last_apply_result", "idle")
-            channel_status["cooldown_remaining_sec"] = cooldown_remaining_sec
-            normalized_channels[str(channel_id)] = channel_status
-
-        status["channels"] = normalized_channels
-
-    return status
-
 @plugin.method("revenue-status")
 def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     """
@@ -2031,11 +1655,6 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
             "public_keys": config.public_runtime_keys() if config else [],
             "values": config.public_runtime_dict() if config else {},
         },
-        "realtime_surge_defense": (
-            _normalize_realtime_surge_defense_status(realtime_surge_defense.get_status())
-            if realtime_surge_defense and hasattr(realtime_surge_defense, "get_status")
-            else _default_realtime_surge_defense_status()
-        ),
         "fee_decision": (
             fee_controller.get_last_decision_summary()
             if fee_controller and hasattr(fee_controller, "get_last_decision_summary")
@@ -3805,54 +3424,6 @@ def revenue_clear_reservations(plugin: Plugin) -> Dict[str, Any]:
         plugin.log(f"Error clearing reservations: {e}", level='error')
         return {"error": str(e)}
 
-
-# =============================================================================
-# HOOKS - React to Lightning events
-# =============================================================================
-
-@plugin.hook("htlc_accepted")
-def on_htlc_accepted(onion: Dict, htlc: Dict, plugin: Plugin, **kwargs) -> Dict[str, str]:
-    """
-    Hook called when an HTLC is accepted.
-
-    This hook must stay fail-open and constant-time. It only extracts the live
-    forwarding fields already present on the hook payload and hands them to the
-    in-memory surge-defense manager.
-    """
-    try:
-        if realtime_surge_defense is None:
-            return {"result": "continue"}
-
-        incoming_peer_id = (
-            kwargs.get("peer_id")
-            or kwargs.get("incoming_peer_id")
-            or kwargs.get("peer")
-            or htlc.get("peer_id")
-        )
-        incoming_channel_id = htlc.get("short_channel_id") or htlc.get("channel_id")
-        outgoing_channel_id = kwargs.get("forward_to") or onion.get("forward_to")
-        amount_raw = (
-            htlc.get("amount")
-            or htlc.get("amount_msat")
-            or htlc.get("amount_msatoshi")
-        )
-        amount_msat = _parse_msat(amount_raw or 0)
-
-        if incoming_peer_id and incoming_channel_id and outgoing_channel_id and amount_msat > 0:
-            realtime_surge_defense.ingest_sample(
-                SurgeSample(
-                    ts=time.time(),
-                    amount_msat=amount_msat,
-                    incoming_peer_id=str(incoming_peer_id),
-                    incoming_channel_id=normalize_scid(incoming_channel_id),
-                    outgoing_channel_id=normalize_scid(outgoing_channel_id),
-                )
-            )
-    except Exception as e:
-        plugin.log(f"Realtime surge defense htlc_accepted failed open: {e}", level="debug")
-        plugin.log(f"Traceback: {traceback.format_exc()}", level="debug")
-
-    return {"result": "continue"}
 
 
 def _resolve_scid_to_peer(scid: str) -> Optional[str]:

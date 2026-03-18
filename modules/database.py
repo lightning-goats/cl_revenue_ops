@@ -520,18 +520,6 @@ class Database:
         """)
         
         
-        # PID state table - stores controller state per channel
-        # LEGACY: Kept for backward compatibility, but Hill Climbing uses fee_strategy_state
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS pid_state (
-                channel_id TEXT PRIMARY KEY,
-                integral REAL NOT NULL DEFAULT 0,
-                last_error REAL NOT NULL DEFAULT 0,
-                last_fee_ppm INTEGER NOT NULL DEFAULT 0,
-                last_update INTEGER NOT NULL
-            )
-        """)
-        
         # NEW: Fee Strategy State table for Hill Climbing controller
         # Stores state for the revenue-maximizing Perturb & Observe algorithm
         # UPDATED: Uses last_revenue_rate (REAL) for rate-based feedback instead of
@@ -4532,7 +4520,7 @@ class Database:
                 )
                 deleted["kalman_state"] = cursor.rowcount
 
-                # L11 FIX: Clean up fee_strategy_state and pid_state to prevent
+                # L11 FIX: Clean up fee_strategy_state to prevent
                 # orphaned rows from accumulating on nodes with frequent channel turnover.
                 try:
                     cursor = conn.execute(
@@ -4540,15 +4528,6 @@ class Database:
                         (channel_id,)
                     )
                     deleted["fee_strategy_state"] = cursor.rowcount
-                except Exception:
-                    pass  # Table may not exist on older schemas
-
-                try:
-                    cursor = conn.execute(
-                        "DELETE FROM pid_state WHERE channel_id = ?",
-                        (channel_id,)
-                    )
-                    deleted["pid_state"] = cursor.rowcount
                 except Exception:
                     pass  # Table may not exist on older schemas
 
