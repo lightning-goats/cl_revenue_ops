@@ -308,7 +308,7 @@ class TestPeerPolicyDataclass:
         assert min_mult <= max_mult
 
 
-class TestFeeAutobandPolicy:
+class TestFeeBandPolicy:
     """Test fee band storage in policy manager."""
 
     def test_set_policy_persists_fee_autoband_multipliers(self, mock_database, mock_plugin, sample_peer_ids):

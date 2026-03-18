@@ -28,12 +28,12 @@ class MockConfigSnapshot:
         self,
         min_fee_ppm=1,
         max_fee_ppm=5000,
-        hill_climb_step_ppm=10,
+        step_ppm=10,
         **kwargs
     ):
         self.min_fee_ppm = min_fee_ppm
         self.max_fee_ppm = max_fee_ppm
-        self.hill_climb_step_ppm = hill_climb_step_ppm
+        self.step_ppm = step_ppm
         # Add other fields as needed
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -132,18 +132,18 @@ class TestAdjustAllFeesSkipClassification:
         self, mock_database, mock_plugin, sample_peer_ids
     ):
         """A consumed observation window should not be reclassified as waiting_time."""
-        from modules.fee_controller import HillClimbState
+        from modules.fee_controller import ChannelCycleState
 
         fc = self._make_fc(mock_plugin, mock_database)
         channel_id = "123x456x0"
         peer_id = sample_peer_ids[0]
         now = int(time.time())
-        hc_state = HillClimbState(
+        cycle = ChannelCycleState(
             last_update=now - 7200,
             last_fee_ppm=100,
             last_broadcast_fee_ppm=100,
         )
-        fc._hill_climb_states[channel_id] = hc_state
+        fc._cycle_states[channel_id] = cycle
 
         mock_database.get_all_channel_states.return_value = [
             {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
@@ -158,7 +158,7 @@ class TestAdjustAllFeesSkipClassification:
         })
 
         def consume_window(**_kwargs):
-            hc_state.last_update = now
+            cycle.last_update = now
             return None
 
         fc._adjust_channel_fee = MagicMock(side_effect=consume_window)
@@ -171,18 +171,18 @@ class TestAdjustAllFeesSkipClassification:
 
     def test_adjust_all_fees_reports_gossip_hysteresis(self, mock_database, mock_plugin, sample_peer_ids):
         """Internal target changes without broadcast should hit gossip_hysteresis."""
-        from modules.fee_controller import HillClimbState
+        from modules.fee_controller import ChannelCycleState
 
         fc = self._make_fc(mock_plugin, mock_database)
         channel_id = "123x456x0"
         peer_id = sample_peer_ids[0]
         now = int(time.time())
-        hc_state = HillClimbState(
+        cycle = ChannelCycleState(
             last_update=now - 7200,
             last_fee_ppm=100,
             last_broadcast_fee_ppm=100,
         )
-        fc._hill_climb_states[channel_id] = hc_state
+        fc._cycle_states[channel_id] = cycle
 
         mock_database.get_all_channel_states.return_value = [
             {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
@@ -197,8 +197,8 @@ class TestAdjustAllFeesSkipClassification:
         })
 
         def skip_with_internal_target(**_kwargs):
-            hc_state.last_update = now
-            hc_state.last_fee_ppm = 110
+            cycle.last_update = now
+            cycle.last_fee_ppm = 110
             return None
 
         fc._adjust_channel_fee = MagicMock(side_effect=skip_with_internal_target)
@@ -211,18 +211,18 @@ class TestAdjustAllFeesSkipClassification:
 
     def test_adjust_all_fees_reports_alpha_guard(self, mock_database, mock_plugin, sample_peer_ids):
         """Consumed windows with no target/broadcast change should hit alpha_guard."""
-        from modules.fee_controller import HillClimbState
+        from modules.fee_controller import ChannelCycleState
 
         fc = self._make_fc(mock_plugin, mock_database)
         channel_id = "123x456x0"
         peer_id = sample_peer_ids[0]
         now = int(time.time())
-        hc_state = HillClimbState(
+        cycle = ChannelCycleState(
             last_update=now - 7200,
             last_fee_ppm=100,
             last_broadcast_fee_ppm=90,
         )
-        fc._hill_climb_states[channel_id] = hc_state
+        fc._cycle_states[channel_id] = cycle
 
         mock_database.get_all_channel_states.return_value = [
             {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
@@ -237,9 +237,9 @@ class TestAdjustAllFeesSkipClassification:
         })
 
         def skip_below_threshold(**_kwargs):
-            hc_state.last_update = now
-            hc_state.last_fee_ppm = 100
-            hc_state.last_broadcast_fee_ppm = 90
+            cycle.last_update = now
+            cycle.last_fee_ppm = 100
+            cycle.last_broadcast_fee_ppm = 90
             return None
 
         fc._adjust_channel_fee = MagicMock(side_effect=skip_below_threshold)
@@ -252,18 +252,18 @@ class TestAdjustAllFeesSkipClassification:
 
     def test_adjust_all_fees_reports_idempotent(self, mock_database, mock_plugin, sample_peer_ids):
         """Same-fee on-chain no-op should hit idempotent."""
-        from modules.fee_controller import HillClimbState
+        from modules.fee_controller import ChannelCycleState
 
         fc = self._make_fc(mock_plugin, mock_database)
         channel_id = "123x456x0"
         peer_id = sample_peer_ids[0]
         now = int(time.time())
-        hc_state = HillClimbState(
+        cycle = ChannelCycleState(
             last_update=now - 7200,
             last_fee_ppm=100,
             last_broadcast_fee_ppm=90,
         )
-        fc._hill_climb_states[channel_id] = hc_state
+        fc._cycle_states[channel_id] = cycle
 
         mock_database.get_all_channel_states.return_value = [
             {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
@@ -278,9 +278,9 @@ class TestAdjustAllFeesSkipClassification:
         })
 
         def skip_idempotent(**_kwargs):
-            hc_state.last_update = now
-            hc_state.last_fee_ppm = 100
-            hc_state.last_broadcast_fee_ppm = 100
+            cycle.last_update = now
+            cycle.last_fee_ppm = 100
+            cycle.last_broadcast_fee_ppm = 100
             return None
 
         fc._adjust_channel_fee = MagicMock(side_effect=skip_idempotent)
@@ -295,18 +295,18 @@ class TestAdjustAllFeesSkipClassification:
         self, mock_database, mock_plugin, sample_peer_ids
     ):
         """Dynamic-window channels with enough forwards should not hit waiting_time."""
-        from modules.fee_controller import HillClimbState
+        from modules.fee_controller import ChannelCycleState
 
         fc = self._make_fc(mock_plugin, mock_database)
         channel_id = "123x456x0"
         peer_id = sample_peer_ids[0]
         now = int(time.time())
-        hc_state = HillClimbState(
+        cycle = ChannelCycleState(
             last_update=now - 1800,
             last_fee_ppm=100,
             last_broadcast_fee_ppm=90,
         )
-        fc._hill_climb_states[channel_id] = hc_state
+        fc._cycle_states[channel_id] = cycle
 
         mock_database.get_all_channel_states.return_value = [
             {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced", "forward_count": 3}
@@ -321,9 +321,9 @@ class TestAdjustAllFeesSkipClassification:
         })
 
         def consume_forward_qualified_window(**_kwargs):
-            hc_state.last_update = now
-            hc_state.last_fee_ppm = 100
-            hc_state.last_broadcast_fee_ppm = 90
+            cycle.last_update = now
+            cycle.last_fee_ppm = 100
+            cycle.last_broadcast_fee_ppm = 90
             return None
 
         fc._adjust_channel_fee = MagicMock(side_effect=consume_forward_qualified_window)
@@ -824,8 +824,6 @@ class TestLastDecisionSummary:
         from modules.fee_controller import FeeController
 
         cfg = Config()
-        mock_database.prune_expired_fee_anchors.return_value = None
-        mock_database.get_all_fee_anchors.return_value = []
         mock_database.get_all_channel_states.return_value = []
 
         fc = FeeController(mock_plugin, cfg, mock_database)
@@ -846,8 +844,6 @@ class TestLastDecisionSummary:
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
         cfg = Config()
-        mock_database.prune_expired_fee_anchors.return_value = None
-        mock_database.get_all_fee_anchors.return_value = []
         mock_database.get_all_channel_states.return_value = [
             {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced"}
         ]

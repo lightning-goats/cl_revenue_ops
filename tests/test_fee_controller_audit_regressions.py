@@ -2,7 +2,7 @@
 Regression tests for fee_controller.py audit (Session 2, 2026-03-02).
 
 Tests cover:
-- C-1: Alpha Sequence priority chain integration test
+- C-1: Fee Priority Chain priority chain integration test
 - C-2: _adjust_channel_fee end-to-end test
 - I-1: NaN guard on update_posterior
 - I-2: Zero-fee probe TTL expiry
@@ -208,11 +208,11 @@ class TestProbeTTL:
 
 
 # =============================================================================
-# C-1: Alpha Sequence priority chain integration test
+# C-1: Fee Priority Chain priority chain integration test
 # =============================================================================
 
-class TestAlphaSequencePriority:
-    """Integration tests for the Alpha Sequence priority chain (C-1).
+class TestFeePriorityChain:
+    """Integration tests for the Fee Priority Chain priority chain (C-1).
 
     Tests verify the correct priority order:
     1. Congestion (saturated HTLC slots -> ceiling fee)

@@ -125,7 +125,7 @@ class TestThompsonContextualRevenueWeight:
         """Create a GaussianThompsonState for testing."""
         from modules.fee_controller import GaussianThompsonState
         state = GaussianThompsonState()
-        # Context key format: "balance:pheromone:time:role"
+        # Context key format: "balance:time:role"
         # Use a key with "normal" time and "P" role
         ctx_key = "mid:med:normal:P"
         # 4-tuple format: (mean, precision, count, last_update)

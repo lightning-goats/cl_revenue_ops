@@ -41,7 +41,7 @@ class TestFeeReasonCode:
 
     def test_algorithm_reason_codes_exist(self):
         """Verify all algorithm decision reason codes are defined."""
-        assert FeeReasonCode.THOMPSON_SAMPLE.value == "thompson_sample"
+        assert FeeReasonCode.DTS_PID_SAMPLE.value == "thompson_sample"
         assert FeeReasonCode.ZERO_FEE_PROBE.value == "zero_fee_probe"
         assert FeeReasonCode.ZERO_FEE_PROBE_SUCCESS.value == "zero_fee_probe_success"
         assert FeeReasonCode.CONGESTION.value == "congestion"
@@ -67,9 +67,9 @@ class TestFeeAdjustment:
             old_fee_ppm=100,
             new_fee_ppm=120,
             reason="test reason",
-            hill_climb_values={"direction": 1}
+            algorithm_values={"direction": 1}
         )
-        assert adj.reason_code == FeeReasonCode.THOMPSON_SAMPLE.value
+        assert adj.reason_code == FeeReasonCode.DTS_PID_SAMPLE.value
 
     def test_fee_adjustment_with_reason_code(self):
         """FeeAdjustment should accept explicit reason_code."""
@@ -79,7 +79,7 @@ class TestFeeAdjustment:
             old_fee_ppm=100,
             new_fee_ppm=110,
             reason="test reason",
-            hill_climb_values={"direction": 1},
+            algorithm_values={"direction": 1},
             reason_code=FeeReasonCode.CONGESTION.value,
         )
 
@@ -94,7 +94,7 @@ class TestFeeAdjustment:
             old_fee_ppm=100,
             new_fee_ppm=90,
             reason="decreasing fee",
-            hill_climb_values={"direction": -1},
+            algorithm_values={"direction": -1},
             reason_code=FeeReasonCode.ZERO_FEE_PROBE.value
         )
 
@@ -104,7 +104,7 @@ class TestFeeAdjustment:
         assert result["old_fee_ppm"] == 100
         assert result["new_fee_ppm"] == 90
         assert result["reason"] == "decreasing fee"
-        assert result["hill_climb_values"] == {"direction": -1}
+        assert result["algorithm_values"] == {"direction": -1}
 
 
 def _load_revenue_status_module():

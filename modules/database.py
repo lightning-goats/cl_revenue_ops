@@ -3,7 +3,7 @@ Database module for cl-revenue-ops
 
 Handles SQLite persistence for:
 - Channel flow states and history
-- Hill Climbing fee controller state
+- Fee controller state
 - Fee change history
 - Rebalance history
 
@@ -224,7 +224,7 @@ class Database:
     Provides persistence for:
     - Channel states (source/sink/balanced classification)
     - Flow metrics history
-    - Hill Climbing fee controller state
+    - Fee controller state
     - Fee change audit log
     - Rebalance history
     
@@ -520,7 +520,7 @@ class Database:
         """)
         
         
-        # NEW: Fee Strategy State table for Hill Climbing controller
+        # Fee Strategy State table for fee controller
         # Stores state for the revenue-maximizing Perturb & Observe algorithm
         # UPDATED: Uses last_revenue_rate (REAL) for rate-based feedback instead of
         # last_revenue_sats to measure revenue per hour since last fee change.
@@ -1087,19 +1087,6 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
-        # Fee anchors table: advisor-set soft fee targets with decaying weight
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fee_anchors (
-                channel_id TEXT PRIMARY KEY,
-                target_fee_ppm INTEGER NOT NULL,
-                base_weight REAL NOT NULL DEFAULT 0.7,
-                confidence REAL NOT NULL DEFAULT 1.0,
-                ttl_seconds INTEGER NOT NULL DEFAULT 86400,
-                reason TEXT DEFAULT '',
-                set_at INTEGER NOT NULL
-            )
-        """)
-
         self.plugin.log("Database initialized successfully")
     
 
@@ -1598,12 +1585,12 @@ class Database:
         conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
     
     # =========================================================================
-    # Fee Strategy State Methods (Hill Climbing Controller)
+    # Fee Strategy State Methods
     # =========================================================================
     
     def get_fee_strategy_state(self, channel_id: str) -> Dict[str, Any]:
         """
-        Get Hill Climbing fee strategy state for a channel.
+        Get fee strategy state for a channel.
 
         Used by the revenue-maximizing Perturb & Observe algorithm.
 
@@ -1681,7 +1668,7 @@ class Database:
                                    v2_state_json: str = '{}',
                                    last_update: int = None):
         """
-        Update Hill Climbing fee strategy state for a channel.
+        Update fee strategy state for a channel.
 
         Called after each fee adjustment iteration to record the state
         for the next observation period.
@@ -5439,57 +5426,6 @@ class Database:
         ).fetchone()
         return row['avg_fee'] if row and row['avg_fee'] else 1.0
     
-    # =========================================================================
-    # Fee Anchors: Advisor-set soft fee targets with decaying weight
-    # =========================================================================
-
-    def set_fee_anchor(self, channel_id: str, target_fee_ppm: int,
-                       base_weight: float = 0.7, confidence: float = 1.0,
-                       ttl_seconds: int = 86400, reason: str = '') -> None:
-        """Upsert a fee anchor for a channel."""
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT OR REPLACE INTO fee_anchors
-            (channel_id, target_fee_ppm, base_weight, confidence, ttl_seconds, reason, set_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (channel_id, target_fee_ppm, base_weight, confidence,
-              ttl_seconds, reason, int(time.time())))
-
-    def get_fee_anchor(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        """Get the fee anchor for a channel, or None if not set/expired."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT * FROM fee_anchors WHERE channel_id = ?", (channel_id,)
-        ).fetchone()
-        if row:
-            return dict(row)
-        return None
-
-    def get_all_fee_anchors(self) -> List[Dict[str, Any]]:
-        """Get all fee anchors."""
-        conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM fee_anchors").fetchall()
-        return [dict(r) for r in rows]
-
-    def delete_fee_anchor(self, channel_id: str) -> None:
-        """Delete the fee anchor for a channel."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM fee_anchors WHERE channel_id = ?", (channel_id,))
-
-    def delete_all_fee_anchors(self) -> None:
-        """Delete all fee anchors."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM fee_anchors")
-
-    def prune_expired_fee_anchors(self) -> int:
-        """Delete expired fee anchors. Returns count deleted."""
-        conn = self._get_connection()
-        now = int(time.time())
-        cursor = conn.execute(
-            "DELETE FROM fee_anchors WHERE set_at + ttl_seconds < ?", (now,)
-        )
-        return cursor.rowcount
-
     def close(self):
         """Close the thread-local database connection (if any).
 

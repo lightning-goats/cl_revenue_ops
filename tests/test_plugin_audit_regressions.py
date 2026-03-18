@@ -56,16 +56,6 @@ def test_threadsafe_rpc_fire_and_forget_drops_when_async_queue_full():
         proxy._async_executor.shutdown(wait=True)
 
 
-def test_revenue_fee_anchor_returns_deprecated():
-    """revenue-fee-anchor is deprecated and always returns deprecated status."""
-    mod = _load_plugin_module()
-
-    r1 = mod.revenue_fee_anchor(
-        mod.plugin, action="set", channel_id="1x2x3", target_fee_ppm=100, ttl_hours="abc"
-    )
-    assert r1["status"] == "deprecated"
-
-
 def test_channel_state_changed_resolves_txid_to_scid_before_closure_accounting():
     mod = _load_plugin_module()
     txid = "a" * 64

@@ -40,7 +40,7 @@ def _listpeerchannels_payload(
 
 
 def _fee_strategy_state_dict():
-    # Minimal dict for _get_hill_climb_state/_get_thompson_aimd_state loaders.
+    # Minimal dict for _get_cycle_state fee strategy loaders.
     return {
         "last_revenue_rate": 0.0,
         "last_fee_ppm": 0,
@@ -190,7 +190,7 @@ class TestDynamicHtlcMinPersistence:
 class TestGossipRefreshExecution:
     def test_gossip_refresh_executes_setchannel_and_returns_fee_adjustment(self, mock_plugin, mock_database):
         from modules.config import Config
-        from modules.fee_controller import FeeController, HillClimbState, FeeReasonCode
+        from modules.fee_controller import FeeController, ChannelCycleState, FeeReasonCode
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -213,7 +213,7 @@ class TestGossipRefreshExecution:
         fc = FeeController(mock_plugin, cfg, mock_database)
 
         # Provide a real-ish state and ensure the fee change will be applied.
-        st = HillClimbState(
+        st = ChannelCycleState(
             last_update=int(time.time()) - 86400 * 2,
             last_broadcast_fee_ppm=100,
             last_fee_ppm=100,

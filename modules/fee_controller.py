@@ -30,7 +30,7 @@ Concern 3 — Hard Safety: Floor/ceiling clamps
 - Vegas Reflex floor: mempool spike -> raise fee floor
 - Global bounds: min_fee_ppm, max_fee_ppm from configuration
 
-The Alpha Sequence (Fee Priority Chain):
+The Fee Priority Chain:
 1. Congestion: HTLC slots saturated -> ceiling fee
 2. Zero-Fee Probe: Defibrillator for dead channels -> 0 PPM
 3. DTS+PID: Primary fee optimization
@@ -77,7 +77,7 @@ class FeeReasonCode(Enum):
 
     Categories:
     - Policy overrides: Static policies that bypass algorithmic decisions
-    - Algorithm decisions: Core Thompson Sampling / Hill Climbing outcomes
+    - Algorithm decisions: Core DTS+PID fee controller outcomes
     - Heuristic modifiers: Channel-aware adjustments to step size
     - Skip reasons: Why a channel was not adjusted this cycle
     """
@@ -86,7 +86,7 @@ class FeeReasonCode(Enum):
     POLICY_STATIC = "policy_static"       # Peer has static fee target
 
     # Algorithm decisions
-    THOMPSON_SAMPLE = "thompson_sample"               # Normal Thompson posterior sample
+    DTS_PID_SAMPLE = "thompson_sample"               # Normal Thompson posterior sample
     ZERO_FEE_PROBE = "zero_fee_probe"                 # Defibrillator 0-fee probe
     ZERO_FEE_PROBE_SUCCESS = "zero_fee_probe_success" # Probe succeeded, exit to floor
     CONGESTION = "congestion"                         # Congestion-based fee surge
@@ -927,7 +927,7 @@ class GaussianThompsonState:
 
     def inject_synthetic_observation(self, fee, revenue_rate, weight_scale=0.3, time_bucket="normal"):
         """
-        Inject a reduced-weight synthetic observation from Alpha Sequence bypasses.
+        Inject a reduced-weight synthetic observation from priority chain bypasses.
 
         When congestion or zero-fee probes bypass Thompson entirely, Thompson
         gets no observations and can't learn. This injects synthetic observations
@@ -1294,9 +1294,9 @@ class ChannelFeeState:
 
 
 @dataclass
-class HillClimbState:
+class ChannelCycleState:
     """
-    State of the Hill Climbing fee optimizer for one channel.
+    Per-channel cycle tracking state for the fee controller.
 
     UPDATED: Uses rate-based feedback (revenue per hour) instead of
     absolute revenue to eliminate lag from using 7-day averages.
@@ -1453,7 +1453,7 @@ class FeeAdjustment:
         old_fee_ppm: Previous fee
         new_fee_ppm: New fee after adjustment
         reason: Explanation of the adjustment
-        hill_climb_values: Hill Climbing algorithm internal values
+        algorithm_values: Fee controller algorithm internal values
         reason_code: Structured FeeReasonCode value (for explainability)
     """
     channel_id: str
@@ -1461,8 +1461,8 @@ class FeeAdjustment:
     old_fee_ppm: int
     new_fee_ppm: int
     reason: str
-    hill_climb_values: Dict[str, Any]
-    reason_code: str = FeeReasonCode.THOMPSON_SAMPLE.value  # Default reason
+    algorithm_values: Dict[str, Any]
+    reason_code: str = FeeReasonCode.DTS_PID_SAMPLE.value  # Default reason
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1471,7 +1471,7 @@ class FeeAdjustment:
             "old_fee_ppm": self.old_fee_ppm,
             "new_fee_ppm": self.new_fee_ppm,
             "reason": self.reason,
-            "hill_climb_values": self.hill_climb_values,
+            "algorithm_values": self.algorithm_values,
             "reason_code": self.reason_code
         }
 
@@ -1487,8 +1487,8 @@ class FeeController:
       posterior forgetting (gamma=0.95). Samples from Normal posterior over
       fee-revenue observations.
     - PID Controller: Balance management multiplier (0.1x–10.0x) from channel
-      outbound ratio. Replaces scarcity pricing, AIMD defense, saturation
-      floor/drain, and balance-based floor with one unified mechanism.
+      outbound ratio. Replaces legacy balance-based adjustments with one
+      unified mechanism.
     - Hard Safety: Economic floors (rebalance cost, Vegas Reflex, min_fee)
       and ceiling (max_fee) that the PID has no signal for.
 
@@ -1580,12 +1580,12 @@ class FeeController:
             except Exception as e:
                 self.plugin.log(f"POLICY_CHANGE: Failed to register callback: {e}", level='debug')
 
-        # HillClimbState cache: still actively used for observation timers,
+        # ChannelCycleState cache: still actively used for observation timers,
         # sleep/wake cycles, broadcast fee tracking, trend direction, and
         # dynamic HTLC minimum baselines.  A future Phase 3 refactor may
         # extract these into a dedicated ChannelCycleState, but for now
-        # HillClimbState remains the canonical per-channel cycle tracker.
-        self._hill_climb_states: Dict[str, HillClimbState] = {}
+        # ChannelCycleState remains the canonical per-channel cycle tracker.
+        self._cycle_states: Dict[str, ChannelCycleState] = {}
 
         # Per-channel fee state cache
         self._channel_fee_states: Dict[str, ChannelFeeState] = {}
@@ -1600,7 +1600,7 @@ class FeeController:
         # Phase 7: Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
 
-        # AskRene topology cache (for AIMD depletion checks)
+        # AskRene topology cache (for depletion checks)
         self._askrene_cache: Dict[str, int] = {}
         self._askrene_cache_ts: int = 0
         self._askrene_lock = threading.Lock()
@@ -1769,7 +1769,7 @@ class FeeController:
             # Load directly
             state = ChannelFeeState.from_v2_dict(v2_data, db_state)
         else:
-            # Migration from HillClimbState
+            # Migration from ChannelCycleState
             state = ChannelFeeState.from_v2_dict(v2_data, db_state)
 
             # Stamp as migrated so we don't re-migrate on next restart
@@ -2005,10 +2005,10 @@ class FeeController:
         """
         pruned = 0
 
-        # Prune Hill Climbing states from memory
-        stale_keys = [k for k in self._hill_climb_states.keys() if k not in active_channel_ids]
+        # Prune cycle states from memory
+        stale_keys = [k for k in self._cycle_states.keys() if k not in active_channel_ids]
         for key in stale_keys:
-            del self._hill_climb_states[key]
+            del self._cycle_states[key]
             pruned += 1
 
         # Prune channel fee states from memory
@@ -2039,7 +2039,7 @@ class FeeController:
 
         if pruned > 0:
             self.plugin.log(
-                f"GC: Pruned {pruned} total stale Hill Climbing states from closed channels",
+                f"GC: Pruned {pruned} total stale cycle states from closed channels",
                 level='debug'
             )
 
@@ -2066,8 +2066,8 @@ class FeeController:
 
         # TS-3: All state mutations must be inside _state_lock
         with self._state_lock:
-            # Wake in-memory Hill Climbing states
-            for channel_id, state in list(self._hill_climb_states.items()):
+            # Wake in-memory cycle states
+            for channel_id, state in list(self._cycle_states.items()):
                 changed = False
                 if state.is_sleeping:
                     state.is_sleeping = False
@@ -2080,7 +2080,7 @@ class FeeController:
                     state.last_update = backdated
                     changed = True
                 if changed:
-                    self._save_hill_climb_state(channel_id, state)
+                    self._save_cycle_state(channel_id, state)
                     woken += 1
 
             # Wake in-memory channel fee states
@@ -2102,7 +2102,7 @@ class FeeController:
             # Skip closed channels: only wake entries that match an
             # in-memory state (HC or Thompson) — those are the channels
             # that have been seen in a recent adjust_all_fees cycle.
-            active_ids = set(self._hill_climb_states.keys()) | set(self._channel_fee_states.keys())
+            active_ids = set(self._cycle_states.keys()) | set(self._channel_fee_states.keys())
             try:
                 db_states = self.database.get_all_fee_strategy_states()
                 for db_state in db_states:
@@ -2115,14 +2115,14 @@ class FeeController:
                     is_sleeping = db_state.get("is_sleeping", 0)
                     db_last_update = db_state.get("last_update", 0)
                     needs_wake = is_sleeping or db_last_update > backdated
-                    if needs_wake and channel_id not in self._hill_climb_states:
-                        hc_state = self._get_hill_climb_state(channel_id)
-                        hc_state.is_sleeping = False
-                        hc_state.sleep_until = 0
-                        hc_state.stable_cycles = 0
-                        if hc_state.last_update > backdated:
-                            hc_state.last_update = backdated
-                        self._save_hill_climb_state(channel_id, hc_state)
+                    if needs_wake and channel_id not in self._cycle_states:
+                        cycle = self._get_cycle_state(channel_id)
+                        cycle.is_sleeping = False
+                        cycle.sleep_until = 0
+                        cycle.stable_cycles = 0
+                        if cycle.last_update > backdated:
+                            cycle.last_update = backdated
+                        self._save_cycle_state(channel_id, cycle)
                         woken += 1
             except Exception as e:
                 self.plugin.log(f"Error waking database states: {e}", level='warning')
@@ -2137,7 +2137,7 @@ class FeeController:
 
     def adjust_all_fees(self) -> List[FeeAdjustment]:
         """
-        Adjust fees for all channels using Hill Climbing optimization.
+        Adjust fees for all channels using DTS+PID optimization.
 
         This is the main entry point, called periodically by the timer.
 
@@ -2260,7 +2260,7 @@ class FeeController:
                                     old_fee_ppm=current_fee,
                                     new_fee_ppm=policy.fee_ppm_target,
                                     reason="Policy: STATIC fee override",
-                                    hill_climb_values={"policy": "static"}
+                                    algorithm_values={"policy": "static"}
                                 ))
                             except Exception as e:
                                 self.plugin.log(f"Error setting static fee for {channel_id}: {e}", level='error')
@@ -2269,7 +2269,7 @@ class FeeController:
                             skip_reasons["policy_static"] += 1
                     continue
 
-                # DYNAMIC strategy continues to normal Hill Climbing below
+                # DYNAMIC strategy continues to normal fee optimization below
 
             # Get channel info
             channel_info = channels.get(channel_id)
@@ -2277,14 +2277,14 @@ class FeeController:
                 continue
             
             try:
-                # Check Hill Climb state before adjustment to track skip reasons
+                # Check cycle state before adjustment to track skip reasons
                 # Issue #32: pass actual fee for desync detection
                 actual_fee = channel_info.get("fee_proportional_millionths", 0)
-                hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=actual_fee)
+                cycle = self._get_cycle_state(channel_id, actual_fee_ppm=actual_fee)
                 now = int(time.time())
-                pre_is_sleeping = hc_state.is_sleeping
-                pre_last_update = hc_state.last_update
-                pre_last_broadcast_fee = hc_state.last_broadcast_fee_ppm
+                pre_is_sleeping = cycle.is_sleeping
+                pre_last_update = cycle.last_update
+                pre_last_broadcast_fee = cycle.last_broadcast_fee_ppm
                 pre_forward_count = 0
                 pre_hours_elapsed = 0.0
                 if pre_last_update > 0:
@@ -2306,7 +2306,7 @@ class FeeController:
                     adjustments.append(adjustment)
                 else:
                     skip_reason = self._classify_no_adjustment_skip_reason(
-                        hc_state=hc_state,
+                        cycle=cycle,
                         now=now,
                         pre_is_sleeping=pre_is_sleeping,
                         pre_last_update=pre_last_update,
@@ -2378,7 +2378,7 @@ class FeeController:
 
     def _classify_no_adjustment_skip_reason(
         self,
-        hc_state: "HillClimbState",
+        cycle: "ChannelCycleState",
         now: int,
         pre_is_sleeping: bool,
         pre_last_update: int,
@@ -2397,15 +2397,15 @@ class FeeController:
             if not time_ok and not forwards_ok:
                 return "waiting_time"
 
-        if hc_state.last_update >= now:
+        if cycle.last_update >= now:
             if (
-                hc_state.last_fee_ppm != actual_fee_ppm
-                and hc_state.last_broadcast_fee_ppm == pre_last_broadcast_fee_ppm
+                cycle.last_fee_ppm != actual_fee_ppm
+                and cycle.last_broadcast_fee_ppm == pre_last_broadcast_fee_ppm
             ):
                 return "gossip_hysteresis"
             if (
-                hc_state.last_fee_ppm == actual_fee_ppm
-                and hc_state.last_broadcast_fee_ppm == actual_fee_ppm
+                cycle.last_fee_ppm == actual_fee_ppm
+                and cycle.last_broadcast_fee_ppm == actual_fee_ppm
             ):
                 return "idempotent"
             return "alpha_guard"
@@ -2415,7 +2415,7 @@ class FeeController:
     def _should_force_gossip_refresh(
         self,
         channel_id: str,
-        state: Union[ChannelFeeState, HillClimbState],
+        state: Union[ChannelFeeState, ChannelCycleState],
         current_time: int
     ) -> bool:
         """
@@ -2465,7 +2465,7 @@ class FeeController:
         self,
         channel_id: str,
         peer_id: str,
-        state: Union[ChannelFeeState, HillClimbState],
+        state: Union[ChannelFeeState, ChannelCycleState],
         current_fee_ppm: int,
         current_time: int
     ) -> Optional[FeeAdjustment]:
@@ -2539,7 +2539,7 @@ class FeeController:
         if isinstance(state, ChannelFeeState):
             self._save_channel_fee_state(channel_id, state)
         else:
-            self._save_hill_climb_state(channel_id, state)
+            self._save_cycle_state(channel_id, state)
 
         # Keep Thompson state coherent too, if already present.
         if channel_id in self._channel_fee_states:
@@ -2557,7 +2557,7 @@ class FeeController:
             new_fee_ppm=nudge_fee,
             old_fee_ppm=current_fee_ppm,
             reason="gossip_refresh",
-            hill_climb_values={
+            algorithm_values={
                 "hours_since_broadcast": hours_since_broadcast,
                 "hours_since_forward": hours_since_forward,
                 "nudge_amount": self.GOSSIP_REFRESH_NUDGE_PPM
@@ -2598,8 +2598,8 @@ class FeeController:
         if cfg is None:
             cfg = self.config.snapshot()
 
-        # Used for structured logs. Hill Climb sets this before applying modifiers;
-        # Thompson uses step_ppm as the absolute fee delta, so original==step.
+        # Used for structured logs. Fee controller sets this before applying modifiers;
+        # DTS uses step_ppm as the absolute fee delta, so original==step.
         original_step_ppm = 0
 
         # Detect critical state (Phase 5.5)
@@ -2621,10 +2621,10 @@ class FeeController:
         if current_fee_ppm == 0 and not is_under_probe:
             current_fee_ppm = cfg.min_fee_ppm
 
-        # Load Hill Climbing state (Issue #32: pass actual fee for desync detection)
-        hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=raw_chain_fee)
+        # Load cycle state (Issue #32: pass actual fee for desync detection)
+        cycle = self._get_cycle_state(channel_id, actual_fee_ppm=raw_chain_fee)
         
-        # Decision for target fee (The Alpha Sequence)
+        # Decision for target fee (Fee Priority Chain)
         # NOTE: FIRE_SALE logic removed in v2.2.3
         # Reason: FIRE_SALE set fees to 1 ppm for zombie/underwater channels, but this
         # bypassed all floor protections and caused flash drain on saturated channels.
@@ -2649,10 +2649,10 @@ class FeeController:
                 _ts_sleep_state.sleep_until = 0
                 _ts_sleep_state.stable_cycles = 0
                 self._save_channel_fee_state(channel_id, _ts_sleep_state)
-                hc_state.is_sleeping = False
-                hc_state.sleep_until = 0
-                hc_state.stable_cycles = 0
-                self._save_hill_climb_state(channel_id, hc_state)
+                cycle.is_sleeping = False
+                cycle.sleep_until = 0
+                cycle.stable_cycles = 0
+                self._save_cycle_state(channel_id, cycle)
                 self.plugin.log(
                     f"HYSTERESIS: Channel {channel_id[:12]}... waking up (sleep timer expired)",
                     level='info'
@@ -2686,10 +2686,10 @@ class FeeController:
                     _ts_sleep_state.sleep_until = 0
                     _ts_sleep_state.stable_cycles = 0
                     self._save_channel_fee_state(channel_id, _ts_sleep_state)
-                    hc_state.is_sleeping = False
-                    hc_state.sleep_until = 0
-                    hc_state.stable_cycles = 0
-                    self._save_hill_climb_state(channel_id, hc_state)
+                    cycle.is_sleeping = False
+                    cycle.sleep_until = 0
+                    cycle.stable_cycles = 0
+                    self._save_cycle_state(channel_id, cycle)
                     self.plugin.log(
                         f"HYSTERESIS: Channel {channel_id[:12]}... waking up due to revenue spike "
                         f"({percent_change:.0%} change, threshold={self.WAKE_UP_THRESHOLD:.0%})",
@@ -2728,9 +2728,9 @@ class FeeController:
         #
         # EXCEPTION: If channel is SHIELDED, we always use raw volume.
         if cfg.enable_reputation and not is_shielded:
-            volume_since_sats = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
+            volume_since_sats = self.database.get_weighted_volume_since(channel_id, cycle.last_update)
         else:
-            volume_since_sats = self.database.get_volume_since(channel_id, hc_state.last_update)
+            volume_since_sats = self.database.get_volume_since(channel_id, cycle.last_update)
         
         # FLAP PROTECTION: Penalize flapping peers' volume for revenue signal
         # Peers with high disconnect rates have dampened revenue signals so we
@@ -2753,8 +2753,8 @@ class FeeController:
             )
         
         # Calculate time elapsed since last update
-        if hc_state.last_update > 0:
-            hours_elapsed = (now - hc_state.last_update) / 3600.0
+        if cycle.last_update > 0:
+            hours_elapsed = (now - cycle.last_update) / 3600.0
         else:
             hours_elapsed = 0.0
 
@@ -2767,10 +2767,10 @@ class FeeController:
         # - MIN_OBSERVATION_HOURS: Hard floor prevents burst manipulation
         # - MIN_FORWARDS_FOR_SIGNAL: Statistical significance requirement
         # =====================================================================
-        forward_count = self.database.get_forward_count_since(channel_id, hc_state.last_update)
-        hc_state.forward_count_since_update = forward_count
+        forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
+        cycle.forward_count_since_update = forward_count
 
-        if hc_state.last_update > 0:
+        if cycle.last_update > 0:
             # Dynamic window logic (OR):
             # - Window closes when EITHER condition is met:
             #   1. At least MIN_OBSERVATION_HOURS elapsed (time signal), OR
@@ -2813,7 +2813,7 @@ class FeeController:
 
         # Issue #28: Apply EMA smoothing to reduce fee volatility
         # EMA smooths out payment timing noise when observation window is short
-        smoothed_revenue_rate = hc_state.update_ema_revenue_rate(
+        smoothed_revenue_rate = cycle.update_ema_revenue_rate(
             raw_revenue_rate,
             alpha=cfg.ema_smoothing_alpha
         )
@@ -2891,7 +2891,7 @@ class FeeController:
         if floor_ppm >= ceiling_ppm:
             ceiling_ppm = floor_ppm + 10
         
-        # Target Decision Block (The Alpha Sequence)
+        # Target Decision Block (Fee Priority Chain)
         # Priority: Congestion > Zero-Fee Probe > DTS+PID
         decision_reason = "unknown"
         base_new_fee = None
@@ -2903,11 +2903,11 @@ class FeeController:
         if is_congested:
             new_fee_ppm = ceiling_ppm
             decision_reason = "CONGESTION"
-            new_direction = hc_state.trend_direction
-            step_ppm = hc_state.step_ppm
+            new_direction = cycle.trend_direction
+            step_ppm = cycle.step_ppm
             volatility_reset = False
             rate_change = 0.0
-            previous_rate = hc_state.last_revenue_rate
+            previous_rate = cycle.last_revenue_rate
             target_found = True
 
             # Synthetic observation: Thompson bypassed, inject at reduced weight
@@ -2924,11 +2924,11 @@ class FeeController:
         if not target_found and is_under_probe:
             # Calculate current revenue rate (reuse logic from rate calculation below)
             if cfg.enable_reputation and not is_shielded:
-                v_since = self.database.get_weighted_volume_since(channel_id, hc_state.last_update)
+                v_since = self.database.get_weighted_volume_since(channel_id, cycle.last_update)
             else:
-                v_since = self.database.get_volume_since(channel_id, hc_state.last_update)
+                v_since = self.database.get_volume_since(channel_id, cycle.last_update)
             
-            probe_forward_count = self.database.get_forward_count_since(channel_id, hc_state.last_update)
+            probe_forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
 
             # Success criteria: any forwards/volume observed while probing. We cannot
             # use revenue-rate here because fee may be 0 by design.
@@ -2949,7 +2949,7 @@ class FeeController:
                 original_step_ppm = step_ppm
                 volatility_reset = False
                 rate_change = 0.0
-                previous_rate = hc_state.last_revenue_rate
+                previous_rate = cycle.last_revenue_rate
                 target_found = True
 
                 self.plugin.log(
@@ -2973,12 +2973,12 @@ class FeeController:
                 # Still probing: force 0 PPM
                 new_fee_ppm = 0
                 decision_reason = "ZERO_FEE_PROBE"
-                new_direction = hc_state.trend_direction
-                step_ppm = hc_state.step_ppm
+                new_direction = cycle.trend_direction
+                step_ppm = cycle.step_ppm
                 original_step_ppm = step_ppm
                 volatility_reset = False
                 rate_change = 0.0
-                previous_rate = hc_state.last_revenue_rate
+                previous_rate = cycle.last_revenue_rate
                 target_found = True
 
                 # Synthetic observation: probing with 0 fee, no revenue
@@ -2993,15 +2993,14 @@ class FeeController:
 
         # Priority 4: Fee Discovery Algorithm
         # =====================================================================
-        # Thompson Sampling + AIMD (v1.7.0) - Primary Algorithm
-        # OR Hill Climbing (Legacy) - Fallback
+        # DTS+PID - Primary Algorithm
         # =====================================================================
         if not target_found:
             # =====================================================================
-            # THOMPSON SAMPLING + AIMD FEE OPTIMIZATION
+            # DTS+PID FEE OPTIMIZATION
             # =====================================================================
             # Primary: Gaussian Thompson Sampling samples from posterior distribution
-            # Defense: AIMD provides rapid response to routing failures
+            # Defense: PID controller manages balance via closed-loop multiplier
             # =====================================================================
 
             # Load channel fee state
@@ -3041,12 +3040,12 @@ class FeeController:
                     ts_state.last_volume_sats = volume_since_sats
                     ts_state.last_update = now
                     self._save_channel_fee_state(channel_id, ts_state)
-                    # Reset hc_state observation timer so post-sleep window
+                    # Reset cycle observation timer so post-sleep window
                     # doesn't span the entire sleep period
-                    hc_state.last_update = now
-                    hc_state.last_revenue_rate = current_revenue_rate
-                    hc_state.last_fee_ppm = current_fee_ppm
-                    self._save_hill_climb_state(channel_id, hc_state)
+                    cycle.last_update = now
+                    cycle.last_revenue_rate = current_revenue_rate
+                    cycle.last_fee_ppm = current_fee_ppm
+                    self._save_cycle_state(channel_id, cycle)
                     self.plugin.log(
                         f"THOMPSON: Market Calm - {channel_id[:12]}... entering sleep mode.",
                         level='info'
@@ -3123,7 +3122,7 @@ class FeeController:
             thompson_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
 
             # =============================================================
-            # DTS+PID PATH: PID multiplier replaces AIMD/scarcity/cold-start
+            # DTS+PID PATH: PID multiplier for balance management
             # =============================================================
             try:
                 ch_state_data = self.database.get_channel_state(channel_id)
@@ -3156,15 +3155,15 @@ class FeeController:
             step_ppm = abs(new_fee_ppm - current_fee_ppm)
             original_step_ppm = step_ppm
 
-            # Build the hc_state alias for end-of-method compatibility
+            # Build the cycle alias for end-of-method compatibility
             # (Thompson state will be saved separately)
-            hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=raw_chain_fee)
-            hc_state.last_revenue_rate = current_revenue_rate
-            hc_state.last_fee_ppm = current_fee_ppm
-            hc_state.trend_direction = new_direction
-            hc_state.step_ppm = step_ppm
-            hc_state.forward_count_since_update = forward_count
-            hc_state.last_volume_sats = volume_since_sats
+            cycle = self._get_cycle_state(channel_id, actual_fee_ppm=raw_chain_fee)
+            cycle.last_revenue_rate = current_revenue_rate
+            cycle.last_fee_ppm = current_fee_ppm
+            cycle.trend_direction = new_direction
+            cycle.step_ppm = step_ppm
+            cycle.forward_count_since_update = forward_count
+            cycle.last_volume_sats = volume_since_sats
 
             # Store decision_reason for use in logging
             elasticity_info = f"thompson_posterior_mean={ts_state.thompson.posterior_mean:.0f}"
@@ -3211,16 +3210,16 @@ class FeeController:
             
         if fee_change < min_change and not is_congested and not htlcmin_policy_change:
             # CRITICAL: Reset observation timer so the next cycle doesn't
-            # double-count the current window's data.  Thompson posteriors,
-            # AIMD outcomes, demand baselines, and elasticity trackers were
+            # double-count the current window's data.  DTS+PID posteriors,
+            # demand baselines, and elasticity trackers were
             # already updated above using this window's accumulated
             # volume/revenue.  Not resetting last_update causes the same
             # observations to be re-ingested on every subsequent cycle that
             # also falls below the Alpha Guard threshold.
-            hc_state.last_revenue_rate = current_revenue_rate
-            hc_state.last_fee_ppm = current_fee_ppm
-            hc_state.last_update = now
-            self._save_hill_climb_state(channel_id, hc_state)
+            cycle.last_revenue_rate = current_revenue_rate
+            cycle.last_fee_ppm = current_fee_ppm
+            cycle.last_update = now
+            self._save_cycle_state(channel_id, cycle)
 
             if channel_id in self._channel_fee_states:
                 try:
@@ -3240,53 +3239,53 @@ class FeeController:
         # GOSSIP HYSTERESIS: The 5% Gate (Phase 5.5)
         # Reduce network noise by only broadcasting significant changes.
         # =====================================================================
-        delta_broadcast = abs(new_fee_ppm - hc_state.last_broadcast_fee_ppm)
-        threshold = hc_state.last_broadcast_fee_ppm * 0.05
+        delta_broadcast = abs(new_fee_ppm - cycle.last_broadcast_fee_ppm)
+        threshold = cycle.last_broadcast_fee_ppm * 0.05
         
         # Override: Always broadcast if entering/exiting critical states
         # or if we have never broadcasted before.
         # Compare state CATEGORY only (strip parenthetical details) to avoid
         # hysteresis bypass when balance bucket or modifier values change.
-        last_state_category = (hc_state.last_state or "").split(" (")[0]
+        last_state_category = (cycle.last_state or "").split(" (")[0]
         current_state_category = decision_reason.split(" (")[0]
         significant_change = (delta_broadcast > threshold) or \
-                             (hc_state.last_broadcast_fee_ppm <= 1) or \
+                             (cycle.last_broadcast_fee_ppm <= 1) or \
                              (new_fee_ppm <= 1) or \
                              (target_found and last_state_category != current_state_category) or \
-                             (not target_found and hc_state.last_state == "CONGESTION")
+                             (not target_found and cycle.last_state == "CONGESTION")
 
         if not significant_change and not htlcmin_policy_change:
             # =========================================================================
             # GOSSIP REFRESH CHECK: Must run BEFORE last_update reset so we can
             # detect 24h+ staleness. After reset, last_update=now defeats the check.
             # =========================================================================
-            if self._should_force_gossip_refresh(channel_id, hc_state, now):
+            if self._should_force_gossip_refresh(channel_id, cycle, now):
                 return self._create_gossip_refresh_adjustment(
                     channel_id=channel_id,
                     peer_id=peer_id,
-                    state=hc_state,
+                    state=cycle,
                     current_fee_ppm=current_fee_ppm,
                     current_time=now
                 )
 
             # HYSTERESIS: Skip RPC, update internal target but reset observation timer.
             # We MUST reset last_update because the fee/revenue data for this window
-            # has already been consumed by Thompson/AIMD posterior updates above.
+            # has already been consumed by DTS+PID posterior updates above.
             # Not resetting would cause double-counting on the next cycle.
-            hc_state.last_fee_ppm = new_fee_ppm
-            hc_state.last_revenue_rate = current_revenue_rate
-            hc_state.trend_direction = new_direction
-            hc_state.step_ppm = step_ppm
-            hc_state.last_update = now
-            self._save_hill_climb_state(channel_id, hc_state)
+            cycle.last_fee_ppm = new_fee_ppm
+            cycle.last_revenue_rate = current_revenue_rate
+            cycle.trend_direction = new_direction
+            cycle.step_ppm = step_ppm
+            cycle.last_update = now
+            self._save_cycle_state(channel_id, cycle)
 
             self.plugin.log(
-                f"HYSTERESIS: Target fee {new_fee_ppm} is <5% delta from broadcast {hc_state.last_broadcast_fee_ppm}. "
+                f"HYSTERESIS: Target fee {new_fee_ppm} is <5% delta from broadcast {cycle.last_broadcast_fee_ppm}. "
                 f"Skipping gossip; pausing observation.",
                 level='info'
             )
 
-            # Persist Thompson state changes too (posterior updates, AIMD outcomes, etc).
+            # Persist Thompson state changes too (posterior updates, PID state, etc).
             # IMPORTANT: We MUST update last_update here because the Thompson posterior
             # was already updated with the current observation window's data (at the
             # update_posterior call above). If we don't reset the timer, the next cycle
@@ -3335,14 +3334,14 @@ class FeeController:
         
         # IDEMPOTENCY GUARD: Skip RPC if target is physically set (Phase 5.5)
         if new_fee_ppm == raw_chain_fee and not htlcmin_policy_change:
-            hc_state.last_revenue_rate = current_revenue_rate
-            hc_state.last_fee_ppm = raw_chain_fee
-            hc_state.last_broadcast_fee_ppm = new_fee_ppm
-            hc_state.last_state = decision_reason
-            hc_state.trend_direction = new_direction
-            hc_state.step_ppm = step_ppm
-            hc_state.last_update = now  # Reset observation timer
-            self._save_hill_climb_state(channel_id, hc_state)
+            cycle.last_revenue_rate = current_revenue_rate
+            cycle.last_fee_ppm = raw_chain_fee
+            cycle.last_broadcast_fee_ppm = new_fee_ppm
+            cycle.last_state = decision_reason
+            cycle.trend_direction = new_direction
+            cycle.step_ppm = step_ppm
+            cycle.last_update = now  # Reset observation timer
+            self._save_cycle_state(channel_id, cycle)
 
             # Save channel fee state
             if channel_id in self._channel_fee_states:
@@ -3369,7 +3368,7 @@ class FeeController:
         elif is_congested:
             fee_reason_code = FeeReasonCode.CONGESTION.value
         else:
-            fee_reason_code = FeeReasonCode.THOMPSON_SAMPLE.value
+            fee_reason_code = FeeReasonCode.DTS_PID_SAMPLE.value
 
         # Apply the fee change (Significant change -> Broadcast)
         result = self.set_channel_fee(
@@ -3383,14 +3382,14 @@ class FeeController:
         
         if result.get("success"):
             # Update state with new broadcast fee and refresh timer
-            hc_state.last_revenue_rate = current_revenue_rate
-            hc_state.last_fee_ppm = current_fee_ppm
-            hc_state.last_broadcast_fee_ppm = new_fee_ppm
-            hc_state.last_state = decision_reason
-            hc_state.trend_direction = new_direction
-            hc_state.step_ppm = step_ppm
-            hc_state.last_update = now
-            self._save_hill_climb_state(channel_id, hc_state)
+            cycle.last_revenue_rate = current_revenue_rate
+            cycle.last_fee_ppm = current_fee_ppm
+            cycle.last_broadcast_fee_ppm = new_fee_ppm
+            cycle.last_state = decision_reason
+            cycle.trend_direction = new_direction
+            cycle.step_ppm = step_ppm
+            cycle.last_update = now
+            self._save_cycle_state(channel_id, cycle)
 
             # Save channel fee state
             if channel_id in self._channel_fee_states:
@@ -3415,7 +3414,7 @@ class FeeController:
                 old_fee_ppm=current_fee_ppm,
                 new_fee_ppm=new_fee_ppm,
                 reason=reason,
-                hill_climb_values={
+                algorithm_values={
                     "current_revenue_rate": current_revenue_rate,
                     "previous_revenue_rate": previous_rate,
                     "rate_change": rate_change,
@@ -3423,19 +3422,19 @@ class FeeController:
                     "hours_elapsed": hours_elapsed,
                     "direction": new_direction,
                     "step_ppm": step_ppm,
-                    "consecutive_same_direction": hc_state.consecutive_same_direction,
+                    "consecutive_same_direction": cycle.consecutive_same_direction,
                     "volatility_reset": volatility_reset,
                 },
                 reason_code=fee_reason_code,
             )
 
-        # RPC failed: fee was NOT changed on-chain, but Thompson posteriors and
-        # AIMD state were already updated with this observation window's data.
+        # RPC failed: fee was NOT changed on-chain, but DTS+PID posteriors
+        # were already updated with this observation window's data.
         # Reset observation timer to prevent double-counting on next cycle.
-        hc_state.last_revenue_rate = current_revenue_rate
-        hc_state.last_fee_ppm = current_fee_ppm
-        hc_state.last_update = now
-        self._save_hill_climb_state(channel_id, hc_state)
+        cycle.last_revenue_rate = current_revenue_rate
+        cycle.last_fee_ppm = current_fee_ppm
+        cycle.last_update = now
+        self._save_cycle_state(channel_id, cycle)
 
         if channel_id in self._channel_fee_states:
             try:
@@ -3514,13 +3513,13 @@ class FeeController:
         # BUG FIX: Wake sleeping channel on manual fee change
         # A manual override should reset the observation window
         with self._state_lock:
-            if manual and channel_id in self._hill_climb_states:
-                hc_state = self._hill_climb_states[channel_id]
-                if hc_state.is_sleeping:
-                    hc_state.is_sleeping = False
-                    hc_state.sleep_until = 0
-                    hc_state.stable_cycles = 0
-                    self._save_hill_climb_state(channel_id, hc_state)
+            if manual and channel_id in self._cycle_states:
+                cycle = self._cycle_states[channel_id]
+                if cycle.is_sleeping:
+                    cycle.is_sleeping = False
+                    cycle.sleep_until = 0
+                    cycle.stable_cycles = 0
+                    self._save_cycle_state(channel_id, cycle)
                     self.plugin.log(
                         f"MANUAL_WAKE: Channel {channel_id[:12]}... woken due to manual fee change",
                         level='info'
@@ -3595,15 +3594,15 @@ class FeeController:
                 # TS-1: Protect state mutations with _state_lock
                 with self._state_lock:
                     try:
-                        hc_state = self._get_hill_climb_state(channel_id, actual_fee_ppm=fee_ppm)
-                        hc_state.is_sleeping = False
-                        hc_state.sleep_until = 0
-                        hc_state.stable_cycles = 0
-                        hc_state.last_fee_ppm = fee_ppm
-                        hc_state.last_broadcast_fee_ppm = fee_ppm
-                        hc_state.last_update = now
-                        hc_state.last_state = reason_code or "manual"
-                        self._save_hill_climb_state(channel_id, hc_state)
+                        cycle = self._get_cycle_state(channel_id, actual_fee_ppm=fee_ppm)
+                        cycle.is_sleeping = False
+                        cycle.sleep_until = 0
+                        cycle.stable_cycles = 0
+                        cycle.last_fee_ppm = fee_ppm
+                        cycle.last_broadcast_fee_ppm = fee_ppm
+                        cycle.last_update = now
+                        cycle.last_state = reason_code or "manual"
+                        self._save_cycle_state(channel_id, cycle)
                     except Exception as e:
                         self.plugin.log(f"STATE_SYNC: Failed to update hill state for {channel_id}: {e}", level="debug")
 
@@ -3936,9 +3935,9 @@ class FeeController:
             self.plugin.log(f"Error getting feerates: {e}", level='debug')
             return None
     
-    def _get_hill_climb_state(self, channel_id: str, actual_fee_ppm: int = None) -> HillClimbState:
+    def _get_cycle_state(self, channel_id: str, actual_fee_ppm: int = None) -> ChannelCycleState:
         """
-        Get Hill Climbing state for a channel.
+        Get cycle state for a channel.
 
         Checks in-memory cache first, then database.
         Updated to use rate-based feedback (last_revenue_rate), step_ppm,
@@ -3951,8 +3950,8 @@ class FeeController:
         """
         import json
 
-        if channel_id in self._hill_climb_states:
-            cached_state = self._hill_climb_states[channel_id]
+        if channel_id in self._cycle_states:
+            cached_state = self._cycle_states[channel_id]
             # Issue #32: Check for desync even on cached state
             if actual_fee_ppm is not None and actual_fee_ppm > 0:
                 tracked = cached_state.last_broadcast_fee_ppm
@@ -3963,7 +3962,7 @@ class FeeController:
                         level='warn'
                     )
                     cached_state.last_broadcast_fee_ppm = actual_fee_ppm
-                    self._save_hill_climb_state(channel_id, cached_state)
+                    self._save_cycle_state(channel_id, cached_state)
             return cached_state
 
         # Load from database (uses the fee_strategy_state table)
@@ -3976,7 +3975,7 @@ class FeeController:
         except json.JSONDecodeError:
             v2_data = {}
 
-        hc_state = HillClimbState(
+        cycle = ChannelCycleState(
             last_revenue_rate=db_state.get("last_revenue_rate", 0.0),
             ema_revenue_rate=v2_data.get("ema_revenue_rate"),  # Issue #28: None if absent, preserves 0.0
             last_fee_ppm=db_state.get("last_fee_ppm", 0),
@@ -3997,23 +3996,23 @@ class FeeController:
 
         # Issue #32: Check for desync when loading from database
         if actual_fee_ppm is not None and actual_fee_ppm > 0:
-            tracked = hc_state.last_broadcast_fee_ppm
+            tracked = cycle.last_broadcast_fee_ppm
             if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
                 self.plugin.log(
                     f"FEE DESYNC (db load): {channel_id[:16]}... "
                     f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
                     level='warn'
                 )
-                hc_state.last_broadcast_fee_ppm = actual_fee_ppm
+                cycle.last_broadcast_fee_ppm = actual_fee_ppm
 
-        self._hill_climb_states[channel_id] = hc_state
-        return hc_state
+        self._cycle_states[channel_id] = cycle
+        return cycle
 
-    def _save_hill_climb_state(self, channel_id: str, state: HillClimbState):
-        """Save Hill Climbing state to cache and database (including v2.0 fields)."""
+    def _save_cycle_state(self, channel_id: str, state: ChannelCycleState):
+        """Save cycle state to cache and database (including v2.0 fields)."""
         import json
 
-        self._hill_climb_states[channel_id] = state
+        self._cycle_states[channel_id] = state
 
         # Serialize v2.0 state to JSON
         v2_data = {

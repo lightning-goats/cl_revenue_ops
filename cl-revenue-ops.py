@@ -2004,7 +2004,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     Diagnostic command to understand why fee adjustments may not be happening.
 
     Shows:
-    - Hill Climb state for each channel (sleeping, last_update, forward count)
+    - Cycle state for each channel (sleeping, last_update, forward count)
     - Why each channel was skipped in the last cycle
     - Dynamic window status
     - Hysteresis/sleep status
@@ -2202,26 +2202,6 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
         return {"status": "success", "channel": channel_id, "new_fee_ppm": applied_fee, **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
-
-
-@plugin.method("revenue-fee-anchor")
-def revenue_fee_anchor(plugin: Plugin,
-                       action: str,
-                       channel_id: str = "",
-                       target_fee_ppm: int = 0,
-                       confidence: float = 1.0,
-                       base_weight: float = 0.7,
-                       ttl_hours: int = 24,
-                       reason: str = "") -> Dict[str, Any]:
-    """
-    Fee anchors have been removed (DTS+PID replaced heuristic fee targets).
-    Use revenue-policy with fee_multiplier_min/fee_multiplier_max instead.
-    """
-    return {
-        "status": "deprecated",
-        "message": "Fee anchors are removed. "
-                   "Use revenue-policy with fee_multiplier_min/fee_multiplier_max instead.",
-    }
 
 
 @plugin.method("revenue-rebalance")
@@ -2618,8 +2598,8 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
       strategy=dynamic|static|passive   Fee control strategy
       rebalance=enabled|disabled|source_only|sink_only   Rebalance mode
       fee_ppm=N   Target fee for static strategy (required if strategy=static)
-      fee_multiplier_min=X.Y   Dynamic fee autoband floor multiplier (uses fee_ppm_target as anchor)
-      fee_multiplier_max=X.Y   Dynamic fee autoband ceiling multiplier (uses fee_ppm_target as anchor)
+      fee_multiplier_min=X.Y   Dynamic fee floor multiplier (uses fee_ppm_target as anchor)
+      fee_multiplier_max=X.Y   Dynamic fee ceiling multiplier (uses fee_ppm_target as anchor)
       expires_in_hours=N       Optional auto-expiry for policy (revert to defaults)
 
     Strategies:
