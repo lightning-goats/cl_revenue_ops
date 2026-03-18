@@ -374,6 +374,88 @@ class TestDTSPIDIntegration:
         assert isinstance(result, FeeAdjustment)
 
 
+class TestClampedFeeReadback:
+    """Bug: sink flow multiplier dropped floor below min_fee_ppm, causing
+    set_channel_fee to re-clamp — but the caller never read back the
+    clamped value, so FEE log and last_broadcast_fee_ppm were wrong."""
+
+    def _channel_info(self, *, current_fee_ppm=500, outbound_pct=50.0):
+        capacity_sats = 2_000_000
+        spendable_sats = int(capacity_sats * (outbound_pct / 100.0))
+        return {
+            "fee_proportional_millionths": current_fee_ppm,
+            "capacity": capacity_sats,
+            "spendable_msat": f"{spendable_sats * 1000}msat",
+            "opener": "local",
+        }
+
+    def _state(self, flow="sink"):
+        return {"state": flow, "forward_count": 50, "sats_out": 10000}
+
+    def test_sink_floor_never_drops_below_min_fee_ppm(self, mock_plugin, mock_database):
+        """Sink flow_state_multiplier must not push floor below min_fee_ppm."""
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 100
+        ch_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        # Use a sink state so flow_state_multiplier=0.50
+        mock_database.get_channel_state.return_value = {
+            "kalman_flow_ratio": 0.9,
+            "kalman_velocity": 0.0,
+            "state": "sink",
+        }
+
+        # First call to initialise DTS state
+        fc._adjust_channel_fee(
+            ch_id, peer_id, self._state("sink"),
+            self._channel_info(), cfg=cfg
+        )
+
+        # Pin DTS to sample at exactly the floor
+        ts_state = fc._channel_fee_states[ch_id]
+        ts_state.thompson.sample_fee = lambda floor, ceiling: floor
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = int(time.time()) - 1800
+
+        result = fc._adjust_channel_fee(
+            ch_id, peer_id, self._state("sink"),
+            self._channel_info(), cfg=cfg
+        )
+        assert result is not None
+        # Even with sink multiplier, the floor must not drop below min_fee_ppm
+        assert result.new_fee_ppm >= cfg.min_fee_ppm
+
+    def test_set_channel_fee_clamp_propagated_to_state(self, mock_plugin, mock_database):
+        """If set_channel_fee clamps, last_broadcast_fee_ppm must reflect actual fee."""
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 100
+        ch_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        fc._adjust_channel_fee(
+            ch_id, peer_id, self._state("balanced"),
+            self._channel_info(), cfg=cfg
+        )
+
+        ts_state = fc._channel_fee_states[ch_id]
+        # Force a fee that will be clamped by set_channel_fee
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 30
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = int(time.time()) - 1800
+
+        result = fc._adjust_channel_fee(
+            ch_id, peer_id, self._state("balanced"),
+            self._channel_info(), cfg=cfg
+        )
+
+        # Even if DTS sampled 30, the returned and stored fee must be >= min_fee_ppm
+        if result is not None:
+            assert result.new_fee_ppm >= cfg.min_fee_ppm
+        cycle = fc._cycle_states[ch_id]
+        assert cycle.last_broadcast_fee_ppm >= cfg.min_fee_ppm
+
+
 class TestPIDEdgeCases:
     def test_rapid_balance_change_ewma_dampens(self):
         pid = PIDState()

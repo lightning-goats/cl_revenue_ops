@@ -2848,9 +2848,9 @@ class FeeController:
         opener = channel_info.get("opener", "local")
         base_floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id, opener=opener)
         base_floor_ppm = max(base_floor_ppm, cfg.min_fee_ppm)
-        # Apply flow state to floor (sinks can go lower)
+        # Apply flow state to floor (sinks can go lower, but never below min_fee_ppm)
         base_floor_ppm = int(base_floor_ppm * flow_state_multiplier)
-        base_floor_ppm = max(base_floor_ppm, 1)  # Never go below 1 ppm
+        base_floor_ppm = max(base_floor_ppm, cfg.min_fee_ppm)
 
         # Apply Vegas Reflex floor multiplier (mempool spike defense)
         vegas_multiplier = self._vegas_state.get_floor_multiplier()
@@ -3376,6 +3376,9 @@ class FeeController:
         )
         
         if result.get("success"):
+            # Read back actual fee (may have been clamped by set_channel_fee)
+            new_fee_ppm = result.get("fee_ppm", new_fee_ppm)
+
             # Update state with new broadcast fee and refresh timer
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = current_fee_ppm
