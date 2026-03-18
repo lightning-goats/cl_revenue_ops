@@ -2406,8 +2406,6 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     from modules.fee_controller import HillClimbingFeeController
     min_obs_hours = HillClimbingFeeController.MIN_OBSERVATION_HOURS
     min_forwards = HillClimbingFeeController.MIN_FORWARDS_FOR_SIGNAL
-    max_obs_hours = HillClimbingFeeController.MAX_OBSERVATION_HOURS
-    enable_dyn_windows = HillClimbingFeeController.ENABLE_DYNAMIC_WINDOWS
 
     now = int(time.time())
     result = {
@@ -2416,13 +2414,6 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "fee_interval_seconds": config.fee_interval if config else 1800,
             "min_observation_hours": min_obs_hours,
             "min_forwards_for_signal": min_forwards,
-            "max_observation_hours": max_obs_hours,
-            "enable_dynamic_windows": enable_dyn_windows,
-            "auto_band_enabled": bool(getattr(config, "auto_band_enabled", False)) if config else False,
-            "auto_band_min_observations": int(getattr(config, "auto_band_min_observations", 20)) if config else 20,
-            "auto_band_sigma": float(getattr(config, "auto_band_sigma", 2.0)) if config else 2.0,
-            "auto_band_min_width_ppm": int(getattr(config, "auto_band_min_width_ppm", 50)) if config else 50,
-            "auto_band_recalibrate_interval": int(getattr(config, "auto_band_recalibrate_interval", 10)) if config else 10,
         },
         "channels": [],
         "summary": {
@@ -2453,8 +2444,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         hours_since_update = (now - last_update) / 3600.0 if last_update > 0 else 0.0
 
         # Determine skip reason
-        # With ENABLE_DYNAMIC_WINDOWS=True and OR logic:
-        # Channel is ready if EITHER time >= min_obs_hours OR forwards >= min_forwards
+        # Dynamic windows: channel is ready if EITHER time >= min_obs_hours OR forwards >= min_forwards
         skip_reason = None
         status = "ready"
 
@@ -2468,53 +2458,15 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             skip_reason = f"SLEEPING (wake in {mins_until_wake} min)"
             status = "sleeping"
             result["summary"]["sleeping"] += 1
-        elif enable_dyn_windows and (time_ok or forwards_ok):
-            # OR logic: either condition met = ready
+        elif time_ok or forwards_ok:
             status = "ready"
             result["summary"]["ready"] += 1
-        elif not enable_dyn_windows and time_ok:
-            # Legacy: time-only check
-            status = "ready"
-            result["summary"]["ready"] += 1
-        elif not time_ok and not forwards_ok:
-            # Neither condition met - waiting for either
+        else:
             skip_reason = f"WAITING ({forward_count}/{min_forwards} fwds, {hours_since_update:.1f}/{min_obs_hours}h)"
             status = "waiting"
             result["summary"]["waiting_time"] += 1
-        else:
-            status = "ready"
-            result["summary"]["ready"] += 1
 
         chan_state = state_lookup.get(channel_id, {})
-        peer_id = chan_state.get("peer_id")
-        effective_autoband = None
-        auto_band = None
-        if fee_controller is not None:
-            if peer_id and hasattr(fee_controller, "_get_effective_dynamic_fee_autoband_ppm"):
-                band_min_ppm, band_max_ppm, band_source = fee_controller._get_effective_dynamic_fee_autoband_ppm(
-                    channel_id,
-                    peer_id,
-                )
-                if band_min_ppm is not None or band_max_ppm is not None:
-                    effective_autoband = {
-                        "min_ppm": band_min_ppm,
-                        "max_ppm": band_max_ppm,
-                        "source": band_source,
-                    }
-            if hasattr(fee_controller, "_get_channel_auto_band"):
-                auto_band_state = fee_controller._get_channel_auto_band(channel_id)
-                if auto_band_state is not None:
-                    auto_band = {
-                        "min_ppm": auto_band_state.min_ppm,
-                        "max_ppm": auto_band_state.max_ppm,
-                        "optimal_fee_ppm": auto_band_state.optimal_fee_ppm,
-                        "posterior_std": auto_band_state.posterior_std,
-                        "observation_count": auto_band_state.observation_count,
-                        "sigma": auto_band_state.sigma,
-                        "min_width_ppm": auto_band_state.min_width_ppm,
-                        "last_calibrated": auto_band_state.last_calibrated,
-                        "source": auto_band_state.source,
-                    }
         result["channels"].append({
             "channel_id": channel_id[:12] + "..." if len(channel_id) > 12 else channel_id,
             "status": status,
@@ -2525,8 +2477,6 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "last_broadcast_fee_ppm": last_broadcast_fee,
             "last_revenue_rate": round(last_revenue_rate, 2),
             "flow_state": chan_state.get("state", "unknown"),
-            "effective_autoband": effective_autoband,
-            "auto_band": auto_band,
         })
         result["summary"]["total"] += 1
 
@@ -2652,86 +2602,14 @@ def revenue_fee_anchor(plugin: Plugin,
                        ttl_hours: int = 24,
                        reason: str = "") -> Dict[str, Any]:
     """
-    Manage advisor fee anchors (soft fee targets with decaying weight).
-
-    Usage:
-      lightning-cli revenue-fee-anchor action=set channel_id=X target_fee_ppm=N [confidence=0.8] [base_weight=0.7] [ttl_hours=24] [reason="..."]
-      lightning-cli revenue-fee-anchor action=list
-      lightning-cli revenue-fee-anchor action=get channel_id=X
-      lightning-cli revenue-fee-anchor action=clear channel_id=X
-      lightning-cli revenue-fee-anchor action=clear-all
+    Fee anchors have been removed (DTS+PID replaced heuristic fee targets).
+    Use revenue-policy with fee_multiplier_min/fee_multiplier_max instead.
     """
-    if fee_controller is None:
-        return {"error": "Plugin not fully initialized"}
-
-    if getattr(fee_controller, 'ENABLE_SIMPLIFIED_FEE_PATH', False):
-        return {
-            "status": "deprecated",
-            "message": "Fee anchors are deprecated under simplified fee path. "
-                       "Use revenue-policy with fee_multiplier_min/fee_multiplier_max instead.",
-        }
-
-    if action == "set":
-        if not channel_id:
-            return {"status": "error", "error": "channel_id is required for set"}
-        try:
-            target_fee_ppm = int(target_fee_ppm)
-        except (ValueError, TypeError):
-            return {"status": "error", "error": "target_fee_ppm must be an integer"}
-        if target_fee_ppm < 0:
-            return {"status": "error", "error": "target_fee_ppm must be non-negative"}
-
-        # SCID or PeerID format check
-        if not (re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id) or len(channel_id) == 66):
-            return {"status": "error", "error": "Invalid channel_id format"}
-
-        try:
-            ttl_seconds = int(ttl_hours) * 3600
-        except (ValueError, TypeError):
-            return {"status": "error", "error": "ttl_hours must be an integer"}
-        if ttl_seconds < 3600 or ttl_seconds > 604800:
-            return {"status": "error", "error": "ttl_hours must be between 1 hour and 7 days (168 hours)"}
-
-        try:
-            base_weight = float(base_weight)
-        except (ValueError, TypeError):
-            return {"status": "error", "error": "base_weight must be a number"}
-        try:
-            confidence = float(confidence)
-        except (ValueError, TypeError):
-            return {"status": "error", "error": "confidence must be a number"}
-
-        return fee_controller.set_fee_anchor(
-            channel_id=channel_id,
-            target_fee_ppm=target_fee_ppm,
-            base_weight=base_weight,
-            confidence=confidence,
-            ttl_seconds=ttl_seconds,
-            reason=reason,
-        )
-
-    elif action == "list":
-        anchors = fee_controller.list_fee_anchors()
-        return {"status": "success", "anchors": anchors, "count": len(anchors)}
-
-    elif action == "get":
-        if not channel_id:
-            return {"status": "error", "error": "channel_id is required for get"}
-        anchor = fee_controller.get_fee_anchor(channel_id)
-        if anchor is None:
-            return {"status": "success", "anchor": None, "message": "No active anchor"}
-        return {"status": "success", "anchor": anchor}
-
-    elif action == "clear":
-        if not channel_id:
-            return {"status": "error", "error": "channel_id is required for clear"}
-        return fee_controller.clear_fee_anchor(channel_id)
-
-    elif action == "clear-all":
-        return fee_controller.clear_all_fee_anchors()
-
-    else:
-        return {"status": "error", "error": f"Unknown action: {action}. Use set/list/get/clear/clear-all"}
+    return {
+        "status": "deprecated",
+        "message": "Fee anchors are removed. "
+                   "Use revenue-policy with fee_multiplier_min/fee_multiplier_max instead.",
+    }
 
 
 @plugin.method("revenue-rebalance")

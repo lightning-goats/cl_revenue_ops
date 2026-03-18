@@ -1,7 +1,7 @@
 """
 Fee Controller module for cl-revenue-ops
 
-MODULE 2: Revenue-Maximizing Fee Controller (Dynamic Pricing)
+MODULE 2: Revenue-Maximizing Fee Controller (DTS+PID)
 
 This module implements a three-concern fee optimization architecture:
 
@@ -15,38 +15,31 @@ Concern 1 — Market Pricing: Discounted Gaussian Thompson Sampling (DTS)
 - Bayesian posterior over fee-revenue observations
 - Discount factor (gamma=0.95) decays posterior precision each cycle,
   giving ~6.5h half-life to naturally forget stale data
-- Replaces polynomial regression, contextual posteriors, elasticity
-  tracking, and historical response curves
 
 Concern 2 — Balance Management: PID Controller
 - Produces a 0.1x–10.0x multiplier from channel outbound ratio
-- P-term: reacts to current imbalance (replaces scarcity pricing)
-- I-term: reacts to sustained imbalance (replaces saturation drain ceiling)
-- D-term: reacts to sudden changes (replaces AIMD defense)
+- P-term: reacts to current imbalance
+- I-term: reacts to sustained imbalance
+- D-term: reacts to sudden changes
 - EWMA-smoothed error (alpha=0.3) handles sparse Lightning feedback
 - Capacity-scaled gains: larger channels get less aggressive PID
 - Dynamic target ratio: source=0.7, sink=0.3, balanced=0.5
 
 Concern 3 — Hard Safety: Floor/ceiling clamps
 - Rebalance cost floor: SOURCE channels must cover rebalancing costs
-- Vegas Reflex floor: mempool spike → raise fee floor
+- Vegas Reflex floor: mempool spike -> raise fee floor
 - Global bounds: min_fee_ppm, max_fee_ppm from configuration
-- These are economic constraints the PID has no signal for
 
 The Alpha Sequence (Fee Priority Chain):
-1. Congestion: HTLC slots saturated → ceiling fee
-2. Zero-Fee Probe: Defibrillator for dead channels → 0 PPM
-3. DTS+PID: Primary fee optimization (DTS samples market fee, PID adjusts for balance)
+1. Congestion: HTLC slots saturated -> ceiling fee
+2. Zero-Fee Probe: Defibrillator for dead channels -> 0 PPM
+3. DTS+PID: Primary fee optimization
 
 Post-DTS+PID:
 - Gossip Hysteresis: Suppress sub-threshold changes
 
-Legacy Path (ENABLE_DTS_PID=False):
-- Thompson+AIMD with scarcity pricing, saturation floors/ceilings, cold-start
-- Hill Climbing fallback when ENABLE_THOMPSON_AIMD is False
-
 Revenue Calculation:
-- Revenue = Volume × Fee
+- Revenue = Volume x Fee
 - Revenue rate tracked over observation windows with EMA smoothing
 - Demand-adjusted via Kalman flow estimation
 """
@@ -94,20 +87,12 @@ class FeeReasonCode(Enum):
 
     # Algorithm decisions
     THOMPSON_SAMPLE = "thompson_sample"               # Normal Thompson posterior sample
-    THOMPSON_COLD_START = "thompson_cold_start"       # Insufficient data, using prior
-    THOMPSON_AIMD_DEFENSE = "thompson_aimd_defense"   # AIMD triggered fee increase
     ZERO_FEE_PROBE = "zero_fee_probe"                 # Defibrillator 0-fee probe
     ZERO_FEE_PROBE_SUCCESS = "zero_fee_probe_success" # Probe succeeded, exit to floor
     CONGESTION = "congestion"                         # Congestion-based fee surge
-    SCARCITY = "scarcity"                             # Low outbound liquidity premium
     GOSSIP_REFRESH = "gossip_refresh"                 # Minimal nudge to refresh channel_update
     CHANNEL_OPEN = "channel_open"                     # Initial fee set on channel open
-    ANCHOR_BLEND = "anchor_blend"                     # Advisor fee anchor blended in
 
-    # Heuristic modifiers (applied on top of algorithm decision)
-    YOUNG_CHANNEL_CAP = "young_channel_cap"                   # Step capped for young channel
-    HIGH_VOLATILITY_REDUCE = "high_volatility_reduce"         # Step reduced due to fee volatility
-    HIGH_FAILURE_CONSERVATIVE = "high_failure_conservative"   # Step reduced due to high failure rate
 
     # Skip reasons
     SKIP_SLEEPING = "skip_sleeping"               # Hysteresis sleep mode active
@@ -116,1015 +101,7 @@ class FeeReasonCode(Enum):
     SKIP_FEE_UNCHANGED = "skip_fee_unchanged"     # Calculated fee equals current fee
 
 
-@dataclass
-class HeuristicModifiers:
-    """
-    Captures heuristic adjustments applied to fee step size.
 
-    Serializable to JSON for storage in fee_changes.heuristic_modifiers column.
-    """
-    young_channel: Optional[Dict[str, Any]] = None      # {age_days, original_step, capped_step}
-    high_volatility: Optional[Dict[str, Any]] = None    # {volatility, reduction_factor}
-    high_failure: Optional[Dict[str, Any]] = None       # {failure_rate, reduction_factor}
-
-    def to_json(self) -> str:
-        """Serialize to JSON string for database storage."""
-        data = {}
-        if self.young_channel:
-            data["young_channel"] = self.young_channel
-        if self.high_volatility:
-            data["high_volatility"] = self.high_volatility
-        if self.high_failure:
-            data["high_failure"] = self.high_failure
-        return json.dumps(data) if data else ""
-
-    @classmethod
-    def from_json(cls, json_str: str) -> "HeuristicModifiers":
-        """Deserialize from JSON string."""
-        if not json_str:
-            return cls()
-        try:
-            data = json.loads(json_str)
-            return cls(
-                young_channel=data.get("young_channel"),
-                high_volatility=data.get("high_volatility"),
-                high_failure=data.get("high_failure")
-            )
-        except (json.JSONDecodeError, TypeError):
-            return cls()
-
-    def has_modifiers(self) -> bool:
-        """Check if any modifiers were applied."""
-        return bool(self.young_channel or self.high_volatility or self.high_failure)
-
-    def get_modifier_codes(self) -> List[FeeReasonCode]:
-        """Get list of modifier reason codes that were applied."""
-        codes = []
-        if self.young_channel:
-            codes.append(FeeReasonCode.YOUNG_CHANNEL_CAP)
-        if self.high_volatility:
-            codes.append(FeeReasonCode.HIGH_VOLATILITY_REDUCE)
-        if self.high_failure:
-            codes.append(FeeReasonCode.HIGH_FAILURE_CONSERVATIVE)
-        return codes
-
-
-@dataclass
-class FeeAnchor:
-    """Advisor-set soft fee target with decaying influence."""
-    channel_id: str
-    target_fee_ppm: int
-    base_weight: float       # 0.7 default (strong anchor)
-    confidence: float        # 0.0-1.0
-    ttl_seconds: int         # default 86400 (24h), max 604800 (7d)
-    reason: str
-    set_at: float            # time.time() when created
-
-    def effective_weight(self) -> float:
-        """Calculate current weight after time decay."""
-        if self.ttl_seconds <= 0:
-            return 0.0
-        age = time.time() - self.set_at
-        decay = max(0.0, 1.0 - age / self.ttl_seconds)
-        return self.base_weight * self.confidence * decay
-
-    def is_expired(self) -> bool:
-        return time.time() - self.set_at >= self.ttl_seconds
-
-
-# =============================================================================
-# IMPROVEMENT #3: Historical Response Curve
-# =============================================================================
-# Store past fee→revenue experiments per channel with exponential decay.
-# Security mitigations:
-# - Fixed-size rolling history (max 100 observations per channel)
-# - Exponential decay weights (recent data matters more)
-# - Periodic curve reset on regime change detection
-# =============================================================================
-
-@dataclass
-class FeeRevenueObservation:
-    """Single observation of fee→revenue relationship."""
-    fee_ppm: int
-    revenue_rate: float  # sats/hour
-    timestamp: int
-    forward_count: int  # Number of forwards in this observation
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "fee_ppm": self.fee_ppm,
-            "revenue_rate": self.revenue_rate,
-            "timestamp": self.timestamp,
-            "forward_count": self.forward_count
-        }
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "FeeRevenueObservation":
-        return cls(
-            fee_ppm=d.get("fee_ppm", 0),
-            revenue_rate=d.get("revenue_rate", 0.0),
-            timestamp=d.get("timestamp", 0),
-            forward_count=d.get("forward_count", 0)
-        )
-
-
-@dataclass
-class HistoricalResponseCurve:
-    """
-    Historical fee→revenue response curve for a channel.
-
-    Security mitigations:
-    - MAX_OBSERVATIONS: Fixed-size to prevent database bloat DoS
-    - DECAY_HALFLIFE: Recent data weighted more (stale data fades)
-    - regime_change_count: Detect market regime changes and reset
-    """
-    MAX_OBSERVATIONS = 100  # Security: bounded memory per channel
-    DECAY_HALFLIFE_HOURS = 168.0  # 7 days half-life
-    MIN_OBSERVATIONS_FOR_PREDICTION = 5  # Need enough data points
-
-    observations: List[FeeRevenueObservation] = field(default_factory=list)
-    regime_change_count: int = 0  # Track regime shifts
-    last_regime_check: int = 0
-
-    def add_observation(self, fee_ppm: int, revenue_rate: float,
-                       forward_count: int) -> None:
-        """Add a new observation, pruning oldest if at capacity."""
-        now = int(time.time())
-        obs = FeeRevenueObservation(
-            fee_ppm=fee_ppm,
-            revenue_rate=revenue_rate,
-            timestamp=now,
-            forward_count=forward_count
-        )
-        self.observations.append(obs)
-
-        # Security: Enforce max size (FIFO eviction)
-        if len(self.observations) > self.MAX_OBSERVATIONS:
-            self.observations = self.observations[-self.MAX_OBSERVATIONS:]
-
-    def get_weighted_observations(self) -> List[Tuple[int, float, float]]:
-        """
-        Get observations with exponential decay weights.
-
-        Returns:
-            List of (fee_ppm, revenue_rate, weight) tuples
-        """
-        now = int(time.time())
-        results = []
-
-        for obs in self.observations:
-            age_hours = (now - obs.timestamp) / 3600.0
-            # Exponential decay: weight = 0.5^(age/halflife)
-            weight = math.pow(0.5, age_hours / self.DECAY_HALFLIFE_HOURS)
-            # Also weight by forward count (more data = more confidence)
-            weight *= min(1.0, obs.forward_count / 10.0)
-            results.append((obs.fee_ppm, obs.revenue_rate, weight))
-
-        return results
-
-    # Polynomial smoothing parameters
-    MIN_OBSERVATIONS_FOR_POLYNOMIAL = 8  # Need more points for reliable fit
-    POLYNOMIAL_CURVATURE_MIN = -1e-6  # Must be concave (negative quadratic term)
-
-    def _fit_quadratic_weighted(self, observations: List[Tuple[int, float, float]]
-                                 ) -> Optional[Tuple[float, float, float]]:
-        """
-        Fit weighted quadratic polynomial to fee->revenue observations.
-
-        Uses weighted least squares to fit: revenue = a*fee² + b*fee + c
-        Weights are used to emphasize recent, high-confidence observations.
-
-        The optimal fee for a concave parabola (a < 0) is at vertex: -b/(2a)
-
-        Returns:
-            (a, b, c) coefficients if fit is valid, None if fit fails
-
-        Implementation note: Uses normal equations for weighted least squares.
-        For numerical stability, we normalize fees to [0,1] range internally.
-        """
-        if len(observations) < 3:
-            return None
-
-        # Extract data and normalize fees for numerical stability
-        fees = [obs[0] for obs in observations]
-        revenues = [obs[1] for obs in observations]
-        weights = [obs[2] for obs in observations]
-
-        fee_min = min(fees)
-        fee_max = max(fees)
-        fee_range = fee_max - fee_min
-
-        if fee_range < 10:  # Need some spread in fee values
-            return None
-
-        # Normalize fees to [0, 1]
-        norm_fees = [(f - fee_min) / fee_range for f in fees]
-
-        # Build weighted design matrix X and response vector y
-        # X = [1, x, x²], y = revenue, W = diag(weights)
-        # Solve (X'WX)β = X'Wy
-
-        # Compute sums needed for normal equations
-        sum_w = sum(weights)
-        sum_wx = sum(w * x for w, x in zip(weights, norm_fees))
-        sum_wx2 = sum(w * x**2 for w, x in zip(weights, norm_fees))
-        sum_wx3 = sum(w * x**3 for w, x in zip(weights, norm_fees))
-        sum_wx4 = sum(w * x**4 for w, x in zip(weights, norm_fees))
-
-        sum_wy = sum(w * y for w, y in zip(weights, revenues))
-        sum_wxy = sum(w * x * y for w, x, y in zip(weights, norm_fees, revenues))
-        sum_wx2y = sum(w * x**2 * y for w, x, y in zip(weights, norm_fees, revenues))
-
-        # Normal equations matrix: [sum_w, sum_wx, sum_wx2]   [c]   [sum_wy]
-        #                          [sum_wx, sum_wx2, sum_wx3] [b] = [sum_wxy]
-        #                          [sum_wx2, sum_wx3, sum_wx4][a]   [sum_wx2y]
-
-        # Solve using Cramer's rule (3x3 system)
-        # Matrix determinant
-        det = (sum_w * (sum_wx2 * sum_wx4 - sum_wx3**2)
-               - sum_wx * (sum_wx * sum_wx4 - sum_wx3 * sum_wx2)
-               + sum_wx2 * (sum_wx * sum_wx3 - sum_wx2**2))
-
-        if abs(det) < 1e-12:  # Singular matrix
-            return None
-
-        # Solve for coefficients (in normalized space)
-        # c coefficient
-        det_c = (sum_wy * (sum_wx2 * sum_wx4 - sum_wx3**2)
-                 - sum_wx * (sum_wxy * sum_wx4 - sum_wx3 * sum_wx2y)
-                 + sum_wx2 * (sum_wxy * sum_wx3 - sum_wx2 * sum_wx2y))
-        c_norm = det_c / det
-
-        # b coefficient
-        det_b = (sum_w * (sum_wxy * sum_wx4 - sum_wx3 * sum_wx2y)
-                 - sum_wy * (sum_wx * sum_wx4 - sum_wx3 * sum_wx2)
-                 + sum_wx2 * (sum_wx * sum_wx2y - sum_wx2 * sum_wxy))
-        b_norm = det_b / det
-
-        # a coefficient
-        det_a = (sum_w * (sum_wx2 * sum_wx2y - sum_wxy * sum_wx3)
-                 - sum_wx * (sum_wx * sum_wx2y - sum_wxy * sum_wx2)
-                 + sum_wy * (sum_wx * sum_wx3 - sum_wx2**2))
-        a_norm = det_a / det
-
-        # Convert back to original fee scale
-        # If y = a_norm*x_norm² + b_norm*x_norm + c_norm
-        # and x_norm = (fee - fee_min) / fee_range
-        # then y = a_norm*((fee-fee_min)/range)² + b_norm*((fee-fee_min)/range) + c_norm
-        #        = (a_norm/range²)*fee² + (b_norm/range - 2*a_norm*fee_min/range²)*fee + ...
-        a = a_norm / (fee_range ** 2)
-        b = b_norm / fee_range - 2 * a_norm * fee_min / (fee_range ** 2)
-        c = c_norm - b_norm * fee_min / fee_range + a_norm * (fee_min / fee_range) ** 2
-
-        return (a, b, c)
-
-    def predict_optimal_fee(self, floor_ppm: int, ceiling_ppm: int) -> Optional[int]:
-        """
-        Predict optimal fee based on historical data.
-
-        Uses weighted quadratic polynomial fit to find revenue maximum.
-        Falls back to weighted maximum if polynomial fit fails or is unreliable.
-
-        The polynomial approach provides:
-        - Smoother extrapolation between observed points
-        - Better estimates when optimal fee hasn't been directly observed
-        - Detection of revenue curve shape (concave = valid optimization target)
-
-        Returns None if insufficient data.
-        """
-        weighted_obs = self.get_weighted_observations()
-
-        if len(weighted_obs) < self.MIN_OBSERVATIONS_FOR_PREDICTION:
-            return None
-
-        # Try polynomial fit if we have enough diverse observations
-        if len(weighted_obs) >= self.MIN_OBSERVATIONS_FOR_POLYNOMIAL:
-            poly_result = self._fit_quadratic_weighted(weighted_obs)
-
-            if poly_result is not None:
-                a, b, c = poly_result
-
-                # For valid optimization, curve must be concave (a < 0)
-                # This means there's a maximum, not a minimum
-                if a < self.POLYNOMIAL_CURVATURE_MIN:
-                    # Optimal fee at vertex: x = -b / (2a)
-                    optimal_fee = int(-b / (2 * a))
-
-                    # Validate the prediction is within reasonable bounds
-                    if floor_ppm <= optimal_fee <= ceiling_ppm:
-                        return optimal_fee
-
-                    if optimal_fee < floor_ppm:
-                        return floor_ppm  # Optimal is below floor, use floor
-                    else:
-                        return ceiling_ppm  # Optimal is above ceiling, use ceiling
-
-        # Fallback: Find the fee with highest weighted revenue in our history
-        best_fee = None
-        best_revenue = -1.0
-
-        for fee_ppm, revenue_rate, weight in weighted_obs:
-            weighted_revenue = revenue_rate * weight
-            if weighted_revenue > best_revenue:
-                best_revenue = weighted_revenue
-                best_fee = fee_ppm
-
-        if best_fee is None:
-            return None
-
-        # Clamp to bounds
-        return max(floor_ppm, min(ceiling_ppm, best_fee))
-
-    # Statistical threshold for regime change detection
-    REGIME_CHANGE_Z_THRESHOLD = 2.5  # Standard deviations from mean
-
-    def detect_regime_change(self, current_revenue_rate: float) -> bool:
-        """
-        Detect if market regime has changed (invalidates historical data).
-
-        Uses statistical z-score test instead of hardcoded 3x threshold:
-        - Calculates mean and standard deviation of recent observations
-        - Detects regime change if current is > REGIME_CHANGE_Z_THRESHOLD
-          standard deviations from the mean
-
-        This is more robust because:
-        - Accounts for historical variability (volatile channels tolerate more)
-        - More sensitive for stable channels (tight band = easier to detect)
-        - Falls back to 3x ratio if insufficient variance data
-
-        Returns:
-            True if regime change detected
-        """
-        if len(self.observations) < 10:
-            return False
-
-        # Get recent observations (last 10)
-        recent = self.observations[-10:]
-        revenues = [o.revenue_rate for o in recent]
-        avg_revenue = sum(revenues) / len(revenues)
-
-        # N1 FIX: Guard against near-zero avg_revenue that would cause unstable division
-        if avg_revenue < 1e-6:
-            return False
-
-        # MA-1: Use sample variance (N-1 divisor) for unbiased estimate
-        if len(revenues) < 2:
-            return False
-        variance = sum((r - avg_revenue) ** 2 for r in revenues) / (len(revenues) - 1)
-        std_dev = math.sqrt(variance) if variance > 0 else 0
-
-        # Use z-score test if we have meaningful variance
-        if std_dev > 0.01:  # Minimum std to avoid division issues
-            z_score = abs(current_revenue_rate - avg_revenue) / std_dev
-            if z_score > self.REGIME_CHANGE_Z_THRESHOLD:
-                self.regime_change_count += 1
-                return True
-        else:
-            # Fallback to ratio test for very stable revenue (near-zero variance)
-            ratio = current_revenue_rate / avg_revenue
-            if ratio > 3.0 or ratio < 0.33:
-                self.regime_change_count += 1
-                return True
-
-        return False
-
-    def reset_curve(self) -> None:
-        """Reset the curve (used on regime change)."""
-        self.observations = []
-        self.regime_change_count = 0
-
-    def should_broadcast_observation(self, fee_ppm: int, revenue_rate: float,
-                                      forward_count: int) -> bool:
-        """
-        Check if this observation should be broadcast to fleet.
-
-        Broadcasts significant observations that provide value to fleet learning:
-        - High forward count (more reliable data point)
-        - Fee near local optimum region
-        - Significant deviation from historical average
-        """
-        if forward_count < 5:
-            return False  # Not enough data for reliable observation
-
-        if len(self.observations) < 5:
-            return False  # Need baseline first
-
-        # Broadcast if this is in our best-performing fee region
-        best_fee = self.predict_optimal_fee(0, 10000)
-        if best_fee and abs(fee_ppm - best_fee) < 50:
-            return True  # Near optimal, valuable data
-
-        # Broadcast if revenue is significantly different from average
-        recent = self.observations[-10:]
-        avg_revenue = sum(o.revenue_rate for o in recent) / len(recent)
-        if avg_revenue > 0:
-            ratio = revenue_rate / avg_revenue
-            if ratio > 1.5 or ratio < 0.5:
-                return True  # Significant deviation worth sharing
-
-        return False
-
-    def get_broadcast_data(self) -> Dict[str, Any]:
-        """Get curve data for fleet broadcast."""
-        weighted_obs = self.get_weighted_observations()
-        best_fee = self.predict_optimal_fee(0, 10000)
-
-        return {
-            "observation_count": len(self.observations),
-            "regime_change_count": self.regime_change_count,
-            "best_fee_estimate": best_fee,
-            "recent_observations": [
-                {"fee_ppm": fee, "revenue_rate": rev, "weight": w}
-                for fee, rev, w in weighted_obs[-10:]  # Last 10
-            ]
-        }
-
-    def incorporate_fleet_curve(
-        self,
-        fleet_observations: List[Dict[str, Any]],
-        fleet_weight: float = 0.3
-    ) -> None:
-        """
-        Incorporate fleet-aggregated response curve data.
-
-        Args:
-            fleet_observations: List of {fee_ppm, revenue_rate, weight, count}
-            fleet_weight: Weight to give fleet data (0-1)
-        """
-        if not fleet_observations:
-            return
-
-        # SEC-5: Clamp fleet_weight and bound incoming values
-        fleet_weight = max(0.0, min(1.0, fleet_weight))
-        MAX_FLEET_FEE_PPM = 200_000  # 2x absolute max as sanity bound
-        MAX_FLEET_REVENUE = 100_000.0  # sats/hr sanity bound
-
-        # I-10 FIX: Cap fleet observations to prevent displacement of local data
-        local_count = len(self.observations)
-        max_fleet = max(5, local_count)
-        fleet_observations = fleet_observations[:max_fleet]
-
-        # Add fleet observations with reduced weight
-        now = int(time.time())
-        for obs in fleet_observations:
-            fee = obs.get("fee_ppm", 0)
-            revenue = obs.get("revenue_rate", 0)
-            count = obs.get("count", 1)
-
-            # SEC-5: Clamp incoming fleet values to reasonable ranges
-            fee = max(0, min(int(fee), MAX_FLEET_FEE_PPM))
-            revenue = max(0.0, min(float(revenue), MAX_FLEET_REVENUE))
-            count = max(0, min(int(count), 10000))
-
-            if fee > 0 and revenue >= 0:
-                # Add as synthetic observation with fleet weight
-                synthetic = FeeRevenueObservation(
-                    fee_ppm=fee,
-                    revenue_rate=revenue * fleet_weight,
-                    timestamp=now - 3600,  # Slightly older to prioritize local
-                    forward_count=max(1, int(count * fleet_weight))
-                )
-                self.observations.append(synthetic)
-
-        # Enforce max size
-        if len(self.observations) > self.MAX_OBSERVATIONS:
-            self.observations = self.observations[-self.MAX_OBSERVATIONS:]
-
-    def get_regime_broadcast_data(self) -> Dict[str, Any]:
-        """Get regime change data for fleet broadcast."""
-        recent = self.observations[-20:] if len(self.observations) >= 20 else self.observations
-
-        return {
-            "regime_change_count": self.regime_change_count,
-            "recent_avg_revenue": sum(o.revenue_rate for o in recent) / len(recent) if recent else 0,
-            "observation_count": len(self.observations)
-        }
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "observations": [o.to_dict() for o in self.observations],
-            "regime_change_count": self.regime_change_count,
-            "last_regime_check": self.last_regime_check
-        }
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "HistoricalResponseCurve":
-        curve = cls()
-        curve.observations = [
-            FeeRevenueObservation.from_dict(o)
-            for o in d.get("observations", [])
-        ]
-        curve.regime_change_count = d.get("regime_change_count", 0)
-        curve.last_regime_check = d.get("last_regime_check", 0)
-        return curve
-
-
-# =============================================================================
-# IMPROVEMENT #4: Elasticity Tracking
-# =============================================================================
-# Track (Δvolume/volume) / (Δfee/fee) to understand demand sensitivity.
-# Security mitigations:
-# - Revenue-weighted (not volume) to prevent volume stuffing
-# - Outlier detection on sudden volume changes
-# - Minimum sample size requirements
-# =============================================================================
-
-@dataclass
-class ElasticityTracker:
-    """
-    Track price elasticity of demand for a channel.
-
-    Elasticity = (Δrevenue/revenue) / (Δfee/fee)
-    - Elasticity < -1: Elastic (revenue drops faster than fee rises)
-    - Elasticity > -1: Inelastic (can raise fees without losing much revenue)
-
-    Expected ranges for Lightning Network channels:
-    - Typical: -2.0 to 0.0 (mildly elastic to inelastic)
-    - Highly elastic: -3.0 to -2.0 (price-sensitive routes)
-    - Inelastic: -0.5 to 0.0 (captive routes, low competition)
-    - Anomalous: < -5.0 or > 1.0 (likely measurement error or attack)
-
-    Benchmarks from Lightning Network research:
-    - Well-connected hub channels: typically -0.5 to -1.5
-    - Last-mile channels: typically -0.2 to -0.8 (more inelastic)
-    - Competitive routes: typically -1.5 to -3.0 (more elastic)
-
-    Security mitigations:
-    - Use revenue-weighted changes (not raw volume) to prevent stuffing
-    - Outlier detection: ignore sudden 5x volume changes
-    - Minimum fee change threshold to get valid signal
-    - Bounds validation: clamp extreme values to [-5, 2] range
-    """
-    MAX_HISTORY = 20  # Rolling window
-    OUTLIER_THRESHOLD = 5.0  # Ignore >5x volume changes (attack protection)
-    MIN_FEE_CHANGE_PCT = 0.05  # Need 5% fee change for valid measurement
-    MIN_SAMPLES = 3  # Minimum samples for elasticity estimate
-
-    # Validation bounds based on economic theory and LN observations
-    MIN_VALID_ELASTICITY = -5.0  # Below this is likely measurement error
-    MAX_VALID_ELASTICITY = 2.0   # Above this is anomalous (Giffen goods rare)
-
-    # Historical data points: (fee_ppm, volume_sats, revenue_rate, timestamp)
-    history: List[Tuple[int, int, float, int]] = field(default_factory=list)
-    current_elasticity: float = -1.0  # Default assumption: unit elastic
-    confidence: float = 0.0  # 0-1 confidence in estimate
-
-    def add_observation(self, fee_ppm: int, volume_sats: int,
-                       revenue_rate: float) -> None:
-        """Add observation, maintaining rolling window."""
-        now = int(time.time())
-        self.history.append((fee_ppm, volume_sats, revenue_rate, now))
-
-        # Enforce max size
-        if len(self.history) > self.MAX_HISTORY:
-            self.history = self.history[-self.MAX_HISTORY:]
-
-        # Recalculate elasticity
-        self._update_elasticity()
-
-    def _update_elasticity(self) -> None:
-        """Calculate elasticity from recent observations."""
-        if len(self.history) < 2:
-            return
-
-        elasticities = []
-        weights = []
-
-        for i in range(1, len(self.history)):
-            prev_fee, prev_vol, prev_rev, prev_ts = self.history[i-1]
-            curr_fee, curr_vol, curr_rev, curr_ts = self.history[i]
-
-            # Skip if fee didn't change enough
-            if prev_fee <= 0:
-                continue
-            fee_change_pct = abs(curr_fee - prev_fee) / prev_fee
-            if fee_change_pct < self.MIN_FEE_CHANGE_PCT:
-                continue
-
-            # Skip if volume change is suspicious (outlier detection)
-            if prev_vol > 0:
-                vol_ratio = curr_vol / prev_vol if prev_vol > 0 else 1.0
-                if vol_ratio > self.OUTLIER_THRESHOLD or vol_ratio < 1/self.OUTLIER_THRESHOLD:
-                    continue  # Likely attack or anomaly
-
-            # Calculate elasticity using revenue (not volume) for security
-            # Revenue-weighted protects against volume stuffing attacks
-            if prev_rev > 0 and prev_fee > 0:
-                revenue_change_pct = (curr_rev - prev_rev) / prev_rev
-                fee_change_pct_signed = (curr_fee - prev_fee) / prev_fee
-
-                if abs(fee_change_pct_signed) > 0.01:  # Avoid division by tiny numbers
-                    # Revenue elasticity (similar interpretation to price elasticity)
-                    elasticity = revenue_change_pct / fee_change_pct_signed
-
-                    # Weight by recency (newer = higher weight)
-                    age_hours = (int(time.time()) - curr_ts) / 3600.0
-                    weight = math.exp(-age_hours / 168.0)  # 7-day decay
-
-                    elasticities.append(elasticity)
-                    weights.append(weight)
-
-        if len(elasticities) >= self.MIN_SAMPLES:
-            # Weighted average
-            total_weight = sum(weights)
-            if total_weight > 0:
-                raw_elasticity = sum(
-                    e * w for e, w in zip(elasticities, weights)
-                ) / total_weight
-
-                # Validate against expected bounds
-                # Values outside [-5, 2] are anomalous and clamped
-                if raw_elasticity < self.MIN_VALID_ELASTICITY:
-                    # Extremely negative: likely measurement error, clamp and reduce confidence
-                    self.current_elasticity = self.MIN_VALID_ELASTICITY
-                    self.confidence = min(0.3, len(elasticities) / 10.0)
-                elif raw_elasticity > self.MAX_VALID_ELASTICITY:
-                    # Positive/high: anomalous (Giffen behavior rare), clamp and reduce confidence
-                    self.current_elasticity = self.MAX_VALID_ELASTICITY
-                    self.confidence = min(0.3, len(elasticities) / 10.0)
-                else:
-                    # Normal range: full confidence based on sample count
-                    self.current_elasticity = raw_elasticity
-                    self.confidence = min(1.0, len(elasticities) / 10.0)
-        else:
-            self.confidence = 0.0
-
-    def get_fee_adjustment_hint(self) -> str:
-        """
-        Get hint for fee adjustment based on elasticity.
-
-        Returns:
-            "raise" if inelastic (can raise fees)
-            "lower" if elastic (should lower fees)
-            "hold" if uncertain
-        """
-        if self.confidence < 0.3:
-            return "hold"  # Not enough confidence
-
-        # Revenue elasticity interpretation:
-        # > 0: Revenue increases when fee increases (rare, very inelastic)
-        # < 0 and > -1: Revenue drops less than fee rises (inelastic)
-        # < -1: Revenue drops more than fee rises (elastic)
-
-        if self.current_elasticity > -0.5:
-            return "raise"  # Very inelastic - can raise fees
-        elif self.current_elasticity < -1.5:
-            return "lower"  # Very elastic - should lower fees
-        else:
-            return "hold"  # Near unit elasticity
-
-    def get_optimal_direction(self) -> int:
-        """
-        Get optimal fee direction based on elasticity.
-
-        Returns:
-            1 for increase, -1 for decrease, 0 for hold
-        """
-        hint = self.get_fee_adjustment_hint()
-        if hint == "raise":
-            return 1
-        elif hint == "lower":
-            return -1
-        return 0
-
-    def should_broadcast(self) -> bool:
-        """Check if elasticity should be shared with fleet."""
-        return self.confidence >= 0.5 and len(self.history) >= self.MIN_SAMPLES
-
-    def get_broadcast_data(self) -> Dict[str, Any]:
-        """Get elasticity data for fleet broadcast."""
-        return {
-            "elasticity": self.current_elasticity,
-            "confidence": self.confidence,
-            "sample_count": len(self.history)
-        }
-
-    def incorporate_fleet_data(
-        self,
-        fleet_elasticity: float,
-        fleet_confidence: float,
-        fleet_weight: float = 0.3
-    ) -> None:
-        """
-        Incorporate fleet-aggregated elasticity into local estimate.
-
-        Blends fleet data with local observations for better estimate.
-
-        Args:
-            fleet_elasticity: Fleet-aggregated elasticity
-            fleet_confidence: Fleet confidence in estimate
-            fleet_weight: Weight to give fleet data (0-1)
-        """
-        if fleet_confidence < 0.3:
-            return  # Fleet data not confident enough
-
-        # SEC-5: Clamp incoming fleet values to reasonable ranges
-        fleet_elasticity = max(-10.0, min(10.0, float(fleet_elasticity)))
-        fleet_confidence = max(0.0, min(1.0, float(fleet_confidence)))
-        fleet_weight = max(0.0, min(1.0, float(fleet_weight)))
-
-        # Weight by relative confidence
-        local_weight = self.confidence * (1 - fleet_weight)
-        fleet_adj_weight = fleet_confidence * fleet_weight
-
-        total_weight = local_weight + fleet_adj_weight
-        if total_weight > 0:
-            self.current_elasticity = (
-                self.current_elasticity * local_weight +
-                fleet_elasticity * fleet_adj_weight
-            ) / total_weight
-
-            # Boost confidence when fleet agrees
-            if abs(self.current_elasticity - fleet_elasticity) < 0.5:
-                self.confidence = min(1.0, self.confidence * 1.1)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "history": self.history,
-            "current_elasticity": self.current_elasticity,
-            "confidence": self.confidence
-        }
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "ElasticityTracker":
-        tracker = cls()
-        tracker.history = [tuple(h) for h in d.get("history", [])]
-        tracker.current_elasticity = d.get("current_elasticity", -1.0)
-        tracker.confidence = d.get("confidence", 0.0)
-        return tracker
-
-
-# ── Payment Size Bucket Profiling ──────────────────────────────────────
-# Per-channel payment size distribution tracking for fee elasticity.
-# Each channel maintains Gaussian posteriors per size bucket.
-# Graduated buckets (>=N obs) contribute to revenue-weighted composite fee.
-
-SIZE_BUCKET_BOUNDARIES = [10_000, 100_000, 500_000, 5_000_000]  # sats
-SIZE_BUCKET_LABELS = ["micro", "small", "medium", "large", "whale"]
-SIZE_BUCKET_GRADUATION_THRESHOLD = 10
-
-
-def classify_size_bucket(amount_sats: int) -> int:
-    """Classify a payment amount (sats) into a size bucket index (0-4)."""
-    for i, boundary in enumerate(SIZE_BUCKET_BOUNDARIES):
-        if amount_sats < boundary:
-            return i
-    return len(SIZE_BUCKET_BOUNDARIES)
-
-
-class BucketPosterior:
-    """Gaussian posterior for a single payment size bucket."""
-
-    def __init__(self, mu: float = 200.0, precision: float = 0.1,
-                 n_obs: int = 0, revenue_share: float = 0.0):
-        self.mu = mu
-        self.precision = precision
-        self.n_obs = n_obs
-        self.revenue_share = revenue_share
-
-    @property
-    def graduated(self) -> bool:
-        return self.n_obs >= SIZE_BUCKET_GRADUATION_THRESHOLD
-
-    def sample(self, floor: int, ceiling: int) -> float:
-        """Sample a fee from the posterior, clamped to [floor, ceiling]."""
-        std = 1.0 / max(self.precision, 1e-6) ** 0.5
-        sampled = random.gauss(self.mu, std)
-        return max(floor, min(ceiling, sampled))
-
-    def update(self, observed_fee: float, noise_variance: float = 1000.0):
-        """Bayesian Normal-Normal conjugate update."""
-        noise_variance = max(noise_variance, 1e-6)
-        obs_precision = 1.0 / noise_variance
-        new_precision = self.precision + obs_precision
-        self.mu = (self.precision * self.mu + obs_precision * observed_fee) / new_precision
-        self.precision = new_precision
-        self.n_obs += 1
-
-    def to_dict(self) -> dict:
-        return {
-            "mu": self.mu, "precision": self.precision,
-            "n_obs": self.n_obs, "revenue_share": self.revenue_share,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "BucketPosterior":
-        return cls(
-            mu=d.get("mu", 200.0), precision=d.get("precision", 0.1),
-            n_obs=d.get("n_obs", 0), revenue_share=d.get("revenue_share", 0.0),
-        )
-
-
-class SizeBucketState:
-    """Per-channel payment size bucket state."""
-
-    def __init__(self):
-        self.buckets = {label: BucketPosterior() for label in SIZE_BUCKET_LABELS}
-
-    def update_bucket(self, amount_sats: int, fee_ppm: float,
-                      noise_variance: float = 1000.0):
-        """Update the appropriate bucket's posterior with an observation."""
-        idx = classify_size_bucket(amount_sats)
-        label = SIZE_BUCKET_LABELS[idx]
-        self.buckets[label].update(fee_ppm, noise_variance)
-
-    def update_revenue_shares(self, shares: dict):
-        """Update revenue shares from a {label: share} dict."""
-        for label, share in shares.items():
-            if label in self.buckets:
-                self.buckets[label].revenue_share = share
-
-    def composite_sample(self, channel_wide_sample: float,
-                         floor: int, ceiling: int) -> float:
-        """Revenue-weighted composite fee from graduated buckets.
-
-        Graduated buckets contribute proportional to their revenue_share.
-        Remaining weight goes to channel_wide_sample.
-        """
-        graduated_share = sum(
-            b.revenue_share for b in self.buckets.values() if b.graduated
-        )
-        if graduated_share <= 0:
-            return channel_wide_sample
-
-        composite = 0.0
-        for bucket in self.buckets.values():
-            if bucket.graduated:
-                composite += bucket.sample(floor, ceiling) * bucket.revenue_share
-
-        remaining = 1.0 - graduated_share
-        if remaining > 0:
-            composite += channel_wide_sample * remaining
-
-        return max(floor, min(ceiling, composite))
-
-    def to_dict(self) -> dict:
-        return {label: b.to_dict() for label, b in self.buckets.items()}
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "SizeBucketState":
-        state = cls()
-        for label in SIZE_BUCKET_LABELS:
-            if label in d:
-                state.buckets[label] = BucketPosterior.from_dict(d[label])
-        return state
-
-
-def compute_revenue_shares(bucket_totals: dict) -> dict:
-    """Convert {label: total_fee_msat} to {label: share} where shares sum to 1.0."""
-    total = sum(bucket_totals.values())
-    if total <= 0:
-        return {label: 0.0 for label in bucket_totals}
-    return {label: amt / total for label, amt in bucket_totals.items()}
-
-
-# =============================================================================
-# IMPROVEMENT #5: Thompson Sampling
-# =============================================================================
-# Multi-armed bandit algorithm for exploration vs exploitation.
-# Security mitigations:
-# - Bounded exploration deviation (max ±20% from current fee)
-# - Minimum exploration duration before updating posterior
-# - Gradual exploration ramp-up on new channels
-# =============================================================================
-
-@dataclass
-class ThompsonSamplingState:
-    """
-    Thompson Sampling state for fee exploration.
-
-    Uses Beta distribution to model success probability at each fee level.
-    "Success" is defined as revenue rate exceeding a threshold.
-
-    Security mitigations:
-    - MAX_EXPLORATION_PCT: Never explore more than ±20% from base
-    - MIN_EXPLORE_DURATION: Don't update beliefs too quickly
-    - RAMP_UP_CYCLES: Gradual increase in exploration for new channels
-    """
-    MAX_EXPLORATION_PCT = 0.20  # Max ±20% deviation
-    MIN_EXPLORE_DURATION_HOURS = 2.0  # Minimum time at a fee before judging
-    RAMP_UP_CYCLES = 5  # Number of cycles before full exploration
-    NUM_ARMS = 5  # Discretize fee space into 5 arms: -20%, -10%, 0%, +10%, +20%
-
-    # Beta distribution parameters for each arm (alpha=successes+1, beta=failures+1)
-    # Arms represent: [-20%, -10%, 0%, +10%, +20%] deviations
-    alphas: List[float] = field(default_factory=lambda: [1.0, 1.0, 2.0, 1.0, 1.0])
-    betas: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0])
-
-    current_arm: int = 2  # Start with 0% deviation (center)
-    arm_start_time: int = 0
-    cycles_completed: int = 0
-    last_revenue_rate: float = 0.0
-    exploration_enabled: bool = True
-
-    def sample_arm(self) -> int:
-        """
-        Thompson Sampling: Sample from Beta distributions and pick best arm.
-
-        Returns arm index (0-4) representing fee deviation.
-        """
-        if not self.exploration_enabled:
-            return 2  # No exploration: use base fee
-
-        # Ramp up: reduce exploration early on
-        explore_prob = min(1.0, self.cycles_completed / self.RAMP_UP_CYCLES)
-        if random.random() > explore_prob:
-            return 2  # Use base fee during ramp-up
-
-        # Sample from each arm's Beta distribution
-        samples = []
-        for i in range(self.NUM_ARMS):
-            # Beta(alpha, beta) sample
-            sample = random.betavariate(self.alphas[i], self.betas[i])
-            samples.append(sample)
-
-        # Return arm with highest sample
-        return samples.index(max(samples))
-
-    def get_fee_multiplier(self, arm: int) -> float:
-        """Convert arm index to fee multiplier."""
-        # Arms: 0=-20%, 1=-10%, 2=0%, 3=+10%, 4=+20%
-        deviations = [-0.20, -0.10, 0.0, 0.10, 0.20]
-        return 1.0 + deviations[arm]
-
-    def update_beliefs(self, arm: int, revenue_rate: float,
-                      baseline_rate: float) -> None:
-        """
-        Update Beta distribution based on observed outcome.
-
-        A "success" is revenue rate >= baseline (previous period).
-        """
-        now = int(time.time())
-        hours_elapsed = (now - self.arm_start_time) / 3600.0
-
-        # Security: Don't update too quickly
-        if hours_elapsed < self.MIN_EXPLORE_DURATION_HOURS:
-            return
-
-        # Determine success/failure
-        # Success if revenue rate >= baseline (we did as well or better)
-        success = revenue_rate >= baseline_rate * 0.95  # 5% tolerance
-
-        if success:
-            self.alphas[arm] += 1.0
-        else:
-            self.betas[arm] += 1.0
-
-        # Bound parameters to prevent overflow (proportional rescaling preserves ratio)
-        max_param = 100.0
-        for i in range(len(self.alphas)):
-            total = self.alphas[i] + self.betas[i]
-            if total > max_param * 2:
-                factor = (max_param * 2) / total
-                self.alphas[i] *= factor
-                self.betas[i] *= factor
-
-        self.cycles_completed += 1
-        self.last_revenue_rate = revenue_rate
-
-    def start_exploration(self, arm: int) -> None:
-        """Start exploring a new arm."""
-        self.current_arm = arm
-        self.arm_start_time = int(time.time())
-
-    def get_best_arm(self) -> int:
-        """Get the arm with highest expected value (exploitation only)."""
-        expected_values = [
-            self.alphas[i] / (self.alphas[i] + self.betas[i])
-            for i in range(self.NUM_ARMS)
-        ]
-        return expected_values.index(max(expected_values))
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "alphas": self.alphas,
-            "betas": self.betas,
-            "current_arm": self.current_arm,
-            "arm_start_time": self.arm_start_time,
-            "cycles_completed": self.cycles_completed,
-            "last_revenue_rate": self.last_revenue_rate,
-            "exploration_enabled": self.exploration_enabled
-        }
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "ThompsonSamplingState":
-        state = cls()
-        # L-6: Validate Beta distribution parameters (must be > 0 for betavariate)
-        state.alphas = [max(0.01, a) for a in d.get("alphas", [1.0, 1.0, 2.0, 1.0, 1.0])]
-        state.betas = [max(0.01, b) for b in d.get("betas", [1.0, 1.0, 1.0, 1.0, 1.0])]
-        # H-5: Ensure alphas/betas are exactly NUM_ARMS length (pad or truncate)
-        while len(state.alphas) < cls.NUM_ARMS:
-            state.alphas.append(1.0)
-        state.alphas = state.alphas[:cls.NUM_ARMS]
-        while len(state.betas) < cls.NUM_ARMS:
-            state.betas.append(1.0)
-        state.betas = state.betas[:cls.NUM_ARMS]
-        state.current_arm = d.get("current_arm", 2)
-        state.arm_start_time = d.get("arm_start_time", 0)
-        state.cycles_completed = d.get("cycles_completed", 0)
-        state.last_revenue_rate = d.get("last_revenue_rate", 0.0)
-        state.exploration_enabled = d.get("exploration_enabled", True)
-        return state
 
 
 # =============================================================================
@@ -1970,37 +947,6 @@ class GaussianThompsonState:
             self.observations = self.observations[-self.MAX_OBSERVATIONS:]
         self._recompute_posterior()
 
-    def _apply_elasticity_to_prior(self, elasticity: float, confidence: float) -> None:
-        """
-        Bias the polynomial prior's quadratic coefficient toward the
-        curvature implied by observed price elasticity.
-
-        Modifies _prior_coeffs and _prior_precision so that the next
-        _recompute_posterior() call incorporates the elasticity signal.
-        Uses reset-to-default-then-bias to avoid compounding drift.
-
-        Args:
-            elasticity: Current elasticity estimate (typically [-3, 0])
-            confidence: Confidence in the estimate (0-1)
-        """
-        if confidence <= 0.3:
-            return
-        # Map elasticity [-3.0, 0.0] → expected 'a' coefficient [-0.5, -0.01]
-        # More elastic → stronger negative curvature
-        clamped_e = max(-3.0, min(0.0, elasticity))
-        target_a = -0.01 + (clamped_e / -3.0) * (-0.5 - (-0.01))  # linear map
-
-        # Reset to default then blend toward target (prevents compounding drift)
-        default_a = 0.0
-        blend = 0.3 * confidence
-        self._prior_coeffs[0] = (1.0 - blend) * default_a + blend * target_a
-
-        # Boost precision on 'a' coefficient (reset from default 0.01, capped)
-        default_prec_a = 0.01
-        self._prior_precision[0][0] = min(
-            10.0, default_prec_a + confidence * 0.1
-        )
-
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state to dict for database storage."""
         return {
@@ -2087,215 +1033,6 @@ class GaussianThompsonState:
 
         state.last_sampled_fee = d.get("last_sampled_fee", 0)
         state.last_sample_time = d.get("last_sample_time", 0)
-        return state
-
-
-# =============================================================================
-# IMPROVEMENT #7: AIMD Defense Layer
-# =============================================================================
-# Additive Increase / Multiplicative Decrease for rapid response to failures.
-# When consecutive failures occur, we quickly drop fees to find working level.
-# When things are going well, we slowly increase to find optimal.
-# =============================================================================
-
-@dataclass
-class AIMDDefenseState:
-    """
-    AIMD (Additive Increase / Multiplicative Decrease) defense layer.
-
-    Provides rapid response to routing failures by:
-    - Tracking consecutive successes and failures
-    - Multiplicative decrease (0.85x) on failure streaks
-    - Additive increase (+0.02 modifier) on success streaks
-
-    This overlays Thompson Sampling to provide quick recovery when
-    market conditions change suddenly. Thompson learns slowly but
-    correctly; AIMD reacts quickly to protect revenue.
-
-    Context-Aware Tuning Guidelines:
-    -----------------------------------------------------------------
-    For AGGRESSIVE defense (competitive routes, high failure rates):
-      - MULTIPLICATIVE_DECREASE = 0.75 (faster drop: 25% per streak)
-      - FAILURE_THRESHOLD = 2 (quicker trigger)
-      - MIN_DECREASE_INTERVAL = 1800 (30 min cooldown)
-
-    For CONSERVATIVE defense (stable routes, low competition):
-      - MULTIPLICATIVE_DECREASE = 0.90 (slower drop: 10% per streak)
-      - FAILURE_THRESHOLD = 5 (more patience)
-      - MIN_DECREASE_INTERVAL = 7200 (2 hour cooldown)
-
-    For HIGH-TRAFFIC channels (many forwards/hour):
-      - SUCCESS_THRESHOLD = 20 (more successes before increase)
-      - Prevents premature fee increases during burst traffic
-
-    For LOW-TRAFFIC channels (few forwards/day):
-      - SUCCESS_THRESHOLD = 5 (fewer successes before increase)
-      - Faster adaptation to sparse feedback
-
-    Security mitigations:
-    - MIN_DECREASE_INTERVAL: cooldown prevents rapid oscillation
-    - is_active flag prevents AIMD from fighting Thompson
-    - Bounded modifier range (0.5 to 1.5)
-    """
-    # AIMD parameters (tunable based on channel characteristics)
-    # L-7: Removed dead ADDITIVE_INCREASE_PPM; increase is proportional (+0.02 modifier per success streak)
-    MULTIPLICATIVE_DECREASE = 0.85  # Multiply by 0.85 on failure streak (15% drop)
-
-    # Thresholds for triggering AIMD
-    FAILURE_THRESHOLD = 3           # Failures before multiplicative decrease
-    SUCCESS_THRESHOLD = 10          # Successes before additive increase
-
-    # Cooldowns
-    MIN_DECREASE_INTERVAL = 3600    # 1 hour between decreases (oscillation protection)
-
-    # Modifier bounds
-    MIN_MODIFIER = 0.5              # Never reduce below 50% of Thompson fee
-    MAX_MODIFIER = 1.5              # Never exceed 150% of Thompson fee
-
-    # State tracking
-    consecutive_failures: int = 0
-    consecutive_successes: int = 0
-
-    # AIMD modifier (1.0 = no adjustment)
-    aimd_modifier: float = 1.0
-
-    # Defense mode tracking
-    is_active: bool = False          # True when AIMD is overriding Thompson
-    last_decrease_time: int = 0      # Timestamp of last decrease
-    total_decreases: int = 0         # Count for diagnostics
-    total_increases: int = 0         # Count for diagnostics
-
-    def record_outcome(self, was_success=None, success_score=None, is_exploring=False) -> None:
-        """
-        Record a routing outcome using continuous success score or binary flag.
-
-        Success score mapping:
-        - >= 0.7: success (increment successes, reset failures)
-        - < 0.3: failure (increment failures, reset successes)
-          UNLESS is_exploring=True — exploration failures are ignored
-        - 0.3–0.7: neutral zone (no counter change)
-
-        Legacy was_success=True/False is still supported for backward compat.
-
-        Args:
-            was_success: Legacy binary flag (True/False). Used if success_score not provided.
-            success_score: Continuous score (forward_rate / expected_demand).
-                          Values > 1.0 mean above-average demand.
-            is_exploring: If True, failures during Thompson exploration are ignored
-                         to prevent AIMD from creating a downward spiral.
-        """
-        now = int(time.time())
-
-        # Convert legacy binary to score if needed
-        if success_score is None:
-            if was_success is None:
-                return
-            success_score = 1.0 if was_success else 0.0
-
-        if success_score >= 0.7:
-            # Success: forward rate is >= 70% of baseline
-            self.consecutive_successes += 1
-            self.consecutive_failures = 0
-
-            # Check for additive increase
-            if self.consecutive_successes >= self.SUCCESS_THRESHOLD:
-                # Additive increase: nudge modifier up slightly
-                self.aimd_modifier = min(1.5, self.aimd_modifier + 0.02)
-                self.consecutive_successes = 0  # Reset counter
-                self.total_increases += 1
-
-                # Deactivate AIMD mode if we're doing well
-                if self.aimd_modifier >= 1.0:
-                    self.is_active = False
-        elif success_score < 0.3:
-            # Failure: forward rate is < 30% of baseline
-            # But suppress failure counting during Thompson exploration
-            if is_exploring:
-                # Don't penalize exploratory fee experiments
-                return
-
-            self.consecutive_failures += 1
-            self.consecutive_successes = 0
-
-            # Check for multiplicative decrease
-            if self.consecutive_failures >= self.FAILURE_THRESHOLD:
-                # Check cooldown
-                if (now - self.last_decrease_time) >= self.MIN_DECREASE_INTERVAL:
-                    # Multiplicative decrease
-                    self.aimd_modifier = max(0.5, self.aimd_modifier * self.MULTIPLICATIVE_DECREASE)
-                    self.last_decrease_time = now
-                    self.consecutive_failures = 0  # Reset counter
-                    self.total_decreases += 1
-                    self.is_active = True  # Activate defense mode
-        # else: neutral zone (0.3 <= score < 0.7) — no counter change
-
-    def apply_to_fee(self, thompson_fee: int, floor: int, ceiling: int) -> int:
-        """
-        Apply AIMD modifier to Thompson's sampled fee.
-
-        When AIMD is not active, passes through Thompson's fee unchanged.
-
-        Args:
-            thompson_fee: Fee sampled by Thompson Sampling
-            floor: Minimum allowed fee
-            ceiling: Maximum allowed fee
-
-        Returns:
-            Adjusted fee in ppm
-        """
-        modifier = self.get_effective_modifier()
-
-        if modifier == 1.0:
-            return thompson_fee
-
-        # Apply modifier
-        adjusted = int(thompson_fee * modifier)
-
-        # Clamp to bounds
-        return max(floor, min(ceiling, adjusted))
-
-    def get_effective_modifier(self) -> float:
-        """
-        Get the effective AIMD fee modifier.
-
-        Returns:
-            Modifier to apply to Thompson's sampled fee
-        """
-        if not self.is_active:
-            return 1.0
-
-        return self.aimd_modifier if self.is_active else 1.0
-
-    def reset(self) -> None:
-        """Reset AIMD state (used on regime change or manual intervention)."""
-        self.consecutive_failures = 0
-        self.consecutive_successes = 0
-        self.aimd_modifier = 1.0
-        self.is_active = False
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize to dict for database storage."""
-        return {
-            "consecutive_failures": self.consecutive_failures,
-            "consecutive_successes": self.consecutive_successes,
-            "aimd_modifier": self.aimd_modifier,
-            "is_active": self.is_active,
-            "last_decrease_time": self.last_decrease_time,
-            "total_decreases": self.total_decreases,
-            "total_increases": self.total_increases
-        }
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "AIMDDefenseState":
-        """Deserialize from dict."""
-        state = cls()
-        state.consecutive_failures = d.get("consecutive_failures", 0)
-        state.consecutive_successes = d.get("consecutive_successes", 0)
-        state.aimd_modifier = d.get("aimd_modifier", 1.0)
-        state.is_active = d.get("is_active", False)
-        state.last_decrease_time = d.get("last_decrease_time", 0)
-        state.total_decreases = d.get("total_decreases", 0)
-        state.total_increases = d.get("total_increases", 0)
         return state
 
 
@@ -2404,47 +1141,6 @@ class PIDState:
         return state
 
 
-@dataclass
-class AutoFeeBandState:
-    """Persisted posterior-derived dynamic fee autoband for a channel."""
-
-    min_ppm: int
-    max_ppm: int
-    optimal_fee_ppm: int
-    posterior_std: float
-    observation_count: int
-    sigma: float
-    min_width_ppm: int
-    last_calibrated: int
-    source: str = "auto"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "min_ppm": self.min_ppm,
-            "max_ppm": self.max_ppm,
-            "optimal_fee_ppm": self.optimal_fee_ppm,
-            "posterior_std": self.posterior_std,
-            "observation_count": self.observation_count,
-            "sigma": self.sigma,
-            "min_width_ppm": self.min_width_ppm,
-            "last_calibrated": self.last_calibrated,
-            "source": self.source,
-        }
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "AutoFeeBandState":
-        return cls(
-            min_ppm=int(d.get("min_ppm", 0)),
-            max_ppm=int(d.get("max_ppm", 0)),
-            optimal_fee_ppm=int(d.get("optimal_fee_ppm", 0)),
-            posterior_std=float(d.get("posterior_std", 0.0)),
-            observation_count=int(d.get("observation_count", 0)),
-            sigma=float(d.get("sigma", 2.0)),
-            min_width_ppm=int(d.get("min_width_ppm", 0)),
-            last_calibrated=int(d.get("last_calibrated", 0)),
-            source=str(d.get("source", "auto")),
-        )
-
 
 # =============================================================================
 # IMPROVEMENT #8: Combined Thompson+AIMD State
@@ -2469,14 +1165,9 @@ class ThompsonAIMDState:
     Preserved from HillClimbState (for compatibility):
     - Deadband hysteresis (sleep mode)
     - Revenue rate tracking
-    - Historical curve data (seeds Thompson prior)
-    - Elasticity data (informs prior uncertainty)
     """
     # Thompson Sampling state
     thompson: GaussianThompsonState = field(default_factory=GaussianThompsonState)
-
-    # AIMD defense state
-    aimd: AIMDDefenseState = field(default_factory=AIMDDefenseState)
 
     # Preserved from HillClimbState for hysteresis and tracking
     last_revenue_rate: float = 0.0      # Raw revenue rate
@@ -2495,15 +1186,6 @@ class ThompsonAIMDState:
     forward_count_since_update: int = 0
     last_volume_sats: int = 0
 
-    # Keep historical curve for regime detection and prior seeding
-    historical_curve_data: Dict[str, Any] = field(default_factory=dict)
-
-    # Keep elasticity for prior uncertainty
-    elasticity_data: Dict[str, Any] = field(default_factory=dict)
-
-    # Legacy Thompson data (for migration, deprecated)
-    thompson_data: Dict[str, Any] = field(default_factory=dict)
-
     # Algorithm tracking
     algorithm_version: str = "thompson_aimd_v1"
 
@@ -2516,44 +1198,9 @@ class ThompsonAIMDState:
     # PID balance controller state
     pid: PIDState = field(default_factory=PIDState)
 
-    # Payment size bucket profiling state
-    size_buckets: SizeBucketState = field(default_factory=SizeBucketState)
-
     # Restore target for temporary dynamic HTLC minimum defenses
     dynamic_htlcmin_baseline_msat: Optional[int] = None
 
-    # Posterior-derived dynamic fee autoband
-    auto_band_data: Optional[Dict[str, Any]] = None
-
-    def get_historical_curve(self) -> HistoricalResponseCurve:
-        """Deserialize historical curve from dict."""
-        if self.historical_curve_data:
-            return HistoricalResponseCurve.from_dict(self.historical_curve_data)
-        return HistoricalResponseCurve()
-
-    def set_historical_curve(self, curve: HistoricalResponseCurve) -> None:
-        """Serialize historical curve to dict."""
-        self.historical_curve_data = curve.to_dict()
-
-    def get_elasticity_tracker(self) -> ElasticityTracker:
-        """Deserialize elasticity tracker from dict."""
-        if self.elasticity_data:
-            return ElasticityTracker.from_dict(self.elasticity_data)
-        return ElasticityTracker()
-
-    def set_elasticity_tracker(self, tracker: ElasticityTracker) -> None:
-        """Serialize elasticity tracker to dict."""
-        self.elasticity_data = tracker.to_dict()
-
-    def get_auto_band(self) -> Optional["AutoFeeBandState"]:
-        """Deserialize persisted auto-band metadata."""
-        if not self.auto_band_data:
-            return None
-        return AutoFeeBandState.from_dict(self.auto_band_data)
-
-    def set_auto_band(self, auto_band: Optional["AutoFeeBandState"]) -> None:
-        """Serialize auto-band metadata into v2 state."""
-        self.auto_band_data = auto_band.to_dict() if auto_band is not None else None
 
     def update_ema_revenue_rate(self, current_rate: float, alpha: float = 0.3) -> float:
         """
@@ -2580,26 +1227,19 @@ class ThompsonAIMDState:
         Serialize to v2 JSON format for database storage.
 
         This format is stored in the v2_state_json column and contains
-        all Thompson+AIMD state plus preserved legacy fields.
+        DTS+PID state.
         """
         return {
             "algorithm_version": self.algorithm_version,
             "thompson_state": self.thompson.to_dict(),
-            "aimd_state": self.aimd.to_dict(),
             "ema_revenue_rate": self.ema_revenue_rate,
-            "historical_curve": self.historical_curve_data,
-            "elasticity": self.elasticity_data,
-            # Legacy thompson_data kept for migration path
-            "thompson": self.thompson_data,
             # Vegas-Thompson interaction
             "last_vegas_multiplier": self.last_vegas_multiplier,
             # F-R6-1 FIX: Persist gossip refresh cooldown so it survives restarts
             "last_gossip_refresh": self.last_gossip_refresh,
             # PID balance controller state
             "pid_state": self.pid.to_dict(),
-            "size_buckets": self.size_buckets.to_dict(),
             "dynamic_htlcmin_baseline_msat": self.dynamic_htlcmin_baseline_msat,
-            "auto_band": self.auto_band_data,
         }
 
     @classmethod
@@ -2616,49 +1256,18 @@ class ThompsonAIMDState:
         """
         state = cls()
 
-        # Check if this is new Thompson+AIMD state or needs migration
+        # Check if this is new format or needs migration
         if d.get("algorithm_version") == "thompson_aimd_v1":
-            # New format - load directly
             state.thompson = GaussianThompsonState.from_dict(
                 d.get("thompson_state", {})
             )
-            state.aimd = AIMDDefenseState.from_dict(
-                d.get("aimd_state", {})
-            )
         else:
-            # Migration: Initialize from historical data
+            # Migration: Initialize fresh DTS state
             state.thompson = GaussianThompsonState()
-            state.aimd = AIMDDefenseState()
-
-            # Seed Thompson from historical curve if available
-            historical = d.get("historical_curve", {})
-            observations = historical.get("observations", [])
-            for obs in observations:
-                if isinstance(obs, dict):
-                    state.thompson.observations.append((
-                        obs.get("fee_ppm", 200),
-                        obs.get("revenue_rate", 0),
-                        min(1.0, obs.get("forward_count", 1) / 10.0),
-                        obs.get("timestamp", 0),
-                        obs.get("time_bucket", "normal")
-                    ))
-
-            # Recompute posterior from migrated observations
-            if state.thompson.observations:
-                state.thompson._recompute_posterior()
-
-            # Seed prior uncertainty from elasticity
-            elasticity = d.get("elasticity", {})
-            confidence = elasticity.get("confidence", 0)
-            if confidence > 0:
-                state.thompson.prior_std_fee = int(100 * (1 - confidence * 0.3))
 
         # Load common fields
         ema_val = d.get("ema_revenue_rate")
         state.ema_revenue_rate = ema_val if ema_val is not None else None
-        state.historical_curve_data = d.get("historical_curve", {})
-        state.elasticity_data = d.get("elasticity", {})
-        state.thompson_data = d.get("thompson", {})
         state.algorithm_version = d.get("algorithm_version", "migrated")
         # Vegas-Thompson interaction (default 1.0 for backward compat)
         state.last_vegas_multiplier = d.get("last_vegas_multiplier", 1.0)
@@ -2668,11 +1277,7 @@ class ThompsonAIMDState:
         pid_data = d.get("pid_state", {})
         state.pid = PIDState.from_dict(pid_data) if pid_data else PIDState()
 
-        # Payment size bucket profiling state
-        size_buckets_data = d.get("size_buckets", {})
-        state.size_buckets = SizeBucketState.from_dict(size_buckets_data) if size_buckets_data else SizeBucketState()
         state.dynamic_htlcmin_baseline_msat = d.get("dynamic_htlcmin_baseline_msat")
-        state.auto_band_data = d.get("auto_band")
 
         # Load legacy fields from main table if provided
         if legacy_state:
@@ -2689,6 +1294,8 @@ class ThompsonAIMDState:
 
         return state
 
+        return state
+
 
 @dataclass
 class HillClimbState:
@@ -2697,13 +1304,6 @@ class HillClimbState:
 
     UPDATED: Uses rate-based feedback (revenue per hour) instead of
     absolute revenue to eliminate lag from using 7-day averages.
-
-    v2.0 IMPROVEMENTS:
-    - Dynamic observation windows (forward-count based)
-    - Historical response curve tracking
-    - Elasticity tracking for demand sensitivity
-    - Thompson Sampling for exploration
-    - Multipliers applied to bounds (not fee directly)
 
     Attributes:
         last_revenue_rate: Revenue rate in sats/hour observed since last fee change
@@ -2716,13 +1316,8 @@ class HillClimbState:
         sleep_until: Unix timestamp when to wake up from sleep mode
         stable_cycles: Number of consecutive stable cycles (for entering sleep)
         last_broadcast_fee_ppm: The last fee PPM broadcasted to the network
-
-        # v2.0 additions
         forward_count_since_update: Forwards since last fee change (dynamic window)
         last_volume_sats: Volume in sats during last observation period
-        historical_curve: Historical fee→revenue response curve
-        elasticity_tracker: Demand elasticity tracking
-        thompson_state: Thompson Sampling exploration state
     """
     last_revenue_rate: float = 0.0  # Revenue rate in sats/hour (raw, unsmoothed)
     ema_revenue_rate: Optional[float] = None  # Issue #28: EMA-smoothed revenue rate
@@ -2737,54 +1332,14 @@ class HillClimbState:
     last_broadcast_fee_ppm: int = 0  # Last fee PPM broadcasted to the network
     last_state: str = 'balanced'  # State during last broadcast
 
-    # v2.0: Dynamic observation windows (Improvement #2)
     forward_count_since_update: int = 0  # Number of forwards since last fee change
-    last_volume_sats: int = 0  # Volume during last period (for elasticity)
-
-    # v2.0: Historical response curve (Improvement #3) - stored as dict for DB
-    historical_curve_data: Dict[str, Any] = field(default_factory=dict)
-
-    # v2.0: Elasticity tracking (Improvement #4) - stored as dict for DB
-    elasticity_data: Dict[str, Any] = field(default_factory=dict)
-
-    # v2.0: Thompson Sampling (Improvement #5) - stored as dict for DB
-    thompson_data: Dict[str, Any] = field(default_factory=dict)
+    last_volume_sats: int = 0  # Volume during last period
 
     # Gossip refresh tracking
     last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
 
     # Restore target for temporary dynamic HTLC minimum defenses
     dynamic_htlcmin_baseline_msat: Optional[int] = None
-
-    def get_historical_curve(self) -> HistoricalResponseCurve:
-        """Deserialize historical curve from dict."""
-        if self.historical_curve_data:
-            return HistoricalResponseCurve.from_dict(self.historical_curve_data)
-        return HistoricalResponseCurve()
-
-    def set_historical_curve(self, curve: HistoricalResponseCurve) -> None:
-        """Serialize historical curve to dict."""
-        self.historical_curve_data = curve.to_dict()
-
-    def get_elasticity_tracker(self) -> ElasticityTracker:
-        """Deserialize elasticity tracker from dict."""
-        if self.elasticity_data:
-            return ElasticityTracker.from_dict(self.elasticity_data)
-        return ElasticityTracker()
-
-    def set_elasticity_tracker(self, tracker: ElasticityTracker) -> None:
-        """Serialize elasticity tracker to dict."""
-        self.elasticity_data = tracker.to_dict()
-
-    def get_thompson_state(self) -> ThompsonSamplingState:
-        """Deserialize Thompson Sampling state from dict."""
-        if self.thompson_data:
-            return ThompsonSamplingState.from_dict(self.thompson_data)
-        return ThompsonSamplingState()
-
-    def set_thompson_state(self, state: ThompsonSamplingState) -> None:
-        """Serialize Thompson Sampling state to dict."""
-        self.thompson_data = state.to_dict()
 
     def update_ema_revenue_rate(self, current_rate: float, alpha: float = 0.3) -> float:
         """
@@ -2890,41 +1445,6 @@ class VegasReflexState:
         return 1.0 + (self.intensity ** 0.5) * 2.0
 
 
-def calculate_scarcity_multiplier(outbound_ratio: float, scarcity_threshold: float) -> float:
-    """
-    Phase 7: Calculate scarcity pricing multiplier for low local balance.
-    
-    When outbound liquidity is scarce (below threshold), we charge premium
-    fees because the remaining liquidity is more valuable. This implements
-    economically rational pricing: price rises as supply decreases.
-    
-    ALGORITHM:
-    - If outbound_ratio >= threshold: multiplier = 1.0 (no premium)
-    - If outbound_ratio < threshold: linear scaling from 1.0x to 3.0x
-      - At threshold: 1.0x
-      - At 0% balance: 3.0x
-    
-    Formula: multiplier = 1.0 + 2.0 * (1 - ratio / threshold)
-    
-    Args:
-        outbound_ratio: Current outbound liquidity ratio (0.0 to 1.0)
-        scarcity_threshold: Threshold below which scarcity pricing activates (e.g., 0.30)
-        
-    Returns:
-        Fee multiplier (1.0 to 3.0)
-    """
-    if outbound_ratio >= scarcity_threshold:
-        return 1.0
-    
-    if scarcity_threshold <= 0:
-        return 1.0  # Safety: avoid division by zero
-    
-    # Linear interpolation: 1.0x at threshold, 3.0x at 0
-    scarcity_depth = 1.0 - (outbound_ratio / scarcity_threshold)
-    multiplier = 1.0 + (scarcity_depth * 2.0)
-    
-    return min(3.0, max(1.0, multiplier))
-
 
 @dataclass
 class FeeAdjustment:
@@ -2939,7 +1459,6 @@ class FeeAdjustment:
         reason: Explanation of the adjustment
         hill_climb_values: Hill Climbing algorithm internal values
         reason_code: Structured FeeReasonCode value (for explainability)
-        heuristic_modifiers: HeuristicModifiers applied (for explainability)
     """
     channel_id: str
     peer_id: str
@@ -2948,10 +1467,9 @@ class FeeAdjustment:
     reason: str
     hill_climb_values: Dict[str, Any]
     reason_code: str = FeeReasonCode.THOMPSON_SAMPLE.value  # Default reason
-    heuristic_modifiers: Optional[HeuristicModifiers] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        result = {
+        return {
             "channel_id": self.channel_id,
             "peer_id": self.peer_id,
             "old_fee_ppm": self.old_fee_ppm,
@@ -2960,9 +1478,6 @@ class FeeAdjustment:
             "hill_climb_values": self.hill_climb_values,
             "reason_code": self.reason_code
         }
-        if self.heuristic_modifiers:
-            result["heuristic_modifiers"] = self.heuristic_modifiers.to_json()
-        return result
 
 
 class HillClimbingFeeController:
@@ -2987,10 +1502,6 @@ class HillClimbingFeeController:
     3. Feedback Control: PID manages balance via closed-loop multiplier
     4. Separation of Concerns: Market pricing, balance mgmt, and safety are independent
 
-    Legacy paths (ENABLE_DTS_PID=False):
-    - Thompson+AIMD with scarcity, saturation floors/ceilings, cold-start
-    - Hill Climbing fallback (ENABLE_THOMPSON_AIMD=False)
-
     Known Limitations (documented, not bugs):
     - I-12: No per-channel fee change rate limit — timer interval provides implicit limiting
     - I-14: RLock held across DB I/O in adjust_fees — architectural constraint, single-threaded cycle
@@ -2998,181 +1509,40 @@ class HillClimbingFeeController:
     - I-16: Non-atomic state save (Thompson + HC states) — single-threaded cycle mitigates
     """
     
-    # Hill Climbing parameters
-    STEP_PPM = 50           # Initial step size in PPM
-    STEP_PERCENT = 0.05     # Percentage step size (5%)
-    MIN_STEP_PPM = 10       # Minimum step size (floor for dampening)
-    MAX_STEP_PPM = 200      # Maximum step size
-    MAX_CONSECUTIVE = 5     # Max consecutive moves in same direction before reducing step
-    DAMPENING_FACTOR = 0.5  # Step size decay factor on direction reversal (halve the step)
+    # Observation window parameters
     MIN_OBSERVATION_HOURS = 0.5  # Minimum hours between fee changes for valid signal
     VOLATILITY_THRESHOLD = 0.50  # 50% change in revenue rate triggers volatility reset
+    MIN_FORWARDS_FOR_SIGNAL = 3  # Forwards threshold for dynamic window
 
-    # Deadband Hysteresis parameters (Phase 4: Stability & Scaling)
-    # These reduce gossip noise by suppressing fee updates when the market is stable
+    # Deadband Hysteresis parameters
     STABILITY_THRESHOLD = 0.01   # 1% change - consider market stable if below this
     WAKE_UP_THRESHOLD = 0.20     # 20% revenue spike triggers immediate wake-up
-    SLEEP_CYCLES = 2             # Sleep for 2x the fee interval (faster adaptation)
+    SLEEP_CYCLES = 2             # Sleep for 2x the fee interval
     STABLE_CYCLES_REQUIRED = 3   # Number of flat cycles before entering sleep mode
 
-    # ==========================================================================
-    # v2.0 IMPROVEMENT PARAMETERS (with security mitigations)
-    # ==========================================================================
-
-    # Improvement #1: Multipliers to Bounds
-    # Instead of new_fee = base_fee * multiplier, we do:
-    # floor = base_floor * liquidity_multiplier
-    # ceiling = base_ceiling * profitability_multiplier
-    # This prevents oscillation from stacking multipliers on the fee itself
-    ENABLE_BOUNDS_MULTIPLIERS = True  # Feature flag
+    # Bounds multipliers: floor/ceiling adjustments from liquidity/profitability
     MAX_FLOOR_MULTIPLIER = 3.0        # Security: Floor can't exceed 3x base
     MIN_CEILING_MULTIPLIER = 0.5      # Security: Ceiling can't go below 0.5x base
-
-    # Improvement #2: Dynamic Observation Windows
-    # Use forward count in addition to time-based windows.
-    # Window closes when EITHER condition is met (OR logic):
-    #   - MIN_OBSERVATION_HOURS elapsed (time-based signal), OR
-    #   - MIN_FORWARDS_FOR_SIGNAL forwards observed (data-based signal)
-    # This prevents channels from getting stuck while still reacting quickly
-    # when routing data is available.
-    ENABLE_DYNAMIC_WINDOWS = True     # Enabled: use OR logic for time/forwards
-    MIN_FORWARDS_FOR_SIGNAL = 3       # Forwards threshold (proceed if met)
-    MAX_OBSERVATION_HOURS = 6.0       # Safety ceiling (unused with OR logic)
-    # Note: MIN_OBSERVATION_HOURS already defined above (1.0)
-
-    # Improvement #3: Historical Response Curve
-    # Security mitigations: See HistoricalResponseCurve class
-    ENABLE_HISTORICAL_CURVE = True    # Feature flag
-    REGIME_CHECK_INTERVAL = 3600      # Check for regime change every hour
-
-    # Improvement #4: Elasticity Tracking
-    # Security mitigations: See ElasticityTracker class
-    ENABLE_ELASTICITY = True          # Feature flag
-    ELASTICITY_WEIGHT = 0.3           # How much elasticity influences direction (0-1)
-
-    # Improvement #5: Thompson Sampling
-    # Security mitigations: See ThompsonSamplingState class
-    ENABLE_THOMPSON_SAMPLING = True   # Feature flag
-    THOMPSON_WEIGHT = 0.35            # Probability of using Thompson suggestion (increased for better exploration)
-
-    # ==========================================================================
-    # Issue #19: Balance-Based Minimum Fee Floor
-    # ==========================================================================
-    # Channels with critically low local balance need higher minimum fees to
-    # protect scarce liquidity and ensure any routing is adequately compensated.
-    ENABLE_BALANCE_FLOOR = True       # Feature flag
-    CRITICAL_BALANCE_THRESHOLD = 10   # Percent - below this is "critical"
-    CRITICAL_BALANCE_MIN_FEE = 200    # PPM floor for critically drained channels (reduced from 500)
-    LOW_BALANCE_THRESHOLD = 25        # Percent - below this is "low"
-    LOW_BALANCE_MIN_FEE = 100         # PPM floor for low balance channels (reduced from 200)
 
     # ==========================================================================
     # Issue #20: Flow-Based Ceiling Reduction
     # ==========================================================================
-    # Channels with high fees but zero flow for extended periods should have
-    # their ceiling reduced to enable price discovery.
-    ENABLE_FLOW_CEILING = True        # Feature flag
-    ZERO_FLOW_DAYS_MODERATE = 3       # Days of zero flow for moderate reduction
-    ZERO_FLOW_DAYS_SEVERE = 7         # Days of zero flow for severe reduction
-    ZERO_FLOW_FEE_THRESHOLD = 500     # Only apply if current fee > this PPM
-    ZERO_FLOW_REDUCTION_MODERATE = 0.75  # 25% ceiling reduction after 3 days
-    ZERO_FLOW_REDUCTION_SEVERE = 0.50    # 50% ceiling reduction after 7 days
+    ZERO_FLOW_DAYS_MODERATE = 3
+    ZERO_FLOW_DAYS_SEVERE = 7
+    ZERO_FLOW_FEE_THRESHOLD = 500
+    ZERO_FLOW_REDUCTION_MODERATE = 0.75
+    ZERO_FLOW_REDUCTION_SEVERE = 0.50
 
     # ==========================================================================
     # Issue #32: Rebalance Cost-Aware Fee Floor
     # ==========================================================================
-    # SOURCE channels (outbound-heavy) require rebalancing to maintain liquidity.
-    # This floor ensures fees recover the cost of that rebalancing with a margin.
-    # Prevents the scenario where a channel charges 80ppm but costs 100ppm to rebalance.
-    ENABLE_REBALANCE_FLOOR = True       # Feature flag
-    REBALANCE_FLOOR_MARGIN = 1.20       # Multiplier (1.20 = 20% margin)
-    REBALANCE_FLOOR_MIN_SAMPLES = 3     # Minimum rebalances for confidence
-    REBALANCE_FLOOR_WINDOW_DAYS = 30    # Lookback window for cost history
-
-    # ==========================================================================
-    # Flash Drain Protection: Activity-Scaled Saturation Floor
-    # ==========================================================================
-    # Idle saturated channels (high local balance, low recent activity) are
-    # vulnerable to "flash drains" - rapid depletion from payment avalanches
-    # when fees drop too low. This floor protects them while allowing active
-    # channels to optimize revenue normally.
-    #
-    # The protection scales with:
-    # 1. Channel capacity (larger channels = bigger targets)
-    # 2. Recent activity (more forwards = more trust = less protection)
-    # 3. Idle duration (longer idle = more protection needed)
-    ENABLE_SATURATION_FLOOR = True        # Feature flag
-    SATURATION_THRESHOLD_PCT = 80         # Above this % local balance = saturated
-    SATURATION_CAPACITY_DIVISOR = 200_000 # capacity / this = base floor ppm
-    SATURATION_MIN_FLOOR_PPM = 15         # Absolute minimum protection floor
-    # Activity thresholds (forwards in last 24h)
-    SATURATION_TRUSTED_FORWARDS = 50      # 50+ forwards = fully trusted, no floor
-    SATURATION_WARMING_FORWARDS = 20      # 20-49 = warming up, 50% protection
-    SATURATION_CAUTIOUS_FORWARDS = 10     # 10-19 = cautious, 75% protection
-    # Idle duration multipliers (hours since last forward)
-    SATURATION_IDLE_HOURS_LONG = 72       # 3+ days idle = 1.5x protection
-    SATURATION_IDLE_HOURS_SHORT = 24      # 1+ day idle = 1.25x protection
-
-    # ==========================================================================
-    # Saturation Drain Ceiling (Fix: Fee Death Spiral Inversion)
-    # ==========================================================================
-    # When a channel is HEAVILY saturated (>90% local balance), it needs LOW
-    # fees to ATTRACT outbound flow and drain excess local liquidity. This is
-    # the OPPOSITE of the saturation floor which protects against flash drains.
-    #
-    # The death spiral problem: saturated channels get high fees (saturation
-    # floor), depleted channels get high fees (balance floor), so ALL channels
-    # end up with high fees and routing dies.
-    #
-    # This ceiling CAPS fees low for heavily saturated channels to encourage
-    # drainage. The ceiling scales with saturation severity.
-    ENABLE_SATURATION_DRAIN = True        # Feature flag
-    SATURATION_DRAIN_THRESHOLD_PCT = 90   # Above this % local balance = needs drainage
-    SATURATION_DRAIN_SEVERE_PCT = 95      # Above this = more aggressive drainage
-    SATURATION_DRAIN_CRITICAL_PCT = 99    # Above this = most aggressive drainage
-    # Ceiling multipliers (applied to global_min)
-    SATURATION_DRAIN_CEILING_MULT_90 = 3.0   # 90-95%: ceiling at 3x global_min
-    SATURATION_DRAIN_CEILING_MULT_95 = 2.0   # 95-99%: ceiling at 2x global_min
-    SATURATION_DRAIN_CEILING_MULT_99 = 1.5   # 99%+: ceiling at 1.5x global_min
-
-    # ==========================================================================
-    # Cold-Start Mode for Stagnant Channels
-    # ==========================================================================
-    # Channels with very low forward counts need price discovery - force fees
-    # DOWN with larger steps to attract initial flow. Standard Hill Climbing
-    # increases fees on flat revenue, which is counterproductive for channels
-    # that need LOWER fees to attract any traffic at all.
-    ENABLE_COLD_START = True          # Feature flag
-    COLD_START_FORWARD_THRESHOLD = 5  # Forwards below this triggers cold-start
-    COLD_START_STEP_PPM = 50          # Larger step for aggressive price discovery
-    COLD_START_MAX_FEE_PPM = 100      # Force ceiling down during cold-start
-
-    # ==========================================================================
-    # Fee Algorithm Feature Flags
-    # ==========================================================================
-    # Evolution: Hill Climbing → Thompson+AIMD → Simplified → DTS+PID
-    #
-    # Current architecture (all three True):
-    #   DTS (Discounted Thompson) samples market fee from Bayesian posterior.
-    #   PID controller produces balance multiplier (0.1x–10.0x).
-    #   Final fee = clamp(DTS × PID, hard_floor, hard_ceiling).
-    #
-    # Set ENABLE_DTS_PID=False to fall back to simplified Thompson+AIMD.
-    # Set ENABLE_SIMPLIFIED_FEE_PATH=False to restore full 13-modifier path.
-    # Set ENABLE_THOMPSON_AIMD=False to fall back to Hill Climbing.
-    ENABLE_THOMPSON_AIMD = True
-    ENABLE_SIMPLIFIED_FEE_PATH = True
-    ENABLE_DTS_PID = True
-
-    THOMPSON_COLD_START_BONUS = 1.5   # Extra exploration for channels with few observations
-    THOMPSON_CONTEXT_WEIGHT = 0.7     # Weight for contextual vs global posterior
-    AIMD_DEFENSE_CEILING_BOOST = 0.1  # Allow 10% above ceiling when in defense mode
+    REBALANCE_FLOOR_MARGIN = 1.20
+    REBALANCE_FLOOR_MIN_SAMPLES = 3
+    REBALANCE_FLOOR_WINDOW_DAYS = 30
 
     # =============================================================================
     # GOSSIP REFRESH FOR FROZEN CHANNEL DETECTION
     # =============================================================================
-    # When channels go quiet and fees stabilize, gossip can go stale.
-    # This forces a minimal fee change to refresh network visibility.
     ENABLE_GOSSIP_REFRESH = True
 
     # Minimum hours since last fee broadcast before considering refresh
@@ -3247,33 +1617,6 @@ class HillClimbingFeeController:
             "safety_block": False,
         }
 
-        # Fee anchors: advisor-set soft fee targets (loaded from DB)
-        self._fee_anchors: Dict[str, FeeAnchor] = {}
-        self._load_fee_anchors()
-
-    # =========================================================================
-    # Fee Anchor Methods
-    # =========================================================================
-
-    def _load_fee_anchors(self) -> None:
-        """Load non-expired fee anchors from database into memory."""
-        try:
-            self.database.prune_expired_fee_anchors()
-            rows = self.database.get_all_fee_anchors()
-            for row in rows:
-                anchor = FeeAnchor(
-                    channel_id=row['channel_id'],
-                    target_fee_ppm=row['target_fee_ppm'],
-                    base_weight=row['base_weight'],
-                    confidence=row['confidence'],
-                    ttl_seconds=row['ttl_seconds'],
-                    reason=row.get('reason', ''),
-                    set_at=row['set_at'],
-                )
-                self._fee_anchors[anchor.channel_id] = anchor
-        except Exception as e:
-            self.plugin.log(f"Failed to load fee anchors: {e}", level='warning')
-
     def _set_last_decision_summary(
         self,
         *,
@@ -3341,155 +1684,6 @@ class HillClimbingFeeController:
                 return True
         return False
 
-    def _apply_fee_anchor(self, channel_id: str, proposed_fee: int,
-                          floor_ppm: int, ceiling_ppm: int) -> Tuple[int, Optional[str]]:
-        """
-        Blend advisor fee anchor into proposed fee.
-
-        Returns (blended_fee, reason_suffix) or (proposed_fee, None) if no anchor.
-        """
-        anchor = self._fee_anchors.get(channel_id)
-        if anchor is None:
-            return proposed_fee, None
-
-        if anchor.is_expired():
-            del self._fee_anchors[channel_id]
-            try:
-                self.database.delete_fee_anchor(channel_id)
-            except Exception:
-                pass
-            return proposed_fee, None
-
-        ew = anchor.effective_weight()
-        if ew < 0.01:
-            return proposed_fee, None
-
-        blended = int(proposed_fee * (1.0 - ew) + anchor.target_fee_ppm * ew)
-        blended = max(floor_ppm, min(ceiling_ppm, blended))
-
-        if blended != proposed_fee:
-            reason = (
-                f"anchor:{anchor.target_fee_ppm}ppm w={ew:.2f} "
-                f"({anchor.reason})" if anchor.reason else
-                f"anchor:{anchor.target_fee_ppm}ppm w={ew:.2f}"
-            )
-            self.plugin.log(
-                f"FEE_ANCHOR: {channel_id[:12]}... {proposed_fee}->{blended} ppm "
-                f"(target={anchor.target_fee_ppm} weight={ew:.3f})",
-                level='debug'
-            )
-            return blended, reason
-
-        return proposed_fee, None
-
-    def set_fee_anchor(self, channel_id: str, target_fee_ppm: int,
-                       base_weight: float = 0.7, confidence: float = 1.0,
-                       ttl_seconds: int = 86400, reason: str = '') -> Dict[str, Any]:
-        """Public API: set a fee anchor for a channel."""
-        # Validate
-        if target_fee_ppm < 0:
-            return {"error": "target_fee_ppm must be non-negative"}
-        if not (0.0 < base_weight <= 1.0):
-            return {"error": "base_weight must be in (0.0, 1.0]"}
-        if not (0.0 <= confidence <= 1.0):
-            return {"error": "confidence must be in [0.0, 1.0]"}
-        if ttl_seconds < 1 or ttl_seconds > 604800:
-            return {"error": "ttl_seconds must be between 1 and 604800 (7 days)"}
-
-        anchor = FeeAnchor(
-            channel_id=channel_id,
-            target_fee_ppm=target_fee_ppm,
-            base_weight=base_weight,
-            confidence=confidence,
-            ttl_seconds=ttl_seconds,
-            reason=reason,
-            set_at=time.time(),
-        )
-        # M-5: Protect _fee_anchors with _state_lock
-        with self._state_lock:
-            self._fee_anchors[channel_id] = anchor
-        self.database.set_fee_anchor(
-            channel_id, target_fee_ppm, base_weight, confidence, ttl_seconds, reason
-        )
-        self.plugin.log(
-            f"Fee anchor set: {channel_id} -> {target_fee_ppm} ppm "
-            f"(weight={base_weight}, conf={confidence}, ttl={ttl_seconds}s, reason={reason})",
-            level='info'
-        )
-        return {
-            "status": "success",
-            "channel_id": channel_id,
-            "target_fee_ppm": target_fee_ppm,
-            "base_weight": base_weight,
-            "confidence": confidence,
-            "ttl_seconds": ttl_seconds,
-            "reason": reason,
-        }
-
-    def get_fee_anchor(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        """Public API: get fee anchor for a channel."""
-        # TS-2: Protect with _state_lock (consistent with list_fee_anchors)
-        with self._state_lock:
-            anchor = self._fee_anchors.get(channel_id)
-            if anchor is None or anchor.is_expired():
-                return None
-            return {
-                "channel_id": anchor.channel_id,
-                "target_fee_ppm": anchor.target_fee_ppm,
-                "base_weight": anchor.base_weight,
-                "confidence": anchor.confidence,
-                "ttl_seconds": anchor.ttl_seconds,
-                "reason": anchor.reason,
-                "set_at": anchor.set_at,
-                "effective_weight": anchor.effective_weight(),
-                "remaining_seconds": max(0, anchor.ttl_seconds - (time.time() - anchor.set_at)),
-            }
-
-    def list_fee_anchors(self) -> List[Dict[str, Any]]:
-        """Public API: list all active fee anchors."""
-        result = []
-        # M-5: Protect _fee_anchors with _state_lock
-        with self._state_lock:
-            anchors_snapshot = list(self._fee_anchors.items())
-        for cid, anchor in anchors_snapshot:
-            if anchor.is_expired():
-                with self._state_lock:
-                    self._fee_anchors.pop(cid, None)
-                continue
-            result.append({
-                "channel_id": anchor.channel_id,
-                "target_fee_ppm": anchor.target_fee_ppm,
-                "base_weight": anchor.base_weight,
-                "confidence": anchor.confidence,
-                "ttl_seconds": anchor.ttl_seconds,
-                "reason": anchor.reason,
-                "set_at": anchor.set_at,
-                "effective_weight": anchor.effective_weight(),
-                "remaining_seconds": max(0, anchor.ttl_seconds - (time.time() - anchor.set_at)),
-            })
-        return result
-
-    def clear_fee_anchor(self, channel_id: str) -> Dict[str, Any]:
-        """Public API: remove fee anchor for a channel."""
-        # M-5: Protect _fee_anchors with _state_lock
-        with self._state_lock:
-            self._fee_anchors.pop(channel_id, None)
-        self.database.delete_fee_anchor(channel_id)
-        return {"status": "success", "channel_id": channel_id}
-
-    def clear_all_fee_anchors(self) -> Dict[str, Any]:
-        """Public API: remove all fee anchors."""
-        # M-5: Protect _fee_anchors with _state_lock
-        with self._state_lock:
-            count = len(self._fee_anchors)
-            self._fee_anchors.clear()
-        self.database.delete_all_fee_anchors()
-        return {"status": "success", "cleared": count}
-
-    # =========================================================================
-    # Thompson Sampling + AIMD Helper Methods (v1.7.0)
-    # =========================================================================
-
     def _get_context_with_values(
         self,
         channel_id: str,
@@ -3524,37 +1718,6 @@ class HillClimbingFeeController:
 
         context_key = f"{balance}:{time_bucket}:{role}"
         return (context_key, time_bucket, role)
-
-    def _update_size_bucket_posteriors(self, channel_id: str,
-                                       ts_state: ThompsonAIMDState) -> None:
-        """Update size bucket posteriors from recent forwards and refresh revenue shares."""
-        since_ts = ts_state.last_update or (int(time.time()) - 86400)
-        try:
-            conn = self.database._get_connection()
-            rows = conn.execute(
-                "SELECT out_msat, fee_msat FROM forwards "
-                "WHERE out_channel = ? AND timestamp > ?",
-                (channel_id, since_ts),
-            ).fetchall()
-        except Exception as e:
-            self.plugin.log(f"SIZE_BUCKETS: forwards query failed for {channel_id[:12]}...: {e}", level='debug')
-            return
-
-        for row in rows:
-            out_msat = row["out_msat"]
-            fee_msat = row["fee_msat"]
-            amount_sats = out_msat // 1000
-            if amount_sats > 0 and out_msat > 0:
-                fee_ppm = (fee_msat * 1_000_000) / out_msat
-                ts_state.size_buckets.update_bucket(amount_sats, fee_ppm)
-
-        try:
-            totals = self.database.get_revenue_by_size_bucket(channel_id, window_days=7)
-            shares = compute_revenue_shares(totals)
-            ts_state.size_buckets.update_revenue_shares(shares)
-        except Exception as e:
-            self.plugin.log(f"SIZE_BUCKETS: revenue share refresh failed for {channel_id[:12]}...: {e}", level='debug')
-
 
     def _get_thompson_aimd_state(
         self,
@@ -3687,202 +1850,6 @@ class HillClimbingFeeController:
         self._thompson_aimd_states[channel_id] = state
         return state
 
-    def _get_balance_based_floor(self, local_balance_pct: float, global_min: int) -> int:
-        """
-        Calculate minimum fee floor based on local balance ratio (Issue #19).
-
-        Critically drained channels need higher minimum fees to:
-        1. Discourage further drain of scarce liquidity
-        2. Ensure any routing through drained channel is compensated
-        3. Signal to routing nodes that capacity is limited
-
-        Args:
-            local_balance_pct: Local balance as percentage (0-100)
-            global_min: Global minimum fee from config
-
-        Returns:
-            Minimum fee floor in PPM
-        """
-        if not self.ENABLE_BALANCE_FLOOR:
-            return global_min
-
-        if local_balance_pct < self.CRITICAL_BALANCE_THRESHOLD:
-            return max(global_min, self.CRITICAL_BALANCE_MIN_FEE)
-        elif local_balance_pct < self.LOW_BALANCE_THRESHOLD:
-            return max(global_min, self.LOW_BALANCE_MIN_FEE)
-        else:
-            return global_min
-
-    def _get_saturation_protection_floor(
-        self,
-        channel_id: str,
-        capacity_sats: int,
-        local_balance_pct: float,
-        global_min: int
-    ) -> int:
-        """
-        Flash drain protection for idle saturated channels.
-
-        Idle channels at high local balance are vulnerable to "flash drains" -
-        rapid depletion when fees drop too low and payment avalanches hit.
-        This floor protects them while allowing active channels to optimize
-        revenue normally through Thompson sampling.
-
-        The protection scales intelligently:
-        1. Channel capacity: Larger channels = bigger targets = higher floor
-        2. Recent activity: More forwards = more trust = less protection needed
-        3. Idle duration: Longer idle = more protection (channel is "cold")
-
-        As a channel proves it can handle flow safely (accumulates forwards
-        without being drained), the protection floor decays, eventually
-        trusting Thompson sampling fully.
-
-        Args:
-            channel_id: Channel to check
-            capacity_sats: Channel capacity in satoshis
-            local_balance_pct: Local balance as percentage (0-100)
-            global_min: Global minimum fee from config
-
-        Returns:
-            Minimum fee floor in PPM (may be global_min if no protection needed)
-        """
-        if not self.ENABLE_SATURATION_FLOOR:
-            return global_min
-
-        # Only apply to saturated channels (high local balance) in the 80-90% range
-        # Channels >90% use saturation DRAIN ceiling instead (need LOW fees to drain)
-        if local_balance_pct < self.SATURATION_THRESHOLD_PCT:
-            return global_min
-        if self.ENABLE_SATURATION_DRAIN and local_balance_pct >= self.SATURATION_DRAIN_THRESHOLD_PCT:
-            # >90%: Drain ceiling applies, not protection floor
-            return global_min
-
-        # Get recent activity metrics
-        now = int(time.time())
-        last_forward_ts = self.database.get_last_forward_time(channel_id)
-
-        # Calculate hours since last forward
-        if last_forward_ts and last_forward_ts > 0:
-            hours_since_forward = (now - last_forward_ts) / 3600
-        else:
-            hours_since_forward = 999  # No forwards ever = very idle
-
-        # Get forward count in last 24 hours
-        ts_24h_ago = now - (24 * 3600)
-        recent_forwards = self.database.get_forward_count_since(channel_id, ts_24h_ago)
-
-        # Check if channel is trusted (enough recent activity)
-        if recent_forwards >= self.SATURATION_TRUSTED_FORWARDS:
-            # Channel has proven it can handle flow - trust Thompson sampling
-            return global_min
-
-        # Calculate capacity-based floor
-        # Larger channels are bigger targets and need more protection
-        capacity_floor = max(
-            self.SATURATION_MIN_FLOOR_PPM,
-            capacity_sats // self.SATURATION_CAPACITY_DIVISOR
-        )
-
-        # Scale by activity level (more activity = less protection needed)
-        if recent_forwards >= self.SATURATION_WARMING_FORWARDS:
-            activity_factor = 0.50  # 50% protection - warming up
-        elif recent_forwards >= self.SATURATION_CAUTIOUS_FORWARDS:
-            activity_factor = 0.75  # 75% protection - cautious
-        else:
-            activity_factor = 1.00  # Full protection - idle/minimal activity
-
-        # Apply idle duration multiplier (longer idle = more protection)
-        if hours_since_forward > self.SATURATION_IDLE_HOURS_LONG:
-            idle_multiplier = 1.50  # 3+ days idle
-        elif hours_since_forward > self.SATURATION_IDLE_HOURS_SHORT:
-            idle_multiplier = 1.25  # 1+ day idle
-        else:
-            idle_multiplier = 1.00  # Recently active
-
-        # Calculate final protection floor
-        protection_floor = int(capacity_floor * activity_factor * idle_multiplier)
-
-        if protection_floor > global_min:
-            self.plugin.log(
-                f"SATURATION_FLOOR: {channel_id[:12]}... local={local_balance_pct:.0f}%, "
-                f"forwards_24h={recent_forwards}, idle={hours_since_forward:.1f}h, "
-                f"floor={protection_floor}ppm (capacity={capacity_floor}, "
-                f"activity={activity_factor:.0%}, idle_mult={idle_multiplier:.2f})",
-                level='debug'
-            )
-
-        return max(global_min, protection_floor)
-
-    def _get_saturation_drain_ceiling(
-        self,
-        channel_id: str,
-        local_balance_pct: float,
-        current_fee_ppm: int,
-        global_min: int
-    ) -> Optional[int]:
-        """
-        Saturation drain ceiling for heavily saturated channels.
-
-        When a channel has >90% local balance, it needs LOW fees to ATTRACT
-        outbound flow and drain excess liquidity. This is the OPPOSITE of the
-        saturation floor (which protects against flash drains for 80-90% range).
-
-        The death spiral problem: saturated channels get high fees from the
-        saturation floor, depleted channels get high fees from balance floor,
-        so ALL channels end up with high fees and routing dies.
-
-        This ceiling CAPS fees low to encourage drainage. The ceiling tightens
-        as saturation becomes more severe:
-        - 90-95% local: ceiling at 3x global_min
-        - 95-99% local: ceiling at 2x global_min
-        - 99%+ local:   ceiling at 1.5x global_min
-
-        Args:
-            channel_id: Channel to check
-            local_balance_pct: Local balance as percentage (0-100)
-            current_fee_ppm: Current fee in PPM
-            global_min: Global minimum fee from config
-
-        Returns:
-            Ceiling in PPM if saturation drain applies, None otherwise
-        """
-        if not self.ENABLE_SATURATION_DRAIN:
-            return None
-
-        # Only apply to heavily saturated channels (>90% local balance)
-        if local_balance_pct < self.SATURATION_DRAIN_THRESHOLD_PCT:
-            return None
-
-        # Calculate ceiling based on saturation severity
-        if local_balance_pct >= self.SATURATION_DRAIN_CRITICAL_PCT:
-            ceiling_mult = self.SATURATION_DRAIN_CEILING_MULT_99
-            severity = "critical"
-        elif local_balance_pct >= self.SATURATION_DRAIN_SEVERE_PCT:
-            ceiling_mult = self.SATURATION_DRAIN_CEILING_MULT_95
-            severity = "severe"
-        else:
-            ceiling_mult = self.SATURATION_DRAIN_CEILING_MULT_90
-            severity = "moderate"
-
-        drain_ceiling = int(global_min * ceiling_mult)
-
-        # Only apply if current fee is above the drain ceiling
-        if current_fee_ppm > drain_ceiling:
-            self.plugin.log(
-                f"SATURATION_DRAIN: {channel_id[:12]}... local={local_balance_pct:.0f}% ({severity}), "
-                f"capping fee from {current_fee_ppm} to {drain_ceiling}ppm "
-                f"(ceiling={ceiling_mult:.1f}x global_min={global_min})",
-                level='info'
-            )
-        else:
-            self.plugin.log(
-                f"SATURATION_DRAIN: {channel_id[:12]}... local={local_balance_pct:.0f}% ({severity}), "
-                f"current_fee={current_fee_ppm}ppm already below drain_ceiling={drain_ceiling}ppm",
-                level='debug'
-            )
-
-        return drain_ceiling
-
     def _get_rebalance_cost_floor(
         self,
         channel_id: str,
@@ -3904,8 +1871,6 @@ class HillClimbingFeeController:
         Returns:
             Minimum fee floor in PPM, or None if insufficient data or not applicable
         """
-        if not self.ENABLE_REBALANCE_FLOOR:
-            return None
 
         # Only apply to SOURCE channels - sinks don't need rebalancing
         if flow_state != "source":
@@ -3984,8 +1949,6 @@ class HillClimbingFeeController:
         Returns:
             Adjusted ceiling in PPM
         """
-        if not self.ENABLE_FLOW_CEILING:
-            return base_ceiling
 
         # Only apply to high-fee channels
         if current_fee < self.ZERO_FLOW_FEE_THRESHOLD:
@@ -4076,17 +2039,6 @@ class HillClimbingFeeController:
         except Exception as e:
             self.plugin.log(f"GC: Error pruning database states: {e}", level='warning')
 
-        # Prune expired fee anchors
-        try:
-            expired = self.database.prune_expired_fee_anchors()
-            if expired > 0:
-                # Also remove from in-memory cache
-                for cid in list(self._fee_anchors.keys()):
-                    if self._fee_anchors[cid].is_expired():
-                        del self._fee_anchors[cid]
-                pruned += expired
-        except Exception as e:
-            self.plugin.log(f"GC: Error pruning fee anchors: {e}", level='warning')
 
         if pruned > 0:
             self.plugin.log(
@@ -4443,14 +2395,10 @@ class HillClimbingFeeController:
             return "sleeping"
 
         if pre_last_update > 0:
-            if self.ENABLE_DYNAMIC_WINDOWS:
-                time_ok = pre_hours_elapsed >= self.MIN_OBSERVATION_HOURS
-                forwards_ok = pre_forward_count >= self.MIN_FORWARDS_FOR_SIGNAL
-                if not time_ok and not forwards_ok:
-                    return "waiting_time"
-            else:
-                if pre_hours_elapsed < self.MIN_OBSERVATION_HOURS:
-                    return "waiting_time"
+            time_ok = pre_hours_elapsed >= self.MIN_OBSERVATION_HOURS
+            forwards_ok = pre_forward_count >= self.MIN_FORWARDS_FOR_SIGNAL
+            if not time_ok and not forwards_ok:
+                return "waiting_time"
 
         if hc_state.last_update >= now:
             if (
@@ -4490,8 +2438,6 @@ class HillClimbingFeeController:
         Returns:
             True if gossip refresh should be forced
         """
-        if not self.ENABLE_GOSSIP_REFRESH:
-            return False
         
         # Check 1: Time since last broadcast
         if state.last_update > 0:
@@ -4599,7 +2545,7 @@ class HillClimbingFeeController:
             self._save_hill_climb_state(channel_id, state)
 
         # Keep Thompson state coherent too, if already present.
-        if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+        if channel_id in self._thompson_aimd_states:
             ts_state = self._thompson_aimd_states[channel_id]
             ts_state.last_gossip_refresh = current_time
             ts_state.last_fee_ppm = nudge_fee
@@ -4639,9 +2585,6 @@ class HillClimbingFeeController:
 
         Hard floors = max(chain_cost, vegas_floor, rebalance_cost_floor, min_fee)
         Hard ceiling = max_fee (before legacy saturation drain)
-
-        Legacy path (ENABLE_DTS_PID=False):
-        - Thompson+AIMD with scarcity, saturation floors/ceilings, cold-start
 
         Args:
             channel_id: Channel to adjust
@@ -4694,29 +2637,21 @@ class HillClimbingFeeController:
         # DEADBAND HYSTERESIS: Sleep Status Check (Phase 4: Stability & Scaling)
         # Reduces gossip noise by suppressing fee updates when the market is stable
         # =====================================================================
-        # When Thompson+AIMD is active, use ts_state for sleep decisions so both
-        # algorithms share a single sleep/wake state
-        if self.ENABLE_THOMPSON_AIMD:
-            _ts_sleep_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
-            _sleep_is_sleeping = _ts_sleep_state.is_sleeping
-            _sleep_until = _ts_sleep_state.sleep_until
-            _sleep_last_update = _ts_sleep_state.last_update
-            _sleep_last_revenue_rate = _ts_sleep_state.last_revenue_rate
-        else:
-            _sleep_is_sleeping = hc_state.is_sleeping
-            _sleep_until = hc_state.sleep_until
-            _sleep_last_update = hc_state.last_update
-            _sleep_last_revenue_rate = hc_state.last_revenue_rate
+        # Use ts_state for sleep decisions
+        _ts_sleep_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+        _sleep_is_sleeping = _ts_sleep_state.is_sleeping
+        _sleep_until = _ts_sleep_state.sleep_until
+        _sleep_last_update = _ts_sleep_state.last_update
+        _sleep_last_revenue_rate = _ts_sleep_state.last_revenue_rate
 
         if _sleep_is_sleeping:
             # Check if it's time to wake up (sleep timer expired)
             if now > _sleep_until:
                 # Timer expired - wake up
-                if self.ENABLE_THOMPSON_AIMD:
-                    _ts_sleep_state.is_sleeping = False
-                    _ts_sleep_state.sleep_until = 0
-                    _ts_sleep_state.stable_cycles = 0
-                    self._save_thompson_aimd_state(channel_id, _ts_sleep_state)
+                _ts_sleep_state.is_sleeping = False
+                _ts_sleep_state.sleep_until = 0
+                _ts_sleep_state.stable_cycles = 0
+                self._save_thompson_aimd_state(channel_id, _ts_sleep_state)
                 hc_state.is_sleeping = False
                 hc_state.sleep_until = 0
                 hc_state.stable_cycles = 0
@@ -4750,11 +2685,10 @@ class HillClimbingFeeController:
 
                 if percent_change > self.WAKE_UP_THRESHOLD:
                     # Significant revenue spike detected - wake up immediately!
-                    if self.ENABLE_THOMPSON_AIMD:
-                        _ts_sleep_state.is_sleeping = False
-                        _ts_sleep_state.sleep_until = 0
-                        _ts_sleep_state.stable_cycles = 0
-                        self._save_thompson_aimd_state(channel_id, _ts_sleep_state)
+                    _ts_sleep_state.is_sleeping = False
+                    _ts_sleep_state.sleep_until = 0
+                    _ts_sleep_state.stable_cycles = 0
+                    self._save_thompson_aimd_state(channel_id, _ts_sleep_state)
                     hc_state.is_sleeping = False
                     hc_state.sleep_until = 0
                     hc_state.stable_cycles = 0
@@ -4839,7 +2773,7 @@ class HillClimbingFeeController:
         forward_count = self.database.get_forward_count_since(channel_id, hc_state.last_update)
         hc_state.forward_count_since_update = forward_count
 
-        if self.ENABLE_DYNAMIC_WINDOWS and hc_state.last_update > 0:
+        if hc_state.last_update > 0:
             # Dynamic window logic (OR):
             # - Window closes when EITHER condition is met:
             #   1. At least MIN_OBSERVATION_HOURS elapsed (time signal), OR
@@ -4867,19 +2801,6 @@ class HillClimbingFeeController:
                     level='debug'
                 )
                 return None
-        else:
-            # Legacy behavior: time-only observation window
-            if hours_elapsed < self.MIN_OBSERVATION_HOURS:
-                self.plugin.log(
-                    f"Skipping {channel_id[:12]}...: observation window too short "
-                    f"({hours_elapsed:.2f}h < {self.MIN_OBSERVATION_HOURS}h minimum)",
-                    level='debug'
-                )
-                # Still too early for valid signal - skip this channel for now
-                if hc_state.last_update > 0:  # Only skip if we have prior state
-                    return None
-                # First run - continue with initialization
-                hours_elapsed = 1.0  # Use 1 hour as default for first run
 
         # First run initialization
         if hours_elapsed <= 0:
@@ -4945,32 +2866,7 @@ class HillClimbingFeeController:
         # and saturation_floor — heuristics the PID is designed to replace.
         _hard_floor_ppm = base_floor_ppm
 
-        # =====================================================================
-        # Issue #19: Balance-Based Minimum Fee Floor
-        # =====================================================================
-        # Critically drained channels need higher minimum fees to protect
-        # scarce liquidity. This floor is applied AFTER other floor adjustments.
-        local_balance_pct = outbound_ratio * 100  # Convert to percentage
-        balance_floor_ppm = self._get_balance_based_floor(local_balance_pct, cfg.min_fee_ppm)
-        if balance_floor_ppm > base_floor_ppm:
-            self.plugin.log(
-                f"BALANCE_FLOOR: {channel_id[:12]}... local={local_balance_pct:.1f}%, "
-                f"floor raised from {base_floor_ppm} to {balance_floor_ppm} ppm",
-                level='debug'
-            )
-            base_floor_ppm = balance_floor_ppm
 
-        # =====================================================================
-        # Flash Drain Protection: Activity-Scaled Saturation Floor
-        # =====================================================================
-        # Idle saturated channels are vulnerable to rapid depletion when fees
-        # drop too low. This floor protects them while allowing active channels
-        # to optimize revenue. Protection decays as channel proves it's safe.
-        saturation_floor_ppm = self._get_saturation_protection_floor(
-            channel_id, capacity, local_balance_pct, cfg.min_fee_ppm
-        )
-        if saturation_floor_ppm > base_floor_ppm:
-            base_floor_ppm = saturation_floor_ppm
 
         # =====================================================================
         # Issue #32: Rebalance Cost-Aware Fee Floor
@@ -5008,116 +2904,7 @@ class HillClimbingFeeController:
         # DTS+PID uses this — saturation drain is a heuristic the PID replaces.
         _hard_ceiling_ppm = base_ceiling_ppm
 
-        # =====================================================================
-        # Saturation Drain Ceiling (Fix: Fee Death Spiral Inversion)
-        # =====================================================================
-        # Heavily saturated channels (>90% local) need LOW fees to drain.
-        # This ceiling overrides normal ceiling to encourage outbound flow.
-        saturation_drain_ceiling = self._get_saturation_drain_ceiling(
-            channel_id, local_balance_pct, current_fee_ppm, cfg.min_fee_ppm
-        )
-        saturation_drain_active = saturation_drain_ceiling is not None
-        if saturation_drain_ceiling is not None:
-            # Drain ceiling takes precedence - cap the ceiling
-            if base_ceiling_ppm > saturation_drain_ceiling:
-                base_ceiling_ppm = saturation_drain_ceiling
 
-        # =====================================================================
-        # Issue #18 Fix: Balance Floor Priority (extended for Issue #32 & saturation)
-        # =====================================================================
-        # Scarcity protection for drained channels, flash drain protection for
-        # saturated channels, and cost recovery for rebalanced channels all take
-        # priority over normal ceiling limits. If any protective floor is active,
-        # ensure ceiling accommodates it.
-        effective_floor = max(
-            balance_floor_ppm,
-            saturation_floor_ppm,
-            0 if saturation_drain_active else (rebalance_floor_ppm or 0),
-        )
-        if effective_floor > cfg.min_fee_ppm:  # A protective floor is active
-            min_ceiling_for_floor = effective_floor + 100  # Allow room for hill climbing
-            if base_ceiling_ppm < min_ceiling_for_floor:
-                self.plugin.log(
-                    f"SCARCITY_PRIORITY: {channel_id[:12]}... raising ceiling from "
-                    f"{base_ceiling_ppm} to {min_ceiling_for_floor} ppm to accommodate "
-                    f"effective floor of {effective_floor} ppm",
-                    level='info'
-                )
-                base_ceiling_ppm = min_ceiling_for_floor
-
-        # =====================================================================
-        # Per-Peer Dynamic Fee Autoband (Policy-Driven)
-        # =====================================================================
-        # Autoband constrains dynamic pricing to a range derived from:
-        #   fee_ppm_target * fee_multiplier_min/max
-        # Example: 500-1000 ppm band => target=500, min=1.0, max=2.0
-        #
-        # If the autoband conflicts with a protective floor (e.g. scarcity / cost
-        # recovery), safety wins and the ceiling is lifted to the floor.
-        # =====================================================================
-        if self.ENABLE_THOMPSON_AIMD:
-            ts_state_for_band = self._get_thompson_aimd_state(
-                channel_id,
-                peer_id,
-                actual_fee_ppm=raw_chain_fee,
-            )
-            self._maybe_auto_calibrate_channel_fee_band(
-                channel_id,
-                peer_id,
-                ts_state_for_band,
-                cfg,
-                now=now,
-            )
-        band_min_ppm, band_max_ppm, band_source = self._get_effective_dynamic_fee_autoband_ppm(
-            channel_id,
-            peer_id,
-            cfg=cfg,
-        )
-        if band_min_ppm is not None or band_max_ppm is not None:
-            old_floor_ppm = base_floor_ppm
-            old_ceiling_ppm = base_ceiling_ppm
-            old_hard_floor_ppm = _hard_floor_ppm
-            old_hard_ceiling_ppm = _hard_ceiling_ppm
-
-            if band_min_ppm is not None:
-                base_floor_ppm = max(base_floor_ppm, band_min_ppm)
-                _hard_floor_ppm = max(_hard_floor_ppm, band_min_ppm)
-            if band_max_ppm is not None:
-                base_ceiling_ppm = min(base_ceiling_ppm, band_max_ppm)
-                _hard_ceiling_ppm = min(_hard_ceiling_ppm, band_max_ppm)
-
-            if base_floor_ppm > base_ceiling_ppm:
-                self.plugin.log(
-                    f"POLICY_AUTOBAND_CONFLICT: {channel_id[:12]}... "
-                    f"band={band_min_ppm or '-'}-{band_max_ppm or '-'} ppm conflicts with "
-                    f"safety floor {base_floor_ppm} ppm; preserving floor.",
-                    level='warn'
-                )
-                base_ceiling_ppm = base_floor_ppm
-                _hard_ceiling_ppm = max(_hard_ceiling_ppm, _hard_floor_ppm)
-            elif old_floor_ppm != base_floor_ppm or old_ceiling_ppm != base_ceiling_ppm:
-                self.plugin.log(
-                    f"{band_source.upper()}_AUTOBAND: {channel_id[:12]}... "
-                    f"floor={old_floor_ppm}->{base_floor_ppm}, "
-                    f"ceiling={old_ceiling_ppm}->{base_ceiling_ppm}, "
-                    f"hard_floor={old_hard_floor_ppm}->{_hard_floor_ppm}, "
-                    f"hard_ceiling={old_hard_ceiling_ppm}->{_hard_ceiling_ppm}, "
-                    f"band={band_min_ppm or '-'}-{band_max_ppm or '-'} ppm",
-                    level='debug'
-                )
-
-        if saturation_drain_ceiling is not None:
-            capped_floor_ppm = min(base_floor_ppm, saturation_drain_ceiling)
-            capped_ceiling_ppm = min(base_ceiling_ppm, saturation_drain_ceiling)
-            if capped_floor_ppm != base_floor_ppm or capped_ceiling_ppm != base_ceiling_ppm:
-                self.plugin.log(
-                    f"SATURATION_DRAIN_CAP: {channel_id[:12]}... "
-                    f"floor={base_floor_ppm}->{capped_floor_ppm}, "
-                    f"ceiling={base_ceiling_ppm}->{capped_ceiling_ppm}",
-                    level='info'
-                )
-            base_floor_ppm = capped_floor_ppm
-            base_ceiling_ppm = capped_ceiling_ppm
 
         # =====================================================================
         # IMPROVEMENT #1: Apply Multipliers to Bounds (Not Fee Directly)
@@ -5127,44 +2914,40 @@ class HillClimbingFeeController:
         #             ceiling = base_ceiling / prof_mult (unprofitable = lower ceiling)
         # This prevents oscillation from stacking multipliers on the fee itself
         # =====================================================================
-        if self.ENABLE_BOUNDS_MULTIPLIERS:
-            # Liquidity multiplier raises floor (scarce liquidity = higher minimum)
-            floor_multiplier = min(liquidity_multiplier, self.MAX_FLOOR_MULTIPLIER)
-            floor_ppm = int(base_floor_ppm * floor_multiplier)
+        # Liquidity multiplier raises floor (scarce liquidity = higher minimum)
+        floor_multiplier = min(liquidity_multiplier, self.MAX_FLOOR_MULTIPLIER)
+        floor_ppm = int(base_floor_ppm * floor_multiplier)
 
-            # Profitability multiplier lowers ceiling for unprofitable channels
-            # If profitability_multiplier > 1, channel is unprofitable, lower ceiling
-            # If profitability_multiplier < 1, channel is profitable, raise ceiling
-            if profitability_multiplier > 1.0:
-                ceiling_multiplier = max(1.0 / profitability_multiplier, self.MIN_CEILING_MULTIPLIER)
-            else:
-                ceiling_multiplier = 1.0  # Don't raise ceiling above max
-            ceiling_ppm = int(base_ceiling_ppm * ceiling_multiplier)
-
-            # Security: Ensure floor never exceeds ceiling
-            # Issue #18/#32: When protective floor is active, raise ceiling instead of lowering floor
-            if floor_ppm >= ceiling_ppm:
-                if effective_floor > cfg.min_fee_ppm:
-                    # Protective floor is active - raise ceiling to preserve cost recovery
-                    ceiling_ppm = floor_ppm + 10
-                    self.plugin.log(
-                        f"SCARCITY_GUARD: {channel_id[:12]}... ceiling raised to {ceiling_ppm} "
-                        f"to preserve effective floor of {effective_floor}",
-                        level='info'
-                    )
-                else:
-                    # Normal case - lower floor to fit ceiling
-                    floor_ppm = max(1, ceiling_ppm - 10)
-
-            self.plugin.log(
-                f"BOUNDS_MULT: {channel_id[:12]}... floor={base_floor_ppm}->{floor_ppm} "
-                f"(x{floor_multiplier:.2f}), ceiling={base_ceiling_ppm}->{ceiling_ppm} "
-                f"(x{ceiling_multiplier:.2f})",
-                level='debug'
-            )
+        # Profitability multiplier lowers ceiling for unprofitable channels
+        # If profitability_multiplier > 1, channel is unprofitable, lower ceiling
+        # If profitability_multiplier < 1, channel is profitable, raise ceiling
+        if profitability_multiplier > 1.0:
+            ceiling_multiplier = max(1.0 / profitability_multiplier, self.MIN_CEILING_MULTIPLIER)
         else:
-            floor_ppm = base_floor_ppm
-            ceiling_ppm = base_ceiling_ppm
+            ceiling_multiplier = 1.0  # Don't raise ceiling above max
+        ceiling_ppm = int(base_ceiling_ppm * ceiling_multiplier)
+
+        # Security: Ensure floor never exceeds ceiling
+        # Issue #18/#32: When protective floor is active, raise ceiling instead of lowering floor
+        if floor_ppm >= ceiling_ppm:
+            if effective_floor > cfg.min_fee_ppm:
+                # Protective floor is active - raise ceiling to preserve cost recovery
+                ceiling_ppm = floor_ppm + 10
+                self.plugin.log(
+                    f"SCARCITY_GUARD: {channel_id[:12]}... ceiling raised to {ceiling_ppm} "
+                    f"to preserve effective floor of {effective_floor}",
+                    level='info'
+                )
+            else:
+                # Normal case - lower floor to fit ceiling
+                floor_ppm = max(1, ceiling_ppm - 10)
+
+        self.plugin.log(
+            f"BOUNDS_MULT: {channel_id[:12]}... floor={base_floor_ppm}->{floor_ppm} "
+            f"(x{floor_multiplier:.2f}), ceiling={base_ceiling_ppm}->{ceiling_ppm} "
+            f"(x{ceiling_multiplier:.2f})",
+            level='debug'
+        )
         
         # =====================================================================
         # PRIORITY OVERRIDE: Zero-Fee Probe > Fire Sale
@@ -5179,8 +2962,7 @@ class HillClimbingFeeController:
         base_new_fee = None  # For observability; set in Hill Climbing branch
         new_fee_ppm = 0
         target_found = False
-        is_cold_start = False  # Initialize here; may be set True in Hill Climbing branch
-        heuristic_modifiers = HeuristicModifiers()  # Initialize early; populated in Hill Climbing branch
+        # (HeuristicModifiers and cold_start removed in Phase 2 - DTS+PID doesn't use them)
         volatility_reset = False  # Default; set True only inside Hill Climbing/Thompson volatility paths
 
         # Priority 1: Congestion (Emergency High Fee)
@@ -5195,15 +2977,14 @@ class HillClimbingFeeController:
             target_found = True
 
             # Synthetic observation: Thompson bypassed, inject at reduced weight
-            if self.ENABLE_THOMPSON_AIMD:
-                try:
-                    ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
-                    ts_state_synth.thompson.inject_synthetic_observation(
-                        ceiling_ppm, current_revenue_rate, weight_scale=0.3
-                    )
-                    self._save_thompson_aimd_state(channel_id, ts_state_synth)
-                except Exception as e:
-                    self.plugin.log(f"Synthetic Thompson state injection failed for {channel_id[:12]}...: {e}", level='debug')
+            try:
+                ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+                ts_state_synth.thompson.inject_synthetic_observation(
+                    ceiling_ppm, current_revenue_rate, weight_scale=0.3
+                )
+                self._save_thompson_aimd_state(channel_id, ts_state_synth)
+            except Exception as e:
+                self.plugin.log(f"Synthetic Thompson state injection failed for {channel_id[:12]}...: {e}", level='debug')
 
         # Priority 2: Zero-Fee Probe Logic (Jumpstarting)
         if not target_found and is_under_probe:
@@ -5245,16 +3026,15 @@ class HillClimbingFeeController:
                 )
 
                 # Synthetic observation: probe succeeded at floor fee
-                if self.ENABLE_THOMPSON_AIMD:
-                    try:
-                        ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
-                        probe_revenue = (v_since * new_fee_ppm) / 1_000_000 if v_since > 0 else 0.0
-                        ts_state_synth.thompson.inject_synthetic_observation(
-                            new_fee_ppm, probe_revenue, weight_scale=0.2
-                        )
-                        self._save_thompson_aimd_state(channel_id, ts_state_synth)
-                    except Exception as e:
-                        self.plugin.log(f"Synthetic Thompson state injection (probe success) failed for {channel_id[:12]}...: {e}", level='debug')
+                try:
+                    ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+                    probe_revenue = (v_since * new_fee_ppm) / 1_000_000 if v_since > 0 else 0.0
+                    ts_state_synth.thompson.inject_synthetic_observation(
+                        new_fee_ppm, probe_revenue, weight_scale=0.2
+                    )
+                    self._save_thompson_aimd_state(channel_id, ts_state_synth)
+                except Exception as e:
+                    self.plugin.log(f"Synthetic Thompson state injection (probe success) failed for {channel_id[:12]}...: {e}", level='debug')
             else:
                 # Still probing: force 0 PPM
                 new_fee_ppm = 0
@@ -5268,22 +3048,21 @@ class HillClimbingFeeController:
                 target_found = True
 
                 # Synthetic observation: probing with 0 fee, no revenue
-                if self.ENABLE_THOMPSON_AIMD:
-                    try:
-                        ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
-                        ts_state_synth.thompson.inject_synthetic_observation(
-                            0, 0.0, weight_scale=0.1
-                        )
-                        self._save_thompson_aimd_state(channel_id, ts_state_synth)
-                    except Exception as e:
-                        self.plugin.log(f"Synthetic Thompson state injection (probe active) failed for {channel_id[:12]}...: {e}", level='debug')
+                try:
+                    ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+                    ts_state_synth.thompson.inject_synthetic_observation(
+                        0, 0.0, weight_scale=0.1
+                    )
+                    self._save_thompson_aimd_state(channel_id, ts_state_synth)
+                except Exception as e:
+                    self.plugin.log(f"Synthetic Thompson state injection (probe active) failed for {channel_id[:12]}...: {e}", level='debug')
 
         # Priority 4: Fee Discovery Algorithm
         # =====================================================================
         # Thompson Sampling + AIMD (v1.7.0) - Primary Algorithm
         # OR Hill Climbing (Legacy) - Fallback
         # =====================================================================
-        if not target_found and self.ENABLE_THOMPSON_AIMD:
+        if not target_found:
             # =====================================================================
             # THOMPSON SAMPLING + AIMD FEE OPTIMIZATION
             # =====================================================================
@@ -5293,17 +3072,6 @@ class HillClimbingFeeController:
 
             # Load Thompson+AIMD state
             ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
-            self._maybe_auto_calibrate_channel_fee_band(
-                channel_id,
-                peer_id,
-                ts_state,
-                cfg,
-                now=now,
-            )
-
-            # Update payment size bucket posteriors from recent forwards
-            self._update_size_bucket_posteriors(channel_id, ts_state)
-
             # Track rate change for logging and hysteresis
             rate_change = current_revenue_rate - ts_state.last_revenue_rate
             previous_rate = ts_state.last_revenue_rate
@@ -5319,46 +3087,7 @@ class HillClimbingFeeController:
             historical_curve = ts_state.get_historical_curve()
             elasticity_tracker = ts_state.get_elasticity_tracker()
 
-            # Record observation for historical analysis
-            regime_already_checked = False
-            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                if self.ENABLE_HISTORICAL_CURVE:
-                    historical_curve.add_observation(
-                        fee_ppm=current_fee_ppm,
-                        revenue_rate=current_revenue_rate,
-                        forward_count=forward_count
-                    )
 
-                    # Check for regime change
-                    # M-12: Track whether we already checked regime to avoid double-detection below
-                    regime_already_checked = False
-                    if now - historical_curve.last_regime_check > self.REGIME_CHECK_INTERVAL:
-                        historical_curve.last_regime_check = now
-                        regime_already_checked = True
-                        if historical_curve.detect_regime_change(current_revenue_rate):
-                            self.plugin.log(
-                                f"THOMPSON: Regime change detected for {channel_id[:12]}... "
-                                f"Resetting Thompson posterior.",
-                                level='info'
-                            )
-                            historical_curve.reset_curve()
-                            ts_state = self._reset_channel_after_regime_change(
-                                channel_id,
-                                peer_id,
-                                ts_state,
-                            )
-
-                    ts_state.set_historical_curve(historical_curve)
-
-            # Update elasticity tracker
-            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                if self.ENABLE_ELASTICITY:
-                    elasticity_tracker.add_observation(
-                        fee_ppm=current_fee_ppm,
-                        volume_sats=volume_since_sats,
-                        revenue_rate=current_revenue_rate
-                    )
-                    ts_state.set_elasticity_tracker(elasticity_tracker)
 
             # =====================================================================
             # VOLATILITY & HYSTERESIS (preserved)
@@ -5423,17 +3152,6 @@ class HillClimbingFeeController:
 
             adjusted_revenue_rate = current_revenue_rate / demand_factor
 
-            # =====================================================================
-            # ELASTICITY → POLYNOMIAL PRIOR BIAS
-            # =====================================================================
-            # Bias the quadratic coefficient toward the curvature implied by
-            # observed elasticity before the posterior update incorporates it.
-            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
-                    ts_state.thompson._apply_elasticity_to_prior(
-                        elasticity=elasticity_tracker.current_elasticity,
-                        confidence=elasticity_tracker.confidence
-                    )
 
             # =====================================================================
             # THOMPSON SAMPLING: Update Posterior and Sample Fee
@@ -5457,8 +3175,7 @@ class HillClimbingFeeController:
             # =====================================================================
             # DTS: Apply discount factor before sampling (posterior forgetting)
             # =====================================================================
-            if self.ENABLE_DTS_PID:
-                ts_state.thompson.apply_dts_discount(gamma=0.95)
+            ts_state.thompson.apply_dts_discount(gamma=0.95)
 
             # =====================================================================
             # VEGAS-THOMPSON INTERACTION
@@ -5475,279 +3192,46 @@ class HillClimbingFeeController:
             # =====================================================================
             # THOMPSON SAMPLING: Sample Fee
             # =====================================================================
-            if self.ENABLE_SIMPLIFIED_FEE_PATH:
-                # Simplified: direct posterior sample, no stigmergic modulation
-                raw_thompson_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
-                thompson_fee = ts_state.size_buckets.composite_sample(
-                    raw_thompson_fee, floor_ppm, ceiling_ppm
-                )
-            else:
-                # Legacy: contextual + elasticity bias
-                # Sample fee from Thompson posterior (contextual if enough data)
-                thompson_fee = ts_state.thompson.sample_fee_contextual(
-                    context_key=context_key,
-                    floor=floor_ppm,
-                    ceiling=ceiling_ppm
-                )
+            # Direct posterior sample
+            thompson_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
 
-                # Elasticity-informed sampled fee bias
-                if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.3:
-                    direction = elasticity_tracker.get_optimal_direction()
-                    if direction != 0:
-                        bias = direction * elasticity_tracker.confidence * ts_state.thompson.posterior_std * 0.3
-                        thompson_fee = int(max(floor_ppm, min(ceiling_ppm, thompson_fee + bias)))
+            # =============================================================
+            # DTS+PID PATH: PID multiplier replaces AIMD/scarcity/cold-start
+            # =============================================================
+            try:
+                ch_state_data = self.database.get_channel_state(channel_id)
+                flow_state_str = (ch_state_data or {}).get("state", "balanced")
+            except Exception:
+                flow_state_str = "balanced"
 
-                # Apply fleet differentiation offset (computed above, doesn't mutate posterior)
-                if differentiation_offset != 0:
-                    thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + differentiation_offset))
+            capacity = channel_info.get("capacity", 2_000_000)
+            pid_multiplier = ts_state.pid.calculate_multiplier(
+                current_outbound_ratio=outbound_ratio,
+                capacity_sats=capacity,
+                flow_state=flow_state_str,
+            )
+            new_fee_ppm = int(thompson_fee * pid_multiplier)
 
-                thompson_fee = ts_state.size_buckets.composite_sample(
-                    thompson_fee, floor_ppm, ceiling_ppm
-                )
+            # Use hard safety constraints only — bypass legacy heuristic
+            # floors (balance_floor, saturation_floor) and ceilings
+            # (saturation_drain) that the PID is designed to replace.
+            new_fee_ppm = max(_hard_floor_ppm, min(_hard_ceiling_ppm, new_fee_ppm))
 
-            if self.ENABLE_DTS_PID:
-                # =============================================================
-                # DTS+PID PATH: PID multiplier replaces AIMD/scarcity/cold-start
-                # =============================================================
-                try:
-                    ch_state_data = self.database.get_channel_state(channel_id)
-                    flow_state_str = (ch_state_data or {}).get("state", "balanced")
-                except Exception:
-                    flow_state_str = "balanced"
+            decision_reason = (
+                f"dts_pid (dts={thompson_fee}, pid={pid_multiplier:.2f}, "
+                f"flow={flow_state_str})"
+            )
 
-                capacity = channel_info.get("capacity", 2_000_000)
-                pid_multiplier = ts_state.pid.calculate_multiplier(
-                    current_outbound_ratio=outbound_ratio,
-                    capacity_sats=capacity,
-                    flow_state=flow_state_str,
-                )
-                new_fee_ppm = int(thompson_fee * pid_multiplier)
+            # Update volume tracking
+            ts_state.last_volume_sats = volume_since_sats
 
-                # Use hard safety constraints only — bypass legacy heuristic
-                # floors (balance_floor, saturation_floor) and ceilings
-                # (saturation_drain) that the PID is designed to replace.
-                new_fee_ppm = max(_hard_floor_ppm, min(_hard_ceiling_ppm, new_fee_ppm))
+            # Align downstream vars to hard constraints
+            effective_ceiling = _hard_ceiling_ppm
+            floor_ppm = _hard_floor_ppm
+            base_new_fee = new_fee_ppm
 
-                decision_reason = (
-                    f"dts_pid (dts={thompson_fee}, pid={pid_multiplier:.2f}, "
-                    f"flow={flow_state_str})"
-                )
-
-                # Update volume tracking
-                ts_state.last_volume_sats = volume_since_sats
-
-                # Align downstream vars to hard constraints
-                effective_ceiling = _hard_ceiling_ppm
-                floor_ppm = _hard_floor_ppm
-                base_new_fee = new_fee_ppm
-
-                # PID handles balance management; no cold-start needed
-                is_cold_start = False
-
-                # Mark target found
-                target_found = True
-            else:
-                # =============================================================
-                # LEGACY PATH: AIMD + scarcity + cold-start (unchanged)
-                # =============================================================
-
-                # =====================================================================
-                # WEIGHTED AIMD SUCCESS METRIC + AIMD-THOMPSON COORDINATION
-                # =====================================================================
-                # Compute continuous success score (not binary) and detect if Thompson
-                # is exploring so AIMD doesn't penalize exploratory fee experiments.
-                forward_rate = forward_count / max(hours_elapsed, 0.1)
-                # AIMD success score normalized against Kalman expected demand.
-                # The 10x multiplier is deliberate normalization (I-11): expected_demand is in
-                # forwards/hour from Kalman, but forward_rate spans the observation window.
-                # Dividing by 10x expected_demand normalizes score to ~[0,1] for typical windows.
-                success_score = forward_rate / max(expected_demand * 10.0, 0.1)
-                is_exploring = abs(thompson_fee - ts_state.thompson.posterior_mean) > ts_state.thompson.posterior_std * 0.5
-
-                # Topology depletion: suppress AIMD failure when downstream is depleted
-                # Uses a separate flag to avoid conflating exploration with depletion
-                topology_suppressed = False
-                if not is_exploring and success_score < 0.3:
-                    capacity = channel_info.get("capacity", 1)
-                    try:
-                        if self._is_topology_depleted(channel_id, capacity, cfg):
-                            topology_suppressed = True
-                    except Exception as e:
-                        self.plugin.log(f"Topology depletion check failed: {e}", level='debug')
-
-                ts_state.aimd.record_outcome(
-                    success_score=success_score,
-                    is_exploring=is_exploring or topology_suppressed
-                )
-
-                # =====================================================================
-                # P2 PROFITABILITY-WEIGHTED THOMPSON SAMPLING
-                # =====================================================================
-                # Adjust Thompson fee based on channel profitability:
-                # - Profitable channels: Allow more aggressive exploration (wider range)
-                # - Underperforming channels: Constrain to proven ranges
-                # - Zombie/Fire Sale: Force low fees regardless of Thompson
-                if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                    profitability_adjustment = 0
-                    if self.profitability:
-                        try:
-                            from .profitability_analyzer import ProfitabilityClass
-                            prof_data = self.profitability.get_profitability(channel_id)
-                            if prof_data:
-                                # Calculate profitability weight
-                                if prof_data.classification == ProfitabilityClass.PROFITABLE:
-                                    # Highly profitable - allow upward exploration
-                                    if prof_data.roi_percent > 20:
-                                        # Very profitable - bias toward higher fees
-                                        profitability_adjustment = int(thompson_fee * 0.1)  # +10%
-                                        self.plugin.log(
-                                            f"P2_PROFIT: {channel_id[:12]}... profitable channel "
-                                            f"(ROI={prof_data.roi_percent:.1f}%), biasing up +{profitability_adjustment}ppm",
-                                            level='debug'
-                                        )
-                                elif prof_data.classification == ProfitabilityClass.MARGINAL:
-                                    # Marginal - stay conservative with Thompson
-                                    pass  # No adjustment
-                                elif prof_data.classification == ProfitabilityClass.UNDERWATER:
-                                    # Underwater - bias toward lower fees to increase flow
-                                    if prof_data.roi_percent < -20:
-                                        profitability_adjustment = -int(thompson_fee * 0.15)  # -15%
-                                        self.plugin.log(
-                                            f"P2_PROFIT: {channel_id[:12]}... underwater channel "
-                                            f"(ROI={prof_data.roi_percent:.1f}%), biasing down {abs(profitability_adjustment)}ppm",
-                                            level='debug'
-                                        )
-                                elif prof_data.classification == ProfitabilityClass.ZOMBIE:
-                                    # Zombie - aggressive low pricing
-                                    profitability_adjustment = floor_ppm - thompson_fee  # Force to floor
-                                    self.plugin.log(
-                                        f"P2_PROFIT: {channel_id[:12]}... zombie channel, "
-                                        f"forcing to floor ({floor_ppm}ppm)",
-                                        level='info'
-                                    )
-
-                                # Apply profitability adjustment
-                                thompson_fee = max(floor_ppm, min(ceiling_ppm, thompson_fee + profitability_adjustment))
-                        except Exception as e:
-                            self.plugin.log(
-                                f"P2_PROFIT: Failed to get profitability adjustment: {e}",
-                                level='debug'
-                            )
-
-                # =====================================================================
-                # AIMD DEFENSE LAYER
-                # =====================================================================
-                # Apply AIMD modifier when in defense mode (after failure streak)
-                new_fee_ppm = ts_state.aimd.apply_to_fee(thompson_fee, floor_ppm, ceiling_ppm)
-
-                # Build decision reason
-                effective_mod = ts_state.aimd.get_effective_modifier()
-                if ts_state.aimd.is_active:
-                    decision_reason = f"thompson_aimd_defense (mod={effective_mod:.2f})"
-                else:
-                    decision_reason = f"thompson_sample (ctx={context_key})"
-
-                # Cold-start mode: channels with very few forwards need lower fees
-                if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                    is_cold_start = False
-                    total_forwards = state.get("forward_count", 0) if state else 0
-                    if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
-                        if current_fee_ppm > cfg.min_fee_ppm:
-                            is_cold_start = True
-                            # Bias Thompson toward lower fees for cold channels
-                            cold_target = min(new_fee_ppm, floor_ppm + 50)
-                            new_fee_ppm = cold_target
-                            decision_reason = f"thompson_cold_start (fwds={total_forwards})"
-                            self.plugin.log(
-                                f"THOMPSON COLD-START: {channel_id[:12]}... has {total_forwards} forwards. "
-                                f"Biasing toward floor ({new_fee_ppm} ppm).",
-                                level='info'
-                            )
-
-                # Update volume tracking
-                ts_state.last_volume_sats = volume_since_sats
-
-                # Phase 7: Scarcity Pricing (preserved)
-                opener = channel_info.get("opener", "local")
-                total_sats_out = state.get("sats_out", 0) if state else 0
-                is_virgin_remote = (opener == "remote" and total_sats_out == 0)
-
-                if cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
-                    if is_cold_start:
-                        # Cold-start channels need low fees to attract traffic.
-                        # Scarcity pricing would push fees up, contradicting cold-start intent.
-                        self.plugin.log(
-                            f"SCARCITY_SKIP: {channel_id[:12]}... suppressing scarcity (cold-start active).",
-                            level='info'
-                        )
-                    elif is_virgin_remote:
-                        self.plugin.log(
-                            f"VIRGIN CHANNEL AMNESTY: {channel_id[:12]}... suppressing scarcity.",
-                            level='info'
-                        )
-                    elif not self.ENABLE_BOUNDS_MULTIPLIERS:
-                        # Only apply direct scarcity if floor multiplier wasn't already used
-                        scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
-                        original_fee = new_fee_ppm
-                        new_fee_ppm = int(new_fee_ppm * scarcity_mult)
-                        self.plugin.log(
-                            f"SCARCITY: {channel_id[:12]}... {original_fee}->{new_fee_ppm} ppm "
-                            f"({scarcity_mult:.2f}x)",
-                            level='info'
-                        )
-
-                # Apply cold-start ceiling cap
-                effective_ceiling = ceiling_ppm
-                if is_cold_start:
-                    cold_start_ceiling = max(self.COLD_START_MAX_FEE_PPM, floor_ppm + 50)
-                    effective_ceiling = min(ceiling_ppm, cold_start_ceiling)
-
-                # Clamp to bounds
-                new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
-                base_new_fee = new_fee_ppm  # For logging compatibility
-
-                # =====================================================================
-                # DTS+PID SHADOW MODE: Log what DTS+PID would have set
-                # =====================================================================
-                # Uses the PERSISTED ts_state.pid so EWMA and integral errors
-                # accumulate correctly across cycles (not an ephemeral PIDState).
-                # Clamps to hard safety constraints, bypassing legacy heuristic
-                # floors/ceilings that the PID is designed to replace.
-                try:
-                    try:
-                        sh_ch_state = self.database.get_channel_state(channel_id)
-                        sh_flow = (sh_ch_state or {}).get("state", "balanced")
-                    except Exception:
-                        sh_flow = "balanced"
-
-                    shadow_pid_mult = ts_state.pid.calculate_multiplier(
-                        current_outbound_ratio=outbound_ratio,
-                        capacity_sats=channel_info.get("capacity", 2_000_000),
-                        flow_state=sh_flow,
-                    )
-                    shadow_fee = int(thompson_fee * shadow_pid_mult)
-                    shadow_fee = max(_hard_floor_ppm, min(_hard_ceiling_ppm, shadow_fee))
-
-                    self.plugin.log(
-                        f"DTS_PID_SHADOW: {channel_id[:12]}... "
-                        f"actual={new_fee_ppm} shadow={shadow_fee} "
-                        f"(dts={thompson_fee}, pid={shadow_pid_mult:.2f}, "
-                        f"flow={sh_flow}, outbound={outbound_ratio:.2f})",
-                        level='info'
-                    )
-                except Exception as e:
-                    self.plugin.log(
-                        f"DTS_PID_SHADOW: {channel_id[:12]}... error: {e}",
-                        level='debug'
-                    )
-
-            # Fee anchor blend (advisor soft target)
-            if not self.ENABLE_SIMPLIFIED_FEE_PATH:
-                new_fee_ppm, anchor_reason = self._apply_fee_anchor(
-                    channel_id, new_fee_ppm, floor_ppm, effective_ceiling
-                )
-                if anchor_reason:
-                    decision_reason = f"{decision_reason}+{anchor_reason}"
+            # Mark target found
+            target_found = True
 
             # =====================================================================
             # Thompson+AIMD State Saving and Result Preparation
@@ -5772,347 +3256,6 @@ class HillClimbingFeeController:
             # Store decision_reason for use in logging
             elasticity_info = f"thompson_posterior_mean={ts_state.thompson.posterior_mean:.0f}"
 
-        # =====================================================================
-        # FALLBACK: Hill Climbing (Legacy Algorithm)
-        # =====================================================================
-        # Used when ENABLE_THOMPSON_AIMD is False
-        # Gated behind ENABLE_SIMPLIFIED_FEE_PATH — doubly unreachable when both flags are True
-        elif not target_found and not self.ENABLE_SIMPLIFIED_FEE_PATH:
-            # HILL CLIMBING DECISION (Rate-Based)
-            rate_change = current_revenue_rate - hc_state.last_revenue_rate
-            last_direction = hc_state.trend_direction
-            previous_rate = hc_state.last_revenue_rate
-
-            step_ppm = hc_state.step_ppm
-            if step_ppm <= 0:
-                step_ppm = self.STEP_PPM
-
-            # =====================================================================
-            # IMPROVEMENT #3: Historical Response Curve
-            # =====================================================================
-            # Record observation and check for regime change
-            # =====================================================================
-            historical_curve = hc_state.get_historical_curve()
-            elasticity_tracker = hc_state.get_elasticity_tracker()
-            thompson_state = hc_state.get_thompson_state()
-
-            if self.ENABLE_HISTORICAL_CURVE:
-                # Record this observation
-                historical_curve.add_observation(
-                    fee_ppm=current_fee_ppm,
-                    revenue_rate=current_revenue_rate,
-                    forward_count=forward_count
-                )
-
-                # Check for regime change (market conditions shifted dramatically)
-                if now - historical_curve.last_regime_check > self.REGIME_CHECK_INTERVAL:
-                    historical_curve.last_regime_check = now
-                    if historical_curve.detect_regime_change(current_revenue_rate):
-                        self.plugin.log(
-                            f"REGIME CHANGE: {channel_id[:12]}... detected regime shift "
-                            f"(count={historical_curve.regime_change_count}). Resetting curve.",
-                            level='info'
-                        )
-                        historical_curve.reset_curve()
-                        # Also reset Thompson beliefs on regime change
-                        thompson_state = ThompsonSamplingState()
-
-                hc_state.set_historical_curve(historical_curve)
-
-            # =====================================================================
-            # IMPROVEMENT #4: Elasticity Tracking
-            # =====================================================================
-            # Track demand elasticity to understand price sensitivity
-            # =====================================================================
-            elasticity_direction = 0
-            elasticity_info = ""
-            if self.ENABLE_ELASTICITY:
-                elasticity_tracker.add_observation(
-                    fee_ppm=current_fee_ppm,
-                    volume_sats=volume_since_sats,
-                    revenue_rate=current_revenue_rate
-                )
-                elasticity_direction = elasticity_tracker.get_optimal_direction()
-                elasticity_info = (
-                    f"elasticity={elasticity_tracker.current_elasticity:.2f} "
-                    f"(conf={elasticity_tracker.confidence:.0%}, "
-                    f"hint={elasticity_tracker.get_fee_adjustment_hint()})"
-                )
-                hc_state.set_elasticity_tracker(elasticity_tracker)
-
-            # =====================================================================
-            # IMPROVEMENT #5: Thompson Sampling
-            # =====================================================================
-            # Explore fee space to find global optimum
-            # =====================================================================
-            thompson_multiplier = 1.0
-            thompson_info = ""
-            if self.ENABLE_THOMPSON_SAMPLING:
-                # Update beliefs based on outcome of current arm
-                thompson_state.update_beliefs(
-                    arm=thompson_state.current_arm,
-                    revenue_rate=current_revenue_rate,
-                    baseline_rate=hc_state.last_revenue_rate
-                )
-
-                # Sample next arm (exploration vs exploitation)
-                if random.random() < self.THOMPSON_WEIGHT:
-                    next_arm = thompson_state.sample_arm()
-                    thompson_multiplier = thompson_state.get_fee_multiplier(next_arm)
-                    thompson_state.start_exploration(next_arm)
-                    thompson_info = f"thompson_arm={next_arm} (mult={thompson_multiplier:.2f})"
-                else:
-                    # Exploitation: use best known arm (multiplier stays 1.0 = arm 2)
-                    best_arm = thompson_state.get_best_arm()
-                    # Set current_arm to base-fee arm (2) so next cycle's
-                    # update_beliefs attributes the outcome correctly
-                    thompson_state.current_arm = 2
-                    thompson_state.arm_start_time = int(time.time())
-                    thompson_info = f"thompson_exploit (best_arm={best_arm})"
-
-                hc_state.set_thompson_state(thompson_state)
-
-            # VOLATILITY RESET & DEADBAND HYSTERESIS
-            volatility_reset = False
-            rate_change_ratio = 0.0
-            if hc_state.last_update > 0 and hc_state.last_revenue_rate > 0:
-                delta_rate = abs(current_revenue_rate - hc_state.last_revenue_rate)
-                rate_change_ratio = delta_rate / max(1.0, hc_state.last_revenue_rate)
-
-                if rate_change_ratio > self.VOLATILITY_THRESHOLD:
-                    step_ppm = self.STEP_PPM
-                    volatility_reset = True
-                    hc_state.stable_cycles = 0
-
-            # DEADBAND HYSTERESIS: Enter Sleep Mode Check
-            if hc_state.last_update > 0 and rate_change_ratio < self.STABILITY_THRESHOLD:
-                hc_state.stable_cycles += 1
-                if hc_state.stable_cycles >= self.STABLE_CYCLES_REQUIRED:
-                    sleep_duration_seconds = cfg.fee_interval * self.SLEEP_CYCLES
-                    hc_state.is_sleeping = True
-                    hc_state.sleep_until = now + sleep_duration_seconds
-                    hc_state.last_revenue_rate = current_revenue_rate
-                    hc_state.last_fee_ppm = current_fee_ppm
-                    hc_state.last_volume_sats = volume_since_sats
-                    hc_state.last_update = now
-                    self._save_hill_climb_state(channel_id, hc_state)
-                    self.plugin.log(f"HYSTERESIS: Market Calm - Channel {channel_id[:12]}... entering sleep mode.", level='info')
-                    return None
-            else:
-                if rate_change_ratio >= self.STABILITY_THRESHOLD:
-                    hc_state.stable_cycles = 0
-
-            # Direction Decision (enhanced with elasticity input)
-            if hc_state.last_update == 0:
-                new_direction = 1
-                decision_reason = "initial"
-            elif rate_change > 0:
-                new_direction = last_direction
-                decision_reason = "rate_up"
-                hc_state.consecutive_same_direction += 1
-                if rate_change_ratio > 0.20:
-                    step_ppm = min(int(step_ppm * 2), self.MAX_STEP_PPM)
-            elif rate_change < 0:
-                new_direction = -last_direction
-                decision_reason = "rate_down"
-                hc_state.consecutive_same_direction = 0
-                step_ppm = max(self.MIN_STEP_PPM, int(step_ppm * self.DAMPENING_FACTOR))
-            else:
-                new_direction = -last_direction
-                decision_reason = "rate_flat"
-                hc_state.consecutive_same_direction = 0
-                step_ppm = max(self.MIN_STEP_PPM, int(step_ppm * self.DAMPENING_FACTOR))
-
-            # ELASTICITY INFLUENCE: Blend elasticity signal with Hill Climbing
-            # If elasticity has high confidence and disagrees with Hill Climbing,
-            # we weight the elasticity suggestion
-            if self.ENABLE_ELASTICITY and elasticity_tracker.confidence > 0.5:
-                if elasticity_direction != 0 and elasticity_direction != new_direction:
-                    # Elasticity disagrees - blend based on weight
-                    if random.random() < self.ELASTICITY_WEIGHT:
-                        new_direction = elasticity_direction
-                        decision_reason = f"{decision_reason}+elasticity_override"
-                        self.plugin.log(
-                            f"ELASTICITY OVERRIDE: {channel_id[:12]}... using elasticity "
-                            f"direction={new_direction} ({elasticity_info})",
-                            level='info'
-                        )
-
-            # COLD-START MODE: Override direction for stagnant channels
-            # Channels with very few forwards need LOWER fees to attract traffic,
-            # not higher fees (which standard Hill Climbing would apply on flat revenue).
-            is_cold_start = False
-            total_forwards = state.get("forward_count", 0) if state else 0
-            if self.ENABLE_COLD_START and total_forwards < self.COLD_START_FORWARD_THRESHOLD:
-                # Only apply if we're not already at minimum fees
-                if current_fee_ppm > cfg.min_fee_ppm:
-                    is_cold_start = True
-                    new_direction = -1  # Always decrease fees
-                    step_ppm = self.COLD_START_STEP_PPM  # Use larger step for discovery
-                    decision_reason = f"cold_start (fwds={total_forwards})"
-                    self.plugin.log(
-                        f"COLD-START MODE: {channel_id[:12]}... has only {total_forwards} forwards. "
-                        f"Forcing fee DOWN with {step_ppm}ppm step for price discovery.",
-                        level='info'
-                    )
-
-            # Apply step constraints
-            step_percent = max(current_fee_ppm * self.STEP_PERCENT, self.MIN_STEP_PPM)
-            step_ppm = max(step_ppm, int(step_percent))
-            step_ppm = min(step_ppm, self.MAX_STEP_PPM)
-            if hc_state.consecutive_same_direction > self.MAX_CONSECUTIVE:
-                step_ppm = max(self.MIN_STEP_PPM, step_ppm // 2)
-
-            # =================================================================
-            # HEURISTIC TUNING: Channel-aware step size modifiers
-            # =================================================================
-            # These heuristics reduce fee volatility and prevent over-optimization
-            # in channels where the signal-to-noise ratio is poor.
-            # Track modifiers for explainability.
-            # =================================================================
-            heuristic_modifiers = HeuristicModifiers()
-            original_step_ppm = step_ppm  # For logging
-
-            # Heuristic A: Young Channel Cap (<30 days)
-            # Young channels have insufficient data for confident fee optimization.
-            # Cap step size to prevent wild swings during establishment period.
-            YOUNG_CHANNEL_AGE_DAYS = 30
-            YOUNG_CHANNEL_MAX_STEP = 25
-
-            channel_age_days = self._get_channel_age_days(channel_id, channel_info)
-            if channel_age_days < YOUNG_CHANNEL_AGE_DAYS:
-                if step_ppm > YOUNG_CHANNEL_MAX_STEP:
-                    heuristic_modifiers.young_channel = {
-                        "age_days": channel_age_days,
-                        "original_step": step_ppm,
-                        "capped_step": YOUNG_CHANNEL_MAX_STEP
-                    }
-                    step_ppm = YOUNG_CHANNEL_MAX_STEP
-                    self.plugin.log(
-                        f"HEURISTIC: Young channel {channel_id[:12]}... (age={channel_age_days}d) "
-                        f"step capped {original_step_ppm}ppm -> {step_ppm}ppm",
-                        level='debug'
-                    )
-
-            # Heuristic B: High Volatility Reduction
-            # If fee has been changing direction frequently, reduce step size.
-            # High volatility = unstable market signal, be conservative.
-            HIGH_VOLATILITY_THRESHOLD = 0.5  # stddev/mean ratio
-            VOLATILITY_STEP_REDUCTION = 0.5
-
-            fee_volatility = self._get_fee_volatility(channel_id)
-            if fee_volatility > HIGH_VOLATILITY_THRESHOLD:
-                reduced_step = int(step_ppm * VOLATILITY_STEP_REDUCTION)
-                reduced_step = max(self.MIN_STEP_PPM, reduced_step)
-                if reduced_step < step_ppm:
-                    heuristic_modifiers.high_volatility = {
-                        "volatility": round(fee_volatility, 3),
-                        "reduction_factor": VOLATILITY_STEP_REDUCTION
-                    }
-                    step_ppm = reduced_step
-                    self.plugin.log(
-                        f"HEURISTIC: High volatility {channel_id[:12]}... (vol={fee_volatility:.2f}) "
-                        f"step reduced to {step_ppm}ppm",
-                        level='debug'
-                    )
-
-            # Heuristic C: High Failure Rate Conservative
-            # Channels with high routing failure rates may have unreliable fee signals.
-            # Be conservative to avoid thrashing.
-            HIGH_FAILURE_RATE_THRESHOLD = 0.3
-            FAILURE_CONSERVATIVE_BIAS = 0.8
-
-            failure_rate = self._get_channel_failure_rate(channel_id)
-            if failure_rate > HIGH_FAILURE_RATE_THRESHOLD:
-                reduced_step = int(step_ppm * FAILURE_CONSERVATIVE_BIAS)
-                reduced_step = max(self.MIN_STEP_PPM, reduced_step)
-                if reduced_step < step_ppm:
-                    heuristic_modifiers.high_failure = {
-                        "failure_rate": round(failure_rate, 3),
-                        "reduction_factor": FAILURE_CONSERVATIVE_BIAS
-                    }
-                    step_ppm = reduced_step
-                    self.plugin.log(
-                        f"HEURISTIC: High failure rate {channel_id[:12]}... (fail={failure_rate:.2f}) "
-                        f"step reduced to {step_ppm}ppm",
-                        level='debug'
-                    )
-
-            # Calculate base new fee (Hill Climbing step)
-            base_new_fee = current_fee_ppm + (new_direction * step_ppm)
-
-            # Apply Thompson Sampling exploration multiplier (bounded ±20%)
-            if self.ENABLE_THOMPSON_SAMPLING and thompson_multiplier != 1.0:
-                base_new_fee = int(base_new_fee * thompson_multiplier)
-
-            # IMPROVEMENT #1: With BOUNDS_MULTIPLIERS, don't stack multipliers on fee
-            # The multipliers are already applied to floor/ceiling
-            if self.ENABLE_BOUNDS_MULTIPLIERS:
-                new_fee_ppm = base_new_fee  # No multiplier stacking
-            else:
-                # Legacy behavior: apply multipliers to fee
-                new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
-
-            # Update state with volume for elasticity tracking
-            hc_state.last_volume_sats = volume_since_sats
-
-            # Phase 7: Scarcity Pricing - premium for low local balance
-            # Phase 7.1: Virgin Channel Amnesty - bypass for remote-opened channels with no traffic
-            # Note: cfg already passed as parameter - don't create a new snapshot here
-            opener = channel_info.get("opener", "local")
-            total_sats_out = state.get("sats_out", 0) if state else 0
-            is_virgin_remote = (opener == "remote" and total_sats_out == 0)
-            
-            if cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
-                if is_cold_start:
-                    # Cold-start channels need low fees to attract traffic.
-                    # Scarcity pricing would push fees up, contradicting cold-start intent.
-                    self.plugin.log(
-                        f"SCARCITY_SKIP: {channel_id[:12]}... suppressing scarcity (cold-start active).",
-                        level='info'
-                    )
-                elif is_virgin_remote:
-                    # Virgin Remote Channel: Suppress scarcity pricing to encourage break-in traffic
-                    self.plugin.log(
-                        f"VIRGIN CHANNEL AMNESTY: {channel_id[:12]}... is remote-opened with 0 outbound traffic. "
-                        f"Suppressing Scarcity Pricing to encourage break-in.",
-                        level='info'
-                    )
-                elif not self.ENABLE_BOUNDS_MULTIPLIERS:
-                    # Only apply direct scarcity if floor multiplier wasn't already used
-                    scarcity_mult = calculate_scarcity_multiplier(outbound_ratio, cfg.scarcity_threshold)
-                    original_fee = new_fee_ppm
-                    new_fee_ppm = int(new_fee_ppm * scarcity_mult)
-                    self.plugin.log(
-                        f"SCARCITY PRICING: {channel_id[:12]}... balance={outbound_ratio:.1%} "
-                        f"(below {cfg.scarcity_threshold:.0%}). Applied {scarcity_mult:.2f}x "
-                        f"({original_fee} -> {new_fee_ppm} PPM)",
-                        level='info'
-                    )
-
-            # Apply cold-start ceiling cap for stagnant channels
-            # BUT: Cold-start ceiling must respect balance floor for depleted channels
-            # This prevents extremely low fees on channels with scarce liquidity
-            effective_ceiling = ceiling_ppm
-            if is_cold_start:
-                # Cold start ceiling, but never below the balance/scarcity floor
-                cold_start_ceiling = max(self.COLD_START_MAX_FEE_PPM, floor_ppm + 50)
-                effective_ceiling = min(ceiling_ppm, cold_start_ceiling)
-                if effective_ceiling < ceiling_ppm:
-                    self.plugin.log(
-                        f"COLD-START CEILING: {channel_id[:12]}... capping fee at {effective_ceiling} ppm "
-                        f"(normal ceiling: {ceiling_ppm} ppm, floor: {floor_ppm} ppm) for price discovery.",
-                        level='info'
-                    )
-
-            new_fee_ppm = max(floor_ppm, min(effective_ceiling, new_fee_ppm))
-
-            # Fee anchor blend (advisor soft target)
-            new_fee_ppm, anchor_reason = self._apply_fee_anchor(
-                channel_id, new_fee_ppm, floor_ppm, effective_ceiling
-            )
-            if anchor_reason:
-                decision_reason = f"{decision_reason}+{anchor_reason}"
 
         # =====================================================================
         # DYNAMIC HTLC POLICY TARGETS
@@ -6137,13 +3280,8 @@ class HillClimbingFeeController:
                     level='debug'
                 )
 
-        htlcmin_msat = self._calculate_dynamic_htlcmin_msat(
-            state=state,
-            channel_info=channel_info,
-            cfg=cfg,
-            vegas_multiplier=vegas_multiplier,
-            htlcmax_msat=htlcmax_msat,
-        )
+        # Dynamic HTLC min removed in Phase 2 (was _calculate_dynamic_htlcmin_msat)
+        htlcmin_msat = None
         current_htlcmin_msat = parse_msat(
             channel_info.get("htlc_minimum_msat", channel_info.get("htlc_min_msat", 0))
         )
@@ -6171,7 +3309,7 @@ class HillClimbingFeeController:
             hc_state.last_update = now
             self._save_hill_climb_state(channel_id, hc_state)
 
-            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+            if channel_id in self._thompson_aimd_states:
                 try:
                     ts_state = self._thompson_aimd_states[channel_id]
                     ts_state.last_revenue_rate = current_revenue_rate
@@ -6240,7 +3378,7 @@ class HillClimbingFeeController:
             # was already updated with the current observation window's data (at the
             # update_posterior call above). If we don't reset the timer, the next cycle
             # would re-use the same accumulated volume/revenue, double-counting observations.
-            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+            if channel_id in self._thompson_aimd_states:
                 try:
                     ts_state = self._thompson_aimd_states[channel_id]
                     ts_state.last_fee_ppm = new_fee_ppm
@@ -6266,35 +3404,21 @@ class HillClimbingFeeController:
         # Issue #28: Log both raw and EMA-smoothed rates for debugging
         ema_note = f" (raw={raw_revenue_rate:.2f})" if raw_revenue_rate != current_revenue_rate else ""
 
-        # Choose algorithm name based on which was used
-        if self.ENABLE_THOMPSON_AIMD and "thompson" in decision_reason:
-            # Thompson+AIMD was used
-            algorithm_name = "Thompson+AIMD"
-            # Include Thompson-specific info
-            ts_state_local = self._thompson_aimd_states.get(channel_id)
-            if ts_state_local:
-                thompson_info = (
-                    f"posterior_mean={ts_state_local.thompson.posterior_mean:.0f}, "
-                    f"posterior_std={ts_state_local.thompson.posterior_std:.0f}, "
-                    f"aimd_active={ts_state_local.aimd.is_active}"
-                )
-            else:
-                thompson_info = "state_unavailable"
-            reason = (
-                f"{algorithm_name}: rate={current_revenue_rate:.2f}sats/hr{ema_note} ({decision_reason}){volatility_note}, "
-                f"{thompson_info}, applied={applied_dir}({applied_delta:+d}ppm), "
-                f"state={flow_state}, liquidity={bucket} ({outbound_ratio:.0%}), "
-                f"{marginal_roi_info}"
+        # Build reason string for DTS+PID
+        ts_state_local = self._thompson_aimd_states.get(channel_id)
+        if ts_state_local:
+            thompson_info = (
+                f"posterior_mean={ts_state_local.thompson.posterior_mean:.0f}, "
+                f"posterior_std={ts_state_local.thompson.posterior_std:.0f}"
             )
         else:
-            # Hill Climbing (legacy) was used
-            reason = (
-                f"HillClimb: rate={current_revenue_rate:.2f}sats/hr{ema_note} ({decision_reason}){volatility_note}, "
-                f"hill_dir={hill_dir}, applied={applied_dir}({applied_delta:+d}ppm), "
-                f"step={step_ppm}ppm{base_fee_note}{mult_note}, state={flow_state}, "
-                f"liquidity={bucket} ({outbound_ratio:.0%}), "
-                f"{marginal_roi_info}"
-            )
+            thompson_info = "state_unavailable"
+        reason = (
+            f"DTS+PID: rate={current_revenue_rate:.2f}sats/hr{ema_note} ({decision_reason}){volatility_note}, "
+            f"{thompson_info}, applied={applied_dir}({applied_delta:+d}ppm), "
+            f"state={flow_state}, liquidity={bucket} ({outbound_ratio:.0%}), "
+            f"{marginal_roi_info}"
+        )
         
         # IDEMPOTENCY GUARD: Skip RPC if target is physically set (Phase 5.5)
         if new_fee_ppm == raw_chain_fee and not htlcmin_policy_change:
@@ -6308,7 +3432,7 @@ class HillClimbingFeeController:
             self._save_hill_climb_state(channel_id, hc_state)
 
             # Save Thompson+AIMD state if that algorithm was used
-            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+            if channel_id in self._thompson_aimd_states:
                 ts_state = self._thompson_aimd_states[channel_id]
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = raw_chain_fee
@@ -6329,14 +3453,8 @@ class HillClimbingFeeController:
             fee_reason_code = FeeReasonCode.ZERO_FEE_PROBE.value
         elif decision_reason == "ZERO_FEE_PROBE_SUCCESS":
             fee_reason_code = FeeReasonCode.ZERO_FEE_PROBE_SUCCESS.value
-        elif is_cold_start:
-            fee_reason_code = FeeReasonCode.THOMPSON_COLD_START.value
-        elif "aimd" in decision_reason.lower():
-            fee_reason_code = FeeReasonCode.THOMPSON_AIMD_DEFENSE.value
         elif is_congested:
             fee_reason_code = FeeReasonCode.CONGESTION.value
-        elif cfg.enable_scarcity_pricing and outbound_ratio < cfg.scarcity_threshold:
-            fee_reason_code = FeeReasonCode.SCARCITY.value
         else:
             fee_reason_code = FeeReasonCode.THOMPSON_SAMPLE.value
 
@@ -6344,7 +3462,6 @@ class HillClimbingFeeController:
         result = self.set_channel_fee(
             channel_id, new_fee_ppm, reason=reason,
             reason_code=fee_reason_code,
-            heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None,
             enforce_limits=(fee_reason_code != FeeReasonCode.ZERO_FEE_PROBE.value),
             channel_info=channel_info,
             htlcmin_msat=htlcmin_msat,
@@ -6363,7 +3480,7 @@ class HillClimbingFeeController:
             self._save_hill_climb_state(channel_id, hc_state)
 
             # Save Thompson+AIMD state if that algorithm was used
-            if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+            if channel_id in self._thompson_aimd_states:
                 ts_state = self._thompson_aimd_states[channel_id]
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = current_fee_ppm
@@ -6372,15 +3489,9 @@ class HillClimbingFeeController:
                 ts_state.last_update = now
                 self._save_thompson_aimd_state(channel_id, ts_state)
 
-            # Build structured log line (fee_reason_code already computed above)
-            modifiers_summary = ""
-            if heuristic_modifiers.has_modifiers():
-                modifier_codes = [m.value for m in heuristic_modifiers.get_modifier_codes()]
-                modifiers_summary = f"+{'+'.join(modifier_codes)}"
-
             self.plugin.log(
                 f"FEE: {channel_id[:12]}... {current_fee_ppm}->{new_fee_ppm}ppm "
-                f"[{fee_reason_code}{modifiers_summary}] "
+                f"[{fee_reason_code}] "
                 f"step:{original_step_ppm}->{step_ppm} | {decision_reason}",
                 level='info'
             )
@@ -6401,15 +3512,8 @@ class HillClimbingFeeController:
                     "step_ppm": step_ppm,
                     "consecutive_same_direction": hc_state.consecutive_same_direction,
                     "volatility_reset": volatility_reset,
-                    "size_bucket_weights": {
-                        label: {"share": round(b.revenue_share, 3), "mu": round(b.mu, 1),
-                                "n_obs": b.n_obs, "graduated": b.graduated}
-                        for label, b in self._thompson_aimd_states[channel_id].size_buckets.buckets.items()
-                        if b.n_obs > 0
-                    } if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states else {},
                 },
                 reason_code=fee_reason_code,
-                heuristic_modifiers=heuristic_modifiers if heuristic_modifiers.has_modifiers() else None
             )
 
         # RPC failed: fee was NOT changed on-chain, but Thompson posteriors and
@@ -6420,7 +3524,7 @@ class HillClimbingFeeController:
         hc_state.last_update = now
         self._save_hill_climb_state(channel_id, hc_state)
 
-        if self.ENABLE_THOMPSON_AIMD and channel_id in self._thompson_aimd_states:
+        if channel_id in self._thompson_aimd_states:
             try:
                 ts_state = self._thompson_aimd_states[channel_id]
                 ts_state.last_revenue_rate = current_revenue_rate
@@ -6435,361 +3539,13 @@ class HillClimbingFeeController:
 
         return None
 
-    def _get_dynamic_policy_fee_autoband_ppm(self, peer_id: str) -> Tuple[Optional[int], Optional[int]]:
-        """Return (min_ppm, max_ppm) autoband for a DYNAMIC peer policy, if configured."""
-        if not self.policy_manager:
-            return (None, None)
-
-        try:
-            policy = self.policy_manager.get_policy(peer_id)
-        except Exception:
-            return (None, None)
-
-        if policy.strategy != FeeStrategy.DYNAMIC or policy.fee_ppm_target is None:
-            return (None, None)
-
-        if policy.fee_multiplier_min is None and policy.fee_multiplier_max is None:
-            return (None, None)
-
-        # Enforce global multiplier safety bounds while preserving explicit-only endpoints.
-        eff_min_mult, eff_max_mult = policy.get_fee_multiplier_bounds()
-        band_min_ppm = None
-        band_max_ppm = None
-
-        if policy.fee_multiplier_min is not None:
-            band_min_ppm = max(1, int(round(policy.fee_ppm_target * eff_min_mult)))
-        if policy.fee_multiplier_max is not None:
-            band_max_ppm = max(1, int(round(policy.fee_ppm_target * eff_max_mult)))
-
-        if band_min_ppm is not None and band_max_ppm is not None and band_min_ppm > band_max_ppm:
-            band_min_ppm, band_max_ppm = band_max_ppm, band_min_ppm
-
-        return (band_min_ppm, band_max_ppm)
-
     def _handle_policy_change(self, peer_id: str, policy: PeerPolicy) -> None:
-        """Invalidate stale auto-band state when policy changes supersede learning."""
-        if not peer_id or policy is None:
-            return
+        """Handle policy changes (placeholder for future use)."""
+        pass
 
-        invalidate_auto_band = (
-            policy.strategy != FeeStrategy.DYNAMIC
-            or policy.fee_multiplier_min is not None
-            or policy.fee_multiplier_max is not None
-        )
-        if not invalidate_auto_band:
-            return
-
-        try:
-            result = self.plugin.rpc.listpeerchannels(peer_id)
-        except Exception as e:
-            self.plugin.log(
-                f"POLICY_CHANGE: Failed to list channels for {peer_id[:12]}...: {e}",
-                level='debug'
-            )
-            return
-
-        cleared = 0
-        seen_channel_ids = set()
-        for channel in result.get("channels", []):
-            for channel_key in ("short_channel_id", "channel_id"):
-                channel_id = channel.get(channel_key)
-                if not channel_id:
-                    continue
-                normalized_channel_id = str(channel_id).replace(":", "x")
-                if normalized_channel_id in seen_channel_ids:
-                    continue
-                seen_channel_ids.add(normalized_channel_id)
-                if self._get_channel_auto_band(normalized_channel_id) is None:
-                    continue
-                self._clear_channel_auto_band(normalized_channel_id)
-                cleared += 1
-
-        if cleared:
-            self.plugin.log(
-                f"POLICY_CHANGE: Cleared {cleared} auto band(s) for {peer_id[:12]}...",
-                level='info'
-            )
-
-    def _get_channel_auto_band(self, channel_id: str) -> Optional[AutoFeeBandState]:
-        """Return persisted per-channel automatic autoband metadata, if any."""
-        if not channel_id:
-            return None
-        state = self._get_or_create_thompson_aimd_state_for_channel(channel_id)
-        return state.get_auto_band()
-
-    def _set_channel_auto_band(
-        self,
-        channel_id: str,
-        *,
-        min_ppm: int,
-        max_ppm: int,
-        optimal_fee_ppm: int,
-        posterior_std: float,
-        observation_count: int,
-        sigma: float,
-        min_width_ppm: int,
-        last_calibrated: Optional[int] = None,
-    ) -> AutoFeeBandState:
-        """Persist a per-channel automatic autoband in Thompson state."""
-        state = self._get_or_create_thompson_aimd_state_for_channel(channel_id)
-        auto_band = AutoFeeBandState(
-            min_ppm=int(min_ppm),
-            max_ppm=int(max_ppm),
-            optimal_fee_ppm=int(optimal_fee_ppm),
-            posterior_std=float(posterior_std),
-            observation_count=int(observation_count),
-            sigma=float(sigma),
-            min_width_ppm=int(min_width_ppm),
-            last_calibrated=int(last_calibrated or time.time()),
-        )
-        state.set_auto_band(auto_band)
-        self._save_thompson_aimd_state(channel_id, state)
-        return auto_band
-
-    def _clear_channel_auto_band(self, channel_id: str) -> None:
-        """Remove persisted per-channel automatic autoband metadata."""
-        if not channel_id:
-            return
-        state = self._get_or_create_thompson_aimd_state_for_channel(channel_id)
-        if state.get_auto_band() is None:
-            return
-        state.set_auto_band(None)
-        self._save_thompson_aimd_state(channel_id, state)
-
-    def _get_effective_dynamic_fee_autoband_ppm(
-        self,
-        channel_id: str,
-        peer_id: str,
-        cfg: Optional[Config] = None,
-    ) -> Tuple[Optional[int], Optional[int], str]:
-        """Resolve the active autoband with precedence auto > manual > none."""
-        cfg_obj = cfg
-        if cfg_obj is None:
-            cfg_obj = self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
-
-        if getattr(cfg_obj, "auto_band_enabled", False):
-            auto_band = self._get_channel_auto_band(channel_id)
-            if auto_band is not None:
-                return (auto_band.min_ppm, auto_band.max_ppm, auto_band.source)
-
-        band_min_ppm, band_max_ppm = self._get_dynamic_policy_fee_autoband_ppm(peer_id)
-        if band_min_ppm is not None or band_max_ppm is not None:
-            return (band_min_ppm, band_max_ppm, "manual")
-
-        return (None, None, "none")
-
-    def _auto_calibrate_channel_fee_band(
-        self,
-        channel_id: str,
-        peer_id: str,
-        ts_state: ThompsonAIMDState,
-        cfg: Config,
-    ) -> bool:
-        """Compute and persist an automatic autoband from posterior uncertainty."""
-        if not getattr(cfg, "auto_band_enabled", False):
-            return False
-
-        policy = None
-        if self.policy_manager:
-            try:
-                policy = self.policy_manager.get_policy(peer_id)
-            except Exception:
-                policy = None
-
-        if policy and policy.strategy != FeeStrategy.DYNAMIC:
-            return False
-
-        observation_count = len(getattr(ts_state.thompson, "observations", []))
-        min_observations = int(getattr(cfg, "auto_band_min_observations", 20))
-        if observation_count < min_observations:
-            return False
-
-        optimal_fee = ts_state.thompson.predict_optimal_fee(
-            int(getattr(cfg, "min_fee_ppm", 1)),
-            int(getattr(cfg, "max_fee_ppm", 5000)),
-        )
-        if optimal_fee is None:
-            return False
-
-        sigma = float(getattr(cfg, "auto_band_sigma", 2.0))
-        min_width_ppm = int(getattr(cfg, "auto_band_min_width_ppm", 50))
-        posterior_std = float(getattr(ts_state.thompson, "posterior_std", 0.0))
-        half_width = int(round(max(0.0, sigma * posterior_std)))
-
-        min_fee_ppm = int(getattr(cfg, "min_fee_ppm", 1))
-        max_fee_ppm = int(getattr(cfg, "max_fee_ppm", 5000))
-        band_min_ppm = max(min_fee_ppm, int(round(optimal_fee - half_width)))
-        band_max_ppm = min(max_fee_ppm, int(round(optimal_fee + half_width)))
-
-        if band_max_ppm - band_min_ppm < min_width_ppm:
-            half_min_width = min_width_ppm / 2.0
-            band_min_ppm = max(min_fee_ppm, int(math.floor(optimal_fee - half_min_width)))
-            band_max_ppm = min(max_fee_ppm, int(math.ceil(optimal_fee + half_min_width)))
-
-        if band_min_ppm > band_max_ppm:
-            band_min_ppm, band_max_ppm = band_max_ppm, band_min_ppm
-
-        self._set_channel_auto_band(
-            channel_id,
-            min_ppm=band_min_ppm,
-            max_ppm=band_max_ppm,
-            optimal_fee_ppm=int(optimal_fee),
-            posterior_std=posterior_std,
-            observation_count=observation_count,
-            sigma=sigma,
-            min_width_ppm=min_width_ppm,
-        )
-        return True
-
-    def _maybe_auto_calibrate_channel_fee_band(
-        self,
-        channel_id: str,
-        peer_id: str,
-        ts_state: ThompsonAIMDState,
-        cfg: Config,
-        *,
-        now: Optional[int] = None,
-    ) -> bool:
-        """Calibrate automatic fee bands only when the configured interval has elapsed."""
-        if not getattr(cfg, "auto_band_enabled", False):
-            return False
-
-        now_ts = int(now if now is not None else time.time())
-        auto_band = ts_state.get_auto_band()
-        recalibrate_every = max(1, int(getattr(cfg, "auto_band_recalibrate_interval", 10)))
-        min_interval_seconds = max(1, int(getattr(cfg, "fee_interval", 1800))) * recalibrate_every
-        if auto_band is not None and (now_ts - int(auto_band.last_calibrated)) < min_interval_seconds:
-            return False
-
-        return self._auto_calibrate_channel_fee_band(channel_id, peer_id, ts_state, cfg)
-
-    def _reset_channel_after_regime_change(
-        self,
-        channel_id: str,
-        peer_id: str,
-        ts_state: ThompsonAIMDState,
-    ) -> ThompsonAIMDState:
-        """Reset Thompson beliefs and clear any learned autoband after regime change."""
-        ts_state.thompson = GaussianThompsonState()
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-        ts_state.thompson.prior_std_fee = cfg.thompson_prior_std_fee
-        ts_state.aimd.reset()
-        ts_state.set_auto_band(None)
-        self._save_thompson_aimd_state(channel_id, ts_state)
-        return ts_state
-
-    def _get_dynamic_htlcmin_baseline_msat(self, channel_id: str) -> Optional[int]:
-        """Return the persisted operator baseline for temporary htlcmin defenses."""
-        if not channel_id:
-            return None
-
-        with self._state_lock:
-            cached_baseline = self._dynamic_htlcmin_baselines.get(channel_id)
-            if cached_baseline is not None:
-                return int(cached_baseline)
-
-            for state in (
-                self._thompson_aimd_states.get(channel_id),
-                self._hill_climb_states.get(channel_id),
-            ):
-                baseline_msat = getattr(state, "dynamic_htlcmin_baseline_msat", None)
-                if baseline_msat is not None:
-                    baseline_msat = int(baseline_msat)
-                    self._dynamic_htlcmin_baselines[channel_id] = baseline_msat
-                    return baseline_msat
-
-        return None
-
-    def _set_dynamic_htlcmin_baseline_msat(self, channel_id: str, baseline_msat: Optional[int]) -> None:
-        """Mirror the temporary htlcmin restore target into all active state caches."""
-        if not channel_id:
-            return
-
-        baseline_value = None if baseline_msat is None else int(baseline_msat)
-
-        with self._state_lock:
-            if baseline_value is None:
-                self._dynamic_htlcmin_baselines.pop(channel_id, None)
-            else:
-                self._dynamic_htlcmin_baselines[channel_id] = baseline_value
-
-            hc_state = self._hill_climb_states.get(channel_id)
-            if hc_state is not None:
-                hc_state.dynamic_htlcmin_baseline_msat = baseline_value
-
-            ts_state = self._thompson_aimd_states.get(channel_id)
-            if ts_state is not None:
-                ts_state.dynamic_htlcmin_baseline_msat = baseline_value
-
-    def _calculate_dynamic_htlcmin_msat(
-        self,
-        state: Dict[str, Any],
-        channel_info: Dict[str, Any],
-        cfg: 'ConfigSnapshot',
-        vegas_multiplier: float,
-        htlcmax_msat: Optional[int],
-    ) -> Optional[int]:
-        """Raise HTLC minimum defensively under congestion or Vegas pressure."""
-        if not getattr(cfg, 'enable_dynamic_htlcmin', False):
-            return None
-
-        try:
-            channel_id = str(channel_info.get("channel_id", "") or "")
-            advertised_baseline = int(channel_info.get("htlc_minimum_msat", 0) or 0)
-            utilization = float(state.get("htlc_utilization", 0.0) or 0.0)
-            utilization = max(0.0, min(1.0, utilization))
-            raw_threshold = getattr(cfg, "htlc_congestion_threshold", 1.0)
-            threshold = 1.0 if raw_threshold is None else float(raw_threshold)
-            threshold = max(0.0, min(1.0, threshold))
-            congestion_active = utilization > threshold and threshold < 1.0
-            vegas_active = vegas_multiplier > 1.0
-
-            stored_baseline = self._get_dynamic_htlcmin_baseline_msat(channel_id)
-            if channel_id and (congestion_active or vegas_active) and stored_baseline is None:
-                self._set_dynamic_htlcmin_baseline_msat(channel_id, advertised_baseline)
-                stored_baseline = advertised_baseline
-
-            baseline = advertised_baseline if stored_baseline is None else stored_baseline
-
-            if not congestion_active and not vegas_active:
-                return baseline if stored_baseline is not None else (baseline or None)
-
-            capacity_msat = int(channel_info.get("capacity", 0) or 0) * 1000
-            protective_seed = capacity_msat // 483 if capacity_msat > 0 else 0
-            defensive_baseline = max(baseline, protective_seed)
-
-            congestion_value = baseline
-            if congestion_active:
-                congestion_pressure = min(1.0, (utilization - threshold) / max(1e-9, 1.0 - threshold))
-                congestion_multiplier = 2.0 ** (4.0 * congestion_pressure)
-                congestion_value = int(round(defensive_baseline * congestion_multiplier))
-
-            vegas_value = baseline
-            if vegas_active:
-                vegas_value = int(round(defensive_baseline * vegas_multiplier))
-
-            htlcmin_msat = max(baseline, congestion_value, vegas_value)
-
-            active_htlcmax_msat = htlcmax_msat
-            if active_htlcmax_msat is None:
-                active_htlcmax_msat = parse_msat(
-                    channel_info.get("htlc_maximum_msat", channel_info.get("htlc_max_msat", 0))
-                )
-            if active_htlcmax_msat:
-                htlcmin_msat = min(htlcmin_msat, max(0, int(active_htlcmax_msat) - 1000))
-
-            return htlcmin_msat or None
-        except Exception as exc:
-            self.plugin.log(
-                f"DYNAMIC_HTLCMIN: failed to calculate for {channel_info.get('channel_id', 'unknown')}: {exc}",
-                level='debug'
-            )
-            return None
-    
     def set_channel_fee(self, channel_id: str, fee_ppm: int,
                        reason: str = "manual", manual: bool = False,
                        reason_code: Optional[str] = None,
-                       heuristic_modifiers: Optional[HeuristicModifiers] = None,
                        enforce_limits: bool = True,
                        channel_info: Optional[Dict[str, Any]] = None,
                        htlcmin_msat: Optional[int] = None,
@@ -6809,7 +3565,6 @@ class HillClimbingFeeController:
             reason: Explanation for the change
             manual: True if manually triggered (vs automatic)
             reason_code: Structured FeeReasonCode value (for explainability)
-            heuristic_modifiers: HeuristicModifiers applied (for explainability)
 
         Returns:
             Result dict with success status and details
@@ -6898,10 +3653,6 @@ class HillClimbingFeeController:
 
             self.plugin.rpc.setchannel(**rpc_params)
 
-            if htlcmin_msat is not None:
-                stored_baseline = self._get_dynamic_htlcmin_baseline_msat(channel_id)
-                if stored_baseline is not None and int(htlcmin_msat) == int(stored_baseline):
-                    self._set_dynamic_htlcmin_baseline_msat(channel_id, None)
 
             # M-13: Removed per-channel sleep+verify+retry loop from hot path.
             # Fee verification is handled by the existing gossip refresh mechanism
@@ -6916,7 +3667,6 @@ class HillClimbingFeeController:
                 reason=reason,
                 manual=manual,
                 reason_code=reason_code,
-                heuristic_modifiers=heuristic_modifiers.to_json() if heuristic_modifiers else None
             )
 
             # Keep optimizer state coherent for manual/policy/gossip-refresh changes
@@ -6944,19 +3694,18 @@ class HillClimbingFeeController:
                     except Exception as e:
                         self.plugin.log(f"STATE_SYNC: Failed to update hill state for {channel_id}: {e}", level="debug")
 
-                    if self.ENABLE_THOMPSON_AIMD:
-                        try:
-                            ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=fee_ppm)
-                            ts_state.is_sleeping = False
-                            ts_state.sleep_until = 0
-                            ts_state.stable_cycles = 0
-                            ts_state.last_fee_ppm = fee_ppm
-                            ts_state.last_broadcast_fee_ppm = fee_ppm
-                            ts_state.last_update = now
-                            ts_state.last_state = reason_code or "manual"
-                            self._save_thompson_aimd_state(channel_id, ts_state)
-                        except Exception as e:
-                            self.plugin.log(f"STATE_SYNC: Failed to update Thompson state for {channel_id}: {e}", level="debug")
+                    try:
+                        ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=fee_ppm)
+                        ts_state.is_sleeping = False
+                        ts_state.sleep_until = 0
+                        ts_state.stable_cycles = 0
+                        ts_state.last_fee_ppm = fee_ppm
+                        ts_state.last_broadcast_fee_ppm = fee_ppm
+                        ts_state.last_update = now
+                        ts_state.last_state = reason_code or "manual"
+                        self._save_thompson_aimd_state(channel_id, ts_state)
+                    except Exception as e:
+                        self.plugin.log(f"STATE_SYNC: Failed to update Thompson state for {channel_id}: {e}", level="debug")
             
             result["success"] = True
             result["old_fee_ppm"] = old_fee_ppm
@@ -7090,31 +3839,10 @@ class HillClimbingFeeController:
                     )
 
             # ── DYNAMIC: Thompson prior sample ────────────────────────
-            if self.ENABLE_THOMPSON_AIMD:
-                ts = GaussianThompsonState()
-                ts.prior_std_fee = cfg.thompson_prior_std_fee
-                initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
-            else:
-                # Fallback: use the configured prior mean, clamped to bounds
-                initial_fee = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, 200))
+            ts = GaussianThompsonState()
+            ts.prior_std_fee = cfg.thompson_prior_std_fee
+            initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
 
-            band_min_ppm, band_max_ppm, _ = self._get_effective_dynamic_fee_autoband_ppm(
-                scid,
-                peer_id,
-                cfg=cfg,
-            )
-            if band_min_ppm is not None or band_max_ppm is not None:
-                original_initial_fee = initial_fee
-                if band_min_ppm is not None:
-                    initial_fee = max(initial_fee, band_min_ppm)
-                if band_max_ppm is not None:
-                    initial_fee = min(initial_fee, band_max_ppm)
-                if initial_fee != original_initial_fee:
-                    self.plugin.log(
-                        f"INITIAL_FEE_AUTOBAND: {scid[:16]}... {original_initial_fee}->{initial_fee} ppm "
-                        f"(band={band_min_ppm or '-'}-{band_max_ppm or '-'} ppm)",
-                        level='info'
-                    )
 
             self.plugin.log(
                 f"INITIAL_FEE: {scid[:16]}... -> {initial_fee} PPM "
@@ -7600,17 +4328,6 @@ class HillClimbingFeeController:
         
         return channels
     
-    def reset_hill_climb_state(self, channel_id: str):
-        """
-        Reset Hill Climbing state for a channel.
-        
-        Use this when manually intervening or if the controller
-        is behaving erratically.
-        """
-        hc_state = HillClimbState()
-        self._save_hill_climb_state(channel_id, hc_state)
-        self.plugin.log(f"Reset Hill Climbing state for {channel_id}")
-
 
 
 # Keep alias for backward compatibility
