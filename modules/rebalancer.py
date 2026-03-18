@@ -36,111 +36,6 @@ if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
 
 
-# --- Temporal pre-positioning constants ---
-PRE_POSITION_HORIZON = 8   # hours ahead to check for depletion
-PRE_POSITION_MIN_RATIO = 0.35  # don't pre-position above this ratio
-
-
-def should_pre_position(outbound_ratio: float, current_balance_sats: float,
-                         capacity: int, current_hour: int,
-                         kalman_velocity_per_hour: float,
-                         temporal_profile, low_liquidity_threshold: float) -> bool:
-    """Check if a channel should be pre-positioned (rebalanced before depletion).
-
-    Returns True when ALL conditions are met:
-    1. Profile is graduated (enough temporal data)
-    2. Channel ratio is below PRE_POSITION_MIN_RATIO (getting low but not depleted)
-    3. Channel ratio is above low_liquidity_threshold (not already depleted)
-    4. Current hour is in a quiet period
-    5. Depletion forecast is within PRE_POSITION_HORIZON hours
-    """
-    from modules.flow_analysis import estimate_depletion_hours
-
-    if not temporal_profile.graduated:
-        return False
-    if outbound_ratio > PRE_POSITION_MIN_RATIO:
-        return False
-    if outbound_ratio <= low_liquidity_threshold:
-        return False  # already depleted, normal trigger handles this
-    if not temporal_profile.is_quiet_now(current_hour):
-        return False
-
-    depletion_target = capacity * low_liquidity_threshold
-    hours = estimate_depletion_hours(
-        current_balance_sats, depletion_target, current_hour,
-        kalman_velocity_per_hour, temporal_profile,
-    )
-    return hours <= PRE_POSITION_HORIZON
-
-
-MAX_TEMPORAL_RATIO = 0.70  # never target more than 70% of capacity
-
-
-def compute_temporal_target(current_hour: int, temporal_profile, capacity: int) -> int:
-    """Compute demand-based rebalance target from temporal profile.
-
-    Returns the predicted outflow until the next quiet window, multiplied
-    by a buffer based on traffic burstiness. Returns 0 if profile is not
-    graduated (caller should use existing volume-based target).
-    """
-    from modules.flow_analysis import get_buffer_multiplier
-
-    if not temporal_profile.graduated:
-        return 0
-
-    start, duration = temporal_profile.next_quiet_window(current_hour)
-    # Hours until quiet window starts
-    if current_hour in temporal_profile.quiet_hours:
-        # Already in quiet window — size to cover until end of quiet + next active period
-        # Use the next active period as the horizon
-        hours_to_next_active = duration
-        hours_active = 24 - duration
-        hours_ahead = hours_active  # cover the next active period
-    else:
-        hours_ahead = (start - current_hour) % 24
-        if hours_ahead == 0:
-            hours_ahead = 24  # full cycle
-
-    predicted = temporal_profile.predicted_outflow(current_hour, hours_ahead)
-    buffer = get_buffer_multiplier(temporal_profile.burstiness)
-    target = int(predicted * buffer)
-
-    # Cap at MAX_TEMPORAL_RATIO of capacity
-    max_target = int(capacity * MAX_TEMPORAL_RATIO)
-    return min(target, max_target)
-
-
-# --- Temporal source selection constants ---
-SOURCE_TEMPORAL_WINDOW = 4
-SOURCE_QUIET_FACTOR = 0.85
-SOURCE_PEAK_FACTOR = 1.25
-SOURCE_QUIET_THRESHOLD = 0.1
-SOURCE_PEAK_THRESHOLD = 0.3
-
-
-def compute_temporal_source_factor(current_hour: int, available_balance: int,
-                                    temporal_profile) -> float:
-    """Compute temporal adjustment factor for source candidate opportunity cost.
-
-    Returns:
-        0.85 if source is in quiet period (cheap to drain)
-        1.25 if source is entering peak (expensive to drain)
-        1.0 otherwise or if profile not graduated
-    """
-    if not temporal_profile.graduated:
-        return 1.0
-
-    upcoming_demand = temporal_profile.predicted_outflow(current_hour, SOURCE_TEMPORAL_WINDOW)
-    demand_ratio = upcoming_demand / max(available_balance, 1)
-
-    if demand_ratio < SOURCE_QUIET_THRESHOLD:
-        return SOURCE_QUIET_FACTOR
-    elif demand_ratio > SOURCE_PEAK_THRESHOLD:
-        return SOURCE_PEAK_FACTOR
-    else:
-        return 1.0
-
-
 class JobStatus(Enum):
     """Status of a sling background job."""
     PENDING = "pending"
@@ -2254,32 +2149,6 @@ class EVRebalancer:
                 
                 else:
                     effective_low_threshold = float(hot_override_depletion_thresholds.get(peer_id, cfg.low_liquidity_threshold))
-                    # Temporal pre-positioning: rebalance before depletion during quiet hours
-                    try:
-                        temporal_json = self.database.load_temporal_profile(channel_id)
-                        if temporal_json and isinstance(temporal_json, str):
-                            from modules.flow_analysis import TemporalProfile
-                            _tp = TemporalProfile.from_dict(json.loads(temporal_json))
-                            from datetime import datetime, timezone
-                            _current_hour = datetime.now(timezone.utc).hour
-                            _kalman = self.database.get_kalman_state(channel_id)
-                            _velocity = float((_kalman or {}).get("flow_velocity", 0.0))
-                            _balance_sats = int(info.get("to_us_msat", 0)) // 1000
-                            _capacity = int(info.get("total_msat", 0)) // 1000
-                            if should_pre_position(
-                                outbound_ratio, _balance_sats, _capacity,
-                                _current_hour, _velocity, _tp,
-                                effective_low_threshold
-                            ):
-                                depleted_channels.append((channel_id, info, outbound_ratio))
-                                self.plugin.log(
-                                    f"PRE-POSITION: channel={channel_id} ratio={outbound_ratio:.2f} "
-                                    f"quiet_hour={_current_hour} depletes_in<{PRE_POSITION_HORIZON}h",
-                                    level='info'
-                                )
-                                continue  # skip normal threshold check, already added
-                    except Exception:
-                        pass  # temporal pre-positioning is best-effort
                     if outbound_ratio < effective_low_threshold:
                         depleted_channels.append((channel_id, info, outbound_ratio))
                     elif outbound_ratio > cfg.high_liquidity_threshold:
@@ -2703,27 +2572,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         
         # CRITICAL: Clamp raw_target to capacity (never exceed what's possible)
         raw_target = min(raw_target, capacity)
-
-        # Temporal demand-based sizing: use predicted demand if higher
-        try:
-            temporal_json = self.database.load_temporal_profile(dest_channel)
-            if temporal_json:
-                from modules.flow_analysis import TemporalProfile
-                from datetime import datetime, timezone
-                _tp = TemporalProfile.from_dict(json.loads(temporal_json))
-                _current_hour = datetime.now(timezone.utc).hour
-                temporal_target = compute_temporal_target(
-                    _current_hour, _tp, capacity
-                )
-                if temporal_target > raw_target:
-                    self.plugin.log(
-                        f"TEMPORAL SIZING: channel={dest_channel[:12]}... "
-                        f"temporal_target={temporal_target} > volume_target={raw_target}",
-                        level='debug'
-                    )
-                    raw_target = temporal_target
-        except Exception:
-            pass  # temporal sizing is advisory; never block rebalancing
 
         # Skip tiny channels that can't meet the minimum rebalance amount
         # Instead of force-filling them (which caused target > capacity), we skip them
@@ -3678,24 +3526,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 # Balanced: neutral
                 flow_multiplier = 1.0
 
-            # Temporal source bias: prefer quiet-period sources
-            temporal_factor = 1.0
-            try:
-                temporal_json = self.database.load_temporal_profile(cid)
-                if temporal_json:
-                    import json
-                    from modules.flow_analysis import TemporalProfile
-                    from datetime import datetime, timezone
-                    _tp = TemporalProfile.from_dict(json.loads(temporal_json))
-                    _current_hour = datetime.now(timezone.utc).hour
-                    _balance_sats = int(info.get("to_us_msat", 0)) // 1000
-                    temporal_factor = compute_temporal_source_factor(
-                        _current_hour, _balance_sats, _tp
-                    )
-            except Exception:
-                temporal_factor = 1.0
-
-            turnover_weight = base_turnover_weight * flow_multiplier * temporal_factor
+            turnover_weight = base_turnover_weight * flow_multiplier
             weighted_opp_cost = int(source_fee_ppm * turnover_weight)
 
             # Calculate spread: what we earn minus what it costs
