@@ -9,6 +9,7 @@ Covers:
 5. DTS: Cold-start explore_std clamped to MIN_STD
 6. Policy: set_policies_batch validates fee_ppm, tags, multiplier bounds
 7. Config: _apply_override enforces range validation
+8. Rebalancer: _estimate_push_ev passes channel SCID (not peer_id) to turnover calc
 """
 
 import pytest
@@ -433,3 +434,65 @@ class TestConfigOverrideRangeValidation:
         # enable_reputation is a bool in CONFIG_FIELD_TYPES but NOT in CONFIG_FIELD_RANGES
         config._apply_override('enable_reputation', 'false')
         assert config.enable_reputation is False
+
+
+# =============================================================================
+# Fix 8: Push EV passes channel SCID (not peer_id) to _calculate_turnover_rate
+# =============================================================================
+
+class TestPushEVTurnoverChannelId:
+    """
+    Bug: _estimate_push_ev passed src_peer_id (66-char hex) to
+    _calculate_turnover_rate, which expects a channel SCID (e.g. "123x456x0").
+    This caused get_channel_state to miss the lookup and fall back to the
+    default turnover rate, making EV calculations inaccurate.
+    """
+
+    def _make_rebalancer(self):
+        """Create an EVRebalancer with mock dependencies."""
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        plugin = MagicMock()
+        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        database = MagicMock()
+        database.get_channel_state.return_value = {
+            "sats_in": 500_000,
+            "sats_out": 300_000,
+        }
+        r = EVRebalancer(plugin, cfg, database)
+        return r, database
+
+    def test_turnover_receives_scid_not_peer_id(self):
+        """_estimate_push_ev should pass the channel SCID to _calculate_turnover_rate."""
+        r, database = self._make_rebalancer()
+
+        src_channel = "750000x1234x0"    # SCID format: contains 'x'
+        src_peer_id = "02" + "ab" * 32   # 66-char hex peer ID
+        src_info = {
+            "capacity": 10_000_000,
+            "peer_id": src_peer_id,
+            "fee_ppm": 500,
+        }
+        src_ratio = 0.80  # overfull, triggers push logic
+
+        # Mock _estimate_inbound_fee and _estimate_expected_fee_sats
+        r._estimate_inbound_fee = MagicMock(return_value=100)
+        r._estimate_expected_fee_sats = MagicMock(return_value=50)
+
+        dest_scids = ["800000x5678x1"]
+        dest_peer_ids = ["03" + "cd" * 32]
+
+        result = r._estimate_push_ev(src_channel, src_info, src_ratio, dest_scids, dest_peer_ids)
+
+        # _calculate_turnover_rate calls database.get_channel_state.
+        # Verify it was called with the SCID, not the peer_id.
+        channel_id_arg = database.get_channel_state.call_args[0][0]
+        assert "x" in channel_id_arg, (
+            f"_calculate_turnover_rate received '{channel_id_arg}' which looks like a "
+            f"peer_id, not a channel SCID. Expected an SCID containing 'x'."
+        )
+        assert channel_id_arg == src_channel, (
+            f"Expected _calculate_turnover_rate to receive '{src_channel}', "
+            f"got '{channel_id_arg}'"
+        )

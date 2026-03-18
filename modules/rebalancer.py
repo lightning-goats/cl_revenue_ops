@@ -3139,7 +3139,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         # I-1 FIX: Apply utilization discount to push EV (same as pull EV).
         # Push targets are channels with 3+ source failures, which may have low demand.
-        src_turnover = self._calculate_turnover_rate(src_peer_id, capacity)
+        src_turnover = self._calculate_turnover_rate(src_channel, capacity)
         cooldown_days = max(0.01, getattr(cfg, 'rebalance_cooldown_hours', 24) / 24.0)
         expected_utilization = max(0.05, min(1.0, src_turnover * cooldown_days))
 
