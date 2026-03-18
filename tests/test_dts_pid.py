@@ -490,3 +490,17 @@ class TestPIDEdgeCases:
         assert math.isfinite(m) and 0.1 <= m <= 10.0
         assert math.isfinite(pid.ewma_error)
         assert math.isfinite(pid.integral_error)
+
+
+class TestVariancePrecision:
+    """Negative floating-point variance must not bypass MIN_STD floor."""
+
+    def test_identical_observations_no_negative_variance(self):
+        """When all observations have identical fees, variance must not go negative."""
+        ts = GaussianThompsonState()
+        for _ in range(50):
+            ts.update_posterior(fee=200, revenue_rate=1.0, hours=1.0)
+        assert ts.posterior_std >= ts.MIN_STD
+        sample = ts.sample_fee(100, 500)
+        assert not math.isnan(sample)
+        assert 100 <= sample <= 500

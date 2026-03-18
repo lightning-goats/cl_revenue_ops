@@ -784,7 +784,7 @@ class GaussianThompsonState:
             weighted_sum = sum(f * w for f, _, w in weighted_obs)
             weighted_sq_sum = sum(f * f * w for f, _, w in weighted_obs)
             obs_mean = weighted_sum / total_weight
-            variance = (weighted_sq_sum / total_weight) - (obs_mean ** 2)
+            variance = max(0.0, (weighted_sq_sum / total_weight) - (obs_mean ** 2))
             variance = max(self.MIN_STD ** 2, variance)
 
             prior_precision = 1.0 / max(self.MIN_STD ** 2, self.prior_std_fee ** 2)
@@ -1288,8 +1288,6 @@ class ChannelFeeState:
             state.stable_cycles = legacy_state.get("stable_cycles", 0)
             state.forward_count_since_update = legacy_state.get("forward_count_since_update", 0)
             state.last_volume_sats = legacy_state.get("last_volume_sats", 0)
-
-        return state
 
         return state
 
