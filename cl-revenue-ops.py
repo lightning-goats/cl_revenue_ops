@@ -795,8 +795,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         """Perform cleanup after shutdown_event is set. Runs via atexit."""
         if safe_plugin and hasattr(safe_plugin, 'rpc'):
             try:
-                safe_plugin.rpc._executor.shutdown(wait=False)
-                safe_plugin.rpc._async_executor.shutdown(wait=False)
+                safe_plugin.rpc._executor.shutdown(wait=True)
+                safe_plugin.rpc._async_executor.shutdown(wait=True)
             except Exception:
                 pass
 
@@ -1340,7 +1340,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 _boltz_auto_cycle_state['last_finished_ts'] = finished
                 _boltz_auto_cycle_state['last_duration_ms'] = duration_ms
                 # Preserve last_result if set by success/skip/disabled path, otherwise leave as-is.
-            _boltz_auto_cycle_run_lock.release()
+            if acquired:
+                _boltz_auto_cycle_run_lock.release()
 
     def boltz_auto_cycle_loop():
         """Background loop for profit-gated Boltz auto-balance cycles."""
