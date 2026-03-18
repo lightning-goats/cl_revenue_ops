@@ -86,7 +86,7 @@ class FeeReasonCode(Enum):
     POLICY_STATIC = "policy_static"       # Peer has static fee target
 
     # Algorithm decisions
-    DTS_PID_SAMPLE = "thompson_sample"               # Normal Thompson posterior sample
+    DTS_PID_SAMPLE = "dts_pid_sample"                 # Normal DTS posterior sample
     ZERO_FEE_PROBE = "zero_fee_probe"                 # Defibrillator 0-fee probe
     ZERO_FEE_PROBE_SUCCESS = "zero_fee_probe_success" # Probe succeeded, exit to floor
     CONGESTION = "congestion"                         # Congestion-based fee surge
@@ -105,10 +105,11 @@ class FeeReasonCode(Enum):
 
 
 # =============================================================================
-# Gaussian Thompson Sampling (Primary Algorithm)
+# DTS: Discounted Thompson Sampling (Market Fee Component)
 # =============================================================================
 # Continuous posterior for fee optimization using Gaussian conjugate priors.
-# Replaces discrete 5-arm Thompson Sampling with continuous fee space.
+# Bayesian exploration of the fee space with discount factor gamma=0.95
+# for natural forgetting of stale observations (~6.5h half-life).
 # Security mitigations:
 # - Bounded observations (max 200 per channel)
 # - Exponential decay on old observations
@@ -885,9 +886,9 @@ class GaussianThompsonState:
 
     def apply_vegas_adjustment(self, vegas_multiplier, new_floor):
         """
-        Adjust Thompson posterior when Vegas Reflex raises the floor significantly.
+        Adjust DTS posterior when Vegas Reflex raises the floor significantly.
 
-        When Vegas raises the floor > 1.2x, Thompson's posterior may be below
+        When Vegas raises the floor > 1.2x, the DTS posterior may be below
         the new floor, causing all samples to clamp and corrupting learning.
         This boosts uncertainty and nudges the posterior toward the new floor.
 
@@ -929,7 +930,7 @@ class GaussianThompsonState:
         """
         Inject a reduced-weight synthetic observation from priority chain bypasses.
 
-        When congestion or zero-fee probes bypass Thompson entirely, Thompson
+        When congestion or zero-fee probes bypass DTS entirely, the posterior
         gets no observations and can't learn. This injects synthetic observations
         at reduced weight so the posterior still incorporates bypass data.
 
@@ -1185,7 +1186,7 @@ class ChannelFeeState:
     # Gossip refresh tracking
     last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
 
-    # Vegas-Thompson interaction tracking
+    # Vegas-DTS interaction tracking
     last_vegas_multiplier: float = 1.0
 
     # PID balance controller state
@@ -1226,7 +1227,7 @@ class ChannelFeeState:
             "algorithm_version": self.algorithm_version,
             "thompson_state": self.thompson.to_dict(),
             "ema_revenue_rate": self.ema_revenue_rate,
-            # Vegas-Thompson interaction
+            # Vegas-DTS interaction
             "last_vegas_multiplier": self.last_vegas_multiplier,
             # F-R6-1 FIX: Persist gossip refresh cooldown so it survives restarts
             "last_gossip_refresh": self.last_gossip_refresh,
@@ -1265,7 +1266,7 @@ class ChannelFeeState:
         ema_val = d.get("ema_revenue_rate")
         state.ema_revenue_rate = ema_val if ema_val is not None else None
         state.algorithm_version = d.get("algorithm_version", "migrated")
-        # Vegas-Thompson interaction (default 1.0 for backward compat)
+        # Vegas-DTS interaction (default 1.0 for backward compat)
         state.last_vegas_multiplier = d.get("last_vegas_multiplier", 1.0)
         # F-R6-1 FIX: Restore gossip refresh cooldown from persisted state
         state.last_gossip_refresh = d.get("last_gossip_refresh", 0)
@@ -1368,7 +1369,7 @@ class ChannelCycleState:
 @dataclass
 class VegasReflexState:
     """
-    State for Vegas Reflex mempool acceleration (Phase 7).
+    State for Vegas Reflex mempool acceleration.
     
     Protects against arbitrageurs draining channels during high on-chain fee spikes
     by dynamically raising fee floors.
@@ -1501,8 +1502,6 @@ class FeeController:
     Known Limitations (documented, not bugs):
     - I-12: No per-channel fee change rate limit — timer interval provides implicit limiting
     - I-14: RLock held across DB I/O in adjust_fees — architectural constraint, single-threaded cycle
-    - I-15: Dual HC/Thompson state objects — legacy compatibility for HC fallback path
-    - I-16: Non-atomic state save (Thompson + HC states) — single-threaded cycle mitigates
     """
     
     # Observation window parameters
@@ -1582,8 +1581,8 @@ class FeeController:
 
         # ChannelCycleState cache: still actively used for observation timers,
         # sleep/wake cycles, broadcast fee tracking, trend direction, and
-        # dynamic HTLC minimum baselines.  A future Phase 3 refactor may
-        # extract these into a dedicated ChannelCycleState, but for now
+        # dynamic HTLC minimum baselines.  A future refactor may
+        # extract these into a dedicated structure, but for now
         # ChannelCycleState remains the canonical per-channel cycle tracker.
         self._cycle_states: Dict[str, ChannelCycleState] = {}
 
@@ -1597,7 +1596,7 @@ class FeeController:
         # Preserve operator-advertised HTLC minimums while temporary defenses are active.
         self._dynamic_htlcmin_baselines: Dict[str, int] = {}
 
-        # Phase 7: Vegas Reflex state (global, not per-channel)
+        # Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
 
         # AskRene topology cache (for depletion checks)
@@ -1744,7 +1743,7 @@ class FeeController:
                 tracked = cached_state.last_broadcast_fee_ppm
                 if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
                     self.plugin.log(
-                        f"FEE DESYNC (thompson cached): {channel_id[:16]}... "
+                        f"FEE DESYNC (cached): {channel_id[:16]}... "
                         f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
                         level='warn'
                     )
@@ -1789,7 +1788,7 @@ class FeeController:
             tracked = state.last_broadcast_fee_ppm
             if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
                 self.plugin.log(
-                    f"FEE DESYNC (thompson db): {channel_id[:16]}... "
+                    f"FEE DESYNC (db): {channel_id[:16]}... "
                     f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
                     level='warn'
                 )
@@ -1814,9 +1813,9 @@ class FeeController:
             channel_id=channel_id,
             last_revenue_rate=state.last_revenue_rate,
             last_fee_ppm=state.last_fee_ppm,
-            trend_direction=1,  # Not used by Thompson but kept for schema
-            step_ppm=50,  # Not used by Thompson but kept for schema
-            consecutive_same_direction=0,  # Not used by Thompson
+            trend_direction=1,  # Not used by DTS+PID but kept for schema
+            step_ppm=50,  # Not used by DTS+PID but kept for schema
+            consecutive_same_direction=0,  # Not used by DTS+PID
             last_broadcast_fee_ppm=state.last_broadcast_fee_ppm,
             last_state=state.last_state,
             is_sleeping=1 if state.is_sleeping else 0,
@@ -2012,8 +2011,8 @@ class FeeController:
             pruned += 1
 
         # Prune channel fee states from memory
-        stale_thompson_keys = [k for k in self._channel_fee_states.keys() if k not in active_channel_ids]
-        for key in stale_thompson_keys:
+        stale_fee_state_keys = [k for k in self._channel_fee_states.keys() if k not in active_channel_ids]
+        for key in stale_fee_state_keys:
             del self._channel_fee_states[key]
             pruned += 1
 
@@ -2100,7 +2099,7 @@ class FeeController:
 
             # Also wake any channels in database not yet in memory.
             # Skip closed channels: only wake entries that match an
-            # in-memory state (HC or Thompson) — those are the channels
+            # in-memory fee state — those are the channels
             # that have been seen in a recent adjust_all_fees cycle.
             active_ids = set(self._cycle_states.keys()) | set(self._channel_fee_states.keys())
             try:
@@ -2198,10 +2197,10 @@ class FeeController:
         # This reduces N RPC calls to 1 per adjust_all_fees cycle
         chain_costs = self._get_dynamic_chain_costs()
         
-        # Phase 7: Take ConfigSnapshot for thread-safe reads
+        # Take ConfigSnapshot for thread-safe reads
         cfg = self.config.snapshot()
         
-        # Phase 7: Vegas Reflex - update mempool acceleration state
+        # Vegas Reflex - update mempool acceleration state
         if cfg.enable_vegas_reflex and chain_costs:
             current_sat_vb = chain_costs.get("sat_per_vbyte", 1.0)
             self.database.record_mempool_fee(current_sat_vb)
@@ -2541,7 +2540,7 @@ class FeeController:
         else:
             self._save_cycle_state(channel_id, state)
 
-        # Keep Thompson state coherent too, if already present.
+        # Keep DTS state coherent too, if already present.
         if channel_id in self._channel_fee_states:
             ts_state = self._channel_fee_states[channel_id]
             ts_state.last_gossip_refresh = current_time
@@ -2574,7 +2573,7 @@ class FeeController:
         Adjust fee for a single channel.
 
         DTS+PID path (default):
-        1. Update Thompson posterior with observed revenue rate
+        1. Update DTS posterior with observed revenue rate
         2. Apply DTS discount (gamma=0.95) to forget stale data
         3. Sample market fee from posterior
         4. Calculate PID multiplier from outbound ratio vs target
@@ -2602,11 +2601,11 @@ class FeeController:
         # DTS uses step_ppm as the absolute fee delta, so original==step.
         original_step_ppm = 0
 
-        # Detect critical state (Phase 5.5)
+        # Detect critical state
         is_congested = (state and state.get("state") == "congested")
 
         # =====================================================================
-        # ZERO-FEE PROBE: Defibrillator Override (Phase 8.1)
+        # ZERO-FEE PROBE: Defibrillator Override
         # =====================================================================
         probe_flag = self.database.get_channel_probe(channel_id)
         is_under_probe = (probe_flag is not None)
@@ -2628,10 +2627,10 @@ class FeeController:
         # NOTE: FIRE_SALE logic removed in v2.2.3
         # Reason: FIRE_SALE set fees to 1 ppm for zombie/underwater channels, but this
         # bypassed all floor protections and caused flash drain on saturated channels.
-        # Thompson Sampling now handles price discovery for all channels naturally.
+        # DTS now handles price discovery for all channels naturally.
         
         # =====================================================================
-        # DEADBAND HYSTERESIS: Sleep Status Check (Phase 4: Stability & Scaling)
+        # DEADBAND HYSTERESIS: Sleep Status Check
         # Reduces gossip noise by suppressing fee updates when the market is stable
         # =====================================================================
         # Use ts_state for sleep decisions
@@ -2807,7 +2806,7 @@ class FeeController:
         # Revenue = Volume * Fee_PPM / 1_000_000
         # Use raw_chain_fee (actual on-chain fee), NOT current_fee_ppm (which may be
         # inflated from 0 to min_fee_ppm). Using inflated fee creates phantom revenue
-        # that poisons the Thompson posterior with false positive signals.
+        # that poisons the DTS posterior with false positive signals.
         revenue_sats = (volume_since_sats * raw_chain_fee) / 1_000_000
         raw_revenue_rate = revenue_sats / hours_elapsed if hours_elapsed > 0 else 0.0
 
@@ -2910,7 +2909,7 @@ class FeeController:
             previous_rate = cycle.last_revenue_rate
             target_found = True
 
-            # Synthetic observation: Thompson bypassed, inject at reduced weight
+            # Synthetic observation: DTS bypassed, inject at reduced weight
             try:
                 ts_state_synth = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
                 ts_state_synth.thompson.inject_synthetic_observation(
@@ -2918,7 +2917,7 @@ class FeeController:
                 )
                 self._save_channel_fee_state(channel_id, ts_state_synth)
             except Exception as e:
-                self.plugin.log(f"Synthetic Thompson state injection failed for {channel_id[:12]}...: {e}", level='debug')
+                self.plugin.log(f"Synthetic DTS observation injection failed for {channel_id[:12]}...: {e}", level='debug')
 
         # Priority 2: Zero-Fee Probe Logic (Jumpstarting)
         if not target_found and is_under_probe:
@@ -2968,7 +2967,7 @@ class FeeController:
                     )
                     self._save_channel_fee_state(channel_id, ts_state_synth)
                 except Exception as e:
-                    self.plugin.log(f"Synthetic Thompson state injection (probe success) failed for {channel_id[:12]}...: {e}", level='debug')
+                    self.plugin.log(f"Synthetic DTS observation injection (probe success) failed for {channel_id[:12]}...: {e}", level='debug')
             else:
                 # Still probing: force 0 PPM
                 new_fee_ppm = 0
@@ -2989,7 +2988,7 @@ class FeeController:
                     )
                     self._save_channel_fee_state(channel_id, ts_state_synth)
                 except Exception as e:
-                    self.plugin.log(f"Synthetic Thompson state injection (probe active) failed for {channel_id[:12]}...: {e}", level='debug')
+                    self.plugin.log(f"Synthetic DTS observation injection (probe active) failed for {channel_id[:12]}...: {e}", level='debug')
 
         # Priority 4: Fee Discovery Algorithm
         # =====================================================================
@@ -2999,8 +2998,8 @@ class FeeController:
             # =====================================================================
             # DTS+PID FEE OPTIMIZATION
             # =====================================================================
-            # Primary: Gaussian Thompson Sampling samples from posterior distribution
-            # Defense: PID controller manages balance via closed-loop multiplier
+            # DTS: Sample market fee from Gaussian posterior distribution
+            # PID: Balance management via closed-loop multiplier
             # =====================================================================
 
             # Load channel fee state
@@ -3009,7 +3008,7 @@ class FeeController:
             rate_change = current_revenue_rate - ts_state.last_revenue_rate
             previous_rate = ts_state.last_revenue_rate
 
-            # Get context key and raw values for contextual Thompson Sampling
+            # Get context key and raw values for contextual DTS
             context_key, time_bucket, corridor_role = self._get_context_with_values(
                 channel_id, peer_id, outbound_ratio
             )
@@ -3082,7 +3081,7 @@ class FeeController:
             # =====================================================================
             # THOMPSON SAMPLING: Update Posterior and Sample Fee
             # =====================================================================
-            # Update Thompson posterior with demand-adjusted observation
+            # Update DTS posterior with demand-adjusted observation
             ts_state.thompson.update_posterior(
                 fee=current_fee_ppm,
                 revenue_rate=adjusted_revenue_rate,
@@ -3104,22 +3103,18 @@ class FeeController:
             ts_state.thompson.apply_dts_discount(gamma=0.95)
 
             # =====================================================================
-            # VEGAS-THOMPSON INTERACTION
+            # VEGAS-DTS INTERACTION
             # =====================================================================
-            # When Vegas raises floor significantly, boost Thompson's uncertainty
+            # When Vegas raises floor significantly, boost DTS uncertainty
             # and nudge posterior toward new floor so samples aren't all clamped.
             if vegas_multiplier > 1.2:
                 ts_state.thompson.apply_vegas_adjustment(vegas_multiplier, base_floor_ppm)
                 ts_state.last_vegas_multiplier = vegas_multiplier
 
             # =====================================================================
-            # BROADCAST FEE DISCOVERIES (P1 Integration)
-            # + P2 COMPETITION AVOIDANCE: Thompson Posterior Sharing
+            # DTS: Sample Fee from posterior
             # =====================================================================
-            # THOMPSON SAMPLING: Sample Fee
-            # =====================================================================
-            # Direct posterior sample
-            thompson_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
+            dts_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
 
             # =============================================================
             # DTS+PID PATH: PID multiplier for balance management
@@ -3136,11 +3131,11 @@ class FeeController:
                 capacity_sats=capacity,
                 flow_state=flow_state_str,
             )
-            new_fee_ppm = int(thompson_fee * pid_multiplier)
+            new_fee_ppm = int(dts_fee * pid_multiplier)
             new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
 
             decision_reason = (
-                f"dts_pid (dts={thompson_fee}, pid={pid_multiplier:.2f}, "
+                f"dts_pid (dts={dts_fee}, pid={pid_multiplier:.2f}, "
                 f"flow={flow_state_str})"
             )
 
@@ -3156,7 +3151,7 @@ class FeeController:
             original_step_ppm = step_ppm
 
             # Build the cycle alias for end-of-method compatibility
-            # (Thompson state will be saved separately)
+            # (DTS+PID state will be saved separately)
             cycle = self._get_cycle_state(channel_id, actual_fee_ppm=raw_chain_fee)
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = current_fee_ppm
@@ -3166,7 +3161,7 @@ class FeeController:
             cycle.last_volume_sats = volume_since_sats
 
             # Store decision_reason for use in logging
-            elasticity_info = f"thompson_posterior_mean={ts_state.thompson.posterior_mean:.0f}"
+            elasticity_info = f"dts_posterior_mean={ts_state.thompson.posterior_mean:.0f}"
 
 
         # =====================================================================
@@ -3192,7 +3187,7 @@ class FeeController:
                     level='debug'
                 )
 
-        # Dynamic HTLC min removed in Phase 2 (was _calculate_dynamic_htlcmin_msat)
+        # Dynamic HTLC min removed (was _calculate_dynamic_htlcmin_msat)
         htlcmin_msat = None
         current_htlcmin_msat = parse_msat(
             channel_info.get("htlc_minimum_msat", channel_info.get("htlc_min_msat", 0))
@@ -3230,13 +3225,13 @@ class FeeController:
                     self._save_channel_fee_state(channel_id, ts_state)
                 except Exception as e:
                     self.plugin.log(
-                        f"ALPHA_GUARD: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
+                        f"ALPHA_GUARD: Failed to persist DTS state for {channel_id[:12]}...: {e}",
                         level='debug'
                     )
             return None
         
         # =====================================================================
-        # GOSSIP HYSTERESIS: The 5% Gate (Phase 5.5)
+        # GOSSIP HYSTERESIS: The 5% Gate
         # Reduce network noise by only broadcasting significant changes.
         # =====================================================================
         delta_broadcast = abs(new_fee_ppm - cycle.last_broadcast_fee_ppm)
@@ -3285,8 +3280,8 @@ class FeeController:
                 level='info'
             )
 
-            # Persist Thompson state changes too (posterior updates, PID state, etc).
-            # IMPORTANT: We MUST update last_update here because the Thompson posterior
+            # Persist DTS+PID state changes too (posterior updates, PID state, etc).
+            # IMPORTANT: We MUST update last_update here because the DTS posterior
             # was already updated with the current observation window's data (at the
             # update_posterior call above). If we don't reset the timer, the next cycle
             # would re-use the same accumulated volume/revenue, double-counting observations.
@@ -3300,7 +3295,7 @@ class FeeController:
                     self._save_channel_fee_state(channel_id, ts_state)
                 except Exception as e:
                     self.plugin.log(
-                        f"HYSTERESIS: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
+                        f"HYSTERESIS: Failed to persist DTS state for {channel_id[:12]}...: {e}",
                         level='debug'
                     )
 
@@ -3310,7 +3305,7 @@ class FeeController:
         volatility_note = " [VOLATILITY_RESET]" if volatility_reset else ""
         applied_delta = int(new_fee_ppm) - int(current_fee_ppm)
         applied_dir = "up" if applied_delta > 0 else ("down" if applied_delta < 0 else "flat")
-        hill_dir = "up" if new_direction > 0 else "down"
+        direction_label = "up" if new_direction > 0 else "down"
         base_fee_note = f", base={int(base_new_fee)}ppm" if base_new_fee is not None else ""
         mult_note = f", mult=liq{liquidity_multiplier:.2f}*prof{profitability_multiplier:.2f}"
         # Issue #28: Log both raw and EMA-smoothed rates for debugging
@@ -3319,20 +3314,20 @@ class FeeController:
         # Build reason string for DTS+PID
         ts_state_local = self._channel_fee_states.get(channel_id)
         if ts_state_local:
-            thompson_info = (
+            dts_info = (
                 f"posterior_mean={ts_state_local.thompson.posterior_mean:.0f}, "
                 f"posterior_std={ts_state_local.thompson.posterior_std:.0f}"
             )
         else:
-            thompson_info = "state_unavailable"
+            dts_info = "state_unavailable"
         reason = (
             f"DTS+PID: rate={current_revenue_rate:.2f}sats/hr{ema_note} ({decision_reason}){volatility_note}, "
-            f"{thompson_info}, applied={applied_dir}({applied_delta:+d}ppm), "
+            f"{dts_info}, applied={applied_dir}({applied_delta:+d}ppm), "
             f"state={flow_state}, liquidity={bucket} ({outbound_ratio:.0%}), "
             f"{marginal_roi_info}"
         )
         
-        # IDEMPOTENCY GUARD: Skip RPC if target is physically set (Phase 5.5)
+        # IDEMPOTENCY GUARD: Skip RPC if target is physically set
         if new_fee_ppm == raw_chain_fee and not htlcmin_policy_change:
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = raw_chain_fee
@@ -3445,7 +3440,7 @@ class FeeController:
                 self._save_channel_fee_state(channel_id, ts_state)
             except Exception as e:
                 self.plugin.log(
-                    f"RPC_FAIL_STATE: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
+                    f"RPC_FAIL_STATE: Failed to persist DTS state for {channel_id[:12]}...: {e}",
                     level='debug'
                 )
 
@@ -3604,7 +3599,7 @@ class FeeController:
                         cycle.last_state = reason_code or "manual"
                         self._save_cycle_state(channel_id, cycle)
                     except Exception as e:
-                        self.plugin.log(f"STATE_SYNC: Failed to update hill state for {channel_id}: {e}", level="debug")
+                        self.plugin.log(f"STATE_SYNC: Failed to update cycle state for {channel_id}: {e}", level="debug")
 
                     try:
                         ts_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=fee_ppm)
@@ -3617,7 +3612,7 @@ class FeeController:
                         ts_state.last_state = reason_code or "manual"
                         self._save_channel_fee_state(channel_id, ts_state)
                     except Exception as e:
-                        self.plugin.log(f"STATE_SYNC: Failed to update Thompson state for {channel_id}: {e}", level="debug")
+                        self.plugin.log(f"STATE_SYNC: Failed to update DTS state for {channel_id}: {e}", level="debug")
             
             result["success"] = True
             result["old_fee_ppm"] = old_fee_ppm
@@ -3647,7 +3642,7 @@ class FeeController:
         Decision priority:
         1. PASSIVE policy  -> skip (no fee management)
         2. STATIC policy   -> set fixed target fee
-        3. DYNAMIC policy  -> Thompson prior sample (or prior mean)
+        3. DYNAMIC policy  -> DTS prior sample (or prior mean)
 
         Args:
             channel_id: Channel ID from the channel_state_changed event
@@ -3750,7 +3745,7 @@ class FeeController:
                         channel_info=channel_info
                     )
 
-            # ── DYNAMIC: Thompson prior sample ────────────────────────
+            # ── DYNAMIC: DTS prior sample ─────────────────────────────
             ts = GaussianThompsonState()
             ts.prior_std_fee = cfg.thompson_prior_std_fee
             initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
@@ -3758,7 +3753,7 @@ class FeeController:
 
             self.plugin.log(
                 f"INITIAL_FEE: {scid[:16]}... -> {initial_fee} PPM "
-                f"(Thompson prior sample)"
+                f"(DTS prior sample)"
             )
             return self.set_channel_fee(
                 scid, initial_fee,
@@ -3786,7 +3781,7 @@ class FeeController:
         
         ALGORITHM:
         1. Base Floor: Amortized open/close costs over lifetime volume.
-           (Phase 7: REPLACEMENT COST PRICING logic)
+           (replacement cost pricing)
         2. Risk Premium: Additional fee needed to cover on-chain enforcement diff
            during high congestion for typical HTLC sizes.
         3. HTLC Hold Risk Premium: Markup for peers with high "Stall Risk"

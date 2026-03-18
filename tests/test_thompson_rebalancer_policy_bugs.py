@@ -1,12 +1,12 @@
 """
-Tests for Thompson Sampling, Rebalancer, and Policy Engine bug fixes.
+Tests for DTS posterior, Rebalancer, and Policy Engine bug fixes.
 
 Covers:
 1. Rebalancer: fee_paid_sats → actual_fee_sats kwarg fix (P0 crash)
-2. Thompson: Double revenue_weight removed from update_contextual
-3. Thompson: Double revenue_factor removed from _recompute_posterior
-4. Thompson: Legacy migration includes time_bucket (5-tuple)
-5. Thompson: Cold-start explore_std clamped to MIN_STD
+2. DTS: Double revenue_weight removed from update_contextual
+3. DTS: Double revenue_factor removed from _recompute_posterior
+4. DTS: Legacy migration includes time_bucket (5-tuple)
+5. DTS: Cold-start explore_std clamped to MIN_STD
 6. Policy: set_policies_batch validates fee_ppm, tags, multiplier bounds
 7. Config: _apply_override enforces range validation
 """
@@ -112,17 +112,17 @@ class TestRebalancerTimeoutKwarg:
 
 
 # =============================================================================
-# Fix 2: Thompson update_contextual double revenue_weight
+# Fix 2: DTS update_contextual double revenue_weight
 # =============================================================================
 
-class TestThompsonContextualRevenueWeight:
+class TestDTSContextualRevenueWeight:
     """
     Bug: update_contextual applied revenue_weight twice — once in learning_rate
     via (1 + revenue_weight), and again as multiplier on the update direction.
     """
 
-    def _make_thompson_state(self):
-        """Create a GaussianThompsonState for testing."""
+    def _make_dts_state(self):
+        """Create a GaussianThompsonState for DTS testing."""
         from modules.fee_controller import GaussianThompsonState
         state = GaussianThompsonState()
         # Context key format: "balance:time:role"
@@ -135,7 +135,7 @@ class TestThompsonContextualRevenueWeight:
 
     def test_low_revenue_still_moves_mean(self):
         """Low-revenue observations should still update the contextual posterior (proper Bayesian)."""
-        state, ctx_key = self._make_thompson_state()
+        state, ctx_key = self._make_dts_state()
 
         # Low revenue rate (1 sat/hr)
         state.update_contextual(
@@ -153,7 +153,7 @@ class TestThompsonContextualRevenueWeight:
 
     def test_high_revenue_does_not_overshoot(self):
         """High-revenue observations should not overshoot due to double-weighting."""
-        state, ctx_key = self._make_thompson_state()
+        state, ctx_key = self._make_dts_state()
 
         # High revenue rate (200 sat/hr)
         state.update_contextual(
@@ -170,8 +170,8 @@ class TestThompsonContextualRevenueWeight:
 
     def test_revenue_impact_is_bounded(self):
         """Higher revenue should have proportionally more impact, but bounded by precision."""
-        state_high, ctx_key = self._make_thompson_state()
-        state_low = self._make_thompson_state()[0]
+        state_high, ctx_key = self._make_dts_state()
+        state_low = self._make_dts_state()[0]
         state_low.contextual_posteriors[ctx_key] = (200.0, 1.0 / (50.0 ** 2), 5, 0)
 
         # Same fee, different revenue
@@ -191,10 +191,10 @@ class TestThompsonContextualRevenueWeight:
 
 
 # =============================================================================
-# Fix 3: Thompson _recompute_posterior double revenue_factor
+# Fix 3: DTS _recompute_posterior double revenue_factor
 # =============================================================================
 
-class TestThompsonPosteriorRevenueDoubleCount:
+class TestDTSPosteriorRevenueDoubleCount:
     """
     Bug: _recompute_posterior applied revenue_factor on top of base_weight
     which already includes revenue from update_posterior line 1333.

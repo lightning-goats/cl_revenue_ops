@@ -178,9 +178,8 @@ class TestPIDStatePersistence:
 
     def test_missing_pid_state_initializes_fresh(self):
         d = {
-            "algorithm_version": "thompson_aimd_v1",
+            "algorithm_version": "thompson_aimd_v1",  # legacy version tag for migration test
             "thompson_state": {},
-            "aimd_state": {},
         }
         ts = ChannelFeeState.from_v2_dict(d)
         assert isinstance(ts.pid, PIDState)
@@ -189,7 +188,7 @@ class TestPIDStatePersistence:
 
 
 # =========================================================================
-# Integration tests for ENABLE_DTS_PID flag and full DTS+PID fee path
+# Integration tests for the DTS+PID fee path
 # =========================================================================
 
 
@@ -285,13 +284,13 @@ class TestDTSPIDIntegration:
         ch_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
-        # First call to initialise Thompson state
+        # First call to initialise DTS state
         fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
             self._channel_info(outbound_pct=50.0), cfg=cfg
         )
 
-        # Pin Thompson sample_fee to return a deterministic value
+        # Pin DTS sample_fee to return a deterministic value
         ts_state = fc._channel_fee_states[ch_id]
         ts_state.thompson.sample_fee = lambda floor, ceiling: 200
 
@@ -322,13 +321,13 @@ class TestDTSPIDIntegration:
 
         # Use current_fee_ppm=500 so PID-adjusted fees (around 150-200)
         # are far enough from current to pass the Alpha Guard threshold.
-        # First call to initialise Thompson state
+        # First call to initialise DTS state
         fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
             self._channel_info(outbound_pct=50.0, current_fee_ppm=500), cfg=cfg
         )
 
-        # Pin Thompson sample_fee to return a deterministic value
+        # Pin DTS sample_fee to return a deterministic value
         ts_state = fc._channel_fee_states[ch_id]
         ts_state.thompson.sample_fee = lambda floor, ceiling: 200
 

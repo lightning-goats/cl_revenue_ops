@@ -11,7 +11,7 @@ Architecture Pattern: "Strategist, Manager, and Driver"
 - MANAGER (JobManager): Manages lifecycle of background sling jobs
 - DRIVER (Sling plugin): Actually executes the payments in the background
 
-Phase 4: Async Job Queue
+Async Job Queue
 - Decouples decision-making from execution
 - Allows concurrent rebalancing attempts
 - Uses sling-job (background) instead of sling-once (blocking)
@@ -2626,7 +2626,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         rebalance_amount = min(desired_amount, dynamic_chunk_cap)
         amount_msat = rebalance_amount * 1000
         
-        # BROADCAST FEE ALIGNMENT (Phase 5.5): Use confirmed broadcast fee for EV
+        # BROADCAST FEE ALIGNMENT: Use confirmed broadcast fee for EV
         # This prevents "Self-Arbitrage" where we pay for a rebalance expecting to
         # earn at the internal target fee, but Hysteresis blocked the update so we're
         # actually still selling liquidity at a lower broadcast fee.
@@ -3488,7 +3488,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             flow_state = state.get("state", "balanced") if state else "balanced"
 
             # =================================================================
-            # FLOW-AWARE OPPORTUNITY COST (Phase 6 Enhancement)
+            # FLOW-AWARE OPPORTUNITY COST
             # =================================================================
             # The cost of using liquidity from a channel depends on its flow:
             #

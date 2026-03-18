@@ -1031,7 +1031,7 @@ class ChannelProfitabilityAnalyzer:
         }
 
     # =========================================================================
-    # Phase 8: P&L Dashboard Methods
+    # P&L Dashboard Methods
     # =========================================================================
 
     def get_pnl_summary(self, window_days: int = 30) -> Dict[str, Any]:

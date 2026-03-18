@@ -172,7 +172,7 @@ class TestSetChannelFeeHtlcMin:
 
 
 class TestDynamicHtlcMinPersistence:
-    def test_thompson_state_roundtrip_preserves_dynamic_htlcmin_baseline(self):
+    def test_fee_state_roundtrip_preserves_dynamic_htlcmin_baseline(self):
         from modules.fee_controller import ChannelFeeState
 
         state = ChannelFeeState()
@@ -365,8 +365,8 @@ class TestSetInitialFee:
         )
         return fc
 
-    def test_initial_fee_sets_thompson_prior_sample(self, mock_plugin, mock_database):
-        """New dynamic channel gets a fee from the Thompson prior."""
+    def test_initial_fee_sets_dts_prior_sample(self, mock_plugin, mock_database):
+        """New dynamic channel gets a fee from the DTS prior."""
         from modules.fee_controller import FeeReasonCode
 
         channel_id = "123x456x0"

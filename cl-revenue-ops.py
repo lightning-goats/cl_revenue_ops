@@ -164,7 +164,7 @@ plugin = Plugin()
 shutdown_event = threading.Event()
 
 # =============================================================================
-# THREAD-SAFE RPC WRAPPER (Phase 5.5: High-Uptime Stability)
+# THREAD-SAFE RPC WRAPPER (High-Uptime Stability)
 # =============================================================================
 
 class RPCTimeoutError(RpcError):
@@ -539,7 +539,7 @@ plugin.add_option(
     description='Multiplier for Kelly fraction (default: 0.5 = Half Kelly). Full Kelly (1.0) maximizes growth but has high volatility.'
 )
 
-# Phase 7 options (v1.3.0)
+# Vegas Reflex options
 plugin.add_option(
     name='revenue-ops-vegas-reflex',
     default='true',
@@ -894,7 +894,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         reputation_decay=_safe_float('revenue-ops-reputation-decay'),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
         kelly_fraction=_safe_float('revenue-ops-kelly-fraction'),
-        # Phase 7 options (v1.3.0)
+        # Vegas Reflex options
         enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
         vegas_decay_rate=_safe_float('revenue-ops-vegas-decay'),
         rpc_timeout_seconds=_safe_int('revenue-ops-rpc-timeout-seconds'),
@@ -918,7 +918,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                f"fee_range=[{config.min_fee_ppm}, {config.max_fee_ppm}], "
                f"dry_run={config.dry_run}")
     
-    # Create thread-safe RPC proxy (Phase 5.5: High-Uptime Stability)
+    # Create thread-safe RPC proxy (High-Uptime Stability)
     # pyln-client opens a new Unix socket per call — thread-safe by design.
     # ThreadSafeRpcProxy adds timeout protection via ThreadPoolExecutor.
     safe_plugin = ThreadSafePluginProxy(plugin)
@@ -953,7 +953,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log(f"Warning: Failed to initialize Boltz CLI integration: {e}", level='warn')
 
     # =========================================================================
-    # STARTUP DEPENDENCY CHECKS (Phase 4: Stability & Scaling)
+    # STARTUP DEPENDENCY CHECKS (Stability)
     # Verify external plugins are available before initializing dependent modules
     # =========================================================================
     try:
@@ -1008,7 +1008,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if cleaned > 0:
         plugin.log(f"Startup cleanup: Released {cleaned} stale budget reservations")
 
-    # Phase 7: Load config overrides from database (persisted runtime changes)
+    # Load config overrides from database (persisted runtime changes)
     try:
         override_warnings = config.load_overrides(database)
         if config._version > 0:
@@ -1424,7 +1424,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     def financial_snapshot_loop():
         """
-        Background loop for daily financial snapshots (Phase 8: Dashboard).
+        Background loop for daily financial snapshots (Dashboard).
 
         Takes a snapshot of TLV, balances, and accumulated P&L metrics
         once every 24 hours for historical trend analysis.
@@ -1564,7 +1564,7 @@ def run_flow_analysis():
         balanced = sum(1 for r in results.values() if r.state.is_balanced)
         plugin.log(f"Channel states: {sources} sources, {sinks} sinks, {balanced} balanced")
         
-        # Apply reputation decay (Phase 3: Time-windowing)
+        # Apply reputation decay (Time-windowing)
         # This ensures recent peer behavior matters more than ancient history
         if database and config and config.enable_reputation:
             database.decay_reputation(config.reputation_decay)
@@ -2850,7 +2850,7 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
     
     try:
         if report_type == "summary":
-            # Basic summary - expand with Phase 8 P&L when available
+            # Basic summary - expand with P&L when available
             all_policies = policy_manager.get_all_policies()
             
             strategy_counts = {}
@@ -3042,7 +3042,7 @@ def revenue_hot_channel_protection_peers(plugin: Plugin, action: str = "list", p
 @plugin.method("revenue-config")
 def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = None) -> Dict[str, Any]:
     """
-    Get or set runtime configuration (Phase 7: Dynamic Runtime Configuration).
+    Get or set runtime configuration (Dynamic Runtime Configuration).
     
     Usage:
       lightning-cli revenue-config get           # Get public operator controls
@@ -3124,7 +3124,7 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
 @plugin.method("revenue-dashboard")
 def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
     """
-    Phase 8: The Sovereign Dashboard - P&L Engine
+    P&L Engine
 
     Returns financial health metrics and warnings about underperforming channels.
 

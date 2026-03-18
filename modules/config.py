@@ -4,9 +4,8 @@ Configuration module for cl-revenue-ops
 Contains the Config dataclass that holds all tunable parameters
 for the Revenue Operations plugin.
 
-Phase 7 additions:
-- ConfigSnapshot: Immutable snapshot for thread-safe cycle execution
-- Runtime configuration updates via RPC
+Includes ConfigSnapshot for immutable, thread-safe cycle execution
+and runtime configuration updates via RPC.
 """
 
 import math
@@ -97,10 +96,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_cooldown_hours': int,
     'futility_cooldown_hours': int,
     'inbound_fee_estimate_ppm': int,
-    # Phase 7 additions
+    # Vegas Reflex
     'enable_vegas_reflex': bool,
     'vegas_decay_rate': float,
-    # Phase 1: Operational Hardening
+    # Operational Hardening
     'rpc_timeout_seconds': int,
     'rpc_circuit_breaker_seconds': int,
     'rpc_pool_size': int,
@@ -111,7 +110,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'enable_velocity_gate': bool,
     'min_velocity_threshold': float,
     'new_channel_grace_days': int,
-    # Thompson Sampling (v1.7.0)
+    # DTS (Discounted Thompson Sampling) parameters
     'thompson_prior_std_fee': int,
     'thompson_observation_decay_hours': int,
     'thompson_max_observations': int,
@@ -175,7 +174,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # Issue #30: Velocity gate for rebalancing
     'min_velocity_threshold': (0.0, 1.0),
     'new_channel_grace_days': (0, 30),
-    # Thompson Sampling (v1.7.0)
+    # DTS (Discounted Thompson Sampling) parameters
     'thompson_prior_std_fee': (10, 500),
     'thompson_observation_decay_hours': (24, 720),  # 1 day to 30 days
     'thompson_max_observations': (50, 500),
@@ -299,15 +298,15 @@ class Config:
     total_cost_budget_window_hours: int = 24  # Window for profit-based budget calculation
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
 
-    # Revenue-Proportional Budget (Phase 7: Dynamic Budget Scaling)
+    # Revenue-Proportional Budget
     enable_proportional_budget: bool = True   # Scale daily budget based on revenue (Issue #22)
     proportional_budget_pct: float = 0.30     # Budget = max(daily_budget_sats, revenue_24h * pct)
                                                # Default 30% of 24h revenue
     
-    # Phase 1: Operational Hardening
+    # RPC Hardening
     rpc_timeout_seconds: int = 15
     rpc_circuit_breaker_seconds: int = 60
-    rpc_pool_size: int = 5             # Number of RPC worker processes (Phase 2)
+    rpc_pool_size: int = 5             # Number of RPC worker processes
     reservation_timeout_hours: int = 4  # Hours before stale budget reservations auto-release
     
     # HTLC Congestion threshold
@@ -318,13 +317,13 @@ class Config:
     reputation_decay: float = 0.98  # Decay factor per flow_interval (default hourly)
                                      # 0.98^24 ≈ 0.61, meaning old data loses ~40% weight daily
 
-    # Kelly Criterion Position Sizing (Phase 4: Risk Management)
+    # Kelly Criterion Position Sizing
     enable_kelly: bool = False       # If True, scale rebalance budget by Kelly fraction (opt-in)
     kelly_fraction: float = 0.5      # Multiplier for Kelly fraction (0.5 = Half Kelly)
                                       # Full Kelly (1.0) maximizes growth but has high volatility
                                       # Half Kelly (0.5) reduces volatility drag significantly
     
-    # Async Job Queue (Phase 4: Stability & Scaling)
+    # Async Job Queue
     max_concurrent_jobs: int = 5              # Max number of concurrent sling rebalance jobs
     sling_job_timeout_seconds: int = 7200     # Timeout for sling jobs (2 hours default)
     sling_chunk_size_sats: int = 500000       # Amount per sling rebalance attempt (500k sats)
@@ -333,7 +332,7 @@ class Config:
     askrene_layer: str = 'xpay'               # Layer name for askrene-listlayers
     askrene_max_age_sec: int = 900            # Max constraint age (seconds) to consider fresh
 
-    # Enhanced Sling Integration (Phase 6)
+    # Sling Integration
     sling_max_hops: int = 5                   # Max route hops (shorter = faster, more reliable)
     sling_parallel_jobs: int = 2              # Concurrent route attempts per job
     sling_target_sink: float = 0.40           # Balance target for sink channels (want more inbound)
@@ -351,11 +350,11 @@ class Config:
     # Runtime dependency flags (set during init based on listplugins)
     sling_available: bool = True   # Set to False if sling plugin not detected
     
-    # Phase 7 additions (v1.3.0)
+    # Vegas Reflex (mempool spike defense)
     enable_vegas_reflex: bool = True       # Mempool spike defense
     vegas_decay_rate: float = 0.85         # Per-cycle decay (~30min half-life)
     
-    # Deferred (v1.4.0)
+    # Deferred features
     enable_flow_asymmetry: bool = False    # Rare liquidity premium
     enable_peer_sync: bool = False         # Peer-level fee syncing
 
@@ -371,7 +370,7 @@ class Config:
     new_channel_grace_days: int = 7        # Days before velocity gate applies to new channels
 
     # ==========================================================================
-    # Thompson Sampling Parameters (v1.7.0)
+    # DTS (Discounted Thompson Sampling) Parameters
     # ==========================================================================
     thompson_prior_std_fee: int = 100         # Default prior uncertainty in ppm
     thompson_observation_decay_hours: int = 168  # 7-day half-life for observations
@@ -686,7 +685,7 @@ class ConfigSnapshot:
     sling_job_timeout_seconds: int
     sling_chunk_size_sats: int
 
-    # Enhanced Sling Integration (Phase 6)
+    # Sling Integration
     sling_max_hops: int
     sling_parallel_jobs: int
     sling_target_sink: float
@@ -703,15 +702,15 @@ class ConfigSnapshot:
     # Runtime dependency flags
     sling_available: bool
     
-    # Phase 7 additions (v1.3.0)
+    # Vegas Reflex (mempool spike defense)
     enable_vegas_reflex: bool
     vegas_decay_rate: float
     
-    # Deferred (v1.4.0)
+    # Deferred features
     enable_flow_asymmetry: bool
     enable_peer_sync: bool
 
-    # Phase 1: Operational Hardening
+    # RPC Hardening
     rpc_timeout_seconds: int
     rpc_circuit_breaker_seconds: int
     rpc_pool_size: int
@@ -725,7 +724,7 @@ class ConfigSnapshot:
     min_velocity_threshold: float
     new_channel_grace_days: int
 
-    # Thompson Sampling (v1.7.0)
+    # DTS (Discounted Thompson Sampling) parameters
     thompson_prior_std_fee: int
     thompson_observation_decay_hours: int
     thompson_max_observations: int

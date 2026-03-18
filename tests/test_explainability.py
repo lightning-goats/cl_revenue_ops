@@ -41,7 +41,7 @@ class TestFeeReasonCode:
 
     def test_algorithm_reason_codes_exist(self):
         """Verify all algorithm decision reason codes are defined."""
-        assert FeeReasonCode.DTS_PID_SAMPLE.value == "thompson_sample"
+        assert FeeReasonCode.DTS_PID_SAMPLE.value == "dts_pid_sample"
         assert FeeReasonCode.ZERO_FEE_PROBE.value == "zero_fee_probe"
         assert FeeReasonCode.ZERO_FEE_PROBE_SUCCESS.value == "zero_fee_probe_success"
         assert FeeReasonCode.CONGESTION.value == "congestion"

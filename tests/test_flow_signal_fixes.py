@@ -729,8 +729,8 @@ class TestConsumerVelocityConversion:
         assert std_dev_correct < std_dev_wrong
 
 
-class TestThompsonExtrapolation:
-    """Tests for Thompson posterior f_star clamping (Fix 4)."""
+class TestDTSExtrapolation:
+    """Tests for DTS posterior f_star clamping (Fix 4)."""
 
     def test_f_star_allows_extrapolation_above(self):
         """f_star should be allowed to exceed 1.0 (extrapolate beyond tested range)."""

@@ -243,7 +243,7 @@ class Database:
         """
         self.db_path = os.path.expanduser(db_path)
         self.plugin = plugin
-        # Thread-local storage for connections (Phase 5.5: Database Thread Safety)
+        # Thread-local storage for connections (Thread Safety)
         self._local = threading.local()
         # EH-6: Track all thread connections for shutdown cleanup
         self._thread_connections: list = []
@@ -586,7 +586,7 @@ class Database:
                 resolved_time INTEGER DEFAULT 0
             )
         """)
-        # Phase 2: Ensure forwards schema is idempotent and restart-safe
+        # Ensure forwards schema is idempotent and restart-safe
         self._migrate_forwards_schema(conn)
 
         
@@ -713,7 +713,7 @@ class Database:
         except sqlite3.OperationalError:
             pass
 
-        # Config overrides table (Phase 7: Dynamic Runtime Configuration)
+        # Config overrides table (Dynamic Runtime Configuration)
         # Stores operator overrides that persist across restarts
         conn.execute("""
             CREATE TABLE IF NOT EXISTS config_overrides (
@@ -724,7 +724,7 @@ class Database:
             )
         """)
         
-        # Mempool fee history (Phase 7: Vegas Reflex MA calculation)
+        # Mempool fee history (Vegas Reflex MA calculation)
         # Tracks on-chain fee rates for detecting spikes
         conn.execute("""
             CREATE TABLE IF NOT EXISTS mempool_fee_history (
@@ -826,7 +826,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_events_time ON spend_events(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_events_category ON spend_events(category, timestamp)")
 
-        # Phase 8: Financial Snapshots for P&L Dashboard
+        # Financial Snapshots for P&L Dashboard
         # Records daily node state for TLV tracking and trend analysis
         conn.execute("""
             CREATE TABLE IF NOT EXISTS financial_snapshots (
@@ -963,7 +963,7 @@ class Database:
         # v2.0 Migration: Add columns for fee algorithm improvements
         # - forward_count_since_update: Dynamic observation windows (Improvement #2)
         # - last_volume_sats: For elasticity tracking
-        # - v2_state_json: JSON blob for complex state (historical curve, elasticity, Thompson)
+        # - v2_state_json: JSON blob for DTS+PID state (posterior, PID integral/derivative)
         try:
             conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN forward_count_since_update INTEGER DEFAULT 0")
             self.plugin.log("Added forward_count_since_update column to fee_strategy_state")
@@ -1092,7 +1092,7 @@ class Database:
 
     def _migrate_forwards_schema(self, conn: sqlite3.Connection) -> None:
         """
-        Phase 2: Make forwards ingestion idempotent and restart-safe.
+        Make forwards ingestion idempotent and restart-safe.
 
         - Adds resolved_time column if missing
         - Backfills resolved_time from timestamp + resolution_time (best-effort)
@@ -1687,7 +1687,7 @@ class Database:
             stable_cycles: Number of consecutive stable cycles (for hysteresis)
             forward_count_since_update: v2.0 - Forwards since last fee change
             last_volume_sats: v2.0 - Volume during last period (for elasticity)
-            v2_state_json: v2.0 - JSON blob for historical curve, elasticity, Thompson state
+            v2_state_json: v2.0 - JSON blob for DTS+PID state (posterior, PID integral/derivative)
         """
         conn = self._get_connection()
         ts = last_update if last_update is not None else int(time.time())
@@ -1966,7 +1966,7 @@ class Database:
         return int((row['total_fees_msat'] or 0) // 1000) if row else 0
 
     # =========================================================================
-    # Phase 8: Financial Snapshots for P&L Dashboard
+    # Financial Snapshots for P&L Dashboard
     # =========================================================================
 
     def record_financial_snapshot(self, local_balance_sats: int, remote_balance_sats: int,
@@ -3209,7 +3209,7 @@ class Database:
             """
             Bulk insert forwards from RPC hydration.
 
-            Phase 2: Idempotent insert using INSERT OR IGNORE under a UNIQUE index.
+            Idempotent insert using INSERT OR IGNORE under a UNIQUE index.
             Wrapped in a single transaction for performance (10-100x faster than
             autocommit per-row on large forward sets).
 
@@ -3460,15 +3460,15 @@ class Database:
         """
         Record a completed forward for real-time tracking.
 
-        Phase 2: Use canonical forward times (received_time/resolved_time) and
+        Use canonical forward times (received_time/resolved_time) and
         INSERT OR IGNORE under a UNIQUE index to prevent double-dips on restart.
 
         Backward compatible:
           - Legacy call: record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time)
-          - Phase 2 call: record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat,
+          - Canonical call: record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat,
                                          received_time, resolved_time[, resolution_time])
         """
-        # Parse legacy vs Phase 2 call patterns
+        # Parse legacy vs canonical call patterns
         received_time: int = 0
         resolved_time: int = 0
         resolution_time: float = 0.0
@@ -5295,7 +5295,7 @@ class Database:
         return cur.rowcount > 0
 
     # =========================================================================
-    # Config Overrides Methods (Phase 7: Dynamic Runtime Configuration)
+    # Config Overrides Methods (Dynamic Runtime Configuration)
     # =========================================================================
     
     def get_config_override(self, key: str) -> Optional[str]:
@@ -5387,7 +5387,7 @@ class Database:
             raise
     
     # =========================================================================
-    # Mempool Fee History Methods (Phase 7: Vegas Reflex)
+    # Mempool Fee History Methods (Vegas Reflex)
     # =========================================================================
     
     def record_mempool_fee(self, sat_per_vbyte: float) -> None:

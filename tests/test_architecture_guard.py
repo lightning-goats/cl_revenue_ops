@@ -1,8 +1,9 @@
 """
 Regression guard: ensure removed architectures do not quietly return.
 
-These tests verify that hive integration, Thompson+AIMD fallback, and
-legacy fee algorithms remain absent from the codebase.
+These tests verify that hive integration, legacy standalone fee algorithms
+(AIMD, Hill Climbing, discrete Thompson), and removed feature flags remain
+absent from the codebase.  The current architecture is DTS+PID only.
 """
 import ast
 import importlib
@@ -42,7 +43,7 @@ class TestNoHiveReintroduction:
 
 
 class TestNoLegacyFeeAlgorithms:
-    """Thompson+AIMD and Hill Climbing algorithms must not return."""
+    """Legacy standalone fee algorithms (AIMD, Hill Climbing, discrete Thompson) must not return."""
 
     def test_no_aimd_defense_state(self):
         from modules import fee_controller
