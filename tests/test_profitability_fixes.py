@@ -412,3 +412,104 @@ class TestRoiSortingAndVolume:
         total_cost = 500 + 100  # no splice
         expected_cost_per_sat = total_cost / 500_000
         assert abs(result.cost_per_sat_routed - expected_cost_per_sat) < 1e-9
+
+
+# ============================================================
+# Fix: Channel open timestamp passed to record_channel_open_cost
+# ============================================================
+
+class TestOpenTimestampPassthrough:
+    """record_channel_open_cost must store the actual channel open time,
+    not time.time(), so windowed budget queries don't count old opens as recent."""
+
+    def test_get_channel_costs_passes_open_timestamp(self):
+        """_get_channel_costs passes open_timestamp to record_channel_open_cost."""
+        analyzer = _make_analyzer()
+        old_ts = int(time.time()) - 90 * 86400  # 90 days ago
+
+        # No cached cost → forces bookkeeper lookup → records result
+        analyzer.database.get_channel_open_cost.return_value = None
+        analyzer.database.get_channel_rebalance_costs.return_value = 0
+        analyzer.database.get_channel_splice_history.return_value = []
+        analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
+        }
+
+        # Bookkeeper returns a cost
+        with patch.object(analyzer, '_get_rebalance_costs_from_bookkeeper', return_value=0), \
+             patch.object(analyzer, '_get_open_cost_from_bookkeeper', return_value=150):
+            analyzer._get_channel_costs(
+                "100x1x0", "peer1", "abc123", 2_000_000,
+                opener="local", open_timestamp=old_ts
+            )
+
+        # The recorded timestamp must be the actual open time, not now
+        call_args = analyzer.database.record_channel_open_cost.call_args
+        assert call_args is not None, "record_channel_open_cost was not called"
+        # Check the timestamp kwarg or positional arg
+        if call_args.kwargs.get("timestamp") is not None:
+            recorded_ts = call_args.kwargs["timestamp"]
+        else:
+            # positional: (channel_id, peer_id, cost, capacity, timestamp)
+            recorded_ts = call_args[0][4] if len(call_args[0]) > 4 else None
+        assert recorded_ts == old_ts, (
+            f"Expected open_timestamp={old_ts}, got {recorded_ts}. "
+            "Budget queries will miscount old opens as recent spend."
+        )
+
+    def test_remote_channel_self_heal_uses_open_timestamp(self):
+        """Self-healing remote channel cost correction preserves open timestamp."""
+        analyzer = _make_analyzer()
+        old_ts = int(time.time()) - 180 * 86400  # 180 days ago
+
+        # Remote channel with stale nonzero cost triggers self-heal
+        analyzer.database.get_channel_open_cost.return_value = 500
+        analyzer.database.get_channel_rebalance_costs.return_value = 0
+        analyzer.database.get_channel_splice_history.return_value = []
+        analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
+        }
+
+        with patch.object(analyzer, '_get_rebalance_costs_from_bookkeeper', return_value=0):
+            analyzer._get_channel_costs(
+                "200x2x0", "peer2", "def456", 3_000_000,
+                opener="remote", open_timestamp=old_ts
+            )
+
+        call_args = analyzer.database.record_channel_open_cost.call_args
+        assert call_args is not None, "Self-heal did not call record_channel_open_cost"
+        if call_args.kwargs.get("timestamp") is not None:
+            recorded_ts = call_args.kwargs["timestamp"]
+        else:
+            recorded_ts = call_args[0][4] if len(call_args[0]) > 4 else None
+        assert recorded_ts == old_ts, (
+            f"Self-heal used timestamp={recorded_ts}, expected {old_ts}"
+        )
+
+    def test_sanity_check_correction_uses_open_timestamp(self):
+        """_sanity_check_open_cost passes timestamp when self-healing."""
+        analyzer = _make_analyzer()
+        old_ts = int(time.time()) - 60 * 86400
+
+        # Set up a local channel with an invalid open cost (triggers sanity check)
+        analyzer.database.get_channel_open_cost.return_value = 5_000_000  # > capacity, invalid
+        analyzer.database.get_channel_rebalance_costs.return_value = 0
+        analyzer.database.get_channel_splice_history.return_value = []
+        analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
+        }
+
+        with patch.object(analyzer, '_get_rebalance_costs_from_bookkeeper', return_value=0), \
+             patch.object(analyzer, '_get_open_cost_from_bookkeeper', return_value=300):
+            analyzer._get_channel_costs(
+                "300x3x0", "peer3", "ghi789", 2_000_000,
+                opener="local", open_timestamp=old_ts
+            )
+
+        call_args = analyzer.database.record_channel_open_cost.call_args
+        assert call_args is not None
+        if call_args.kwargs.get("timestamp") is not None:
+            recorded_ts = call_args.kwargs["timestamp"]
+        else:
+            recorded_ts = call_args[0][4] if len(call_args[0]) > 4 else None
+        assert recorded_ts == old_ts

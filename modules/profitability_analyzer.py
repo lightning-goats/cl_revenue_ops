@@ -470,10 +470,14 @@ class ChannelProfitabilityAnalyzer:
             capacity = channel_info.get("capacity", 0)
             funding_txid = channel_info.get("funding_txid", "")
             opener = channel_info.get("opener", "local")
-            
+            open_timestamp = channel_info.get("open_timestamp")
+
             # Get costs from database
             # Pass opener to correctly handle remote vs local channel costs
-            costs = self._get_channel_costs(channel_id, peer_id, funding_txid, capacity, opener)
+            costs = self._get_channel_costs(
+                channel_id, peer_id, funding_txid, capacity, opener,
+                open_timestamp=open_timestamp
+            )
             
             # Get revenue from routing history
             # Use precalculated data if provided, otherwise fall back to single RPC call
@@ -765,22 +769,24 @@ class ChannelProfitabilityAnalyzer:
         self._profitability_cache.pop(channel_id, None)
     
     def record_channel_open_cost(self, channel_id: str, peer_id: str,
-                                  open_cost_sats: int, capacity_sats: int):
+                                  open_cost_sats: int, capacity_sats: int,
+                                  timestamp: Optional[int] = None):
         """
         Record the cost to open a channel.
-        
+
         Args:
             channel_id: New channel ID
             peer_id: Peer node ID
             open_cost_sats: On-chain fees paid
             capacity_sats: Channel capacity
+            timestamp: Actual channel open time (defaults to now for new opens)
         """
         self.database.record_channel_open_cost(
             channel_id=channel_id,
             peer_id=peer_id,
             open_cost_sats=open_cost_sats,
             capacity_sats=capacity_sats,
-            timestamp=int(time.time())
+            timestamp=timestamp or int(time.time())
         )
     
     def get_zombie_channels(self, validate_exists: bool = True) -> List[ChannelProfitability]:
@@ -1563,24 +1569,26 @@ class ChannelProfitabilityAnalyzer:
         
         return None
     
-    def _get_channel_costs(self, channel_id: str, peer_id: str, 
+    def _get_channel_costs(self, channel_id: str, peer_id: str,
                           funding_txid: str, capacity_sats: int = 0,
-                          opener: str = "local") -> ChannelCosts:
+                          opener: str = "local",
+                          open_timestamp: Optional[int] = None) -> ChannelCosts:
         """
         Get costs for a channel from bookkeeper and database.
-        
+
         Cost sources (in priority order):
         1. If opener == 'remote': Cost is 0 (we didn't pay to open it).
         2. Bookkeeper onchain_fee events for the funding tx (most accurate).
         3. Database cached value.
         4. Config estimated_open_cost_sats (fallback).
-        
+
         Args:
             channel_id: Short channel ID
             peer_id: Peer node ID
             funding_txid: Funding transaction ID
             capacity_sats: Channel capacity
             opener: Who opened the channel ('local' or 'remote')
+            open_timestamp: Actual channel open time (for correct budget windowing)
         """
         # Get rebalance costs - combine database records with bookkeeper data
         db_rebalance_costs = self.database.get_channel_rebalance_costs(channel_id)
@@ -1605,7 +1613,8 @@ class ChannelProfitabilityAnalyzer:
                     level='info'
                 )
                 self.database.record_channel_open_cost(
-                    channel_id, peer_id, 0, capacity_sats
+                    channel_id, peer_id, 0, capacity_sats,
+                    timestamp=open_timestamp
                 )
         else:
             # Local opener -> We paid fees. Proceed with lookup logic.
@@ -1630,14 +1639,16 @@ class ChannelProfitabilityAnalyzer:
                             level='info'
                         )
                         self.database.record_channel_open_cost(
-                            channel_id, peer_id, requeried_cost, capacity_sats
+                            channel_id, peer_id, requeried_cost, capacity_sats,
+                            timestamp=open_timestamp
                         )
                         open_cost = requeried_cost
             
             # SANITY CHECK: Detect invalid open_cost (capital mistaken as expense)
             if open_cost is not None and capacity_sats > 0:
                 open_cost = self._sanity_check_open_cost(
-                    channel_id, peer_id, funding_txid, open_cost, capacity_sats
+                    channel_id, peer_id, funding_txid, open_cost, capacity_sats,
+                    open_timestamp=open_timestamp
                 )
             
             # Query bookkeeper if not found
@@ -1645,7 +1656,8 @@ class ChannelProfitabilityAnalyzer:
                 open_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
                 if open_cost is not None:
                     self.database.record_channel_open_cost(
-                        channel_id, peer_id, open_cost, capacity_sats
+                        channel_id, peer_id, open_cost, capacity_sats,
+                        timestamp=open_timestamp
                     )
             
             # Final fallback
@@ -1692,7 +1704,8 @@ class ChannelProfitabilityAnalyzer:
     
     def _sanity_check_open_cost(self, channel_id: str, peer_id: str,
                                  funding_txid: str, open_cost: int,
-                                 capacity_sats: int) -> int:
+                                 capacity_sats: int,
+                                 open_timestamp: Optional[int] = None) -> int:
         """
         Sanity check and self-heal invalid open_cost values.
         
@@ -1756,7 +1769,8 @@ class ChannelProfitabilityAnalyzer:
         
         # Step 4: Update database with corrected value (self-healing)
         self.database.record_channel_open_cost(
-            channel_id, peer_id, corrected_cost, capacity_sats
+            channel_id, peer_id, corrected_cost, capacity_sats,
+            timestamp=open_timestamp
         )
         self.plugin.log(
             f"Database updated with corrected open_cost for {channel_id}",
