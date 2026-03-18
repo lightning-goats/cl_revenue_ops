@@ -426,10 +426,11 @@ class ChannelProfitabilityAnalyzer:
                 cls = p.classification.value
                 classifications[cls] = classifications.get(cls, 0) + 1
 
+            age_label = f"{int(time.time()) - old_timestamp}s" if old_timestamp else "initial"
             self.plugin.log(
                 f"Profitability analysis complete: {len(results)} channels - "
                 f"{classifications} [thread={threading.current_thread().name}, "
-                f"cache_age={int(time.time()) - old_timestamp}s]"
+                f"cache_age={age_label}]"
             )
 
         except Exception as e:
