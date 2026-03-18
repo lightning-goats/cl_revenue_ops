@@ -105,7 +105,7 @@ class FeeReasonCode(Enum):
 
 
 # =============================================================================
-# IMPROVEMENT #6: Gaussian Thompson Sampling (Primary Algorithm)
+# Gaussian Thompson Sampling (Primary Algorithm)
 # =============================================================================
 # Continuous posterior for fee optimization using Gaussian conjugate priors.
 # Replaces discrete 5-arm Thompson Sampling with continuous fee space.
@@ -1143,33 +1143,26 @@ class PIDState:
 
 
 # =============================================================================
-# IMPROVEMENT #8: Combined Thompson+AIMD State
+# Per-Channel Fee State
 # =============================================================================
-# Unified state class that combines Thompson Sampling with AIMD defense.
-# This replaces HillClimbState as the primary fee optimization state.
+# Unified state class for DTS+PID fee optimization per channel.
 # =============================================================================
 
 @dataclass
-class ThompsonAIMDState:
+class ChannelFeeState:
     """
-    Combined state for Thompson Sampling + AIMD fee optimization.
+    Per-channel fee state for DTS+PID fee optimization.
 
-    This replaces HillClimbState as the primary algorithm. It combines:
-    - GaussianThompsonState: Learns optimal fee through Bayesian exploration
-    - AIMDDefenseState: Rapid response to sudden market changes
-
-    The Thompson algorithm provides careful, statistically-sound fee
-    optimization, while AIMD provides quick defensive adjustments when
-    things go wrong.
-
-    Preserved from HillClimbState (for compatibility):
+    Contains:
+    - GaussianThompsonState: DTS posterior over fee-revenue relationship
+    - PIDState: Balance management multiplier
     - Deadband hysteresis (sleep mode)
     - Revenue rate tracking
     """
     # Thompson Sampling state
     thompson: GaussianThompsonState = field(default_factory=GaussianThompsonState)
 
-    # Preserved from HillClimbState for hysteresis and tracking
+    # Revenue and fee tracking
     last_revenue_rate: float = 0.0      # Raw revenue rate
     ema_revenue_rate: Optional[float] = None  # EMA-smoothed revenue rate
     last_fee_ppm: int = 0               # Last fee we set
@@ -1243,16 +1236,16 @@ class ThompsonAIMDState:
         }
 
     @classmethod
-    def from_v2_dict(cls, d: Dict[str, Any], legacy_state: Dict[str, Any] = None) -> "ThompsonAIMDState":
+    def from_v2_dict(cls, d: Dict[str, Any], legacy_state: Dict[str, Any] = None) -> "ChannelFeeState":
         """
         Deserialize from v2 JSON format.
 
         Args:
             d: v2_state_json data
-            legacy_state: Optional legacy HillClimbState fields from main table
+            legacy_state: Optional legacy fields from main DB table
 
         Returns:
-            ThompsonAIMDState instance
+            ChannelFeeState instance
         """
         state = cls()
 
@@ -1480,7 +1473,7 @@ class FeeAdjustment:
         }
 
 
-class HillClimbingFeeController:
+class FeeController:
     """
     DTS+PID fee controller for revenue maximization.
 
@@ -1519,10 +1512,6 @@ class HillClimbingFeeController:
     WAKE_UP_THRESHOLD = 0.20     # 20% revenue spike triggers immediate wake-up
     SLEEP_CYCLES = 2             # Sleep for 2x the fee interval
     STABLE_CYCLES_REQUIRED = 3   # Number of flat cycles before entering sleep mode
-
-    # Bounds multipliers: floor/ceiling adjustments from liquidity/profitability
-    MAX_FLOOR_MULTIPLIER = 3.0        # Security: Floor can't exceed 3x base
-    MIN_CEILING_MULTIPLIER = 0.5      # Security: Ceiling can't go below 0.5x base
 
     # ==========================================================================
     # Issue #20: Flow-Based Ceiling Reduction
@@ -1589,12 +1578,12 @@ class HillClimbingFeeController:
                 self.plugin.log(f"POLICY_CHANGE: Failed to register callback: {e}", level='debug')
 
         # In-memory cache of Hill Climbing states (also persisted to DB)
-        # Note: This cache is used for both legacy HillClimbState and new ThompsonAIMDState
+        # Legacy HillClimbState cache (kept for observation timer compatibility)
         self._hill_climb_states: Dict[str, HillClimbState] = {}
 
-        # Thompson+AIMD state cache (v1.7.0)
-        self._thompson_aimd_states: Dict[str, ThompsonAIMDState] = {}
-        self._thompson_migrated_channels: set = set()  # Dedup migration logs
+        # Per-channel fee state cache
+        self._channel_fee_states: Dict[str, ChannelFeeState] = {}
+        self._migrated_channels: set = set()  # Dedup migration logs
 
         # Lock protecting state dict access across threads
         self._state_lock = threading.RLock()  # TS-1: RLock for re-entrant access from set_channel_fee
@@ -1719,17 +1708,17 @@ class HillClimbingFeeController:
         context_key = f"{balance}:{time_bucket}:{role}"
         return (context_key, time_bucket, role)
 
-    def _get_thompson_aimd_state(
+    def _get_channel_fee_state(
         self,
         channel_id: str,
         peer_id: str,
         actual_fee_ppm: int = None
-    ) -> ThompsonAIMDState:
+    ) -> ChannelFeeState:
         """
-        Get Thompson+AIMD state for a channel.
+        Get fee state for a channel.
 
         Checks in-memory cache first, then database. Handles migration from
-        legacy HillClimbState if needed.
+        legacy state if needed.
 
         Args:
             channel_id: Channel ID
@@ -1737,13 +1726,13 @@ class HillClimbingFeeController:
             actual_fee_ppm: Optional actual fee from chain for desync detection
 
         Returns:
-            ThompsonAIMDState for the channel
+            ChannelFeeState for the channel
         """
         import json
 
         # Check in-memory cache
-        if channel_id in self._thompson_aimd_states:
-            cached_state = self._thompson_aimd_states[channel_id]
+        if channel_id in self._channel_fee_states:
+            cached_state = self._channel_fee_states[channel_id]
             # Desync check
             if actual_fee_ppm is not None and actual_fee_ppm > 0:
                 tracked = cached_state.last_broadcast_fee_ppm
@@ -1754,7 +1743,7 @@ class HillClimbingFeeController:
                         level='warn'
                     )
                     cached_state.last_broadcast_fee_ppm = actual_fee_ppm
-                    self._save_thompson_aimd_state(channel_id, cached_state)
+                    self._save_channel_fee_state(channel_id, cached_state)
             return cached_state
 
         # Load from database
@@ -1767,20 +1756,20 @@ class HillClimbingFeeController:
         except json.JSONDecodeError:
             v2_data = {}
 
-        # Check if this is Thompson+AIMD or needs migration
+        # Check if this is current format or needs migration
         if v2_data.get("algorithm_version") == "thompson_aimd_v1":
             # Load directly
-            state = ThompsonAIMDState.from_v2_dict(v2_data, db_state)
+            state = ChannelFeeState.from_v2_dict(v2_data, db_state)
         else:
             # Migration from HillClimbState
-            state = ThompsonAIMDState.from_v2_dict(v2_data, db_state)
+            state = ChannelFeeState.from_v2_dict(v2_data, db_state)
 
             # Stamp as migrated so we don't re-migrate on next restart
             state.algorithm_version = "thompson_aimd_v1"
-            self._save_thompson_aimd_state(channel_id, state)
+            self._save_channel_fee_state(channel_id, state)
 
-            if channel_id not in self._thompson_migrated_channels:
-                self._thompson_migrated_channels.add(channel_id)
+            if channel_id not in self._migrated_channels:
+                self._migrated_channels.add(channel_id)
                 self.plugin.log(
                     f"THOMPSON_MIGRATE: {channel_id[:12]}... migrated from Hill Climbing "
                     f"({len(state.thompson.observations)} observations from history)",
@@ -1798,14 +1787,14 @@ class HillClimbingFeeController:
                 )
                 state.last_broadcast_fee_ppm = actual_fee_ppm
 
-        self._thompson_aimd_states[channel_id] = state
+        self._channel_fee_states[channel_id] = state
         return state
 
-    def _save_thompson_aimd_state(self, channel_id: str, state: ThompsonAIMDState) -> None:
-        """Save Thompson+AIMD state to cache and database."""
+    def _save_channel_fee_state(self, channel_id: str, state: ChannelFeeState) -> None:
+        """Save channel fee state to cache and database."""
         import json
 
-        self._thompson_aimd_states[channel_id] = state
+        self._channel_fee_states[channel_id] = state
 
         # Serialize to v2 JSON format
         v2_data = state.to_v2_dict()
@@ -1831,11 +1820,11 @@ class HillClimbingFeeController:
             last_update=state.last_update
         )
 
-    def _get_or_create_thompson_aimd_state_for_channel(self, channel_id: str) -> ThompsonAIMDState:
-        """Return cached Thompson+AIMD state or a minimal persisted state shell."""
+    def _get_or_create_channel_fee_state(self, channel_id: str) -> ChannelFeeState:
+        """Return cached channel fee state or a minimal persisted state shell."""
         import json
 
-        cached_state = self._thompson_aimd_states.get(channel_id)
+        cached_state = self._channel_fee_states.get(channel_id)
         if cached_state is not None:
             return cached_state
 
@@ -1846,8 +1835,8 @@ class HillClimbingFeeController:
         except json.JSONDecodeError:
             v2_data = {}
 
-        state = ThompsonAIMDState.from_v2_dict(v2_data, db_state or {})
-        self._thompson_aimd_states[channel_id] = state
+        state = ChannelFeeState.from_v2_dict(v2_data, db_state or {})
+        self._channel_fee_states[channel_id] = state
         return state
 
     def _get_rebalance_cost_floor(
@@ -2014,10 +2003,10 @@ class HillClimbingFeeController:
             del self._hill_climb_states[key]
             pruned += 1
 
-        # Prune Thompson+AIMD states from memory
-        stale_thompson_keys = [k for k in self._thompson_aimd_states.keys() if k not in active_channel_ids]
+        # Prune channel fee states from memory
+        stale_thompson_keys = [k for k in self._channel_fee_states.keys() if k not in active_channel_ids]
         for key in stale_thompson_keys:
-            del self._thompson_aimd_states[key]
+            del self._channel_fee_states[key]
             pruned += 1
 
         # Also prune from database to prevent stale entries in debug output
@@ -2086,8 +2075,8 @@ class HillClimbingFeeController:
                     self._save_hill_climb_state(channel_id, state)
                     woken += 1
 
-            # Wake in-memory Thompson+AIMD states
-            for channel_id, ts_state in list(self._thompson_aimd_states.items()):
+            # Wake in-memory channel fee states
+            for channel_id, ts_state in list(self._channel_fee_states.items()):
                 changed = False
                 if ts_state.is_sleeping:
                     ts_state.is_sleeping = False
@@ -2098,14 +2087,14 @@ class HillClimbingFeeController:
                     ts_state.last_update = backdated
                     changed = True
                 if changed:
-                    self._save_thompson_aimd_state(channel_id, ts_state)
+                    self._save_channel_fee_state(channel_id, ts_state)
                     woken += 1
 
             # Also wake any channels in database not yet in memory.
             # Skip closed channels: only wake entries that match an
             # in-memory state (HC or Thompson) — those are the channels
             # that have been seen in a recent adjust_all_fees cycle.
-            active_ids = set(self._hill_climb_states.keys()) | set(self._thompson_aimd_states.keys())
+            active_ids = set(self._hill_climb_states.keys()) | set(self._channel_fee_states.keys())
             try:
                 db_states = self.database.get_all_fee_strategy_states()
                 for db_state in db_states:
@@ -2418,7 +2407,7 @@ class HillClimbingFeeController:
     def _should_force_gossip_refresh(
         self,
         channel_id: str,
-        state: Union[ThompsonAIMDState, HillClimbState],
+        state: Union[ChannelFeeState, HillClimbState],
         current_time: int
     ) -> bool:
         """
@@ -2468,7 +2457,7 @@ class HillClimbingFeeController:
         self,
         channel_id: str,
         peer_id: str,
-        state: Union[ThompsonAIMDState, HillClimbState],
+        state: Union[ChannelFeeState, HillClimbState],
         current_fee_ppm: int,
         current_time: int
     ) -> Optional[FeeAdjustment]:
@@ -2539,20 +2528,20 @@ class HillClimbingFeeController:
         state.last_update = current_time
         state.last_state = FeeReasonCode.GOSSIP_REFRESH.value
 
-        if isinstance(state, ThompsonAIMDState):
-            self._save_thompson_aimd_state(channel_id, state)
+        if isinstance(state, ChannelFeeState):
+            self._save_channel_fee_state(channel_id, state)
         else:
             self._save_hill_climb_state(channel_id, state)
 
         # Keep Thompson state coherent too, if already present.
-        if channel_id in self._thompson_aimd_states:
-            ts_state = self._thompson_aimd_states[channel_id]
+        if channel_id in self._channel_fee_states:
+            ts_state = self._channel_fee_states[channel_id]
             ts_state.last_gossip_refresh = current_time
             ts_state.last_fee_ppm = nudge_fee
             ts_state.last_broadcast_fee_ppm = nudge_fee
             ts_state.last_update = current_time
             ts_state.last_state = FeeReasonCode.GOSSIP_REFRESH.value
-            self._save_thompson_aimd_state(channel_id, ts_state)
+            self._save_channel_fee_state(channel_id, ts_state)
 
         return FeeAdjustment(
             channel_id=channel_id,
@@ -2638,7 +2627,7 @@ class HillClimbingFeeController:
         # Reduces gossip noise by suppressing fee updates when the market is stable
         # =====================================================================
         # Use ts_state for sleep decisions
-        _ts_sleep_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+        _ts_sleep_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
         _sleep_is_sleeping = _ts_sleep_state.is_sleeping
         _sleep_until = _ts_sleep_state.sleep_until
         _sleep_last_update = _ts_sleep_state.last_update
@@ -2651,7 +2640,7 @@ class HillClimbingFeeController:
                 _ts_sleep_state.is_sleeping = False
                 _ts_sleep_state.sleep_until = 0
                 _ts_sleep_state.stable_cycles = 0
-                self._save_thompson_aimd_state(channel_id, _ts_sleep_state)
+                self._save_channel_fee_state(channel_id, _ts_sleep_state)
                 hc_state.is_sleeping = False
                 hc_state.sleep_until = 0
                 hc_state.stable_cycles = 0
@@ -2688,7 +2677,7 @@ class HillClimbingFeeController:
                     _ts_sleep_state.is_sleeping = False
                     _ts_sleep_state.sleep_until = 0
                     _ts_sleep_state.stable_cycles = 0
-                    self._save_thompson_aimd_state(channel_id, _ts_sleep_state)
+                    self._save_channel_fee_state(channel_id, _ts_sleep_state)
                     hc_state.is_sleeping = False
                     hc_state.sleep_until = 0
                     hc_state.stable_cycles = 0
@@ -2861,19 +2850,10 @@ class HillClimbingFeeController:
         if vegas_multiplier > 1.0:
             base_floor_ppm = int(base_floor_ppm * vegas_multiplier)
 
-        # Snapshot hard safety floor BEFORE heuristic floors are applied.
-        # DTS+PID uses this instead of floor_ppm, which includes balance_floor
-        # and saturation_floor — heuristics the PID is designed to replace.
-        _hard_floor_ppm = base_floor_ppm
-
-
-
         # =====================================================================
         # Issue #32: Rebalance Cost-Aware Fee Floor
         # =====================================================================
         # SOURCE channels should charge fees sufficient to recover rebalance costs.
-        # This prevents the scenario where a channel charges 80ppm but costs 100ppm
-        # to rebalance, guaranteeing losses on every forwarded sat.
         rebalance_floor_ppm = self._get_rebalance_cost_floor(
             channel_id, peer_id, flow_state
         )
@@ -2885,85 +2865,31 @@ class HillClimbingFeeController:
             )
             base_floor_ppm = rebalance_floor_ppm
 
-        # Include rebalance cost in hard floor (economic constraint, not heuristic)
-        if rebalance_floor_ppm is not None:
-            _hard_floor_ppm = max(_hard_floor_ppm, rebalance_floor_ppm)
-
-        base_ceiling_ppm = cfg.max_fee_ppm
-
         # =====================================================================
         # Issue #20: Flow-Based Ceiling Reduction
         # =====================================================================
-        # High-fee channels with no flow for extended periods should have their
-        # ceiling reduced to enable price discovery.
+        # High-fee channels with no flow for extended periods get lower ceiling
+        # to enable price discovery.
+        base_ceiling_ppm = cfg.max_fee_ppm
         base_ceiling_ppm = self._get_flow_adjusted_ceiling(
             channel_id, current_fee_ppm, base_ceiling_ppm
         )
 
-        # Snapshot hard ceiling BEFORE saturation drain ceiling is applied.
-        # DTS+PID uses this — saturation drain is a heuristic the PID replaces.
-        _hard_ceiling_ppm = base_ceiling_ppm
-
-
-
-        # =====================================================================
-        # IMPROVEMENT #1: Apply Multipliers to Bounds (Not Fee Directly)
-        # =====================================================================
-        # Instead of: new_fee = base_fee * liquidity_mult * prof_mult
-        # We do:      floor = base_floor * liquidity_mult (scarce = higher floor)
-        #             ceiling = base_ceiling / prof_mult (unprofitable = lower ceiling)
-        # This prevents oscillation from stacking multipliers on the fee itself
-        # =====================================================================
-        # Liquidity multiplier raises floor (scarce liquidity = higher minimum)
-        floor_multiplier = min(liquidity_multiplier, self.MAX_FLOOR_MULTIPLIER)
-        floor_ppm = int(base_floor_ppm * floor_multiplier)
-
-        # Profitability multiplier lowers ceiling for unprofitable channels
-        # If profitability_multiplier > 1, channel is unprofitable, lower ceiling
-        # If profitability_multiplier < 1, channel is profitable, raise ceiling
-        if profitability_multiplier > 1.0:
-            ceiling_multiplier = max(1.0 / profitability_multiplier, self.MIN_CEILING_MULTIPLIER)
-        else:
-            ceiling_multiplier = 1.0  # Don't raise ceiling above max
-        ceiling_ppm = int(base_ceiling_ppm * ceiling_multiplier)
+        # Final bounds used by all paths (DTS+PID, congestion, probe)
+        floor_ppm = base_floor_ppm
+        ceiling_ppm = base_ceiling_ppm
 
         # Security: Ensure floor never exceeds ceiling
-        # Issue #18/#32: When protective floor is active, raise ceiling instead of lowering floor
         if floor_ppm >= ceiling_ppm:
-            if effective_floor > cfg.min_fee_ppm:
-                # Protective floor is active - raise ceiling to preserve cost recovery
-                ceiling_ppm = floor_ppm + 10
-                self.plugin.log(
-                    f"SCARCITY_GUARD: {channel_id[:12]}... ceiling raised to {ceiling_ppm} "
-                    f"to preserve effective floor of {effective_floor}",
-                    level='info'
-                )
-            else:
-                # Normal case - lower floor to fit ceiling
-                floor_ppm = max(1, ceiling_ppm - 10)
-
-        self.plugin.log(
-            f"BOUNDS_MULT: {channel_id[:12]}... floor={base_floor_ppm}->{floor_ppm} "
-            f"(x{floor_multiplier:.2f}), ceiling={base_ceiling_ppm}->{ceiling_ppm} "
-            f"(x{ceiling_multiplier:.2f})",
-            level='debug'
-        )
+            ceiling_ppm = floor_ppm + 10
         
-        # =====================================================================
-        # PRIORITY OVERRIDE: Zero-Fee Probe > Fire Sale
-        # =====================================================================
-        # The Alpha Sequence priority is: Congestion > Zero-Fee Probe > Thompson/Hill Climbing
-        # NOTE: FIRE_SALE removed in v2.2.3 - Thompson Sampling handles price discovery
-        # =====================================================================
-
         # Target Decision Block (The Alpha Sequence)
-        # M-10: Initialize decision_reason before any branch can use it
+        # Priority: Congestion > Zero-Fee Probe > DTS+PID
         decision_reason = "unknown"
-        base_new_fee = None  # For observability; set in Hill Climbing branch
+        base_new_fee = None
         new_fee_ppm = 0
         target_found = False
-        # (HeuristicModifiers and cold_start removed in Phase 2 - DTS+PID doesn't use them)
-        volatility_reset = False  # Default; set True only inside Hill Climbing/Thompson volatility paths
+        volatility_reset = False
 
         # Priority 1: Congestion (Emergency High Fee)
         if is_congested:
@@ -2978,11 +2904,11 @@ class HillClimbingFeeController:
 
             # Synthetic observation: Thompson bypassed, inject at reduced weight
             try:
-                ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+                ts_state_synth = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
                 ts_state_synth.thompson.inject_synthetic_observation(
                     ceiling_ppm, current_revenue_rate, weight_scale=0.3
                 )
-                self._save_thompson_aimd_state(channel_id, ts_state_synth)
+                self._save_channel_fee_state(channel_id, ts_state_synth)
             except Exception as e:
                 self.plugin.log(f"Synthetic Thompson state injection failed for {channel_id[:12]}...: {e}", level='debug')
 
@@ -3027,12 +2953,12 @@ class HillClimbingFeeController:
 
                 # Synthetic observation: probe succeeded at floor fee
                 try:
-                    ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+                    ts_state_synth = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
                     probe_revenue = (v_since * new_fee_ppm) / 1_000_000 if v_since > 0 else 0.0
                     ts_state_synth.thompson.inject_synthetic_observation(
                         new_fee_ppm, probe_revenue, weight_scale=0.2
                     )
-                    self._save_thompson_aimd_state(channel_id, ts_state_synth)
+                    self._save_channel_fee_state(channel_id, ts_state_synth)
                 except Exception as e:
                     self.plugin.log(f"Synthetic Thompson state injection (probe success) failed for {channel_id[:12]}...: {e}", level='debug')
             else:
@@ -3049,11 +2975,11 @@ class HillClimbingFeeController:
 
                 # Synthetic observation: probing with 0 fee, no revenue
                 try:
-                    ts_state_synth = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+                    ts_state_synth = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
                     ts_state_synth.thompson.inject_synthetic_observation(
                         0, 0.0, weight_scale=0.1
                     )
-                    self._save_thompson_aimd_state(channel_id, ts_state_synth)
+                    self._save_channel_fee_state(channel_id, ts_state_synth)
                 except Exception as e:
                     self.plugin.log(f"Synthetic Thompson state injection (probe active) failed for {channel_id[:12]}...: {e}", level='debug')
 
@@ -3070,8 +2996,8 @@ class HillClimbingFeeController:
             # Defense: AIMD provides rapid response to routing failures
             # =====================================================================
 
-            # Load Thompson+AIMD state
-            ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+            # Load channel fee state
+            ts_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
             # Track rate change for logging and hysteresis
             rate_change = current_revenue_rate - ts_state.last_revenue_rate
             previous_rate = ts_state.last_revenue_rate
@@ -3113,7 +3039,7 @@ class HillClimbingFeeController:
                     ts_state.last_fee_ppm = current_fee_ppm
                     ts_state.last_volume_sats = volume_since_sats
                     ts_state.last_update = now
-                    self._save_thompson_aimd_state(channel_id, ts_state)
+                    self._save_channel_fee_state(channel_id, ts_state)
                     # Reset hc_state observation timer so post-sleep window
                     # doesn't span the entire sleep period
                     hc_state.last_update = now
@@ -3211,11 +3137,7 @@ class HillClimbingFeeController:
                 flow_state=flow_state_str,
             )
             new_fee_ppm = int(thompson_fee * pid_multiplier)
-
-            # Use hard safety constraints only — bypass legacy heuristic
-            # floors (balance_floor, saturation_floor) and ceilings
-            # (saturation_drain) that the PID is designed to replace.
-            new_fee_ppm = max(_hard_floor_ppm, min(_hard_ceiling_ppm, new_fee_ppm))
+            new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
 
             decision_reason = (
                 f"dts_pid (dts={thompson_fee}, pid={pid_multiplier:.2f}, "
@@ -3224,24 +3146,14 @@ class HillClimbingFeeController:
 
             # Update volume tracking
             ts_state.last_volume_sats = volume_since_sats
-
-            # Align downstream vars to hard constraints
-            effective_ceiling = _hard_ceiling_ppm
-            floor_ppm = _hard_floor_ppm
             base_new_fee = new_fee_ppm
 
-            # Mark target found
             target_found = True
 
-            # =====================================================================
-            # Thompson+AIMD State Saving and Result Preparation
-            # =====================================================================
+            # State saving and result preparation
             new_direction = 1 if new_fee_ppm > current_fee_ppm else (-1 if new_fee_ppm < current_fee_ppm else 0)
-            step_ppm = abs(new_fee_ppm - current_fee_ppm)  # For logging compatibility
-            original_step_ppm = step_ppm  # Thompson: no heuristic step modifiers
-
-            # Mark target as found
-            target_found = True
+            step_ppm = abs(new_fee_ppm - current_fee_ppm)
+            original_step_ppm = step_ppm
 
             # Build the hc_state alias for end-of-method compatibility
             # (Thompson state will be saved separately)
@@ -3309,13 +3221,13 @@ class HillClimbingFeeController:
             hc_state.last_update = now
             self._save_hill_climb_state(channel_id, hc_state)
 
-            if channel_id in self._thompson_aimd_states:
+            if channel_id in self._channel_fee_states:
                 try:
-                    ts_state = self._thompson_aimd_states[channel_id]
+                    ts_state = self._channel_fee_states[channel_id]
                     ts_state.last_revenue_rate = current_revenue_rate
                     ts_state.last_fee_ppm = current_fee_ppm
                     ts_state.last_update = now
-                    self._save_thompson_aimd_state(channel_id, ts_state)
+                    self._save_channel_fee_state(channel_id, ts_state)
                 except Exception as e:
                     self.plugin.log(
                         f"ALPHA_GUARD: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
@@ -3378,14 +3290,14 @@ class HillClimbingFeeController:
             # was already updated with the current observation window's data (at the
             # update_posterior call above). If we don't reset the timer, the next cycle
             # would re-use the same accumulated volume/revenue, double-counting observations.
-            if channel_id in self._thompson_aimd_states:
+            if channel_id in self._channel_fee_states:
                 try:
-                    ts_state = self._thompson_aimd_states[channel_id]
+                    ts_state = self._channel_fee_states[channel_id]
                     ts_state.last_fee_ppm = new_fee_ppm
                     ts_state.last_revenue_rate = current_revenue_rate
                     ts_state.last_state = decision_reason
                     ts_state.last_update = now
-                    self._save_thompson_aimd_state(channel_id, ts_state)
+                    self._save_channel_fee_state(channel_id, ts_state)
                 except Exception as e:
                     self.plugin.log(
                         f"HYSTERESIS: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
@@ -3405,7 +3317,7 @@ class HillClimbingFeeController:
         ema_note = f" (raw={raw_revenue_rate:.2f})" if raw_revenue_rate != current_revenue_rate else ""
 
         # Build reason string for DTS+PID
-        ts_state_local = self._thompson_aimd_states.get(channel_id)
+        ts_state_local = self._channel_fee_states.get(channel_id)
         if ts_state_local:
             thompson_info = (
                 f"posterior_mean={ts_state_local.thompson.posterior_mean:.0f}, "
@@ -3431,15 +3343,15 @@ class HillClimbingFeeController:
             hc_state.last_update = now  # Reset observation timer
             self._save_hill_climb_state(channel_id, hc_state)
 
-            # Save Thompson+AIMD state if that algorithm was used
-            if channel_id in self._thompson_aimd_states:
-                ts_state = self._thompson_aimd_states[channel_id]
+            # Save channel fee state
+            if channel_id in self._channel_fee_states:
+                ts_state = self._channel_fee_states[channel_id]
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = raw_chain_fee
                 ts_state.last_broadcast_fee_ppm = new_fee_ppm
                 ts_state.last_state = decision_reason
                 ts_state.last_update = now
-                self._save_thompson_aimd_state(channel_id, ts_state)
+                self._save_channel_fee_state(channel_id, ts_state)
 
             self.plugin.log(
                 f"IDEMPOTENT: {channel_id[:12]}... target fee {new_fee_ppm} ppm already set on chain. "
@@ -3479,15 +3391,15 @@ class HillClimbingFeeController:
             hc_state.last_update = now
             self._save_hill_climb_state(channel_id, hc_state)
 
-            # Save Thompson+AIMD state if that algorithm was used
-            if channel_id in self._thompson_aimd_states:
-                ts_state = self._thompson_aimd_states[channel_id]
+            # Save channel fee state
+            if channel_id in self._channel_fee_states:
+                ts_state = self._channel_fee_states[channel_id]
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = current_fee_ppm
                 ts_state.last_broadcast_fee_ppm = new_fee_ppm
                 ts_state.last_state = decision_reason
                 ts_state.last_update = now
-                self._save_thompson_aimd_state(channel_id, ts_state)
+                self._save_channel_fee_state(channel_id, ts_state)
 
             self.plugin.log(
                 f"FEE: {channel_id[:12]}... {current_fee_ppm}->{new_fee_ppm}ppm "
@@ -3524,13 +3436,13 @@ class HillClimbingFeeController:
         hc_state.last_update = now
         self._save_hill_climb_state(channel_id, hc_state)
 
-        if channel_id in self._thompson_aimd_states:
+        if channel_id in self._channel_fee_states:
             try:
-                ts_state = self._thompson_aimd_states[channel_id]
+                ts_state = self._channel_fee_states[channel_id]
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = current_fee_ppm
                 ts_state.last_update = now
-                self._save_thompson_aimd_state(channel_id, ts_state)
+                self._save_channel_fee_state(channel_id, ts_state)
             except Exception as e:
                 self.plugin.log(
                     f"RPC_FAIL_STATE: Failed to persist Thompson state for {channel_id[:12]}...: {e}",
@@ -3612,13 +3524,13 @@ class HillClimbingFeeController:
                         f"MANUAL_WAKE: Channel {channel_id[:12]}... woken due to manual fee change",
                         level='info'
                     )
-            if manual and channel_id in self._thompson_aimd_states:
-                ts_state = self._thompson_aimd_states[channel_id]
+            if manual and channel_id in self._channel_fee_states:
+                ts_state = self._channel_fee_states[channel_id]
                 if ts_state.is_sleeping:
                     ts_state.is_sleeping = False
                     ts_state.sleep_until = 0
                     ts_state.stable_cycles = 0
-                    self._save_thompson_aimd_state(channel_id, ts_state)
+                    self._save_channel_fee_state(channel_id, ts_state)
 
         try:
             # Get channel info to find peer ID and current fee
@@ -3695,7 +3607,7 @@ class HillClimbingFeeController:
                         self.plugin.log(f"STATE_SYNC: Failed to update hill state for {channel_id}: {e}", level="debug")
 
                     try:
-                        ts_state = self._get_thompson_aimd_state(channel_id, peer_id, actual_fee_ppm=fee_ppm)
+                        ts_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=fee_ppm)
                         ts_state.is_sleeping = False
                         ts_state.sleep_until = 0
                         ts_state.stable_cycles = 0
@@ -3703,7 +3615,7 @@ class HillClimbingFeeController:
                         ts_state.last_broadcast_fee_ppm = fee_ppm
                         ts_state.last_update = now
                         ts_state.last_state = reason_code or "manual"
-                        self._save_thompson_aimd_state(channel_id, ts_state)
+                        self._save_channel_fee_state(channel_id, ts_state)
                     except Exception as e:
                         self.plugin.log(f"STATE_SYNC: Failed to update Thompson state for {channel_id}: {e}", level="debug")
             
@@ -4330,5 +4242,7 @@ class HillClimbingFeeController:
     
 
 
-# Keep alias for backward compatibility
-PIDFeeController = HillClimbingFeeController
+# Keep aliases for backward compatibility
+PIDFeeController = FeeController
+HillClimbingFeeController = FeeController
+ThompsonAIMDState = ChannelFeeState

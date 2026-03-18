@@ -3,7 +3,7 @@ cl-revenue-ops modules package
 
 This package contains the core modules for the Revenue Operations plugin:
 - flow_analysis: Sink/Source detection and flow metrics
-- fee_controller: Hill Climbing (Perturb & Observe) dynamic fee optimization
+- fee_controller: DTS+PID dynamic fee optimization
 - rebalancer: EV-based profit-aware rebalancing
 - config: Configuration and constants
 - database: SQLite storage layer
@@ -11,7 +11,7 @@ This package contains the core modules for the Revenue Operations plugin:
 """
 
 from .flow_analysis import FlowAnalyzer, ChannelState, FlowMetrics
-from .fee_controller import PIDFeeController
+from .fee_controller import FeeController
 from .rebalancer import EVRebalancer, RebalanceCandidate
 from .config import Config
 from .database import Database
@@ -21,7 +21,7 @@ __all__ = [
     'FlowAnalyzer',
     'ChannelState',
     'FlowMetrics',
-    'PIDFeeController',
+    'FeeController',
     'EVRebalancer',
     'RebalanceCandidate',
     'Config',

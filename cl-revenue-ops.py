@@ -33,7 +33,7 @@ from pyln.client import Plugin, RpcError
 
 # Import our modules
 from modules.flow_analysis import FlowAnalyzer, ChannelState
-from modules.fee_controller import PIDFeeController
+from modules.fee_controller import FeeController
 from modules.rebalancer import EVRebalancer
 from modules.config import Config
 from modules.database import Database
@@ -460,7 +460,7 @@ class ThreadSafePluginProxy:
 
 # Global instances (initialized in init)
 flow_analyzer: Optional[FlowAnalyzer] = None
-fee_controller: Optional[PIDFeeController] = None
+fee_controller: Optional[FeeController] = None
 rebalancer: Optional[EVRebalancer] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
@@ -1401,7 +1401,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize analysis modules
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
     capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager)
-    fee_controller = PIDFeeController(
+    fee_controller = FeeController(
         safe_plugin,
         config,
         database,
@@ -2403,9 +2403,9 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         return {"error": "Plugin not fully initialized"}
 
     # Import fee controller constants for accurate debug output
-    from modules.fee_controller import HillClimbingFeeController
-    min_obs_hours = HillClimbingFeeController.MIN_OBSERVATION_HOURS
-    min_forwards = HillClimbingFeeController.MIN_FORWARDS_FOR_SIGNAL
+    from modules.fee_controller import FeeController
+    min_obs_hours = FeeController.MIN_OBSERVATION_HOURS
+    min_forwards = FeeController.MIN_FORWARDS_FOR_SIGNAL
 
     now = int(time.time())
     result = {
