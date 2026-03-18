@@ -2818,7 +2818,7 @@ class FeeController:
         current_revenue_rate = smoothed_revenue_rate
 
         # Get capacity and balance for liquidity adjustments
-        capacity = channel_info.get("capacity", 1)
+        capacity = channel_info.get("capacity") or 2_000_000
         spendable = parse_msat(channel_info.get("spendable_msat", 0)) // 1000
         outbound_ratio = spendable / capacity if capacity > 0 else 0.5
         
@@ -3123,7 +3123,7 @@ class FeeController:
             except Exception:
                 flow_state_str = "balanced"
 
-            capacity = channel_info.get("capacity", 2_000_000)
+            capacity = channel_info.get("capacity") or 2_000_000
             pid_multiplier = ts_state.pid.calculate_multiplier(
                 current_outbound_ratio=outbound_ratio,
                 capacity_sats=capacity,
@@ -3199,7 +3199,7 @@ class FeeController:
         if current_fee_ppm < 100:
             min_change = 1
         else:
-            min_change = max(5, current_fee_ppm * 0.03)
+            min_change = max(5, (current_fee_ppm * 3 + 99) // 100)  # Ceiling of 3%
             
         if fee_change < min_change and not is_congested and not htlcmin_policy_change:
             # CRITICAL: Reset observation timer so the next cycle doesn't
