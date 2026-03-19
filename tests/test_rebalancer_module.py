@@ -619,7 +619,11 @@ class TestExtractFeePpm:
 
 class TestFeeSatsFromTotalSpent:
     """Change 10c: Verify _handle_job_success uses total_spent_sats when
-    other fee fields are missing."""
+    other fee fields are missing.
+
+    B5 FIX: total_spent_sats = principal + fee.  Fee is derived as
+    total_spent - amount_transferred (not used raw as fee).
+    """
 
     def test_fee_from_total_spent_sats(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -652,16 +656,17 @@ class TestFeeSatsFromTotalSpent:
         mock_database.record_rebalance_cost = MagicMock()
         mock_database.mark_budget_spent = MagicMock()
 
+        # B5: total_spent_sats = principal (50000) + fee (25) = 50025
         stats = {
             "successes_in_time_window": {
                 "total_amount_sats": 50000,
-                "total_spent_sats": 25,
+                "total_spent_sats": 50025,
             }
         }
 
         jm._handle_job_success(job, 50000, stats)
 
-        # Verify fee_sats=25 was used in record_rebalance_cost
+        # Verify fee_sats=25 (50025 - 50000) was used in record_rebalance_cost
         mock_database.record_rebalance_cost.assert_called_once()
         call_kwargs = mock_database.record_rebalance_cost.call_args
         assert call_kwargs[1]["cost_sats"] == 25 or call_kwargs[0][2] == 25

@@ -856,3 +856,220 @@ class TestB4StopAllJobsBudget:
             f"PENDING job (rebalance_id={job_pending.rebalance_id}) should have "
             f"its budget released. But release_budget_reservation was called with: {released_ids}"
         )
+
+
+# ============================================================================
+# 9. B5: _handle_job_success total_spent_sats used as fee
+# ============================================================================
+
+
+class TestB5TotalSpentSatsAsFee:
+    """B5: Third fallback in _handle_job_success treats total_spent_sats
+    (principal + fee) as just fee.  This massively overcounts the fee.
+    The fix derives fee as total_spent - amount_transferred.
+    """
+
+    def _make_job_manager(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+        return jm
+
+    def test_total_spent_derives_fee_not_raw(self, mock_plugin, mock_database):
+        """When only total_spent_sats is available (50010 for 50000 amount),
+        fee should be ~10, not 50010."""
+        jm = self._make_job_manager(mock_plugin, mock_database)
+
+        job = _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=42)
+        amount_transferred = 50000
+
+        # Stats: no fee_total_sats, no fee_total_msat, only total_spent_sats
+        stats = {
+            "successes_in_time_window": {
+                "total_spent_sats": 50010,  # principal (50000) + fee (10)
+            }
+        }
+
+        # Stub stop_job to avoid sling RPC
+        jm.stop_job = MagicMock(return_value=True)
+
+        jm._handle_job_success(job, amount_transferred, stats)
+
+        # Fee should be 10, not 50010
+        call_args = mock_database.update_rebalance_result.call_args
+        actual_fee = call_args[0][2]  # positional arg: fee_sats
+        assert actual_fee == 10, (
+            f"Expected fee_sats=10 (total_spent 50010 - amount 50000), "
+            f"got fee_sats={actual_fee}. Bug B5: total_spent_sats treated as fee."
+        )
+
+    def test_total_spent_less_than_amount_skips_fallback(self, mock_plugin, mock_database):
+        """When total_spent_sats <= amount_transferred, the fallback should not
+        set fee_sats (would produce negative or zero fee)."""
+        jm = self._make_job_manager(mock_plugin, mock_database)
+
+        job = _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=43)
+        amount_transferred = 50000
+
+        # total_spent_sats == amount (no fee component detectable)
+        stats = {
+            "successes_in_time_window": {
+                "total_spent_sats": 50000,
+            }
+        }
+
+        jm.stop_job = MagicMock(return_value=True)
+        jm._handle_job_success(job, amount_transferred, stats)
+
+        # fee_sats should NOT be 50000 (the old bug); it should be the
+        # conservative estimate from the fallback estimator
+        call_args = mock_database.update_rebalance_result.call_args
+        actual_fee = call_args[0][2]
+        assert actual_fee != 50000, (
+            f"fee_sats should not be {actual_fee} (== amount_transferred). "
+            f"total_spent == amount means no fee detectable via this path."
+        )
+
+
+# ============================================================================
+# 10. B6: Profit reconciliation inflated for legacy candidates
+# ============================================================================
+
+
+class TestB6ProfitReconciliationInflated:
+    """B6: When expected_fee_sats==0 (legacy candidates), the profit
+    reconciliation falls back to max_budget_sats as assumed fee, inflating
+    actual_profit.  Fix: use fee_sats as fallback so delta is zero.
+    """
+
+    def _make_job_manager(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        return JobManager(mock_plugin, cfg, mock_database)
+
+    def test_legacy_candidate_profit_not_inflated(self, mock_plugin, mock_database):
+        """With expected_fee_sats=0, max_budget_sats=10, fee_sats=3,
+        expected_profit=5:
+          Without fix: assumed_fee=10 -> actual_profit=5+(10-3)=12 (INFLATED)
+          With fix:    assumed_fee=3  -> actual_profit=5+(3-3)=5  (correct)
+        """
+        from modules.rebalancer import RebalanceCandidate
+        jm = self._make_job_manager(mock_plugin, mock_database)
+
+        cand = _candidate(amount_sats=50000)
+        # Override the fields relevant to B6
+        cand = RebalanceCandidate(
+            source_candidates=cand.source_candidates,
+            to_channel=cand.to_channel,
+            primary_source_peer_id=cand.primary_source_peer_id,
+            to_peer_id=cand.to_peer_id,
+            amount_sats=cand.amount_sats,
+            amount_msat=cand.amount_msat,
+            outbound_fee_ppm=cand.outbound_fee_ppm,
+            inbound_fee_ppm=cand.inbound_fee_ppm,
+            source_fee_ppm=cand.source_fee_ppm,
+            weighted_opp_cost_ppm=cand.weighted_opp_cost_ppm,
+            spread_ppm=cand.spread_ppm,
+            max_budget_sats=10,
+            max_budget_msat=10_000,
+            max_fee_ppm=2000,
+            expected_profit_sats=5,
+            expected_fee_sats=0,  # Legacy: no expected_fee_sats
+            liquidity_ratio=0.1,
+            dest_flow_state="balanced",
+            dest_turnover_rate=0.0,
+            source_turnover_rate=0.0,
+        )
+
+        job = _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=44,
+                          candidate=cand)
+
+        # Stats that produce fee_sats=3 (via fee_total_sats)
+        stats = {"fee_total_sats": 3}
+
+        jm.stop_job = MagicMock(return_value=True)
+        jm._handle_job_success(job, 50000, stats)
+
+        call_args = mock_database.update_rebalance_result.call_args
+        actual_profit = call_args[0][3]  # positional arg: actual_profit
+        assert actual_profit == 5, (
+            f"Expected actual_profit=5 (no inflation), got {actual_profit}. "
+            f"Bug B6: max_budget_sats (10) used as assumed_fee when "
+            f"expected_fee_sats==0, inflating profit to {5 + (10 - 3)}=12."
+        )
+
+
+# ============================================================================
+# 11. B7: _handle_job_failure ignores partial fee spend
+# ============================================================================
+
+
+class TestB7PartialFeeSpendOnFailure:
+    """B7: _handle_job_failure unconditionally calls release_budget_reservation
+    without checking for partial fees from failed payment attempts.
+    Fix: check for partial fees and call mark_budget_spent if > 0.
+    """
+
+    def _make_job_manager(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        return JobManager(mock_plugin, cfg, mock_database)
+
+    def test_failure_with_partial_fee_calls_mark_budget_spent(self, mock_plugin, mock_database):
+        """Failure with fee_total_msat: '5000msat' -> should call
+        mark_budget_spent('42', 5), NOT release_budget_reservation."""
+        jm = self._make_job_manager(mock_plugin, mock_database)
+
+        job = _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=42)
+
+        stats = {
+            "last_error": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+            "fee_total_msat": "5000msat",
+        }
+
+        jm.stop_job = MagicMock(return_value=True)
+        jm._handle_job_failure(job, stats)
+
+        # Should call mark_budget_spent, NOT release_budget_reservation
+        mock_database.mark_budget_spent.assert_called_once_with("42", 5)
+        mock_database.release_budget_reservation.assert_not_called()
+
+    def test_failure_with_no_fees_calls_release(self, mock_plugin, mock_database):
+        """Failure with no fee info -> should call release_budget_reservation."""
+        jm = self._make_job_manager(mock_plugin, mock_database)
+
+        job = _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=43)
+
+        stats = {
+            "last_error": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+        }
+
+        jm.stop_job = MagicMock(return_value=True)
+        jm._handle_job_failure(job, stats)
+
+        # No partial fee -> should release the reservation
+        mock_database.release_budget_reservation.assert_called_once_with("43")
+        mock_database.mark_budget_spent.assert_not_called()
+
+    def test_failure_with_fee_total_sats_calls_mark_budget_spent(self, mock_plugin, mock_database):
+        """Failure with fee_total_sats (no msat) -> should call mark_budget_spent."""
+        jm = self._make_job_manager(mock_plugin, mock_database)
+
+        job = _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=44)
+
+        stats = {
+            "last_error": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+            "fee_total_sats": 8,
+        }
+
+        jm.stop_job = MagicMock(return_value=True)
+        jm._handle_job_failure(job, stats)
+
+        mock_database.mark_budget_spent.assert_called_once_with("44", 8)
+        mock_database.release_budget_reservation.assert_not_called()

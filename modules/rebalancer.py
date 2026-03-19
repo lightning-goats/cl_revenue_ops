@@ -1027,10 +1027,13 @@ class JobManager:
             fee_msat = self._parse_msat(stats.get("fee_total_msat"))
             fee_sats = fee_msat // 1000 if fee_msat else 0
         if not fee_sats:
-            # Per-scid detailed stats provide total_spent_sats
+            # B5 FIX: total_spent_sats includes principal + fee.
+            # Derive fee as total_spent - amount_transferred.
             successes = stats.get("successes_in_time_window")
             if isinstance(successes, dict):
-                fee_sats = self._parse_sats(successes.get("total_spent_sats"))
+                total_spent = self._parse_sats(successes.get("total_spent_sats"))
+                if total_spent and total_spent > amount_transferred:
+                    fee_sats = total_spent - amount_transferred
         
         # Estimate fee from amount if sling doesn't report it
         if fee_sats == 0 and amount_transferred > 0:
@@ -1040,9 +1043,10 @@ class JobManager:
         # Calculate actual profit
         # expected_profit was computed as: income - expected_fee - source_loss
         # Actual profit replaces expected_fee with the real fee paid.
-        # When expected_fee_sats is 0 (legacy candidates), fall back to max_budget_sats.
+        # B6 FIX: When expected_fee_sats==0 (legacy candidates), use fee_sats
+        # to avoid inflation from max_budget_sats fallback.
         expected_profit = job.candidate.expected_profit_sats
-        assumed_fee = job.candidate.expected_fee_sats or job.candidate.max_budget_sats
+        assumed_fee = job.candidate.expected_fee_sats or fee_sats
         actual_profit = expected_profit + (assumed_fee - fee_sats)
         
         self.plugin.log(
@@ -1119,9 +1123,18 @@ class JobManager:
             with self._source_failures_lock:
                 self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
 
-        # Release budget reservation (CRITICAL-01 fix)
-        # H-4: Ensure reservation_id is str to match DB column type
-        self.database.release_budget_reservation(str(job.rebalance_id))
+        # B7 FIX: Check for partial fee spend before releasing budget.
+        partial_fee_sats = 0
+        fee_msat = self._parse_msat(stats.get("fee_total_msat"))
+        if fee_msat:
+            partial_fee_sats = fee_msat // 1000
+        if not partial_fee_sats:
+            partial_fee_sats = self._parse_sats(stats.get("fee_total_sats"))
+
+        if partial_fee_sats > 0:
+            self.database.mark_budget_spent(str(job.rebalance_id), partial_fee_sats)
+        else:
+            self.database.release_budget_reservation(str(job.rebalance_id))
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
