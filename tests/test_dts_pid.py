@@ -11,6 +11,7 @@ from modules.fee_controller import (
     FeeController,
     PIDState,
     ChannelFeeState,
+    ChannelCycleState,
 )
 
 
@@ -350,11 +351,10 @@ class TestDTSPIDIntegration:
 
     def test_pid_state_persisted_after_adjustment(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        result = fc._adjust_channel_fee(
+        fc._adjust_channel_fee(
             "123x456x0", "02" + "a" * 64, self._state(),
             self._channel_info(), cfg=cfg
         )
-        assert result is not None
         assert mock_database.update_fee_strategy_state.called
         call_kwargs = mock_database.update_fee_strategy_state.call_args
         v2_json = call_kwargs.kwargs.get("v2_state_json") or call_kwargs[1].get("v2_state_json", "{}")
@@ -487,6 +487,219 @@ class TestPIDEdgeCases:
         assert math.isfinite(m) and 0.1 <= m <= 10.0
         assert math.isfinite(pid.ewma_error)
         assert math.isfinite(pid.integral_error)
+
+
+class TestDTSPIDStabilityCaps:
+    def _state(self, flow="balanced_active"):
+        return {"state": flow, "forward_count": 50, "sats_out": 10_000}
+
+    def _channel_info(self, *, current_fee_ppm=500, outbound_pct=50.0):
+        capacity_sats = 2_000_000
+        spendable_sats = int(capacity_sats * (outbound_pct / 100.0))
+        return {
+            "fee_proportional_millionths": current_fee_ppm,
+            "capacity": capacity_sats,
+            "spendable_msat": f"{spendable_sats * 1000}msat",
+            "opener": "local",
+        }
+
+    def _prepare_channel(
+        self,
+        fc,
+        mock_database,
+        channel_id,
+        peer_id,
+        *,
+        current_fee_ppm,
+        flow="balanced_active",
+        outbound_pct=50.0,
+        sleeping=False,
+        sleep_until=0,
+    ):
+        now = int(time.time())
+        mock_database.get_channel_state.return_value = {
+            "kalman_flow_ratio": outbound_pct / 100.0,
+            "kalman_velocity": 0.0,
+            "state": flow,
+        }
+
+        cycle = ChannelCycleState(
+            last_revenue_rate=5.0,
+            last_fee_ppm=current_fee_ppm,
+            last_update=now - 7200,
+            last_broadcast_fee_ppm=current_fee_ppm,
+            is_sleeping=sleeping,
+            sleep_until=sleep_until,
+            stable_cycles=3 if sleeping else 0,
+        )
+        fc._cycle_states[channel_id] = cycle
+
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=current_fee_ppm)
+        ts_state.last_revenue_rate = 5.0
+        ts_state.last_fee_ppm = current_fee_ppm
+        ts_state.last_broadcast_fee_ppm = current_fee_ppm
+        ts_state.last_update = now - 7200
+        ts_state.is_sleeping = sleeping
+        ts_state.sleep_until = sleep_until
+        ts_state.stable_cycles = 3 if sleeping else 0
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = now - 1800
+        return ts_state
+
+    def test_normal_cycle_cannot_jump_from_near_min_to_near_max(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 75
+        cfg.max_fee_ppm = 2500
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        current_fee_ppm = 79
+
+        ts_state = self._prepare_channel(
+            fc, mock_database, channel_id, peer_id,
+            current_fee_ppm=current_fee_ppm,
+            flow="balanced_active",
+            outbound_pct=50.0,
+        )
+        ts_state.thompson.sample_fee = lambda floor, ceiling: ceiling
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 10.0
+
+        result = fc._adjust_channel_fee(
+            channel_id,
+            peer_id,
+            self._state("balanced_active"),
+            self._channel_info(current_fee_ppm=current_fee_ppm),
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.new_fee_ppm > current_fee_ppm
+        assert result.new_fee_ppm < cfg.max_fee_ppm
+        assert "raw_dts_target_ppm" in result.algorithm_values
+        assert "post_pid_target_ppm" in result.algorithm_values
+        assert "bounded_target_ppm" in result.algorithm_values
+        assert "applied_target_ppm" in result.algorithm_values
+
+    def test_normal_cycle_cannot_jump_from_near_max_to_near_min(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 75
+        cfg.max_fee_ppm = 2500
+        channel_id = "123x456x0"
+        peer_id = "02" + "b" * 64
+        current_fee_ppm = 2500
+
+        ts_state = self._prepare_channel(
+            fc, mock_database, channel_id, peer_id,
+            current_fee_ppm=current_fee_ppm,
+            flow="source",
+            outbound_pct=80.0,
+        )
+        ts_state.thompson.sample_fee = lambda floor, ceiling: floor
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 0.1
+
+        result = fc._adjust_channel_fee(
+            channel_id,
+            peer_id,
+            self._state("source"),
+            self._channel_info(current_fee_ppm=current_fee_ppm, outbound_pct=80.0),
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.new_fee_ppm < current_fee_ppm
+        assert result.new_fee_ppm > cfg.min_fee_ppm
+
+    def test_waking_channel_uses_stricter_damping_than_normal_cycle(self, mock_plugin, mock_database):
+        active_fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 75
+        cfg.max_fee_ppm = 2500
+        active_channel_id = "123x456x0"
+        wake_channel_id = "123x457x0"
+        active_peer_id = "02" + "c" * 64
+        wake_peer_id = "02" + "d" * 64
+        current_fee_ppm = 500
+        now = int(time.time())
+
+        active_state = self._prepare_channel(
+            active_fc, mock_database, active_channel_id, active_peer_id,
+            current_fee_ppm=current_fee_ppm,
+            flow="balanced_active",
+        )
+        active_state.thompson.sample_fee = lambda floor, ceiling: ceiling
+        active_state.pid.calculate_multiplier = lambda **kwargs: 10.0
+
+        wake_state = self._prepare_channel(
+            active_fc, mock_database, wake_channel_id, wake_peer_id,
+            current_fee_ppm=current_fee_ppm,
+            flow="balanced_active",
+            sleeping=True,
+            sleep_until=now - 1,
+        )
+        wake_state.thompson.sample_fee = lambda floor, ceiling: ceiling
+        wake_state.pid.calculate_multiplier = lambda **kwargs: 10.0
+
+        active_result = active_fc._adjust_channel_fee(
+            active_channel_id,
+            active_peer_id,
+            self._state("balanced_active"),
+            self._channel_info(current_fee_ppm=current_fee_ppm),
+            cfg=cfg,
+        )
+        wake_result = active_fc._adjust_channel_fee(
+            wake_channel_id,
+            wake_peer_id,
+            self._state("balanced_active"),
+            self._channel_info(current_fee_ppm=current_fee_ppm),
+            cfg=cfg,
+        )
+
+        assert active_result is not None and wake_result is not None
+        active_delta = active_result.new_fee_ppm - current_fee_ppm
+        wake_delta = wake_result.new_fee_ppm - current_fee_ppm
+        assert wake_delta < active_delta
+        assert wake_result.algorithm_values["wake_damping_applied"] is True
+
+    def test_small_changes_still_hit_hysteresis_noop(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x458x0"
+        peer_id = "02" + "e" * 64
+        current_fee_ppm = 100
+
+        ts_state = self._prepare_channel(
+            fc, mock_database, channel_id, peer_id,
+            current_fee_ppm=current_fee_ppm,
+            flow="balanced",
+        )
+        ts_state.thompson.sample_fee = lambda floor, ceiling: current_fee_ppm + 1
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
+        result = fc._adjust_channel_fee(
+            channel_id,
+            peer_id,
+            self._state("balanced"),
+            self._channel_info(current_fee_ppm=current_fee_ppm),
+            cfg=cfg,
+        )
+
+        assert result is None
+
+    def test_congestion_bypasses_normal_damping(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 75
+        cfg.max_fee_ppm = 2500
+        channel_id = "123x459x0"
+        peer_id = "02" + "f" * 64
+        current_fee_ppm = 75
+
+        result = fc._adjust_channel_fee(
+            channel_id,
+            peer_id,
+            {"state": "congested", "forward_count": 50, "sats_out": 10_000},
+            self._channel_info(current_fee_ppm=current_fee_ppm),
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.new_fee_ppm == cfg.max_fee_ppm
 
 
 class TestVariancePrecision:

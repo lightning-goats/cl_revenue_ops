@@ -1425,7 +1425,6 @@ class FeeController:
     4. Separation of Concerns: Market pricing, balance mgmt, and safety are independent
 
     Known Limitations (documented, not bugs):
-    - I-12: No per-channel fee change rate limit — timer interval provides implicit limiting
     - I-14: RLock held across DB I/O in adjust_fees — architectural constraint, single-threaded cycle
     """
     
@@ -1439,6 +1438,10 @@ class FeeController:
     WAKE_UP_THRESHOLD = 0.20     # 20% revenue spike triggers immediate wake-up
     SLEEP_CYCLES = 2             # Sleep for 2x the fee interval
     STABLE_CYCLES_REQUIRED = 3   # Number of flat cycles before entering sleep mode
+    NORMAL_CYCLE_MAX_DELTA_RATIO = 0.50
+    NORMAL_CYCLE_MIN_DELTA_PPM = 100
+    WAKE_CYCLE_MAX_DELTA_RATIO = 0.20
+    WAKE_CYCLE_MIN_DELTA_PPM = 50
 
     # ==========================================================================
     # Issue #20: Flow-Based Ceiling Reduction
@@ -2488,6 +2491,55 @@ class FeeController:
             },
             reason_code=FeeReasonCode.GOSSIP_REFRESH.value
         )
+
+    def _get_fee_step_cap(self, current_fee_ppm: int, woke_from_sleep: bool) -> int:
+        """Return the maximum allowed per-cycle fee move for the current mode."""
+        ratio = (
+            self.WAKE_CYCLE_MAX_DELTA_RATIO
+            if woke_from_sleep else
+            self.NORMAL_CYCLE_MAX_DELTA_RATIO
+        )
+        min_delta = (
+            self.WAKE_CYCLE_MIN_DELTA_PPM
+            if woke_from_sleep else
+            self.NORMAL_CYCLE_MIN_DELTA_PPM
+        )
+        scaled_delta = int(math.ceil(max(current_fee_ppm, 1) * ratio))
+        return max(min_delta, scaled_delta)
+
+    def _apply_damped_fee_target(
+        self,
+        current_fee_ppm: int,
+        bounded_target_ppm: int,
+        woke_from_sleep: bool,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """
+        Convert a bounded DTS+PID target into the fee we will actually apply.
+
+        The controller still decides direction and target. This helper only limits
+        how much of that move can land in a single normal adjustment cycle.
+        """
+        requested_delta = int(bounded_target_ppm) - int(current_fee_ppm)
+        max_delta_ppm = self._get_fee_step_cap(current_fee_ppm, woke_from_sleep)
+        cap_reason = "none"
+        cap_applied = False
+
+        if abs(requested_delta) > max_delta_ppm:
+            cap_applied = True
+            cap_reason = "wake_cycle_delta_cap" if woke_from_sleep else "normal_cycle_delta_cap"
+            applied_fee_ppm = int(current_fee_ppm) + (
+                max_delta_ppm if requested_delta > 0 else -max_delta_ppm
+            )
+        else:
+            applied_fee_ppm = int(bounded_target_ppm)
+
+        return applied_fee_ppm, {
+            "requested_delta_ppm": requested_delta,
+            "max_delta_ppm": max_delta_ppm,
+            "cap_reason": cap_reason,
+            "cap_applied": cap_applied,
+            "wake_damping_applied": woke_from_sleep,
+        }
     
     def _adjust_channel_fee(self, channel_id: str, peer_id: str,
                            state: Dict[str, Any],
@@ -2525,6 +2577,16 @@ class FeeController:
         # Used for structured logs. Fee controller sets this before applying modifiers;
         # DTS uses step_ppm as the absolute fee delta, so original==step.
         original_step_ppm = 0
+        woke_from_sleep = False
+        wake_reason = "none"
+        raw_dts_target_ppm = None
+        post_pid_target_ppm = None
+        bounded_target_ppm = None
+        applied_target_ppm = None
+        bound_reason = "none"
+        delta_cap_reason = "none"
+        delta_cap_ppm = 0
+        delta_cap_applied = False
 
         # Detect critical state
         is_congested = (state and state.get("state") == "congested")
@@ -2569,6 +2631,8 @@ class FeeController:
             # Check if it's time to wake up (sleep timer expired)
             if now > _sleep_until:
                 # Timer expired - wake up
+                woke_from_sleep = True
+                wake_reason = "sleep_timer_expired"
                 _ts_sleep_state.is_sleeping = False
                 _ts_sleep_state.sleep_until = 0
                 _ts_sleep_state.stable_cycles = 0
@@ -2603,6 +2667,8 @@ class FeeController:
 
                 if percent_change > self.WAKE_UP_THRESHOLD:
                     # Significant revenue spike detected - wake up immediately!
+                    woke_from_sleep = True
+                    wake_reason = "revenue_spike"
                     _ts_sleep_state.is_sleeping = False
                     _ts_sleep_state.sleep_until = 0
                     _ts_sleep_state.stable_cycles = 0
@@ -2972,8 +3038,21 @@ class FeeController:
                 capacity_sats=capacity,
                 flow_state=flow_state_str,
             )
-            new_fee_ppm = int(dts_fee * pid_multiplier)
-            new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
+            raw_dts_target_ppm = int(dts_fee)
+            post_pid_target_ppm = int(dts_fee * pid_multiplier)
+            bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
+            if bounded_target_ppm != post_pid_target_ppm:
+                bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
+
+            new_fee_ppm, damping_info = self._apply_damped_fee_target(
+                current_fee_ppm=current_fee_ppm,
+                bounded_target_ppm=bounded_target_ppm,
+                woke_from_sleep=woke_from_sleep,
+            )
+            applied_target_ppm = new_fee_ppm
+            delta_cap_reason = damping_info["cap_reason"]
+            delta_cap_ppm = damping_info["max_delta_ppm"]
+            delta_cap_applied = damping_info["cap_applied"]
 
             decision_reason = (
                 f"dts_pid (dts={dts_fee}, pid={pid_multiplier:.2f}, "
@@ -2982,7 +3061,7 @@ class FeeController:
 
             # Update volume tracking
             ts_state.last_volume_sats = volume_since_sats
-            base_new_fee = new_fee_ppm
+            base_new_fee = bounded_target_ppm
 
             target_found = True
 
@@ -3149,6 +3228,14 @@ class FeeController:
         direction_label = "up" if new_direction > 0 else "down"
         base_fee_note = f", base={int(base_new_fee)}ppm" if base_new_fee is not None else ""
         mult_note = f", mult=liq{liquidity_multiplier:.2f}*prof{profitability_multiplier:.2f}"
+        target_summary = (
+            f"targets=dts:{raw_dts_target_ppm}, post_pid:{post_pid_target_ppm}, "
+            f"bounded:{bounded_target_ppm}, applied:{applied_target_ppm}, "
+            f"bound:{bound_reason}, cap:{delta_cap_reason}({delta_cap_ppm}ppm), "
+            f"wake:{wake_reason}"
+            if raw_dts_target_ppm is not None else
+            f"targets=n/a, wake:{wake_reason}"
+        )
 
         # Build reason string for DTS+PID
         ts_state_local = self._channel_fee_states.get(channel_id)
@@ -3161,7 +3248,7 @@ class FeeController:
             dts_info = "state_unavailable"
         reason = (
             f"DTS+PID: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}){volatility_note}, "
-            f"{dts_info}, applied={applied_dir}({applied_delta:+d}ppm), "
+            f"{dts_info}, {target_summary}, applied={applied_dir}({applied_delta:+d}ppm), "
             f"state={flow_state}, liquidity={bucket} ({outbound_ratio:.0%}), "
             f"{marginal_roi_info}"
         )
@@ -3241,7 +3328,7 @@ class FeeController:
             self.plugin.log(
                 f"FEE: {channel_id[:12]}... {current_fee_ppm}->{new_fee_ppm}ppm "
                 f"[{fee_reason_code}] "
-                f"step:{original_step_ppm}->{step_ppm} | {decision_reason}",
+                f"step:{original_step_ppm}->{step_ppm} | {target_summary} | {decision_reason}",
                 level='info'
             )
 
@@ -3261,6 +3348,16 @@ class FeeController:
                     "step_ppm": step_ppm,
                     "consecutive_same_direction": cycle.consecutive_same_direction,
                     "volatility_reset": volatility_reset,
+                    "raw_dts_target_ppm": raw_dts_target_ppm,
+                    "post_pid_target_ppm": post_pid_target_ppm,
+                    "bounded_target_ppm": bounded_target_ppm,
+                    "applied_target_ppm": applied_target_ppm if applied_target_ppm is not None else new_fee_ppm,
+                    "bound_reason": bound_reason,
+                    "delta_cap_reason": delta_cap_reason,
+                    "delta_cap_ppm": delta_cap_ppm,
+                    "delta_cap_applied": delta_cap_applied,
+                    "wake_damping_applied": woke_from_sleep,
+                    "wake_reason": wake_reason,
                 },
                 reason_code=fee_reason_code,
             )
@@ -4069,5 +4166,4 @@ class FeeController:
         
         return channels
     
-
 
