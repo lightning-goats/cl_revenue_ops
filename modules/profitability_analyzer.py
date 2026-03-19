@@ -1669,7 +1669,16 @@ class ChannelProfitabilityAnalyzer:
                     f"bookkeeper data not available",
                     level='debug'
                 )
-        
+
+        # Ensure opened_at timestamp is correct for budget windowing.
+        # Previous bug stored opened_at=now for all channels on first run;
+        # re-write with the actual open_timestamp on every analysis pass.
+        if open_timestamp is not None and open_cost is not None:
+            self.database.record_channel_open_cost(
+                channel_id, peer_id, open_cost, capacity_sats,
+                timestamp=open_timestamp
+            )
+
         # Splice costs
         splice_history = self.database.get_channel_splice_history(channel_id)
         splice_cost = sum(int(s.get("fee_sats", 0) or 0) for s in splice_history)
