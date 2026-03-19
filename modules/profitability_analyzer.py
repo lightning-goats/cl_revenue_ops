@@ -167,7 +167,7 @@ class ChannelProfitability:
             Returns 1.0 if no rebalance costs and earning/contributing
             Returns 0.0 if no rebalance costs and no contribution
         """
-        if self.rebalance_cost_30d_sats == 0:
+        if self.rebalance_cost_30d_sats <= 0:
             return 1.0 if self.marginal_profit_30d_sats > 0 else 0.0
         return self.marginal_profit_30d_sats / max(1, self.rebalance_cost_30d_sats)
     

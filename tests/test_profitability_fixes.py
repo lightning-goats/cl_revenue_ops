@@ -513,3 +513,108 @@ class TestOpenTimestampPassthrough:
         else:
             recorded_ts = call_args[0][4] if len(call_args[0]) > 4 else None
         assert recorded_ts == old_ts
+
+
+# ============================================================
+# Fix 6: Guard marginal ROI against negative rebalance costs
+# ============================================================
+
+class TestMarginalRoiEdgeCases:
+    """Negative rebalance costs must not invert ROI sign."""
+
+    def test_negative_rebalance_cost_positive_profit_returns_one(self):
+        """Negative rebalance costs with positive profit returns 1.0."""
+        prof = _make_profitability(
+            marginal_profit_30d=500, rebalance_cost_30d=-100
+        )
+        assert prof.marginal_roi == 1.0
+
+    def test_negative_rebalance_cost_zero_profit_returns_zero(self):
+        """Negative rebalance costs with zero profit returns 0.0."""
+        prof = _make_profitability(
+            marginal_profit_30d=0, rebalance_cost_30d=-50
+        )
+        assert prof.marginal_roi == 0.0
+
+    def test_negative_rebalance_cost_negative_profit_returns_zero(self):
+        """Negative rebalance costs with negative profit returns 0.0."""
+        prof = _make_profitability(
+            marginal_profit_30d=-200, rebalance_cost_30d=-50
+        )
+        assert prof.marginal_roi == 0.0
+
+    def test_negative_rebalance_cost_never_inverts_sign(self):
+        """Ensure marginal_roi is always >= 0 when rebalance cost is negative."""
+        for cost in [-1, -10, -100, -1000]:
+            for profit in [-500, -1, 0, 1, 500]:
+                prof = _make_profitability(
+                    marginal_profit_30d=profit, rebalance_cost_30d=cost
+                )
+                assert prof.marginal_roi >= 0.0, (
+                    f"marginal_roi={prof.marginal_roi} for profit={profit}, cost={cost}"
+                )
+
+
+# ============================================================
+# Fix 7: Capacity division guards (audit confirmation)
+# ============================================================
+
+class TestCapacityDivisionGuards:
+    """Verify zero/negative capacity does not cause ZeroDivisionError."""
+
+    def test_zero_capacity_zero_cost_roi(self):
+        """Zero capacity with zero cost should not raise ZeroDivisionError."""
+        analyzer = _make_analyzer()
+        channel_info = {
+            "peer_id": "02" + "a" * 64,
+            "capacity": 0,
+            "funding_txid": "abc123",
+            "opener": "remote",
+            "open_timestamp": int(time.time()) - 86400 * 30,
+        }
+        analyzer._get_channel_costs = MagicMock(return_value=_make_costs(
+            open_cost=0, rebalance=0, splice=0
+        ))
+        analyzer._get_channel_revenue = MagicMock(return_value=_make_revenue(
+            fees=100, sourced_fees=0
+        ))
+        analyzer._get_last_routing_time = MagicMock(return_value=int(time.time()) - 3600)
+        analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_sats': 50,
+            'rebalance_cost_sats': 0,
+        }
+
+        # Should not raise ZeroDivisionError
+        result = analyzer.analyze_channel("111x222x0", channel_info=channel_info)
+        assert result is not None
+
+    def test_zero_volume_cost_per_sat(self):
+        """Zero volume should yield 0.0 cost_per_sat, not ZeroDivisionError."""
+        analyzer = _make_analyzer()
+        channel_info = {
+            "peer_id": "02" + "a" * 64,
+            "capacity": 2_000_000,
+            "funding_txid": "abc123",
+            "opener": "local",
+            "open_timestamp": int(time.time()) - 86400 * 30,
+        }
+        analyzer._get_channel_costs = MagicMock(return_value=_make_costs(
+            open_cost=500, rebalance=100
+        ))
+        analyzer._get_channel_revenue = MagicMock(return_value=_make_revenue(
+            fees=0, sourced_fees=0, volume=0, sourced_volume=0,
+            forwards=0, sourced_forwards=0
+        ))
+        analyzer._get_last_routing_time = MagicMock(return_value=None)
+        analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_sats': 0,
+            'rebalance_cost_sats': 0,
+        }
+        analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0, "last_success_time": 0,
+        }
+
+        result = analyzer.analyze_channel("111x222x0", channel_info=channel_info)
+        assert result is not None
+        assert result.cost_per_sat_routed == 0.0
+        assert result.fee_per_sat_routed == 0.0
