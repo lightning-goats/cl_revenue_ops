@@ -444,8 +444,8 @@ class JobManager:
             # - SOURCE channels: Want more outbound capacity (higher target)
             # - BALANCED: Neutral 50/50
             # =================================================================
-            flow_state = candidate.dest_flow_state if hasattr(candidate, 'dest_flow_state') else "balanced"
-            direction = getattr(candidate, 'direction', 'pull')
+            flow_state = candidate.dest_flow_state
+            direction = candidate.direction
 
             if direction == "push":
                 # Push: target is the local balance ratio to drain DOWN to
@@ -2219,9 +2219,6 @@ class EVRebalancer:
             )
             
             for dest_id, dest_info, dest_ratio in depleted_channels:
-                if self._is_pending_with_backoff(dest_id): 
-                    continue
-                
                 # =====================================================================
                 # FUTILITY CIRCUIT BREAKER (TODO #15)
                 # =====================================================================
@@ -2332,18 +2329,6 @@ class EVRebalancer:
                 return (priority, c.expected_profit_sats)
 
             candidates.sort(key=sort_key, reverse=True)
-
-            # When budget is exceeded but hot-channel protection is enabled,
-            # only allow hot-channel-protected candidates through.
-            if getattr(self, '_budget_hot_channel_only', False):
-                hot_only = [c for c in candidates if c.hot_channel_protection]
-                if hot_only:
-                    self.plugin.log(
-                        f"BUDGET_HOT_ONLY: Filtered {len(candidates)} candidates down to "
-                        f"{len(hot_only)} hot-channel-protected candidates",
-                        level='info'
-                    )
-                candidates = hot_only
 
             # Limit to available slots
             selected = candidates[:available_slots]
@@ -2478,11 +2463,10 @@ class EVRebalancer:
             return None
         
         # Dynamic targeting based on flow state
-        if dest_flow_state == "source": 
+        # Note: sink channels are filtered out at method entry (return None)
+        if dest_flow_state == "source":
             target_ratio = 0.85
-        elif dest_flow_state == "sink": 
-            target_ratio = 0.15
-        else: 
+        else:
             target_ratio = 0.50
         
         # =====================================================================
@@ -2535,25 +2519,19 @@ class EVRebalancer:
 
         # Apply velocity gate
         velocity_adjusted_target_ratio = target_ratio
-        velocity_gate_reason = None
 
         if cfg.enable_velocity_gate:
             # Grace period for new channels - they get normal targeting
-            if channel_age_days < cfg.new_channel_grace_days:
-                velocity_gate_reason = f"new_channel_grace (age={channel_age_days}d)"
-            elif velocity < cfg.min_velocity_threshold:
+            if channel_age_days >= cfg.new_channel_grace_days and velocity < cfg.min_velocity_threshold:
                 # Low velocity - use conservative target (15% of capacity)
                 # This is enough to test routing without wasting budget
                 velocity_adjusted_target_ratio = 0.15
-                velocity_gate_reason = f"low_velocity ({velocity:.4f} < {cfg.min_velocity_threshold})"
                 self.plugin.log(
                     f"VELOCITY GATE: {dest_channel[:12]}... conservative target "
                     f"(velocity={velocity:.4f}, age={channel_age_days}d, "
                     f"target={velocity_adjusted_target_ratio:.0%} vs original {target_ratio:.0%})",
                     level='debug'
                 )
-            else:
-                velocity_gate_reason = f"velocity_ok ({velocity:.4f})"
 
         # Use velocity-adjusted target ratio
         target_ratio = velocity_adjusted_target_ratio
@@ -2576,10 +2554,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # target above capacity, causing repeated failures and pathological candidates.
         # Solution: Clamp to capacity and skip tiny channels that can't meet min_amount.
         # =====================================================================
-        
-        # Guard: Skip zero-capacity channels entirely
-        if capacity <= 0:
-            return None
         
         # Calculate volume-based target (3 days of buffer)
         vol_target = int(daily_volume * 3)
@@ -2869,14 +2843,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         expected_income = int((rebalance_amount * expected_utilization * outbound_fee_ppm) // 1_000_000)
 
-        sharpe_penalty_factor = 1.0
-
         turnover_weight = min(1.0, source_turnover_rate * 7)
         # I-2 FIX: Use source channel's own utilization probability for opportunity cost,
         # not the destination's expected_utilization. These are independent probabilistic events.
         source_utilization = max(0.05, min(1.0, source_turnover_rate * cooldown_days))
         expected_source_loss = int(
-            (rebalance_amount * source_utilization * source_fee_ppm * turnover_weight * sharpe_penalty_factor) // 1_000_000
+            (rebalance_amount * source_utilization * source_fee_ppm * turnover_weight) // 1_000_000
         )
 
         # =================================================================
@@ -3166,9 +3138,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         kelly = cfg.kelly_fraction if cfg.enable_kelly else 1.0
         max_fee_ppm = max(1, int(spread * kelly))
         max_budget = max(1, (amount * max_fee_ppm + 999_999) // 1_000_000)
-
-        if max_budget <= 0:
-            return None
 
         # B3 FIX: Use primary destination peer for fee estimation, not the source.
         # In push rebalancing, routing fees go through destination peers.
@@ -4223,7 +4192,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         RPC issue should not block all rebalancing.  Budget check (DB-only)
         always runs and fails closed.
         """
-        self._budget_hot_channel_only = False
         if cfg is None:
             cfg = self.config.snapshot()
         try:
@@ -4343,27 +4311,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         except Exception as e:
             self.plugin.log(f"Error checking capital controls: {e}", level='error')
             return False
-    
-    def _is_pending_with_backoff(self, channel_id: str) -> bool:
-        """Check if channel has a pending operation with exponential backoff."""
-        # Also check job manager for active jobs
-        if self.job_manager.has_active_job(channel_id):
-            return True
-            
-        with self._pending_lock:
-            pending_time = self._pending.get(channel_id, 0)
-        if pending_time == 0:
-            return False
-
-        failure_count, _ = self.database.get_failure_count(channel_id)
-        base_cooldown = 600
-        cooldown = base_cooldown * (2 ** min(failure_count, 4))
-
-        if int(time.time()) - pending_time > cooldown:
-            with self._pending_lock:
-                self._pending.pop(channel_id, None)
-            return False
-        return True
     
     # =========================================================================
     # Job Management API (exposed for RPC commands)
