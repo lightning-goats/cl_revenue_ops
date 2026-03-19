@@ -3162,7 +3162,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # M-17: Negative spread means we'd lose money on this direction
         if spread <= 0:
             return None
-        max_fee_ppm = max(1, int(spread * cfg.kelly_fraction))
+        # B10 FIX: Guard kelly_fraction behind enable_kelly, matching pull path.
+        kelly = cfg.kelly_fraction if cfg.enable_kelly else 1.0
+        max_fee_ppm = max(1, int(spread * kelly))
         max_budget = max(1, (amount * max_fee_ppm + 999_999) // 1_000_000)
 
         if max_budget <= 0:
@@ -4094,7 +4096,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         except Exception as e:
             self.plugin.log(f"Defibrillator shock failed: {e}", level='error')
             return {
-                "success": True, 
+                "success": False,
                 "message": f"Zero-Fee flag set, but active shock failed: {e}"
             }
 

@@ -9,6 +9,8 @@ Covers:
   B2: Weekly budget uses 24h external costs (should scale to 7d)
   B3: Push EV uses wrong peer for fee estimation
   B4: stop_all_jobs unconditionally releases budget for already-handled jobs
+  B10: Push EV uses kelly_fraction without enable_kelly guard
+  B11: diagnostic_rebalance returns success:true on exception
 """
 
 import math
@@ -1198,3 +1200,156 @@ class TestPeerExclusionRemoval:
             f"Expected sling-except-peer remove call for {peer_reenabled[:16]}..., "
             f"but got calls: {mock_plugin.rpc.call.call_args_list}"
         )
+
+
+# ============================================================================
+# 10. B10: Push EV uses kelly_fraction without enable_kelly guard
+# ============================================================================
+
+
+class TestB10PushEvKellyGuard:
+    """B10: _estimate_push_ev uses cfg.kelly_fraction unconditionally to scale
+    max_fee_ppm, halving the push fee budget even when Kelly is disabled.
+    The pull path correctly guards behind ``if self.config.enable_kelly``.
+    """
+
+    def _make_rebalancer(self, mock_plugin, mock_database, *, enable_kelly=False, kelly_fraction=0.5):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            dry_run=True,
+            enable_proportional_budget=False,
+            enable_kelly=enable_kelly,
+            kelly_fraction=kelly_fraction,
+            rebalance_min_amount=10_000,
+            rebalance_max_amount=5_000_000,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        return r
+
+    def test_push_ev_uses_full_spread_when_kelly_disabled(self, mock_plugin, mock_database):
+        """With enable_kelly=False and kelly_fraction=0.5, push EV should use
+        full spread (450), not halved (225)."""
+        r = self._make_rebalancer(mock_plugin, mock_database,
+                                  enable_kelly=False, kelly_fraction=0.5)
+
+        src_peer_id = "02" + "a" * 64
+        dest_peer_id = "02" + "b" * 64
+
+        src_channel = "111x222x0"
+        src_info = {
+            "peer_id": src_peer_id,
+            "capacity": 2_000_000,
+            "spendable_sats": 1_600_000,
+            "fee_ppm": 500,
+        }
+        src_ratio = 0.80  # High ratio -> excess to push
+
+        dest_scids = ["333x444x0"]
+        dest_peer_ids = [dest_peer_id]
+
+        # inbound_fee=50 -> spread = 500 - 50 = 450
+        r._estimate_inbound_fee = MagicMock(return_value=50)
+        r._estimate_expected_fee_sats = MagicMock(return_value=5)
+        r._calculate_turnover_rate = MagicMock(return_value=0.5)
+
+        candidate = r._estimate_push_ev(
+            src_channel=src_channel,
+            src_info=src_info,
+            src_ratio=src_ratio,
+            dest_scids=dest_scids,
+            dest_peer_ids=dest_peer_ids,
+        )
+
+        assert candidate is not None, "Push EV candidate should not be None"
+        # spread = 500 - 50 = 450; with kelly disabled, max_fee_ppm = max(1, int(450 * 1.0)) = 450
+        assert candidate.max_fee_ppm == 450, (
+            f"With enable_kelly=False, max_fee_ppm should be 450 (full spread), "
+            f"not {candidate.max_fee_ppm}. Bug B10: kelly_fraction applied without guard."
+        )
+
+    def test_push_ev_uses_kelly_fraction_when_kelly_enabled(self, mock_plugin, mock_database):
+        """With enable_kelly=True and kelly_fraction=0.5, push EV should use
+        halved spread (225)."""
+        r = self._make_rebalancer(mock_plugin, mock_database,
+                                  enable_kelly=True, kelly_fraction=0.5)
+
+        src_peer_id = "02" + "a" * 64
+        dest_peer_id = "02" + "b" * 64
+
+        src_channel = "111x222x0"
+        src_info = {
+            "peer_id": src_peer_id,
+            "capacity": 2_000_000,
+            "spendable_sats": 1_600_000,
+            "fee_ppm": 500,
+        }
+        src_ratio = 0.80
+
+        dest_scids = ["333x444x0"]
+        dest_peer_ids = [dest_peer_id]
+
+        r._estimate_inbound_fee = MagicMock(return_value=50)
+        r._estimate_expected_fee_sats = MagicMock(return_value=5)
+        r._calculate_turnover_rate = MagicMock(return_value=0.5)
+
+        candidate = r._estimate_push_ev(
+            src_channel=src_channel,
+            src_info=src_info,
+            src_ratio=src_ratio,
+            dest_scids=dest_scids,
+            dest_peer_ids=dest_peer_ids,
+        )
+
+        assert candidate is not None, "Push EV candidate should not be None"
+        # spread = 500 - 50 = 450; with kelly enabled, max_fee_ppm = max(1, int(450 * 0.5)) = 225
+        assert candidate.max_fee_ppm == 225, (
+            f"With enable_kelly=True, max_fee_ppm should be 225 (half spread), "
+            f"not {candidate.max_fee_ppm}."
+        )
+
+
+# ============================================================================
+# 11. B11: diagnostic_rebalance returns success:true on exception
+# ============================================================================
+
+
+class TestB11DiagnosticRebalanceExceptionSuccess:
+    """B11: diagnostic_rebalance returns {success: True} when the defibrillator
+    shock raises an exception. Should return {success: False}.
+    """
+
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            dry_run=True,
+            enable_proportional_budget=False,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        return r
+
+    def test_exception_returns_success_false(self, mock_plugin, mock_database):
+        """When defibrillator shock raises an exception, result must have
+        success=False, not success=True."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        # set_channel_probe succeeds (step 1 of defibrillator)
+        mock_database.set_channel_probe = MagicMock()
+
+        # _get_channels_with_balances raises an exception (simulates any
+        # failure in the try block before or during shock execution)
+        r._get_channels_with_balances = MagicMock(
+            side_effect=RuntimeError("RPC timeout")
+        )
+
+        result = r.diagnostic_rebalance("111x222x0")
+
+        assert result["success"] is False, (
+            f"diagnostic_rebalance should return success=False on exception, "
+            f"but got success={result['success']}. Bug B11: exception handler "
+            f"returns success:True."
+        )
+        assert "shock failed" in result["message"].lower() or "failed" in result["message"].lower()
