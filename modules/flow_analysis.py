@@ -564,6 +564,10 @@ class KalmanFlowFilter:
         Returns:
             Innovation (prediction error) for diagnostics
         """
+        # B2 FIX: Reject NaN/Inf observations without resetting state.
+        if not math.isfinite(observed_ratio):
+            return 0.0
+
         # Measurement noise adaptation based on confidence
         # Low confidence = high noise = trust observation less
         r = KALMAN_BASE_MEASUREMENT_NOISE / max(0.1, confidence * KALMAN_CONFIDENCE_SCALING)

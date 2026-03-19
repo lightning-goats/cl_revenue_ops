@@ -860,3 +860,67 @@ class TestKalmanPDEnforcement:
         assert math.isfinite(kf.state.flow_ratio)
         assert math.isfinite(kf.state.flow_velocity)
         assert kf.state.variance_ratio >= 1e-4
+
+
+# =========================================================================
+# Bug B2: Kalman update() NaN/Inf input guard
+# =========================================================================
+
+class TestB2KalmanNaNInputGuard:
+    """NaN/Inf observed_ratio must be rejected without resetting Kalman state.
+
+    Without the guard, NaN propagates through innovation -> gain -> state,
+    and the late NaN guard at line 623 resets all accumulated state.
+    """
+
+    def test_nan_observation_preserves_state(self):
+        """Feeding NaN should return 0.0 and leave state unchanged."""
+        from modules.flow_analysis import KalmanFlowFilter
+
+        kf = KalmanFlowFilter()
+        # Build up meaningful state with two valid observations
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        kf.update(0.3, confidence=0.8)
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        kf.update(0.35, confidence=0.8)
+
+        # Snapshot state before the bad observation
+        snap_ratio = kf.state.flow_ratio
+        snap_velocity = kf.state.flow_velocity
+        snap_variance = kf.state.variance_ratio
+        snap_count = kf.state.observation_count
+
+        # Feed NaN — must be silently rejected
+        result = kf.update(float('nan'), confidence=0.8)
+
+        assert result == 0.0, "NaN observation should return 0.0"
+        assert kf.state.flow_ratio == snap_ratio, "State must not change on NaN"
+        assert kf.state.flow_velocity == snap_velocity, "Velocity must not change on NaN"
+        assert kf.state.variance_ratio == snap_variance, "Variance must not change on NaN"
+        assert kf.state.observation_count == snap_count, "Count must not change on NaN"
+
+    def test_inf_observation_preserves_state(self):
+        """Feeding Inf should return 0.0 and leave state unchanged."""
+        from modules.flow_analysis import KalmanFlowFilter
+
+        kf = KalmanFlowFilter()
+        # Build up meaningful state with two valid observations
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        kf.update(0.3, confidence=0.8)
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        kf.update(0.35, confidence=0.8)
+
+        # Snapshot state before the bad observation
+        snap_ratio = kf.state.flow_ratio
+        snap_velocity = kf.state.flow_velocity
+        snap_variance = kf.state.variance_ratio
+        snap_count = kf.state.observation_count
+
+        # Feed Inf — must be silently rejected
+        result = kf.update(float('inf'), confidence=0.8)
+
+        assert result == 0.0, "Inf observation should return 0.0"
+        assert kf.state.flow_ratio == snap_ratio, "State must not change on Inf"
+        assert kf.state.flow_velocity == snap_velocity, "Velocity must not change on Inf"
+        assert kf.state.variance_ratio == snap_variance, "Variance must not change on Inf"
+        assert kf.state.observation_count == snap_count, "Count must not change on Inf"
