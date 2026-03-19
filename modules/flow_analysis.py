@@ -35,6 +35,11 @@ from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple
 from pyln.client import Plugin, RpcError
 
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
 
 # =============================================================================
 # FLOW ANALYSIS v2.0 IMPROVEMENT PARAMETERS
@@ -212,8 +217,15 @@ class TemporalProfile:
             self.diurnal_strength = 0.0
             return
 
+        if np is None:
+            # numpy unavailable, skip derived field computation
+            self.burstiness = 0.0
+            self.quiet_hours = []
+            self.peak_hours = []
+            self.diurnal_strength = 0.0
+            return
+
         # Burstiness = coefficient of variation
-        import numpy as np
         arr = np.array(self.hourly_out)
         mean_val = np.mean(arr)
         if mean_val > 0:
@@ -290,7 +302,6 @@ def update_temporal_profile(existing: TemporalProfile,
     Returns:
         Updated TemporalProfile with blended values and recomputed derived fields.
     """
-    import time as _time
     updated = TemporalProfile()
     is_first = all(v == 0.0 for v in existing.hourly_out)
     alpha = TEMPORAL_EMA_ALPHA
@@ -315,7 +326,7 @@ def update_temporal_profile(existing: TemporalProfile,
     updated.observation_days = existing.observation_days
     if daily_forwards >= TEMPORAL_MIN_DAILY_FORWARDS:
         updated.observation_days += 1
-    updated.last_updated = int(_time.time())
+    updated.last_updated = int(time.time())
 
     # Recompute derived fields
     updated._recompute_derived()
