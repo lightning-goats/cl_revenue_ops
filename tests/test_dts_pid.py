@@ -28,13 +28,13 @@ class TestPIDState:
         pid = PIDState()
         pid.last_update_time = int(time.time()) - 1800
         m = pid.calculate_multiplier(0.1, capacity_sats=2_000_000)
-        assert m > 1.2, f"Drained channel should raise fee, got {m}"
+        assert m > 1.0, f"Drained channel should raise fee, got {m}"
 
     def test_saturated_channel_lowers_fee(self):
         pid = PIDState()
         pid.last_update_time = int(time.time()) - 1800
         m = pid.calculate_multiplier(0.9, capacity_sats=2_000_000)
-        assert m < 0.8, f"Saturated channel should lower fee, got {m}"
+        assert m < 1.0, f"Saturated channel should lower fee, got {m}"
 
     def test_multiplier_clamped_to_bounds(self):
         pid = PIDState()
@@ -118,6 +118,31 @@ class TestPIDState:
         m = pid.calculate_multiplier(0.5, capacity_sats=0)
         assert 0.1 <= m <= 10.0
 
+    def test_derivative_term_no_longer_changes_multiplier(self):
+        pid_no_d = PIDState(kd=0.0)
+        pid_no_d.last_update_time = int(time.time()) - 1800
+        pid_no_d.calculate_multiplier(0.5, capacity_sats=2_000_000)
+        pid_no_d.last_update_time = int(time.time()) - 1800
+        no_d = pid_no_d.calculate_multiplier(0.1, capacity_sats=2_000_000)
+
+        pid_with_large_d = PIDState(kd=999.0)
+        pid_with_large_d.last_update_time = int(time.time()) - 1800
+        pid_with_large_d.calculate_multiplier(0.5, capacity_sats=2_000_000)
+        pid_with_large_d.last_update_time = int(time.time()) - 1800
+        with_large_d = pid_with_large_d.calculate_multiplier(0.1, capacity_sats=2_000_000)
+
+        assert with_large_d == pytest.approx(no_d, rel=1e-9)
+
+    def test_multiplier_clamped_to_conservative_bounds(self):
+        pid = PIDState()
+        pid.last_update_time = int(time.time()) - 1800
+        m_low = pid.calculate_multiplier(0.0, capacity_sats=2_000_000)
+        assert 0.5 <= m_low <= 2.0
+
+        pid.last_update_time = int(time.time()) - 1800
+        m_high = pid.calculate_multiplier(1.0, capacity_sats=2_000_000)
+        assert 0.5 <= m_high <= 2.0
+
 
 class TestDTSDiscountFactor:
     """Tests for Discounted Thompson Sampling posterior decay."""
@@ -154,6 +179,28 @@ class TestDTSDiscountFactor:
         assert ts.posterior_std > 100.0
         max_std = math.sqrt(1.0 / GaussianThompsonState.MIN_PRECISION)
         assert ts.posterior_std <= max_std + 0.01
+
+
+class TestContextualPosteriorUpdates:
+    """Regression tests for contextual DTS state initialization."""
+
+    def test_secondary_context_initialization_does_not_raise(self):
+        ts = GaussianThompsonState()
+        ts.posterior_mean = 220.0
+        ts.posterior_std = 80.0
+
+        ts.update_contextual(
+            context_key="balanced:strong:peak:S",
+            fee=200,
+            revenue_rate=12.0,
+            time_bucket="peak",
+        )
+
+        ctx = ts.contextual_posteriors["balanced:strong:peak:S"]
+        assert len(ctx) == 4
+        assert ctx[0] > 0
+        assert ctx[1] > 0
+        assert ctx[2] >= 1
 
 
 class TestPIDStatePersistence:
@@ -268,9 +315,21 @@ class TestDTSPIDIntegration:
 
     def test_produces_fee_within_bounds(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        ch_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        fc._adjust_channel_fee(
+            ch_id, peer_id, self._state(),
+            self._channel_info(current_fee_ppm=500), cfg=cfg
+        )
+        ts_state = fc._channel_fee_states[ch_id]
+        ts_state.thompson.observations = [(500, 5.0, 1.0, int(time.time()))] * 10
+        ts_state.thompson.sample_fee = lambda floor, ceiling: ceiling
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = int(time.time()) - 1800
+
         result = fc._adjust_channel_fee(
-            "123x456x0", "02" + "a" * 64, self._state(),
-            self._channel_info(), cfg=cfg
+            ch_id, peer_id, self._state(),
+            self._channel_info(current_fee_ppm=500), cfg=cfg
         )
         assert result is not None
         assert isinstance(result, FeeAdjustment)
@@ -285,12 +344,13 @@ class TestDTSPIDIntegration:
         # First call to initialise DTS state
         fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
-            self._channel_info(outbound_pct=50.0), cfg=cfg
+            self._channel_info(outbound_pct=50.0, current_fee_ppm=500), cfg=cfg
         )
 
         # Pin DTS sample_fee to return a deterministic value
         ts_state = fc._channel_fee_states[ch_id]
-        ts_state.thompson.sample_fee = lambda floor, ceiling: 200
+        ts_state.thompson.observations = [(500, 5.0, 1.0, int(time.time()))] * 10
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 1500
 
         # Reset PID state for clean comparison
         ts_state.pid = PIDState()
@@ -298,7 +358,7 @@ class TestDTSPIDIntegration:
 
         result_balanced = fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
-            self._channel_info(outbound_pct=50.0), cfg=cfg
+            self._channel_info(outbound_pct=50.0, current_fee_ppm=500), cfg=cfg
         )
 
         # Reset PID for the drained run
@@ -307,10 +367,11 @@ class TestDTSPIDIntegration:
 
         result_drained = fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
-            self._channel_info(outbound_pct=10.0), cfg=cfg
+            self._channel_info(outbound_pct=10.0, current_fee_ppm=500), cfg=cfg
         )
-        assert result_balanced is not None and result_drained is not None
-        assert result_drained.new_fee_ppm >= result_balanced.new_fee_ppm
+        balanced_fee = result_balanced.new_fee_ppm if result_balanced is not None else fc._cycle_states[ch_id].last_fee_ppm
+        drained_fee = result_drained.new_fee_ppm if result_drained is not None else fc._cycle_states[ch_id].last_fee_ppm
+        assert drained_fee >= balanced_fee
 
     def test_saturated_channel_gets_lower_fee(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -327,7 +388,8 @@ class TestDTSPIDIntegration:
 
         # Pin DTS sample_fee to return a deterministic value
         ts_state = fc._channel_fee_states[ch_id]
-        ts_state.thompson.sample_fee = lambda floor, ceiling: 200
+        ts_state.thompson.observations = [(500, 5.0, 1.0, int(time.time()))] * 10
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 100
 
         # Reset PID for balanced run
         ts_state.pid = PIDState()
@@ -346,8 +408,9 @@ class TestDTSPIDIntegration:
             ch_id, peer_id, self._state(),
             self._channel_info(outbound_pct=90.0, current_fee_ppm=500), cfg=cfg
         )
-        assert result_balanced is not None and result_saturated is not None
-        assert result_saturated.new_fee_ppm <= result_balanced.new_fee_ppm
+        balanced_fee = result_balanced.new_fee_ppm if result_balanced is not None else fc._cycle_states[ch_id].last_fee_ppm
+        saturated_fee = result_saturated.new_fee_ppm if result_saturated is not None else fc._cycle_states[ch_id].last_fee_ppm
+        assert saturated_fee <= balanced_fee
 
     def test_pid_state_persisted_after_adjustment(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -363,9 +426,20 @@ class TestDTSPIDIntegration:
 
     def test_produces_fee_adjustment_instance(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        ch_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        fc._adjust_channel_fee(
+            ch_id, peer_id, self._state(),
+            self._channel_info(current_fee_ppm=500), cfg=cfg
+        )
+        ts_state = fc._channel_fee_states[ch_id]
+        ts_state.thompson.sample_fee = lambda floor, ceiling: ceiling
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = int(time.time()) - 1800
+
         result = fc._adjust_channel_fee(
-            "123x456x0", "02" + "a" * 64, self._state(),
-            self._channel_info(), cfg=cfg
+            ch_id, peer_id, self._state(),
+            self._channel_info(current_fee_ppm=500), cfg=cfg
         )
         assert result is not None
         assert isinstance(result, FeeAdjustment)
@@ -419,9 +493,11 @@ class TestClampedFeeReadback:
             ch_id, peer_id, self._state("sink"),
             self._channel_info(), cfg=cfg
         )
-        assert result is not None
-        # Even with sink multiplier, the floor must not drop below min_fee_ppm
-        assert result.new_fee_ppm >= cfg.min_fee_ppm
+        # Even with sink multiplier, the floor must not drop below min_fee_ppm.
+        if result is not None:
+            assert result.new_fee_ppm >= cfg.min_fee_ppm
+        cycle = fc._cycle_states[ch_id]
+        assert cycle.last_fee_ppm >= cfg.min_fee_ppm
 
     def test_set_channel_fee_clamp_propagated_to_state(self, mock_plugin, mock_database):
         """If set_channel_fee clamps, last_broadcast_fee_ppm must reflect actual fee."""
@@ -700,6 +776,81 @@ class TestDTSPIDStabilityCaps:
 
         assert result is not None
         assert result.new_fee_ppm == cfg.max_fee_ppm
+
+    def test_balanced_channel_uses_blended_target_before_apply(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 75
+        cfg.max_fee_ppm = 2500
+        channel_id = "123x460x0"
+        peer_id = "02" + "1" * 64
+        current_fee_ppm = 500
+
+        ts_state = self._prepare_channel(
+            fc, mock_database, channel_id, peer_id,
+            current_fee_ppm=current_fee_ppm,
+            flow="balanced_active",
+        )
+        ts_state.thompson.sample_fee = lambda floor, ceiling: ceiling
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
+        result = fc._adjust_channel_fee(
+            channel_id,
+            peer_id,
+            self._state("balanced_active"),
+            self._channel_info(current_fee_ppm=current_fee_ppm),
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.algorithm_values["blended_target_ppm"] < result.algorithm_values["bounded_target_ppm"]
+        assert result.new_fee_ppm <= result.algorithm_values["blended_target_ppm"]
+
+    def test_sparse_data_channel_moves_more_conservatively(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 75
+        cfg.max_fee_ppm = 2500
+        sparse_channel_id = "123x461x0"
+        dense_channel_id = "123x462x0"
+        sparse_peer_id = "02" + "2" * 64
+        dense_peer_id = "02" + "3" * 64
+        current_fee_ppm = 500
+
+        sparse_state = self._prepare_channel(
+            fc, mock_database, sparse_channel_id, sparse_peer_id,
+            current_fee_ppm=current_fee_ppm,
+            flow="balanced_active",
+        )
+        sparse_state.thompson.sample_fee = lambda floor, ceiling: ceiling
+        sparse_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+        sparse_state.thompson.observations = []
+
+        dense_state = self._prepare_channel(
+            fc, mock_database, dense_channel_id, dense_peer_id,
+            current_fee_ppm=current_fee_ppm,
+            flow="balanced_active",
+        )
+        dense_state.thompson.sample_fee = lambda floor, ceiling: ceiling
+        dense_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+        dense_state.thompson.observations = [(500, 5.0, 1.0, int(time.time()))] * 10
+
+        sparse_result = fc._adjust_channel_fee(
+            sparse_channel_id,
+            sparse_peer_id,
+            self._state("balanced_active"),
+            self._channel_info(current_fee_ppm=current_fee_ppm),
+            cfg=cfg,
+        )
+        dense_result = fc._adjust_channel_fee(
+            dense_channel_id,
+            dense_peer_id,
+            self._state("balanced_active"),
+            self._channel_info(current_fee_ppm=current_fee_ppm),
+            cfg=cfg,
+        )
+
+        assert sparse_result is not None and dense_result is not None
+        assert sparse_result.new_fee_ppm < dense_result.new_fee_ppm
+        assert sparse_result.algorithm_values["sparse_data_conservative"] is True
 
 
 class TestVariancePrecision:

@@ -3939,7 +3939,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
     def diagnostic_rebalance(self, channel_id: str) -> Dict[str, Any]:
         """
         Trigger a "Channel Defibrillator" sequence:
-        1. Set Fee to 0 (Passive Lure).
+        1. Enable bounded low-fee exploration (Passive Lure).
         2. Execute small active rebalance (Active Shock).
         
         This is a diagnostic operation to verify channel liveness before
@@ -3947,10 +3947,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         (50k sats) forces liquidity into the channel immediately rather than
         waiting for organic routing traffic.
         """
-        self.plugin.log(f"Defibrillator: Triggering Zero-Fee Probe for channel {channel_id}")
+        self.plugin.log(f"Defibrillator: Triggering bounded exploration for channel {channel_id}")
         
-        # 1. Set the probe flag in the database (Fee Controller will see this and set 0 PPM)
-        self.database.set_channel_probe(channel_id, probe_type='zero_fee')
+        # 1. Set the exploration flag in the database (Fee Controller will
+        # map it to bounded low-fee exploration above the configured floor)
+        self.database.set_channel_probe(channel_id, probe_type='bounded_low_fee')
         
         # 2. THE ACTIVE SHOCK: Attempt a small rebalance immediately
         try:
@@ -3970,7 +3971,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             if not valid_sources:
                 return {
                     "success": True, 
-                    "message": "Zero-Fee flag set, but no sources available for active shock."
+                    "message": "Exploration flag set, but no sources available for active shock."
                 }
             
             # Sort by spendable capacity desc, pick the best
@@ -3984,7 +3985,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             shock_amount = 50_000
             
             # Estimate inbound fee (we accept a loss here, it's a diagnostic cost)
-            # Note: outbound_fee is 0 because we set the probe flag above
+            # Note: outbound_fee is 0 because the active shock itself is not the
+            # fee-controller path; the controller-side exploration remains non-zero.
             inbound_fee = self._estimate_inbound_fee(dest_info.get('peer_id', ''))
             
             candidate = RebalanceCandidate(
@@ -4341,4 +4343,3 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         """Stop all active rebalance jobs."""
         count = self.job_manager.stop_all_jobs(reason="manual_stop_all")
         return {"success": True, "stopped": count}
-

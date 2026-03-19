@@ -5,7 +5,7 @@ Tests cover:
 - C-1: Fee Priority Chain priority chain integration test
 - C-2: _adjust_channel_fee end-to-end test
 - I-1: NaN guard on update_posterior
-- I-2: Zero-fee probe TTL expiry
+- I-2: Exploration-flag TTL expiry
 - I-8: VegasReflexState unit tests
 """
 
@@ -170,11 +170,11 @@ class TestNaNGuardUpdatePosterior:
 
 
 # =============================================================================
-# I-2: Zero-fee probe TTL expiry
+# I-2: Exploration-flag TTL expiry
 # =============================================================================
 
 class TestProbeTTL:
-    """Tests for zero-fee probe TTL expiry (I-2)."""
+    """Tests for bounded-exploration flag TTL expiry (I-2)."""
 
     def test_fresh_probe_returned(self, mock_database):
         """Probe set recently should be returned."""
@@ -214,7 +214,7 @@ class TestFeePriorityChain:
 
     Tests verify the correct priority order:
     1. Congestion (saturated HTLC slots -> ceiling fee)
-    2. Zero-Fee Probe (dead channel -> 0 PPM)
+    2. Bounded low-fee exploration (legacy exploration flag)
     3. DTS+PID (primary optimization)
     """
 
@@ -279,8 +279,8 @@ class TestFeePriorityChain:
         assert result is not None
         assert "CONGESTION" in result.reason
 
-    def test_probe_overrides_dts_pid(self, mock_plugin, mock_database):
-        """Channel under zero-fee probe should get 0 PPM fee (from non-zero)."""
+    def test_probe_uses_bounded_low_fee_exploration(self, mock_plugin, mock_database):
+        """Channel under exploration should use a bounded low non-zero fee."""
         fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
         mock_database.get_channel_probe.return_value = {
             "channel_id": "123x456x0",
@@ -303,11 +303,13 @@ class TestFeePriorityChain:
         result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
         assert result is not None
-        assert "ZERO_FEE_PROBE" in result.reason
-        assert result.new_fee_ppm == 0
+        assert "exploration" in result.reason.lower()
+        assert result.new_fee_ppm >= cfg.min_fee_ppm
+        assert result.new_fee_ppm > 0
+        assert result.new_fee_ppm < channel_info["fee_proportional_millionths"]
 
     def test_congestion_beats_probe(self, mock_plugin, mock_database):
-        """Congestion priority is higher than zero-fee probe."""
+        """Congestion priority is higher than bounded low-fee exploration."""
         fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
         mock_database.get_channel_probe.return_value = {
             "channel_id": "123x456x0",

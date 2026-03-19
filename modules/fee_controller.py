@@ -5,23 +5,28 @@ MODULE 2: Revenue-Maximizing Fee Controller (DTS+PID)
 
 This module implements a three-concern fee optimization architecture:
 
-  Final_Fee = clamp(
-      DTS_market_fee × PID_multiplier,
+  bounded_target = clamp(
+      DTS_market_fee × PID_inventory_bias,
       max(min_fee, rebalance_floor, vegas_floor),
       max_fee
   )
+  blended_target = current_fee + blend_ratio × (bounded_target - current_fee)
+  final_fee = damp(blended_target, per_cycle_delta_cap)
 
 Concern 1 — Market Pricing: Discounted Gaussian Thompson Sampling (DTS)
 - Bayesian posterior over fee-revenue observations
-- Discount factor (gamma=0.95) decays posterior precision each cycle,
-  giving ~6.5h half-life to naturally forget stale data
+- Normal cycles use slower forgetting (gamma=0.98), with even slower
+  forgetting (gamma=0.992) on sparse or quiet channels
+- Samples still come from the DTS posterior, but sparse-data channels
+  are handled more conservatively before the controller trusts them fully
 
 Concern 2 — Balance Management: PID Controller
-- Produces a 0.1x–10.0x multiplier from channel outbound ratio
+- Produces a bounded 0.5x–2.0x inventory-bias multiplier from channel
+  outbound ratio
 - P-term: reacts to current imbalance
 - I-term: reacts to sustained imbalance
-- D-term: reacts to sudden changes
-- EWMA-smoothed error (alpha=0.3) handles sparse Lightning feedback
+- D-term removed to avoid noise amplification on sparse Lightning feedback
+- EWMA-smoothed error (alpha=0.3) keeps balance correction gradual
 - Capacity-scaled gains: larger channels get less aggressive PID
 - Dynamic target ratio: source=0.7, sink=0.3, balanced=0.5
 
@@ -32,11 +37,13 @@ Concern 3 — Hard Safety: Floor/ceiling clamps
 
 The Fee Priority Chain:
 1. Congestion: HTLC slots saturated -> ceiling fee
-2. Zero-Fee Probe: Defibrillator for dead channels -> 0 PPM
+2. Bounded Low-Fee Exploration: legacy probe flag maps to a short-lived,
+   non-zero exploration fee above the configured floor
 3. DTS+PID: Primary fee optimization
 
 Post-DTS+PID:
-- Gossip Hysteresis: Suppress sub-threshold changes
+- Blend toward the bounded target before per-cycle delta capping
+- Gossip Hysteresis: Suppress sub-threshold broadcast changes
 
 Revenue Calculation:
 - Revenue = Volume x Fee
@@ -78,6 +85,7 @@ class FeeReasonCode(Enum):
     Categories:
     - Policy overrides: Static policies that bypass algorithmic decisions
     - Algorithm decisions: Core DTS+PID fee controller outcomes
+    - Legacy compatibility: preserved so old DB rows/reason strings still decode
     - Heuristic modifiers: Channel-aware adjustments to step size
     - Skip reasons: Why a channel was not adjusted this cycle
     """
@@ -87,8 +95,10 @@ class FeeReasonCode(Enum):
 
     # Algorithm decisions
     DTS_PID_SAMPLE = "dts_pid_sample"                 # Normal DTS posterior sample
-    ZERO_FEE_PROBE = "zero_fee_probe"                 # Defibrillator 0-fee probe
-    ZERO_FEE_PROBE_SUCCESS = "zero_fee_probe_success" # Probe succeeded, exit to floor
+    ZERO_FEE_PROBE = "zero_fee_probe"                 # Legacy 0-fee probe reason
+    ZERO_FEE_PROBE_SUCCESS = "zero_fee_probe_success" # Legacy 0-fee probe success reason
+    LOW_FEE_EXPLORATION = "low_fee_exploration"       # Bounded low-fee exploration
+    LOW_FEE_EXPLORATION_SUCCESS = "low_fee_exploration_success"  # Exploration saw traffic
     CONGESTION = "congestion"                         # Congestion-based fee surge
     GOSSIP_REFRESH = "gossip_refresh"                 # Minimal nudge to refresh channel_update
     CHANNEL_OPEN = "channel_open"                     # Initial fee set on channel open
@@ -108,8 +118,8 @@ class FeeReasonCode(Enum):
 # DTS: Discounted Thompson Sampling (Market Fee Component)
 # =============================================================================
 # Continuous posterior for fee optimization using Gaussian conjugate priors.
-# Bayesian exploration of the fee space with discount factor gamma=0.95
-# for natural forgetting of stale observations (~6.5h half-life).
+# The controller passes in conservative discount factors (0.98 normal,
+# 0.992 sparse/quiet) so the posterior forgets stale observations slowly.
 # Security mitigations:
 # - Bounded observations (max 200 per channel)
 # - Exponential decay on old observations
@@ -132,12 +142,13 @@ class GaussianThompsonState:
     Security mitigations:
     - MAX_OBSERVATIONS: Bounded memory per channel (200)
     - DECAY_HOURS: Exponential decay on old observations (7-day half-life)
-    - MIN_OBSERVATIONS: Minimum data before using posterior (3)
+    - MIN_OBSERVATIONS: Minimum data before trusting posterior
     """
     MAX_OBSERVATIONS = 200          # Security: bounded memory
     DECAY_HOURS = 168.0             # 7-day half-life for observation decay
-    MIN_OBSERVATIONS = 3            # Minimum before trusting posterior
+    MIN_OBSERVATIONS = 5            # Minimum before trusting posterior
     MIN_STD = 10                    # Never let uncertainty go below 10 ppm
+    SECONDARY_EXPLORE_BOOST = 1.25  # Slightly wider prior for secondary contexts
 
     # Prior parameters
     prior_mean_fee: int = 200       # Default prior mean: 200 ppm
@@ -276,7 +287,7 @@ class GaussianThompsonState:
         # If not enough observations, explore more widely
         if len(self.observations) < self.MIN_OBSERVATIONS:
             # Use prior with extra exploration (clamped to MIN_STD like normal path)
-            explore_std = max(self.MIN_STD, self.prior_std_fee * 1.5)
+            explore_std = max(self.MIN_STD, self.prior_std_fee * 1.1)
             sampled = random.gauss(self.prior_mean_fee, explore_std)
         else:
             # Try polynomial posterior sampling; fall back to Gaussian
@@ -914,7 +925,9 @@ class GaussianThompsonState:
         "5% less certain" per cycle. Replaces HistoricalResponseCurve
         regime detection.
 
-        Half-life at 30-min cycles with gamma=0.95: ~6.5 hours.
+        The controller typically uses gamma=0.98 for active channels and
+        gamma=0.992 for sparse/quiet channels. Lower gamma values remain
+        available for tests or explicit callers.
 
         Args:
             gamma: Discount factor in (0, 1). Lower = faster forgetting.
@@ -1038,7 +1051,7 @@ class PIDState:
     """PID controller state for channel balance management."""
     kp: float = 2.0
     ki: float = 0.1
-    kd: float = 5.0
+    kd: float = 0.0
     ewma_error: float = 0.0
     integral_error: float = 0.0
     prev_ewma_error: float = 0.0
@@ -1074,8 +1087,6 @@ class PIDState:
         scale = 1.0 / math.log2(max(capacity_sats, 1) / 1_000_000 + 2)
         eff_kp = self.kp * scale
         eff_ki = self.ki * scale
-        eff_kd = self.kd * scale
-
         p_term = eff_kp * self.ewma_error
 
         if dt > 0:
@@ -1086,15 +1097,12 @@ class PIDState:
             )
         i_term = eff_ki * self.integral_error
 
-        if dt > 0:
-            d_term = eff_kd * (self.ewma_error - self.prev_ewma_error) / max(dt, 0.1)
-        else:
-            d_term = 0.0
+        d_term = 0.0
         self.prev_ewma_error = self.ewma_error
 
         output = p_term + i_term + d_term
         multiplier = 1.5 ** output
-        return max(0.1, min(10.0, multiplier))
+        return max(0.5, min(2.0, multiplier))
 
     def to_dict(self) -> dict:
         return {
@@ -1111,7 +1119,7 @@ class PIDState:
         state = cls()
         state.kp = float(d.get("kp", 2.0))
         state.ki = float(d.get("ki", 0.1))
-        state.kd = float(d.get("kd", 5.0))
+        state.kd = float(d.get("kd", 0.0))
         state.ewma_error = float(d.get("ewma_error", 0.0))
         state.integral_error = float(d.get("integral_error", 0.0))
         state.prev_ewma_error = float(d.get("prev_ewma_error", 0.0))
@@ -1407,16 +1415,20 @@ class FeeController:
     DTS+PID fee controller for revenue maximization.
 
     Architecture: Three independent concerns combined as
-    Final_Fee = clamp(DTS_fee × PID_multiplier, hard_floor, hard_ceiling)
+    bounded_target = clamp(DTS_fee × PID_multiplier, hard_floor, hard_ceiling)
+    blended_target = current_fee + blend_ratio × (bounded_target - current_fee)
+    final_fee = damp(blended_target, per_cycle_delta_cap)
 
     - DTS (Discounted Thompson Sampling): Bayesian market fee discovery with
-      posterior forgetting (gamma=0.95). Samples from Normal posterior over
-      fee-revenue observations.
-    - PID Controller: Balance management multiplier (0.1x–10.0x) from channel
-      outbound ratio. Replaces legacy balance-based adjustments with one
-      unified mechanism.
+      slower posterior forgetting (gamma=0.98 normal, gamma=0.992 sparse)
+      and conservative exploration under sparse data.
+    - PID Controller: Balance management multiplier (0.5x–2.0x) from channel
+      outbound ratio. Uses P+I only so inventory bias damps rather than
+      amplifies sparse noisy observations.
     - Hard Safety: Economic floors (rebalance cost, Vegas Reflex, min_fee)
       and ceiling (max_fee) that the PID has no signal for.
+    - Bounded exploration: legacy exploration flags map to non-zero low-fee
+      exploration above the configured floor rather than literal 0-ppm fees.
 
     Key Principles:
     1. Revenue Focus: Maximize Volume × Fee, not just volume
@@ -1438,10 +1450,19 @@ class FeeController:
     WAKE_UP_THRESHOLD = 0.20     # 20% revenue spike triggers immediate wake-up
     SLEEP_CYCLES = 2             # Sleep for 2x the fee interval
     STABLE_CYCLES_REQUIRED = 3   # Number of flat cycles before entering sleep mode
+    DTS_DISCOUNT_GAMMA = 0.98
+    DTS_SPARSE_DISCOUNT_GAMMA = 0.992
+    NORMAL_TARGET_BLEND_RATIO = 0.35
+    WAKE_TARGET_BLEND_RATIO = 0.15
+    SPARSE_TARGET_BLEND_RATIO = 0.10
     NORMAL_CYCLE_MAX_DELTA_RATIO = 0.50
     NORMAL_CYCLE_MIN_DELTA_PPM = 100
     WAKE_CYCLE_MAX_DELTA_RATIO = 0.20
     WAKE_CYCLE_MIN_DELTA_PPM = 50
+    EXPLORATION_FEE_MULTIPLIER = 1.25
+    EXPLORATION_MAX_DISCOUNT_RATIO = 0.50
+    EXPLORATION_HEADROOM_RATIO = 0.35
+    EXPLORATION_SPARSE_HEADROOM_RATIO = 0.50
 
     # ==========================================================================
     # Issue #20: Flow-Based Ceiling Reduction
@@ -2507,19 +2528,103 @@ class FeeController:
         scaled_delta = int(math.ceil(max(current_fee_ppm, 1) * ratio))
         return max(min_delta, scaled_delta)
 
-    def _apply_damped_fee_target(
+    def _is_sparse_data_channel(
+        self,
+        observation_count: int,
+        forward_count: int,
+        hours_elapsed: float,
+        current_revenue_rate: float,
+    ) -> bool:
+        """Return True when a channel should be repriced conservatively."""
+        if observation_count < GaussianThompsonState.MIN_OBSERVATIONS:
+            return True
+        if forward_count < self.MIN_FORWARDS_FOR_SIGNAL:
+            return True
+        if hours_elapsed >= 1.0 and current_revenue_rate <= 0.0:
+            return True
+        return False
+
+    def _get_target_blend_ratio(
+        self,
+        woke_from_sleep: bool,
+        sparse_data_conservative: bool,
+    ) -> float:
+        ratio = self.NORMAL_TARGET_BLEND_RATIO
+        if woke_from_sleep:
+            ratio = min(ratio, self.WAKE_TARGET_BLEND_RATIO)
+        if sparse_data_conservative:
+            ratio = min(ratio, self.SPARSE_TARGET_BLEND_RATIO)
+        return ratio
+
+    def _blend_fee_target(
         self,
         current_fee_ppm: int,
         bounded_target_ppm: int,
         woke_from_sleep: bool,
+        sparse_data_conservative: bool,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Move part-way toward the bounded target before delta capping."""
+        blend_ratio = self._get_target_blend_ratio(
+            woke_from_sleep=woke_from_sleep,
+            sparse_data_conservative=sparse_data_conservative,
+        )
+        requested_delta = int(bounded_target_ppm) - int(current_fee_ppm)
+        blended_delta = int(round(requested_delta * blend_ratio))
+
+        if requested_delta != 0 and blended_delta == 0:
+            blended_delta = 1 if requested_delta > 0 else -1
+
+        blended_target_ppm = int(current_fee_ppm) + blended_delta
+        return blended_target_ppm, {
+            "blend_ratio": blend_ratio,
+            "blended_delta_ppm": blended_delta,
+            "sparse_data_conservative": sparse_data_conservative,
+        }
+
+    def _get_exploration_fee_target(
+        self,
+        current_fee_ppm: int,
+        floor_ppm: int,
+        cfg: "ConfigSnapshot",
+        sparse_data_conservative: bool,
+    ) -> int:
+        """
+        Return a bounded low-fee exploration target.
+
+        Exploration never bypasses the configured/economic floor. Sparse channels
+        stay closer to the current fee, while active channels keep enough
+        headroom above the floor to preserve a meaningful pricing signal.
+        """
+        exploration_floor = max(floor_ppm, cfg.min_fee_ppm)
+        if current_fee_ppm <= exploration_floor:
+            return exploration_floor
+
+        discount_ratio = self.EXPLORATION_MAX_DISCOUNT_RATIO
+        headroom_ratio = self.EXPLORATION_HEADROOM_RATIO
+        if sparse_data_conservative:
+            discount_ratio *= 0.5
+            headroom_ratio = self.EXPLORATION_SPARSE_HEADROOM_RATIO
+
+        floor_candidate = int(math.ceil(exploration_floor * self.EXPLORATION_FEE_MULTIPLIER))
+        headroom = max(0, current_fee_ppm - exploration_floor)
+        headroom_candidate = exploration_floor + int(round(headroom * headroom_ratio))
+        discounted_ceiling = int(round(current_fee_ppm * (1.0 - discount_ratio)))
+        candidate = max(floor_candidate, headroom_candidate)
+        return max(exploration_floor, min(candidate, discounted_ceiling))
+
+    def _apply_damped_fee_target(
+        self,
+        current_fee_ppm: int,
+        target_fee_ppm: int,
+        woke_from_sleep: bool,
     ) -> Tuple[int, Dict[str, Any]]:
         """
-        Convert a bounded DTS+PID target into the fee we will actually apply.
+        Convert a blended DTS+PID target into the fee we will actually apply.
 
         The controller still decides direction and target. This helper only limits
         how much of that move can land in a single normal adjustment cycle.
         """
-        requested_delta = int(bounded_target_ppm) - int(current_fee_ppm)
+        requested_delta = int(target_fee_ppm) - int(current_fee_ppm)
         max_delta_ppm = self._get_fee_step_cap(current_fee_ppm, woke_from_sleep)
         cap_reason = "none"
         cap_applied = False
@@ -2531,7 +2636,7 @@ class FeeController:
                 max_delta_ppm if requested_delta > 0 else -max_delta_ppm
             )
         else:
-            applied_fee_ppm = int(bounded_target_ppm)
+            applied_fee_ppm = int(target_fee_ppm)
 
         return applied_fee_ppm, {
             "requested_delta_ppm": requested_delta,
@@ -2551,13 +2656,14 @@ class FeeController:
 
         DTS+PID path (default):
         1. Update DTS posterior with observed revenue rate
-        2. Apply DTS discount (gamma=0.95) to forget stale data
+        2. Apply conservative DTS discount to forget stale data gradually
         3. Sample market fee from posterior
-        4. Calculate PID multiplier from outbound ratio vs target
-        5. Final fee = clamp(DTS_fee × PID_mult, hard_floor, hard_ceiling)
+        4. Calculate PID inventory bias from outbound ratio vs target
+        5. Clamp to hard bounds, blend toward the bounded target, then apply
+           a per-cycle delta cap
 
         Hard floors = max(chain_cost, vegas_floor, rebalance_cost_floor, min_fee)
-        Hard ceiling = max_fee (before legacy saturation drain)
+        Hard ceiling = max_fee
 
         Args:
             channel_id: Channel to adjust
@@ -2582,29 +2688,33 @@ class FeeController:
         raw_dts_target_ppm = None
         post_pid_target_ppm = None
         bounded_target_ppm = None
+        blended_target_ppm = None
         applied_target_ppm = None
         bound_reason = "none"
         delta_cap_reason = "none"
         delta_cap_ppm = 0
         delta_cap_applied = False
+        sparse_data_conservative = False
+        target_blend_ratio = self.NORMAL_TARGET_BLEND_RATIO
+        exploration_mode = "none"
 
         # Detect critical state
         is_congested = (state and state.get("state") == "congested")
 
         # =====================================================================
-        # ZERO-FEE PROBE: Defibrillator Override
+        # Legacy exploration flag: bounded low-fee exploration override
         # =====================================================================
-        probe_flag = self.database.get_channel_probe(channel_id)
-        is_under_probe = (probe_flag is not None)
+        exploration_flag = self.database.get_channel_probe(channel_id)
+        is_under_exploration = (exploration_flag is not None)
         
         now = int(time.time())
 
         # Get current fee
         raw_chain_fee = channel_info.get("fee_proportional_millionths", 0)
         current_fee_ppm = raw_chain_fee
-        # If CLN reports 0 and we're not intentionally running a 0-fee policy,
+        # If CLN reports 0 and we're not intentionally in an exploration regime,
         # treat it as "unset" and seed to min_fee for sensible initialization.
-        if current_fee_ppm == 0 and not is_under_probe:
+        if current_fee_ppm == 0 and not is_under_exploration:
             current_fee_ppm = cfg.min_fee_ppm
 
         # Load cycle state (Issue #32: pass actual fee for desync detection)
@@ -2770,9 +2880,9 @@ class FeeController:
         flow_state = state.get("state", "balanced")
         flow_state_multiplier = 1.0
         if flow_state == "source":
-            flow_state_multiplier = 1.25  # Sources are scarce - higher fees
+            flow_state_multiplier = 1.10  # Sources are scarce - slightly higher floor
         elif flow_state == "sink":
-            flow_state_multiplier = 0.50  # Sinks fill for free - aggressively lower floor
+            flow_state_multiplier = 0.75  # Sinks can shade lower, but avoid slamming to floor
         
         # Get profitability multiplier (uses marginal ROI now)
         profitability_multiplier = 1.0
@@ -2821,7 +2931,7 @@ class FeeController:
             channel_id, current_fee_ppm, base_ceiling_ppm
         )
 
-        # Final bounds used by all paths (DTS+PID, congestion, probe)
+        # Final bounds used by all paths (DTS+PID, congestion, exploration)
         floor_ppm = base_floor_ppm
         ceiling_ppm = base_ceiling_ppm
 
@@ -2830,7 +2940,7 @@ class FeeController:
             ceiling_ppm = floor_ppm + 10
         
         # Target Decision Block (Fee Priority Chain)
-        # Priority: Congestion > Zero-Fee Probe > DTS+PID
+        # Priority: Congestion > bounded low-fee exploration > DTS+PID
         decision_reason = "unknown"
         base_new_fee = None
         new_fee_ppm = 0
@@ -2848,27 +2958,38 @@ class FeeController:
             previous_rate = cycle.last_revenue_rate
             target_found = True
 
-        # Priority 2: Zero-Fee Probe Logic (Jumpstarting)
-        if not target_found and is_under_probe:
+        # Priority 2: Bounded low-fee exploration driven by the legacy probe flag
+        if not target_found and is_under_exploration:
             # Calculate current revenue rate (reuse logic from rate calculation below)
             v_since = self.database.get_volume_since(channel_id, cycle.last_update)
             
             probe_forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
 
-            # Success criteria: any forwards/volume observed while probing. We cannot
-            # use revenue-rate here because fee may be 0 by design.
-            probe_success = (v_since > 0) or (probe_forward_count > 0)
+            # Success criteria: any forwards/volume observed during exploration.
+            exploration_success = (v_since > 0) or (probe_forward_count > 0)
 
-            if probe_success:
-                # Exit probe immediately and re-establish a non-zero fee floor.
-                # Leaving channels at 0 fee until the next cycle can leak revenue.
+            if exploration_success:
+                # Exploration succeeded. Clear the flag and hold at a safe floor-like
+                # fee instead of bouncing between special regimes.
                 try:
                     self.database.clear_channel_probe(channel_id)
                 except Exception as e:
                     self.plugin.log(f"Failed to clear channel probe for {channel_id[:12]}...: {e}", level='debug')
 
-                new_fee_ppm = max(floor_ppm, cfg.min_fee_ppm)
-                decision_reason = "ZERO_FEE_PROBE_SUCCESS"
+                sparse_data_conservative = self._is_sparse_data_channel(
+                    observation_count=0,
+                    forward_count=probe_forward_count,
+                    hours_elapsed=hours_elapsed,
+                    current_revenue_rate=current_revenue_rate,
+                )
+                new_fee_ppm = self._get_exploration_fee_target(
+                    current_fee_ppm=max(current_fee_ppm, floor_ppm),
+                    floor_ppm=floor_ppm,
+                    cfg=cfg,
+                    sparse_data_conservative=sparse_data_conservative,
+                )
+                exploration_mode = "bounded_low_fee_success"
+                decision_reason = "LOW_FEE_EXPLORATION_SUCCESS"
                 new_direction = 1 if new_fee_ppm > current_fee_ppm else (-1 if new_fee_ppm < current_fee_ppm else 0)
                 step_ppm = abs(new_fee_ppm - current_fee_ppm)
                 original_step_ppm = step_ppm
@@ -2878,16 +2999,27 @@ class FeeController:
                 target_found = True
 
                 self.plugin.log(
-                    f"DEFIBRILLATOR SUCCESS: Channel {channel_id[:12]}... observed "
-                    f"{probe_forward_count} forwards / {v_since} sats during 0-fee probe. "
-                    f"Exiting probe to floor {new_fee_ppm} ppm.",
+                    f"EXPLORATION: Channel {channel_id[:12]}... observed "
+                    f"{probe_forward_count} forwards / {v_since} sats during bounded exploration. "
+                    f"Holding at safe exploration fee {new_fee_ppm} ppm.",
                     level='info'
                 )
 
             else:
-                # Still probing: force 0 PPM
-                new_fee_ppm = 0
-                decision_reason = "ZERO_FEE_PROBE"
+                sparse_data_conservative = self._is_sparse_data_channel(
+                    observation_count=0,
+                    forward_count=probe_forward_count,
+                    hours_elapsed=hours_elapsed,
+                    current_revenue_rate=current_revenue_rate,
+                )
+                new_fee_ppm = self._get_exploration_fee_target(
+                    current_fee_ppm=current_fee_ppm,
+                    floor_ppm=floor_ppm,
+                    cfg=cfg,
+                    sparse_data_conservative=sparse_data_conservative,
+                )
+                exploration_mode = "bounded_low_fee"
+                decision_reason = "LOW_FEE_EXPLORATION"
                 new_direction = cycle.trend_direction
                 step_ppm = cycle.step_ppm
                 original_step_ppm = step_ppm
@@ -2911,6 +3043,12 @@ class FeeController:
 
             # Load channel fee state
             ts_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+            sparse_data_conservative = self._is_sparse_data_channel(
+                observation_count=len(ts_state.thompson.observations),
+                forward_count=forward_count,
+                hours_elapsed=hours_elapsed,
+                current_revenue_rate=current_revenue_rate,
+            )
             # Track rate change for logging and hysteresis
             rate_change = current_revenue_rate - ts_state.last_revenue_rate
             previous_rate = ts_state.last_revenue_rate
@@ -3007,7 +3145,12 @@ class FeeController:
             # =====================================================================
             # DTS: Apply discount factor before sampling (posterior forgetting)
             # =====================================================================
-            ts_state.thompson.apply_dts_discount(gamma=0.95)
+            discount_gamma = (
+                self.DTS_SPARSE_DISCOUNT_GAMMA
+                if sparse_data_conservative else
+                self.DTS_DISCOUNT_GAMMA
+            )
+            ts_state.thompson.apply_dts_discount(gamma=discount_gamma)
 
             # =====================================================================
             # VEGAS-DTS INTERACTION
@@ -3044,9 +3187,16 @@ class FeeController:
             if bounded_target_ppm != post_pid_target_ppm:
                 bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
 
-            new_fee_ppm, damping_info = self._apply_damped_fee_target(
+            blended_target_ppm, blend_info = self._blend_fee_target(
                 current_fee_ppm=current_fee_ppm,
                 bounded_target_ppm=bounded_target_ppm,
+                woke_from_sleep=woke_from_sleep,
+                sparse_data_conservative=sparse_data_conservative,
+            )
+            target_blend_ratio = blend_info["blend_ratio"]
+            new_fee_ppm, damping_info = self._apply_damped_fee_target(
+                current_fee_ppm=current_fee_ppm,
+                target_fee_ppm=blended_target_ppm,
                 woke_from_sleep=woke_from_sleep,
             )
             applied_target_ppm = new_fee_ppm
@@ -3163,9 +3313,11 @@ class FeeController:
         # hysteresis bypass when balance bucket or modifier values change.
         last_state_category = (cycle.last_state or "").split(" (")[0]
         current_state_category = decision_reason.split(" (")[0]
+        legacy_zero_fee_transition = (
+            cycle.last_broadcast_fee_ppm <= 0 or raw_chain_fee <= 0
+        )
         significant_change = (delta_broadcast > threshold) or \
-                             (cycle.last_broadcast_fee_ppm <= 1) or \
-                             (new_fee_ppm <= 1) or \
+                             legacy_zero_fee_transition or \
                              (target_found and last_state_category != current_state_category) or \
                              (not target_found and cycle.last_state == "CONGESTION")
 
@@ -3230,11 +3382,12 @@ class FeeController:
         mult_note = f", mult=liq{liquidity_multiplier:.2f}*prof{profitability_multiplier:.2f}"
         target_summary = (
             f"targets=dts:{raw_dts_target_ppm}, post_pid:{post_pid_target_ppm}, "
-            f"bounded:{bounded_target_ppm}, applied:{applied_target_ppm}, "
-            f"bound:{bound_reason}, cap:{delta_cap_reason}({delta_cap_ppm}ppm), "
-            f"wake:{wake_reason}"
+            f"bounded:{bounded_target_ppm}, blended:{blended_target_ppm}, applied:{applied_target_ppm}, "
+            f"blend:{target_blend_ratio:.2f}, bound:{bound_reason}, cap:{delta_cap_reason}({delta_cap_ppm}ppm), "
+            f"wake:{wake_reason}, sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
             if raw_dts_target_ppm is not None else
-            f"targets=n/a, wake:{wake_reason}"
+            f"targets=n/a, blend:{target_blend_ratio:.2f}, wake:{wake_reason}, "
+            f"sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
         )
 
         # Build reason string for DTS+PID
@@ -3282,7 +3435,11 @@ class FeeController:
             return None
         
         # Determine reason_code for this adjustment
-        if decision_reason == "ZERO_FEE_PROBE":
+        if decision_reason == "LOW_FEE_EXPLORATION":
+            fee_reason_code = FeeReasonCode.LOW_FEE_EXPLORATION.value
+        elif decision_reason == "LOW_FEE_EXPLORATION_SUCCESS":
+            fee_reason_code = FeeReasonCode.LOW_FEE_EXPLORATION_SUCCESS.value
+        elif decision_reason == "ZERO_FEE_PROBE":
             fee_reason_code = FeeReasonCode.ZERO_FEE_PROBE.value
         elif decision_reason == "ZERO_FEE_PROBE_SUCCESS":
             fee_reason_code = FeeReasonCode.ZERO_FEE_PROBE_SUCCESS.value
@@ -3295,7 +3452,7 @@ class FeeController:
         result = self.set_channel_fee(
             channel_id, new_fee_ppm, reason=reason,
             reason_code=fee_reason_code,
-            enforce_limits=(fee_reason_code != FeeReasonCode.ZERO_FEE_PROBE.value),
+            enforce_limits=True,
             channel_info=channel_info,
             htlcmin_msat=htlcmin_msat,
             htlcmax_msat=htlcmax_msat
@@ -3351,13 +3508,17 @@ class FeeController:
                     "raw_dts_target_ppm": raw_dts_target_ppm,
                     "post_pid_target_ppm": post_pid_target_ppm,
                     "bounded_target_ppm": bounded_target_ppm,
+                    "blended_target_ppm": blended_target_ppm if blended_target_ppm is not None else bounded_target_ppm,
                     "applied_target_ppm": applied_target_ppm if applied_target_ppm is not None else new_fee_ppm,
+                    "target_blend_ratio": target_blend_ratio,
                     "bound_reason": bound_reason,
                     "delta_cap_reason": delta_cap_reason,
                     "delta_cap_ppm": delta_cap_ppm,
                     "delta_cap_applied": delta_cap_applied,
                     "wake_damping_applied": woke_from_sleep,
                     "wake_reason": wake_reason,
+                    "sparse_data_conservative": sparse_data_conservative,
+                    "exploration_mode": exploration_mode,
                 },
                 reason_code=fee_reason_code,
             )
@@ -3515,11 +3676,15 @@ class FeeController:
                 reason_code=reason_code,
             )
 
-            # Keep optimizer state coherent for manual/policy/gossip-refresh changes
-            # (algorithm-driven changes update their own state post-call).
+            # Keep optimizer state coherent for manual/policy/gossip-refresh and
+            # exploration-driven changes (algorithm-driven DTS samples update their
+            # own state post-call).
             should_sync_state = manual or reason_code in (
                 FeeReasonCode.POLICY_STATIC.value,
+                FeeReasonCode.LOW_FEE_EXPLORATION.value,
+                FeeReasonCode.LOW_FEE_EXPLORATION_SUCCESS.value,
                 FeeReasonCode.ZERO_FEE_PROBE.value,
+                FeeReasonCode.ZERO_FEE_PROBE_SUCCESS.value,
                 FeeReasonCode.GOSSIP_REFRESH.value,
                 FeeReasonCode.CHANNEL_OPEN.value,
             )
@@ -4166,4 +4331,3 @@ class FeeController:
         
         return channels
     
-

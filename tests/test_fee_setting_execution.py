@@ -234,8 +234,25 @@ class TestGossipRefreshExecution:
         mock_plugin.rpc.setchannel.assert_called()
 
 
-class TestZeroFeeProbeEndToEnd:
-    def test_zero_fee_probe_sets_fee_to_zero_bypassing_min_fee(self, mock_plugin, mock_database):
+class TestBoundedExplorationEndToEnd:
+    def test_exploration_target_preserves_meaningful_headroom_above_floor(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        cfg = Config(min_fee_ppm=40, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        fc = FeeController(mock_plugin, cfg, mock_database)
+
+        target = fc._get_exploration_fee_target(
+            current_fee_ppm=400,
+            floor_ppm=40,
+            cfg=cfg.snapshot(),
+            sparse_data_conservative=False,
+        )
+
+        assert target > int(40 * fc.EXPLORATION_FEE_MULTIPLIER)
+        assert target < 400
+
+    def test_exploration_uses_bounded_low_fee_above_floor(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.fee_controller import FeeController, FeeReasonCode
 
@@ -286,11 +303,13 @@ class TestZeroFeeProbeEndToEnd:
 
         adj = fc._adjust_channel_fee(channel_id, peer_id, flow_state, channel_info, chain_costs=None, cfg=cfg.snapshot())
         assert adj is not None
-        assert adj.reason_code == FeeReasonCode.ZERO_FEE_PROBE.value
+        assert adj.reason_code == FeeReasonCode.LOW_FEE_EXPLORATION.value
+        assert adj.new_fee_ppm >= cfg.min_fee_ppm
+        assert adj.new_fee_ppm > 0
+        assert adj.new_fee_ppm < channel_info["fee_proportional_millionths"]
+        assert _setchannel_kwargs(mock_plugin)["feeppm"] == adj.new_fee_ppm
 
-        assert _setchannel_kwargs(mock_plugin)["feeppm"] == 0
-
-    def test_zero_fee_probe_success_exits_to_floor_and_clears_probe(self, mock_plugin, mock_database):
+    def test_exploration_success_holds_safe_low_fee_and_clears_probe(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.fee_controller import FeeController, FeeReasonCode
 
@@ -299,8 +318,8 @@ class TestZeroFeeProbeEndToEnd:
 
         cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
 
-        # Fee is currently 0 (probe already active), and we observed volume -> success.
-        fee_holder = {"fee": 0}
+        # Channel is already at a low fee and exploration sees traffic.
+        fee_holder = {"fee": 15}
         mock_plugin.rpc.setchannel = MagicMock(
             side_effect=lambda *args, **kwargs: fee_holder.__setitem__("fee", kwargs["feeppm"])
         )
@@ -334,18 +353,72 @@ class TestZeroFeeProbeEndToEnd:
             "spendable_msat": 500_000_000,
             "receivable_msat": 500_000_000,
             "fee_base_msat": 0,
-            "fee_proportional_millionths": 0,
+            "fee_proportional_millionths": 15,
             "opener": "local",
         }
         flow_state = {"state": "balanced", "forward_count": 0, "sats_out": 0}
 
         adj = fc._adjust_channel_fee(channel_id, peer_id, flow_state, channel_info, chain_costs=None, cfg=cfg.snapshot())
         assert adj is not None
-        assert adj.reason_code == FeeReasonCode.ZERO_FEE_PROBE_SUCCESS.value
+        assert adj.reason_code == FeeReasonCode.LOW_FEE_EXPLORATION_SUCCESS.value
         assert adj.new_fee_ppm >= 10
+        assert adj.new_fee_ppm > 0
 
         mock_database.clear_channel_probe.assert_called()
         assert _setchannel_kwargs(mock_plugin)["feeppm"] == adj.new_fee_ppm
+
+    def test_set_channel_fee_syncs_state_for_low_fee_exploration_reasons(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import (
+            ChannelCycleState,
+            ChannelFeeState,
+            FeeController,
+            FeeReasonCode,
+        )
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        now = int(time.time())
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=25)
+        mock_plugin.rpc.setchannel = MagicMock()
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc._cycle_states[channel_id] = ChannelCycleState(
+            last_fee_ppm=200,
+            last_broadcast_fee_ppm=200,
+            last_update=now - 7200,
+            is_sleeping=True,
+            sleep_until=now + 3600,
+            stable_cycles=2,
+        )
+        fc._channel_fee_states[channel_id] = ChannelFeeState(
+            last_fee_ppm=200,
+            last_broadcast_fee_ppm=200,
+            last_update=now - 7200,
+            is_sleeping=True,
+            sleep_until=now + 3600,
+            stable_cycles=2,
+        )
+
+        result = fc.set_channel_fee(
+            channel_id,
+            25,
+            reason="bounded exploration",
+            reason_code=FeeReasonCode.LOW_FEE_EXPLORATION.value,
+            channel_info={"peer_id": peer_id, "fee_proportional_millionths": 200},
+        )
+
+        assert result["success"] is True
+        assert fc._cycle_states[channel_id].last_broadcast_fee_ppm == 25
+        assert fc._cycle_states[channel_id].last_state == FeeReasonCode.LOW_FEE_EXPLORATION.value
+        assert fc._cycle_states[channel_id].is_sleeping is False
+        assert fc._channel_fee_states[channel_id].last_broadcast_fee_ppm == 25
+        assert fc._channel_fee_states[channel_id].last_state == FeeReasonCode.LOW_FEE_EXPLORATION.value
+        assert fc._channel_fee_states[channel_id].is_sleeping is False
 
 
 class TestSetInitialFee:

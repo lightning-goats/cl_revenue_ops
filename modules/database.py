@@ -671,11 +671,12 @@ class Database:
             VALUES (1, 0, 0, 0)
         """)
 
-        # Channel Probes table for Zero-Fee Probe Defibrillator
+        # Channel exploration flags. Legacy rows may still carry probe_type='zero_fee',
+        # but the fee controller now interprets the flag as bounded low-fee exploration.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS channel_probes (
                 channel_id TEXT PRIMARY KEY,
-                probe_type TEXT NOT NULL,  -- 'zero_fee'
+                probe_type TEXT NOT NULL,  -- legacy 'zero_fee' or current 'bounded_low_fee'
                 started_at INTEGER NOT NULL
             )
         """)
@@ -1555,8 +1556,12 @@ class Database:
     # Channel Probe Methods
     # =========================================================================
 
-    def set_channel_probe(self, channel_id: str, probe_type: str = 'zero_fee'):
-        """Sets the probe flag for a channel."""
+    def set_channel_probe(self, channel_id: str, probe_type: str = 'bounded_low_fee'):
+        """Sets the bounded-exploration flag for a channel.
+
+        The legacy probe_type='zero_fee' value is still accepted for backward
+        compatibility with older callers and persisted rows.
+        """
         conn = self._get_connection()
         now = int(time.time())
         conn.execute("""
@@ -1565,11 +1570,11 @@ class Database:
         """, (channel_id, probe_type, now))
 
     def get_channel_probe(self, channel_id: str, max_age_seconds: int = 86400) -> Optional[Dict[str, Any]]:
-        """Gets the probe flag for a channel, returning None if expired.
+        """Gets the bounded-exploration flag for a channel, returning None if expired.
 
         Args:
             channel_id: Channel to check
-            max_age_seconds: Maximum age of probe before auto-expiry (default 24h)
+            max_age_seconds: Maximum age of exploration before auto-expiry (default 24h)
         """
         conn = self._get_connection()
         row = conn.execute(
@@ -1579,7 +1584,7 @@ class Database:
         if row is None:
             return None
         probe = dict(row)
-        # Auto-expire stale probes to prevent permanent 0-fee
+        # Auto-expire stale flags to prevent permanent exploration mode.
         started_at = probe.get("started_at", 0)
         if started_at > 0 and (int(time.time()) - started_at) > max_age_seconds:
             conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
@@ -1587,7 +1592,7 @@ class Database:
         return probe
 
     def clear_channel_probe(self, channel_id: str):
-        """Clears the probe flag for a channel."""
+        """Clears the bounded-exploration flag for a channel."""
         conn = self._get_connection()
         conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
     
