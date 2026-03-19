@@ -501,8 +501,8 @@ class KalmanFlowFilter:
 
     def _ensure_positive_definite(self) -> None:
         """Ensure covariance matrix stays positive definite."""
-        self.state.variance_ratio = max(1e-6, self.state.variance_ratio)
-        self.state.variance_velocity = max(1e-6, self.state.variance_velocity)
+        self.state.variance_ratio = max(1e-4, self.state.variance_ratio)
+        self.state.variance_velocity = max(1e-4, self.state.variance_velocity)
         det = self.state.variance_ratio * self.state.variance_velocity - self.state.covariance ** 2
         if det <= 0:
             max_cov = math.sqrt(self.state.variance_ratio * self.state.variance_velocity) * 0.9

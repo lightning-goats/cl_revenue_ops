@@ -795,3 +795,26 @@ class TestAskReneClamp:
         p = (historical_p * 0.3) + (askrene_p * 0.7)
 
         assert p > 0, f"Blended probability must be positive: {p}"
+
+
+# =========================================================================
+# Kalman PD Enforcement: minimum variance floor
+# =========================================================================
+
+class TestKalmanPDEnforcement:
+    """Kalman filter must enforce positive-definite covariance before update."""
+
+    def test_zero_variance_does_not_produce_nan(self):
+        """If variance reaches zero, filter must not produce NaN."""
+        from modules.flow_analysis import KalmanFlowFilter
+
+        kf = KalmanFlowFilter()
+        # Force variance to near-zero
+        kf.state.variance_ratio = 1e-8
+        kf.state.variance_velocity = 1e-8
+        kf.state.covariance = 0.0
+        # Update should not crash or produce NaN
+        kf.update(observed_ratio=0.5, confidence=1.0)
+        assert math.isfinite(kf.state.flow_ratio)
+        assert math.isfinite(kf.state.flow_velocity)
+        assert kf.state.variance_ratio >= 1e-4
