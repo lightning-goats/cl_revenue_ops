@@ -1260,10 +1260,14 @@ class JobManager:
             # the spend before releasing the reservation.
             if self.stop_job(scid, reason=reason):
                 count += 1
-            try:
-                self.database.release_budget_reservation(str(job.rebalance_id))
-            except Exception as e:
-                self.plugin.log(f"Failed to release budget reservation during stop_all: {e}", level='debug')
+            # B4 FIX: Only release budget for jobs still in PENDING/RUNNING status.
+            # Jobs in SUCCESS/FAILED/TIMEOUT already had their budget handled by
+            # monitor_jobs (via mark_budget_spent or release_budget_reservation).
+            if job.status in (JobStatus.PENDING, JobStatus.RUNNING):
+                try:
+                    self.database.release_budget_reservation(str(job.rebalance_id))
+                except Exception as e:
+                    self.plugin.log(f"Failed to release budget reservation during stop_all: {e}", level='debug')
         return count
     
     def cleanup_orphans(self) -> int:

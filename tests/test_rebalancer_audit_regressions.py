@@ -8,6 +8,7 @@ Covers:
   I-12: Hot channel profit budget floor
   B2: Weekly budget uses 24h external costs (should scale to 7d)
   B3: Push EV uses wrong peer for fee estimation
+  B4: stop_all_jobs unconditionally releases budget for already-handled jobs
 """
 
 import math
@@ -720,4 +721,138 @@ class TestB3PushEvWrongPeer:
         assert called_with_peer == src_peer_id, (
             f"When dest_peer_ids is None, should fall back to src_peer_id "
             f"{src_peer_id!r}, but was called with {called_with_peer!r}."
+        )
+
+
+# ============================================================================
+# 8. B4: stop_all_jobs unconditionally releases budget
+# ============================================================================
+
+
+class TestB4StopAllJobsBudget:
+    """B4: stop_all_jobs must NOT release budget for jobs already handled by
+    monitor_jobs (SUCCESS/FAILED/TIMEOUT).  Only PENDING/RUNNING jobs should
+    have their reservations released during shutdown.
+    """
+
+    def test_only_releases_budget_for_pending_or_running_jobs(self, mock_plugin, mock_database):
+        """Create two jobs: one SUCCESS (already handled), one RUNNING.
+        stop_all_jobs should only call release_budget_reservation for the RUNNING job.
+        """
+        from modules.config import Config
+        from modules.rebalancer import JobManager, JobStatus
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+
+        # Job 1: SUCCESS — budget already handled by monitor_jobs
+        job_success = _active_job(scid="111x222x0", rebalance_id=100)
+        job_success.status = JobStatus.SUCCESS
+
+        # Job 2: RUNNING — budget NOT yet handled, should be released
+        job_running = _active_job(scid="333x444x0", rebalance_id=200)
+        job_running.status = JobStatus.RUNNING
+
+        with jm._jobs_lock:
+            jm._active_jobs["111x222x0"] = job_success
+            jm._active_jobs["333x444x0"] = job_running
+
+        # stop_job succeeds for both
+        mock_plugin.rpc.call.return_value = {}
+
+        jm.stop_all_jobs(reason="shutdown")
+
+        # Collect all calls to release_budget_reservation
+        release_calls = mock_database.release_budget_reservation.call_args_list
+        released_ids = [c[0][0] for c in release_calls]
+
+        # RUNNING job's reservation should be released
+        assert str(job_running.rebalance_id) in released_ids, (
+            f"Expected release for RUNNING job (rebalance_id={job_running.rebalance_id}), "
+            f"but release_budget_reservation was called with: {released_ids}"
+        )
+
+        # SUCCESS job's reservation should NOT be released (already handled)
+        assert str(job_success.rebalance_id) not in released_ids, (
+            f"SUCCESS job (rebalance_id={job_success.rebalance_id}) should NOT have "
+            f"its budget released — it was already handled by monitor_jobs. "
+            f"But release_budget_reservation was called with: {released_ids}"
+        )
+
+    def test_does_not_release_budget_for_failed_jobs(self, mock_plugin, mock_database):
+        """FAILED jobs already had budget handled by monitor_jobs."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager, JobStatus
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+
+        job_failed = _active_job(scid="111x222x0", rebalance_id=300)
+        job_failed.status = JobStatus.FAILED
+
+        with jm._jobs_lock:
+            jm._active_jobs["111x222x0"] = job_failed
+
+        mock_plugin.rpc.call.return_value = {}
+
+        jm.stop_all_jobs(reason="shutdown")
+
+        release_calls = mock_database.release_budget_reservation.call_args_list
+        released_ids = [c[0][0] for c in release_calls]
+
+        assert str(job_failed.rebalance_id) not in released_ids, (
+            f"FAILED job should NOT have its budget released — already handled. "
+            f"But release_budget_reservation was called with: {released_ids}"
+        )
+
+    def test_does_not_release_budget_for_timeout_jobs(self, mock_plugin, mock_database):
+        """TIMEOUT jobs already had budget handled by _handle_job_timeout."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager, JobStatus
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+
+        job_timeout = _active_job(scid="111x222x0", rebalance_id=400)
+        job_timeout.status = JobStatus.TIMEOUT
+
+        with jm._jobs_lock:
+            jm._active_jobs["111x222x0"] = job_timeout
+
+        mock_plugin.rpc.call.return_value = {}
+
+        jm.stop_all_jobs(reason="shutdown")
+
+        release_calls = mock_database.release_budget_reservation.call_args_list
+        released_ids = [c[0][0] for c in release_calls]
+
+        assert str(job_timeout.rebalance_id) not in released_ids, (
+            f"TIMEOUT job should NOT have its budget released — already handled. "
+            f"But release_budget_reservation was called with: {released_ids}"
+        )
+
+    def test_releases_budget_for_pending_jobs(self, mock_plugin, mock_database):
+        """PENDING jobs have not been processed yet — budget should be released."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager, JobStatus
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+
+        job_pending = _active_job(scid="111x222x0", rebalance_id=500)
+        job_pending.status = JobStatus.PENDING
+
+        with jm._jobs_lock:
+            jm._active_jobs["111x222x0"] = job_pending
+
+        mock_plugin.rpc.call.return_value = {}
+
+        jm.stop_all_jobs(reason="shutdown")
+
+        release_calls = mock_database.release_budget_reservation.call_args_list
+        released_ids = [c[0][0] for c in release_calls]
+
+        assert str(job_pending.rebalance_id) in released_ids, (
+            f"PENDING job (rebalance_id={job_pending.rebalance_id}) should have "
+            f"its budget released. But release_budget_reservation was called with: {released_ids}"
         )
