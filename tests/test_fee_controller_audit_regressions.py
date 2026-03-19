@@ -177,7 +177,7 @@ class TestProbeTTL:
     """Tests for bounded-exploration flag TTL expiry (I-2)."""
 
     def test_fresh_probe_returned(self, mock_database):
-        """Probe set recently should be returned."""
+        """Legacy exploration flag set recently should be returned."""
         from modules.database import Database
 
         # We need a real-ish database for this test
@@ -189,7 +189,7 @@ class TestProbeTTL:
         assert not is_expired, "Fresh probe should not be expired"
 
     def test_stale_probe_expired(self):
-        """Probe older than 24h should be treated as expired."""
+        """Legacy exploration flag older than 24h should be treated as expired."""
         probe = {"channel_id": "123x456x0", "probe_type": "zero_fee", "started_at": int(time.time()) - 90000}
         started_at = probe.get("started_at", 0)
         max_age = 86400  # 24h
@@ -197,7 +197,7 @@ class TestProbeTTL:
         assert is_expired, "Stale probe (>24h) should be expired"
 
     def test_probe_without_timestamp_not_expired(self):
-        """Probe with started_at=0 should not be expired (backward compat)."""
+        """Legacy exploration flag with started_at=0 should not expire (backward compat)."""
         probe = {"channel_id": "123x456x0", "probe_type": "zero_fee", "started_at": 0}
         started_at = probe.get("started_at", 0)
         max_age = 86400
@@ -292,7 +292,7 @@ class TestFeePriorityChain:
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
-        # Channel has a non-zero fee that needs to be overridden to 0
+        # Channel has a non-zero fee that should be pulled into bounded exploration.
         channel_info = {
             "fee_proportional_millionths": 200,
             "capacity": 2_000_000,
@@ -304,6 +304,8 @@ class TestFeePriorityChain:
 
         assert result is not None
         assert "exploration" in result.reason.lower()
+        assert "zero" not in result.reason.lower()
+        assert "probe" not in result.reason.lower()
         assert result.new_fee_ppm >= cfg.min_fee_ppm
         assert result.new_fee_ppm > 0
         assert result.new_fee_ppm < channel_info["fee_proportional_millionths"]

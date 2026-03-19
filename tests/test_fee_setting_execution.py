@@ -235,6 +235,22 @@ class TestGossipRefreshExecution:
 
 
 class TestBoundedExplorationEndToEnd:
+    def test_exploration_can_land_on_floor_when_channel_is_already_near_floor(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        cfg = Config(min_fee_ppm=40, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        fc = FeeController(mock_plugin, cfg, mock_database)
+
+        target = fc._get_exploration_fee_target(
+            current_fee_ppm=42,
+            floor_ppm=40,
+            cfg=cfg.snapshot(),
+            sparse_data_conservative=False,
+        )
+
+        assert target == 40
+
     def test_exploration_target_preserves_meaningful_headroom_above_floor(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.fee_controller import FeeController

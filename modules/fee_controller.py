@@ -178,8 +178,10 @@ class GaussianThompsonState:
     _last_fee_min: float = 0.0
     _last_fee_max: float = 0.0
 
-    # Context-specific posteriors: {context_key: (mean, std, count)}
-    contextual_posteriors: Dict[str, Tuple[float, float, int]] = field(default_factory=dict)
+    # Context-specific posteriors stored as:
+    # {context_key: (mean, precision, count, last_update)}
+    # Legacy serialized 3-tuples (mean, std, count) are still accepted on load.
+    contextual_posteriors: Dict[str, Tuple[float, float, int, int]] = field(default_factory=dict)
 
     # Tracking
     last_sampled_fee: int = 0
@@ -328,7 +330,7 @@ class GaussianThompsonState:
             ctx = self.contextual_posteriors[context_key]
 
             # Handle both 3-tuple (legacy: mean, std, count) and
-            # 4-tuple (new: mean, precision, count, last_update) formats
+            # 4-tuple (stored: mean, precision, count, last_update) formats
             if len(ctx) == 4:
                 ctx_mean, ctx_precision, ctx_count, _ = ctx
                 ctx_std = 1.0 / math.sqrt(max(ctx_precision, 1e-6))
@@ -486,7 +488,7 @@ class GaussianThompsonState:
         contexts don't dominate fresh observations.
 
         Args:
-            context_key: Context identifier (e.g., "low:strong:peak:P")
+            context_key: Context identifier (e.g., "balanced:peak:P")
             fee: Fee that was charged
             revenue_rate: Observed revenue rate (demand-adjusted)
             time_bucket: Current time bucket ("low", "normal", "peak")
@@ -496,7 +498,7 @@ class GaussianThompsonState:
         if context_key not in self.contextual_posteriors:
             # Initialize from global posterior as hierarchical prior
             parts = context_key.split(":") if ":" in context_key else []
-            role = parts[3] if len(parts) >= 4 else "P"
+            role = parts[2] if len(parts) >= 3 else "P"
 
             # Convert global posterior std to precision
             init_std = self.posterior_std
@@ -530,8 +532,8 @@ class GaussianThompsonState:
         # Compute observation weight
         # Time-aware: same time bucket = full weight, adjacent = partial
         parts = context_key.split(":") if ":" in context_key else []
-        ctx_time = parts[2] if len(parts) >= 3 else "normal"
-        ctx_role = parts[3] if len(parts) >= 4 else "P"
+        ctx_time = parts[1] if len(parts) >= 2 else "normal"
+        ctx_role = parts[2] if len(parts) >= 3 else "P"
         time_weight = self._time_similarity(time_bucket, ctx_time)
 
         # Revenue-based observation weight
@@ -583,7 +585,8 @@ class GaussianThompsonState:
         adjacent contexts while still sharing directional information.
 
         Args:
-            context_key: The exact context that was observed
+            context_key: The exact 3-part context key that was observed
+                ("{balance}:{time_bucket}:{role}")
             fee: Fee that was charged
             revenue_rate: Observed revenue rate
             observed_time: Time bucket that was actually observed
@@ -608,7 +611,7 @@ class GaussianThompsonState:
             if adj_key in self.contextual_posteriors:
                 adj = self.contextual_posteriors[adj_key]
 
-                # Handle both 3-tuple (legacy) and 4-tuple (new) formats
+                # Handle both 3-tuple (legacy) and 4-tuple (stored) formats
                 if len(adj) == 4:
                     adj_mean, adj_precision, adj_count, adj_last = adj
                 else:
@@ -1642,7 +1645,8 @@ class FeeController:
             outbound_ratio: Current outbound liquidity ratio (0.0-1.0)
 
         Returns:
-            Tuple of (context_key, time_bucket, corridor_role)
+            Tuple of (context_key, time_bucket, corridor_role) where
+            context_key uses the current "{balance}:{time_bucket}:{role}" shape.
         """
         # Balance bucket
         if outbound_ratio < 0.15:
@@ -2591,9 +2595,10 @@ class FeeController:
         """
         Return a bounded low-fee exploration target.
 
-        Exploration never bypasses the configured/economic floor. Sparse channels
-        stay closer to the current fee, while active channels keep enough
-        headroom above the floor to preserve a meaningful pricing signal.
+        Exploration never bypasses the configured/economic floor. Channels that
+        are already near the floor may stay at the floor; channels with real
+        headroom are kept low-fee but above the floor to preserve pricing signal.
+        Sparse channels stay even closer to the current fee.
         """
         exploration_floor = max(floor_ppm, cfg.min_fee_ppm)
         if current_fee_ppm <= exploration_floor:
@@ -2702,7 +2707,9 @@ class FeeController:
         is_congested = (state and state.get("state") == "congested")
 
         # =====================================================================
-        # Legacy exploration flag: bounded low-fee exploration override
+        # Legacy DB probe flag now means bounded low-fee exploration.
+        # Compatibility is preserved at the storage layer, but the active path
+        # no longer implies literal 0-ppm behavior.
         # =====================================================================
         exploration_flag = self.database.get_channel_probe(channel_id)
         is_under_exploration = (exploration_flag is not None)
@@ -2874,7 +2881,6 @@ class FeeController:
         outbound_ratio = spendable / capacity if capacity > 0 else 0.5
         
         bucket = LiquidityBuckets.get_bucket(outbound_ratio)
-        liquidity_multiplier = LiquidityBuckets.get_fee_multiplier(bucket)
         
         # Get flow state for bias
         flow_state = state.get("state", "balanced")
@@ -2884,11 +2890,9 @@ class FeeController:
         elif flow_state == "sink":
             flow_state_multiplier = 0.75  # Sinks can shade lower, but avoid slamming to floor
         
-        # Get profitability multiplier (uses marginal ROI now)
-        profitability_multiplier = 1.0
+        # Expose marginal ROI in logs when profitability data is available.
         marginal_roi_info = "unknown"
         if self.profitability:
-            profitability_multiplier = self.profitability.get_fee_multiplier(channel_id)
             prof_data = self.profitability.get_profitability(channel_id)
             if prof_data:
                 marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
@@ -2942,7 +2946,6 @@ class FeeController:
         # Target Decision Block (Fee Priority Chain)
         # Priority: Congestion > bounded low-fee exploration > DTS+PID
         decision_reason = "unknown"
-        base_new_fee = None
         new_fee_ppm = 0
         target_found = False
         volatility_reset = False
@@ -2961,24 +2964,23 @@ class FeeController:
         # Priority 2: Bounded low-fee exploration driven by the legacy probe flag
         if not target_found and is_under_exploration:
             # Calculate current revenue rate (reuse logic from rate calculation below)
-            v_since = self.database.get_volume_since(channel_id, cycle.last_update)
-            
-            probe_forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
+            exploration_volume_sats = self.database.get_volume_since(channel_id, cycle.last_update)
+            exploration_forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
 
             # Success criteria: any forwards/volume observed during exploration.
-            exploration_success = (v_since > 0) or (probe_forward_count > 0)
+            exploration_success = (exploration_volume_sats > 0) or (exploration_forward_count > 0)
 
             if exploration_success:
-                # Exploration succeeded. Clear the flag and hold at a safe floor-like
-                # fee instead of bouncing between special regimes.
+                # Exploration succeeded. Clear the flag and hold at a safe low fee
+                # near the floor instead of bouncing between special regimes.
                 try:
                     self.database.clear_channel_probe(channel_id)
                 except Exception as e:
-                    self.plugin.log(f"Failed to clear channel probe for {channel_id[:12]}...: {e}", level='debug')
+                    self.plugin.log(f"Failed to clear exploration flag for {channel_id[:12]}...: {e}", level='debug')
 
                 sparse_data_conservative = self._is_sparse_data_channel(
                     observation_count=0,
-                    forward_count=probe_forward_count,
+                    forward_count=exploration_forward_count,
                     hours_elapsed=hours_elapsed,
                     current_revenue_rate=current_revenue_rate,
                 )
@@ -3000,7 +3002,7 @@ class FeeController:
 
                 self.plugin.log(
                     f"EXPLORATION: Channel {channel_id[:12]}... observed "
-                    f"{probe_forward_count} forwards / {v_since} sats during bounded exploration. "
+                    f"{exploration_forward_count} forwards / {exploration_volume_sats} sats during bounded exploration. "
                     f"Holding at safe exploration fee {new_fee_ppm} ppm.",
                     level='info'
                 )
@@ -3008,7 +3010,7 @@ class FeeController:
             else:
                 sparse_data_conservative = self._is_sparse_data_channel(
                     observation_count=0,
-                    forward_count=probe_forward_count,
+                    forward_count=exploration_forward_count,
                     hours_elapsed=hours_elapsed,
                     current_revenue_rate=current_revenue_rate,
                 )
@@ -3211,8 +3213,6 @@ class FeeController:
 
             # Update volume tracking
             ts_state.last_volume_sats = volume_since_sats
-            base_new_fee = bounded_target_ppm
-
             target_found = True
 
             # State saving and result preparation
@@ -3229,10 +3229,6 @@ class FeeController:
             cycle.step_ppm = step_ppm
             cycle.forward_count_since_update = forward_count
             cycle.last_volume_sats = volume_since_sats
-
-            # Store decision_reason for use in logging
-            elasticity_info = f"dts_posterior_mean={ts_state.thompson.posterior_mean:.0f}"
-
 
         # =====================================================================
         # DYNAMIC HTLC POLICY TARGETS
@@ -3377,9 +3373,6 @@ class FeeController:
         volatility_note = " [VOLATILITY_RESET]" if volatility_reset else ""
         applied_delta = int(new_fee_ppm) - int(current_fee_ppm)
         applied_dir = "up" if applied_delta > 0 else ("down" if applied_delta < 0 else "flat")
-        direction_label = "up" if new_direction > 0 else "down"
-        base_fee_note = f", base={int(base_new_fee)}ppm" if base_new_fee is not None else ""
-        mult_note = f", mult=liq{liquidity_multiplier:.2f}*prof{profitability_multiplier:.2f}"
         target_summary = (
             f"targets=dts:{raw_dts_target_ppm}, post_pid:{post_pid_target_ppm}, "
             f"bounded:{bounded_target_ppm}, blended:{blended_target_ppm}, applied:{applied_target_ppm}, "

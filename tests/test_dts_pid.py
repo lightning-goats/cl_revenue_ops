@@ -2,6 +2,7 @@
 import json
 import math
 import time
+from typing import Dict, Tuple, get_type_hints
 from unittest.mock import MagicMock
 
 import pytest
@@ -184,23 +185,43 @@ class TestDTSDiscountFactor:
 class TestContextualPosteriorUpdates:
     """Regression tests for contextual DTS state initialization."""
 
-    def test_secondary_context_initialization_does_not_raise(self):
+    def test_contextual_posteriors_annotation_uses_4_tuple_storage(self):
+        hints = get_type_hints(GaussianThompsonState)
+        assert hints["contextual_posteriors"] == Dict[str, Tuple[float, float, int, int]]
+
+    def test_secondary_context_initialization_uses_current_3_part_key_shape(self):
         ts = GaussianThompsonState()
         ts.posterior_mean = 220.0
         ts.posterior_std = 80.0
 
         ts.update_contextual(
-            context_key="balanced:strong:peak:S",
+            context_key="balanced:peak:S",
             fee=200,
-            revenue_rate=12.0,
+            revenue_rate=-1.0,
             time_bucket="peak",
         )
 
-        ctx = ts.contextual_posteriors["balanced:strong:peak:S"]
+        ctx = ts.contextual_posteriors["balanced:peak:S"]
         assert len(ctx) == 4
         assert ctx[0] > 0
-        assert ctx[1] > 0
+        expected_precision = 1.0 / max((80.0 * ts.SECONDARY_EXPLORE_BOOST) ** 2, ts.MIN_STD ** 2)
+        assert ctx[1] == pytest.approx(expected_precision, rel=1e-9)
         assert ctx[2] >= 1
+
+    def test_legacy_contextual_3_tuple_deserializes_to_4_tuple(self):
+        state = GaussianThompsonState.from_dict(
+            {
+                "contextual_posteriors": {
+                    "balanced:normal:P": (125.0, 20.0, 3),
+                }
+            }
+        )
+
+        ctx = state.contextual_posteriors["balanced:normal:P"]
+        assert len(ctx) == 4
+        assert ctx[0] == 125.0
+        assert ctx[2] == 3
+        assert ctx[3] == 0
 
 
 class TestPIDStatePersistence:
@@ -443,6 +464,53 @@ class TestDTSPIDIntegration:
         )
         assert result is not None
         assert isinstance(result, FeeAdjustment)
+
+    def test_get_context_with_values_returns_current_3_part_key_shape(self, mock_plugin, mock_database):
+        fc, _ = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        context_key, time_bucket, role = fc._get_context_with_values(
+            channel_id="123x456x0",
+            peer_id="02" + "a" * 64,
+            outbound_ratio=0.5,
+        )
+
+        assert context_key == "balanced:normal:P"
+        assert time_bucket == "normal"
+        assert role == "P"
+
+    def test_sparse_channel_uses_sparse_discount_gamma(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        fc._adjust_channel_fee(
+            channel_id, peer_id, self._state(),
+            self._channel_info(current_fee_ppm=500), cfg=cfg
+        )
+
+        ts_state = fc._channel_fee_states[channel_id]
+        ts_state.thompson.observations = []
+        ts_state.thompson.sample_fee = lambda floor, ceiling: floor
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = int(time.time()) - 1800
+
+        seen_gamma = {}
+
+        def capture_gamma(gamma):
+            seen_gamma["value"] = gamma
+
+        ts_state.thompson.apply_dts_discount = capture_gamma
+        mock_database.get_forward_count_since.return_value = 0
+        mock_database.get_volume_since.return_value = 0
+        fc._cycle_states[channel_id].last_update = int(time.time()) - 7200
+        fc._channel_fee_states[channel_id].last_update = int(time.time()) - 7200
+
+        fc._adjust_channel_fee(
+            channel_id, peer_id, self._state(),
+            self._channel_info(current_fee_ppm=500), cfg=cfg
+        )
+
+        assert seen_gamma["value"] == pytest.approx(fc.DTS_SPARSE_DISCOUNT_GAMMA)
 
 
 class TestClampedFeeReadback:
