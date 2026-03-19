@@ -260,46 +260,53 @@ class Database:
         Returns:
             sqlite3.Connection: Thread-local database connection
         """
-        if not hasattr(self._local, 'conn') or self._local.conn is None:
-            # Ensure directory exists (guard against bare filename with no directory)
-            db_dir = os.path.dirname(self.db_path)
-            if db_dir:
-                os.makedirs(db_dir, exist_ok=True)
-            
-            # Create new connection for this thread
-            self._local.conn = sqlite3.connect(
-                self.db_path,
-                isolation_level=None  # Autocommit mode
-            )
-            self._local.conn.row_factory = sqlite3.Row
-            
+        if hasattr(self._local, 'conn') and self._local.conn is not None:
+            return self._local.conn
+
+        # Ensure directory exists (guard against bare filename with no directory)
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
+        # Create new connection for this thread in a local variable so that
+        # a PRAGMA failure does not leave a half-configured connection in
+        # thread-local storage (connection leak prevention).
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+
             # Enable Write-Ahead Logging for better multi-thread concurrency
             # WAL allows readers and writers to operate concurrently
-            wal_result = self._local.conn.execute("PRAGMA journal_mode=WAL;").fetchone()
+            wal_result = conn.execute("PRAGMA journal_mode=WAL;").fetchone()
             if wal_result and wal_result[0] != 'wal':
                 self.plugin.log(
                     f"Database: WAL mode not enabled (got '{wal_result[0]}'), "
                     f"falling back to default journal mode",
                     level='warn'
                 )
-            
+
             # Reduce "database is locked" errors under contention
-            self._local.conn.execute("PRAGMA busy_timeout=5000;")
+            conn.execute("PRAGMA busy_timeout=5000;")
             # Reasonable durability/performance tradeoff for WAL mode
-            self._local.conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
             # D3 FIX: Enforce foreign key constraints (defined but previously unenforced)
-            self._local.conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA foreign_keys=ON;")
             # Enable incremental auto-vacuum so PRAGMA incremental_vacuum works.
             # Only takes effect on a fresh (empty) database; harmless no-op otherwise.
-            self._local.conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
-            # EH-6: Track connection for shutdown cleanup
-            with self._thread_conn_lock:
-                self._thread_connections.append(self._local.conn)
-            self.plugin.log(
-                f"Database: Created new thread-local connection (thread={threading.current_thread().name})",
-                level='debug'
-            )
-        return self._local.conn
+            conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
+        except Exception:
+            conn.close()
+            raise
+
+        # EH-6: Track connection for shutdown cleanup — only after full success
+        with self._thread_conn_lock:
+            self._thread_connections.append(conn)
+        self._local.conn = conn
+        self.plugin.log(
+            f"Database: Created new thread-local connection (thread={threading.current_thread().name})",
+            level='debug'
+        )
+        return conn
 
     def close_connection(self) -> None:
         """
