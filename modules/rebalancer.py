@@ -477,7 +477,7 @@ class JobManager:
             # =================================================================
             # - maxhops: Shorter routes are faster and more reliable
             # - target: Flow-aware balance target
-            # - outppm: Fallback for source discovery when candidates list fails
+            # - outppm: Cap per-hop fee; also used as sole source signal when no candidates
             # =================================================================
             job_params = {
                 "scid": to_scid,
@@ -528,17 +528,17 @@ class JobManager:
             if source_scids_sling:
                 job_params["candidates"] = source_scids_sling
 
-            # Add outppm as fallback source discovery (if configured and no candidates)
+            # Add outppm to cap source-side fee (if configured)
             if self.config.sling_outppm_fallback > 0:
                 if not source_scids_sling:
-                    # No candidates - use outppm for discovery
+                    # No candidates - outppm is the only source-selection signal
                     job_params["outppm"] = self.config.sling_outppm_fallback
                     self.plugin.log(
                         f"No candidates for {to_scid}, using outppm={self.config.sling_outppm_fallback} fallback",
                         level='info'
                     )
                 else:
-                    # Have candidates but also add outppm as backup
+                    # Have candidates; outppm still caps per-hop fee for all routes
                     job_params["outppm"] = self.config.sling_outppm_fallback
 
             self.plugin.rpc.call("sling-job", job_params)
@@ -1881,6 +1881,7 @@ class EVRebalancer:
         self._pending: Dict[str, int] = {}
         self._pending_lock = threading.Lock()  # L-14: Protect _pending dict
         self._our_node_id: Optional[str] = None
+        self._fee_cache: Dict[Tuple[str, int], Optional[int]] = {}  # F11 FIX: Initialize in __init__
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
 
         # Optional callback injected by cl-revenue-ops to report external liquidity
@@ -1991,7 +1992,7 @@ class EVRebalancer:
                 self._our_node_id = info.get("id", "")
             except Exception as e:
                 self.plugin.log(f"Error getting our node ID: {e}", level='error')
-                self._our_node_id = ""
+                return None  # F10 FIX: Don't cache failure, retry next call
         return self._our_node_id
 
     def _get_channel_age_days(self, channel_id: str, channel_info: Dict = None) -> int:
@@ -2404,6 +2405,10 @@ class EVRebalancer:
         # Track bleeder status for explainability (default to "none")
         dest_bleeder_status = "none"
 
+        # F6 FIX: Initialize prof before try block so we can reference it
+        # directly instead of the fragile locals().get('prof') pattern.
+        prof = None
+
         # Check profitability logic
         if self._profitability_analyzer:
             try:
@@ -2513,7 +2518,7 @@ class EVRebalancer:
             dest_flow_state=dest_flow_state,
             dest_ratio=dest_ratio,
             velocity=velocity,
-            prof=locals().get('prof'),
+            prof=prof,
             cfg=cfg,
         )
 
@@ -3320,7 +3325,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         """
         # Check cache first (memoization for this run)
         cache_key = (peer_id, int(amount_msat or 0))
-        if hasattr(self, '_fee_cache') and cache_key in self._fee_cache:
+        if cache_key in self._fee_cache:
             return self._fee_cache[cache_key]
         
         result = None
@@ -3363,8 +3368,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 self.plugin.log(f"Failed to query gossip for last-hop fee: {e}", level='debug')
 
         # Cache the result (even if None, to avoid re-querying)
-        if hasattr(self, '_fee_cache'):
-            self._fee_cache[cache_key] = result
+        self._fee_cache[cache_key] = result
         
         return result
 
