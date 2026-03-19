@@ -938,3 +938,25 @@ class TestB3PrevTsRemoved:
         sig = inspect.signature(FlowAnalyzer._apply_kalman_filter)
         param_names = list(sig.parameters.keys())
         assert "prev_ts" not in param_names
+
+
+# =========================================================================
+# F2: Kalman reclassification extraction
+# =========================================================================
+
+class TestF2KalmanReclassificationExtraction:
+    """Kalman reclassification block is extracted into a shared method."""
+
+    def test_shared_method_exists(self):
+        from modules.flow_analysis import FlowAnalyzer
+        assert hasattr(FlowAnalyzer, '_apply_kalman_reclassification')
+
+    def test_shared_method_signature(self):
+        import inspect
+        from modules.flow_analysis import FlowAnalyzer
+        sig = inspect.signature(FlowAnalyzer._apply_kalman_reclassification)
+        param_names = list(sig.parameters.keys())
+        # Must accept these parameters (self excluded from check)
+        for expected in ['metrics', 'channel_id', 'capacity', 'our_balance',
+                         'channel_daily', 'raw_entries', 'last_forward_ts']:
+            assert expected in param_names, f"Missing parameter: {expected}"

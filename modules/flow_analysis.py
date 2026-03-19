@@ -864,6 +864,85 @@ class FlowAnalyzer:
 
         return max(-1.0, min(1.0, raw_ratio)), len(recent_entries)
 
+    def _apply_kalman_reclassification(
+        self,
+        metrics: 'FlowMetrics',
+        channel_id: str,
+        capacity: int,
+        our_balance: int,
+        channel_daily: List[Dict[str, int]],
+        raw_entries: List,
+        last_forward_ts: int,
+    ) -> None:
+        """Apply Kalman filter and reclassify channel state based on the result.
+
+        Mutates *metrics* in place: sets kalman_* fields and potentially
+        overrides ``metrics.state`` when the filter has converged.
+
+        Steps performed:
+        1. Compute raw observation via ``_compute_raw_kalman_observation``
+        2. Calculate observation confidence
+        3. Call ``_apply_kalman_filter``
+        4. Set ``metrics.kalman_*`` fields
+        5. Check convergence (uncertainty + observation-count thresholds)
+        6. Re-classify ``metrics.state`` based on ``kalman_ratio``
+        7. Fallback to balance position for the BALANCED zone
+        """
+        if not ENABLE_KALMAN_FILTER:
+            return
+
+        raw_observation, raw_count = self._compute_raw_kalman_observation(
+            channel_id, capacity, raw_entries
+        )
+        kalman_confidence = (
+            self._calculate_confidence(raw_count, last_forward_ts)
+            if raw_count > 0
+            else metrics.confidence
+        )
+
+        kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change, obs_count = \
+            self._apply_kalman_filter(
+                channel_id=channel_id,
+                observed_ratio=raw_observation,
+                confidence=kalman_confidence,
+                daily_buckets=channel_daily,
+                has_observation=True,
+            )
+        metrics.kalman_flow_ratio = kalman_ratio
+        metrics.kalman_velocity = kalman_velocity
+        metrics.kalman_uncertainty = kalman_uncertainty
+        metrics.kalman_regime_change = regime_change
+
+        # Use Kalman estimate for state classification only when the filter
+        # has converged (low uncertainty) AND has accumulated enough
+        # observations.  Without the observation count check, fresh/purged
+        # filters declare "confident" (low variance) after just 1-2 cycles
+        # while the flow_ratio estimate is still near 0.0, incorrectly
+        # overriding EMA with BALANCED.
+        kalman_converged = (
+            kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY
+            and obs_count >= KALMAN_MIN_OBSERVATIONS
+        )
+        if not metrics.is_congested and kalman_converged:
+            if kalman_ratio > self.config.source_threshold:
+                metrics.state = ChannelState.SOURCE
+            elif kalman_ratio < self.config.sink_threshold:
+                metrics.state = ChannelState.SINK
+            else:
+                # Kalman ratio is small — use balance position as
+                # structural signal (matching EMA fallback logic).
+                outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
+                if outbound_ratio < 0.25:
+                    metrics.state = ChannelState.SOURCE
+                elif outbound_ratio > 0.75:
+                    metrics.state = ChannelState.SINK
+                else:
+                    turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
+                    if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
+                        metrics.state = ChannelState.BALANCED_ACTIVE
+                    else:
+                        metrics.state = ChannelState.BALANCED
+
     # =========================================================================
     # v2.0 IMPROVEMENT METHODS
     # =========================================================================
@@ -1109,55 +1188,15 @@ class FlowAnalyzer:
             )
 
             # v2.1: Apply Kalman filter for improved flow estimation
-            if ENABLE_KALMAN_FILTER:
-                # Compute raw observation from per-forward data (not EMA-smoothed)
-                raw_entries = raw_flow_data.get(channel_id, [])
-                raw_observation, raw_count = self._compute_raw_kalman_observation(
-                    channel_id, capacity, raw_entries
-                )
-                kalman_confidence = self._calculate_confidence(raw_count, last_forward_ts) if raw_count > 0 else metrics.confidence
-
-                kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change, obs_count = \
-                    self._apply_kalman_filter(
-                        channel_id=channel_id,
-                        observed_ratio=raw_observation,
-                        confidence=kalman_confidence,
-                        daily_buckets=channel_daily,
-                        has_observation=True  # FIX: Must be True unconditionally so idle channels decay to 0
-                    )
-                metrics.kalman_flow_ratio = kalman_ratio
-                metrics.kalman_velocity = kalman_velocity
-                metrics.kalman_uncertainty = kalman_uncertainty
-                metrics.kalman_regime_change = regime_change
-
-                # Use Kalman estimate for state classification only when the filter
-                # has converged (low uncertainty) AND has accumulated enough observations.
-                # Without the observation count check, fresh/purged filters declare
-                # "confident" (low variance) after just 1-2 cycles while the flow_ratio
-                # estimate is still near 0.0, incorrectly overriding EMA with BALANCED.
-                kalman_converged = (
-                    kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY
-                    and obs_count >= KALMAN_MIN_OBSERVATIONS
-                )
-                if not metrics.is_congested and kalman_converged:
-                    if kalman_ratio > self.config.source_threshold:
-                        metrics.state = ChannelState.SOURCE
-                    elif kalman_ratio < self.config.sink_threshold:
-                        metrics.state = ChannelState.SINK
-                    else:
-                        # Kalman ratio is small — use balance position as
-                        # structural signal (matching EMA fallback logic).
-                        outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
-                        if outbound_ratio < 0.25:
-                            metrics.state = ChannelState.SOURCE
-                        elif outbound_ratio > 0.75:
-                            metrics.state = ChannelState.SINK
-                        else:
-                            turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
-                            if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-                                metrics.state = ChannelState.BALANCED_ACTIVE
-                            else:
-                                metrics.state = ChannelState.BALANCED
+            self._apply_kalman_reclassification(
+                metrics=metrics,
+                channel_id=channel_id,
+                capacity=capacity,
+                our_balance=our_balance,
+                channel_daily=channel_daily,
+                raw_entries=raw_flow_data.get(channel_id, []),
+                last_forward_ts=last_forward_ts,
+            )
 
             results[channel_id] = metrics
 
@@ -1335,53 +1374,17 @@ class FlowAnalyzer:
         )
 
         # v2.1: Apply Kalman filter
-        if ENABLE_KALMAN_FILTER:
-            # Compute raw observation from per-forward data (not EMA-smoothed)
-            raw_entries = self.database.get_continuous_net_flow_channel(
+        self._apply_kalman_reclassification(
+            metrics=metrics,
+            channel_id=channel_id,
+            capacity=capacity,
+            our_balance=our_balance,
+            channel_daily=channel_daily,
+            raw_entries=self.database.get_continuous_net_flow_channel(
                 channel_id, window_hours=self.config.flow_window_days * 24
-            )
-            raw_observation, raw_count = self._compute_raw_kalman_observation(
-                channel_id, capacity, raw_entries
-            )
-            kalman_confidence = self._calculate_confidence(raw_count, last_forward_ts) if raw_count > 0 else metrics.confidence
-
-            kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change, obs_count = \
-                self._apply_kalman_filter(
-                    channel_id=channel_id,
-                    observed_ratio=raw_observation,
-                    confidence=kalman_confidence,
-                    daily_buckets=channel_daily,
-                    has_observation=True  # FIX: Must be True unconditionally so idle channels decay to 0
-                )
-            metrics.kalman_flow_ratio = kalman_ratio
-            metrics.kalman_velocity = kalman_velocity
-            metrics.kalman_uncertainty = kalman_uncertainty
-            metrics.kalman_regime_change = regime_change
-
-            # Re-classify using Kalman only when converged (matching analyze_all_channels)
-            kalman_converged = (
-                kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY
-                and obs_count >= KALMAN_MIN_OBSERVATIONS
-            )
-            if not metrics.is_congested and kalman_converged:
-                if kalman_ratio > self.config.source_threshold:
-                    metrics.state = ChannelState.SOURCE
-                elif kalman_ratio < self.config.sink_threshold:
-                    metrics.state = ChannelState.SINK
-                else:
-                    # Kalman ratio is small — use balance position as
-                    # structural signal (matching EMA fallback logic).
-                    outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
-                    if outbound_ratio < 0.25:
-                        metrics.state = ChannelState.SOURCE
-                    elif outbound_ratio > 0.75:
-                        metrics.state = ChannelState.SINK
-                    else:
-                        turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
-                        if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-                            metrics.state = ChannelState.BALANCED_ACTIVE
-                        else:
-                            metrics.state = ChannelState.BALANCED
+            ),
+            last_forward_ts=last_forward_ts,
+        )
 
         # I-9: Skip DB persistence when called during bulk analyze_all_channels(),
         # which does its own DB writes. This avoids redundant writes and potential
