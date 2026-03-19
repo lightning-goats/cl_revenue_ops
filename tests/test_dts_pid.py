@@ -664,6 +664,147 @@ class TestCycleStatePersistence:
         assert restored_cycle.last_broadcast_at == 0
         assert restored_fee.last_broadcast_at == 0
 
+    def test_repeated_save_without_explicit_changes_does_not_clobber(
+        self, mock_plugin, mock_database
+    ):
+        """Double-save after tracking is cleared must not regress shared fields
+        to stale in-memory counterpart values."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "2" * 64
+        row = self._install_persistent_row(mock_database, channel_id)
+
+        # First: save cycle with known shared-field values
+        cycle_state = ChannelCycleState(last_gossip_refresh=111)
+        cycle_state.last_broadcast_at = 222
+        cycle_state.dynamic_htlcmin_baseline_msat = 3333
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        # Now save fee_state with different shared-field values
+        fee_state = ChannelFeeState()
+        fee_state.last_gossip_refresh = 900
+        fee_state.last_broadcast_at = 800
+        fee_state.dynamic_htlcmin_baseline_msat = 7777
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        # Verify first save worked
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 900
+        assert persisted_v2["last_broadcast_at"] == 800
+        assert persisted_v2["dynamic_htlcmin_baseline_msat"] == 7777
+
+        # Save fee_state AGAIN without touching shared fields.
+        # The in-memory cycle_state still has stale values (111, 222, 3333).
+        # This must NOT regress shared fields to those stale values.
+        fee_state.last_fee_ppm = 999  # non-shared field change
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 900, \
+            "Double-save must not regress gossip_refresh to stale cycle value"
+        assert persisted_v2["last_broadcast_at"] == 800, \
+            "Double-save must not regress broadcast_at to stale cycle value"
+        assert persisted_v2["dynamic_htlcmin_baseline_msat"] == 7777, \
+            "Double-save must not regress htlcmin to stale cycle value"
+
+    def test_repeated_cycle_save_without_explicit_changes_does_not_clobber(
+        self, mock_plugin, mock_database
+    ):
+        """Same as above but with cycle saving twice and stale fee counterpart."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        row = self._install_persistent_row(mock_database, channel_id)
+
+        # Save fee_state with known shared-field values
+        fee_state = ChannelFeeState()
+        fee_state.last_gossip_refresh = 500
+        fee_state.last_broadcast_at = 600
+        fee_state.dynamic_htlcmin_baseline_msat = 4444
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        # Now save cycle_state with different shared-field values
+        cycle_state = ChannelCycleState()
+        cycle_state.last_gossip_refresh = 1000
+        cycle_state.last_broadcast_at = 1100
+        cycle_state.dynamic_htlcmin_baseline_msat = 8888
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 1000
+        assert persisted_v2["last_broadcast_at"] == 1100
+        assert persisted_v2["dynamic_htlcmin_baseline_msat"] == 8888
+
+        # Save cycle AGAIN without touching shared fields.
+        cycle_state.step_ppm = 77  # non-shared field change
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 1000
+        assert persisted_v2["last_broadcast_at"] == 1100
+        assert persisted_v2["dynamic_htlcmin_baseline_msat"] == 8888
+
+    def test_load_does_not_create_false_explicit_overrides(
+        self, mock_plugin, mock_database
+    ):
+        """Loading from DB then saving without changes must preserve DB values."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "3" * 64
+        row = self._install_persistent_row(mock_database, channel_id)
+
+        # Seed DB with known shared-field values via cycle save
+        seed_cycle = ChannelCycleState()
+        seed_cycle.last_gossip_refresh = 555
+        seed_cycle.last_broadcast_at = 666
+        seed_cycle.dynamic_htlcmin_baseline_msat = 9999
+        fc._save_cycle_state(channel_id, seed_cycle)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 555
+
+        # Clear caches, reload from DB
+        fc._cycle_states.clear()
+        fc._channel_fee_states.clear()
+        loaded_fee = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=0)
+        loaded_cycle = fc._get_cycle_state(channel_id, actual_fee_ppm=0)
+
+        # Verify explicit tracking is clean after load
+        assert loaded_fee.explicit_shared_fields() == set()
+        assert loaded_cycle.explicit_shared_fields() == set()
+
+        # Save fee_state without touching shared fields
+        loaded_fee.last_fee_ppm = 123
+        fc._save_channel_fee_state(channel_id, loaded_fee)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 555, \
+            "Load-then-save must not create false explicit overrides"
+        assert persisted_v2["last_broadcast_at"] == 666
+        assert persisted_v2["dynamic_htlcmin_baseline_msat"] == 9999
+
+    def test_default_construction_has_clean_tracking_after_post_init(self):
+        """Default construction with all-default values should have empty tracking."""
+        fs = ChannelFeeState()
+        # __post_init__ uses heuristic: defaults (0, 0, None) → nothing added
+        # _track_shared_field_assignments is True after __post_init__
+        # But no non-default values → no tracking
+        assert fs.explicit_shared_fields() == set()
+
+        cs = ChannelCycleState()
+        assert cs.explicit_shared_fields() == set()
+
+    def test_setattr_tracks_clear_to_default(self):
+        """Setting a shared field to its default value (0 or None) must still be tracked."""
+        fs = ChannelFeeState()
+        fs.clear_explicit_shared_fields()
+
+        fs.last_gossip_refresh = 0
+        assert "last_gossip_refresh" in fs.explicit_shared_fields()
+
+        fs.clear_explicit_shared_fields()
+        fs.dynamic_htlcmin_baseline_msat = None
+        assert "dynamic_htlcmin_baseline_msat" in fs.explicit_shared_fields()
+
     def test_restart_round_trip_preserves_cycle_and_dts_state(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         channel_id = "123x456x0"

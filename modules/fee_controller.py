@@ -1881,23 +1881,23 @@ class FeeController:
             caller_preference = ("cycle", "fee")
             explicit_shared_fields = cycle_state.explicit_shared_fields() if cycle_state is not None else set()
 
-        def _resolve_shared_field(key: str, persisted_default: Any) -> Any:
+        def _resolve_shared_field(key: str, persisted_value: Any) -> Any:
             primary_source = fee_payload if caller_preference[0] == "fee" else cycle_payload
-            secondary_source = cycle_payload if caller_preference[1] == "cycle" else fee_payload
             if key in explicit_shared_fields and key in primary_source:
                 return primary_source[key]
-            if key in secondary_source:
-                return secondary_source[key]
-            return persisted_default
+            return persisted_value
 
-        canonical_last_gossip_refresh = _resolve_shared_field("last_gossip_refresh", 0)
+        canonical_last_gossip_refresh = _resolve_shared_field(
+            "last_gossip_refresh",
+            v2_data.get("last_gossip_refresh", 0),
+        )
         canonical_last_broadcast_at = _resolve_shared_field(
             "last_broadcast_at",
-            db_state.get("last_update", 0),
+            v2_data.get("last_broadcast_at", db_state.get("last_update", 0)),
         )
         canonical_htlcmin_baseline_msat = _resolve_shared_field(
             "dynamic_htlcmin_baseline_msat",
-            None,
+            v2_data.get("dynamic_htlcmin_baseline_msat"),
         )
 
         cycle_payload["last_gossip_refresh"] = canonical_last_gossip_refresh
