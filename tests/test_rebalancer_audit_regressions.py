@@ -7,6 +7,7 @@ Covers:
   C-4: Channel close detection in monitor_jobs
   I-12: Hot channel profit budget floor
   B2: Weekly budget uses 24h external costs (should scale to 7d)
+  B3: Push EV uses wrong peer for fee estimation
 """
 
 import math
@@ -612,3 +613,111 @@ class TestB2WeeklyBudgetExtCosts:
             "Bug B2: ext_spent was not scaled to 7d for the weekly comparison."
         )
         assert r._capital_control_blocker == "weekly_budget_sats"
+
+
+# ============================================================================
+# 7. B3: Push EV uses wrong peer for fee estimation
+# ============================================================================
+
+
+class TestB3PushEvWrongPeer:
+    """B3: _estimate_push_ev passes src_peer_id to _estimate_expected_fee_sats,
+    but in push rebalancing fees route through destination peers.  The fee
+    estimate must use the primary destination peer, not the source.
+    """
+
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            dry_run=True,
+            enable_proportional_budget=False,
+            enable_kelly=False,
+            rebalance_min_amount=10_000,
+            rebalance_max_amount=5_000_000,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        return r
+
+    def test_fee_estimate_uses_dest_peer_not_src(self, mock_plugin, mock_database):
+        """_estimate_expected_fee_sats must be called with the dest peer ID,
+        not the source peer ID."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        src_peer_id = "02" + "a" * 64
+        dest_peer_id = "02" + "b" * 64
+
+        src_channel = "111x222x0"
+        src_info = {
+            "peer_id": src_peer_id,
+            "capacity": 2_000_000,
+            "spendable_sats": 1_600_000,
+            "fee_ppm": 500,
+        }
+        src_ratio = 0.80  # High ratio -> excess to push
+
+        dest_scids = ["333x444x0"]
+        dest_peer_ids = [dest_peer_id]
+
+        # Mock internal helpers so _estimate_push_ev doesn't bail early
+        r._estimate_inbound_fee = MagicMock(return_value=50)
+        r._estimate_expected_fee_sats = MagicMock(return_value=5)
+        r._calculate_turnover_rate = MagicMock(return_value=0.5)
+
+        candidate = r._estimate_push_ev(
+            src_channel=src_channel,
+            src_info=src_info,
+            src_ratio=src_ratio,
+            dest_scids=dest_scids,
+            dest_peer_ids=dest_peer_ids,
+        )
+
+        # The key assertion: fee estimation must use dest peer, not src peer
+        r._estimate_expected_fee_sats.assert_called_once()
+        call_args = r._estimate_expected_fee_sats.call_args
+        called_with_peer = call_args[0][0]
+        assert called_with_peer == dest_peer_id, (
+            f"_estimate_expected_fee_sats called with peer {called_with_peer!r} "
+            f"(the source), but should have been called with {dest_peer_id!r} "
+            f"(the destination). Bug B3: push EV uses wrong peer for fee estimate."
+        )
+
+    def test_falls_back_to_src_peer_when_no_dest_peer_ids(self, mock_plugin, mock_database):
+        """When dest_peer_ids is None/empty, fall back to src_peer_id."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        src_peer_id = "02" + "a" * 64
+
+        src_channel = "111x222x0"
+        src_info = {
+            "peer_id": src_peer_id,
+            "capacity": 2_000_000,
+            "spendable_sats": 1_600_000,
+            "fee_ppm": 500,
+        }
+        src_ratio = 0.80
+
+        dest_scids = ["333x444x0"]
+        dest_peer_ids = None  # No dest peer IDs available
+
+        r._estimate_inbound_fee = MagicMock(return_value=50)
+        r._estimate_expected_fee_sats = MagicMock(return_value=5)
+        r._calculate_turnover_rate = MagicMock(return_value=0.5)
+
+        candidate = r._estimate_push_ev(
+            src_channel=src_channel,
+            src_info=src_info,
+            src_ratio=src_ratio,
+            dest_scids=dest_scids,
+            dest_peer_ids=dest_peer_ids,
+        )
+
+        # When no dest peer IDs, fallback to src_peer_id is acceptable
+        r._estimate_expected_fee_sats.assert_called_once()
+        call_args = r._estimate_expected_fee_sats.call_args
+        called_with_peer = call_args[0][0]
+        assert called_with_peer == src_peer_id, (
+            f"When dest_peer_ids is None, should fall back to src_peer_id "
+            f"{src_peer_id!r}, but was called with {called_with_peer!r}."
+        )

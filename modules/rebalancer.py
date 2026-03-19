@@ -3139,8 +3139,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         if max_budget <= 0:
             return None
 
-        # FIX: Calculate expected fee rather than subtracting absolute max_budget
-        expected_fee_sats = self._estimate_expected_fee_sats(src_peer_id, amount)
+        # B3 FIX: Use primary destination peer for fee estimation, not the source.
+        # In push rebalancing, routing fees go through destination peers.
+        primary_dest_peer = dest_peer_ids[0] if dest_peer_ids else src_peer_id
+        expected_fee_sats = self._estimate_expected_fee_sats(primary_dest_peer, amount)
         expected_fee_sats = min(expected_fee_sats, max_budget)
 
         # I-1 FIX: Apply utilization discount to push EV (same as pull EV).
