@@ -4294,11 +4294,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 )
 
             weekly_fees_spent = self.database.get_total_rebalance_fees(now - 7 * 86400)
-            weekly_total_spent = weekly_fees_spent + ext_spent
+            # B2 FIX: ext_spent is a 24h figure. Scale to 7d for weekly comparison.
+            weekly_total_spent = weekly_fees_spent + (ext_spent * 7)
             if weekly_total_spent >= effective_weekly:
                 self.plugin.log(
                     f"CAPITAL CONTROL: Weekly budget exceeded "
-                    f"(rebalance_fees_7d={weekly_fees_spent} + external_spent={ext_spent} "
+                    f"(rebalance_fees_7d={weekly_fees_spent} + external_spent_7d_est={ext_spent * 7} "
                     f"= {weekly_total_spent} >= {effective_weekly})",
                     level='warn'
                 )

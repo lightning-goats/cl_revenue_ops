@@ -6,6 +6,7 @@ Covers:
   C-3: Stop job re-add on sling failure
   C-4: Channel close detection in monitor_jobs
   I-12: Hot channel profit budget floor
+  B2: Weekly budget uses 24h external costs (should scale to 7d)
 """
 
 import math
@@ -551,3 +552,63 @@ class TestB1MaxFeePpmRederive:
             f"amount_msat={candidate.amount_msat}). "
             f"I-3 cap reduced the budget but max_fee_ppm was not re-derived."
         )
+
+
+# ============================================================================
+# 6. B2: Weekly budget uses 24h external costs (should scale to 7d)
+# ============================================================================
+
+
+class TestB2WeeklyBudgetExtCosts:
+    """B2: ext_spent from spent_24h_sats is a 24h figure but was added raw to
+    7-day weekly_fees_spent for the weekly budget gate.  External spending was
+    undercounted by ~6x.  The fix scales ext_spent * 7 for the weekly comparison.
+    """
+
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            dry_run=True,
+            enable_proportional_budget=False,
+            daily_budget_sats=100_000,       # High daily budget so daily gate does NOT block
+            weekly_budget_sats=1000,          # Low weekly budget — this is the gate we test
+            min_wallet_reserve=0,             # Disable reserve check
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        return r
+
+    def test_weekly_gate_blocks_when_ext_costs_scaled_to_7d(self, mock_plugin, mock_database):
+        """spent_24h_sats=200 -> 200*7=1400 > weekly_budget=1000 -> blocked.
+
+        Without the fix: 0 + 200 = 200 < 1000 -> wrongly passes.
+        With the fix:    0 + 1400 = 1400 > 1000 -> correctly blocked.
+        """
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        # Reserve check: provide enough funds to pass
+        mock_plugin.rpc.listfunds.return_value = {
+            "outputs": [{"status": "confirmed", "amount_msat": 10_000_000_000}],
+            "channels": [],
+        }
+
+        # Both daily and weekly rebalance fees from DB are 0
+        mock_database.get_total_rebalance_fees.return_value = 0
+        mock_database.get_total_routing_revenue.return_value = 0
+
+        # External liquidity costs: 200 sats in the last 24h
+        r._get_external_liquidity_costs = MagicMock(return_value={
+            "spent_24h_sats": 200,
+            "reserved_24h_sats": 0,
+        })
+
+        result = r._check_capital_controls()
+
+        # With the fix (ext_spent * 7 = 1400 > 1000), this should be False
+        assert result is False, (
+            "Weekly budget gate should block when 24h external costs scaled to "
+            "7d (200 * 7 = 1400) exceed weekly_budget_sats (1000). "
+            "Bug B2: ext_spent was not scaled to 7d for the weekly comparison."
+        )
+        assert r._capital_control_blocker == "weekly_budget_sats"
