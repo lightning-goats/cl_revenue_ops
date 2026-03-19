@@ -1787,6 +1787,12 @@ class FeeController:
         DTS/PID controller payload in a single row. Every save must therefore
         merge the caller's updates with the currently persisted counterpart state
         so save order never destroys the other side of the controller.
+
+        Shared fields that live in both payloads are caller-authoritative when
+        the caller provides a meaningful value. Unset/default shared-field
+        values (0 for timestamps, None for optional baselines) fall back to the
+        cached or persisted counterpart state so a partial save cannot erase
+        fresher shared state.
         """
         db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
         cycle_source = cycle_state or self._cycle_states.get(channel_id)
@@ -1803,17 +1809,43 @@ class FeeController:
             else self._extract_fee_state_payload(db_state, v2_data)
         )
 
-        canonical_last_gossip_refresh = cycle_payload.get(
-            "last_gossip_refresh",
-            fee_payload.get("last_gossip_refresh", 0),
-        )
-        canonical_last_broadcast_at = cycle_payload.get(
+        caller_preference: Tuple[str, str]
+        if fee_state is not None and cycle_state is None:
+            caller_preference = ("fee", "cycle")
+        else:
+            caller_preference = ("cycle", "fee")
+
+        def _resolve_shared_field(key: str, persisted_default: Any) -> Any:
+            primary_source = fee_payload if caller_preference[0] == "fee" else cycle_payload
+            secondary_source = cycle_payload if caller_preference[1] == "cycle" else fee_payload
+            unset_value = None
+            if key in ("last_gossip_refresh", "last_broadcast_at"):
+                unset_value = 0
+
+            def _value_from(source: Dict[str, Any]) -> Tuple[bool, Any]:
+                if key not in source:
+                    return False, None
+                value = source[key]
+                if unset_value is not None and value == unset_value:
+                    return False, value
+                if unset_value is None and value is None:
+                    return False, value
+                return True, value
+
+            for source in (primary_source, secondary_source):
+                has_value, value = _value_from(source)
+                if has_value:
+                    return value
+            return persisted_default
+
+        canonical_last_gossip_refresh = _resolve_shared_field("last_gossip_refresh", 0)
+        canonical_last_broadcast_at = _resolve_shared_field(
             "last_broadcast_at",
-            fee_payload.get("last_broadcast_at", db_state.get("last_update", 0)),
+            db_state.get("last_update", 0),
         )
-        canonical_htlcmin_baseline_msat = cycle_payload.get(
+        canonical_htlcmin_baseline_msat = _resolve_shared_field(
             "dynamic_htlcmin_baseline_msat",
-            fee_payload.get("dynamic_htlcmin_baseline_msat"),
+            None,
         )
 
         cycle_payload["last_gossip_refresh"] = canonical_last_gossip_refresh

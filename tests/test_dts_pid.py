@@ -423,6 +423,164 @@ class TestCycleStatePersistence:
         assert restored.last_volume_sats == 75_000
         assert restored.last_broadcast_at == cycle_state.last_broadcast_at
 
+    def test_saving_fee_state_prefers_caller_shared_fields_over_stale_cycle_cache(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "d" * 64
+        now = int(time.time())
+        row = self._install_persistent_row(mock_database, channel_id)
+
+        stale_cycle = ChannelCycleState(
+            last_update=now - 7200,
+            last_gossip_refresh=111,
+            dynamic_htlcmin_baseline_msat=1000,
+        )
+        stale_cycle.last_broadcast_at = 222
+        fc._cycle_states[channel_id] = stale_cycle
+
+        fee_state = ChannelFeeState()
+        fee_state.thompson.posterior_mean = 210.0
+        fee_state.last_gossip_refresh = now - 1200
+        fee_state.last_broadcast_at = now - 3600
+        fee_state.dynamic_htlcmin_baseline_msat = 4321
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == fee_state.last_gossip_refresh
+        assert persisted_v2["last_broadcast_at"] == fee_state.last_broadcast_at
+        assert (
+            persisted_v2["dynamic_htlcmin_baseline_msat"]
+            == fee_state.dynamic_htlcmin_baseline_msat
+        )
+        assert (
+            persisted_v2["cycle_state"]["last_gossip_refresh"]
+            == fee_state.last_gossip_refresh
+        )
+        assert (
+            persisted_v2["cycle_state"]["last_broadcast_at"]
+            == fee_state.last_broadcast_at
+        )
+        assert (
+            persisted_v2["cycle_state"]["dynamic_htlcmin_baseline_msat"]
+            == fee_state.dynamic_htlcmin_baseline_msat
+        )
+
+        fc._channel_fee_states.pop(channel_id, None)
+        restored = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=200)
+        assert restored.last_gossip_refresh == fee_state.last_gossip_refresh
+        assert restored.last_broadcast_at == fee_state.last_broadcast_at
+        assert (
+            restored.dynamic_htlcmin_baseline_msat
+            == fee_state.dynamic_htlcmin_baseline_msat
+        )
+
+    def test_saving_cycle_state_prefers_caller_shared_fields_over_stale_fee_cache(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        now = int(time.time())
+        row = self._install_persistent_row(mock_database, channel_id)
+
+        stale_fee = ChannelFeeState()
+        stale_fee.last_gossip_refresh = 333
+        stale_fee.last_broadcast_at = 444
+        stale_fee.dynamic_htlcmin_baseline_msat = 2000
+        fc._channel_fee_states[channel_id] = stale_fee
+
+        cycle_state = ChannelCycleState(
+            last_update=now - 900,
+            last_gossip_refresh=now - 600,
+            dynamic_htlcmin_baseline_msat=8765,
+        )
+        cycle_state.last_broadcast_at = now - 1800
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == cycle_state.last_gossip_refresh
+        assert persisted_v2["last_broadcast_at"] == cycle_state.last_broadcast_at
+        assert (
+            persisted_v2["dynamic_htlcmin_baseline_msat"]
+            == cycle_state.dynamic_htlcmin_baseline_msat
+        )
+        assert (
+            persisted_v2["fee_state"]["last_gossip_refresh"]
+            == cycle_state.last_gossip_refresh
+        )
+        assert (
+            persisted_v2["fee_state"]["last_broadcast_at"]
+            == cycle_state.last_broadcast_at
+        )
+        assert (
+            persisted_v2["fee_state"]["dynamic_htlcmin_baseline_msat"]
+            == cycle_state.dynamic_htlcmin_baseline_msat
+        )
+
+    def test_shared_fields_follow_most_recent_caller_regardless_of_save_order(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "e" * 64
+        now = int(time.time())
+        row = self._install_persistent_row(mock_database, channel_id)
+
+        cycle_state = ChannelCycleState(
+            last_update=now - 7200,
+            last_gossip_refresh=100,
+            dynamic_htlcmin_baseline_msat=1000,
+        )
+        cycle_state.last_broadcast_at = 200
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        fee_state = ChannelFeeState()
+        fee_state.last_gossip_refresh = 300
+        fee_state.last_broadcast_at = 400
+        fee_state.dynamic_htlcmin_baseline_msat = 5000
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 300
+        assert persisted_v2["last_broadcast_at"] == 400
+        assert persisted_v2["dynamic_htlcmin_baseline_msat"] == 5000
+
+        cycle_state_new = ChannelCycleState(
+            last_update=now - 600,
+            last_gossip_refresh=600,
+            dynamic_htlcmin_baseline_msat=7000,
+        )
+        cycle_state_new.last_broadcast_at = 650
+        fc._save_cycle_state(channel_id, cycle_state_new)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 600
+        assert persisted_v2["last_broadcast_at"] == 650
+        assert persisted_v2["dynamic_htlcmin_baseline_msat"] == 7000
+
+        fee_state_new = ChannelFeeState()
+        fee_state_new.last_gossip_refresh = 900
+        fee_state_new.last_broadcast_at = 950
+        fee_state_new.dynamic_htlcmin_baseline_msat = 9900
+        fc._save_channel_fee_state(channel_id, fee_state_new)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 900
+        assert persisted_v2["last_broadcast_at"] == 950
+        assert persisted_v2["dynamic_htlcmin_baseline_msat"] == 9900
+
+        fc._cycle_states.clear()
+        fc._channel_fee_states.clear()
+        restored_cycle = fc._get_cycle_state(channel_id, actual_fee_ppm=150)
+        restored_fee = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=150)
+        assert restored_cycle.last_gossip_refresh == 900
+        assert restored_cycle.last_broadcast_at == 950
+        assert restored_cycle.dynamic_htlcmin_baseline_msat == 9900
+        assert restored_fee.last_gossip_refresh == 900
+        assert restored_fee.last_broadcast_at == 950
+        assert restored_fee.dynamic_htlcmin_baseline_msat == 9900
+
     def test_restart_round_trip_preserves_cycle_and_dts_state(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         channel_id = "123x456x0"
@@ -458,6 +616,9 @@ class TestCycleStatePersistence:
         fee_state.last_broadcast_fee_ppm = cycle_state.last_broadcast_fee_ppm
         fee_state.last_update = cycle_state.last_update
         fee_state.last_gossip_refresh = cycle_state.last_gossip_refresh
+        fee_state.last_broadcast_at = cycle_state.last_broadcast_at
+        fee_state.dynamic_htlcmin_baseline_msat = 5555
+        cycle_state.dynamic_htlcmin_baseline_msat = 5555
 
         fc._save_cycle_state(channel_id, cycle_state)
         fc._save_channel_fee_state(channel_id, fee_state)
@@ -472,10 +633,13 @@ class TestCycleStatePersistence:
         assert restored_cycle.last_broadcast_fee_ppm == cycle_state.last_broadcast_fee_ppm
         assert restored_cycle.last_broadcast_at == cycle_state.last_broadcast_at
         assert restored_cycle.last_gossip_refresh == cycle_state.last_gossip_refresh
+        assert restored_cycle.dynamic_htlcmin_baseline_msat == 5555
         assert restored_fee.thompson.observations == fee_state.thompson.observations
         assert restored_fee.thompson.posterior_mean == pytest.approx(333.0)
         assert restored_fee.pid.integral_error == pytest.approx(0.75)
         assert restored_fee.last_vegas_multiplier == pytest.approx(1.3)
+        assert restored_fee.last_broadcast_at == cycle_state.last_broadcast_at
+        assert restored_fee.dynamic_htlcmin_baseline_msat == 5555
 
     def test_legacy_rows_without_new_v2_keys_load_safe_defaults(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
