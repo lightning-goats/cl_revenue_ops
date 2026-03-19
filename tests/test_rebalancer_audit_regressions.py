@@ -439,3 +439,115 @@ class TestHotChannelProfitBudgetFloor:
 
         assert result["eligible"] is True
         assert result["channel_profit_budget_sats"] >= 1
+
+
+# ============================================================================
+# 5. B1: max_fee_ppm re-derived after I-3 budget cap
+# ============================================================================
+
+
+class TestB1MaxFeePpmRederive:
+    """B1: max_fee_ppm must be re-derived after I-3 caps max_budget_sats down to expected_income.
+
+    Without the fix, the stale pre-cap max_fee_ppm is recorded as attempted_ppm
+    on failure (line 1110), poisoning the fee escalation feedback loop.
+    """
+
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            dry_run=True,
+            enable_proportional_budget=False,
+            enable_kelly=False,
+            enable_velocity_gate=False,
+            rebalance_min_amount=50_000,
+            rebalance_max_amount=5_000_000,
+            rebalance_min_profit=0,
+            rebalance_min_profit_ppm=0,
+            rebalance_cooldown_hours=24,
+            flow_window_days=7,
+            sling_chunk_size_sats=500_000,
+            hot_channel_protection_enabled=False,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r._profitability_analyzer = None
+        return r
+
+    def test_max_fee_ppm_capped_after_i3_budget_reduction(self, mock_plugin, mock_database):
+        """When I-3 cap reduces max_budget_sats, max_fee_ppm must be re-derived to match."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        dest_channel = "111x222x0"
+        dest_peer_id = "02" + "b" * 64
+        source_peer_id = "02" + "c" * 64
+        capacity = 10_000_000  # 10M sats
+
+        # Low outbound ratio -> channel needs rebalance
+        dest_ratio = 0.05
+        spendable = int(capacity * dest_ratio)  # 500k sats
+
+        dest_info = {
+            "peer_id": dest_peer_id,
+            "capacity": capacity,
+            "spendable_sats": spendable,
+            "fee_ppm": 500,  # High outbound fee
+        }
+
+        # Set up a source with low opportunity cost to ensure a large spread
+        source_scid = "333x444x0"
+        source_info = {
+            "peer_id": source_peer_id,
+            "capacity": 5_000_000,
+            "spendable_sats": 4_000_000,
+            "fee_ppm": 50,
+        }
+        sources = [(source_scid, source_info, 0.8)]
+
+        # Database mocks
+        # Channel state: very low volume (low utilization -> I-3 cap triggers)
+        mock_database.get_channel_state.return_value = {
+            "state": "balanced",
+            "sats_in": 10_000,   # Very low volume
+            "sats_out": 10_000,
+        }
+        mock_database.get_fee_strategy_state.return_value = {
+            "last_broadcast_fee_ppm": 500,
+        }
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_failure_count.return_value = (0, None)
+        mock_database.get_failure_metadata.return_value = {"last_attempted_ppm": 0}
+        mock_database.get_kalman_state.return_value = None  # No Kalman -> linear fallback
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+        mock_database.get_peer_closed_channel_profit_summary.return_value = None
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+
+        # Mock internal methods
+        r._estimate_inbound_fee = MagicMock(return_value=50)
+        r._get_channel_age_days = MagicMock(return_value=30)
+
+        # Mock _select_source_candidates to return our source
+        r._select_source_candidates = MagicMock(return_value=[
+            (source_scid, source_info, 1.0, 50),  # (scid, info, score, opp_cost)
+        ])
+
+        candidate = r._analyze_rebalance_ev(
+            dest_channel=dest_channel,
+            dest_info=dest_info,
+            dest_ratio=dest_ratio,
+            sources=sources,
+        )
+
+        assert candidate is not None, "Expected a RebalanceCandidate, got None"
+
+        # The key assertion: max_fee_ppm must be derivable from max_budget_msat
+        # budget_ppm = (max_budget_msat * 1_000_000) // amount_msat
+        # max_fee_ppm should be <= budget_ppm (the capped budget)
+        capped_budget_ppm = (candidate.max_budget_msat * 1_000_000) // candidate.amount_msat
+        assert candidate.max_fee_ppm <= capped_budget_ppm, (
+            f"STALE max_fee_ppm! max_fee_ppm={candidate.max_fee_ppm} exceeds "
+            f"capped budget_ppm={capped_budget_ppm} (max_budget_msat={candidate.max_budget_msat}, "
+            f"amount_msat={candidate.amount_msat}). "
+            f"I-3 cap reduced the budget but max_fee_ppm was not re-derived."
+        )

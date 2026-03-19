@@ -2863,6 +2863,12 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         if expected_income > 0:
             max_budget_sats = min(max_budget_sats, max(1, expected_income))
             max_budget_msat = max_budget_sats * 1000
+            # B1 FIX: Re-derive max_fee_ppm from the capped budget.
+            # Without this, the stale pre-cap max_fee_ppm is recorded as
+            # attempted_ppm on failure, poisoning fee escalation feedback.
+            if amount_msat > 0:
+                capped_budget_ppm = (max_budget_msat * 1_000_000) // amount_msat
+                max_fee_ppm = min(max_fee_ppm, max(1, capped_budget_ppm)) if capped_budget_ppm > 0 else max_fee_ppm
 
         expected_fee_sats = self._estimate_expected_fee_sats(dest_peer_id, rebalance_amount)
         # Never let expected fee exceed the max budget (it's a ceiling)
