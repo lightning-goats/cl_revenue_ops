@@ -926,28 +926,6 @@ class GaussianThompsonState:
         precision = max(precision, self.MIN_PRECISION)
         self.posterior_std = math.sqrt(1.0 / precision)
 
-    def inject_synthetic_observation(self, fee, revenue_rate, weight_scale=0.3, time_bucket="normal"):
-        """
-        Inject a reduced-weight synthetic observation from priority chain bypasses.
-
-        When congestion or zero-fee probes bypass DTS entirely, the posterior
-        gets no observations and can't learn. This injects synthetic observations
-        at reduced weight so the posterior still incorporates bypass data.
-
-        Args:
-            fee: Fee that was in effect during bypass (e.g., ceiling for congestion)
-            revenue_rate: Revenue observed during bypass period
-            weight_scale: Maximum weight for synthetic obs (default 0.3 = 30% of normal)
-            time_bucket: Current time bucket
-        """
-        now = int(time.time())
-        weight = min(1.0, 1.0 / 6.0) * min(1.0, (revenue_rate + 1) / 100.0)
-        weight = max(0.01, min(weight_scale, weight))
-        self.observations.append((fee, revenue_rate, weight, now, time_bucket))
-        if len(self.observations) > self.MAX_OBSERVATIONS:
-            self.observations = self.observations[-self.MAX_OBSERVATIONS:]
-        self._recompute_posterior()
-
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state to dict for database storage."""
         return {
@@ -2804,16 +2782,6 @@ class FeeController:
             previous_rate = cycle.last_revenue_rate
             target_found = True
 
-            # Synthetic observation: DTS bypassed, inject at reduced weight
-            try:
-                ts_state_synth = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
-                ts_state_synth.thompson.inject_synthetic_observation(
-                    ceiling_ppm, current_revenue_rate, weight_scale=0.3
-                )
-                self._save_channel_fee_state(channel_id, ts_state_synth)
-            except Exception as e:
-                self.plugin.log(f"Synthetic DTS observation injection failed for {channel_id[:12]}...: {e}", level='debug')
-
         # Priority 2: Zero-Fee Probe Logic (Jumpstarting)
         if not target_found and is_under_probe:
             # Calculate current revenue rate (reuse logic from rate calculation below)
@@ -2850,16 +2818,6 @@ class FeeController:
                     level='info'
                 )
 
-                # Synthetic observation: probe succeeded at floor fee
-                try:
-                    ts_state_synth = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
-                    probe_revenue = (v_since * new_fee_ppm) / 1_000_000 if v_since > 0 else 0.0
-                    ts_state_synth.thompson.inject_synthetic_observation(
-                        new_fee_ppm, probe_revenue, weight_scale=0.2
-                    )
-                    self._save_channel_fee_state(channel_id, ts_state_synth)
-                except Exception as e:
-                    self.plugin.log(f"Synthetic DTS observation injection (probe success) failed for {channel_id[:12]}...: {e}", level='debug')
             else:
                 # Still probing: force 0 PPM
                 new_fee_ppm = 0
@@ -2872,15 +2830,6 @@ class FeeController:
                 previous_rate = cycle.last_revenue_rate
                 target_found = True
 
-                # Synthetic observation: probing with 0 fee, no revenue
-                try:
-                    ts_state_synth = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
-                    ts_state_synth.thompson.inject_synthetic_observation(
-                        0, 0.0, weight_scale=0.1
-                    )
-                    self._save_channel_fee_state(channel_id, ts_state_synth)
-                except Exception as e:
-                    self.plugin.log(f"Synthetic DTS observation injection (probe active) failed for {channel_id[:12]}...: {e}", level='debug')
 
         # Priority 4: Fee Discovery Algorithm
         # =====================================================================
