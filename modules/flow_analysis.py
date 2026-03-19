@@ -51,15 +51,6 @@ MIN_CONFIDENCE = 0.1  # Never fully ignore flow state
 MAX_CONFIDENCE = 1.0
 CONFIDENCE_RECENCY_HALFLIFE_DAYS = 3.0  # Confidence decays by 50% every 3 days of no activity
 
-# Improvement #2: Graduated Flow Multipliers
-# multiplier = 1.0 + (flow_ratio * gradient) instead of fixed 1.25/0.80
-# Security: Bounded to 0.5 - 2.0 range
-ENABLE_GRADUATED_MULTIPLIERS = True
-GRADUATED_MULTIPLIER_GRADIENT = 0.5  # multiplier change per unit flow_ratio
-MIN_FLOW_MULTIPLIER = 0.5  # Security: Floor
-MAX_FLOW_MULTIPLIER = 2.0  # Security: Ceiling
-MULTIPLIER_DEADBAND = 0.1  # Ignore flow_ratio changes smaller than this
-
 # Improvement #3: Flow Velocity Tracking
 # velocity = (current_ratio - previous_ratio) / time_hours
 # Security: Outlier detection, bounded range
@@ -1045,36 +1036,6 @@ class FlowAnalyzer:
         # Security: enforce bounds
         return max(MIN_CONFIDENCE, min(MAX_CONFIDENCE, confidence))
 
-    def _calculate_graduated_multiplier(self, flow_ratio: float, confidence: float) -> float:
-        """
-        Calculate graduated flow multiplier based on flow magnitude.
-
-        Instead of fixed 1.25/0.80 multipliers, scale proportionally:
-        multiplier = 1.0 + (|flow_ratio| * gradient * sign(flow_ratio))
-
-        For sources (positive ratio): higher multiplier (raise fees)
-        For sinks (negative ratio): lower multiplier (lower fees)
-
-        Security: Bounded to MIN_FLOW_MULTIPLIER - MAX_FLOW_MULTIPLIER
-        """
-        if not ENABLE_GRADUATED_MULTIPLIERS:
-            return 1.0
-
-        # Apply deadband - ignore small flow_ratio changes
-        if abs(flow_ratio) < MULTIPLIER_DEADBAND:
-            return 1.0
-
-        # Calculate raw multiplier
-        # Positive flow_ratio (source) -> multiplier > 1.0
-        # Negative flow_ratio (sink) -> multiplier < 1.0
-        raw_multiplier = 1.0 + (flow_ratio * GRADUATED_MULTIPLIER_GRADIENT)
-
-        # Weight by confidence (low confidence = closer to 1.0)
-        weighted_multiplier = 1.0 + (raw_multiplier - 1.0) * confidence
-
-        # Security: enforce bounds
-        return max(MIN_FLOW_MULTIPLIER, min(MAX_FLOW_MULTIPLIER, weighted_multiplier))
-
     def _calculate_velocity(
         self, flow_ratio: float, previous_ratio: float,
         previous_timestamp: int, forward_count: int
@@ -1686,8 +1647,7 @@ class FlowAnalyzer:
             flow_ratio, previous_ratio, previous_ratio_ts, forward_count
         )
 
-        # v2.0: Calculate graduated multiplier (weighted by confidence)
-        flow_multiplier = self._calculate_graduated_multiplier(flow_ratio, confidence)
+        flow_multiplier = 1.0
 
         return FlowMetrics(
             channel_id=channel_id,
