@@ -2,7 +2,7 @@
 import json
 import math
 import time
-from typing import Dict, Tuple, get_type_hints
+from typing import Dict, List, Tuple, get_type_hints
 from unittest.mock import MagicMock
 
 import pytest
@@ -185,6 +185,10 @@ class TestDTSDiscountFactor:
 class TestContextualPosteriorUpdates:
     """Regression tests for contextual DTS state initialization."""
 
+    def test_observations_annotation_uses_5_tuple_storage(self):
+        hints = get_type_hints(GaussianThompsonState)
+        assert hints["observations"] == List[Tuple[int, float, float, int, str]]
+
     def test_contextual_posteriors_annotation_uses_4_tuple_storage(self):
         hints = get_type_hints(GaussianThompsonState)
         assert hints["contextual_posteriors"] == Dict[str, Tuple[float, float, int, int]]
@@ -223,6 +227,17 @@ class TestContextualPosteriorUpdates:
         assert ctx[2] == 3
         assert ctx[3] == 0
 
+    def test_legacy_observation_4_tuple_deserializes_with_default_time_bucket(self):
+        state = GaussianThompsonState.from_dict(
+            {
+                "observations": [
+                    (125, 3.0, 0.5, 1234567890),
+                ]
+            }
+        )
+
+        assert state.observations == [(125, 3.0, 0.5, 1234567890, "normal")]
+
 
 class TestPIDStatePersistence:
     """Tests for PID state serialization in ChannelFeeState."""
@@ -259,17 +274,44 @@ class TestPIDStatePersistence:
 class TestCycleStatePersistence:
     """Tests for ChannelCycleState persistence through v2_state_json."""
 
+    @staticmethod
+    def _install_persistent_row(mock_database, channel_id: str):
+        row = {
+            "channel_id": channel_id,
+            "last_revenue_rate": 0.0,
+            "last_fee_ppm": 0,
+            "last_broadcast_fee_ppm": 0,
+            "trend_direction": 1,
+            "step_ppm": 50,
+            "consecutive_same_direction": 0,
+            "last_update": 0,
+            "last_state": "unknown",
+            "is_sleeping": 0,
+            "sleep_until": 0,
+            "stable_cycles": 0,
+            "forward_count_since_update": 0,
+            "last_volume_sats": 0,
+            "v2_state_json": "{}",
+        }
+
+        def get_state(_channel_id):
+            assert _channel_id == channel_id
+            return dict(row)
+
+        def update_state(**kwargs):
+            row.clear()
+            row.update(kwargs)
+            row.setdefault("channel_id", channel_id)
+
+        mock_database.get_fee_strategy_state.side_effect = get_state
+        mock_database.update_fee_strategy_state.side_effect = update_state
+        return row
+
     def test_cycle_state_round_trips_last_gossip_refresh(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         channel_id = "123x456x0"
         now = int(time.time())
-        persisted = {}
-
-        def capture_update(**kwargs):
-            persisted.clear()
-            persisted.update(kwargs)
-
-        mock_database.update_fee_strategy_state.side_effect = capture_update
+        self._install_persistent_row(mock_database, channel_id)
 
         state = ChannelCycleState(
             last_revenue_rate=5.0,
@@ -287,17 +329,184 @@ class TestCycleStatePersistence:
             last_volume_sats=50_000,
             last_gossip_refresh=now - 1800,
         )
+        state.last_broadcast_at = now - 172800
         mock_database.get_last_forward_time.return_value = now - 172800
 
         fc._save_cycle_state(channel_id, state)
-
-        mock_database.get_fee_strategy_state.return_value = dict(persisted)
         fc._cycle_states.pop(channel_id, None)
 
         restored = fc._get_cycle_state(channel_id, actual_fee_ppm=150)
 
         assert restored.last_gossip_refresh == state.last_gossip_refresh
+        assert restored.last_broadcast_at == state.last_broadcast_at
         assert fc._should_force_gossip_refresh(channel_id, restored, now) is False
+
+    def test_saving_cycle_state_preserves_existing_dts_state(self, mock_plugin, mock_database):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        now = int(time.time())
+        self._install_persistent_row(mock_database, channel_id)
+
+        fee_state = ChannelFeeState()
+        fee_state.thompson.observations = [(200, 1.5, 0.5, now - 100, "normal")]
+        fee_state.thompson.posterior_mean = 210.0
+        fee_state.thompson.posterior_std = 55.0
+        fee_state.pid.integral_error = 1.25
+        fee_state.last_vegas_multiplier = 1.4
+        fee_state.last_gossip_refresh = now - 5000
+        fee_state.last_update = now - 7200
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        cycle_state = ChannelCycleState(
+            last_revenue_rate=7.0,
+            last_fee_ppm=220,
+            last_broadcast_fee_ppm=220,
+            trend_direction=-1,
+            step_ppm=77,
+            consecutive_same_direction=3,
+            last_update=now - 1800,
+            last_state="balanced",
+            forward_count_since_update=9,
+            last_volume_sats=75_000,
+            last_gossip_refresh=now - 5000,
+        )
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        fc._channel_fee_states.pop(channel_id, None)
+        restored = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=220)
+
+        assert restored.thompson.observations == fee_state.thompson.observations
+        assert restored.thompson.posterior_mean == pytest.approx(210.0)
+        assert restored.pid.integral_error == pytest.approx(1.25)
+        assert restored.last_vegas_multiplier == pytest.approx(1.4)
+
+    def test_saving_fee_state_preserves_existing_cycle_state(self, mock_plugin, mock_database):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        now = int(time.time())
+        self._install_persistent_row(mock_database, channel_id)
+
+        cycle_state = ChannelCycleState(
+            last_revenue_rate=7.0,
+            last_fee_ppm=220,
+            last_broadcast_fee_ppm=215,
+            trend_direction=-1,
+            step_ppm=77,
+            consecutive_same_direction=4,
+            last_update=now - 3600,
+            last_state="balanced",
+            forward_count_since_update=9,
+            last_volume_sats=75_000,
+            last_gossip_refresh=now - 5000,
+        )
+        cycle_state.last_broadcast_at = now - 86400
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        fee_state = ChannelFeeState()
+        fee_state.thompson.observations = [(200, 1.5, 0.5, now - 100, "normal")]
+        fee_state.pid.integral_error = 1.25
+        fee_state.last_vegas_multiplier = 1.4
+        fee_state.last_revenue_rate = cycle_state.last_revenue_rate
+        fee_state.last_fee_ppm = cycle_state.last_fee_ppm
+        fee_state.last_broadcast_fee_ppm = cycle_state.last_broadcast_fee_ppm
+        fee_state.last_update = cycle_state.last_update
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        fc._cycle_states.pop(channel_id, None)
+        restored = fc._get_cycle_state(channel_id, actual_fee_ppm=215)
+
+        assert restored.trend_direction == -1
+        assert restored.step_ppm == 77
+        assert restored.consecutive_same_direction == 4
+        assert restored.last_volume_sats == 75_000
+        assert restored.last_broadcast_at == cycle_state.last_broadcast_at
+
+    def test_restart_round_trip_preserves_cycle_and_dts_state(self, mock_plugin, mock_database):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "b" * 64
+        now = int(time.time())
+        self._install_persistent_row(mock_database, channel_id)
+
+        cycle_state = ChannelCycleState(
+            last_revenue_rate=12.5,
+            last_fee_ppm=350,
+            last_broadcast_fee_ppm=340,
+            trend_direction=-1,
+            step_ppm=88,
+            consecutive_same_direction=2,
+            last_update=now - 900,
+            last_state="balanced",
+            forward_count_since_update=13,
+            last_volume_sats=120_000,
+            last_gossip_refresh=now - 3600,
+        )
+        cycle_state.last_broadcast_at = now - 86400
+        fee_state = ChannelFeeState()
+        fee_state.thompson.observations = [
+            (300, 2.0, 0.5, now - 7200, "normal"),
+            (350, 3.0, 0.7, now - 3600, "peak"),
+        ]
+        fee_state.thompson.posterior_mean = 333.0
+        fee_state.thompson.posterior_std = 44.0
+        fee_state.pid.integral_error = 0.75
+        fee_state.last_vegas_multiplier = 1.3
+        fee_state.last_revenue_rate = cycle_state.last_revenue_rate
+        fee_state.last_fee_ppm = cycle_state.last_fee_ppm
+        fee_state.last_broadcast_fee_ppm = cycle_state.last_broadcast_fee_ppm
+        fee_state.last_update = cycle_state.last_update
+        fee_state.last_gossip_refresh = cycle_state.last_gossip_refresh
+
+        fc._save_cycle_state(channel_id, cycle_state)
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        fc._cycle_states.clear()
+        fc._channel_fee_states.clear()
+
+        restored_cycle = fc._get_cycle_state(channel_id, actual_fee_ppm=340)
+        restored_fee = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=340)
+
+        assert restored_cycle.last_update == cycle_state.last_update
+        assert restored_cycle.last_broadcast_fee_ppm == cycle_state.last_broadcast_fee_ppm
+        assert restored_cycle.last_broadcast_at == cycle_state.last_broadcast_at
+        assert restored_cycle.last_gossip_refresh == cycle_state.last_gossip_refresh
+        assert restored_fee.thompson.observations == fee_state.thompson.observations
+        assert restored_fee.thompson.posterior_mean == pytest.approx(333.0)
+        assert restored_fee.pid.integral_error == pytest.approx(0.75)
+        assert restored_fee.last_vegas_multiplier == pytest.approx(1.3)
+
+    def test_legacy_rows_without_new_v2_keys_load_safe_defaults(self, mock_plugin, mock_database):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "c" * 64
+        legacy_last_update = int(time.time()) - 7200
+        mock_database.get_fee_strategy_state.return_value = {
+            "channel_id": channel_id,
+            "last_revenue_rate": 2.0,
+            "last_fee_ppm": 120,
+            "last_broadcast_fee_ppm": 110,
+            "trend_direction": -1,
+            "step_ppm": 25,
+            "consecutive_same_direction": 1,
+            "last_update": legacy_last_update,
+            "last_state": "balanced",
+            "is_sleeping": 0,
+            "sleep_until": 0,
+            "stable_cycles": 0,
+            "forward_count_since_update": 2,
+            "last_volume_sats": 1000,
+            "v2_state_json": json.dumps({"algorithm_version": "dts_pid_v1"}),
+        }
+
+        cycle = fc._get_cycle_state(channel_id, actual_fee_ppm=110)
+        fee_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=110)
+
+        assert cycle.last_gossip_refresh == 0
+        assert cycle.last_broadcast_at == legacy_last_update
+        assert fee_state.last_gossip_refresh == 0
+        assert fee_state.last_broadcast_at == legacy_last_update
 
 
 # =========================================================================

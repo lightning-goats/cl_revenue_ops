@@ -30,6 +30,7 @@ from modules.fee_controller import (
     GaussianThompsonState,
     FeeController,
     ChannelFeeState,
+    ChannelCycleState,
     FeeAdjustment,
     FeeReasonCode,
 )
@@ -511,3 +512,113 @@ class TestAdjustChannelFeeEndToEnd:
 
         assert result is None
         assert fc._channel_fee_states[channel_id].is_sleeping is True
+
+    def test_gossip_refresh_eligibility_uses_broadcast_age_not_observation_cursor(self, mock_plugin, mock_database):
+        fc, _cfg = self._make_fc_full(mock_plugin, mock_database)
+        now = int(time.time())
+        channel_id = "123x456x2"
+        state = ChannelCycleState(
+            last_update=now - 300,
+            last_broadcast_fee_ppm=150,
+            last_gossip_refresh=now - 172800,
+        )
+        state.last_broadcast_at = now - 172800
+        mock_database.get_last_forward_time.return_value = now - 172800
+
+        assert fc._should_force_gossip_refresh(channel_id, state, now) is True
+
+    def test_gossip_refresh_respects_feature_gate_and_cooldown(self, mock_plugin, mock_database):
+        fc, _cfg = self._make_fc_full(mock_plugin, mock_database)
+        now = int(time.time())
+        channel_id = "123x456x3"
+        state = ChannelCycleState(
+            last_update=now - 300,
+            last_broadcast_fee_ppm=150,
+            last_gossip_refresh=now - 3600,
+        )
+        state.last_broadcast_at = now - 172800
+        mock_database.get_last_forward_time.return_value = now - 172800
+
+        assert fc._should_force_gossip_refresh(channel_id, state, now) is False
+
+        fc.ENABLE_GOSSIP_REFRESH = False
+        state.last_gossip_refresh = now - 172800
+        assert fc._should_force_gossip_refresh(channel_id, state, now) is False
+
+    def test_alpha_guard_updates_observation_cursor_only(self, mock_plugin, mock_database):
+        fc, cfg = self._make_fc_full(mock_plugin, mock_database)
+        channel_id = "123x456x4"
+        peer_id = "02" + "c" * 64
+        now = int(time.time())
+
+        cycle = ChannelCycleState(
+            last_revenue_rate=5.0,
+            last_fee_ppm=500,
+            last_broadcast_fee_ppm=500,
+            last_update=now - 7200,
+        )
+        cycle.last_broadcast_at = now - 172800
+        fc._cycle_states[channel_id] = cycle
+
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=500)
+        ts_state.last_revenue_rate = 5.0
+        ts_state.last_fee_ppm = 500
+        ts_state.last_broadcast_fee_ppm = 500
+        ts_state.last_update = now - 7200
+        ts_state.last_broadcast_at = now - 172800
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 501
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
+        channel_info = {
+            "fee_proportional_millionths": 500,
+            "capacity": 2_000_000,
+            "spendable_msat": "1000000000msat",
+            "opener": "local",
+        }
+        state = {"state": "balanced", "forward_count": 50, "sats_out": 10000}
+
+        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
+
+        assert result is None
+        assert fc._cycle_states[channel_id].last_update >= now
+        assert fc._cycle_states[channel_id].last_broadcast_at == cycle.last_broadcast_at
+        assert fc._channel_fee_states[channel_id].last_broadcast_at == ts_state.last_broadcast_at
+
+    def test_successful_broadcast_updates_both_observation_and_broadcast_timestamps(self, mock_plugin, mock_database):
+        fc, cfg = self._make_fc_full(mock_plugin, mock_database)
+        channel_id = "123x456x5"
+        peer_id = "02" + "d" * 64
+        now = int(time.time())
+
+        cycle = ChannelCycleState(
+            last_revenue_rate=5.0,
+            last_fee_ppm=500,
+            last_broadcast_fee_ppm=500,
+            last_update=now - 7200,
+        )
+        cycle.last_broadcast_at = now - 172800
+        fc._cycle_states[channel_id] = cycle
+
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=500)
+        ts_state.last_revenue_rate = 5.0
+        ts_state.last_fee_ppm = 500
+        ts_state.last_broadcast_fee_ppm = 500
+        ts_state.last_update = now - 7200
+        ts_state.last_broadcast_at = now - 172800
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 1200
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
+        channel_info = {
+            "fee_proportional_millionths": 500,
+            "capacity": 2_000_000,
+            "spendable_msat": "1000000000msat",
+            "opener": "local",
+        }
+        state = {"state": "balanced", "forward_count": 50, "sats_out": 10000}
+
+        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
+
+        assert result is not None
+        assert fc._cycle_states[channel_id].last_update >= now
+        assert fc._cycle_states[channel_id].last_broadcast_at >= now
+        assert fc._channel_fee_states[channel_id].last_broadcast_at >= now

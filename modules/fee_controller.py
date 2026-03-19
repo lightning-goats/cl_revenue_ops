@@ -154,8 +154,8 @@ class GaussianThompsonState:
     prior_mean_fee: int = 200       # Default prior mean: 200 ppm
     prior_std_fee: int = 100        # Default prior uncertainty: 100 ppm
 
-    # Observations: List of (fee_ppm, revenue_rate, weight, timestamp)
-    observations: List[Tuple[int, float, float, int]] = field(default_factory=list)
+    # Observations: List of (fee_ppm, revenue_rate, weight, timestamp, time_bucket)
+    observations: List[Tuple[int, float, float, int, str]] = field(default_factory=list)
 
     # Posterior parameters (updated from observations)
     posterior_mean: float = 200.0
@@ -947,7 +947,7 @@ class GaussianThompsonState:
         return {
             "prior_mean_fee": self.prior_mean_fee,
             "prior_std_fee": self.prior_std_fee,
-            "observations": self.observations,  # List of tuples
+            "observations": self.observations,  # List of 5-tuples with time_bucket
             "posterior_mean": self.posterior_mean,
             "posterior_std": self.posterior_std,
             "posterior_coeffs": self.posterior_coeffs,
@@ -968,7 +968,15 @@ class GaussianThompsonState:
         state = cls()
         state.prior_mean_fee = d.get("prior_mean_fee", 200)
         state.prior_std_fee = d.get("prior_std_fee", 100)
-        state.observations = [tuple(o) for o in d.get("observations", [])]
+        converted_observations = []
+        for obs in d.get("observations", []):
+            t = tuple(obs)
+            if len(t) == 4:
+                fee, revenue_rate, weight, ts = t
+                converted_observations.append((fee, revenue_rate, weight, ts, "normal"))
+            else:
+                converted_observations.append(t)
+        state.observations = converted_observations
         state.posterior_mean = d.get("posterior_mean", 200.0)
         state.posterior_std = d.get("posterior_std", 100.0)
         # Backward compat: convert legacy 3-tuple (mean, std, count) to
@@ -1156,7 +1164,8 @@ class ChannelFeeState:
     last_revenue_rate: float = 0.0      # Raw revenue rate
     last_fee_ppm: int = 0               # Last fee we set
     last_broadcast_fee_ppm: int = 0     # Last fee broadcasted to network
-    last_update: int = 0                # Timestamp of last update
+    last_update: int = 0                # Observation cursor / last ingested window
+    last_broadcast_at: int = 0          # Timestamp of last successful CLN fee broadcast
     last_state: str = 'balanced'        # Flow state during last update
 
     # Deadband hysteresis
@@ -1198,6 +1207,7 @@ class ChannelFeeState:
             "last_vegas_multiplier": self.last_vegas_multiplier,
             # F-R6-1 FIX: Persist gossip refresh cooldown so it survives restarts
             "last_gossip_refresh": self.last_gossip_refresh,
+            "last_broadcast_at": self.last_broadcast_at,
             # PID balance controller state
             "pid_state": self.pid.to_dict(),
             "dynamic_htlcmin_baseline_msat": self.dynamic_htlcmin_baseline_msat,
@@ -1235,6 +1245,8 @@ class ChannelFeeState:
         state.last_vegas_multiplier = d.get("last_vegas_multiplier", 1.0)
         # F-R6-1 FIX: Restore gossip refresh cooldown from persisted state
         state.last_gossip_refresh = d.get("last_gossip_refresh", 0)
+        legacy_broadcast_at = legacy_state.get("last_update", 0) if legacy_state else 0
+        state.last_broadcast_at = d.get("last_broadcast_at", legacy_broadcast_at)
         # PID balance controller state
         pid_data = d.get("pid_state", {})
         state.pid = PIDState.from_dict(pid_data) if pid_data else PIDState()
@@ -1270,7 +1282,8 @@ class ChannelCycleState:
         last_fee_ppm: Fee that was in effect during last period
         trend_direction: Current search direction (1 = increasing, -1 = decreasing)
         step_ppm: Current step size in PPM (subject to wiggle dampening)
-        last_update: Timestamp of last update
+        last_update: Observation cursor for the last ingested adjustment window
+        last_broadcast_at: Timestamp of the last successful CLN fee broadcast
         consecutive_same_direction: How many times we've moved in same direction
         is_sleeping: Deadband hysteresis - True if channel is in sleep mode
         sleep_until: Unix timestamp when to wake up from sleep mode
@@ -1283,7 +1296,8 @@ class ChannelCycleState:
     last_fee_ppm: int = 0
     trend_direction: int = 1  # 1 = try increasing fee, -1 = try decreasing
     step_ppm: int = 50  # Current step size (decays on reversal)
-    last_update: int = 0
+    last_update: int = 0  # Observation cursor
+    last_broadcast_at: int = 0  # Last successful CLN fee broadcast time
     consecutive_same_direction: int = 0
     is_sleeping: bool = False  # Deadband hysteresis sleep state
     sleep_until: int = 0  # Unix timestamp when to wake up
@@ -1668,6 +1682,177 @@ class FeeController:
         context_key = f"{balance}:{time_bucket}:{role}"
         return (context_key, time_bucket, role)
 
+    def _load_persisted_fee_strategy_row(self, channel_id: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Load the current fee_strategy_state row plus parsed v2 payload."""
+        db_state = self.database.get_fee_strategy_state(channel_id) if self.database else {"channel_id": channel_id}
+        v2_json_str = db_state.get("v2_state_json", "{}") if db_state else "{}"
+        try:
+            v2_data = json.loads(v2_json_str) if v2_json_str else {}
+        except json.JSONDecodeError:
+            v2_data = {}
+        return db_state, v2_data
+
+    @staticmethod
+    def _extract_fee_state_payload(db_state: Dict[str, Any], v2_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the DTS/PID portion of the persisted v2 payload."""
+        nested_payload = v2_data.get("fee_state")
+        legacy_broadcast_at = db_state.get("last_update", 0)
+
+        if isinstance(nested_payload, dict):
+            payload = dict(nested_payload)
+        else:
+            payload = {
+                key: v2_data[key]
+                for key in (
+                    "algorithm_version",
+                    "thompson_state",
+                    "last_vegas_multiplier",
+                    "last_gossip_refresh",
+                    "last_broadcast_at",
+                    "pid_state",
+                    "dynamic_htlcmin_baseline_msat",
+                )
+                if key in v2_data
+            }
+
+        payload.setdefault("algorithm_version", "dts_pid_v1")
+        payload.setdefault("last_vegas_multiplier", 1.0)
+        payload.setdefault("last_gossip_refresh", v2_data.get("last_gossip_refresh", 0))
+        payload.setdefault("last_broadcast_at", v2_data.get("last_broadcast_at", legacy_broadcast_at))
+        payload.setdefault(
+            "dynamic_htlcmin_baseline_msat",
+            v2_data.get("dynamic_htlcmin_baseline_msat"),
+        )
+        return payload
+
+    @staticmethod
+    def _extract_cycle_state_payload(db_state: Dict[str, Any], v2_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the cycle-tracking portion of persisted state."""
+        payload = {
+            "last_revenue_rate": db_state.get("last_revenue_rate", 0.0),
+            "last_fee_ppm": db_state.get("last_fee_ppm", 0),
+            "trend_direction": db_state.get("trend_direction", 1),
+            "step_ppm": db_state.get("step_ppm", 50),
+            "last_update": db_state.get("last_update", 0),
+            "consecutive_same_direction": db_state.get("consecutive_same_direction", 0),
+            "is_sleeping": bool(db_state.get("is_sleeping", 0)),
+            "sleep_until": db_state.get("sleep_until", 0),
+            "stable_cycles": db_state.get("stable_cycles", 0),
+            "last_broadcast_fee_ppm": db_state.get("last_broadcast_fee_ppm", 0),
+            "last_state": db_state.get("last_state", "balanced"),
+            "forward_count_since_update": db_state.get("forward_count_since_update", 0),
+            "last_volume_sats": db_state.get("last_volume_sats", 0),
+            "last_gossip_refresh": v2_data.get("last_gossip_refresh", 0),
+            "last_broadcast_at": v2_data.get("last_broadcast_at", db_state.get("last_update", 0)),
+            "dynamic_htlcmin_baseline_msat": v2_data.get("dynamic_htlcmin_baseline_msat"),
+        }
+        nested_payload = v2_data.get("cycle_state")
+        if isinstance(nested_payload, dict):
+            payload.update(nested_payload)
+        return payload
+
+    @staticmethod
+    def _serialize_cycle_state_payload(state: ChannelCycleState) -> Dict[str, Any]:
+        """Serialize cycle-only state into the canonical v2 payload shape."""
+        return {
+            "last_revenue_rate": state.last_revenue_rate,
+            "last_fee_ppm": state.last_fee_ppm,
+            "trend_direction": state.trend_direction,
+            "step_ppm": state.step_ppm,
+            "last_update": state.last_update,
+            "last_broadcast_at": state.last_broadcast_at,
+            "consecutive_same_direction": state.consecutive_same_direction,
+            "is_sleeping": bool(state.is_sleeping),
+            "sleep_until": state.sleep_until,
+            "stable_cycles": state.stable_cycles,
+            "last_broadcast_fee_ppm": state.last_broadcast_fee_ppm,
+            "last_state": state.last_state,
+            "forward_count_since_update": state.forward_count_since_update,
+            "last_volume_sats": state.last_volume_sats,
+            "last_gossip_refresh": state.last_gossip_refresh,
+            "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
+        }
+
+    def _build_merged_fee_strategy_row(
+        self,
+        channel_id: str,
+        *,
+        cycle_state: Optional[ChannelCycleState] = None,
+        fee_state: Optional[ChannelFeeState] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Build a non-destructive fee_strategy_state row update.
+
+        The fee_strategy_state table stores both cycle-tracking fields and the
+        DTS/PID controller payload in a single row. Every save must therefore
+        merge the caller's updates with the currently persisted counterpart state
+        so save order never destroys the other side of the controller.
+        """
+        db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
+        cycle_source = cycle_state or self._cycle_states.get(channel_id)
+        fee_source = fee_state or self._channel_fee_states.get(channel_id)
+
+        cycle_payload = (
+            self._serialize_cycle_state_payload(cycle_source)
+            if cycle_source is not None
+            else self._extract_cycle_state_payload(db_state, v2_data)
+        )
+        fee_payload = (
+            fee_source.to_v2_dict()
+            if fee_source is not None
+            else self._extract_fee_state_payload(db_state, v2_data)
+        )
+
+        canonical_last_gossip_refresh = cycle_payload.get(
+            "last_gossip_refresh",
+            fee_payload.get("last_gossip_refresh", 0),
+        )
+        canonical_last_broadcast_at = cycle_payload.get(
+            "last_broadcast_at",
+            fee_payload.get("last_broadcast_at", db_state.get("last_update", 0)),
+        )
+        canonical_htlcmin_baseline_msat = cycle_payload.get(
+            "dynamic_htlcmin_baseline_msat",
+            fee_payload.get("dynamic_htlcmin_baseline_msat"),
+        )
+
+        cycle_payload["last_gossip_refresh"] = canonical_last_gossip_refresh
+        cycle_payload["last_broadcast_at"] = canonical_last_broadcast_at
+        cycle_payload["dynamic_htlcmin_baseline_msat"] = canonical_htlcmin_baseline_msat
+        fee_payload["last_gossip_refresh"] = canonical_last_gossip_refresh
+        fee_payload["last_broadcast_at"] = canonical_last_broadcast_at
+        fee_payload["dynamic_htlcmin_baseline_msat"] = canonical_htlcmin_baseline_msat
+
+        merged_v2 = {
+            "algorithm_version": fee_payload.get("algorithm_version", "dts_pid_v1"),
+            "fee_state": fee_payload,
+            "cycle_state": cycle_payload,
+            # Flat compatibility mirrors for existing readers/tests.
+            "thompson_state": fee_payload.get("thompson_state", {}),
+            "last_vegas_multiplier": fee_payload.get("last_vegas_multiplier", 1.0),
+            "pid_state": fee_payload.get("pid_state", {}),
+            "last_gossip_refresh": canonical_last_gossip_refresh,
+            "last_broadcast_at": canonical_last_broadcast_at,
+            "dynamic_htlcmin_baseline_msat": canonical_htlcmin_baseline_msat,
+        }
+
+        row_fields = {
+            "last_revenue_rate": cycle_payload.get("last_revenue_rate", 0.0),
+            "last_fee_ppm": cycle_payload.get("last_fee_ppm", 0),
+            "trend_direction": cycle_payload.get("trend_direction", 1),
+            "step_ppm": cycle_payload.get("step_ppm", 50),
+            "consecutive_same_direction": cycle_payload.get("consecutive_same_direction", 0),
+            "last_broadcast_fee_ppm": cycle_payload.get("last_broadcast_fee_ppm", 0),
+            "last_state": cycle_payload.get("last_state", "unknown"),
+            "is_sleeping": 1 if cycle_payload.get("is_sleeping", False) else 0,
+            "sleep_until": cycle_payload.get("sleep_until", 0),
+            "stable_cycles": cycle_payload.get("stable_cycles", 0),
+            "forward_count_since_update": cycle_payload.get("forward_count_since_update", 0),
+            "last_volume_sats": cycle_payload.get("last_volume_sats", 0),
+            "last_update": cycle_payload.get("last_update", 0),
+        }
+        return row_fields, merged_v2
+
     def _get_channel_fee_state(
         self,
         channel_id: str,
@@ -1688,8 +1873,6 @@ class FeeController:
         Returns:
             ChannelFeeState for the channel
         """
-        import json
-
         # Check in-memory cache
         if channel_id in self._channel_fee_states:
             cached_state = self._channel_fee_states[channel_id]
@@ -1707,24 +1890,18 @@ class FeeController:
             return cached_state
 
         # Load from database
-        db_state = self.database.get_fee_strategy_state(channel_id)
-
-        # Parse v2.0 JSON state
-        v2_json_str = db_state.get("v2_state_json", "{}")
-        try:
-            v2_data = json.loads(v2_json_str) if v2_json_str else {}
-        except json.JSONDecodeError:
-            v2_data = {}
+        db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
+        fee_v2_data = self._extract_fee_state_payload(db_state, v2_data)
 
         # Check if this is a known format or needs migration.
         # Accept both legacy "thompson_aimd_v1" and current "dts_pid_v1".
         known_versions = {"thompson_aimd_v1", "dts_pid_v1"}
-        if v2_data.get("algorithm_version") in known_versions:
+        if fee_v2_data.get("algorithm_version") in known_versions:
             # Load directly
-            state = ChannelFeeState.from_v2_dict(v2_data, db_state)
+            state = ChannelFeeState.from_v2_dict(fee_v2_data, db_state)
         else:
             # Migration from ChannelCycleState
-            state = ChannelFeeState.from_v2_dict(v2_data, db_state)
+            state = ChannelFeeState.from_v2_dict(fee_v2_data, db_state)
 
             # Stamp as migrated so we don't re-migrate on next restart
             state.algorithm_version = "dts_pid_v1"
@@ -1754,50 +1931,44 @@ class FeeController:
 
     def _save_channel_fee_state(self, channel_id: str, state: ChannelFeeState) -> None:
         """Save channel fee state to cache and database."""
-        import json
-
         self._channel_fee_states[channel_id] = state
 
-        # Serialize to v2 JSON format
-        v2_data = state.to_v2_dict()
+        row_fields, v2_data = self._build_merged_fee_strategy_row(
+            channel_id,
+            fee_state=state,
+        )
         v2_json_str = json.dumps(v2_data)
 
-        # Save to database using existing fee_strategy_state table
-        # This maintains compatibility with the existing schema
         self.database.update_fee_strategy_state(
             channel_id=channel_id,
-            last_revenue_rate=state.last_revenue_rate,
-            last_fee_ppm=state.last_fee_ppm,
-            trend_direction=1,  # Not used by DTS+PID but kept for schema
-            step_ppm=50,  # Not used by DTS+PID but kept for schema
-            consecutive_same_direction=0,  # Not used by DTS+PID
-            last_broadcast_fee_ppm=state.last_broadcast_fee_ppm,
-            last_state=state.last_state,
-            is_sleeping=1 if state.is_sleeping else 0,
-            sleep_until=state.sleep_until,
-            stable_cycles=state.stable_cycles,
-            forward_count_since_update=state.forward_count_since_update,
-            last_volume_sats=state.last_volume_sats,
+            last_revenue_rate=row_fields["last_revenue_rate"],
+            last_fee_ppm=row_fields["last_fee_ppm"],
+            trend_direction=row_fields["trend_direction"],
+            step_ppm=row_fields["step_ppm"],
+            consecutive_same_direction=row_fields["consecutive_same_direction"],
+            last_broadcast_fee_ppm=row_fields["last_broadcast_fee_ppm"],
+            last_state=row_fields["last_state"],
+            is_sleeping=row_fields["is_sleeping"],
+            sleep_until=row_fields["sleep_until"],
+            stable_cycles=row_fields["stable_cycles"],
+            forward_count_since_update=row_fields["forward_count_since_update"],
+            last_volume_sats=row_fields["last_volume_sats"],
             v2_state_json=v2_json_str,
-            last_update=state.last_update
+            last_update=row_fields["last_update"],
         )
 
     def _get_or_create_channel_fee_state(self, channel_id: str) -> ChannelFeeState:
         """Return cached channel fee state or a minimal persisted state shell."""
-        import json
-
         cached_state = self._channel_fee_states.get(channel_id)
         if cached_state is not None:
             return cached_state
 
-        db_state = self.database.get_fee_strategy_state(channel_id) if self.database else {}
-        v2_json_str = db_state.get("v2_state_json", "{}") if db_state else "{}"
-        try:
-            v2_data = json.loads(v2_json_str) if v2_json_str else {}
-        except json.JSONDecodeError:
-            v2_data = {}
+        db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
 
-        state = ChannelFeeState.from_v2_dict(v2_data, db_state or {})
+        state = ChannelFeeState.from_v2_dict(
+            self._extract_fee_state_payload(db_state, v2_data),
+            db_state or {},
+        )
         self._channel_fee_states[channel_id] = state
         return state
 
@@ -2377,7 +2548,7 @@ class FeeController:
         
         Criteria:
         1. Feature is enabled
-        2. 24+ hours since last fee broadcast (last_update)
+        2. 24+ hours since last successful fee broadcast
         3. 24+ hours since last forward (channel is idle)
         4. 24+ hours since last gossip refresh (cooldown)
         
@@ -2389,10 +2560,13 @@ class FeeController:
         Returns:
             True if gossip refresh should be forced
         """
+        if not self.ENABLE_GOSSIP_REFRESH:
+            return False
         
         # Check 1: Time since last broadcast
-        if state.last_update > 0:
-            hours_since_broadcast = (current_time - state.last_update) / 3600
+        last_broadcast_at = getattr(state, "last_broadcast_at", 0) or 0
+        if last_broadcast_at > 0:
+            hours_since_broadcast = (current_time - last_broadcast_at) / 3600
             if hours_since_broadcast < self.GOSSIP_REFRESH_MIN_BROADCAST_AGE_HOURS:
                 return False
         else:
@@ -2457,7 +2631,8 @@ class FeeController:
             return None
         
         # Calculate diagnostic info for logging
-        hours_since_broadcast = (current_time - state.last_update) / 3600 if state.last_update > 0 else 999
+        last_broadcast_at = getattr(state, "last_broadcast_at", 0) or 0
+        hours_since_broadcast = (current_time - last_broadcast_at) / 3600 if last_broadcast_at > 0 else 999
         
         last_forward_ts = self.database.get_last_forward_time(channel_id)
         if last_forward_ts and last_forward_ts > 0:
@@ -2487,6 +2662,7 @@ class FeeController:
         state.last_gossip_refresh = current_time
         state.last_fee_ppm = nudge_fee
         state.last_broadcast_fee_ppm = nudge_fee
+        state.last_broadcast_at = current_time
         state.last_update = current_time
         state.last_state = FeeReasonCode.GOSSIP_REFRESH.value
 
@@ -2501,6 +2677,7 @@ class FeeController:
             ts_state.last_gossip_refresh = current_time
             ts_state.last_fee_ppm = nudge_fee
             ts_state.last_broadcast_fee_ppm = nudge_fee
+            ts_state.last_broadcast_at = current_time
             ts_state.last_update = current_time
             ts_state.last_state = FeeReasonCode.GOSSIP_REFRESH.value
             self._save_channel_fee_state(channel_id, ts_state)
@@ -3323,8 +3500,9 @@ class FeeController:
 
         if not significant_change and not htlcmin_policy_change:
             # =========================================================================
-            # GOSSIP REFRESH CHECK: Must run BEFORE last_update reset so we can
-            # detect 24h+ staleness. After reset, last_update=now defeats the check.
+            # GOSSIP REFRESH CHECK
+            # Broadcast staleness uses last_broadcast_at, so observation-cursor
+            # resets below do not mask refresh eligibility.
             # =========================================================================
             if self._should_force_gossip_refresh(channel_id, cycle, now):
                 return self._create_gossip_refresh_adjustment(
@@ -3478,6 +3656,7 @@ class FeeController:
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = current_fee_ppm
             cycle.last_broadcast_fee_ppm = new_fee_ppm
+            cycle.last_broadcast_at = now
             cycle.last_state = decision_reason
             cycle.trend_direction = new_direction
             cycle.step_ppm = step_ppm
@@ -3490,6 +3669,7 @@ class FeeController:
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = current_fee_ppm
                 ts_state.last_broadcast_fee_ppm = new_fee_ppm
+                ts_state.last_broadcast_at = now
                 ts_state.last_state = decision_reason
                 ts_state.last_update = now
                 self._save_channel_fee_state(channel_id, ts_state)
@@ -3711,6 +3891,7 @@ class FeeController:
                         cycle.stable_cycles = 0
                         cycle.last_fee_ppm = fee_ppm
                         cycle.last_broadcast_fee_ppm = fee_ppm
+                        cycle.last_broadcast_at = now
                         cycle.last_update = now
                         cycle.last_state = reason_code or "manual"
                         self._save_cycle_state(channel_id, cycle)
@@ -3724,6 +3905,7 @@ class FeeController:
                         ts_state.stable_cycles = 0
                         ts_state.last_fee_ppm = fee_ppm
                         ts_state.last_broadcast_fee_ppm = fee_ppm
+                        ts_state.last_broadcast_at = now
                         ts_state.last_update = now
                         ts_state.last_state = reason_code or "manual"
                         self._save_channel_fee_state(channel_id, ts_state)
@@ -4059,8 +4241,6 @@ class FeeController:
             actual_fee_ppm: Optional actual fee from chain - if provided and there's
                            a large mismatch with tracked fee, will resync (Issue #32)
         """
-        import json
-
         if channel_id in self._cycle_states:
             cached_state = self._cycle_states[channel_id]
             # Issue #32: Check for desync even on cached state
@@ -4076,33 +4256,26 @@ class FeeController:
                     self._save_cycle_state(channel_id, cached_state)
             return cached_state
 
-        # Load from database (uses the fee_strategy_state table)
-        db_state = self.database.get_fee_strategy_state(channel_id)
-
-        # Parse v2.0 JSON state
-        v2_json_str = db_state.get("v2_state_json", "{}")
-        try:
-            v2_data = json.loads(v2_json_str) if v2_json_str else {}
-        except json.JSONDecodeError:
-            v2_data = {}
+        db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
+        cycle_data = self._extract_cycle_state_payload(db_state, v2_data)
 
         cycle = ChannelCycleState(
-            last_revenue_rate=db_state.get("last_revenue_rate", 0.0),
-            last_fee_ppm=db_state.get("last_fee_ppm", 0),
-            trend_direction=db_state.get("trend_direction", 1),
-            step_ppm=db_state.get("step_ppm", 50),
-            last_update=db_state.get("last_update", 0),
-            consecutive_same_direction=db_state.get("consecutive_same_direction", 0),
-            is_sleeping=bool(db_state.get("is_sleeping", 0)),
-            sleep_until=db_state.get("sleep_until", 0),
-            stable_cycles=db_state.get("stable_cycles", 0),
-            last_broadcast_fee_ppm=db_state.get("last_broadcast_fee_ppm", 0),
-            last_state=db_state.get("last_state", "balanced"),
-            # v2.0 fields
-            forward_count_since_update=db_state.get("forward_count_since_update", 0),
-            last_volume_sats=db_state.get("last_volume_sats", 0),
-            last_gossip_refresh=v2_data.get("last_gossip_refresh", 0),
-            dynamic_htlcmin_baseline_msat=v2_data.get("dynamic_htlcmin_baseline_msat"),
+            last_revenue_rate=cycle_data.get("last_revenue_rate", 0.0),
+            last_fee_ppm=cycle_data.get("last_fee_ppm", 0),
+            trend_direction=cycle_data.get("trend_direction", 1),
+            step_ppm=cycle_data.get("step_ppm", 50),
+            last_update=cycle_data.get("last_update", 0),
+            last_broadcast_at=cycle_data.get("last_broadcast_at", cycle_data.get("last_update", 0)),
+            consecutive_same_direction=cycle_data.get("consecutive_same_direction", 0),
+            is_sleeping=bool(cycle_data.get("is_sleeping", 0)),
+            sleep_until=cycle_data.get("sleep_until", 0),
+            stable_cycles=cycle_data.get("stable_cycles", 0),
+            last_broadcast_fee_ppm=cycle_data.get("last_broadcast_fee_ppm", 0),
+            last_state=cycle_data.get("last_state", "balanced"),
+            forward_count_since_update=cycle_data.get("forward_count_since_update", 0),
+            last_volume_sats=cycle_data.get("last_volume_sats", 0),
+            last_gossip_refresh=cycle_data.get("last_gossip_refresh", 0),
+            dynamic_htlcmin_baseline_msat=cycle_data.get("dynamic_htlcmin_baseline_msat"),
         )
 
         # Issue #32: Check for desync when loading from database
@@ -4120,36 +4293,32 @@ class FeeController:
         return cycle
 
     def _save_cycle_state(self, channel_id: str, state: ChannelCycleState):
-        """Save cycle state to cache and database (including v2.0 fields)."""
-        import json
+        """Save cycle state without overwriting the channel's DTS/PID payload."""
 
         self._cycle_states[channel_id] = state
 
-        # Serialize v2.0 state to JSON
-        v2_data = {
-            "algorithm_version": "dts_pid_v1",
-            "last_gossip_refresh": state.last_gossip_refresh,
-            "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
-        }
+        row_fields, v2_data = self._build_merged_fee_strategy_row(
+            channel_id,
+            cycle_state=state,
+        )
         v2_json_str = json.dumps(v2_data)
 
         self.database.update_fee_strategy_state(
             channel_id=channel_id,
-            last_revenue_rate=state.last_revenue_rate,
-            last_fee_ppm=state.last_fee_ppm,
-            trend_direction=state.trend_direction,
-            step_ppm=state.step_ppm,
-            consecutive_same_direction=state.consecutive_same_direction,
-            last_broadcast_fee_ppm=state.last_broadcast_fee_ppm,
-            last_state=state.last_state,
-            is_sleeping=1 if state.is_sleeping else 0,
-            sleep_until=state.sleep_until,
-            stable_cycles=state.stable_cycles,
-            # v2.0 fields
-            forward_count_since_update=state.forward_count_since_update,
-            last_volume_sats=state.last_volume_sats,
+            last_revenue_rate=row_fields["last_revenue_rate"],
+            last_fee_ppm=row_fields["last_fee_ppm"],
+            trend_direction=row_fields["trend_direction"],
+            step_ppm=row_fields["step_ppm"],
+            consecutive_same_direction=row_fields["consecutive_same_direction"],
+            last_broadcast_fee_ppm=row_fields["last_broadcast_fee_ppm"],
+            last_state=row_fields["last_state"],
+            is_sleeping=row_fields["is_sleeping"],
+            sleep_until=row_fields["sleep_until"],
+            stable_cycles=row_fields["stable_cycles"],
+            forward_count_since_update=row_fields["forward_count_since_update"],
+            last_volume_sats=row_fields["last_volume_sats"],
             v2_state_json=v2_json_str,
-            last_update=state.last_update
+            last_update=row_fields["last_update"],
         )
     
     # =========================================================================
