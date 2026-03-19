@@ -1073,3 +1073,128 @@ class TestB7PartialFeeSpendOnFailure:
 
         mock_database.mark_budget_spent.assert_called_once_with("44", 8)
         mock_database.release_budget_reservation.assert_not_called()
+
+
+# ============================================================================
+# B8: Sentinel cleanup deletes all sentinels (no age check)
+# ============================================================================
+
+
+class TestTimestampedSentinels:
+    """B8: Sentinels should use timestamps, fresh ones should survive monitor_jobs."""
+
+    def test_fresh_sentinel_not_cleaned(self, mock_plugin, mock_database):
+        """A sentinel placed moments ago (fresh timestamp) must survive monitor_jobs."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+
+        # Insert a *fresh* timestamp sentinel (just now)
+        with jm._jobs_lock:
+            jm._active_jobs["111x222x0"] = time.time()
+
+        # Mock sling-stats (no jobs to report)
+        mock_plugin.rpc.call.return_value = {"stats": {}}
+        mock_plugin.rpc.listfunds.return_value = {"channels": []}
+
+        jm._handle_job_failure = MagicMock()
+        jm._handle_job_timeout = MagicMock()
+        jm._handle_job_success = MagicMock()
+
+        jm.monitor_jobs()
+
+        # Fresh sentinel must NOT be cleaned up
+        with jm._jobs_lock:
+            assert "111x222x0" in jm._active_jobs, \
+                "Fresh sentinel was incorrectly cleaned up by monitor_jobs"
+
+    def test_stale_sentinel_cleaned(self, mock_plugin, mock_database):
+        """A sentinel older than sentinel_timeout (300s) must be cleaned up."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+
+        # Insert a *stale* timestamp sentinel (10 minutes old)
+        with jm._jobs_lock:
+            jm._active_jobs["111x222x0"] = time.time() - 600
+
+        # Mock sling-stats (no jobs to report)
+        mock_plugin.rpc.call.return_value = {"stats": {}}
+        mock_plugin.rpc.listfunds.return_value = {"channels": []}
+
+        jm._handle_job_failure = MagicMock()
+        jm._handle_job_timeout = MagicMock()
+        jm._handle_job_success = MagicMock()
+
+        jm.monitor_jobs()
+
+        # Stale sentinel MUST be cleaned up
+        with jm._jobs_lock:
+            assert "111x222x0" not in jm._active_jobs, \
+                "Stale sentinel was not cleaned up by monitor_jobs"
+
+
+# ============================================================================
+# B9: sync_peer_exclusions only adds, never removes
+# ============================================================================
+
+
+class TestPeerExclusionRemoval:
+    """B9: sync_peer_exclusions must remove exclusions for re-enabled peers."""
+
+    def test_stale_exclusion_removed_for_reenabled_peer(self, mock_plugin, mock_database):
+        """When a peer is no longer disabled, its sling exclusion should be removed."""
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+
+        # Two peers currently excluded in sling
+        peer_still_disabled = "02" + "a" * 64
+        peer_reenabled = "02" + "b" * 64
+
+        # Mock sling-except-peer list to return both peers
+        def rpc_side_effect(method, args=None):
+            if method == "sling-except-peer":
+                if args and args[0] == "list":
+                    return [peer_still_disabled, peer_reenabled]
+                return {}
+            return {"stats": {}}
+
+        mock_plugin.rpc.call.side_effect = rpc_side_effect
+
+        # Policy manager only has one peer disabled
+        mock_policy_manager = MagicMock()
+        mock_policy = MagicMock()
+        mock_policy.peer_id = peer_still_disabled
+
+        from modules.policy_manager import RebalanceMode
+        mock_policy.rebalance_mode = RebalanceMode.DISABLED
+
+        mock_policy_manager.get_all_policies.return_value = [mock_policy]
+
+        jm.sync_peer_exclusions(mock_policy_manager)
+
+        # Assert that "remove" was called for the re-enabled peer
+        remove_calls = [
+            c for c in mock_plugin.rpc.call.call_args_list
+            if c[0] == ("sling-except-peer",) and c[1].get("args", c[0][1] if len(c[0]) > 1 else None) is not None
+        ]
+        # Find the remove call specifically
+        found_remove = False
+        for c in mock_plugin.rpc.call.call_args_list:
+            args_positional = c[0]
+            if len(args_positional) >= 2 and args_positional[0] == "sling-except-peer":
+                if isinstance(args_positional[1], list) and len(args_positional[1]) >= 2:
+                    if args_positional[1][0] == "remove" and args_positional[1][1] == peer_reenabled:
+                        found_remove = True
+
+        assert found_remove, (
+            f"Expected sling-except-peer remove call for {peer_reenabled[:16]}..., "
+            f"but got calls: {mock_plugin.rpc.call.call_args_list}"
+        )

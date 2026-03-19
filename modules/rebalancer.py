@@ -393,8 +393,8 @@ class JobManager:
                 return {"success": False, "error": "Job already exists for this channel"}
             if len(self._active_jobs) >= self.max_concurrent_jobs:
                 return {"success": False, "error": "No job slots available"}
-            # Reserve slot with sentinel (None) immediately
-            self._active_jobs[normalized_scid] = None
+            # Reserve slot with sentinel timestamp immediately
+            self._active_jobs[normalized_scid] = time.time()
 
         # Convert SCIDs to sling format (x-separated, e.g., 930866x2599x2)
         to_scid = self._to_sling_scid(candidate.to_channel)
@@ -693,22 +693,22 @@ class JobManager:
         # C-2 FIX: Also clean up stale sentinel entries (None values) from stuck start_job calls.
         # If a sling RPC hangs during start_job, the sentinel blocks the slot indefinitely.
         sentinel_timeout = 300  # 5 minutes
+        now_sentinel = time.time()
         with self._jobs_lock:
             stale_sentinels = [
                 k for k, v in self._active_jobs.items()
-                if v is None
+                if not isinstance(v, ActiveJob) and (
+                    v is None or  # Legacy None sentinels (always stale)
+                    (isinstance(v, (int, float)) and now_sentinel - v > sentinel_timeout)
+                )
             ]
-            # We can't track sentinel creation time (it's just None), so clean up
-            # any sentinels found during monitoring — if start_job is still working,
-            # it will re-add the job. This is safe because start_job checks for
-            # existing entries before inserting.
             for k in stale_sentinels:
                 del self._active_jobs[k]
                 self.plugin.log(
                     f"Cleaned up stale sentinel for {k} (stuck start_job?)",
                     level='info'
                 )
-            jobs_snapshot = {k: v for k, v in self._active_jobs.items() if v is not None}
+            jobs_snapshot = {k: v for k, v in self._active_jobs.items() if isinstance(v, ActiveJob)}
 
         if not jobs_snapshot:
             return summary
@@ -963,7 +963,7 @@ class JobManager:
         # M-1: Use provided snapshot or take one under lock
         if jobs_snapshot is None:
             with self._jobs_lock:
-                jobs_snapshot = {k: v for k, v in self._active_jobs.items() if v is not None}
+                jobs_snapshot = {k: v for k, v in self._active_jobs.items() if isinstance(v, ActiveJob)}
 
         # Per-job detailed stats (preferred — returns known schema)
         for normalized_scid, job in jobs_snapshot.items():
@@ -1265,7 +1265,7 @@ class JobManager:
         """Stop all active jobs and release their budget reservations. Returns count of jobs stopped."""
         count = 0
         with self._jobs_lock:
-            jobs_snapshot = [(k, v) for k, v in self._active_jobs.items() if v is not None]
+            jobs_snapshot = [(k, v) for k, v in self._active_jobs.items() if isinstance(v, ActiveJob)]
         for scid, job in jobs_snapshot:
             # I-10 FIX: Stop the job FIRST, then release budget. Releasing before
             # stop means if sling-stop fails, the budget is freed but the job
@@ -1630,6 +1630,18 @@ class JobManager:
                         )
                     except RpcError as e:
                         self.plugin.log(f"Failed to add peer exclusion: {e}", level='warn')
+
+            # B9 FIX: Remove stale exclusions for re-enabled peers
+            for peer_id in current_exclusions:
+                if peer_id not in peers_to_exclude:
+                    try:
+                        self.plugin.rpc.call("sling-except-peer", ["remove", peer_id])
+                        self.plugin.log(
+                            f"Sling Exclusion: Removed {peer_id[:16]}... (peer re-enabled)",
+                            level='debug'
+                        )
+                    except RpcError as e:
+                        self.plugin.log(f"Failed to remove peer exclusion: {e}", level='warn')
 
             if excluded_count > 0:
                 self.plugin.log(
