@@ -40,7 +40,7 @@ Post-DTS+PID:
 
 Revenue Calculation:
 - Revenue = Volume x Fee
-- Revenue rate tracked over observation windows with EMA smoothing
+- Revenue rate tracked over observation windows
 - Demand-adjusted via Kalman flow estimation
 """
 
@@ -1165,7 +1165,6 @@ class ChannelFeeState:
 
     # Revenue and fee tracking
     last_revenue_rate: float = 0.0      # Raw revenue rate
-    ema_revenue_rate: Optional[float] = None  # EMA-smoothed revenue rate
     last_fee_ppm: int = 0               # Last fee we set
     last_broadcast_fee_ppm: int = 0     # Last fee broadcasted to network
     last_update: int = 0                # Timestamp of last update
@@ -1196,26 +1195,6 @@ class ChannelFeeState:
     dynamic_htlcmin_baseline_msat: Optional[int] = None
 
 
-    def update_ema_revenue_rate(self, current_rate: float, alpha: float = 0.3) -> float:
-        """
-        Update EMA-smoothed revenue rate.
-
-        Args:
-            current_rate: Current raw revenue rate (sats/hour)
-            alpha: Smoothing factor (0.1=slow, 0.5=fast)
-
-        Returns:
-            Updated EMA revenue rate
-        """
-        if self.ema_revenue_rate is None:
-            self.ema_revenue_rate = current_rate
-        else:
-            self.ema_revenue_rate = (
-                alpha * current_rate +
-                (1 - alpha) * self.ema_revenue_rate
-            )
-        return self.ema_revenue_rate
-
     def to_v2_dict(self) -> Dict[str, Any]:
         """
         Serialize to v2 JSON format for database storage.
@@ -1226,7 +1205,6 @@ class ChannelFeeState:
         return {
             "algorithm_version": self.algorithm_version,
             "thompson_state": self.thompson.to_dict(),
-            "ema_revenue_rate": self.ema_revenue_rate,
             # Vegas-DTS interaction
             "last_vegas_multiplier": self.last_vegas_multiplier,
             # F-R6-1 FIX: Persist gossip refresh cooldown so it survives restarts
@@ -1263,8 +1241,6 @@ class ChannelFeeState:
             state.thompson = GaussianThompsonState()
 
         # Load common fields
-        ema_val = d.get("ema_revenue_rate")
-        state.ema_revenue_rate = ema_val if ema_val is not None else None
         state.algorithm_version = d.get("algorithm_version", "migrated")
         # Vegas-DTS interaction (default 1.0 for backward compat)
         state.last_vegas_multiplier = d.get("last_vegas_multiplier", 1.0)
@@ -1314,8 +1290,7 @@ class ChannelCycleState:
         forward_count_since_update: Forwards since last fee change (dynamic window)
         last_volume_sats: Volume in sats during last observation period
     """
-    last_revenue_rate: float = 0.0  # Revenue rate in sats/hour (raw, unsmoothed)
-    ema_revenue_rate: Optional[float] = None  # Issue #28: EMA-smoothed revenue rate
+    last_revenue_rate: float = 0.0  # Revenue rate in sats/hour
     last_fee_ppm: int = 0
     trend_direction: int = 1  # 1 = try increasing fee, -1 = try decreasing
     step_ppm: int = 50  # Current step size (decays on reversal)
@@ -1336,32 +1311,6 @@ class ChannelCycleState:
     # Restore target for temporary dynamic HTLC minimum defenses
     dynamic_htlcmin_baseline_msat: Optional[int] = None
 
-    def update_ema_revenue_rate(self, current_rate: float, alpha: float = 0.3) -> float:
-        """
-        Update EMA-smoothed revenue rate (Issue #28).
-
-        EMA formula: new_ema = alpha * current + (1 - alpha) * old_ema
-
-        This smooths out payment timing noise that causes erratic fee adjustments
-        when the observation window is short (< 1 hour).
-
-        Args:
-            current_rate: Current raw revenue rate (sats/hour)
-            alpha: Smoothing factor (0.1=slow, 0.5=fast). Default 0.3.
-
-        Returns:
-            The updated EMA revenue rate
-        """
-        if self.ema_revenue_rate is None:
-            # First observation - seed with raw value
-            self.ema_revenue_rate = current_rate
-        else:
-            # EMA update: weight current vs historical
-            self.ema_revenue_rate = (
-                alpha * current_rate +
-                (1 - alpha) * self.ema_revenue_rate
-            )
-        return self.ema_revenue_rate
 
 
 @dataclass
@@ -2761,14 +2710,9 @@ class FeeController:
         revenue_sats = (volume_since_sats * raw_chain_fee) / 1_000_000
         raw_revenue_rate = revenue_sats / hours_elapsed if hours_elapsed > 0 else 0.0
 
-        # Issue #28: Apply EMA smoothing to reduce fee volatility
-        # EMA smooths out payment timing noise when observation window is short
-        smoothed_revenue_rate = cycle.update_ema_revenue_rate(
-            raw_revenue_rate,
-            alpha=cfg.ema_smoothing_alpha
-        )
-        # Use smoothed rate for decisions, log both for debugging
-        current_revenue_rate = smoothed_revenue_rate
+        # DTS posterior variance already handles observation noise —
+        # no additional EMA smoothing needed.
+        current_revenue_rate = raw_revenue_rate
 
         # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity") or 2_000_000
@@ -3256,8 +3200,6 @@ class FeeController:
         direction_label = "up" if new_direction > 0 else "down"
         base_fee_note = f", base={int(base_new_fee)}ppm" if base_new_fee is not None else ""
         mult_note = f", mult=liq{liquidity_multiplier:.2f}*prof{profitability_multiplier:.2f}"
-        # Issue #28: Log both raw and EMA-smoothed rates for debugging
-        ema_note = f" (raw={raw_revenue_rate:.2f})" if raw_revenue_rate != current_revenue_rate else ""
 
         # Build reason string for DTS+PID
         ts_state_local = self._channel_fee_states.get(channel_id)
@@ -3269,7 +3211,7 @@ class FeeController:
         else:
             dts_info = "state_unavailable"
         reason = (
-            f"DTS+PID: rate={current_revenue_rate:.2f}sats/hr{ema_note} ({decision_reason}){volatility_note}, "
+            f"DTS+PID: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}){volatility_note}, "
             f"{dts_info}, applied={applied_dir}({applied_delta:+d}ppm), "
             f"state={flow_state}, liquidity={bucket} ({outbound_ratio:.0%}), "
             f"{marginal_roi_info}"
@@ -3923,7 +3865,6 @@ class FeeController:
 
         cycle = ChannelCycleState(
             last_revenue_rate=db_state.get("last_revenue_rate", 0.0),
-            ema_revenue_rate=v2_data.get("ema_revenue_rate"),  # Issue #28: None if absent, preserves 0.0
             last_fee_ppm=db_state.get("last_fee_ppm", 0),
             trend_direction=db_state.get("trend_direction", 1),
             step_ppm=db_state.get("step_ppm", 50),
@@ -3963,7 +3904,6 @@ class FeeController:
         # Serialize v2.0 state to JSON
         v2_data = {
             "algorithm_version": "dts_pid_v1",
-            "ema_revenue_rate": state.ema_revenue_rate,  # Issue #28
             "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
         }
         v2_json_str = json.dumps(v2_data)

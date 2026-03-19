@@ -196,7 +196,6 @@ def _make_config_snapshot(**overrides):
     defaults = {
         "min_fee_ppm": 10,
         "max_fee_ppm": 5000,
-        "ema_smoothing_alpha": 0.3,
         "fee_interval": 1800,
         "inbound_fee_estimate_ppm": 200,
         "thompson_prior_std_fee": 200.0,
