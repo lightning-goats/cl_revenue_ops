@@ -57,7 +57,7 @@ import math
 import json
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Any, Tuple, Union, TYPE_CHECKING
+from typing import Callable, ClassVar, Dict, List, Optional, Any, Set, Tuple, Union, TYPE_CHECKING
 from enum import Enum
 
 from pyln.client import Plugin, RpcError
@@ -1192,6 +1192,38 @@ class ChannelFeeState:
     # Restore target for temporary dynamic HTLC minimum defenses
     dynamic_htlcmin_baseline_msat: Optional[int] = None
 
+    _shared_fields: ClassVar[Tuple[str, ...]] = (
+        "last_gossip_refresh",
+        "last_broadcast_at",
+        "dynamic_htlcmin_baseline_msat",
+    )
+    _explicit_shared_fields: Set[str] = field(default_factory=set, init=False, repr=False)
+    _track_shared_field_assignments: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.last_gossip_refresh != 0:
+            self._explicit_shared_fields.add("last_gossip_refresh")
+        if self.last_broadcast_at != 0:
+            self._explicit_shared_fields.add("last_broadcast_at")
+        if self.dynamic_htlcmin_baseline_msat is not None:
+            self._explicit_shared_fields.add("dynamic_htlcmin_baseline_msat")
+        self._track_shared_field_assignments = True
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        if (
+            name in self._shared_fields
+            and getattr(self, "_track_shared_field_assignments", False)
+        ):
+            self._explicit_shared_fields.add(name)
+
+    def explicit_shared_fields(self) -> Set[str]:
+        """Return shared fields explicitly set by the caller since load/save."""
+        return set(self._explicit_shared_fields)
+
+    def clear_explicit_shared_fields(self) -> None:
+        """Clear shared-field override tracking after load or successful save."""
+        self._explicit_shared_fields.clear()
 
     def to_v2_dict(self) -> Dict[str, Any]:
         """
@@ -1266,6 +1298,7 @@ class ChannelFeeState:
             state.forward_count_since_update = legacy_state.get("forward_count_since_update", 0)
             state.last_volume_sats = legacy_state.get("last_volume_sats", 0)
 
+        state.clear_explicit_shared_fields()
         return state
 
 
@@ -1314,6 +1347,38 @@ class ChannelCycleState:
     # Restore target for temporary dynamic HTLC minimum defenses
     dynamic_htlcmin_baseline_msat: Optional[int] = None
 
+    _shared_fields: ClassVar[Tuple[str, ...]] = (
+        "last_gossip_refresh",
+        "last_broadcast_at",
+        "dynamic_htlcmin_baseline_msat",
+    )
+    _explicit_shared_fields: Set[str] = field(default_factory=set, init=False, repr=False)
+    _track_shared_field_assignments: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.last_gossip_refresh != 0:
+            self._explicit_shared_fields.add("last_gossip_refresh")
+        if self.last_broadcast_at != 0:
+            self._explicit_shared_fields.add("last_broadcast_at")
+        if self.dynamic_htlcmin_baseline_msat is not None:
+            self._explicit_shared_fields.add("dynamic_htlcmin_baseline_msat")
+        self._track_shared_field_assignments = True
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        if (
+            name in self._shared_fields
+            and getattr(self, "_track_shared_field_assignments", False)
+        ):
+            self._explicit_shared_fields.add(name)
+
+    def explicit_shared_fields(self) -> Set[str]:
+        """Return shared fields explicitly set by the caller since load/save."""
+        return set(self._explicit_shared_fields)
+
+    def clear_explicit_shared_fields(self) -> None:
+        """Clear shared-field override tracking after load or successful save."""
+        self._explicit_shared_fields.clear()
 
 
 @dataclass
@@ -1789,10 +1854,9 @@ class FeeController:
         so save order never destroys the other side of the controller.
 
         Shared fields that live in both payloads are caller-authoritative when
-        the caller provides a meaningful value. Unset/default shared-field
-        values (0 for timestamps, None for optional baselines) fall back to the
-        cached or persisted counterpart state so a partial save cannot erase
-        fresher shared state.
+        the caller explicitly set them. This preserves intentional clears and
+        timestamp resets while still letting untouched shared fields fall back
+        to the cached or persisted counterpart state.
         """
         db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
         cycle_source = cycle_state or self._cycle_states.get(channel_id)
@@ -1812,30 +1876,18 @@ class FeeController:
         caller_preference: Tuple[str, str]
         if fee_state is not None and cycle_state is None:
             caller_preference = ("fee", "cycle")
+            explicit_shared_fields = fee_state.explicit_shared_fields()
         else:
             caller_preference = ("cycle", "fee")
+            explicit_shared_fields = cycle_state.explicit_shared_fields() if cycle_state is not None else set()
 
         def _resolve_shared_field(key: str, persisted_default: Any) -> Any:
             primary_source = fee_payload if caller_preference[0] == "fee" else cycle_payload
             secondary_source = cycle_payload if caller_preference[1] == "cycle" else fee_payload
-            unset_value = None
-            if key in ("last_gossip_refresh", "last_broadcast_at"):
-                unset_value = 0
-
-            def _value_from(source: Dict[str, Any]) -> Tuple[bool, Any]:
-                if key not in source:
-                    return False, None
-                value = source[key]
-                if unset_value is not None and value == unset_value:
-                    return False, value
-                if unset_value is None and value is None:
-                    return False, value
-                return True, value
-
-            for source in (primary_source, secondary_source):
-                has_value, value = _value_from(source)
-                if has_value:
-                    return value
+            if key in explicit_shared_fields and key in primary_source:
+                return primary_source[key]
+            if key in secondary_source:
+                return secondary_source[key]
             return persisted_default
 
         canonical_last_gossip_refresh = _resolve_shared_field("last_gossip_refresh", 0)
@@ -1988,6 +2040,7 @@ class FeeController:
             v2_state_json=v2_json_str,
             last_update=row_fields["last_update"],
         )
+        state.clear_explicit_shared_fields()
 
     def _get_or_create_channel_fee_state(self, channel_id: str) -> ChannelFeeState:
         """Return cached channel fee state or a minimal persisted state shell."""
@@ -4309,6 +4362,7 @@ class FeeController:
             last_gossip_refresh=cycle_data.get("last_gossip_refresh", 0),
             dynamic_htlcmin_baseline_msat=cycle_data.get("dynamic_htlcmin_baseline_msat"),
         )
+        cycle.clear_explicit_shared_fields()
 
         # Issue #32: Check for desync when loading from database
         if actual_fee_ppm is not None and actual_fee_ppm > 0:
@@ -4352,6 +4406,7 @@ class FeeController:
             v2_state_json=v2_json_str,
             last_update=row_fields["last_update"],
         )
+        state.clear_explicit_shared_fields()
     
     # =========================================================================
     # Heuristic Helper Methods

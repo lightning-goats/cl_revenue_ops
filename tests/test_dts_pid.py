@@ -581,6 +581,89 @@ class TestCycleStatePersistence:
         assert restored_fee.last_broadcast_at == 950
         assert restored_fee.dynamic_htlcmin_baseline_msat == 9900
 
+    def test_explicit_clear_of_dynamic_htlcmin_baseline_persists_null(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "f" * 64
+        row = self._install_persistent_row(mock_database, channel_id)
+
+        cycle_state = ChannelCycleState(dynamic_htlcmin_baseline_msat=12345)
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        fee_state = ChannelFeeState()
+        fee_state.dynamic_htlcmin_baseline_msat = None
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["dynamic_htlcmin_baseline_msat"] is None
+        assert persisted_v2["fee_state"]["dynamic_htlcmin_baseline_msat"] is None
+        assert persisted_v2["cycle_state"]["dynamic_htlcmin_baseline_msat"] is None
+
+        fc._cycle_states.clear()
+        fc._channel_fee_states.clear()
+        restored_cycle = fc._get_cycle_state(channel_id, actual_fee_ppm=0)
+        restored_fee = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=0)
+        assert restored_cycle.dynamic_htlcmin_baseline_msat is None
+        assert restored_fee.dynamic_htlcmin_baseline_msat is None
+
+    def test_explicit_reset_of_last_gossip_refresh_to_zero_persists(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "1" * 64
+        row = self._install_persistent_row(mock_database, channel_id)
+
+        fee_state = ChannelFeeState()
+        fee_state.last_gossip_refresh = 4321
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        cycle_state = ChannelCycleState()
+        cycle_state.last_gossip_refresh = 0
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_gossip_refresh"] == 0
+        assert persisted_v2["fee_state"]["last_gossip_refresh"] == 0
+        assert persisted_v2["cycle_state"]["last_gossip_refresh"] == 0
+
+        fc._cycle_states.clear()
+        fc._channel_fee_states.clear()
+        restored_cycle = fc._get_cycle_state(channel_id, actual_fee_ppm=0)
+        restored_fee = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=0)
+        assert restored_cycle.last_gossip_refresh == 0
+        assert restored_fee.last_gossip_refresh == 0
+
+    def test_explicit_reset_of_last_broadcast_at_to_zero_persists(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        peer_id = "02" + "0" * 64
+        row = self._install_persistent_row(mock_database, channel_id)
+
+        cycle_state = ChannelCycleState()
+        cycle_state.last_broadcast_at = 9999
+        fc._save_cycle_state(channel_id, cycle_state)
+
+        fee_state = ChannelFeeState()
+        fee_state.last_broadcast_at = 0
+        fc._save_channel_fee_state(channel_id, fee_state)
+
+        persisted_v2 = json.loads(row["v2_state_json"])
+        assert persisted_v2["last_broadcast_at"] == 0
+        assert persisted_v2["fee_state"]["last_broadcast_at"] == 0
+        assert persisted_v2["cycle_state"]["last_broadcast_at"] == 0
+
+        fc._cycle_states.clear()
+        fc._channel_fee_states.clear()
+        restored_cycle = fc._get_cycle_state(channel_id, actual_fee_ppm=0)
+        restored_fee = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=0)
+        assert restored_cycle.last_broadcast_at == 0
+        assert restored_fee.last_broadcast_at == 0
+
     def test_restart_round_trip_preserves_cycle_and_dts_state(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         channel_id = "123x456x0"
