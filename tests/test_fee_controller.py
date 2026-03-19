@@ -767,26 +767,6 @@ class TestAuditRound8Regressions:
         assert info["spendable_msat"] == 500_000_000
         assert info["receivable_msat"] == 500_000_000
 
-    # --- P2-5: NaN guard on uptime ---
-
-    def test_uptime_nan_guard(self, mock_database, mock_plugin):
-        """NaN uptime percentage should be treated as 100% (no penalty)."""
-        import math
-        fc = self._make_fc(mock_plugin, mock_database)
-
-        # If get_peer_uptime_percent returns NaN, the NaN guard should prevent
-        # it from corrupting the volume calculation
-        nan_val = float('nan')
-        assert math.isnan(nan_val)
-
-        # The guard: if not isinstance or isnan -> default to 100
-        uptime_pct = nan_val
-        if not isinstance(uptime_pct, (int, float)) or math.isnan(uptime_pct):
-            uptime_pct = 100.0
-        uptime_factor = max(0.0, min(1.0, uptime_pct / 100.0))
-
-        assert uptime_factor == 1.0, f"NaN uptime should default to 1.0, got {uptime_factor}"
-
 
 class TestCalculateFloorOpener:
     """Tests for fee floor discount on remote-opened channels."""

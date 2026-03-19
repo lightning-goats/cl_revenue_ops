@@ -2657,10 +2657,7 @@ class FeeController:
             else:
                 # Still within sleep period - check for revenue spike that should wake us
                 # Calculate current revenue rate to detect significant changes
-                if cfg.enable_reputation:
-                    volume_since_sats = self.database.get_weighted_volume_since(channel_id, _sleep_last_update)
-                else:
-                    volume_since_sats = self.database.get_volume_since(channel_id, _sleep_last_update)
+                volume_since_sats = self.database.get_volume_since(channel_id, _sleep_last_update)
 
                 hours_elapsed = (now - _sleep_last_update) / 3600.0 if _sleep_last_update > 0 else 1.0
                 hours_elapsed = max(hours_elapsed, 0.1)  # Prevent division by zero
@@ -2701,53 +2698,9 @@ class FeeController:
                     )
                     return None
         
-        # PROFITABILITY SHIELD: Protect high-value peers from reputation penalties
-        # If a channel is highly profitable (ROI > 10%), we ignore its "reputation" score.
-        # This ensures we don't price-out "messy but rich" peers (high volume but occasional failures).
-        is_shielded = False
-        if self.profitability:
-            from .profitability_analyzer import ProfitabilityClass
-            prof_data = self.profitability.get_profitability(channel_id)
-            if prof_data and prof_data.classification == ProfitabilityClass.PROFITABLE:
-                is_shielded = True
-                self.plugin.log(
-                    f"PROFITABILITY SHIELD: Shielding profitable peer {peer_id[:12]}... "
-                    f"(ROI={prof_data.roi_percent:.1f}%) - Reputation penalty ignored.",
-                    level='info'
-                )
-
         # RATE-BASED FEEDBACK: Get volume SINCE LAST FEE CHANGE (not 7-day average)
         # This eliminates the lag from averaging that made the controller blind
-        #
-        # REPUTATION-WEIGHTED VOLUME: If enabled, discount volume by peer success rate
-        # This prevents spammy peers with high failure rates from influencing fees
-        # Effective Volume = Raw Volume * Peer_Success_Rate
-        #
-        # EXCEPTION: If channel is SHIELDED, we always use raw volume.
-        if cfg.enable_reputation and not is_shielded:
-            volume_since_sats = self.database.get_weighted_volume_since(channel_id, cycle.last_update)
-        else:
-            volume_since_sats = self.database.get_volume_since(channel_id, cycle.last_update)
-        
-        # FLAP PROTECTION: Penalize flapping peers' volume for revenue signal
-        # Peers with high disconnect rates have dampened revenue signals so we
-        # don't optimize fees based on unreliable traffic patterns.
-        # Formula: effective_volume = volume * (uptime_pct / 100)
-        # 
-        # NOTE: Shielded channels are NOT protected from Flap Protection.
-        # Unstable connections are bad regardless of profitability.
-        uptime_pct = self.database.get_peer_uptime_percent(peer_id, 86400)  # 24h window
-        if not isinstance(uptime_pct, (int, float)) or math.isnan(uptime_pct):
-            uptime_pct = 100.0
-        uptime_factor = max(0.0, min(1.0, uptime_pct / 100.0))  # Convert 0-100 to 0-1, clamp
-        if uptime_factor < 1.0:
-            original_volume = volume_since_sats
-            volume_since_sats = int(volume_since_sats * uptime_factor)
-            self.plugin.log(
-                f"FLAP PROTECTION: Dampening volume for {channel_id[:12]}... "
-                f"({original_volume} -> {volume_since_sats} sats, uptime={uptime_pct:.1f}%)",
-                level='debug'
-            )
+        volume_since_sats = self.database.get_volume_since(channel_id, cycle.last_update)
         
         # Calculate time elapsed since last update
         if cycle.last_update > 0:
@@ -2920,10 +2873,7 @@ class FeeController:
         # Priority 2: Zero-Fee Probe Logic (Jumpstarting)
         if not target_found and is_under_probe:
             # Calculate current revenue rate (reuse logic from rate calculation below)
-            if cfg.enable_reputation and not is_shielded:
-                v_since = self.database.get_weighted_volume_since(channel_id, cycle.last_update)
-            else:
-                v_since = self.database.get_volume_since(channel_id, cycle.last_update)
+            v_since = self.database.get_volume_since(channel_id, cycle.last_update)
             
             probe_forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
 

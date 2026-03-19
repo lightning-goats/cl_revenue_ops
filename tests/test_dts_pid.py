@@ -196,7 +196,6 @@ def _make_config_snapshot(**overrides):
     defaults = {
         "min_fee_ppm": 10,
         "max_fee_ppm": 5000,
-        "enable_reputation": False,
         "ema_smoothing_alpha": 0.3,
         "fee_interval": 1800,
         "inbound_fee_estimate_ppm": 200,
@@ -219,7 +218,6 @@ def _make_fc_for_dts_pid(mock_plugin, mock_database):
 
     mock_database.get_channel_probe.return_value = None
     mock_database.get_volume_since.return_value = 50_000
-    mock_database.get_weighted_volume_since.return_value = 50_000
     mock_database.get_forward_count_since.return_value = 10
     mock_database.get_peer_uptime_percent.return_value = 99.5
     mock_database.get_channel_state.return_value = {

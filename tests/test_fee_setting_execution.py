@@ -242,7 +242,7 @@ class TestZeroFeeProbeEndToEnd:
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
-        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False, enable_reputation=False)
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
 
         # set_channel_fee verifies with listpeerchannels after setchannel.
         fee_holder = {"fee": 100}
@@ -297,7 +297,7 @@ class TestZeroFeeProbeEndToEnd:
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
-        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False, enable_reputation=False)
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
 
         # Fee is currently 0 (probe already active), and we observed volume -> success.
         fee_holder = {"fee": 0}
