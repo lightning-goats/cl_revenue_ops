@@ -256,6 +256,50 @@ class TestPIDStatePersistence:
         assert ts.pid.ewma_error == 0.0
 
 
+class TestCycleStatePersistence:
+    """Tests for ChannelCycleState persistence through v2_state_json."""
+
+    def test_cycle_state_round_trips_last_gossip_refresh(self, mock_plugin, mock_database):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id = "123x456x0"
+        now = int(time.time())
+        persisted = {}
+
+        def capture_update(**kwargs):
+            persisted.clear()
+            persisted.update(kwargs)
+
+        mock_database.update_fee_strategy_state.side_effect = capture_update
+
+        state = ChannelCycleState(
+            last_revenue_rate=5.0,
+            last_fee_ppm=150,
+            trend_direction=1,
+            step_ppm=50,
+            last_update=now - 172800,
+            consecutive_same_direction=0,
+            is_sleeping=False,
+            sleep_until=0,
+            stable_cycles=0,
+            last_broadcast_fee_ppm=150,
+            last_state="balanced",
+            forward_count_since_update=10,
+            last_volume_sats=50_000,
+            last_gossip_refresh=now - 1800,
+        )
+        mock_database.get_last_forward_time.return_value = now - 172800
+
+        fc._save_cycle_state(channel_id, state)
+
+        mock_database.get_fee_strategy_state.return_value = dict(persisted)
+        fc._cycle_states.pop(channel_id, None)
+
+        restored = fc._get_cycle_state(channel_id, actual_fee_ppm=150)
+
+        assert restored.last_gossip_refresh == state.last_gossip_refresh
+        assert fc._should_force_gossip_refresh(channel_id, restored, now) is False
+
+
 # =========================================================================
 # Integration tests for the DTS+PID fee path
 # =========================================================================

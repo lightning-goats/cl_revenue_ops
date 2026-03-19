@@ -38,7 +38,7 @@ Concern 3 — Hard Safety: Floor/ceiling clamps
 The Fee Priority Chain:
 1. Congestion: HTLC slots saturated -> ceiling fee
 2. Bounded Low-Fee Exploration: legacy probe flag maps to a short-lived,
-   non-zero exploration fee above the configured floor
+   low-fee exploration target at or above the configured/economic floor
 3. DTS+PID: Primary fee optimization
 
 Post-DTS+PID:
@@ -1430,8 +1430,10 @@ class FeeController:
       amplifies sparse noisy observations.
     - Hard Safety: Economic floors (rebalance cost, Vegas Reflex, min_fee)
       and ceiling (max_fee) that the PID has no signal for.
-    - Bounded exploration: legacy exploration flags map to non-zero low-fee
-      exploration above the configured floor rather than literal 0-ppm fees.
+    - Bounded exploration: legacy exploration flags map to low-fee
+      exploration at or above the configured/economic floor rather than
+      literal 0-ppm fees. Channels that are already near the floor may stay
+      on it; channels with more headroom stay low-fee above it.
 
     Key Principles:
     1. Revenue Focus: Maximize Volume × Fee, not just volume
@@ -2770,7 +2772,9 @@ class FeeController:
                 hours_elapsed = (now - _sleep_last_update) / 3600.0 if _sleep_last_update > 0 else 1.0
                 hours_elapsed = max(hours_elapsed, 0.1)  # Prevent division by zero
 
-                revenue_sats = (volume_since_sats * current_fee_ppm) / 1_000_000
+                # Match the normal observation path: use the actual on-chain fee
+                # rather than a seeded min-fee fallback when estimating revenue.
+                revenue_sats = (volume_since_sats * raw_chain_fee) / 1_000_000
                 current_revenue_rate = revenue_sats / hours_elapsed
 
                 # Calculate percent change from last known rate
@@ -3383,21 +3387,36 @@ class FeeController:
             f"sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
         )
 
-        # Build reason string for DTS+PID
-        ts_state_local = self._channel_fee_states.get(channel_id)
-        if ts_state_local:
-            dts_info = (
-                f"posterior_mean={ts_state_local.thompson.posterior_mean:.0f}, "
-                f"posterior_std={ts_state_local.thompson.posterior_std:.0f}"
-            )
-        else:
-            dts_info = "state_unavailable"
-        reason = (
-            f"DTS+PID: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}){volatility_note}, "
-            f"{dts_info}, {target_summary}, applied={applied_dir}({applied_delta:+d}ppm), "
+        common_reason_suffix = (
+            f"rate={current_revenue_rate:.2f}sats/hr ({decision_reason}){volatility_note}, "
+            f"{target_summary}, applied={applied_dir}({applied_delta:+d}ppm), "
             f"state={flow_state}, liquidity={bucket} ({outbound_ratio:.0%}), "
             f"{marginal_roi_info}"
         )
+        if decision_reason == "CONGESTION":
+            reason = f"CONGESTION: ceiling override active, {common_reason_suffix}"
+        elif decision_reason in (
+            "LOW_FEE_EXPLORATION",
+            "LOW_FEE_EXPLORATION_SUCCESS",
+            "ZERO_FEE_PROBE",
+            "ZERO_FEE_PROBE_SUCCESS",
+        ):
+            exploration_label = (
+                "holding safe low-fee after exploration traffic"
+                if decision_reason in ("LOW_FEE_EXPLORATION_SUCCESS", "ZERO_FEE_PROBE_SUCCESS")
+                else "bounded low-fee discovery mode"
+            )
+            reason = f"EXPLORATION: {exploration_label}, {common_reason_suffix}"
+        else:
+            ts_state_local = self._channel_fee_states.get(channel_id)
+            if ts_state_local:
+                dts_info = (
+                    f"posterior_mean={ts_state_local.thompson.posterior_mean:.0f}, "
+                    f"posterior_std={ts_state_local.thompson.posterior_std:.0f}"
+                )
+            else:
+                dts_info = "state_unavailable"
+            reason = f"DTS+PID: {common_reason_suffix}, {dts_info}"
         
         # IDEMPOTENCY GUARD: Skip RPC if target is physically set
         if new_fee_ppm == raw_chain_fee and not htlcmin_policy_change:
@@ -4082,6 +4101,7 @@ class FeeController:
             # v2.0 fields
             forward_count_since_update=db_state.get("forward_count_since_update", 0),
             last_volume_sats=db_state.get("last_volume_sats", 0),
+            last_gossip_refresh=v2_data.get("last_gossip_refresh", 0),
             dynamic_htlcmin_baseline_msat=v2_data.get("dynamic_htlcmin_baseline_msat"),
         )
 
@@ -4108,6 +4128,7 @@ class FeeController:
         # Serialize v2.0 state to JSON
         v2_data = {
             "algorithm_version": "dts_pid_v1",
+            "last_gossip_refresh": state.last_gossip_refresh,
             "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
         }
         v2_json_str = json.dumps(v2_data)

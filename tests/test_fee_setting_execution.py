@@ -377,6 +377,7 @@ class TestBoundedExplorationEndToEnd:
         adj = fc._adjust_channel_fee(channel_id, peer_id, flow_state, channel_info, chain_costs=None, cfg=cfg.snapshot())
         assert adj is not None
         assert adj.reason_code == FeeReasonCode.LOW_FEE_EXPLORATION_SUCCESS.value
+        assert adj.reason.startswith("EXPLORATION:")
         assert adj.new_fee_ppm >= 10
         assert adj.new_fee_ppm > 0
 

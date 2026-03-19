@@ -31,6 +31,7 @@ from modules.fee_controller import (
     FeeController,
     ChannelFeeState,
     FeeAdjustment,
+    FeeReasonCode,
 )
 from modules.config import Config
 
@@ -277,7 +278,9 @@ class TestFeePriorityChain:
         result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
         assert result is not None
-        assert "CONGESTION" in result.reason
+        assert result.reason_code == FeeReasonCode.CONGESTION.value
+        assert result.reason.startswith("CONGESTION:")
+        assert not result.reason.startswith("DTS+PID:")
 
     def test_probe_uses_bounded_low_fee_exploration(self, mock_plugin, mock_database):
         """Channel under exploration should use a bounded low non-zero fee."""
@@ -303,6 +306,8 @@ class TestFeePriorityChain:
         result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
         assert result is not None
+        assert result.reason_code == FeeReasonCode.LOW_FEE_EXPLORATION.value
+        assert result.reason.startswith("EXPLORATION:")
         assert "exploration" in result.reason.lower()
         assert "zero" not in result.reason.lower()
         assert "probe" not in result.reason.lower()
@@ -332,7 +337,8 @@ class TestFeePriorityChain:
 
         assert result is not None
         # Congestion should win over probe
-        assert "CONGESTION" in result.reason
+        assert result.reason_code == FeeReasonCode.CONGESTION.value
+        assert result.reason.startswith("CONGESTION:")
 
 
 # =============================================================================
@@ -399,10 +405,16 @@ class TestAdjustChannelFeeEndToEnd:
         }
         state = {"state": "source", "forward_count": 50, "sats_out": 10000}
 
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=150)
+        ts_state.thompson.sample_fee = lambda floor, ceiling: min(ceiling, 400)
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
         result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
         assert result is not None
         assert isinstance(result, FeeAdjustment)
+        assert result.reason_code == FeeReasonCode.DTS_PID_SAMPLE.value
+        assert result.reason.startswith("DTS+PID:")
         assert result.new_fee_ppm >= 1, "Fee should not be negative"
         assert result.new_fee_ppm <= cfg.max_fee_ppm + 100, "Fee should not exceed ceiling + buffer"
 
@@ -463,3 +475,39 @@ class TestAdjustChannelFeeEndToEnd:
         result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
         assert result is None, "Sleeping channel should not produce a fee adjustment"
+
+    def test_sleeping_channel_uses_raw_chain_fee_for_wake_detection(self, mock_plugin, mock_database):
+        """A seeded min-fee must not create phantom revenue and false wake-ups."""
+        fc, cfg = self._make_fc_full(mock_plugin, mock_database)
+
+        now = int(time.time())
+        channel_id = "123x456x1"
+        peer_id = "02" + "b" * 64
+        mock_database.get_fee_strategy_state.return_value = {
+            "last_revenue_rate": 0.0,
+            "last_fee_ppm": 0,
+            "trend_direction": 1,
+            "step_ppm": 50,
+            "last_update": now - 3600,
+            "consecutive_same_direction": 0,
+            "is_sleeping": 1,
+            "sleep_until": now + 3600,
+            "stable_cycles": 5,
+            "forward_count_since_update": 0,
+            "last_volume_sats": 0,
+            "v2_state_json": None,
+        }
+        mock_database.get_volume_since.return_value = 100_000
+        mock_database.get_forward_count_since.return_value = 0
+
+        channel_info = {
+            "fee_proportional_millionths": 0,
+            "capacity": 2_000_000,
+            "spendable_msat": "1000000000msat",
+        }
+        state = {"state": "balanced", "forward_count": 0}
+
+        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
+
+        assert result is None
+        assert fc._channel_fee_states[channel_id].is_sleeping is True
