@@ -33,8 +33,6 @@ import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime, timedelta
-
 from pyln.client import Plugin, RpcError
 
 
@@ -180,8 +178,6 @@ class KalmanFlowState:
 TEMPORAL_GRADUATION_DAYS = 7
 TEMPORAL_MIN_DAILY_FORWARDS = 10
 TEMPORAL_EMA_ALPHA = 0.3
-TEMPORAL_PEAK_PERCENTILE = 0.75
-TEMPORAL_QUIET_PERCENTILE = 0.25
 
 
 @dataclass
@@ -241,62 +237,6 @@ class TemporalProfile:
             self.diurnal_strength = max(0.0, -autocorr_12)
         else:
             self.diurnal_strength = 0.0
-
-    def predicted_outflow(self, current_hour: int, horizon_hours: int) -> float:
-        """Sum expected outflow sats for the next horizon_hours."""
-        total = 0.0
-        for h in range(horizon_hours):
-            hour_idx = (current_hour + h) % 24
-            total += self.hourly_out[hour_idx]
-        return total
-
-    def predicted_inflow(self, current_hour: int, horizon_hours: int) -> float:
-        """Sum expected inflow sats for the next horizon_hours."""
-        total = 0.0
-        for h in range(horizon_hours):
-            hour_idx = (current_hour + h) % 24
-            total += self.hourly_in[hour_idx]
-        return total
-
-    def is_quiet_now(self, current_hour: int) -> bool:
-        """Whether current_hour falls in a quiet period."""
-        return current_hour in self.quiet_hours
-
-    def next_quiet_window(self, current_hour: int) -> tuple:
-        """Find the next quiet window: (start_hour, duration_hours).
-
-        If currently in a quiet window, returns the current window.
-        Returns (current_hour, 0) if no quiet hours defined.
-        """
-        if not self.quiet_hours:
-            return (current_hour, 0)
-
-        quiet_set = set(self.quiet_hours)
-
-        # Find the start of the next (or current) quiet window
-        # by scanning forward from current_hour
-        for offset in range(24):
-            h = (current_hour + offset) % 24
-            if h in quiet_set:
-                # Found a quiet hour — walk backward to find the true start
-                # of this contiguous quiet window
-                start = h
-                for back in range(1, 24):
-                    prev = (h - back) % 24
-                    if prev in quiet_set:
-                        start = prev
-                    else:
-                        break
-                # Count duration forward from start
-                duration = 0
-                for d in range(24):
-                    if (start + d) % 24 in quiet_set:
-                        duration += 1
-                    else:
-                        break
-                return (start, duration)
-
-        return (current_hour, 0)
 
     def to_dict(self) -> dict:
         return {
@@ -381,76 +321,6 @@ def update_temporal_profile(existing: TemporalProfile,
     updated._recompute_derived()
 
     return updated
-
-
-# --- Depletion forecast constants ---
-MAX_FORECAST_HORIZON = 24
-KALMAN_TREND_CLAMP_LOW = -0.5
-KALMAN_TREND_CLAMP_HIGH = 1.0
-BURSTINESS_LOW = 0.5
-BURSTINESS_HIGH = 1.0
-BUFFER_MULT_LOW = 1.0
-BUFFER_MULT_MED = 1.3
-BUFFER_MULT_HIGH = 1.6
-
-
-def get_buffer_multiplier(burstiness: float) -> float:
-    """Map burstiness score to forecast buffer multiplier."""
-    if burstiness < BURSTINESS_LOW:
-        return BUFFER_MULT_LOW
-    elif burstiness > BURSTINESS_HIGH:
-        return BUFFER_MULT_HIGH
-    else:
-        return BUFFER_MULT_MED
-
-
-def estimate_depletion_hours(current_balance_sats: float,
-                              depletion_target_sats: float,
-                              current_hour: int,
-                              kalman_velocity_per_hour: float,
-                              temporal_profile: TemporalProfile) -> float:
-    """Estimate hours until channel balance drops to depletion_target_sats.
-
-    Combines the hourly histogram (seasonal pattern) with Kalman velocity
-    (trend deviation). Returns float('inf') if no depletion within horizon.
-
-    Args:
-        current_balance_sats: Current outbound balance
-        depletion_target_sats: Balance level that triggers depletion
-        current_hour: Current hour UTC (0-23)
-        kalman_velocity_per_hour: Kalman-estimated outflow rate (sats/hour)
-        temporal_profile: The channel's TemporalProfile
-    """
-    drain_needed = current_balance_sats - depletion_target_sats
-    if drain_needed <= 0:
-        return 0.0
-
-    # Compute Kalman trend factor
-    # kalman_velocity_per_hour <= 0 means no Kalman signal available → no trend adjustment
-    historical_avg = sum(temporal_profile.hourly_out) / 24.0
-    if kalman_velocity_per_hour > 0 and historical_avg > 0:
-        trend_factor = (kalman_velocity_per_hour - historical_avg) / historical_avg
-        trend_factor = max(KALMAN_TREND_CLAMP_LOW, min(KALMAN_TREND_CLAMP_HIGH, trend_factor))
-    else:
-        trend_factor = 0.0
-
-    cumulative = 0.0
-    for h in range(MAX_FORECAST_HORIZON):
-        hour_idx = (current_hour + h) % 24
-        net_out = temporal_profile.hourly_out[hour_idx] - temporal_profile.hourly_in[hour_idx]
-        net_out *= (1.0 + trend_factor)
-        net_out = max(net_out, 0.0)  # only count net outflow
-
-        prev_cumulative = cumulative
-        cumulative += net_out
-
-        if cumulative >= drain_needed:
-            # Interpolate partial hour
-            remaining_in_hour = drain_needed - prev_cumulative
-            partial = remaining_in_hour / max(net_out, 1.0)
-            return float(h) + partial
-
-    return float('inf')
 
 
 class KalmanFlowFilter:
@@ -864,13 +734,8 @@ class FlowAnalyzer:
             net = (bucket.get('out', 0) or 0) - (bucket.get('in', 0) or 0)
             net_flows.append(net)
 
-        if not net_flows:
-            return 1.0
-
         # Calculate coefficient of variation (CV) of net flow changes
         changes = [abs(net_flows[i] - net_flows[i-1]) for i in range(1, len(net_flows))]
-        if not changes:
-            return 1.0
 
         mean_change = sum(changes) / len(changes)
         mean_flow = sum(abs(nf) for nf in net_flows) / len(net_flows)
@@ -1040,7 +905,7 @@ class FlowAnalyzer:
 
     def _calculate_velocity(
         self, flow_ratio: float, previous_ratio: float,
-        previous_timestamp: int, forward_count: int
+        previous_timestamp: int
     ) -> float:
         """
         Calculate flow velocity (rate of change of flow_ratio).
@@ -1118,8 +983,6 @@ class FlowAnalyzer:
 
         # MA-7: Use sample variance (N-1 divisor) for unbiased estimate
         mean_net = sum(net_flows) / len(net_flows)
-        if len(net_flows) < 2:
-            return BASE_EMA_DECAY
         variance = sum((x - mean_net) ** 2 for x in net_flows) / (len(net_flows) - 1)
         std_dev = math.sqrt(variance) if variance > 0 else 0
 
@@ -1151,7 +1014,6 @@ class FlowAnalyzer:
         Returns:
             Dict mapping channel_id to FlowMetrics
         """
-        results = {}
         self._analyze_all_running = True
 
         try:
@@ -1216,8 +1078,6 @@ class FlowAnalyzer:
                 self._calculate_ema_flow(channel_daily, adaptive_decay)
 
             # Extract HTLC information for congestion detection
-            htlc_min = channel.get("htlc_min_msat", 0)
-            htlc_max = channel.get("htlc_max_msat", 0)
             active_htlcs = channel.get("active_htlcs", 0)
             max_htlcs = channel.get("max_htlcs", 483)
 
@@ -1238,8 +1098,6 @@ class FlowAnalyzer:
                 ema_out=ema_out,
                 capacity=capacity,
                 our_balance=our_balance,
-                htlc_min=htlc_min,
-                htlc_max=htlc_max,
                 active_htlcs=active_htlcs,
                 max_htlcs=max_htlcs,
                 # v2.0 parameters
@@ -1447,8 +1305,6 @@ class FlowAnalyzer:
             self._calculate_ema_flow(channel_daily, adaptive_decay)
 
         # Extract HTLC information
-        htlc_min = channel.get("htlc_min_msat", 0)
-        htlc_max = channel.get("htlc_max_msat", 0)
         active_htlcs = channel.get("active_htlcs", 0)
         max_htlcs = channel.get("max_htlcs", 483)
 
@@ -1468,8 +1324,6 @@ class FlowAnalyzer:
             ema_out=ema_out,
             capacity=capacity,
             our_balance=our_balance,
-            htlc_min=htlc_min,
-            htlc_max=htlc_max,
             active_htlcs=active_htlcs,
             max_htlcs=max_htlcs,
             # v2.0 parameters
@@ -1558,7 +1412,6 @@ class FlowAnalyzer:
         sats_in: int, sats_out: int, capacity: int,
         ema_in: float = 0.0, ema_out: float = 0.0,
         our_balance: int = 0,
-        htlc_min: int = 0, htlc_max: int = 0,
         active_htlcs: int = 0, max_htlcs: int = 483,
         # v2.0 parameters
         forward_count: int = 0,
@@ -1646,7 +1499,7 @@ class FlowAnalyzer:
 
         # v2.0: Calculate flow velocity
         velocity = self._calculate_velocity(
-            flow_ratio, previous_ratio, previous_ratio_ts, forward_count
+            flow_ratio, previous_ratio, previous_ratio_ts
         )
 
         flow_multiplier = 1.0
@@ -1760,9 +1613,6 @@ class FlowAnalyzer:
 
             total_weight += weight
 
-        if total_weight <= 0:
-            return 0.0, 0.0, 0, 0, 0, 0
-
         ema_in /= total_weight
         ema_out /= total_weight
 
@@ -1814,39 +1664,4 @@ class FlowAnalyzer:
                 return channel
         return None
     
-    def get_channel_state(self, channel_id: str) -> ChannelState:
-        """
-        Get the cached state of a channel.
-
-        Args:
-            channel_id: The channel to check
-
-        Returns:
-            The channel's current state classification
-        """
-        state_data = self.database.get_channel_state(channel_id)
-        if state_data:
-            state_str = state_data.get("state", "unknown")
-            # BUG FIX: Validate state string before enum conversion
-            try:
-                return ChannelState(state_str)
-            except ValueError:
-                self.plugin.log(
-                    f"Invalid state '{state_str}' in database for channel {channel_id}, returning UNKNOWN",
-                    level='warning'
-                )
-                return ChannelState.UNKNOWN
-        return ChannelState.UNKNOWN
-    
-    def get_sources(self) -> List[Dict[str, Any]]:
-        """Get all channels classified as SOURCE (draining)."""
-        return self.database.get_channels_by_state("source")
-    
-    def get_sinks(self) -> List[Dict[str, Any]]:
-        """Get all channels classified as SINK (filling)."""
-        return self.database.get_channels_by_state("sink")
-    
-    def get_balanced(self) -> List[Dict[str, Any]]:
-        """Get all channels classified as BALANCED."""
-        return self.database.get_channels_by_state("balanced")
 

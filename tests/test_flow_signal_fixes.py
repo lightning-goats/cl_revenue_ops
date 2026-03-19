@@ -829,7 +829,6 @@ class TestB1VelocityOutlierFormula:
             flow_ratio=-0.01,
             previous_ratio=-0.05,
             previous_timestamp=previous_timestamp,
-            forward_count=10,
         )
 
         # Without fix: abs(-0.01+0.01)=0.0, expected_max=0.0, velocity clamped to 0.0
