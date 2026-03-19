@@ -801,6 +801,48 @@ class TestAskReneClamp:
 # Kalman PD Enforcement: minimum variance floor
 # =========================================================================
 
+# =========================================================================
+# Bug B1: Velocity outlier formula shift bug
+# =========================================================================
+
+class TestB1VelocityOutlierFormula:
+    """abs(flow_ratio)+0.01 not abs(flow_ratio+0.01).
+
+    When flow_ratio ~ -0.01, abs(-0.01+0.01)=0.0 makes expected_max=0.0,
+    clamping ALL non-zero velocities to zero and breaking trend detection.
+    """
+
+    def test_velocity_not_zeroed_at_negative_001(self):
+        """Velocity must survive when flow_ratio is near -0.01."""
+        from modules.flow_analysis import FlowAnalyzer
+
+        plugin = MagicMock()
+        config = MagicMock()
+        config.flow_window_days = 7
+        db = MagicMock()
+        analyzer = FlowAnalyzer(plugin, config, db)
+
+        now = int(time.time())
+        previous_timestamp = now - 7200  # 2 hours ago
+
+        velocity = analyzer._calculate_velocity(
+            flow_ratio=-0.01,
+            previous_ratio=-0.05,
+            previous_timestamp=previous_timestamp,
+            forward_count=10,
+        )
+
+        # Without fix: abs(-0.01+0.01)=0.0, expected_max=0.0, velocity clamped to 0.0
+        # With fix:    abs(-0.01)+0.01=0.02, expected_max=0.06, velocity ~0.02
+        assert velocity != 0.0, (
+            f"Velocity should NOT be zero: flow_ratio=-0.01 near the old "
+            f"abs(ratio+0.01) singularity.  Got {velocity}"
+        )
+        assert velocity == pytest.approx(0.02, abs=0.005), (
+            f"Expected velocity ~0.02 (delta 0.04 / 2h), got {velocity}"
+        )
+
+
 class TestKalmanPDEnforcement:
     """Kalman filter must enforce positive-definite covariance before update."""
 

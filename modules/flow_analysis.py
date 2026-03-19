@@ -1068,7 +1068,9 @@ class FlowAnalyzer:
 
         # Security: outlier detection
         # If velocity is extreme relative to expected, likely manipulation
-        expected_max = VELOCITY_OUTLIER_THRESHOLD * abs(flow_ratio + 0.01)  # +0.01 avoid div0
+        # B1 FIX: Use abs(flow_ratio) + 0.01, not abs(flow_ratio + 0.01).
+        # The 0.01 is a floor to avoid zero threshold, not a shift.
+        expected_max = VELOCITY_OUTLIER_THRESHOLD * (abs(flow_ratio) + 0.01)
         if abs(raw_velocity) > expected_max:
             self.plugin.log(
                 f"Velocity outlier detected: {raw_velocity:.4f} > {expected_max:.4f}, clamping",
