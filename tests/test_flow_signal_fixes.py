@@ -924,3 +924,18 @@ class TestB2KalmanNaNInputGuard:
         assert kf.state.flow_velocity == snap_velocity, "Velocity must not change on Inf"
         assert kf.state.variance_ratio == snap_variance, "Variance must not change on Inf"
         assert kf.state.observation_count == snap_count, "Count must not change on Inf"
+
+
+# =========================================================================
+# Bug B3: prev_ts parameter unused in _apply_kalman_filter
+# =========================================================================
+
+class TestB3PrevTsRemoved:
+    """prev_ts parameter is accepted but never read — remove it."""
+
+    def test_apply_kalman_filter_no_prev_ts_param(self):
+        import inspect
+        from modules.flow_analysis import FlowAnalyzer
+        sig = inspect.signature(FlowAnalyzer._apply_kalman_filter)
+        param_names = list(sig.parameters.keys())
+        assert "prev_ts" not in param_names

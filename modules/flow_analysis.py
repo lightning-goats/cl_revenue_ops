@@ -893,7 +893,6 @@ class FlowAnalyzer:
         observed_ratio: float,
         confidence: float,
         daily_buckets: List[Dict[str, int]],
-        prev_ts: int,
         has_observation: bool = True
     ) -> Tuple[float, float, float, bool, int]:
         """
@@ -904,7 +903,6 @@ class FlowAnalyzer:
             observed_ratio: Raw flow ratio from per-forward data
             confidence: Observation confidence (0.1 to 1.0)
             daily_buckets: Daily flow data for volatility calculation
-            prev_ts: Previous update timestamp
             has_observation: If False, run predict-only (no update).
                 Prevents feeding a fake 0.0 observation when no flow data exists.
 
@@ -1267,7 +1265,6 @@ class FlowAnalyzer:
                         observed_ratio=raw_observation,
                         confidence=kalman_confidence,
                         daily_buckets=channel_daily,
-                        prev_ts=prev_ts,
                         has_observation=True  # FIX: Must be True unconditionally so idle channels decay to 0
                     )
                 metrics.kalman_flow_ratio = kalman_ratio
@@ -1500,7 +1497,6 @@ class FlowAnalyzer:
                     observed_ratio=raw_observation,
                     confidence=kalman_confidence,
                     daily_buckets=channel_daily,
-                    prev_ts=prev_ts,
                     has_observation=True  # FIX: Must be True unconditionally so idle channels decay to 0
                 )
             metrics.kalman_flow_ratio = kalman_ratio
