@@ -177,10 +177,29 @@ class CapacityPlanner:
     def _identify_losers(self, all_profitability, all_flow) -> List[Dict[str, Any]]:
         """
         Identify poor-performing channels for capital extraction.
+
+        Enriched with additional data signals for smarter closure decisions:
+        - Hard bleeder bypass: structurally unprofitable channels skip defibrillation gate
+        - Channel role protection: INBOUND_GATEWAYs require much worse ROI for closure
+        - Kalman regime change deferral: demotes CLOSE to DEFIBRILLATE if behavior shifting
+        - Kalman confidence gate: skips closure for channels with unreliable flow data
+        - Peer uptime: added to loser dict for downstream decision-making
         """
         losers = []
 
-        from .profitability_analyzer import ProfitabilityClass
+        from .profitability_analyzer import ProfitabilityClass, ChannelRole
+
+        # Get bleeder classification for all channels
+        bleeders = {}
+        try:
+            bleeder_list = self.profitability.identify_bleeders_v2() or []
+            # Convert list to dict keyed by channel_id for O(1) lookup
+            for b in bleeder_list:
+                cid = getattr(b, 'channel_id', None)
+                if cid:
+                    bleeders[cid] = b
+        except Exception:
+            pass
 
         for scid, prof in all_profitability.items():
             flow_metrics = all_flow.get(scid)
@@ -197,6 +216,44 @@ class CapacityPlanner:
 
             # SCID formatting check - ensure 'x' separator
             scid_display = scid.replace(':', 'x')
+
+            # Kalman confidence gate -- skip closure if data unreliable
+            if flow_metrics:
+                confidence = getattr(flow_metrics, 'confidence', 1.0)
+                # Guard against non-numeric (e.g. MagicMock) or None
+                if not isinstance(confidence, (int, float)):
+                    confidence = 1.0
+                confidence = confidence or 1.0
+                if confidence < 0.5:
+                    continue  # Don't recommend closure with unreliable data
+
+            # Channel role protection -- INBOUND_GATEWAYs source volume for all
+            # outbound channels; closing one has outsized negative impact.
+            channel_role = getattr(prof, 'channel_role', None)
+            is_inbound_gateway = False
+            try:
+                if channel_role is not None:
+                    if isinstance(channel_role, ChannelRole):
+                        is_inbound_gateway = channel_role == ChannelRole.INBOUND_GATEWAY
+                    elif hasattr(channel_role, 'value'):
+                        is_inbound_gateway = channel_role.value in ('INBOUND_GATEWAY', 'inbound_gateway')
+                    else:
+                        is_inbound_gateway = str(channel_role) in ('INBOUND_GATEWAY', 'inbound_gateway')
+            except Exception:
+                pass
+
+            # If inbound gateway, require much worse marginal ROI before closure
+            if is_inbound_gateway and prof.marginal_roi_percent > -50.0:
+                continue  # Protect inbound gateways
+
+            # Hard bleeder bypass -- skip defibrillation gate
+            bleeder_info = bleeders.get(scid)
+            is_hard_bleeder = False
+            if bleeder_info is not None:
+                if hasattr(bleeder_info, 'is_hard_bleeder'):
+                    is_hard_bleeder = bool(bleeder_info.is_hard_bleeder)
+                elif isinstance(bleeder_info, dict):
+                    is_hard_bleeder = bool(bleeder_info.get('is_hard_bleeder', False))
 
             # Logic 1: FIRE SALE mode (Zombie or Deeply Underwater)
             # Guard: require flow data before recommending closure (matches _identify_winners).
@@ -241,41 +298,61 @@ class CapacityPlanner:
                     # Skip close recommendation for remote channels unless deeply underwater
                     continue
 
+            # Kalman regime change deferral -- if the channel's flow behavior
+            # has fundamentally shifted, it may be improving.
+            regime_change = False
+            if flow_metrics:
+                rc = getattr(flow_metrics, 'kalman_regime_change', False)
+                if isinstance(rc, bool):
+                    regime_change = rc
+                else:
+                    regime_change = bool(rc) if rc is not None else False
+
+            # Peer uptime -- low uptime + poor ROI strengthens close signal
+            uptime_pct = None
+            try:
+                uptime_pct = self.profitability.database.get_peer_uptime_percent(
+                    prof.peer_id, duration_seconds=168 * 3600)
+            except Exception:
+                pass
+
             if is_fire_sale or is_stagnant:
                 # PROTECTION: A channel cannot be recommended for "Close"
                 # until the diagnostic_rebalance has been attempted at least twice in the last 14 days.
+                # EXCEPTION: Hard bleeders bypass the defibrillation gate -- they are
+                # structurally unprofitable (rebalance cost > 2x revenue AND net loss > 1000 sats).
                 # Accounting v2.0: Include estimated closure cost
                 estimated_closure_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
                 reason = fire_sale_reason if is_fire_sale else "STAGNANT"
 
-                if attempt_count < 2:
-                    losers.append({
-                        "scid": scid_display,
-                        "peer_id": prof.peer_id,
-                        "reason": f"{reason} (NEEDS DEFIBRILLATOR)",
-                        "roi": round(prof.roi_percent, 2),
-                        "marginal_roi": round(prof.marginal_roi_percent, 2),
-                        "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
-                        "capacity": prof.capacity_sats,
-                        "estimated_closure_cost_sats": estimated_closure_cost,
-                        "rebal_difficulty": round(rebal_difficulty, 2),
-                        "opener": opener,
-                        "action": "DEFIBRILLATE"
-                    })
+                if is_hard_bleeder or attempt_count >= 2:
+                    action = "CLOSE"
+                    # Regime change demotes CLOSE to DEFIBRILLATE (unless hard bleeder,
+                    # which is structurally unprofitable regardless of regime shifts)
+                    if regime_change and not is_hard_bleeder:
+                        action = "DEFIBRILLATE"
+                        reason = f"{reason} (REGIME CHANGE)"
                 else:
-                    losers.append({
-                        "scid": scid_display,
-                        "peer_id": prof.peer_id,
-                        "reason": reason,
-                        "roi": round(prof.roi_percent, 2),
-                        "marginal_roi": round(prof.marginal_roi_percent, 2),
-                        "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
-                        "capacity": prof.capacity_sats,
-                        "estimated_closure_cost_sats": estimated_closure_cost,
-                        "rebal_difficulty": round(rebal_difficulty, 2),
-                        "opener": opener,
-                        "action": "CLOSE"
-                    })
+                    action = "DEFIBRILLATE"
+                    reason = f"{reason} (NEEDS DEFIBRILLATOR)"
+
+                losers.append({
+                    "scid": scid_display,
+                    "peer_id": prof.peer_id,
+                    "reason": reason,
+                    "roi": round(prof.roi_percent, 2),
+                    "marginal_roi": round(prof.marginal_roi_percent, 2),
+                    "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
+                    "capacity": prof.capacity_sats,
+                    "estimated_closure_cost_sats": estimated_closure_cost,
+                    "rebal_difficulty": round(rebal_difficulty, 2),
+                    "opener": opener,
+                    "action": action,
+                    # Enrichment fields
+                    "is_hard_bleeder": is_hard_bleeder,
+                    "uptime_pct": round(uptime_pct, 1) if isinstance(uptime_pct, (int, float)) else None,
+                    "regime_change": regime_change,
+                })
 
         return losers
 

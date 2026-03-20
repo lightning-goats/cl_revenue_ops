@@ -50,6 +50,8 @@ def _mock_flow(
     flow_ratio=0.0,
     kalman_velocity=0.0,
     is_congested=False,
+    confidence=1.0,
+    kalman_regime_change=False,
 ):
     """Create a mock FlowAnalysis."""
     flow = MagicMock()
@@ -59,6 +61,8 @@ def _mock_flow(
     flow.flow_ratio = flow_ratio
     flow.kalman_velocity = kalman_velocity
     flow.is_congested = is_congested
+    flow.confidence = confidence
+    flow.kalman_regime_change = kalman_regime_change
     return flow
 
 
@@ -723,3 +727,314 @@ class TestEnrichedWinners:
             "sourced_fee_contribution_sats", "channel_role", "dts_posterior_mean",
         }
         assert set(winners[0].keys()) == expected_keys
+
+
+def _make_loser_planner():
+    """Create a CapacityPlanner with mocked dependencies for loser tests."""
+    plugin = MagicMock()
+    prof_analyzer = MagicMock()
+    flow_analyzer = MagicMock()
+
+    # Default DB mocks for loser path
+    prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 0}
+    prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+    prof_analyzer.database.get_peer_uptime_percent.side_effect = Exception("not available")
+    # identify_bleeders_v2 returns empty list by default
+    prof_analyzer.identify_bleeders_v2.return_value = []
+
+    planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+    return planner, prof_analyzer
+
+
+def _make_loser_prof(**kwargs):
+    """Create a profitability mock that qualifies as a loser (zombie, >90 days)."""
+    defaults = dict(
+        marginal_roi_percent=-80.0,
+        roi_percent=-90.0,
+        classification=ProfitabilityClass.ZOMBIE,
+        days_open=120,
+        capacity_sats=2_000_000,
+    )
+    defaults.update(kwargs)
+    prof = _mock_profitability(**defaults)
+    # By default not an inbound gateway -- use a simple string for channel_role
+    # so that the ChannelRole isinstance check fails and str() comparison also fails
+    prof.channel_role = "balanced"
+    return prof
+
+
+def _make_loser_flow(**kwargs):
+    """Create flow metrics for a loser channel (not stagnant by default)."""
+    defaults = dict(
+        daily_volume=100,
+        flow_ratio=0.5,
+        capacity=2_000_000,
+        confidence=1.0,
+        kalman_regime_change=False,
+    )
+    defaults.update(kwargs)
+    return _mock_flow(**defaults)
+
+
+class TestEnrichedLosers:
+    """Test enriched loser identification with bleeders, channel role, Kalman, uptime."""
+
+    def test_hard_bleeder_bypasses_defibrillation_gate(self):
+        """Hard bleeders go straight to CLOSE even with attempt_count < 2."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow()
+
+        # Mock identify_bleeders_v2 returning hard bleeder
+        bleeder = MagicMock()
+        bleeder.channel_id = scid
+        bleeder.is_hard_bleeder = True
+        prof_analyzer.identify_bleeders_v2.return_value = [bleeder]
+
+        # attempt_count=0 would normally result in DEFIBRILLATE
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 0}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "CLOSE"
+        assert losers[0]["is_hard_bleeder"] is True
+
+    def test_hard_bleeder_not_demoted_by_regime_change(self):
+        """Hard bleeders are NOT demoted to DEFIBRILLATE by regime changes."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow(kalman_regime_change=True)
+
+        bleeder = MagicMock()
+        bleeder.channel_id = scid
+        bleeder.is_hard_bleeder = True
+        prof_analyzer.identify_bleeders_v2.return_value = [bleeder]
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 0}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "CLOSE"
+        assert losers[0]["is_hard_bleeder"] is True
+
+    def test_non_hard_bleeder_does_not_bypass_gate(self):
+        """Soft bleeders do NOT bypass the defibrillation gate."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow()
+
+        bleeder = MagicMock()
+        bleeder.channel_id = scid
+        bleeder.is_hard_bleeder = False
+        prof_analyzer.identify_bleeders_v2.return_value = [bleeder]
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 0}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "DEFIBRILLATE"
+        assert losers[0]["is_hard_bleeder"] is False
+
+    def test_inbound_gateway_protected_from_closure(self):
+        """INBOUND_GATEWAY channels with marginal_roi > -50% are protected."""
+        from modules.profitability_analyzer import ChannelRole
+
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof(marginal_roi_percent=-30.0)
+        prof.channel_role = ChannelRole.INBOUND_GATEWAY
+        flow = _make_loser_flow()
+
+        # Even with attempt_count >= 2, inbound gateway is protected
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 0
+
+    def test_inbound_gateway_closed_when_deeply_underwater(self):
+        """INBOUND_GATEWAY with marginal_roi < -50% can be closed."""
+        from modules.profitability_analyzer import ChannelRole
+
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof(marginal_roi_percent=-60.0)
+        prof.channel_role = ChannelRole.INBOUND_GATEWAY
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+
+    def test_kalman_regime_change_demotes_to_defibrillate(self):
+        """Regime change demotes CLOSE to DEFIBRILLATE."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow(kalman_regime_change=True)
+
+        # attempt_count >= 2 would normally result in CLOSE
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "DEFIBRILLATE"
+        assert losers[0]["regime_change"] is True
+        assert "(REGIME CHANGE)" in losers[0]["reason"]
+
+    def test_no_regime_change_allows_close(self):
+        """Without regime change, attempt_count >= 2 results in CLOSE."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow(kalman_regime_change=False)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "CLOSE"
+        assert losers[0]["regime_change"] is False
+
+    def test_low_confidence_prevents_closure(self):
+        """Channels with confidence < 0.5 are excluded from losers."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow(confidence=0.3)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 0
+
+    def test_high_confidence_allows_closure(self):
+        """Channels with confidence >= 0.5 are not excluded."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow(confidence=0.8)
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+
+    def test_loser_includes_uptime(self):
+        """Loser dict includes peer uptime percentage."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_peer_uptime_percent.side_effect = None
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 75.0
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["uptime_pct"] == 75.0
+
+    def test_uptime_none_when_unavailable(self):
+        """Uptime is None when database query fails."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_peer_uptime_percent.side_effect = Exception("DB error")
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["uptime_pct"] is None
+
+    def test_bleeder_v2_exception_handled(self):
+        """If identify_bleeders_v2 raises, losers still work."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow()
+
+        prof_analyzer.identify_bleeders_v2.side_effect = Exception("DB error")
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["is_hard_bleeder"] is False
+
+    def test_all_enrichment_fields_present_in_loser(self):
+        """Every loser dict contains all expected enrichment fields."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        expected_keys = {
+            "scid", "peer_id", "reason", "roi", "marginal_roi",
+            "classification", "capacity", "estimated_closure_cost_sats",
+            "rebal_difficulty", "opener", "action",
+            "is_hard_bleeder", "uptime_pct", "regime_change",
+        }
+        assert set(losers[0].keys()) == expected_keys
+
+    def test_stagnant_with_hard_bleeder_closes(self):
+        """Stagnant channel + hard bleeder bypasses defibrillation gate."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        # Stagnant requires: balanced flow, low turnover, marginal_roi < 10%
+        prof = _make_loser_prof(
+            marginal_roi_percent=5.0,
+            roi_percent=-10.0,
+            classification=ProfitabilityClass.UNDERWATER,
+            days_open=60,
+        )
+        flow = _make_loser_flow(daily_volume=1, flow_ratio=0.1, capacity=2_000_000)
+
+        bleeder = MagicMock()
+        bleeder.channel_id = scid
+        bleeder.is_hard_bleeder = True
+        prof_analyzer.identify_bleeders_v2.return_value = [bleeder]
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 0}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "CLOSE"
+        assert losers[0]["reason"] == "STAGNANT"  # Not NEEDS DEFIBRILLATOR
+
+    def test_inbound_gateway_at_boundary(self):
+        """INBOUND_GATEWAY at exactly -50% marginal ROI is NOT protected (> not >=)."""
+        from modules.profitability_analyzer import ChannelRole
+
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof(marginal_roi_percent=-50.0)
+        prof.channel_role = ChannelRole.INBOUND_GATEWAY
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        # marginal_roi_percent == -50.0, condition is > -50.0 to protect
+        # So at exactly -50.0, the channel is NOT protected
+        assert len(losers) == 1
