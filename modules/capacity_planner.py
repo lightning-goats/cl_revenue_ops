@@ -5,6 +5,7 @@ This module identifies "Winner" channels for capital injection
 and "Loser" channels for capital redeployment (Close).
 """
 
+import json
 import time
 from typing import Dict, List, Any
 from pyln.client import Plugin
@@ -86,6 +87,14 @@ class CapacityPlanner:
     def _identify_winners(self, all_profitability, all_flow) -> List[Dict[str, Any]]:
         """
         Identify high-performing channels that are capacity-constrained.
+
+        Enriches each winner with additional data signals for downstream
+        prioritization (peer discovery, channel sizing):
+        - velocity_urgency: Kalman velocity > 0.1 indicates rapid draining
+        - congestion_urgent: HTLC slots saturated (>80%)
+        - sourced_fee_contribution_sats: Inbound fee contribution to other channels
+        - channel_role: Source/sink/router classification
+        - dts_posterior_mean: DTS optimal fee estimate (proven fee-earner signal)
         """
         winners = []
 
@@ -115,6 +124,35 @@ class CapacityPlanner:
             sr_val = success_data.get('success_rate', 1.0) if success_data and success_data.get('total', 0) >= 3 else 1.0
             rebal_difficulty = round(1.0 - sr_val, 2)
 
+            # Kalman velocity urgency: positive velocity on source = draining faster
+            kalman_velocity = getattr(flow_metrics, 'kalman_velocity', 0.0) or 0.0
+            velocity_urgency = kalman_velocity > 0.1
+
+            # Congestion urgency: HTLC slots saturated (>80%)
+            congestion_urgent = bool(getattr(flow_metrics, 'is_congested', False))
+
+            # Sourced fee contribution: inbound channels generating fees for others
+            sourced_contribution = 0
+            if hasattr(prof, 'revenue') and hasattr(prof.revenue, 'sourced_fee_contribution_sats'):
+                sourced_contribution = prof.revenue.sourced_fee_contribution_sats or 0
+
+            # Channel role for downstream prioritization
+            channel_role = getattr(prof, 'channel_role', None)
+            channel_role_str = channel_role.value if hasattr(channel_role, 'value') else str(channel_role) if channel_role else None
+
+            # DTS posterior mean: high mean with low variance = proven fee-earner
+            dts_mean = None
+            try:
+                fee_state = self.profitability.database.get_fee_strategy_state(scid)
+                if fee_state:
+                    v2_json_str = fee_state.get('v2_state_json', '{}') or '{}'
+                    v2_data = json.loads(v2_json_str) if isinstance(v2_json_str, str) else v2_json_str
+                    thompson_state = v2_data.get('thompson_state', {})
+                    if thompson_state:
+                        dts_mean = thompson_state.get('posterior_mean')
+            except Exception:
+                pass
+
             if (effective_roi > 20.0 and
                 turnover > 0.5 and
                 (flow_metrics.flow_ratio > 0.8 or flow_metrics.flow_ratio < -0.8)):
@@ -127,6 +165,11 @@ class CapacityPlanner:
                     "turnover": round(turnover, 4),
                     "capacity": prof.capacity_sats,
                     "rebal_difficulty": rebal_difficulty,
+                    "velocity_urgency": velocity_urgency,
+                    "congestion_urgent": congestion_urgent,
+                    "sourced_fee_contribution_sats": sourced_contribution,
+                    "channel_role": channel_role_str,
+                    "dts_posterior_mean": round(dts_mean, 1) if dts_mean is not None else None,
                 })
 
         return winners

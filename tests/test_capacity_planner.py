@@ -48,6 +48,8 @@ def _mock_flow(
     capacity=2_000_000,
     daily_volume=100,
     flow_ratio=0.0,
+    kalman_velocity=0.0,
+    is_congested=False,
 ):
     """Create a mock FlowAnalysis."""
     flow = MagicMock()
@@ -55,6 +57,8 @@ def _mock_flow(
     flow.capacity = capacity
     flow.daily_volume = daily_volume
     flow.flow_ratio = flow_ratio
+    flow.kalman_velocity = kalman_velocity
+    flow.is_congested = is_congested
     return flow
 
 
@@ -463,3 +467,259 @@ class TestPlannerDatabase:
         assert len(planned) == 1
         completed = db.get_planner_actions(status="completed")
         assert len(completed) == 1
+
+
+def _make_winner_planner():
+    """Create a CapacityPlanner with mocked dependencies for winner tests."""
+    plugin = MagicMock()
+    prof_analyzer = MagicMock()
+    flow_analyzer = MagicMock()
+    # Default: no rebal difficulty, no fee strategy state
+    prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+    prof_analyzer.database.get_fee_strategy_state.return_value = None
+    planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+    return planner, prof_analyzer
+
+
+def _make_winner_prof(**kwargs):
+    """Create a profitability mock that qualifies as a winner."""
+    defaults = dict(
+        marginal_roi_percent=50.0,
+        roi_percent=50.0,
+        classification=ProfitabilityClass.PROFITABLE,
+        days_open=60,
+        capacity_sats=2_000_000,
+    )
+    defaults.update(kwargs)
+    return _mock_profitability(**defaults)
+
+
+def _make_winner_flow(**kwargs):
+    """Create a flow mock that qualifies as a winner (high turnover, strong flow ratio)."""
+    defaults = dict(
+        daily_volume=1_500_000,
+        flow_ratio=0.9,
+        capacity=2_000_000,
+        kalman_velocity=0.0,
+        is_congested=False,
+    )
+    defaults.update(kwargs)
+    return _mock_flow(**defaults)
+
+
+class TestEnrichedWinners:
+    """Test enriched winner identification with additional data signals."""
+
+    def test_winner_includes_velocity_urgency(self):
+        """Winners with high kalman_velocity are flagged urgent."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        flow = _make_winner_flow(kalman_velocity=0.2)
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["velocity_urgency"] is True
+
+    def test_winner_velocity_not_urgent_when_low(self):
+        """Winners with low kalman_velocity are NOT flagged urgent."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        flow = _make_winner_flow(kalman_velocity=0.05)
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["velocity_urgency"] is False
+
+    def test_winner_includes_congestion_flag(self):
+        """Congested winners are flagged for immediate action."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        flow = _make_winner_flow(is_congested=True)
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["congestion_urgent"] is True
+
+    def test_winner_not_congested_by_default(self):
+        """Non-congested winners have congestion_urgent=False."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        flow = _make_winner_flow(is_congested=False)
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["congestion_urgent"] is False
+
+    def test_winner_includes_channel_role(self):
+        """Winners include channel_role for prioritization."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        # Simulate an enum-like channel_role with .value
+        role_mock = MagicMock()
+        role_mock.value = "source"
+        prof.channel_role = role_mock
+        flow = _make_winner_flow()
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["channel_role"] == "source"
+
+    def test_winner_channel_role_none_when_missing(self):
+        """Winners without channel_role have None."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        # Remove channel_role attribute entirely
+        del prof.channel_role
+        flow = _make_winner_flow()
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["channel_role"] is None
+
+    def test_winner_includes_dts_posterior(self):
+        """Winners with DTS data include posterior mean."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        flow = _make_winner_flow()
+
+        import json
+        v2_json = json.dumps({
+            "algorithm_version": "dts_pid_v1",
+            "thompson_state": {
+                "posterior_mean": 350.0,
+                "posterior_std": 25.0,
+            }
+        })
+        prof_analyzer.database.get_fee_strategy_state.return_value = {
+            "channel_id": scid,
+            "v2_state_json": v2_json,
+        }
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["dts_posterior_mean"] == 350.0
+
+    def test_winner_dts_none_when_no_state(self):
+        """Winners without fee strategy state have dts_posterior_mean=None."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        flow = _make_winner_flow()
+
+        prof_analyzer.database.get_fee_strategy_state.return_value = None
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["dts_posterior_mean"] is None
+
+    def test_winner_dts_none_when_empty_v2_json(self):
+        """Winners with empty v2_state_json have dts_posterior_mean=None."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        flow = _make_winner_flow()
+
+        prof_analyzer.database.get_fee_strategy_state.return_value = {
+            "channel_id": scid,
+            "v2_state_json": "{}",
+        }
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["dts_posterior_mean"] is None
+
+    def test_winner_dts_survives_db_error(self):
+        """DTS query failure does not break winner identification."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        flow = _make_winner_flow()
+
+        prof_analyzer.database.get_fee_strategy_state.side_effect = Exception("DB error")
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["dts_posterior_mean"] is None
+
+    def test_winner_includes_sourced_fee_contribution(self):
+        """Winners with sourced fee contribution include the value."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        # Add revenue with sourced_fee_contribution_sats
+        revenue_mock = MagicMock()
+        revenue_mock.sourced_fee_contribution_sats = 5000
+        prof.revenue = revenue_mock
+        flow = _make_winner_flow()
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["sourced_fee_contribution_sats"] == 5000
+
+    def test_winner_sourced_contribution_zero_when_missing(self):
+        """Winners without sourced fee data have sourced_fee_contribution_sats=0."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        # Remove revenue attribute entirely
+        del prof.revenue
+        flow = _make_winner_flow()
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        assert winners[0]["sourced_fee_contribution_sats"] == 0
+
+    def test_non_urgent_winner_normal(self):
+        """Winners without urgency signals have False/None for urgency fields."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        del prof.revenue
+        del prof.channel_role
+        flow = _make_winner_flow(kalman_velocity=0.0, is_congested=False)
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        w = winners[0]
+        assert w["velocity_urgency"] is False
+        assert w["congestion_urgent"] is False
+        assert w["sourced_fee_contribution_sats"] == 0
+        assert w["channel_role"] is None
+        assert w["dts_posterior_mean"] is None
+
+    def test_all_enrichment_fields_present(self):
+        """Every winner dict contains all expected enrichment fields."""
+        planner, prof_analyzer = _make_winner_planner()
+        scid = "100x200x0"
+        prof = _make_winner_prof()
+        flow = _make_winner_flow()
+
+        winners = planner._identify_winners({scid: prof}, {scid: flow})
+
+        assert len(winners) == 1
+        expected_keys = {
+            "scid", "peer_id", "roi", "flow_ratio", "turnover", "capacity",
+            "rebal_difficulty", "velocity_urgency", "congestion_urgent",
+            "sourced_fee_contribution_sats", "channel_role", "dts_posterior_mean",
+        }
+        assert set(winners[0].keys()) == expected_keys
