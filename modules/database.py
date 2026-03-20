@@ -1073,6 +1073,40 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+        # Capacity Planner tables
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS planner_candidates (
+                peer_id TEXT PRIMARY KEY,
+                score REAL NOT NULL DEFAULT 0.0,
+                source TEXT NOT NULL,
+                last_evaluated INTEGER NOT NULL,
+                capacity_recommendation_sats INTEGER,
+                connect_successes INTEGER DEFAULT 0,
+                connect_failures INTEGER DEFAULT 0,
+                metadata_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_candidates_score ON planner_candidates(score)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS planner_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_type TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                channel_id TEXT,
+                amount_sats INTEGER,
+                estimated_cost_sats INTEGER,
+                actual_cost_sats INTEGER,
+                status TEXT NOT NULL DEFAULT 'planned',
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                reason TEXT,
+                metadata_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_status ON planner_actions(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_peer ON planner_actions(peer_id)")
+
         self.plugin.log("Database initialized successfully")
     
 
@@ -5189,6 +5223,128 @@ class Database:
             conn.execute("ROLLBACK")
             raise
     
+    # =========================================================================
+    # Capacity Planner
+    # =========================================================================
+
+    def record_planner_candidate(self, peer_id: str, score: float, source: str,
+                                  capacity_recommendation_sats: int = None,
+                                  metadata: dict = None) -> None:
+        """Record or update a planner candidate peer."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT OR REPLACE INTO planner_candidates
+            (peer_id, score, source, last_evaluated, capacity_recommendation_sats, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (peer_id, score, source, int(time.time()),
+              capacity_recommendation_sats,
+              json.dumps(metadata) if metadata else None))
+
+    def get_planner_candidates(self, min_score: float = -999.0, source: str = None,
+                                limit: int = 32) -> List[Dict[str, Any]]:
+        """Get planner candidates, optionally filtered by score and source."""
+        conn = self._get_connection()
+        if source:
+            rows = conn.execute("""
+                SELECT * FROM planner_candidates
+                WHERE score >= ? AND source = ?
+                ORDER BY score DESC LIMIT ?
+            """, (min_score, source, limit)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM planner_candidates
+                WHERE score >= ?
+                ORDER BY score DESC LIMIT ?
+            """, (min_score, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_candidate_score(self, peer_id: str, delta: float) -> None:
+        """Increment a candidate's score by delta."""
+        conn = self._get_connection()
+        conn.execute("""
+            UPDATE planner_candidates SET score = score + ?, last_evaluated = ?
+            WHERE peer_id = ?
+        """, (delta, int(time.time()), peer_id))
+
+    def delete_planner_candidate(self, peer_id: str) -> None:
+        """Remove a candidate from the pool."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM planner_candidates WHERE peer_id = ?", (peer_id,))
+
+    def record_planner_action(self, action_type: str, peer_id: str,
+                               amount_sats: int = None, estimated_cost_sats: int = None,
+                               reason: str = None, channel_id: str = None,
+                               metadata: dict = None) -> int:
+        """Record a planner action and return its id."""
+        conn = self._get_connection()
+        cursor = conn.execute("""
+            INSERT INTO planner_actions
+            (action_type, peer_id, channel_id, amount_sats, estimated_cost_sats,
+             status, created_at, reason, metadata_json)
+            VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?)
+        """, (action_type, peer_id, channel_id, amount_sats, estimated_cost_sats,
+              int(time.time()), reason,
+              json.dumps(metadata) if metadata else None))
+        return cursor.lastrowid
+
+    def update_planner_action(self, action_id: int, status: str = None,
+                               actual_cost_sats: int = None, channel_id: str = None,
+                               completed_at: int = None) -> None:
+        """Update a planner action's status and/or cost."""
+        conn = self._get_connection()
+        updates = []
+        params = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if actual_cost_sats is not None:
+            updates.append("actual_cost_sats = ?")
+            params.append(actual_cost_sats)
+        if channel_id is not None:
+            updates.append("channel_id = ?")
+            params.append(channel_id)
+        if completed_at is not None:
+            updates.append("completed_at = ?")
+            params.append(completed_at)
+        elif status in ("completed", "failed"):
+            updates.append("completed_at = ?")
+            params.append(int(time.time()))
+        if updates:
+            params.append(action_id)
+            conn.execute(f"UPDATE planner_actions SET {', '.join(updates)} WHERE id = ?", params)
+
+    def get_planner_action(self, action_id: int) -> Optional[Dict[str, Any]]:
+        """Get a single planner action by id."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT * FROM planner_actions WHERE id = ?", (action_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_planner_actions(self, status: str = None, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get planner actions, optionally filtered by status."""
+        conn = self._get_connection()
+        if status:
+            rows = conn.execute("""
+                SELECT * FROM planner_actions WHERE status = ?
+                ORDER BY created_at DESC LIMIT ?
+            """, (status, limit)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM planner_actions
+                ORDER BY created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_planner_actions(self, peer_id: str, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get recent planner actions for a peer (for cooldown checks)."""
+        conn = self._get_connection()
+        since = int(time.time()) - (hours * 3600)
+        rows = conn.execute("""
+            SELECT * FROM planner_actions
+            WHERE peer_id = ? AND created_at >= ?
+            ORDER BY created_at DESC
+        """, (peer_id, since)).fetchall()
+        return [dict(row) for row in rows]
+
     # =========================================================================
     # Mempool Fee History Methods (Vegas Reflex)
     # =========================================================================

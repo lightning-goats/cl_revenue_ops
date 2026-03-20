@@ -4,6 +4,7 @@ Tests for capacity_planner — rebalance difficulty scoring.
 
 import os
 import sys
+import tempfile
 import pytest
 from unittest.mock import MagicMock
 
@@ -17,6 +18,7 @@ sys.modules['pyln.client'] = mock_pyln
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.capacity_planner import CapacityPlanner
+from modules.database import Database
 from modules.profitability_analyzer import ProfitabilityClass
 
 
@@ -360,3 +362,104 @@ class TestNoSpliceFields:
             assert "peer_supports_splice" not in winner
         for loser in report.get("losers", []):
             assert "peer_supports_splice" not in loser
+
+
+class TestPlannerDatabase:
+    """Test planner database tables and CRUD methods."""
+
+    def _make_db(self):
+        """Create fresh database for each test using a temp file."""
+        self._tmpdir = tempfile.mkdtemp()
+        db_path = os.path.join(self._tmpdir, "test_planner.db")
+        plugin = MagicMock()
+        db = Database(db_path, plugin)
+        db.initialize()
+        return db
+
+    def test_record_and_get_candidate(self):
+        db = self._make_db()
+        db.record_planner_candidate("peer1", score=0.8, source="winner",
+                                     capacity_recommendation_sats=2000000)
+        candidates = db.get_planner_candidates(min_score=0.5)
+        assert len(candidates) == 1
+        assert candidates[0]["peer_id"] == "peer1"
+        assert candidates[0]["score"] == 0.8
+        assert candidates[0]["source"] == "winner"
+
+    def test_candidate_score_filter(self):
+        db = self._make_db()
+        db.record_planner_candidate("peer1", score=0.8, source="winner")
+        db.record_planner_candidate("peer2", score=0.2, source="graph")
+        candidates = db.get_planner_candidates(min_score=0.5)
+        assert len(candidates) == 1
+        assert candidates[0]["peer_id"] == "peer1"
+
+    def test_candidate_source_filter(self):
+        db = self._make_db()
+        db.record_planner_candidate("peer1", score=0.8, source="winner")
+        db.record_planner_candidate("peer2", score=0.9, source="graph")
+        candidates = db.get_planner_candidates(source="winner")
+        assert len(candidates) == 1
+        assert candidates[0]["peer_id"] == "peer1"
+
+    def test_update_candidate_score(self):
+        db = self._make_db()
+        db.record_planner_candidate("peer1", score=0.5, source="winner")
+        db.update_candidate_score("peer1", 0.3)
+        candidates = db.get_planner_candidates()
+        assert candidates[0]["score"] == pytest.approx(0.8)
+
+    def test_delete_candidate(self):
+        db = self._make_db()
+        db.record_planner_candidate("peer1", score=0.8, source="winner")
+        db.delete_planner_candidate("peer1")
+        candidates = db.get_planner_candidates()
+        assert len(candidates) == 0
+
+    def test_record_and_get_action(self):
+        db = self._make_db()
+        action_id = db.record_planner_action(
+            action_type="open", peer_id="peer1",
+            amount_sats=2000000, estimated_cost_sats=5000,
+            reason="High ROI winner"
+        )
+        assert action_id > 0
+        action = db.get_planner_action(action_id)
+        assert action["action_type"] == "open"
+        assert action["status"] == "planned"
+        assert action["peer_id"] == "peer1"
+
+    def test_update_action_status(self):
+        db = self._make_db()
+        action_id = db.record_planner_action(
+            action_type="close", peer_id="peer2",
+            amount_sats=1000000, estimated_cost_sats=3000,
+            reason="Zombie channel"
+        )
+        db.update_planner_action(action_id, status="executing")
+        action = db.get_planner_action(action_id)
+        assert action["status"] == "executing"
+
+        db.update_planner_action(action_id, status="completed", actual_cost_sats=2800)
+        action = db.get_planner_action(action_id)
+        assert action["status"] == "completed"
+        assert action["actual_cost_sats"] == 2800
+        assert action["completed_at"] is not None
+
+    def test_get_recent_actions_for_cooldown(self):
+        db = self._make_db()
+        db.record_planner_action(action_type="open", peer_id="peer1", reason="test")
+        recent = db.get_recent_planner_actions("peer1", hours=24)
+        assert len(recent) == 1
+        recent_other = db.get_recent_planner_actions("peer2", hours=24)
+        assert len(recent_other) == 0
+
+    def test_get_actions_by_status(self):
+        db = self._make_db()
+        db.record_planner_action(action_type="open", peer_id="peer1", reason="test1")
+        action_id = db.record_planner_action(action_type="close", peer_id="peer2", reason="test2")
+        db.update_planner_action(action_id, status="completed")
+        planned = db.get_planner_actions(status="planned")
+        assert len(planned) == 1
+        completed = db.get_planner_actions(status="completed")
+        assert len(completed) == 1
