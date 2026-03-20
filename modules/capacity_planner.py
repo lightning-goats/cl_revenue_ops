@@ -27,11 +27,12 @@ class CapacityPlanner:
     Identifies capital redeployment opportunities to maximize yield.
     """
 
-    def __init__(self, plugin: Plugin, profitability_analyzer, flow_analyzer, policy_manager=None):
+    def __init__(self, plugin: Plugin, profitability_analyzer, flow_analyzer, policy_manager=None, config=None):
         self.plugin = plugin
         self.profitability = profitability_analyzer
         self.flow = flow_analyzer
         self.policy_manager = policy_manager
+        self.config = config
         self.rebalancer = None
         self._pending_closes: Dict[str, int] = {}
 
@@ -68,6 +69,178 @@ class CapacityPlanner:
             "losers": losers,
             "recommendations": recommendations,
         }
+
+    def execute_cycle(self, cfg=None) -> Dict[str, Any]:
+        """Main timer-driven cycle. Evaluates and executes open/close decisions."""
+        if cfg is None:
+            cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        if not cfg.planner_enabled:
+            return {"skipped": True, "reason": "planner disabled"}
+
+        summary = {
+            "opens": [],
+            "closes": [],
+            "drains_progressed": [],
+            "skipped_reasons": [],
+        }
+
+        # 1. Check fee gate
+        fee_ok, fee_reason = self._check_fee_gate(cfg)
+        if not fee_ok:
+            summary["skipped_reasons"].append(fee_reason)
+
+        # 2. Fetch analysis data
+        all_profitability = self.profitability.analyze_all_channels()
+        all_flow = self.flow.analyze_all_channels()
+
+        # 3. Identify winners and losers
+        winners = self._identify_winners(all_profitability, all_flow)
+        losers = self._identify_losers(all_profitability, all_flow)
+
+        # 4. Progress existing drains
+        db = self.profitability.database if self.profitability else None
+        for channel_id in list(self._pending_closes.keys()):
+            if self._check_drain_complete(channel_id, cfg):
+                # Find the matching draining action from DB
+                action_id = None
+                peer_id = None
+                if db:
+                    try:
+                        draining_actions = db.get_planner_actions(status='draining')
+                        for action in draining_actions:
+                            if action.get('channel_id') == channel_id:
+                                action_id = action.get('id')
+                                peer_id = action.get('peer_id')
+                                break
+                    except Exception as e:
+                        self.plugin.log(
+                            f"Error fetching draining actions for {channel_id}: {e}",
+                            level='debug',
+                        )
+
+                if action_id and peer_id:
+                    result = self._execute_close(channel_id, peer_id, action_id, cfg)
+                    summary["drains_progressed"].append({
+                        "channel_id": channel_id,
+                        "peer_id": peer_id,
+                        "action_id": action_id,
+                        "result": result.get("status", "unknown"),
+                    })
+                else:
+                    # Drain complete but no matching DB record; clean up tracking
+                    del self._pending_closes[channel_id]
+                    summary["drains_progressed"].append({
+                        "channel_id": channel_id,
+                        "result": "orphaned_drain_cleaned",
+                    })
+
+        # 5. Initiate new closes (up to max_closes_per_cycle)
+        closes_this_cycle = 0
+        closeable = [l for l in losers if l.get("action") == "CLOSE"]
+        sorted_closeable = sorted(closeable, key=lambda x: x.get("marginal_roi", 0))
+        for loser in sorted_closeable:
+            if closes_this_cycle >= cfg.planner_max_closes_per_cycle:
+                break
+            scid = loser.get("scid")
+            peer_id = loser.get("peer_id")
+            if scid in self._pending_closes:
+                continue
+
+            # Check policy allows close
+            close_ok, close_reason = self._check_close_allowed(peer_id)
+            if not close_ok:
+                summary["skipped_reasons"].append(
+                    f"Close blocked for {scid}: {close_reason}"
+                )
+                continue
+
+            # Check cooldown
+            cooldown_ok, cooldown_reason = self._check_cooldown(peer_id)
+            if not cooldown_ok:
+                summary["skipped_reasons"].append(
+                    f"Close cooldown for {scid}: {cooldown_reason}"
+                )
+                continue
+
+            action_id = self._initiate_drain(peer_id, scid, cfg, loser.get("reason", ""))
+            summary["closes"].append({
+                "scid": scid,
+                "peer_id": peer_id,
+                "reason": loser.get("reason", ""),
+                "action_id": action_id,
+            })
+            closes_this_cycle += 1
+
+        # 6. Discover and open channels (up to max_opens_per_cycle)
+        candidates = []
+        if fee_ok:
+            candidates = self._discover_peers(winners, all_profitability, all_flow)
+
+            # Get available funds for sizing
+            available_sats = 0
+            try:
+                funds = self.plugin.rpc.listfunds()
+                confirmed = sum(
+                    o.get("amount_msat", 0) // 1000
+                    for o in funds.get("outputs", [])
+                    if o.get("status") == "confirmed"
+                )
+                min_reserve = getattr(cfg, 'min_wallet_reserve', 500000)
+                available_sats = max(0, confirmed - min_reserve)
+            except Exception as e:
+                self.plugin.log(f"Cannot determine available funds: {e}", level='debug')
+
+            opens_this_cycle = 0
+            for candidate in sorted(candidates, key=lambda c: c.get("score", 0), reverse=True):
+                if opens_this_cycle >= cfg.planner_max_opens_per_cycle:
+                    break
+
+                peer_id = candidate["peer_id"]
+
+                # Size channel
+                channel_size = self._size_channel(candidate, candidates, available_sats, cfg)
+
+                # Check EV
+                ev = self._calculate_open_ev(peer_id, channel_size, cfg)
+                if ev <= 0:
+                    summary["skipped_reasons"].append(
+                        f"Negative EV ({ev:.0f}) for {peer_id[:16]}..."
+                    )
+                    continue
+
+                # Check safety guards
+                guards_ok, guards_reason = self._check_safety_guards(
+                    cfg, "open", peer_id, amount_sats=channel_size
+                )
+                if not guards_ok:
+                    summary["skipped_reasons"].append(
+                        f"Guard failed for {peer_id[:16]}...: {guards_reason}"
+                    )
+                    continue
+
+                # Execute open
+                result = self._execute_open(
+                    peer_id, channel_size, cfg,
+                    reason=candidate.get("reason", "Planner cycle open"),
+                )
+                summary["opens"].append({
+                    "peer_id": peer_id,
+                    "amount_sats": channel_size,
+                    "ev": round(ev, 0),
+                    "result": result.get("status", "unknown"),
+                    "action_id": result.get("action_id"),
+                })
+                opens_this_cycle += 1
+
+                # Reduce available sats for next candidate
+                available_sats = max(0, available_sats - channel_size)
+
+        # 7. Update candidate pool
+        self._update_candidate_pool(candidates if fee_ok else [])
+
+        summary["timestamp"] = int(time.time())
+        return summary
 
     def _get_mempool_recommendation(self) -> str:
         """Query feerates and return a graduated recommendation based on opening costs."""

@@ -161,12 +161,27 @@ class TestRebalanceDifficulty:
         assert winners[0]["rebal_difficulty"] == 0.7  # 1 - 0.3
 
 
-def test_no_config_parameter():
-    """CapacityPlanner should not accept a config parameter."""
+def test_config_parameter_accepted():
+    """CapacityPlanner should accept a config parameter."""
     import inspect
     sig = inspect.signature(CapacityPlanner.__init__)
     param_names = list(sig.parameters.keys())
-    assert "config" not in param_names
+    assert "config" in param_names
+
+
+def test_config_stored_on_instance():
+    """Config parameter is stored as self.config."""
+    plugin = MagicMock()
+    mock_config = MagicMock()
+    planner = CapacityPlanner(plugin, MagicMock(), MagicMock(), config=mock_config)
+    assert planner.config is mock_config
+
+
+def test_config_defaults_to_none():
+    """Config defaults to None when not provided."""
+    plugin = MagicMock()
+    planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+    assert planner.config is None
 
 
 class TestLoserClassification:
@@ -3014,3 +3029,552 @@ class TestDrainAndClose:
         planner = CapacityPlanner(plugin, prof, flow)
 
         assert planner.rebalancer is None
+
+
+# ---------------------------------------------------------------------------
+# Execute Cycle Tests
+# ---------------------------------------------------------------------------
+
+def _make_cycle_cfg(planner_enabled=True, planner_max_opens_per_cycle=2,
+                    planner_max_closes_per_cycle=2, planner_dry_run=False,
+                    planner_max_fee_rate_sat_vb=50.0, min_wallet_reserve=500000,
+                    planner_min_channel_sats=500000, planner_max_channel_sats=10000000,
+                    planner_drain_timeout_hours=72):
+    """Create a mock config snapshot for execute_cycle tests."""
+    cfg = MagicMock()
+    cfg.planner_enabled = planner_enabled
+    cfg.planner_max_opens_per_cycle = planner_max_opens_per_cycle
+    cfg.planner_max_closes_per_cycle = planner_max_closes_per_cycle
+    cfg.planner_dry_run = planner_dry_run
+    cfg.planner_max_fee_rate_sat_vb = planner_max_fee_rate_sat_vb
+    cfg.min_wallet_reserve = min_wallet_reserve
+    cfg.planner_min_channel_sats = planner_min_channel_sats
+    cfg.planner_max_channel_sats = planner_max_channel_sats
+    cfg.planner_drain_timeout_hours = planner_drain_timeout_hours
+    return cfg
+
+
+def _make_cycle_planner(feerates_return=None, listfunds_return=None,
+                         all_profitability=None, all_flow=None,
+                         winners=None, losers=None,
+                         with_policy_manager=True):
+    """Create a CapacityPlanner wired up for execute_cycle tests.
+
+    Returns (planner, plugin, prof_analyzer, flow_analyzer, policy_manager).
+    """
+    plugin = MagicMock()
+
+    # Fee gate default: low fees
+    plugin.rpc.feerates.return_value = feerates_return or {
+        "perkb": {"opening": 10000}  # 10 sat/vB
+    }
+
+    # listfunds default: plenty of funds
+    plugin.rpc.listfunds.return_value = listfunds_return or {
+        "outputs": [
+            {"amount_msat": 50_000_000_000, "status": "confirmed"},  # 50M sats
+        ],
+        "channels": [],
+    }
+
+    # No nodes for graph discovery
+    plugin.rpc.listnodes.return_value = {"nodes": []}
+    plugin.rpc.listchannels.return_value = {"channels": []}
+    plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+    plugin.rpc.listpeerchannels.return_value = {"channels": []}
+
+    prof_analyzer = MagicMock()
+    flow_analyzer = MagicMock()
+
+    # Default return values for analysis
+    prof_analyzer.analyze_all_channels.return_value = all_profitability or {}
+    flow_analyzer.analyze_all_channels.return_value = all_flow or {}
+
+    # Default DB mocks
+    prof_analyzer.database.get_planner_actions.return_value = []
+    prof_analyzer.database.get_recent_planner_actions.return_value = []
+    prof_analyzer.database.get_planner_candidates.return_value = []
+    prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+    prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+    prof_analyzer.database.get_fee_strategy_state.return_value = None
+    prof_analyzer.database.get_peer_uptime_percent.side_effect = Exception("not available")
+    prof_analyzer.database.get_peer_reputation.return_value = None
+    prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+        'count': 0, 'marginal_roi_proxy': 0,
+    }
+    prof_analyzer.database.record_planner_action.return_value = 1
+    prof_analyzer.database.record_planner_candidate.return_value = None
+    prof_analyzer.identify_bleeders_v2.return_value = []
+
+    # fundchannel default
+    plugin.rpc.fundchannel.return_value = {"channel_id": "new_chan_id"}
+    plugin.rpc.connect.return_value = {}
+
+    pm = MagicMock() if with_policy_manager else None
+    if pm:
+        policy = MagicMock()
+        policy.strategy = MagicMock()
+        policy.strategy.value = "dynamic"
+        policy.has_tag.return_value = False
+        pm.get_policy.return_value = policy
+
+    planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer,
+                               policy_manager=pm)
+    return planner, plugin, prof_analyzer, flow_analyzer, pm
+
+
+class TestExecuteCycle:
+    """Test execute_cycle orchestration method."""
+
+    def test_execute_cycle_skips_when_disabled(self):
+        """Cycle does nothing when planner_enabled=False."""
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        cfg = _make_cycle_cfg(planner_enabled=False)
+
+        result = planner.execute_cycle(cfg)
+
+        assert result["skipped"] is True
+        assert result["reason"] == "planner disabled"
+        # No analysis should have been called
+        prof.analyze_all_channels.assert_not_called()
+        flow.analyze_all_channels.assert_not_called()
+
+    def test_execute_cycle_returns_summary_structure(self):
+        """Cycle returns structured summary with all expected keys."""
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        cfg = _make_cycle_cfg()
+
+        result = planner.execute_cycle(cfg)
+
+        assert "opens" in result
+        assert "closes" in result
+        assert "drains_progressed" in result
+        assert "skipped_reasons" in result
+        assert "timestamp" in result
+        assert isinstance(result["opens"], list)
+        assert isinstance(result["closes"], list)
+        assert isinstance(result["drains_progressed"], list)
+        assert isinstance(result["skipped_reasons"], list)
+        assert isinstance(result["timestamp"], int)
+
+    def test_execute_cycle_opens_best_candidate(self):
+        """Cycle opens channel to highest-scoring candidate when guards pass."""
+        # Set up a winner channel that will generate a candidate
+        scid = "100x200x0"
+        winner_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=50.0, roi_percent=50.0,
+            classification=ProfitabilityClass.PROFITABLE, days_open=60,
+        )
+        winner_flow = _mock_flow(
+            daily_volume=1_500_000, flow_ratio=0.9, capacity=2_000_000,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: winner_prof},
+            all_flow={scid: winner_flow},
+        )
+        # Ensure fundchannel returns a channel id
+        plugin.rpc.fundchannel.return_value = {"channel_id": "opened_chan"}
+
+        # Ensure positive EV: give closed summary with good history
+        prof.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 1, 'marginal_roi_proxy': 0.5, 'daily_net_est_sats': 100,
+        }
+
+        cfg = _make_cycle_cfg(planner_max_opens_per_cycle=1)
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["opens"]) >= 1
+        # Verify the open was for the winner's peer
+        opened = result["opens"][0]
+        assert opened["peer_id"] == winner_prof.peer_id
+        assert opened["result"] in ("completed", "dry_run")
+
+    def test_execute_cycle_closes_worst_loser(self):
+        """Cycle initiates drain on worst loser when guards pass."""
+        # Set up a zombie loser
+        scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+
+        cfg = _make_cycle_cfg(planner_max_closes_per_cycle=1)
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["closes"]) == 1
+        closed = result["closes"][0]
+        assert closed["scid"] == scid
+        assert closed["peer_id"] == loser_prof.peer_id
+        assert "ZOMBIE" in closed["reason"]
+
+    def test_execute_cycle_respects_max_opens_per_cycle(self):
+        """At most max_opens_per_cycle opens per invocation."""
+        # Create 3 winner channels
+        all_prof = {}
+        all_flow = {}
+        for i in range(3):
+            scid = f"{100+i}x200x0"
+            peer_id = f"02{'a' * 60}{i:04d}"
+            prof = _mock_profitability(
+                scid=scid, peer_id=peer_id,
+                marginal_roi_percent=50.0, roi_percent=50.0,
+                classification=ProfitabilityClass.PROFITABLE, days_open=60,
+            )
+            fl = _mock_flow(
+                daily_volume=1_500_000, flow_ratio=0.9, capacity=2_000_000,
+            )
+            all_prof[scid] = prof
+            all_flow[scid] = fl
+
+        planner, plugin, prof_az, flow_az, pm = _make_cycle_planner(
+            all_profitability=all_prof,
+            all_flow=all_flow,
+        )
+
+        # Ensure positive EV
+        prof_az.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 1, 'marginal_roi_proxy': 0.5, 'daily_net_est_sats': 100,
+        }
+        plugin.rpc.fundchannel.return_value = {"channel_id": "chan_opened"}
+
+        # Only allow 1 open per cycle
+        cfg = _make_cycle_cfg(planner_max_opens_per_cycle=1)
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["opens"]) <= 1
+
+    def test_execute_cycle_respects_max_closes_per_cycle(self):
+        """At most max_closes_per_cycle closes per invocation."""
+        # Create 3 loser channels
+        all_prof = {}
+        all_flow = {}
+        for i in range(3):
+            scid = f"{200+i}x300x0"
+            peer_id = f"02{'b' * 60}{i:04d}"
+            prof = _mock_profitability(
+                scid=scid, peer_id=peer_id,
+                marginal_roi_percent=-80.0, roi_percent=-90.0,
+                classification=ProfitabilityClass.ZOMBIE, days_open=120,
+            )
+            prof.channel_role = "balanced"
+            fl = _mock_flow(
+                daily_volume=100, flow_ratio=0.5, confidence=1.0,
+                kalman_regime_change=False,
+            )
+            all_prof[scid] = prof
+            all_flow[scid] = fl
+
+        planner, plugin, prof_az, flow_az, pm = _make_cycle_planner(
+            all_profitability=all_prof,
+            all_flow=all_flow,
+        )
+
+        # Only allow 1 close per cycle
+        cfg = _make_cycle_cfg(planner_max_closes_per_cycle=1)
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["closes"]) <= 1
+
+    def test_execute_cycle_progresses_draining_channels(self):
+        """Cycle checks drain progress on pending closes and executes close."""
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+
+        # Seed a pending drain that is complete (timed out)
+        channel_id = "100x200x0"
+        planner._pending_closes[channel_id] = int(time.time()) - 999999  # Long ago
+
+        # Mock DB returning a matching draining action
+        prof.database.get_planner_actions.return_value = [
+            {"id": 42, "channel_id": channel_id, "peer_id": "peer_abc", "status": "draining"},
+        ]
+
+        # Mock the close RPC
+        plugin.rpc.close.return_value = {"txid": "abc123"}
+
+        cfg = _make_cycle_cfg(planner_drain_timeout_hours=1)  # 1 hour timeout, drain started long ago
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["drains_progressed"]) == 1
+        progressed = result["drains_progressed"][0]
+        assert progressed["channel_id"] == channel_id
+        assert progressed["peer_id"] == "peer_abc"
+        assert progressed["action_id"] == 42
+        assert progressed["result"] == "completed"
+
+    def test_execute_cycle_skips_close_for_static_policy(self):
+        """Close skipped for channel with static policy."""
+        scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+
+        # Set policy to static -> close blocked
+        policy = MagicMock()
+        policy.strategy = MagicMock()
+        policy.strategy.value = "static"
+        pm.get_policy.return_value = policy
+
+        cfg = _make_cycle_cfg()
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["closes"]) == 0
+        # Should have a skipped reason about static policy
+        assert any("close blocked" in r.lower() or "static" in r.lower()
+                    for r in result["skipped_reasons"])
+
+    def test_execute_cycle_skips_open_when_fee_gate_fails(self):
+        """No opens attempted when fee gate blocks."""
+        scid = "100x200x0"
+        winner_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=50.0, roi_percent=50.0,
+            classification=ProfitabilityClass.PROFITABLE, days_open=60,
+        )
+        winner_flow = _mock_flow(
+            daily_volume=1_500_000, flow_ratio=0.9, capacity=2_000_000,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            feerates_return={"perkb": {"opening": 200000}},  # 200 sat/vB
+            all_profitability={scid: winner_prof},
+            all_flow={scid: winner_flow},
+        )
+
+        cfg = _make_cycle_cfg(planner_max_fee_rate_sat_vb=50.0)
+
+        result = planner.execute_cycle(cfg)
+
+        # Opens should be empty because fee gate failed
+        assert len(result["opens"]) == 0
+        # Fee gate reason should be in skipped_reasons
+        assert any("exceeds max" in r for r in result["skipped_reasons"])
+        # fundchannel should never have been called
+        plugin.rpc.fundchannel.assert_not_called()
+
+    def test_execute_cycle_skips_open_for_negative_ev(self):
+        """Opens skipped when EV is negative."""
+        scid = "100x200x0"
+        winner_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=50.0, roi_percent=50.0,
+            classification=ProfitabilityClass.PROFITABLE, days_open=60,
+        )
+        winner_flow = _mock_flow(
+            daily_volume=1_500_000, flow_ratio=0.9, capacity=2_000_000,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            # Very high fees to make EV negative during EV calc
+            feerates_return={"perkb": {"opening": 500000}},  # 500 sat/vB
+            all_profitability={scid: winner_prof},
+            all_flow={scid: winner_flow},
+        )
+
+        # High fee threshold so fee gate passes, but EV will be negative
+        cfg = _make_cycle_cfg(planner_max_fee_rate_sat_vb=600.0)
+
+        result = planner.execute_cycle(cfg)
+
+        # Opens should be empty because EV is negative
+        assert len(result["opens"]) == 0
+        assert any("Negative EV" in r for r in result["skipped_reasons"])
+
+    def test_execute_cycle_uses_config_snapshot(self):
+        """Cycle uses config.snapshot() when no cfg passed."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 10000}}
+        plugin.rpc.listfunds.return_value = {
+            "outputs": [{"amount_msat": 50_000_000_000, "status": "confirmed"}],
+            "channels": [],
+        }
+        plugin.rpc.listnodes.return_value = {"nodes": []}
+        plugin.rpc.listchannels.return_value = {"channels": []}
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        prof = MagicMock()
+        prof.analyze_all_channels.return_value = {}
+        prof.database.get_planner_actions.return_value = []
+        prof.database.get_planner_candidates.return_value = []
+        prof.identify_bleeders_v2.return_value = []
+
+        flow = MagicMock()
+        flow.analyze_all_channels.return_value = {}
+
+        mock_config = MagicMock()
+        snapshot_cfg = _make_cycle_cfg(planner_enabled=False)
+        mock_config.snapshot.return_value = snapshot_cfg
+
+        planner = CapacityPlanner(plugin, prof, flow, config=mock_config)
+        result = planner.execute_cycle()
+
+        mock_config.snapshot.assert_called_once()
+        assert result["skipped"] is True
+
+    def test_execute_cycle_skips_already_pending_close(self):
+        """Channels already in _pending_closes are not drained again."""
+        scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+
+        # Already pending
+        planner._pending_closes[scid] = int(time.time())
+
+        # The drain is NOT complete
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [{
+                "short_channel_id": scid,
+                "spendable_msat": 900_000_000,  # 90% local balance
+                "total_msat": 1_000_000_000,
+            }],
+        }
+
+        cfg = _make_cycle_cfg(planner_drain_timeout_hours=999)
+
+        result = planner.execute_cycle(cfg)
+
+        # Should not initiate a new close for already-pending channel
+        assert len(result["closes"]) == 0
+
+    def test_execute_cycle_orphaned_drain_cleaned(self):
+        """Drain-complete channel without DB record is cleaned up."""
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+
+        channel_id = "orphan_chan"
+        planner._pending_closes[channel_id] = int(time.time()) - 999999
+
+        # No matching draining action in DB
+        prof.database.get_planner_actions.return_value = []
+
+        cfg = _make_cycle_cfg(planner_drain_timeout_hours=1)
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["drains_progressed"]) == 1
+        assert result["drains_progressed"][0]["result"] == "orphaned_drain_cleaned"
+        # Channel should be removed from pending
+        assert channel_id not in planner._pending_closes
+
+    def test_execute_cycle_cooldown_blocks_close(self):
+        """Close skipped when peer has recent action (cooldown)."""
+        scid = "200x300x0"
+        peer_id = "02" + "c" * 64
+        loser_prof = _mock_profitability(
+            scid=scid, peer_id=peer_id,
+            marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+
+        # Recent action for this peer
+        prof.database.get_recent_planner_actions.return_value = [
+            {"peer_id": peer_id, "action": "close", "timestamp": int(time.time())},
+        ]
+
+        cfg = _make_cycle_cfg()
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["closes"]) == 0
+        assert any("cooldown" in r.lower() for r in result["skipped_reasons"])
+
+    def test_execute_cycle_closes_still_initiate_when_fee_gate_fails(self):
+        """Closes can still be initiated even when fee gate blocks opens."""
+        scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            feerates_return={"perkb": {"opening": 200000}},  # 200 sat/vB
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+
+        cfg = _make_cycle_cfg(planner_max_fee_rate_sat_vb=50.0)
+
+        result = planner.execute_cycle(cfg)
+
+        # Fee gate blocks opens but not closes
+        assert len(result["opens"]) == 0
+        assert len(result["closes"]) == 1  # Close should still proceed
+
+    def test_execute_cycle_dry_run_mode(self):
+        """In dry_run mode, opens and closes record dry_run status."""
+        scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+
+        cfg = _make_cycle_cfg(planner_dry_run=True)
+
+        result = planner.execute_cycle(cfg)
+
+        # Closes happen in dry_run mode but don't execute actual close
+        assert len(result["closes"]) == 1
+        # fundchannel should NOT have been called (nothing to open here, but also
+        # the drain should be recorded as dry_run in DB)
+        prof.database.update_planner_action.assert_any_call(1, status="dry_run")

@@ -1169,7 +1169,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Initialize analysis modules
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
-    capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager)
+    capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager, config=config)
     fee_controller = FeeController(
         safe_plugin,
         config,
@@ -1426,6 +1426,39 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
         _boltz_auto_cycle_mark_state(next_run_ts=None, running=False)
 
+    def capacity_planner_loop():
+        """Background loop for automated capacity planning."""
+        if not config.planner_enabled:
+            plugin.log("Capacity planner disabled, loop not started", level='debug')
+            return
+
+        # Startup delay: wait for flow + profitability data to warm up
+        startup_delay = 300
+        if shutdown_event.wait(startup_delay):
+            return
+
+        while not shutdown_event.is_set():
+            try:
+                plugin.log("Running scheduled capacity planner cycle...")
+                result = capacity_planner.execute_cycle()
+                if result.get("skipped"):
+                    plugin.log(f"Planner cycle skipped: {result.get('reason')}", level='debug')
+                else:
+                    opens = len(result.get("opens", []))
+                    closes = len(result.get("closes", []))
+                    drains = len(result.get("drains_progressed", []))
+                    plugin.log(f"Planner cycle complete: {opens} opens, {closes} closes, {drains} drains progressed")
+            except Exception as e:
+                plugin.log(f"Error in capacity planner cycle: {e}", level='error')
+                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+
+            cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+            interval = max(600, cfg_snap.planner_interval)
+            jitter = int(interval * 0.2)
+            sleep_time = interval + random.randint(-jitter, jitter)
+            if shutdown_event.wait(sleep_time):
+                break
+
     def snapshot_peers_delayed():
         """
         One-time delayed snapshot of connected peers.
@@ -1569,6 +1602,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
     threading.Thread(target=boltz_auto_cycle_loop, daemon=True, name="boltz-auto-cycle").start()
+    threading.Thread(target=capacity_planner_loop, daemon=True, name="capacity-planner").start()
 
     plugin.log("cl-revenue-ops plugin initialized successfully!")
     return None
