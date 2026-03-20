@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import pytest
 
 from modules.boltz_manager import BoltzCliConfig, BoltzCliManager
+from tests.plugin_test_utils import load_plugin_module
 
 
 def _make_manager(**overrides):
@@ -24,6 +25,64 @@ def _make_manager(**overrides):
     rpc = MagicMock()
     mgr = BoltzCliManager(plugin, rpc, cfg)
     return mgr
+
+
+def _load_boltz_plugin_module():
+    mod = load_plugin_module()
+    mod.plugin.log = MagicMock()
+    return mod
+
+
+class TestBoltzAutoCycleModeSelection:
+    def test_prefers_treasury_when_reserve_below_target(self):
+        mod = _load_boltz_plugin_module()
+
+        selection = mod._select_boltz_auto_cycle_mode(
+            treasury_plan={
+                "status": "ok",
+                "recommendations": [{"channel_id": "100x1x0"}],
+                "treasury": {"deficit_sats": 700000, "min_deficit_sats": 250000},
+            },
+            balance_plan={
+                "recommendations": [{"channel_id": "200x1x0"}],
+            },
+        )
+
+        assert selection["mode"] == "treasury"
+        assert selection["reason"] == "standing_onchain_reserve_below_target"
+        assert selection["reserve_deficit_sats"] == 700000
+
+    def test_falls_back_to_balance_when_treasury_is_at_target(self):
+        mod = _load_boltz_plugin_module()
+
+        selection = mod._select_boltz_auto_cycle_mode(
+            treasury_plan={
+                "status": "at_target",
+                "recommendations": [],
+                "treasury": {"deficit_sats": 0, "min_deficit_sats": 250000},
+            },
+            balance_plan={
+                "recommendations": [{"channel_id": "200x1x0"}],
+            },
+        )
+
+        assert selection["mode"] == "balance"
+        assert selection["reason"] == "onchain_reserve_healthy_use_balance_mode"
+
+    def test_returns_idle_when_no_mode_has_candidates(self):
+        mod = _load_boltz_plugin_module()
+
+        selection = mod._select_boltz_auto_cycle_mode(
+            treasury_plan={
+                "status": "at_target",
+                "recommendations": [],
+                "treasury": {"deficit_sats": 0},
+            },
+            balance_plan={"recommendations": []},
+        )
+
+        assert selection["mode"] == "idle"
+        assert selection["reason"] == "no_eligible_boltz_actions"
 
 
 class TestDynamicChannelTuning:
