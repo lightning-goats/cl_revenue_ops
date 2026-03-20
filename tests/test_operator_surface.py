@@ -165,12 +165,12 @@ def test_planner_cycle_limits_are_parsed_during_init(monkeypatch):
         monkeypatch,
         {
             "revenue-ops-planner-max-opens-per-cycle": "3",
-            "revenue-ops-planner-max-closes-per-cycle": "0",
+            "revenue-ops-planner-max-closes-per-cycle": "2",
         },
     )
 
     assert cfg.planner_max_opens_per_cycle == 3
-    assert cfg.planner_max_closes_per_cycle == 0
+    assert cfg.planner_max_closes_per_cycle == 2
 
 
 def test_revenue_config_list_mutable_returns_public_controls_only():
