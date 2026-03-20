@@ -51,48 +51,6 @@ from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.utils import normalize_scid, parse_msat
 
 
-def _select_boltz_auto_cycle_mode(
-    *,
-    treasury_plan: Optional[Dict[str, Any]],
-    balance_plan: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Pick the next Boltz mode without side effects."""
-    treasury_plan = treasury_plan if isinstance(treasury_plan, dict) else {}
-    balance_plan = balance_plan if isinstance(balance_plan, dict) else {}
-
-    treasury = treasury_plan.get("treasury")
-    treasury = treasury if isinstance(treasury, dict) else {}
-    treasury_recommendations = list(treasury_plan.get("recommendations", [])) if isinstance(treasury_plan.get("recommendations", []), list) else []
-    balance_recommendations = list(balance_plan.get("recommendations", [])) if isinstance(balance_plan.get("recommendations", []), list) else []
-    reserve_deficit_sats = int(treasury.get("deficit_sats", 0) or 0)
-
-    if str(treasury_plan.get("status") or "") == "ok" and treasury_recommendations:
-        return {
-            "mode": "treasury",
-            "reason": "standing_onchain_reserve_below_target",
-            "reserve_deficit_sats": reserve_deficit_sats,
-            "treasury_candidate_count": len(treasury_recommendations),
-            "balance_candidate_count": len(balance_recommendations),
-        }
-
-    if balance_recommendations:
-        return {
-            "mode": "balance",
-            "reason": "onchain_reserve_healthy_use_balance_mode",
-            "reserve_deficit_sats": reserve_deficit_sats,
-            "treasury_candidate_count": len(treasury_recommendations),
-            "balance_candidate_count": len(balance_recommendations),
-        }
-
-    return {
-        "mode": "idle",
-        "reason": "no_eligible_boltz_actions",
-        "reserve_deficit_sats": reserve_deficit_sats,
-        "treasury_candidate_count": len(treasury_recommendations),
-        "balance_candidate_count": len(balance_recommendations),
-    }
-
-
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
@@ -841,6 +799,59 @@ plugin.add_option(
     default='false',
     description='Allow the capacity planner to execute close RPCs (default: false)'
 )
+
+
+# Boltz auto-cycle mode selection stays at module scope so tests can call it
+# directly, but it lives next to the auto-cycle runtime code rather than near
+# imports.
+def _select_boltz_auto_cycle_mode(
+    *,
+    treasury_plan: Optional[Dict[str, Any]],
+    balance_plan: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Pick the next Boltz mode without side effects."""
+    treasury_plan = treasury_plan if isinstance(treasury_plan, dict) else {}
+    balance_plan = balance_plan if isinstance(balance_plan, dict) else {}
+
+    treasury = treasury_plan.get("treasury")
+    treasury = treasury if isinstance(treasury, dict) else {}
+    treasury_recommendations = (
+        list(treasury_plan.get("recommendations", []))
+        if isinstance(treasury_plan.get("recommendations", []), list)
+        else []
+    )
+    balance_recommendations = (
+        list(balance_plan.get("recommendations", []))
+        if isinstance(balance_plan.get("recommendations", []), list)
+        else []
+    )
+    reserve_deficit_sats = int(treasury.get("deficit_sats", 0) or 0)
+
+    if str(treasury_plan.get("status") or "") == "ok" and treasury_recommendations:
+        return {
+            "mode": "treasury",
+            "reason": "standing_onchain_reserve_below_target",
+            "reserve_deficit_sats": reserve_deficit_sats,
+            "treasury_candidate_count": len(treasury_recommendations),
+            "balance_candidate_count": len(balance_recommendations),
+        }
+
+    if balance_recommendations:
+        return {
+            "mode": "balance",
+            "reason": "onchain_reserve_healthy_use_balance_mode",
+            "reserve_deficit_sats": reserve_deficit_sats,
+            "treasury_candidate_count": len(treasury_recommendations),
+            "balance_candidate_count": len(balance_recommendations),
+        }
+
+    return {
+        "mode": "idle",
+        "reason": "no_eligible_boltz_actions",
+        "reserve_deficit_sats": reserve_deficit_sats,
+        "treasury_candidate_count": len(treasury_recommendations),
+        "balance_candidate_count": len(balance_recommendations),
+    }
 
 
 # =============================================================================

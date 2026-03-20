@@ -51,6 +51,8 @@ class TestBoltzAutoCycleModeSelection:
         assert selection["mode"] == "treasury"
         assert selection["reason"] == "standing_onchain_reserve_below_target"
         assert selection["reserve_deficit_sats"] == 700000
+        assert selection["treasury_candidate_count"] == 1
+        assert selection["balance_candidate_count"] == 1
 
     def test_falls_back_to_balance_when_treasury_is_at_target(self):
         mod = _load_boltz_plugin_module()
@@ -68,6 +70,8 @@ class TestBoltzAutoCycleModeSelection:
 
         assert selection["mode"] == "balance"
         assert selection["reason"] == "onchain_reserve_healthy_use_balance_mode"
+        assert selection["treasury_candidate_count"] == 0
+        assert selection["balance_candidate_count"] == 1
 
     def test_returns_idle_when_no_mode_has_candidates(self):
         mod = _load_boltz_plugin_module()
@@ -83,6 +87,8 @@ class TestBoltzAutoCycleModeSelection:
 
         assert selection["mode"] == "idle"
         assert selection["reason"] == "no_eligible_boltz_actions"
+        assert selection["treasury_candidate_count"] == 0
+        assert selection["balance_candidate_count"] == 0
 
 
 class TestDynamicChannelTuning:
