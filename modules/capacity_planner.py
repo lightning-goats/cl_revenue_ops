@@ -769,3 +769,119 @@ class CapacityPlanner:
             return int(sat_per_vb * 140)  # ~140 vbytes for funding tx
         except Exception:
             return ChainCostDefaults.CHANNEL_OPEN_COST_SATS
+
+    def _execute_open(self, peer_id: str, amount_sats: int, cfg, reason: str) -> Dict:
+        """Execute a channel open via fundchannel RPC.
+
+        Flow:
+        1. Record planned action in database
+        2. If dry_run, log and return early
+        3. Reserve budget via generic spend ledger
+        4. Connect to peer
+        5. Call fundchannel
+        6. On success: update action, mark spend
+        7. On failure: update action, release reservation
+        """
+        db = self.profitability.database if self.profitability else None
+
+        estimated_cost = self._estimate_open_cost()
+
+        # Record the planned action
+        action_id = None
+        if db:
+            try:
+                action_id = db.record_planner_action(
+                    action_type="open",
+                    peer_id=peer_id,
+                    amount_sats=amount_sats,
+                    estimated_cost_sats=estimated_cost,
+                    reason=reason,
+                )
+            except Exception as e:
+                self.plugin.log(f"Failed to record planner action: {e}", level='warn')
+
+        # Dry run mode: log but don't execute
+        if cfg.planner_dry_run:
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="dry_run")
+                except Exception:
+                    pass
+            self.plugin.log(
+                f"[DRY RUN] Would open {amount_sats} sat channel to {peer_id[:16]}... "
+                f"(estimated cost: {estimated_cost} sats, reason: {reason})",
+                level='info'
+            )
+            return {"action_id": action_id, "status": "dry_run", "peer_id": peer_id, "amount_sats": amount_sats}
+
+        # Reserve budget
+        reservation_id = f"planner-open-{peer_id[:16]}-{int(time.time())}"
+        if db:
+            try:
+                db.reserve_spend(
+                    reservation_id=reservation_id,
+                    amount_sats=estimated_cost,
+                    category="channel_open",
+                    subcategory="automated",
+                    metadata={"peer_id": peer_id, "amount_sats": amount_sats},
+                )
+            except Exception as e:
+                self.plugin.log(f"Budget reservation failed: {e}", level='warn')
+
+        try:
+            # Connect first (may already be connected)
+            try:
+                self.plugin.rpc.connect(peer_id)
+            except Exception:
+                pass  # Connection may already exist
+
+            # Fund channel
+            result = self.plugin.rpc.fundchannel(
+                id=peer_id,
+                amount=amount_sats,
+                announce=True,
+            )
+
+            channel_id = result.get("channel_id") or result.get("channelid")
+
+            # Success: update action and mark spend
+            if db and action_id:
+                try:
+                    db.update_planner_action(
+                        action_id,
+                        status="completed",
+                        channel_id=channel_id,
+                    )
+                except Exception:
+                    pass
+            if db:
+                try:
+                    db.mark_spend_reservation_spent(
+                        reservation_id=reservation_id,
+                        actual_spent_sats=estimated_cost,
+                        source="capacity_planner",
+                    )
+                except Exception:
+                    pass
+
+            self.plugin.log(
+                f"Channel opened: {channel_id} to {peer_id[:16]}... ({amount_sats} sats)",
+                level='info'
+            )
+            return {"action_id": action_id, "status": "completed", "channel_id": channel_id, "peer_id": peer_id}
+
+        except Exception as e:
+            # Failure: update action and release reservation
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="failed")
+                except Exception:
+                    pass
+            if db:
+                try:
+                    db.release_spend_reservation(reservation_id)
+                except Exception:
+                    pass
+
+            self.plugin.log(f"Channel open failed for {peer_id[:16]}...: {e}", level='error')
+            return {"action_id": action_id, "status": "failed", "error": str(e), "peer_id": peer_id}

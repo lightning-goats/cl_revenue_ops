@@ -2372,3 +2372,187 @@ class TestEstimateOpenCost:
         cost = planner._estimate_open_cost()
         # default 1000 perkb => 1 sat/vB * 140 = 140
         assert cost == 140
+
+
+# ---------------------------------------------------------------------------
+# Channel Open Execution Tests
+# ---------------------------------------------------------------------------
+
+def _make_open_cfg(planner_dry_run=False):
+    """Create a mock config for channel open tests."""
+    cfg = MagicMock()
+    cfg.planner_dry_run = planner_dry_run
+    return cfg
+
+
+def _make_open_planner():
+    """Create a CapacityPlanner wired up for _execute_open tests.
+
+    Returns (planner, db) where db is the mock database.
+    """
+    plugin = MagicMock()
+    prof_analyzer = MagicMock()
+    flow_analyzer = MagicMock()
+    db = prof_analyzer.database
+
+    # Default: record_planner_action returns an action id
+    db.record_planner_action.return_value = 42
+
+    # Default: feerates for _estimate_open_cost
+    plugin.rpc.feerates.return_value = {"perkb": {"opening": 2000}}  # 2 sat/vB
+    # Default: fundchannel succeeds
+    plugin.rpc.fundchannel.return_value = {"channel_id": "123x1x0"}
+
+    planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+    return planner, db
+
+
+class TestChannelOpen:
+    """Tests for _execute_open channel open execution."""
+
+    def test_execute_open_calls_fundchannel(self):
+        """Successful open calls plugin.rpc.fundchannel with correct params."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        result = planner._execute_open("peer1", 2000000, cfg, "test reason")
+        planner.plugin.rpc.fundchannel.assert_called_once_with(
+            id="peer1", amount=2000000, announce=True)
+        assert result["status"] == "completed"
+        assert result["channel_id"] == "123x1x0"
+
+    def test_execute_open_connects_first(self):
+        """Open attempts to connect to peer before funding."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        planner._execute_open("peer1", 2000000, cfg, "test")
+        planner.plugin.rpc.connect.assert_called_once_with("peer1")
+
+    def test_execute_open_records_action(self):
+        """Open execution records action in planner_actions table."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        result = planner._execute_open("peer1", 2000000, cfg, "test")
+        assert result["action_id"] == 42
+        db.record_planner_action.assert_called_once()
+        call_kwargs = db.record_planner_action.call_args
+        assert call_kwargs[1]["action_type"] == "open"
+        assert call_kwargs[1]["peer_id"] == "peer1"
+        assert call_kwargs[1]["amount_sats"] == 2000000
+
+    def test_execute_open_handles_failure(self):
+        """Failed fundchannel records action as failed."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        planner.plugin.rpc.fundchannel.side_effect = Exception("peer offline")
+        result = planner._execute_open("peer1", 2000000, cfg, "test")
+        assert result["status"] == "failed"
+        assert "peer offline" in result["error"]
+
+    def test_execute_open_reserves_budget(self):
+        """Open reserves budget via generic spend ledger."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        planner._execute_open("peer1", 2000000, cfg, "test")
+        db.reserve_spend.assert_called_once()
+        assert db.reserve_spend.call_args[1]["category"] == "channel_open"
+
+    def test_execute_open_releases_on_failure(self):
+        """Failed open releases budget reservation."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        planner.plugin.rpc.fundchannel.side_effect = Exception("fail")
+        planner._execute_open("peer1", 2000000, cfg, "test")
+        db.release_spend_reservation.assert_called_once()
+
+    def test_dry_run_does_not_call_fundchannel(self):
+        """Dry run mode logs but does not execute."""
+        planner, db = _make_open_planner()
+        dry_cfg = _make_open_cfg(planner_dry_run=True)
+        result = planner._execute_open("peer1", 2000000, dry_cfg, "test")
+        assert result["status"] == "dry_run"
+        planner.plugin.rpc.fundchannel.assert_not_called()
+
+    def test_dry_run_records_action(self):
+        """Dry run still records the decision in database."""
+        planner, db = _make_open_planner()
+        dry_cfg = _make_open_cfg(planner_dry_run=True)
+        planner._execute_open("peer1", 2000000, dry_cfg, "test")
+        db.update_planner_action.assert_called_with(42, status="dry_run")
+
+    def test_connect_failure_still_tries_fundchannel(self):
+        """If connect fails (already connected), fundchannel still attempted."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        planner.plugin.rpc.connect.side_effect = Exception("already connected")
+        result = planner._execute_open("peer1", 2000000, cfg, "test")
+        assert result["status"] == "completed"
+        planner.plugin.rpc.fundchannel.assert_called_once()
+
+    def test_success_marks_spend_reservation(self):
+        """Successful open marks the reservation as spent."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        planner._execute_open("peer1", 2000000, cfg, "test")
+        db.mark_spend_reservation_spent.assert_called_once()
+        call_kwargs = db.mark_spend_reservation_spent.call_args[1]
+        assert call_kwargs["source"] == "capacity_planner"
+
+    def test_success_updates_action_completed(self):
+        """Successful open updates action status to completed with channel_id."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        planner._execute_open("peer1", 2000000, cfg, "test")
+        db.update_planner_action.assert_called_once_with(
+            42, status="completed", channel_id="123x1x0")
+
+    def test_failure_updates_action_failed(self):
+        """Failed open updates action status to failed."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        planner.plugin.rpc.fundchannel.side_effect = Exception("out of funds")
+        planner._execute_open("peer1", 2000000, cfg, "test")
+        db.update_planner_action.assert_called_with(42, status="failed")
+
+    def test_no_database_still_works(self):
+        """Method works when profitability/database is None."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 1000}}
+        plugin.rpc.fundchannel.return_value = {"channel_id": "456x2x0"}
+        planner = CapacityPlanner(plugin, None, MagicMock())
+        cfg = _make_open_cfg()
+        result = planner._execute_open("peer1", 1000000, cfg, "no db")
+        assert result["status"] == "completed"
+        assert result["action_id"] is None
+        assert result["channel_id"] == "456x2x0"
+
+    def test_dry_run_returns_amount(self):
+        """Dry run result includes amount_sats for logging."""
+        planner, db = _make_open_planner()
+        dry_cfg = _make_open_cfg(planner_dry_run=True)
+        result = planner._execute_open("peer1", 3000000, dry_cfg, "test")
+        assert result["amount_sats"] == 3000000
+        assert result["peer_id"] == "peer1"
+
+    def test_channelid_fallback(self):
+        """Handles fundchannel returning 'channelid' instead of 'channel_id'."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        planner.plugin.rpc.fundchannel.return_value = {"channelid": "789x3x0"}
+        result = planner._execute_open("peer1", 2000000, cfg, "test")
+        assert result["channel_id"] == "789x3x0"
+
+    def test_record_action_failure_does_not_block_execution(self):
+        """If recording the action fails, open still proceeds."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        db.record_planner_action.side_effect = Exception("DB write error")
+        result = planner._execute_open("peer1", 2000000, cfg, "test")
+        assert result["status"] == "completed"
+        assert result["action_id"] is None
+
+    def test_dry_run_no_budget_reservation(self):
+        """Dry run does not reserve budget."""
+        planner, db = _make_open_planner()
+        dry_cfg = _make_open_cfg(planner_dry_run=True)
+        planner._execute_open("peer1", 2000000, dry_cfg, "test")
+        db.reserve_spend.assert_not_called()
