@@ -66,6 +66,22 @@
 #revenue-ops-rebalancer=sling
 
 # ============================================================================
+# CAPACITY PLANNER
+# ============================================================================
+
+# Planner evaluates opens/closes, but close execution stays off by default.
+# Set revenue-ops-planner-execute-closes=true only for explicit live close RPCs.
+#revenue-ops-planner-enabled=false
+#revenue-ops-planner-dry-run=false
+#revenue-ops-planner-execute-closes=false
+#revenue-ops-planner-interval=21600
+#revenue-ops-planner-max-opens-per-cycle=1
+#revenue-ops-planner-max-closes-per-cycle=0
+#revenue-ops-planner-min-channel-sats=500000
+#revenue-ops-planner-max-channel-sats=10000000
+#revenue-ops-planner-max-fee-rate=50.0
+
+# ============================================================================
 # CAPITAL SAFETY (Global Capital Controls)
 # ============================================================================
 
