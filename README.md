@@ -13,6 +13,13 @@
 - Planner closes are recommendation-only by default.
 - To allow live close RPCs, set `revenue-ops-planner-execute-closes=true` and `revenue-ops-planner-max-closes-per-cycle` to a positive value.
 
+## Boltz Automation
+
+- The in-plugin Boltz auto-cycle is treasury mode first when confirmed on-chain funds are below the configured reserve target.
+- It maintains a standing on-chain reserve for reserve maintenance, and that reserve maintenance is independent of pending planner opens.
+- When the reserve is healthy, it falls back to the existing balance cycle.
+- Boltz automation does not replace channel rebalancing; Sling still handles channel-to-channel liquidity movement.
+
 ## Architecture
 
 ```text
@@ -76,6 +83,14 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-config set <key> <value>` | Change one of the supported runtime controls |
 | `revenue-analyze` | Trigger immediate analysis |
 | `revenue-wake-all` | Wake the background loops immediately |
+
+## Boltz Auto-Cycle
+
+The in-plugin Boltz auto-cycle is treasury mode first. When confirmed on-chain funds are below the configured reserve target, it uses expansion-treasury reverse swaps to rebuild a standing on-chain reserve.
+
+When the reserve is healthy, it falls back to the existing balance cycle and only considers profitable loop-in or loop-out candidates. Reserve maintenance is independent of pending planner opens.
+
+Boltz automation does not replace channel rebalancing. Sling still handles channel-to-channel liquidity movement; Boltz is only used when the plugin decides to convert between Lightning and on-chain liquidity.
 
 ## More Detail
 

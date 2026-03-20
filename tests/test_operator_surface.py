@@ -323,3 +323,11 @@ def test_readme_states_planner_closes_are_recommendation_only_by_default():
 
     assert "Planner closes are recommendation-only by default." in readme
     assert "revenue-ops-planner-execute-closes=true" in readme
+
+
+def test_readme_describes_boltz_treasury_first_boundary():
+    readme = Path("README.md").read_text()
+
+    assert "standing on-chain reserve" in readme
+    assert "treasury mode first" in readme
+    assert "does not replace channel rebalancing" in readme
