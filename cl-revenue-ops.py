@@ -784,6 +784,11 @@ plugin.add_option(
     default='50.0',
     description='Maximum on-chain fee rate (sat/vB) for automated opens/closes (default: 50.0)'
 )
+plugin.add_option(
+    name='revenue-ops-planner-execute-closes',
+    default='false',
+    description='Allow the capacity planner to execute close RPCs (default: false)'
+)
 
 
 # =============================================================================
@@ -934,6 +939,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_enabled=options.get('revenue-ops-planner-enabled', 'false').lower() in ('true', '1', 'yes'),
         planner_interval=_safe_int('revenue-ops-planner-interval'),
         planner_dry_run=options.get('revenue-ops-planner-dry-run', 'false').lower() in ('true', '1', 'yes'),
+        planner_execute_closes=options.get('revenue-ops-planner-execute-closes', 'false').lower() in ('true', '1', 'yes'),
         planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
         planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),

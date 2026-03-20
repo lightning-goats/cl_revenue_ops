@@ -132,6 +132,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_enabled': bool,
     'planner_interval': int,
     'planner_dry_run': bool,
+    'planner_execute_closes': bool,
     'planner_max_opens_per_cycle': int,
     'planner_max_closes_per_cycle': int,
     'planner_min_channel_sats': int,
@@ -408,6 +409,7 @@ class Config:
     planner_enabled: bool = False
     planner_interval: int = 21600               # 6 hours
     planner_dry_run: bool = False
+    planner_execute_closes: bool = False
     planner_max_opens_per_cycle: int = 1
     planner_max_closes_per_cycle: int = 1
     planner_min_channel_sats: int = 500000      # 500k sats
@@ -775,6 +777,7 @@ class ConfigSnapshot:
     planner_enabled: bool = False
     planner_interval: int = 21600
     planner_dry_run: bool = False
+    planner_execute_closes: bool = False
     planner_max_opens_per_cycle: int = 1
     planner_max_closes_per_cycle: int = 1
     planner_min_channel_sats: int = 500000

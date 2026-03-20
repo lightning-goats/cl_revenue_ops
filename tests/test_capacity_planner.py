@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.capacity_planner import CapacityPlanner
 from modules.database import Database
+from modules.config import Config
 from modules.profitability_analyzer import ProfitabilityClass
 
 
@@ -2580,10 +2581,11 @@ class TestChannelOpen:
 # Direct close helpers
 # ---------------------------------------------------------------------------
 
-def _make_close_cfg(planner_dry_run=False):
+def _make_close_cfg(planner_dry_run=False, planner_execute_closes=False):
     """Create a mock config for close tests."""
     cfg = MagicMock()
     cfg.planner_dry_run = planner_dry_run
+    cfg.planner_execute_closes = planner_execute_closes
     return cfg
 
 
@@ -2615,10 +2617,21 @@ class TestDirectClose:
 
     # --- _execute_close tests ---
 
+    def test_execute_close_returns_recommended_when_close_execution_disabled(self):
+        """Close recommendations are logged, not executed, by default."""
+        planner, db, pm = _make_close_planner()
+        cfg = _make_close_cfg(planner_execute_closes=False)
+
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "zombie")
+
+        assert result["status"] == "recommended"
+        planner.plugin.rpc.call.assert_not_called()
+        db.update_planner_action.assert_called_once_with(99, status="recommended")
+
     def test_execute_close_calls_generic_rpc_close(self):
         """Successful close calls generic RPC close with channel_id."""
         planner, db, pm = _make_close_planner()
-        cfg = _make_close_cfg()
+        cfg = _make_close_cfg(planner_execute_closes=True)
 
         planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
@@ -2632,7 +2645,7 @@ class TestDirectClose:
     def test_execute_close_records_action(self):
         """Close records action in database."""
         planner, db, pm = _make_close_planner()
-        cfg = _make_close_cfg()
+        cfg = _make_close_cfg(planner_execute_closes=True)
 
         planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
@@ -2645,7 +2658,7 @@ class TestDirectClose:
     def test_execute_close_updates_action_completed(self):
         """Successful close updates action status to completed."""
         planner, db, pm = _make_close_planner()
-        cfg = _make_close_cfg()
+        cfg = _make_close_cfg(planner_execute_closes=True)
 
         planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
@@ -2668,7 +2681,7 @@ class TestDirectClose:
     def test_execute_close_stops_rebalancer_jobs(self):
         """Close stops any active rebalancer jobs on the channel."""
         planner, db, pm = _make_close_planner(with_rebalancer=True)
-        cfg = _make_close_cfg()
+        cfg = _make_close_cfg(planner_execute_closes=True)
 
         planner.rebalancer.job_manager.has_active_job.return_value = True
         planner.plugin.rpc.call.return_value = {"type": "mutual"}
@@ -2683,7 +2696,7 @@ class TestDirectClose:
     def test_execute_close_no_active_rebalancer_job(self):
         """Close does not call stop_job when there is no active job."""
         planner, db, pm = _make_close_planner(with_rebalancer=True)
-        cfg = _make_close_cfg()
+        cfg = _make_close_cfg(planner_execute_closes=True)
 
         planner.rebalancer.job_manager.has_active_job.return_value = False
         planner.plugin.rpc.call.return_value = {"type": "mutual"}
@@ -2695,7 +2708,7 @@ class TestDirectClose:
     def test_execute_close_failure_records_failed(self):
         """Failed close updates action status to failed."""
         planner, db, pm = _make_close_planner()
-        cfg = _make_close_cfg()
+        cfg = _make_close_cfg(planner_execute_closes=True)
 
         planner.plugin.rpc.call.side_effect = Exception("Peer unreachable")
 
@@ -2708,7 +2721,7 @@ class TestDirectClose:
     def test_execute_close_without_rebalancer(self):
         """Close works when no rebalancer is configured."""
         planner, db, pm = _make_close_planner(with_rebalancer=False)
-        cfg = _make_close_cfg()
+        cfg = _make_close_cfg(planner_execute_closes=True)
 
         planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
@@ -2813,7 +2826,7 @@ class TestDirectClose:
     def test_execute_close_stop_job_exception_continues(self):
         """Close proceeds even if stop_job raises an exception."""
         planner, db, pm = _make_close_planner(with_rebalancer=True)
-        cfg = _make_close_cfg()
+        cfg = _make_close_cfg(planner_execute_closes=True)
 
         planner.rebalancer.job_manager.has_active_job.return_value = True
         planner.rebalancer.job_manager.stop_job.side_effect = Exception("Job manager error")
@@ -2827,7 +2840,7 @@ class TestDirectClose:
     def test_execute_close_db_failure_after_successful_close(self):
         """Close reports success even if DB update fails after close RPC."""
         planner, db, pm = _make_close_planner()
-        cfg = _make_close_cfg()
+        cfg = _make_close_cfg(planner_execute_closes=True)
 
         planner.plugin.rpc.call.return_value = {"type": "mutual"}
         db.update_planner_action.side_effect = Exception("DB write failed")
@@ -2853,6 +2866,7 @@ class TestDirectClose:
 
 def _make_cycle_cfg(planner_enabled=True, planner_max_opens_per_cycle=2,
                     planner_max_closes_per_cycle=2, planner_dry_run=False,
+                    planner_execute_closes=True,
                     planner_max_fee_rate_sat_vb=50.0, min_wallet_reserve=500000,
                     planner_min_channel_sats=500000, planner_max_channel_sats=10000000):
     """Create a mock config snapshot for execute_cycle tests."""
@@ -2861,6 +2875,7 @@ def _make_cycle_cfg(planner_enabled=True, planner_max_opens_per_cycle=2,
     cfg.planner_max_opens_per_cycle = planner_max_opens_per_cycle
     cfg.planner_max_closes_per_cycle = planner_max_closes_per_cycle
     cfg.planner_dry_run = planner_dry_run
+    cfg.planner_execute_closes = planner_execute_closes
     cfg.planner_max_fee_rate_sat_vb = planner_max_fee_rate_sat_vb
     cfg.min_wallet_reserve = min_wallet_reserve
     cfg.planner_min_channel_sats = planner_min_channel_sats
@@ -3023,7 +3038,7 @@ class TestExecuteCycle:
         )
         plugin.rpc.call.return_value = {"type": "mutual"}
 
-        cfg = _make_cycle_cfg(planner_max_closes_per_cycle=1)
+        cfg = _make_cycle_cfg(planner_max_closes_per_cycle=1, planner_execute_closes=True)
 
         result = planner.execute_cycle(cfg)
 
@@ -3035,6 +3050,32 @@ class TestExecuteCycle:
         assert closed["status"] == "completed"
         # Verify close RPC was actually called
         plugin.rpc.call.assert_any_call("close", {"id": scid})
+
+    def test_execute_cycle_logs_close_recommendation_by_default(self):
+        """Cycle records close recommendations when close execution is disabled."""
+        scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+
+        cfg = _make_cycle_cfg(planner_max_closes_per_cycle=1, planner_execute_closes=False)
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["closes"]) == 1
+        assert result["closes"][0]["status"] == "recommended"
+        plugin.rpc.call.assert_not_called()
 
     def test_execute_cycle_respects_max_opens_per_cycle(self):
         """At most max_opens_per_cycle opens per invocation."""
@@ -3316,6 +3357,11 @@ class TestExecuteCycle:
 
 class TestPlannerIntegration:
     """End-to-end integration tests for the capacity planner pipeline."""
+
+    def test_planner_execute_closes_defaults_false(self):
+        """Planner close execution stays disabled by default."""
+        cfg = Config()
+        assert cfg.planner_execute_closes is False
 
     def test_full_cycle_dry_run(self):
         """End-to-end test: full cycle in dry_run mode produces valid report."""

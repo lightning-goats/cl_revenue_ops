@@ -1104,6 +1104,23 @@ class CapacityPlanner:
             )
             return {"action_id": action_id, "status": "dry_run"}
 
+        if not getattr(cfg, "planner_execute_closes", False):
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="recommended")
+                except Exception:
+                    pass
+            self.plugin.log(
+                f"[RECOMMEND] Close {channel_id} (peer: {peer_id[:16]}..., reason: {reason})",
+                level='info',
+            )
+            return {
+                "action_id": action_id,
+                "status": "recommended",
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+            }
+
         # Stop rebalancer jobs if any
         if self.rebalancer and hasattr(self.rebalancer, 'job_manager'):
             try:
