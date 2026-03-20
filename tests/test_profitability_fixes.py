@@ -34,14 +34,13 @@ from modules.profitability_analyzer import (
 # Helpers
 # ============================================================
 
-def _make_costs(open_cost=500, rebalance=1000, splice=0, effective=0):
+def _make_costs(open_cost=500, rebalance=1000, effective=0):
     return ChannelCosts(
         channel_id="111x222x0",
         peer_id="02" + "a" * 64,
         open_cost_sats=open_cost,
         rebalance_cost_sats=rebalance,
         effective_rebalance_cost_sats=effective,
-        splice_cost_sats=splice,
     )
 
 
@@ -135,59 +134,7 @@ class TestFiftyFiftySplit:
 
 
 # ============================================================
-# Fix 2: Splice Costs
-# ============================================================
-
-class TestSpliceCosts:
-    """Verify splice_cost_sats is included in total_cost_sats."""
-
-    def test_splice_in_total(self):
-        """total_cost_sats = open + splice + rebalance."""
-        costs = _make_costs(open_cost=500, rebalance=1000, splice=200)
-        assert costs.total_cost_sats == 1700
-
-    def test_no_splice(self):
-        """Default splice cost is 0, doesn't affect total."""
-        costs = _make_costs(open_cost=500, rebalance=1000)
-        assert costs.splice_cost_sats == 0
-        assert costs.total_cost_sats == 1500
-
-    def test_splice_fetched_in_get_channel_costs(self):
-        """_get_channel_costs() queries splice history and sums fee_sats."""
-        analyzer = _make_analyzer()
-        analyzer.database.get_channel_rebalance_costs.return_value = 100
-        analyzer.database.get_channel_rebalance_success_rate.return_value = None
-        analyzer.database.get_channel_splice_history.return_value = [
-            {"fee_sats": 50, "amount_sats": 500000},
-            {"fee_sats": 30, "amount_sats": 200000},
-        ]
-        analyzer._get_rebalance_costs_from_bookkeeper = MagicMock(return_value=0)
-        analyzer._get_open_cost_from_bookkeeper = MagicMock(return_value=None)
-        analyzer.database.get_channel_open_cost.return_value = 500
-
-        costs = analyzer._get_channel_costs("111x222x0", "02" + "a" * 64, "abc123", 2_000_000)
-        assert costs.splice_cost_sats == 80
-        assert costs.total_cost_sats == 500 + 80 + 100
-
-    def test_splice_none_fee_sats_treated_as_zero(self):
-        """Splice records with None fee_sats are treated as 0."""
-        analyzer = _make_analyzer()
-        analyzer.database.get_channel_rebalance_costs.return_value = 0
-        analyzer.database.get_channel_rebalance_success_rate.return_value = None
-        analyzer.database.get_channel_splice_history.return_value = [
-            {"fee_sats": None},
-            {"fee_sats": 20},
-        ]
-        analyzer._get_rebalance_costs_from_bookkeeper = MagicMock(return_value=0)
-        analyzer._get_open_cost_from_bookkeeper = MagicMock(return_value=None)
-        analyzer.database.get_channel_open_cost.return_value = 500
-
-        costs = analyzer._get_channel_costs("111x222x0", "02" + "a" * 64, "abc123", 2_000_000)
-        assert costs.splice_cost_sats == 20
-
-
-# ============================================================
-# Fix 3: 30-Day Trailing Marginal ROI
+# Fix 2: 30-Day Trailing Marginal ROI
 # ============================================================
 
 class TestMarginalRoi30d:
@@ -331,7 +278,7 @@ class TestRoiSortingAndVolume:
         })
         # Remote open -> open_cost = 0; no rebalancing -> total_cost = 0
         analyzer._get_channel_costs = MagicMock(return_value=_make_costs(
-            open_cost=0, rebalance=0, splice=0
+            open_cost=0, rebalance=0
         ))
         analyzer._get_channel_revenue = MagicMock(return_value=_make_revenue(
             fees=100, sourced_fees=0
@@ -364,7 +311,7 @@ class TestRoiSortingAndVolume:
             }
         })
         analyzer._get_channel_costs = MagicMock(return_value=_make_costs(
-            open_cost=0, rebalance=0, splice=0
+            open_cost=0, rebalance=0
         ))
         analyzer._get_channel_revenue = MagicMock(return_value=_make_revenue(
             fees=0, sourced_fees=0
@@ -409,7 +356,7 @@ class TestRoiSortingAndVolume:
         assert result is not None
         # max(500_000, 300_000) = 500_000
         # cost_per_sat = total_cost / 500_000
-        total_cost = 500 + 100  # no splice
+        total_cost = 500 + 100  # open + rebalance
         expected_cost_per_sat = total_cost / 500_000
         assert abs(result.cost_per_sat_routed - expected_cost_per_sat) < 1e-9
 
@@ -430,7 +377,7 @@ class TestOpenTimestampPassthrough:
         # No cached cost → forces bookkeeper lookup → records result
         analyzer.database.get_channel_open_cost.return_value = None
         analyzer.database.get_channel_rebalance_costs.return_value = 0
-        analyzer.database.get_channel_splice_history.return_value = []
+
         analyzer.database.get_channel_rebalance_success_rate.return_value = {
             "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
         }
@@ -465,7 +412,7 @@ class TestOpenTimestampPassthrough:
         # Remote channel with stale nonzero cost triggers self-heal
         analyzer.database.get_channel_open_cost.return_value = 500
         analyzer.database.get_channel_rebalance_costs.return_value = 0
-        analyzer.database.get_channel_splice_history.return_value = []
+
         analyzer.database.get_channel_rebalance_success_rate.return_value = {
             "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
         }
@@ -494,7 +441,7 @@ class TestOpenTimestampPassthrough:
         # Set up a local channel with an invalid open cost (triggers sanity check)
         analyzer.database.get_channel_open_cost.return_value = 5_000_000  # > capacity, invalid
         analyzer.database.get_channel_rebalance_costs.return_value = 0
-        analyzer.database.get_channel_splice_history.return_value = []
+
         analyzer.database.get_channel_rebalance_success_rate.return_value = {
             "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
         }
@@ -573,7 +520,7 @@ class TestCapacityDivisionGuards:
             "open_timestamp": int(time.time()) - 86400 * 30,
         }
         analyzer._get_channel_costs = MagicMock(return_value=_make_costs(
-            open_cost=0, rebalance=0, splice=0
+            open_cost=0, rebalance=0
         ))
         analyzer._get_channel_revenue = MagicMock(return_value=_make_revenue(
             fees=100, sourced_fees=0

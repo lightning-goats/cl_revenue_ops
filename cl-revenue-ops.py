@@ -2147,9 +2147,9 @@ def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
 def revenue_capacity_report(plugin: Plugin, **kwargs):
     """
     Generate a strategic capital redeployment report.
-    
-    Identifies "Winner" channels for capital injection (Splice-In)
-    and "Loser" channels for capital extraction (Splice-Out/Close).
+
+    Identifies "Winner" channels for capital injection
+    and "Loser" channels for capital extraction or closure.
     """
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}

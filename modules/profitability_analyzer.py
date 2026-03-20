@@ -70,11 +70,10 @@ class ChannelCosts:
     open_cost_sats: int
     rebalance_cost_sats: int
     effective_rebalance_cost_sats: int = 0  # cost adjusted for success rate
-    splice_cost_sats: int = 0
 
     @property
     def total_cost_sats(self) -> int:
-        return self.open_cost_sats + self.splice_cost_sats + self.rebalance_cost_sats
+        return self.open_cost_sats + self.rebalance_cost_sats
 
 
 @dataclass
@@ -983,9 +982,8 @@ class ChannelProfitabilityAnalyzer:
                 - lifetime_revenue_sats: Total routing fees earned
                 - lifetime_opening_costs_sats: Total channel opening fees
                 - lifetime_closure_costs_sats: Total channel closure fees (Accounting v2.0)
-                - lifetime_splice_costs_sats: Total splice fees (Accounting v2.0)
                 - lifetime_rebalance_costs_sats: Total rebalancing fees paid
-                - lifetime_total_costs_sats: Opening + Closure + Splice + Rebalance costs
+                - lifetime_total_costs_sats: Opening + Closure + Rebalance costs
                 - lifetime_net_profit_sats: Revenue - Total Costs
                 - lifetime_roi_percent: ROI percentage
                 - lifetime_forward_count: Total number of forwards
@@ -997,17 +995,15 @@ class ChannelProfitabilityAnalyzer:
         # Convert revenue from msat to sats
         lifetime_revenue_sats = stats["total_revenue_msat"] // 1000
 
-        # Get costs (including closure, splice, and swap costs)
+        # Get costs (including closure and swap costs)
         lifetime_opening_costs_sats = stats["total_opening_cost_sats"]
         lifetime_closure_costs_sats = stats.get("total_closure_cost_sats", 0)
-        lifetime_splice_costs_sats = stats.get("total_splice_cost_sats", 0)
         lifetime_rebalance_costs_sats = stats["total_rebalance_cost_sats"]
 
-        # Calculate totals (includes closure and splice costs)
+        # Calculate totals (includes closure costs)
         lifetime_total_costs_sats = (
             lifetime_opening_costs_sats +
             lifetime_closure_costs_sats +
-            lifetime_splice_costs_sats +
             lifetime_rebalance_costs_sats
         )
         lifetime_net_profit_sats = lifetime_revenue_sats - lifetime_total_costs_sats
@@ -1028,7 +1024,6 @@ class ChannelProfitabilityAnalyzer:
             "lifetime_revenue_sats": lifetime_revenue_sats,
             "lifetime_opening_costs_sats": lifetime_opening_costs_sats,
             "lifetime_closure_costs_sats": lifetime_closure_costs_sats,
-            "lifetime_splice_costs_sats": lifetime_splice_costs_sats,
             "lifetime_rebalance_costs_sats": lifetime_rebalance_costs_sats,
             "lifetime_total_costs_sats": lifetime_total_costs_sats,
             "lifetime_net_profit_sats": lifetime_net_profit_sats,
@@ -1047,7 +1042,7 @@ class ChannelProfitabilityAnalyzer:
 
         Calculates key financial metrics for the Sovereign Dashboard:
         - Gross Revenue: Total routing fees earned
-        - Operating Expense (OpEx): Total costs (rebalance + closure + splice)
+        - Operating Expense (OpEx): Total costs (rebalance + closure)
         - Net Profit: Revenue - OpEx
         - Operating Margin: (Net Profit / Gross Revenue) * 100
 
@@ -1070,13 +1065,12 @@ class ChannelProfitabilityAnalyzer:
         volume_sats = self.database.get_total_volume_since(since_timestamp)
         forward_count = self.database.get_total_forward_count_since(since_timestamp)
 
-        # Get OpEx components (includes closure and splice costs)
+        # Get OpEx components (includes closure costs)
         rebalance_cost_sats = self.database.get_total_rebalance_fees(since_timestamp)
         closure_cost_sats = self.database.get_closure_costs_since(since_timestamp)
-        splice_cost_sats = self.database.get_splice_costs_since(since_timestamp)
 
         # Total OpEx
-        opex_sats = rebalance_cost_sats + closure_cost_sats + splice_cost_sats
+        opex_sats = rebalance_cost_sats + closure_cost_sats
 
         # Calculate net profit
         net_profit_sats = gross_revenue_sats - opex_sats
@@ -1094,7 +1088,6 @@ class ChannelProfitabilityAnalyzer:
             'opex_sats': opex_sats,
             'rebalance_cost_sats': rebalance_cost_sats,
             'closure_cost_sats': closure_cost_sats,
-            'splice_cost_sats': splice_cost_sats,
             'net_profit_sats': net_profit_sats,
             'operating_margin_pct': operating_margin_pct,
             'volume_sats': volume_sats,
@@ -1679,10 +1672,6 @@ class ChannelProfitabilityAnalyzer:
                 timestamp=open_timestamp
             )
 
-        # Splice costs
-        splice_history = self.database.get_channel_splice_history(channel_id)
-        splice_cost = sum(int(s.get("fee_sats", 0) or 0) for s in splice_history)
-
         # Success-rate-adjusted effective cost
         # Estimate 30-day costs from success_data (avg_cost_ppm * avg_amount * successes),
         # inflate only that portion by the success rate, and keep historical costs uninflated.
@@ -1708,8 +1697,7 @@ class ChannelProfitabilityAnalyzer:
             peer_id=peer_id,
             open_cost_sats=open_cost,
             rebalance_cost_sats=rebalance_costs,
-            effective_rebalance_cost_sats=effective_rebalance_costs,
-            splice_cost_sats=splice_cost
+            effective_rebalance_cost_sats=effective_rebalance_costs
         )
     
     def _sanity_check_open_cost(self, channel_id: str, peer_id: str,

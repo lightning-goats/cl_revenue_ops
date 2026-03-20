@@ -1866,8 +1866,8 @@ class EVRebalancer:
     - I-5: Balance delta can false-positive under concurrent forwarding — a forward
       completing during the measurement window inflates/deflates the delta. Fixing
       this requires async forwarding awareness (architectural change).
-    - I-16: SCID-keyed failure counts are invalidated by splice events because splice
-      changes the SCID. A future migration to peer_id-keyed tracking would fix this.
+    - I-16: SCID-keyed failure counts are invalidated when the SCID changes.
+      A future migration to peer_id-keyed tracking would fix this.
     - I-18: Predictive rebalancing (pre-position liquidity before demand spikes) is a
       future feature requiring demand forecasting integration.
     """
