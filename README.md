@@ -84,14 +84,6 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-analyze` | Trigger immediate analysis |
 | `revenue-wake-all` | Wake the background loops immediately |
 
-## Boltz Auto-Cycle
-
-The in-plugin Boltz auto-cycle is treasury mode first. When confirmed on-chain funds are below the configured reserve target, it uses expansion-treasury reverse swaps to rebuild a standing on-chain reserve.
-
-When the reserve is healthy, it falls back to the existing balance cycle and only considers profitable loop-in or loop-out candidates. Reserve maintenance is independent of pending planner opens.
-
-Boltz automation does not replace channel rebalancing. Sling still handles channel-to-channel liquidity movement; Boltz is only used when the plugin decides to convert between Lightning and on-chain liquidity.
-
 ## More Detail
 
 - Minimal config example: [config/cl-revenue-ops.conf.minimal](config/cl-revenue-ops.conf.minimal)
