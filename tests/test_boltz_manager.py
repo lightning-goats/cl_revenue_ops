@@ -247,6 +247,7 @@ class TestBudgetStatus:
 
         assert result["reserved_24h_sats_estimate"] == 150
         assert result["remaining_24h_sats_estimate"] == 90
+        assert result["boltz_remaining_24h_sats_estimate"] == 140
         assert result["boltz_reserved_24h_sats_estimate"] == 120
 
 

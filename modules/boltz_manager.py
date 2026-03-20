@@ -1025,7 +1025,7 @@ class BoltzCliManager:
         total_spent = boltz_spent + external_spent
         total_reserved = local_reserved + external_reserved
 
-        boltz_remaining = max(0, budget - boltz_spent)
+        boltz_remaining = max(0, budget - boltz_spent - local_reserved)
         remaining = max(0, budget - total_spent - total_reserved)
         return {
             "daily_budget_sats": budget,
