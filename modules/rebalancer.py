@@ -2170,11 +2170,6 @@ class EVRebalancer:
                 if channel_id in active_channels:
                     continue
 
-                # Skip channels pending closure by capacity planner
-                if hasattr(self, '_capacity_planner') and self._capacity_planner:
-                    if self._capacity_planner.is_pending_close(channel_id):
-                        continue
-                
                 # STAGNANT INVENTORY DETECTION
                 # Check if a channel is "Stagnant" (Balanced but not moving for ~1 week)
                 # Threshold: turnover < 0.0015 per day (~1% per week)

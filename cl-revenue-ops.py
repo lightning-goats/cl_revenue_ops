@@ -766,8 +766,8 @@ plugin.add_option(
 )
 plugin.add_option(
     name='revenue-ops-planner-dry-run',
-    default='true',
-    description='Log planner decisions without executing (default: true)'
+    default='false',
+    description='Log planner decisions without executing (default: false)'
 )
 plugin.add_option(
     name='revenue-ops-planner-min-channel-sats',
@@ -933,7 +933,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         reservation_timeout_hours=_safe_int('revenue-ops-reservation-timeout-hours'),
         planner_enabled=options.get('revenue-ops-planner-enabled', 'false').lower() in ('true', '1', 'yes'),
         planner_interval=_safe_int('revenue-ops-planner-interval'),
-        planner_dry_run=options.get('revenue-ops-planner-dry-run', 'true').lower() in ('true', '1', 'yes'),
+        planner_dry_run=options.get('revenue-ops-planner-dry-run', 'false').lower() in ('true', '1', 'yes'),
         planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
         planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
@@ -1447,8 +1447,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 else:
                     opens = len(result.get("opens", []))
                     closes = len(result.get("closes", []))
-                    drains = len(result.get("drains_progressed", []))
-                    plugin.log(f"Planner cycle complete: {opens} opens, {closes} closes, {drains} drains progressed")
+                    plugin.log(f"Planner cycle complete: {opens} opens, {closes} closes")
             except Exception as e:
                 plugin.log(f"Error in capacity planner cycle: {e}", level='error')
                 plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')

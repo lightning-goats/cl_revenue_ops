@@ -2575,19 +2575,18 @@ class TestChannelOpen:
 
 
 # ---------------------------------------------------------------------------
-# Drain-then-close lifecycle helpers
+# Direct close helpers
 # ---------------------------------------------------------------------------
 
-def _make_drain_cfg(planner_dry_run=False, planner_drain_timeout_hours=72):
-    """Create a mock config for drain/close tests."""
+def _make_close_cfg(planner_dry_run=False):
+    """Create a mock config for close tests."""
     cfg = MagicMock()
     cfg.planner_dry_run = planner_dry_run
-    cfg.planner_drain_timeout_hours = planner_drain_timeout_hours
     return cfg
 
 
-def _make_drain_planner(with_policy_manager=True, with_rebalancer=False):
-    """Create a CapacityPlanner wired up for drain/close tests.
+def _make_close_planner(with_policy_manager=True, with_rebalancer=False):
+    """Create a CapacityPlanner wired up for close tests.
 
     Returns (planner, db, policy_manager) where db is the mock database.
     """
@@ -2609,259 +2608,70 @@ def _make_drain_planner(with_policy_manager=True, with_rebalancer=False):
     return planner, db, policy_manager
 
 
-class TestDrainAndClose:
-    """Tests for drain-then-close lifecycle: _initiate_drain, _check_drain_complete,
-    _execute_close, and _check_close_allowed."""
-
-    # --- _initiate_drain tests ---
-
-    def test_initiate_drain_sets_policy(self):
-        """Drain phase sets peer policy to passive + source_only."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        planner._initiate_drain("peer_abc", "100x1x0", cfg, "ZOMBIE")
-
-        pm.set_policy.assert_called_once_with(
-            "peer_abc",
-            strategy="passive",
-            rebalance_mode="source_only",
-            tags=["closing", "drain_phase"],
-            expires_in_hours=72,
-        )
-
-    def test_drain_records_action_as_draining(self):
-        """Drain initiation records action with status='draining'."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        action_id = planner._initiate_drain("peer_abc", "100x1x0", cfg, "STAGNANT")
-
-        assert action_id == 99
-        db.record_planner_action.assert_called_once()
-        call_kwargs = db.record_planner_action.call_args
-        assert call_kwargs[1]["action_type"] == "close" or call_kwargs.kwargs.get("action_type") == "close"
-        db.update_planner_action.assert_called_once_with(99, status="draining")
-
-    def test_drain_tracks_pending_close(self):
-        """Drain initiation adds channel to _pending_closes dict."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        planner._initiate_drain("peer_abc", "100x1x0", cfg, "ZOMBIE")
-
-        assert "100x1x0" in planner._pending_closes
-        assert isinstance(planner._pending_closes["100x1x0"], int)
-
-    def test_drain_dry_run_does_not_set_policy(self):
-        """Dry run mode does not set the drain policy or track pending."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg(planner_dry_run=True)
-
-        action_id = planner._initiate_drain("peer_abc", "100x1x0", cfg, "ZOMBIE")
-
-        assert action_id == 99
-        pm.set_policy.assert_not_called()
-        db.update_planner_action.assert_called_once_with(99, status="dry_run")
-        assert "100x1x0" not in planner._pending_closes
-
-    def test_drain_without_policy_manager(self):
-        """Drain works even without a policy manager."""
-        planner, db, _ = _make_drain_planner(with_policy_manager=False)
-        cfg = _make_drain_cfg()
-
-        action_id = planner._initiate_drain("peer_abc", "100x1x0", cfg, "ZOMBIE")
-
-        assert action_id == 99
-        db.update_planner_action.assert_called_once_with(99, status="draining")
-        assert "100x1x0" in planner._pending_closes
-
-    # --- _check_drain_complete tests ---
-
-    def test_drain_complete_by_balance(self):
-        """Drain completes when local balance < 10% capacity."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        # Put the channel in pending_closes
-        planner._pending_closes["100x1x0"] = int(time.time())
-
-        # Mock listpeerchannels showing low local balance
-        planner.plugin.rpc.listpeerchannels.return_value = {
-            "channels": [{
-                "short_channel_id": "100x1x0",
-                "spendable_msat": 50000,    # 50k msat
-                "total_msat": 2000000000,   # 2M sat = 2B msat
-            }]
-        }
-
-        assert planner._check_drain_complete("100x1x0", cfg) is True
-
-    def test_drain_not_complete_high_balance(self):
-        """Drain is not complete when local balance >= 10% capacity."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        planner._pending_closes["100x1x0"] = int(time.time())
-
-        planner.plugin.rpc.listpeerchannels.return_value = {
-            "channels": [{
-                "short_channel_id": "100x1x0",
-                "spendable_msat": 500000000,  # 50% of capacity
-                "total_msat": 1000000000,
-            }]
-        }
-
-        assert planner._check_drain_complete("100x1x0", cfg) is False
-
-    def test_drain_timeout_proceeds_to_close(self):
-        """After drain_timeout_hours, drain is complete regardless of balance."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg(planner_drain_timeout_hours=72)
-
-        # Set drain start to 73 hours ago
-        planner._pending_closes["100x1x0"] = int(time.time()) - (73 * 3600)
-
-        # Balance is still high, but timeout has passed
-        planner.plugin.rpc.listpeerchannels.return_value = {
-            "channels": [{
-                "short_channel_id": "100x1x0",
-                "spendable_msat": 500000000,
-                "total_msat": 1000000000,
-            }]
-        }
-
-        assert planner._check_drain_complete("100x1x0", cfg) is True
-
-    def test_drain_not_timed_out(self):
-        """Before drain_timeout_hours, timeout alone does not complete drain."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg(planner_drain_timeout_hours=72)
-
-        # Set drain start to 1 hour ago
-        planner._pending_closes["100x1x0"] = int(time.time()) - 3600
-
-        # Balance still high
-        planner.plugin.rpc.listpeerchannels.return_value = {
-            "channels": [{
-                "short_channel_id": "100x1x0",
-                "spendable_msat": 500000000,
-                "total_msat": 1000000000,
-            }]
-        }
-
-        assert planner._check_drain_complete("100x1x0", cfg) is False
-
-    def test_drain_handles_msat_strings(self):
-        """Drain check parses msat string values correctly."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        planner._pending_closes["100x1x0"] = int(time.time())
-
-        planner.plugin.rpc.listpeerchannels.return_value = {
-            "channels": [{
-                "short_channel_id": "100x1x0",
-                "spendable_msat": "10000msat",
-                "total_msat": "2000000000msat",
-            }]
-        }
-
-        assert planner._check_drain_complete("100x1x0", cfg) is True
-
-    def test_drain_matches_channel_id_field(self):
-        """Drain check also matches on channel_id field (not just short_channel_id)."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        planner._pending_closes["abc123"] = int(time.time())
-
-        planner.plugin.rpc.listpeerchannels.return_value = {
-            "channels": [{
-                "channel_id": "abc123",
-                "spendable_msat": 1000,
-                "total_msat": 2000000000,
-            }]
-        }
-
-        assert planner._check_drain_complete("abc123", cfg) is True
-
-    def test_drain_rpc_failure_returns_false(self):
-        """If listpeerchannels fails, drain check returns False."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        planner._pending_closes["100x1x0"] = int(time.time())
-        planner.plugin.rpc.listpeerchannels.side_effect = Exception("RPC error")
-
-        assert planner._check_drain_complete("100x1x0", cfg) is False
-
-    def test_drain_channel_not_found_returns_false(self):
-        """If channel is not in listpeerchannels, returns False."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        planner._pending_closes["100x1x0"] = int(time.time())
-
-        planner.plugin.rpc.listpeerchannels.return_value = {
-            "channels": [{
-                "short_channel_id": "999x9x9",
-                "spendable_msat": 100,
-                "total_msat": 2000000000,
-            }]
-        }
-
-        assert planner._check_drain_complete("100x1x0", cfg) is False
+class TestDirectClose:
+    """Tests for direct close lifecycle: _execute_close and _check_close_allowed."""
 
     # --- _execute_close tests ---
 
     def test_execute_close_calls_close_rpc(self):
         """Successful close calls plugin.rpc.close with channel_id."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
+        planner, db, pm = _make_close_planner()
+        cfg = _make_close_cfg()
 
         planner.plugin.rpc.close.return_value = {"type": "mutual"}
-        planner._pending_closes["100x1x0"] = int(time.time())
 
-        result = planner._execute_close("100x1x0", "peer_abc", 99, cfg)
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
         planner.plugin.rpc.close.assert_called_once_with(id="100x1x0")
         assert result["status"] == "completed"
         assert result["action_id"] == 99
         assert result["result"] == {"type": "mutual"}
 
-    def test_execute_close_updates_action_completed(self):
-        """Successful close updates action status to completed."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
+    def test_execute_close_records_action(self):
+        """Close records action in database."""
+        planner, db, pm = _make_close_planner()
+        cfg = _make_close_cfg()
 
         planner.plugin.rpc.close.return_value = {"type": "mutual"}
 
-        planner._execute_close("100x1x0", "peer_abc", 99, cfg)
+        planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
+
+        db.record_planner_action.assert_called_once()
+        call_kwargs = db.record_planner_action.call_args
+        assert call_kwargs[1]["action_type"] == "close" or call_kwargs.kwargs.get("action_type") == "close"
+
+    def test_execute_close_updates_action_completed(self):
+        """Successful close updates action status to completed."""
+        planner, db, pm = _make_close_planner()
+        cfg = _make_close_cfg()
+
+        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+
+        planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
         db.update_planner_action.assert_called_once_with(99, status="completed")
 
-    def test_execute_close_removes_pending(self):
-        """Successful close removes channel from _pending_closes."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
+    def test_execute_close_dry_run(self):
+        """Dry run mode records dry_run status and does not call close RPC."""
+        planner, db, pm = _make_close_planner()
+        cfg = _make_close_cfg(planner_dry_run=True)
 
-        planner._pending_closes["100x1x0"] = int(time.time())
-        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
-        planner._execute_close("100x1x0", "peer_abc", 99, cfg)
-
-        assert "100x1x0" not in planner._pending_closes
+        assert result["status"] == "dry_run"
+        assert result["action_id"] == 99
+        planner.plugin.rpc.close.assert_not_called()
+        db.update_planner_action.assert_called_once_with(99, status="dry_run")
 
     def test_execute_close_stops_rebalancer_jobs(self):
         """Close stops any active rebalancer jobs on the channel."""
-        planner, db, pm = _make_drain_planner(with_rebalancer=True)
-        cfg = _make_drain_cfg()
+        planner, db, pm = _make_close_planner(with_rebalancer=True)
+        cfg = _make_close_cfg()
 
         planner.rebalancer.job_manager.has_active_job.return_value = True
         planner.plugin.rpc.close.return_value = {"type": "mutual"}
 
-        planner._execute_close("100x1x0", "peer_abc", 99, cfg)
+        planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
         planner.rebalancer.job_manager.has_active_job.assert_called_once_with("100x1x0")
         planner.rebalancer.job_manager.stop_job.assert_called_once_with(
@@ -2870,49 +2680,37 @@ class TestDrainAndClose:
 
     def test_execute_close_no_active_rebalancer_job(self):
         """Close does not call stop_job when there is no active job."""
-        planner, db, pm = _make_drain_planner(with_rebalancer=True)
-        cfg = _make_drain_cfg()
+        planner, db, pm = _make_close_planner(with_rebalancer=True)
+        cfg = _make_close_cfg()
 
         planner.rebalancer.job_manager.has_active_job.return_value = False
         planner.plugin.rpc.close.return_value = {"type": "mutual"}
 
-        planner._execute_close("100x1x0", "peer_abc", 99, cfg)
+        planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
         planner.rebalancer.job_manager.stop_job.assert_not_called()
 
     def test_execute_close_failure_records_failed(self):
         """Failed close updates action status to failed."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
+        planner, db, pm = _make_close_planner()
+        cfg = _make_close_cfg()
 
         planner.plugin.rpc.close.side_effect = Exception("Peer unreachable")
 
-        result = planner._execute_close("100x1x0", "peer_abc", 99, cfg)
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
         assert result["status"] == "failed"
         assert "Peer unreachable" in result["error"]
         db.update_planner_action.assert_called_once_with(99, status="failed")
 
-    def test_execute_close_failure_keeps_pending(self):
-        """Failed close keeps channel in _pending_closes."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg()
-
-        planner._pending_closes["100x1x0"] = int(time.time())
-        planner.plugin.rpc.close.side_effect = Exception("Peer unreachable")
-
-        planner._execute_close("100x1x0", "peer_abc", 99, cfg)
-
-        assert "100x1x0" in planner._pending_closes
-
     def test_execute_close_without_rebalancer(self):
         """Close works when no rebalancer is configured."""
-        planner, db, pm = _make_drain_planner(with_rebalancer=False)
-        cfg = _make_drain_cfg()
+        planner, db, pm = _make_close_planner(with_rebalancer=False)
+        cfg = _make_close_cfg()
 
         planner.plugin.rpc.close.return_value = {"type": "mutual"}
 
-        result = planner._execute_close("100x1x0", "peer_abc", 99, cfg)
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
         assert result["status"] == "completed"
 
@@ -2920,7 +2718,7 @@ class TestDrainAndClose:
 
     def test_close_respects_static_policy(self):
         """Channels with static policy are never closed."""
-        planner, db, pm = _make_drain_planner()
+        planner, db, pm = _make_close_planner()
 
         policy = MagicMock()
         policy.strategy = MagicMock()
@@ -2935,7 +2733,7 @@ class TestDrainAndClose:
 
     def test_close_respects_protect_tag(self):
         """Channels tagged 'protect' are never closed."""
-        planner, db, pm = _make_drain_planner()
+        planner, db, pm = _make_close_planner()
 
         policy = MagicMock()
         policy.strategy = MagicMock()
@@ -2950,7 +2748,7 @@ class TestDrainAndClose:
 
     def test_close_respects_no_close_tag(self):
         """Channels tagged 'no_close' are never closed."""
-        planner, db, pm = _make_drain_planner()
+        planner, db, pm = _make_close_planner()
 
         policy = MagicMock()
         policy.strategy = MagicMock()
@@ -2965,7 +2763,7 @@ class TestDrainAndClose:
 
     def test_close_allowed_for_dynamic_policy(self):
         """Channels with dynamic policy and no protect tags can be closed."""
-        planner, db, pm = _make_drain_planner()
+        planner, db, pm = _make_close_planner()
 
         policy = MagicMock()
         policy.strategy = MagicMock()
@@ -2979,15 +2777,30 @@ class TestDrainAndClose:
 
     def test_close_allowed_without_policy_manager(self):
         """Without a policy manager, close is always allowed."""
-        planner, db, _ = _make_drain_planner(with_policy_manager=False)
+        planner, db, _ = _make_close_planner(with_policy_manager=False)
 
         allowed, reason = planner._check_close_allowed("peer_abc")
 
         assert allowed is True
 
+    def test_close_respects_passive_policy(self):
+        """Channels with passive policy are never auto-closed."""
+        planner, db, pm = _make_close_planner()
+
+        policy = MagicMock()
+        policy.strategy = MagicMock()
+        policy.strategy.value = "passive"
+        policy.has_tag.return_value = False
+        pm.get_policy.return_value = policy
+
+        allowed, reason = planner._check_close_allowed("peer_abc")
+
+        assert allowed is False
+        assert "passive" in reason
+
     def test_close_allowed_on_policy_exception(self):
         """If policy check raises exception, close is allowed (fail-open)."""
-        planner, db, pm = _make_drain_planner()
+        planner, db, pm = _make_close_planner()
 
         pm.get_policy.side_effect = Exception("DB error")
 
@@ -2995,31 +2808,32 @@ class TestDrainAndClose:
 
         assert allowed is True
 
-    # --- Integration-style tests ---
+    def test_execute_close_stop_job_exception_continues(self):
+        """Close proceeds even if stop_job raises an exception."""
+        planner, db, pm = _make_close_planner(with_rebalancer=True)
+        cfg = _make_close_cfg()
 
-    def test_dry_run_close_does_not_execute(self):
-        """Dry run mode logs close decision but does not set policy or track."""
-        planner, db, pm = _make_drain_planner()
-        cfg = _make_drain_cfg(planner_dry_run=True)
+        planner.rebalancer.job_manager.has_active_job.return_value = True
+        planner.rebalancer.job_manager.stop_job.side_effect = Exception("Job manager error")
+        planner.plugin.rpc.close.return_value = {"type": "mutual"}
 
-        action_id = planner._initiate_drain("peer_abc", "100x1x0", cfg, "ZOMBIE")
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
-        # Should not call set_policy
-        pm.set_policy.assert_not_called()
-        # Should record dry_run status
-        db.update_planner_action.assert_called_once_with(99, status="dry_run")
-        # Should not track as pending
-        assert "100x1x0" not in planner._pending_closes
+        assert result["status"] == "completed"
+        planner.plugin.rpc.close.assert_called_once_with(id="100x1x0")
 
-    def test_pending_closes_initialized_empty(self):
-        """CapacityPlanner starts with empty _pending_closes dict."""
-        plugin = MagicMock()
-        prof = MagicMock()
-        flow = MagicMock()
-        planner = CapacityPlanner(plugin, prof, flow)
+    def test_execute_close_db_failure_after_successful_close(self):
+        """Close reports success even if DB update fails after close RPC."""
+        planner, db, pm = _make_close_planner()
+        cfg = _make_close_cfg()
 
-        assert planner._pending_closes == {}
-        assert planner.rebalancer is None
+        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        db.update_planner_action.side_effect = Exception("DB write failed")
+
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
+
+        assert result["status"] == "completed"
+        assert result["result"] == {"type": "mutual"}
 
     def test_rebalancer_defaults_to_none(self):
         """CapacityPlanner.rebalancer defaults to None."""
@@ -3038,8 +2852,7 @@ class TestDrainAndClose:
 def _make_cycle_cfg(planner_enabled=True, planner_max_opens_per_cycle=2,
                     planner_max_closes_per_cycle=2, planner_dry_run=False,
                     planner_max_fee_rate_sat_vb=50.0, min_wallet_reserve=500000,
-                    planner_min_channel_sats=500000, planner_max_channel_sats=10000000,
-                    planner_drain_timeout_hours=72):
+                    planner_min_channel_sats=500000, planner_max_channel_sats=10000000):
     """Create a mock config snapshot for execute_cycle tests."""
     cfg = MagicMock()
     cfg.planner_enabled = planner_enabled
@@ -3050,7 +2863,6 @@ def _make_cycle_cfg(planner_enabled=True, planner_max_opens_per_cycle=2,
     cfg.min_wallet_reserve = min_wallet_reserve
     cfg.planner_min_channel_sats = planner_min_channel_sats
     cfg.planner_max_channel_sats = planner_max_channel_sats
-    cfg.planner_drain_timeout_hours = planner_drain_timeout_hours
     return cfg
 
 
@@ -3148,12 +2960,10 @@ class TestExecuteCycle:
 
         assert "opens" in result
         assert "closes" in result
-        assert "drains_progressed" in result
         assert "skipped_reasons" in result
         assert "timestamp" in result
         assert isinstance(result["opens"], list)
         assert isinstance(result["closes"], list)
-        assert isinstance(result["drains_progressed"], list)
         assert isinstance(result["skipped_reasons"], list)
         assert isinstance(result["timestamp"], int)
 
@@ -3192,7 +3002,7 @@ class TestExecuteCycle:
         assert opened["result"] in ("completed", "dry_run")
 
     def test_execute_cycle_closes_worst_loser(self):
-        """Cycle initiates drain on worst loser when guards pass."""
+        """Cycle directly closes worst loser when guards pass."""
         # Set up a zombie loser
         scid = "200x300x0"
         loser_prof = _mock_profitability(
@@ -3209,6 +3019,7 @@ class TestExecuteCycle:
             all_profitability={scid: loser_prof},
             all_flow={scid: loser_flow},
         )
+        plugin.rpc.close.return_value = {"type": "mutual"}
 
         cfg = _make_cycle_cfg(planner_max_closes_per_cycle=1)
 
@@ -3219,6 +3030,9 @@ class TestExecuteCycle:
         assert closed["scid"] == scid
         assert closed["peer_id"] == loser_prof.peer_id
         assert "ZOMBIE" in closed["reason"]
+        assert closed["status"] == "completed"
+        # Verify close RPC was actually called
+        plugin.rpc.close.assert_called_once_with(id=scid)
 
     def test_execute_cycle_respects_max_opens_per_cycle(self):
         """At most max_opens_per_cycle opens per invocation."""
@@ -3289,33 +3103,6 @@ class TestExecuteCycle:
         result = planner.execute_cycle(cfg)
 
         assert len(result["closes"]) <= 1
-
-    def test_execute_cycle_progresses_draining_channels(self):
-        """Cycle checks drain progress on pending closes and executes close."""
-        planner, plugin, prof, flow, pm = _make_cycle_planner()
-
-        # Seed a pending drain that is complete (timed out)
-        channel_id = "100x200x0"
-        planner._pending_closes[channel_id] = int(time.time()) - 999999  # Long ago
-
-        # Mock DB returning a matching draining action
-        prof.database.get_planner_actions.return_value = [
-            {"id": 42, "channel_id": channel_id, "peer_id": "peer_abc", "status": "draining"},
-        ]
-
-        # Mock the close RPC
-        plugin.rpc.close.return_value = {"txid": "abc123"}
-
-        cfg = _make_cycle_cfg(planner_drain_timeout_hours=1)  # 1 hour timeout, drain started long ago
-
-        result = planner.execute_cycle(cfg)
-
-        assert len(result["drains_progressed"]) == 1
-        progressed = result["drains_progressed"][0]
-        assert progressed["channel_id"] == channel_id
-        assert progressed["peer_id"] == "peer_abc"
-        assert progressed["action_id"] == 42
-        assert progressed["result"] == "completed"
 
     def test_execute_cycle_skips_close_for_static_policy(self):
         """Close skipped for channel with static policy."""
@@ -3436,62 +3223,6 @@ class TestExecuteCycle:
         mock_config.snapshot.assert_called_once()
         assert result["skipped"] is True
 
-    def test_execute_cycle_skips_already_pending_close(self):
-        """Channels already in _pending_closes are not drained again."""
-        scid = "200x300x0"
-        loser_prof = _mock_profitability(
-            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
-            classification=ProfitabilityClass.ZOMBIE, days_open=120,
-        )
-        loser_prof.channel_role = "balanced"
-        loser_flow = _mock_flow(
-            daily_volume=100, flow_ratio=0.5, confidence=1.0,
-            kalman_regime_change=False,
-        )
-
-        planner, plugin, prof, flow, pm = _make_cycle_planner(
-            all_profitability={scid: loser_prof},
-            all_flow={scid: loser_flow},
-        )
-
-        # Already pending
-        planner._pending_closes[scid] = int(time.time())
-
-        # The drain is NOT complete
-        plugin.rpc.listpeerchannels.return_value = {
-            "channels": [{
-                "short_channel_id": scid,
-                "spendable_msat": 900_000_000,  # 90% local balance
-                "total_msat": 1_000_000_000,
-            }],
-        }
-
-        cfg = _make_cycle_cfg(planner_drain_timeout_hours=999)
-
-        result = planner.execute_cycle(cfg)
-
-        # Should not initiate a new close for already-pending channel
-        assert len(result["closes"]) == 0
-
-    def test_execute_cycle_orphaned_drain_cleaned(self):
-        """Drain-complete channel without DB record is cleaned up."""
-        planner, plugin, prof, flow, pm = _make_cycle_planner()
-
-        channel_id = "orphan_chan"
-        planner._pending_closes[channel_id] = int(time.time()) - 999999
-
-        # No matching draining action in DB
-        prof.database.get_planner_actions.return_value = []
-
-        cfg = _make_cycle_cfg(planner_drain_timeout_hours=1)
-
-        result = planner.execute_cycle(cfg)
-
-        assert len(result["drains_progressed"]) == 1
-        assert result["drains_progressed"][0]["result"] == "orphaned_drain_cleaned"
-        # Channel should be removed from pending
-        assert channel_id not in planner._pending_closes
-
     def test_execute_cycle_cooldown_blocks_close(self):
         """Close skipped when peer has recent action (cooldown)."""
         scid = "200x300x0"
@@ -3552,7 +3283,7 @@ class TestExecuteCycle:
         assert len(result["closes"]) == 1  # Close should still proceed
 
     def test_execute_cycle_dry_run_mode(self):
-        """In dry_run mode, opens and closes record dry_run status."""
+        """In dry_run mode, closes record dry_run status without calling close RPC."""
         scid = "200x300x0"
         loser_prof = _mock_profitability(
             scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
@@ -3573,41 +3304,12 @@ class TestExecuteCycle:
 
         result = planner.execute_cycle(cfg)
 
-        # Closes happen in dry_run mode but don't execute actual close
+        # Close recorded but not executed
         assert len(result["closes"]) == 1
-        # fundchannel should NOT have been called (nothing to open here, but also
-        # the drain should be recorded as dry_run in DB)
+        assert result["closes"][0]["status"] == "dry_run"
+        # close RPC should NOT have been called
+        plugin.rpc.close.assert_not_called()
         prof.database.update_planner_action.assert_any_call(1, status="dry_run")
-
-
-class TestPendingCloseInterface:
-    """Tests for is_pending_close() coordination interface."""
-
-    def test_pending_close_returns_true_for_known_channel(self):
-        """is_pending_close returns True for channels in _pending_closes."""
-        plugin = MagicMock()
-        prof = MagicMock()
-        flow = MagicMock()
-        planner = CapacityPlanner(plugin, prof, flow)
-        planner._pending_closes["123x1x0"] = int(time.time())
-        assert planner.is_pending_close("123x1x0")
-
-    def test_pending_close_returns_false_for_unknown_channel(self):
-        """is_pending_close returns False for channels not in _pending_closes."""
-        plugin = MagicMock()
-        prof = MagicMock()
-        flow = MagicMock()
-        planner = CapacityPlanner(plugin, prof, flow)
-        planner._pending_closes["123x1x0"] = int(time.time())
-        assert not planner.is_pending_close("456x2x0")
-
-    def test_pending_close_empty(self):
-        """is_pending_close returns False when no channels are pending close."""
-        plugin = MagicMock()
-        prof = MagicMock()
-        flow = MagicMock()
-        planner = CapacityPlanner(plugin, prof, flow)
-        assert not planner.is_pending_close("123x1x0")
 
 
 class TestPlannerIntegration:
@@ -3667,17 +3369,15 @@ class TestPlannerIntegration:
         # --- Assert structured summary keys ---
         assert "opens" in result
         assert "closes" in result
-        assert "drains_progressed" in result
         assert "skipped_reasons" in result
         assert "timestamp" in result
 
-        # --- Assert loser was identified and drain initiated ---
+        # --- Assert loser was identified and close recorded ---
         assert len(result["closes"]) == 1
         assert result["closes"][0]["scid"] == loser_scid
         assert result["closes"][0]["peer_id"] == loser_peer
 
         # --- Assert planner_actions were recorded with status="dry_run" ---
-        # The drain should have been recorded then set to dry_run
         prof_analyzer.database.record_planner_action.assert_called()
         prof_analyzer.database.update_planner_action.assert_any_call(1, status="dry_run")
 
@@ -3875,14 +3575,11 @@ class TestPlannerIntegration:
         ]
 
         planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer, config=mock_config)
-        planner._pending_closes["chan1"] = int(time.time())
 
         status = planner.get_status()
 
         assert status["enabled"] is True
         assert status["dry_run"] is False
-        assert status["pending_closes"] == 1
-        assert "chan1" in status["pending_close_channels"]
         assert status["candidate_pool_size"] == 2
         assert len(status["recent_actions"]) == 1
 
@@ -3919,7 +3616,6 @@ class TestConstructorCleanup:
         assert planner.policy_manager is None
         assert planner.config is None
         assert planner.rebalancer is None
-        assert planner._pending_closes == {}
 
     def test_constructor_all_params(self):
         """Constructor stores all parameters correctly."""
@@ -3936,8 +3632,6 @@ class TestConstructorCleanup:
         assert planner.policy_manager is pm
         assert planner.config is cfg
         assert planner.rebalancer is None
-        assert isinstance(planner._pending_closes, dict)
-        assert len(planner._pending_closes) == 0
 
     def test_old_constructor_signature_without_config(self):
         """Backward compat: constructor works without config (defaults to None)."""
@@ -3967,8 +3661,3 @@ class TestConstructorCleanup:
         planner.rebalancer = mock_rebalancer
         assert planner.rebalancer is mock_rebalancer
 
-    def test_pending_closes_is_dict(self):
-        """_pending_closes is initialized as an empty dict."""
-        planner = CapacityPlanner(MagicMock(), MagicMock(), MagicMock())
-        assert isinstance(planner._pending_closes, dict)
-        assert len(planner._pending_closes) == 0

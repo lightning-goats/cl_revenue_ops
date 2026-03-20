@@ -34,11 +34,6 @@ class CapacityPlanner:
         self.policy_manager = policy_manager
         self.config = config
         self.rebalancer = None
-        self._pending_closes: Dict[str, int] = {}
-
-    def is_pending_close(self, channel_id: str) -> bool:
-        """Check if a channel is pending close by the planner."""
-        return channel_id in self._pending_closes
 
     def get_status(self) -> Dict[str, Any]:
         """Return planner status for RPC query."""
@@ -46,9 +41,7 @@ class CapacityPlanner:
         cfg = self.config
         return {
             "enabled": getattr(cfg, 'planner_enabled', False) if cfg else False,
-            "dry_run": getattr(cfg, 'planner_dry_run', True) if cfg else True,
-            "pending_closes": len(self._pending_closes),
-            "pending_close_channels": list(self._pending_closes.keys()),
+            "dry_run": getattr(cfg, 'planner_dry_run', False) if cfg else False,
             "candidate_pool_size": len(db.get_planner_candidates()) if db else 0,
             "recent_actions": db.get_planner_actions(limit=5) if db else [],
         }
@@ -98,7 +91,6 @@ class CapacityPlanner:
         summary = {
             "opens": [],
             "closes": [],
-            "drains_progressed": [],
             "skipped_reasons": [],
         }
 
@@ -115,44 +107,7 @@ class CapacityPlanner:
         winners = self._identify_winners(all_profitability, all_flow)
         losers = self._identify_losers(all_profitability, all_flow)
 
-        # 4. Progress existing drains
-        db = self.profitability.database if self.profitability else None
-        for channel_id in list(self._pending_closes.keys()):
-            if self._check_drain_complete(channel_id, cfg):
-                # Find the matching draining action from DB
-                action_id = None
-                peer_id = None
-                if db:
-                    try:
-                        draining_actions = db.get_planner_actions(status='draining')
-                        for action in draining_actions:
-                            if action.get('channel_id') == channel_id:
-                                action_id = action.get('id')
-                                peer_id = action.get('peer_id')
-                                break
-                    except Exception as e:
-                        self.plugin.log(
-                            f"Error fetching draining actions for {channel_id}: {e}",
-                            level='debug',
-                        )
-
-                if action_id and peer_id:
-                    result = self._execute_close(channel_id, peer_id, action_id, cfg)
-                    summary["drains_progressed"].append({
-                        "channel_id": channel_id,
-                        "peer_id": peer_id,
-                        "action_id": action_id,
-                        "result": result.get("status", "unknown"),
-                    })
-                else:
-                    # Drain complete but no matching DB record; clean up tracking
-                    del self._pending_closes[channel_id]
-                    summary["drains_progressed"].append({
-                        "channel_id": channel_id,
-                        "result": "orphaned_drain_cleaned",
-                    })
-
-        # 5. Initiate new closes (up to max_closes_per_cycle)
+        # 4. Close worst losers (up to max_closes_per_cycle)
         closes_this_cycle = 0
         closeable = [l for l in losers if l.get("action") == "CLOSE"]
         sorted_closeable = sorted(closeable, key=lambda x: x.get("marginal_roi", 0))
@@ -161,8 +116,6 @@ class CapacityPlanner:
                 break
             scid = loser.get("scid")
             peer_id = loser.get("peer_id")
-            if scid in self._pending_closes:
-                continue
 
             # Check policy allows close
             close_ok, close_reason = self._check_close_allowed(peer_id)
@@ -180,16 +133,17 @@ class CapacityPlanner:
                 )
                 continue
 
-            action_id = self._initiate_drain(peer_id, scid, cfg, loser.get("reason", ""))
+            result = self._execute_close(scid, peer_id, cfg, loser.get("reason", ""))
             summary["closes"].append({
                 "scid": scid,
                 "peer_id": peer_id,
                 "reason": loser.get("reason", ""),
-                "action_id": action_id,
+                "action_id": result.get("action_id"),
+                "status": result.get("status", "unknown"),
             })
             closes_this_cycle += 1
 
-        # 6. Discover and open channels (up to max_opens_per_cycle)
+        # 5. Discover and open channels (up to max_opens_per_cycle)
         candidates = []
         if fee_ok:
             candidates = self._discover_peers(winners, all_profitability, all_flow)
@@ -253,7 +207,7 @@ class CapacityPlanner:
                 # Reduce available sats for next candidate
                 available_sats = max(0, available_sats - channel_size)
 
-        # 7. Update candidate pool
+        # 6. Update candidate pool
         self._update_candidate_pool(candidates if fee_ok else [])
 
         summary["timestamp"] = int(time.time())
@@ -1081,8 +1035,8 @@ class CapacityPlanner:
     def _check_close_allowed(self, peer_id: str) -> tuple:
         """Check if a channel close is allowed for this peer.
 
-        Channels with static policy or tagged 'protect'/'no_close' must
-        never be closed.
+        Channels with static or passive policy, or tagged
+        'protect'/'no_close', must never be auto-closed.
 
         Returns:
             (allowed, reason) tuple.
@@ -1093,11 +1047,13 @@ class CapacityPlanner:
         try:
             policy = self.policy_manager.get_policy(peer_id)
 
-            # Static policy channels are never closed
+            # Static and passive policy channels are never auto-closed
             strategy = policy.strategy
             strategy_str = strategy.value if hasattr(strategy, 'value') else str(strategy)
             if strategy_str == "static":
                 return False, "Channel has static policy — close blocked"
+            if strategy_str == "passive":
+                return False, "Channel has passive policy — close blocked"
 
             # Protected channels are never closed
             if hasattr(policy, 'has_tag'):
@@ -1114,17 +1070,11 @@ class CapacityPlanner:
 
         return True, "Close allowed"
 
-    def _initiate_drain(self, peer_id: str, channel_id: str, cfg, reason: str) -> int:
-        """Phase 1: Set policy to drain, record action.
-
-        Sets the channel to passive+source_only so it drains naturally
-        before close, and records a draining action in the database.
-
-        Returns:
-            The action_id from the database record.
-        """
+    def _execute_close(self, channel_id: str, peer_id: str, cfg, reason: str = "") -> Dict:
+        """Execute a channel close: record action, stop rebalancer, call close RPC."""
         db = self.profitability.database if self.profitability else None
 
+        # Record action
         action_id = None
         if db:
             try:
@@ -1136,8 +1086,9 @@ class CapacityPlanner:
                     reason=reason,
                 )
             except Exception as e:
-                self.plugin.log(f"Failed to record drain action: {e}", level='warn')
+                self.plugin.log(f"Failed to record close action: {e}", level='warn')
 
+        # Dry run gate
         if cfg.planner_dry_run:
             if db and action_id:
                 try:
@@ -1145,78 +1096,12 @@ class CapacityPlanner:
                 except Exception:
                     pass
             self.plugin.log(
-                f"[DRY RUN] Would drain and close {channel_id} "
+                f"[DRY RUN] Would close {channel_id} "
                 f"(peer: {peer_id[:16]}..., reason: {reason})",
                 level='info',
             )
-            return action_id
+            return {"action_id": action_id, "status": "dry_run"}
 
-        # Set drain policy
-        if self.policy_manager:
-            try:
-                self.policy_manager.set_policy(
-                    peer_id,
-                    strategy="passive",
-                    rebalance_mode="source_only",
-                    tags=["closing", "drain_phase"],
-                    expires_in_hours=cfg.planner_drain_timeout_hours,
-                )
-            except Exception as e:
-                self.plugin.log(
-                    f"Failed to set drain policy for {peer_id[:12]}...: {e}",
-                    level='warn',
-                )
-
-        if db and action_id:
-            try:
-                db.update_planner_action(action_id, status="draining")
-            except Exception:
-                pass
-
-        self._pending_closes[channel_id] = int(time.time())
-        return action_id
-
-    def _check_drain_complete(self, channel_id: str, cfg) -> bool:
-        """Check if drain phase is complete.
-
-        Drain is complete when either:
-        - Local balance is less than 10% of channel capacity, or
-        - The drain timeout has elapsed.
-        """
-        # Check timeout
-        drain_start = self._pending_closes.get(channel_id)
-        if drain_start:
-            elapsed_hours = (time.time() - drain_start) / 3600
-            if elapsed_hours > cfg.planner_drain_timeout_hours:
-                return True
-
-        # Check balance
-        try:
-            channels = self.plugin.rpc.listpeerchannels()
-            for ch in channels.get("channels", []):
-                if ch.get("short_channel_id") == channel_id or ch.get("channel_id") == channel_id:
-                    local = ch.get("spendable_msat", 0)
-                    if isinstance(local, str):
-                        local = int(local.replace("msat", ""))
-                    capacity = ch.get("total_msat", 1)
-                    if isinstance(capacity, str):
-                        capacity = int(capacity.replace("msat", ""))
-                    if capacity > 0 and (local / capacity) < 0.1:
-                        return True
-        except Exception as e:
-            self.plugin.log(
-                f"Error checking drain status for {channel_id}: {e}",
-                level='debug',
-            )
-
-        return False
-
-    def _execute_close(self, channel_id: str, peer_id: str, action_id: int, cfg) -> Dict:
-        """Phase 2: Execute channel close.
-
-        Stops any active rebalancer jobs on the channel, then calls
-        the close RPC. Updates the planner action record with the result.
-        """
         # Stop rebalancer jobs if any
         if self.rebalancer and hasattr(self.rebalancer, 'job_manager'):
             try:
@@ -1228,8 +1113,6 @@ class CapacityPlanner:
                     level='warn',
                 )
 
-        db = self.profitability.database if self.profitability else None
-
         try:
             result = self.plugin.rpc.close(id=channel_id)
 
@@ -1238,9 +1121,6 @@ class CapacityPlanner:
                     db.update_planner_action(action_id, status="completed")
                 except Exception:
                     pass
-
-            if channel_id in self._pending_closes:
-                del self._pending_closes[channel_id]
 
             self.plugin.log(
                 f"Channel closed: {channel_id} (peer: {peer_id[:16]}...)",

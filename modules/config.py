@@ -139,7 +139,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_min_channel_age_days': int,
     'planner_min_peer_uptime_pct': float,
     'planner_max_fee_rate_sat_vb': float,
-    'planner_drain_timeout_hours': int,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -232,7 +231,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_channel_age_days': (1, 365),
     'planner_min_peer_uptime_pct': (0.0, 100.0),
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
-    'planner_drain_timeout_hours': (1, 720),
 }
 
 # Valid values for string enum fields
@@ -409,7 +407,7 @@ class Config:
     # Capacity Planner
     planner_enabled: bool = False
     planner_interval: int = 21600               # 6 hours
-    planner_dry_run: bool = True
+    planner_dry_run: bool = False
     planner_max_opens_per_cycle: int = 1
     planner_max_closes_per_cycle: int = 1
     planner_min_channel_sats: int = 500000      # 500k sats
@@ -417,8 +415,6 @@ class Config:
     planner_min_channel_age_days: int = 30
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
-    planner_drain_timeout_hours: int = 72
-
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -778,7 +774,7 @@ class ConfigSnapshot:
     # Capacity Planner
     planner_enabled: bool = False
     planner_interval: int = 21600
-    planner_dry_run: bool = True
+    planner_dry_run: bool = False
     planner_max_opens_per_cycle: int = 1
     planner_max_closes_per_cycle: int = 1
     planner_min_channel_sats: int = 500000
@@ -786,8 +782,6 @@ class ConfigSnapshot:
     planner_min_channel_age_days: int = 30
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
-    planner_drain_timeout_hours: int = 72
-
     # Version tracking
     version: int = 0
     
