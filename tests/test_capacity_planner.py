@@ -2089,3 +2089,286 @@ class TestSafetyGuards:
         ok, reason = planner._check_safety_guards(cfg, "open", "peer1", amount_sats=1000000)
         assert ok is False
         assert "Cooldown" in reason
+
+
+# ---------------------------------------------------------------------------
+# Channel Sizing Tests
+# ---------------------------------------------------------------------------
+
+class TestChannelSizing:
+    """Tests for _size_channel ROI-proportional channel sizing."""
+
+    def _make_planner(self):
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        return CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+
+    def _make_cfg(self, min_channel=500000, max_channel=10000000):
+        cfg = MagicMock()
+        cfg.planner_min_channel_sats = min_channel
+        cfg.planner_max_channel_sats = max_channel
+        return cfg
+
+    def test_roi_proportional_sizing(self):
+        """Higher-scored candidates get proportionally larger channels."""
+        planner = self._make_planner()
+        candidates = [
+            {"peer_id": "p1", "score": 0.6},
+            {"peer_id": "p2", "score": 0.3},
+        ]
+        cfg = self._make_cfg(min_channel=500000, max_channel=10000000)
+        size1 = planner._size_channel(candidates[0], candidates, 6000000, cfg)
+        size2 = planner._size_channel(candidates[1], candidates, 6000000, cfg)
+        assert size1 > size2  # Higher score = larger channel
+
+    def test_size_clamped_to_min(self):
+        """Channel size never below min_channel_sats."""
+        planner = self._make_planner()
+        cfg = self._make_cfg(min_channel=500000, max_channel=10000000)
+        size = planner._size_channel({"score": 0.01}, [{"score": 0.01}], 100000, cfg)
+        assert size == 500000
+
+    def test_size_clamped_to_max(self):
+        """Channel size never above max_channel_sats."""
+        planner = self._make_planner()
+        cfg = self._make_cfg(min_channel=500000, max_channel=5000000)
+        size = planner._size_channel({"score": 1.0}, [{"score": 1.0}], 100000000, cfg)
+        assert size == 5000000
+
+    def test_never_more_than_half_available(self):
+        """No single channel takes more than 50% of available funds."""
+        planner = self._make_planner()
+        cfg = self._make_cfg(min_channel=500000, max_channel=10000000)
+        size = planner._size_channel({"score": 1.0}, [{"score": 1.0}], 4000000, cfg)
+        assert size <= 2000000
+
+    def test_empty_candidates_returns_min(self):
+        """Empty candidate list returns min_channel_sats."""
+        planner = self._make_planner()
+        cfg = self._make_cfg(min_channel=500000, max_channel=10000000)
+        size = planner._size_channel({"score": 1.0}, [], 5000000, cfg)
+        assert size == 500000
+
+    def test_multiple_candidates_proportional(self):
+        """With three candidates, sizes should be proportional to scores."""
+        planner = self._make_planner()
+        candidates = [
+            {"peer_id": "p1", "score": 0.5},
+            {"peer_id": "p2", "score": 0.3},
+            {"peer_id": "p3", "score": 0.2},
+        ]
+        cfg = self._make_cfg(min_channel=100000, max_channel=10000000)
+        available = 10000000
+        size1 = planner._size_channel(candidates[0], candidates, available, cfg)
+        size2 = planner._size_channel(candidates[1], candidates, available, cfg)
+        size3 = planner._size_channel(candidates[2], candidates, available, cfg)
+        assert size1 > size2 > size3
+
+    def test_zero_score_uses_floor(self):
+        """Score of 0 is treated as 0.01 (floor)."""
+        planner = self._make_planner()
+        candidates = [
+            {"peer_id": "p1", "score": 0},
+            {"peer_id": "p2", "score": 0.5},
+        ]
+        cfg = self._make_cfg(min_channel=500000, max_channel=10000000)
+        # Should not crash, score floored to 0.01
+        size = planner._size_channel(candidates[0], candidates, 5000000, cfg)
+        assert size >= 500000
+
+    def test_negative_score_uses_floor(self):
+        """Negative score is treated as 0.01 (floor)."""
+        planner = self._make_planner()
+        candidates = [
+            {"peer_id": "p1", "score": -1.0},
+        ]
+        cfg = self._make_cfg(min_channel=500000, max_channel=10000000)
+        size = planner._size_channel(candidates[0], candidates, 5000000, cfg)
+        assert size >= 500000
+
+    def test_missing_score_uses_floor(self):
+        """Missing score key defaults to 0.01."""
+        planner = self._make_planner()
+        candidates = [
+            {"peer_id": "p1"},
+        ]
+        cfg = self._make_cfg(min_channel=500000, max_channel=10000000)
+        size = planner._size_channel(candidates[0], candidates, 5000000, cfg)
+        assert size >= 500000
+
+
+# ---------------------------------------------------------------------------
+# Open EV Tests
+# ---------------------------------------------------------------------------
+
+class TestOpenEV:
+    """Tests for _calculate_open_ev EV-based channel open decision."""
+
+    def _make_planner(self, feerates_return=None, closed_summary=None,
+                       feerates_raises=False):
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+
+        if feerates_raises:
+            plugin.rpc.feerates.side_effect = Exception("RPC unavailable")
+        elif feerates_return is not None:
+            plugin.rpc.feerates.return_value = feerates_return
+        else:
+            # Default: low fee environment (1 sat/vB)
+            plugin.rpc.feerates.return_value = {"perkb": {"opening": 1000}}
+
+        if closed_summary is not None:
+            prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = closed_summary
+        else:
+            prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = None
+
+        return CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+
+    def _make_cfg(self):
+        cfg = MagicMock()
+        cfg.planner_min_channel_sats = 500000
+        cfg.planner_max_channel_sats = 10000000
+        cfg.min_wallet_reserve = 1000000
+        return cfg
+
+    def test_positive_ev_for_good_peer(self):
+        """Positive EV for peer with profit history."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 1000}},  # 1 sat/vB
+            closed_summary={"daily_net_est_sats": 100},     # 100 sats/day
+        )
+        cfg = self._make_cfg()
+        ev = planner._calculate_open_ev("peer1", 5000000, cfg)
+        # Revenue: 100 * 180 = 18000
+        # On-chain: (1*140) + (1*200) = 340
+        # Rebal: 10 * 180 = 1800
+        # EV = 18000 - 340 - 1800 = 15860
+        assert ev > 0
+
+    def test_negative_ev_for_high_costs(self):
+        """Negative EV when on-chain costs exceed expected revenue."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 500000}},  # 500 sat/vB
+            closed_summary=None,  # No history, use fallback
+        )
+        cfg = self._make_cfg()
+        # Small channel with very high fees
+        ev = planner._calculate_open_ev("peer1", 500000, cfg)
+        # Fallback revenue: 500000 * 0.3 * 150 / 1e6 = 22.5 sats/day
+        # On-chain: (500*140) + (500*200) = 70000 + 100000 = 170000
+        # Lifetime revenue: 22.5 * 180 = 4050
+        # Rebal: 2.25 * 180 = 405
+        # EV = 4050 - 170000 - 405 = -166355
+        assert ev <= 0
+
+    def test_ev_uses_profit_inheritance(self):
+        """Returning peers use historical daily revenue."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 1000}},
+            closed_summary={"daily_net_est_sats": 50},
+        )
+        cfg = self._make_cfg()
+        ev = planner._calculate_open_ev("peer1", 2000000, cfg)
+        # Revenue should use the 50 sats/day from closed summary, not fallback
+        # Expected: 50 * 180 = 9000 revenue
+        # On-chain: 140 + 200 = 340
+        # Rebal: 5 * 180 = 900
+        # EV = 9000 - 340 - 900 = 7760
+        expected_revenue = 50 * 180
+        expected_rebal = 5 * 180
+        expected_on_chain = 140 + 200
+        expected_ev = expected_revenue - expected_on_chain - expected_rebal
+        assert abs(ev - expected_ev) < 1.0  # Allow float tolerance
+
+    def test_ev_fallback_estimate(self):
+        """New peers use capacity-based revenue estimate."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 1000}},
+            closed_summary=None,  # No history
+        )
+        cfg = self._make_cfg()
+        ev = planner._calculate_open_ev("new_peer", 5000000, cfg)
+        # Fallback: 5000000 * 0.3 * 150 / 1e6 = 225 sats/day
+        # Should produce positive EV with low fees
+        assert ev > 0
+
+    def test_ev_survives_rpc_errors(self):
+        """EV calculation works with fallback costs when RPC fails."""
+        planner = self._make_planner(feerates_raises=True)
+        cfg = self._make_cfg()
+        ev = planner._calculate_open_ev("peer1", 5000000, cfg)
+        # Should not crash; uses ChainCostDefaults fallback
+        assert isinstance(ev, float)
+
+    def test_ev_negative_closed_summary_uses_fallback(self):
+        """Negative daily_net_est_sats in closed summary triggers fallback."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 1000}},
+            closed_summary={"daily_net_est_sats": -10},  # Historically unprofitable
+        )
+        cfg = self._make_cfg()
+        ev = planner._calculate_open_ev("peer1", 5000000, cfg)
+        # Should use fallback estimate, not the negative value
+        # Fallback: 5000000 * 0.3 * 150 / 1e6 = 225 sats/day
+        assert ev > 0
+
+    def test_ev_zero_closed_summary_uses_fallback(self):
+        """Zero daily_net_est_sats triggers fallback."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 1000}},
+            closed_summary={"daily_net_est_sats": 0},
+        )
+        cfg = self._make_cfg()
+        ev = planner._calculate_open_ev("peer1", 5000000, cfg)
+        # Fallback: 5000000 * 0.3 * 150 / 1e6 = 225 sats/day
+        assert ev > 0
+
+    def test_ev_database_exception_handled(self):
+        """Database exception for closed summary is handled gracefully."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 1000}}
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.side_effect = Exception("DB error")
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+        cfg = self._make_cfg()
+        ev = planner._calculate_open_ev("peer1", 5000000, cfg)
+        assert isinstance(ev, float)
+        assert ev > 0  # Should use fallback
+
+
+# ---------------------------------------------------------------------------
+# Estimate Open Cost Tests
+# ---------------------------------------------------------------------------
+
+class TestEstimateOpenCost:
+    """Tests for _estimate_open_cost helper."""
+
+    def test_estimate_from_feerates(self):
+        """Uses RPC feerates to estimate open cost."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 5000}}  # 5 sat/vB
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        cost = planner._estimate_open_cost()
+        # 5 sat/vB * 140 vB = 700
+        assert cost == 700
+
+    def test_estimate_fallback_on_rpc_error(self):
+        """Falls back to ChainCostDefaults when RPC fails."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.side_effect = Exception("RPC down")
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        cost = planner._estimate_open_cost()
+        from modules.config import ChainCostDefaults
+        assert cost == ChainCostDefaults.CHANNEL_OPEN_COST_SATS
+
+    def test_estimate_with_default_opening_rate(self):
+        """Uses default 1000 perkb when opening field is missing."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {}}  # No "opening" key
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        cost = planner._estimate_open_cost()
+        # default 1000 perkb => 1 sat/vB * 140 = 140
+        assert cost == 140

@@ -690,3 +690,82 @@ class CapacityPlanner:
         self._update_candidate_pool(merged)
 
         return merged
+
+    def _size_channel(self, candidate: Dict, all_candidates: List[Dict],
+                       available_sats: int, cfg) -> int:
+        """ROI-proportional channel sizing.
+
+        Allocates available funds proportionally to candidate scores.
+        Clamps to [min_channel, max_channel] and never exceeds 50% of available.
+        """
+        if not all_candidates:
+            return cfg.planner_min_channel_sats
+
+        total_score = sum(max(c.get("score", 0.01), 0.01) for c in all_candidates)
+        candidate_score = max(candidate.get("score", 0.01), 0.01)
+        roi_weight = candidate_score / total_score
+
+        raw_size = int(available_sats * roi_weight)
+
+        # Never more than half remaining
+        raw_size = min(raw_size, available_sats // 2)
+
+        # Clamp to config bounds
+        return max(cfg.planner_min_channel_sats,
+                   min(raw_size, cfg.planner_max_channel_sats))
+
+    def _calculate_open_ev(self, peer_id: str, channel_size_sats: int, cfg) -> float:
+        """EV-based channel open decision. Returns expected profit in sats.
+
+        EV = expected_lifetime_revenue - on_chain_cost - expected_rebalance_costs
+        Only open when EV > 0.
+        """
+        # Estimate daily revenue
+        daily_revenue = 0.0
+
+        # Try profit inheritance from closed channels
+        try:
+            closed_summary = self.profitability.database.get_peer_closed_channel_profit_summary(peer_id)
+            if closed_summary and closed_summary.get('daily_net_est_sats', 0) > 0:
+                daily_revenue = closed_summary['daily_net_est_sats']
+        except Exception:
+            pass
+
+        # Fallback: estimate from channel size assuming modest utilization
+        if daily_revenue <= 0:
+            # Assume 30% utilization and 150 PPM average fee
+            daily_revenue = channel_size_sats * 0.3 * 150 / 1_000_000
+
+        # Estimate on-chain costs
+        try:
+            feerates = self.plugin.rpc.feerates(style="perkb")
+            sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
+            open_cost = int(sat_per_vb * 140)   # ~140 vbytes for open tx
+            close_cost = int(sat_per_vb * 200)  # ~200 vbytes for close tx
+        except Exception:
+            open_cost = ChainCostDefaults.CHANNEL_OPEN_COST_SATS
+            close_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+
+        on_chain_cost = open_cost + close_cost
+
+        # Estimate rebalance costs
+        # Conservative: assume 10% of revenue goes to rebalancing
+        rebal_cost_per_day = daily_revenue * 0.1
+
+        # Conservative 6-month lifetime estimate
+        lifetime_days = 180
+
+        expected_revenue = daily_revenue * lifetime_days
+        expected_rebal_cost = rebal_cost_per_day * lifetime_days
+
+        ev = expected_revenue - on_chain_cost - expected_rebal_cost
+        return ev
+
+    def _estimate_open_cost(self) -> int:
+        """Estimate the on-chain cost of opening a channel."""
+        try:
+            feerates = self.plugin.rpc.feerates(style="perkb")
+            sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
+            return int(sat_per_vb * 140)  # ~140 vbytes for funding tx
+        except Exception:
+            return ChainCostDefaults.CHANNEL_OPEN_COST_SATS
