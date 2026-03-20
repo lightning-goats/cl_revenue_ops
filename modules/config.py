@@ -779,7 +779,7 @@ class ConfigSnapshot:
     planner_dry_run: bool = False
     planner_execute_closes: bool = False
     planner_max_opens_per_cycle: int = 1
-    planner_max_closes_per_cycle: int = 1
+    planner_max_closes_per_cycle: int = 0
     planner_min_channel_sats: int = 500000
     planner_max_channel_sats: int = 10000000
     planner_min_channel_age_days: int = 30

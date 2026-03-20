@@ -1986,14 +1986,17 @@ class EVRebalancer:
         return max(0, int((cfg or self.config.snapshot()).daily_budget_sats))
 
     def _get_our_node_id(self) -> str:
-        if self._our_node_id is None:
-            try:
-                info = self.plugin.rpc.getinfo()
-                self._our_node_id = info.get("id", "")
-            except Exception as e:
-                self.plugin.log(f"Error getting our node ID: {e}", level='error')
-                return None  # F10 FIX: Don't cache failure, retry next call
-        return self._our_node_id
+        if self._our_node_id:
+            return self._our_node_id
+        try:
+            info = self.plugin.rpc.getinfo()
+            node_id = info.get("id", "")
+            if node_id:
+                self._our_node_id = node_id
+            return node_id or None
+        except Exception as e:
+            self.plugin.log(f"Error getting our node ID: {e}", level='error')
+            return None  # F10 FIX: Don't cache failure, retry next call
 
     def _get_channel_age_days(self, channel_id: str, channel_info: Dict = None) -> int:
         """

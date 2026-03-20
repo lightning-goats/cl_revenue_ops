@@ -25,7 +25,6 @@ import signal
 import atexit
 import re
 import dataclasses
-from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
 import traceback
@@ -1062,7 +1061,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Build configuration from options. Filter kwargs against the imported Config
     # dataclass fields so partial deployments (new main file + older modules/config.py)
     # don't crash during init. Unknown fields are dropped with a warning.
-    def _safe_int(key, default=0):
+    def _safe_int(key):
         """Parse option as int with descriptive error on failure."""
         try:
             return int(options[key])
@@ -2506,11 +2505,6 @@ def revenue_rebalance(plugin: Plugin,
         except (ValueError, TypeError):
             return {"status": "error", "error": "max_fee_sats must be an integer or null"}
 
-    # Basic SCID format check
-    for cid in (from_channel, to_channel):
-        if not (":" in cid or "x" in cid):
-            return {"status": "error", "error": f"Invalid channel format for {cid}. Use SCID format."}
-
     try:
         result = rebalancer.manual_rebalance(from_channel, to_channel, amount_sats, max_fee_sats, force=force)
         # Check if manual_rebalance returned an error dict
@@ -3491,8 +3485,6 @@ def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
     }
 
     try:
-        import time
-
         # Get all channels currently tracked in channel_states
         tracked_channels = database.get_all_channel_states()
         tracked_ids = {ch['channel_id'] for ch in tracked_channels}
@@ -4277,8 +4269,6 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
         return
 
     try:
-        import time
-
         # Get channel cost data (opening cost)
         channel_cost = database.get_channel_cost(channel_id)
         open_cost_sats = channel_cost.get('open_cost_sats', 0) if channel_cost else 0

@@ -952,10 +952,9 @@ class CapacityPlanner:
         1. Record planned action in database
         2. If dry_run, log and return early
         3. Reserve budget via generic spend ledger
-        4. Connect to peer
-        5. Call fundchannel
-        6. On success: update action, mark spend
-        7. On failure: update action, release reservation
+        4. Call fundchannel (auto-connects via gossip)
+        5. On success: update action, mark spend
+        6. On failure: update action, release reservation
         """
         db = self.profitability.database if self.profitability else None
 
@@ -1106,7 +1105,7 @@ class CapacityPlanner:
         return True, "Close allowed"
 
     def _execute_close(self, channel_id: str, peer_id: str, cfg, reason: str = "") -> Dict:
-        """Execute a channel close: record action, stop rebalancer, call close RPC."""
+        """Close a channel: record action, gate on dry_run/recommendation mode, stop rebalancer, call close RPC."""
         db = self.profitability.database if self.profitability else None
 
         # Record action
@@ -1162,7 +1161,7 @@ class CapacityPlanner:
             except Exception as e:
                 self.plugin.log(
                     f"Error stopping rebalancer job for {channel_id}: {e}",
-                level='warn',
+                    level='warn',
                 )
 
         try:

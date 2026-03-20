@@ -2244,7 +2244,7 @@ class FeeController:
                 )
                 pruned += db_pruned
         except Exception as e:
-            self.plugin.log(f"GC: Error pruning database states: {e}", level='warning')
+            self.plugin.log(f"GC: Error pruning database states: {e}", level='warn')
 
 
         if pruned > 0:
@@ -2335,7 +2335,7 @@ class FeeController:
                         self._save_cycle_state(channel_id, cycle)
                         woken += 1
             except Exception as e:
-                self.plugin.log(f"Error waking database states: {e}", level='warning')
+                self.plugin.log(f"Error waking database states: {e}", level='warn')
 
         if woken > 0:
             self.plugin.log(
@@ -3230,11 +3230,9 @@ class FeeController:
         # Priority 2: Bounded low-fee exploration driven by the legacy probe flag
         if not target_found and is_under_exploration:
             # Calculate current revenue rate (reuse logic from rate calculation below)
-            exploration_volume_sats = self.database.get_volume_since(channel_id, cycle.last_update)
-            exploration_forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
-
+            # Reuse volume/forward data already fetched above.
             # Success criteria: any forwards/volume observed during exploration.
-            exploration_success = (exploration_volume_sats > 0) or (exploration_forward_count > 0)
+            exploration_success = (volume_since_sats > 0) or (forward_count > 0)
 
             if exploration_success:
                 # Exploration succeeded. Clear the flag and hold at a safe low fee
@@ -3246,7 +3244,7 @@ class FeeController:
 
                 sparse_data_conservative = self._is_sparse_data_channel(
                     observation_count=0,
-                    forward_count=exploration_forward_count,
+                    forward_count=forward_count,
                     hours_elapsed=hours_elapsed,
                     current_revenue_rate=current_revenue_rate,
                 )
@@ -3268,7 +3266,7 @@ class FeeController:
 
                 self.plugin.log(
                     f"EXPLORATION: Channel {channel_id[:12]}... observed "
-                    f"{exploration_forward_count} forwards / {exploration_volume_sats} sats during bounded exploration. "
+                    f"{forward_count} forwards / {volume_since_sats} sats during bounded exploration. "
                     f"Holding at safe exploration fee {new_fee_ppm} ppm.",
                     level='info'
                 )
@@ -3276,7 +3274,7 @@ class FeeController:
             else:
                 sparse_data_conservative = self._is_sparse_data_channel(
                     observation_count=0,
-                    forward_count=exploration_forward_count,
+                    forward_count=forward_count,
                     hours_elapsed=hours_elapsed,
                     current_revenue_rate=current_revenue_rate,
                 )
@@ -3376,7 +3374,7 @@ class FeeController:
                 if ch_state is not None:
                     kr = ch_state.get("kalman_flow_ratio", ch_state.get("flow_ratio", 0.0))
                     kv = ch_state.get("kalman_velocity", 0.0)
-                    if not math.isnan(kr) and not math.isnan(kv):
+                    if math.isfinite(kr) and math.isfinite(kv):
                         # Approximate daily momentum
                         expected_demand = abs(kr) + abs(kv * 24.0)
             except Exception as e:
@@ -3443,7 +3441,6 @@ class FeeController:
             except Exception:
                 flow_state_str = "balanced"
 
-            capacity = channel_info.get("capacity") or 2_000_000
             pid_multiplier = ts_state.pid.calculate_multiplier(
                 current_outbound_ratio=outbound_ratio,
                 capacity_sats=capacity,
