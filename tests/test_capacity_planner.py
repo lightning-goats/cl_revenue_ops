@@ -3608,3 +3608,367 @@ class TestPendingCloseInterface:
         flow = MagicMock()
         planner = CapacityPlanner(plugin, prof, flow)
         assert not planner.is_pending_close("123x1x0")
+
+
+class TestPlannerIntegration:
+    """End-to-end integration tests for the capacity planner pipeline."""
+
+    def test_full_cycle_dry_run(self):
+        """End-to-end test: full cycle in dry_run mode produces valid report."""
+        # --- Set up winner channel ---
+        winner_scid = "100x200x0"
+        winner_peer = "02" + "a" * 64
+        winner_prof = _mock_profitability(
+            scid=winner_scid, peer_id=winner_peer,
+            marginal_roi_percent=50.0, roi_percent=50.0,
+            classification=ProfitabilityClass.PROFITABLE,
+            days_open=60, capacity_sats=2_000_000,
+        )
+        winner_flow = _mock_flow(
+            daily_volume=1_500_000, flow_ratio=0.9,
+            capacity=2_000_000, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        # --- Set up loser channel ---
+        loser_scid = "200x300x0"
+        loser_peer = "02" + "b" * 64
+        loser_prof = _mock_profitability(
+            scid=loser_scid, peer_id=loser_peer,
+            marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE,
+            days_open=120, capacity_sats=2_000_000,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5,
+            capacity=2_000_000, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        all_prof = {winner_scid: winner_prof, loser_scid: loser_prof}
+        all_flow = {winner_scid: winner_flow, loser_scid: loser_flow}
+
+        # --- Wire up planner with full mock stack ---
+        planner, plugin, prof_analyzer, flow_analyzer, pm = _make_cycle_planner(
+            all_profitability=all_prof,
+            all_flow=all_flow,
+        )
+
+        # Winner discovery: the winner peer shows up as candidate from
+        # _discover_from_winners (ROI > 30%)
+        # We also need the EV calculation to succeed (positive EV)
+        prof_analyzer.database.get_fee_strategy_state.return_value = None
+
+        cfg = _make_cycle_cfg(planner_dry_run=True)
+
+        result = planner.execute_cycle(cfg)
+
+        # --- Assert structured summary keys ---
+        assert "opens" in result
+        assert "closes" in result
+        assert "drains_progressed" in result
+        assert "skipped_reasons" in result
+        assert "timestamp" in result
+
+        # --- Assert loser was identified and drain initiated ---
+        assert len(result["closes"]) == 1
+        assert result["closes"][0]["scid"] == loser_scid
+        assert result["closes"][0]["peer_id"] == loser_peer
+
+        # --- Assert planner_actions were recorded with status="dry_run" ---
+        # The drain should have been recorded then set to dry_run
+        prof_analyzer.database.record_planner_action.assert_called()
+        prof_analyzer.database.update_planner_action.assert_any_call(1, status="dry_run")
+
+        # --- Assert no RPC mutations (no fundchannel/close calls in dry run) ---
+        plugin.rpc.fundchannel.assert_not_called()
+        plugin.rpc.close.assert_not_called()
+
+    def test_full_cycle_dry_run_with_open_and_close(self):
+        """End-to-end: dry_run cycle with both winner (open) and loser (close)."""
+        winner_scid = "100x200x0"
+        winner_peer = "02" + "a" * 64
+        winner_prof = _mock_profitability(
+            scid=winner_scid, peer_id=winner_peer,
+            marginal_roi_percent=50.0, roi_percent=50.0,
+            classification=ProfitabilityClass.PROFITABLE,
+            days_open=60, capacity_sats=2_000_000,
+        )
+        winner_flow = _mock_flow(
+            daily_volume=1_500_000, flow_ratio=0.9,
+            capacity=2_000_000, confidence=1.0,
+        )
+
+        loser_scid = "200x300x0"
+        loser_peer = "02" + "b" * 64
+        loser_prof = _mock_profitability(
+            scid=loser_scid, peer_id=loser_peer,
+            marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE,
+            days_open=120, capacity_sats=2_000_000,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5,
+            capacity=2_000_000, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        all_prof = {winner_scid: winner_prof, loser_scid: loser_prof}
+        all_flow = {winner_scid: winner_flow, loser_scid: loser_flow}
+
+        planner, plugin, prof_analyzer, flow_analyzer, pm = _make_cycle_planner(
+            all_profitability=all_prof,
+            all_flow=all_flow,
+        )
+
+        # Make EV calculation return positive EV for the winner peer
+        # _calculate_open_ev uses database queries - make them return data
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            'total': 10, 'successes': 8, 'failures': 2,
+            'success_rate': 0.8, 'avg_cost_ppm': 200, 'avg_amount_sats': 100000,
+        }
+        prof_analyzer.database.get_fee_strategy_state.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 2, 'marginal_roi_proxy': 30.0,
+        }
+
+        # Sequence of action_ids for opens and closes
+        action_id_counter = iter(range(1, 100))
+        prof_analyzer.database.record_planner_action.side_effect = lambda **kw: next(action_id_counter)
+
+        cfg = _make_cycle_cfg(planner_dry_run=True)
+
+        result = planner.execute_cycle(cfg)
+
+        # Close should be present
+        assert len(result["closes"]) >= 1
+
+        # No actual RPC mutations in dry_run
+        plugin.rpc.fundchannel.assert_not_called()
+        plugin.rpc.close.assert_not_called()
+
+        # Actions should be recorded as dry_run
+        dry_run_calls = [
+            c for c in prof_analyzer.database.update_planner_action.call_args_list
+            if c == ((1,), {"status": "dry_run"}) or
+               (len(c.args) >= 1 and c.kwargs.get("status") == "dry_run")
+        ]
+        assert len(dry_run_calls) >= 1
+
+    def test_generate_report_still_works(self):
+        """Advisory report generation is not broken by refactor."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 10_000}}
+
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+
+        # Set up winner
+        winner_scid = "100x200x0"
+        winner_prof = _mock_profitability(
+            scid=winner_scid,
+            marginal_roi_percent=50.0, roi_percent=50.0,
+            classification=ProfitabilityClass.PROFITABLE,
+            days_open=60,
+        )
+        winner_flow = _mock_flow(daily_volume=1_500_000, flow_ratio=0.9, capacity=2_000_000)
+
+        # Set up loser
+        loser_scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=loser_scid,
+            marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE,
+            days_open=120,
+        )
+        loser_flow = _mock_flow(daily_volume=100, flow_ratio=0.5)
+
+        prof_analyzer.analyze_all_channels.return_value = {
+            winner_scid: winner_prof,
+            loser_scid: loser_prof,
+        }
+        flow_analyzer.analyze_all_channels.return_value = {
+            winner_scid: winner_flow,
+            loser_scid: loser_flow,
+        }
+
+        # Mock database methods used by identify_winners/losers
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+        prof_analyzer.database.get_fee_strategy_state.return_value = None
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_peer_uptime_percent.side_effect = Exception("not available")
+        prof_analyzer.identify_bleeders_v2.return_value = []
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+        report = planner.generate_report()
+
+        # Assert valid structured output with all required keys
+        assert "timestamp" in report
+        assert "mempool_recommendation" in report
+        assert "summary" in report
+        assert "winners" in report
+        assert "losers" in report
+        assert "recommendations" in report
+
+        # Check summary structure
+        summary = report["summary"]
+        assert "winner_count" in summary
+        assert "loser_count" in summary
+        assert "recommendation_count" in summary
+        assert "total_winner_capacity_sats" in summary
+        assert "total_loser_capacity_sats" in summary
+        assert "actionable_closures" in summary
+        assert "pending_defibrillation" in summary
+
+        # We have at least one winner and one loser
+        assert summary["winner_count"] >= 1
+        assert summary["loser_count"] >= 1
+
+        # Assert no splice fields anywhere in output
+        splice_fields = {"peer_supports_splice", "splice_amount", "splice_direction",
+                         "splice_in_amount", "splice_out_amount", "splice_action"}
+        for winner in report.get("winners", []):
+            for field in splice_fields:
+                assert field not in winner, f"Splice field '{field}' found in winner"
+        for loser in report.get("losers", []):
+            for field in splice_fields:
+                assert field not in loser, f"Splice field '{field}' found in loser"
+
+    def test_generate_report_mempool_recommendation_populated(self):
+        """Report always includes a mempool recommendation string."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 25_000}}
+
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        prof_analyzer.analyze_all_channels.return_value = {}
+        flow_analyzer.analyze_all_channels.return_value = {}
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+        prof_analyzer.database.get_fee_strategy_state.return_value = None
+        prof_analyzer.identify_bleeders_v2.return_value = []
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+        report = planner.generate_report()
+
+        assert isinstance(report["mempool_recommendation"], str)
+        assert len(report["mempool_recommendation"]) > 0
+        assert report["mempool_recommendation"].startswith("PROCEED")
+
+    def test_get_status_returns_correct_structure(self):
+        """get_status returns a well-formed status dict."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+
+        mock_config = MagicMock()
+        mock_config.planner_enabled = True
+        mock_config.planner_dry_run = False
+
+        prof_analyzer.database.get_planner_candidates.return_value = [
+            {"peer_id": "p1", "score": 0.8},
+            {"peer_id": "p2", "score": 0.6},
+        ]
+        prof_analyzer.database.get_planner_actions.return_value = [
+            {"id": 1, "action_type": "open", "status": "completed"},
+        ]
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer, config=mock_config)
+        planner._pending_closes["chan1"] = int(time.time())
+
+        status = planner.get_status()
+
+        assert status["enabled"] is True
+        assert status["dry_run"] is False
+        assert status["pending_closes"] == 1
+        assert "chan1" in status["pending_close_channels"]
+        assert status["candidate_pool_size"] == 2
+        assert len(status["recent_actions"]) == 1
+
+
+class TestConstructorCleanup:
+    """Verify constructor signature and state initialization."""
+
+    def test_constructor_signature(self):
+        """Constructor accepts required and optional parameters."""
+        import inspect
+        sig = inspect.signature(CapacityPlanner.__init__)
+        params = list(sig.parameters.keys())
+
+        # Required positional params
+        assert "self" in params
+        assert "plugin" in params
+        assert "profitability_analyzer" in params
+        assert "flow_analyzer" in params
+
+        # Optional params
+        assert "policy_manager" in params
+        assert "config" in params
+
+    def test_constructor_required_params_only(self):
+        """Constructor works with only required parameters."""
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        planner = CapacityPlanner(plugin, prof, flow)
+
+        assert planner.plugin is plugin
+        assert planner.profitability is prof
+        assert planner.flow is flow
+        assert planner.policy_manager is None
+        assert planner.config is None
+        assert planner.rebalancer is None
+        assert planner._pending_closes == {}
+
+    def test_constructor_all_params(self):
+        """Constructor stores all parameters correctly."""
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        pm = MagicMock()
+        cfg = MagicMock()
+        planner = CapacityPlanner(plugin, prof, flow, policy_manager=pm, config=cfg)
+
+        assert planner.plugin is plugin
+        assert planner.profitability is prof
+        assert planner.flow is flow
+        assert planner.policy_manager is pm
+        assert planner.config is cfg
+        assert planner.rebalancer is None
+        assert isinstance(planner._pending_closes, dict)
+        assert len(planner._pending_closes) == 0
+
+    def test_old_constructor_signature_without_config(self):
+        """Backward compat: constructor works without config (defaults to None)."""
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        # Old-style call: no config kwarg
+        planner = CapacityPlanner(plugin, prof, flow)
+        assert planner.config is None
+
+    def test_old_constructor_with_policy_manager_positional(self):
+        """policy_manager can be passed positionally (4th arg)."""
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        pm = MagicMock()
+        planner = CapacityPlanner(plugin, prof, flow, pm)
+        assert planner.policy_manager is pm
+        assert planner.config is None
+
+    def test_rebalancer_settable_after_init(self):
+        """rebalancer attribute can be set post-init (late binding)."""
+        planner = CapacityPlanner(MagicMock(), MagicMock(), MagicMock())
+        assert planner.rebalancer is None
+
+        mock_rebalancer = MagicMock()
+        planner.rebalancer = mock_rebalancer
+        assert planner.rebalancer is mock_rebalancer
+
+    def test_pending_closes_is_dict(self):
+        """_pending_closes is initialized as an empty dict."""
+        planner = CapacityPlanner(MagicMock(), MagicMock(), MagicMock())
+        assert isinstance(planner._pending_closes, dict)
+        assert len(planner._pending_closes) == 0
