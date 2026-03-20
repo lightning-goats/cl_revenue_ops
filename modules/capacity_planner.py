@@ -125,13 +125,23 @@ class CapacityPlanner:
                 )
                 continue
 
-            # Check cooldown
-            cooldown_ok, cooldown_reason = self._check_cooldown(peer_id)
-            if not cooldown_ok:
-                summary["skipped_reasons"].append(
-                    f"Close cooldown for {scid}: {cooldown_reason}"
+            if getattr(cfg, "planner_execute_closes", False):
+                guards_ok, guards_reason = self._check_safety_guards(
+                    cfg, "close", peer_id
                 )
-                continue
+                if not guards_ok:
+                    summary["skipped_reasons"].append(
+                        f"Close guard failed for {scid}: {guards_reason}"
+                    )
+                    continue
+            else:
+                # Recommendation-only close logging still respects cooldowns.
+                cooldown_ok, cooldown_reason = self._check_cooldown(peer_id)
+                if not cooldown_ok:
+                    summary["skipped_reasons"].append(
+                        f"Close cooldown for {scid}: {cooldown_reason}"
+                    )
+                    continue
 
             result = self._execute_close(scid, peer_id, cfg, loser.get("reason", ""))
             summary["closes"].append({
@@ -783,7 +793,7 @@ class CapacityPlanner:
                 return False, f"Cooldown: {len(recent)} action(s) for peer in last 24h"
             return True, "No recent actions for peer"
         except Exception as e:
-            return True, f"Cooldown check failed (allowing): {e}"
+            return False, f"Cooldown check failed: {e}"
 
     def _check_safety_guards(self, cfg, action_type: str, peer_id: str,
                               amount_sats: int = 0) -> tuple:

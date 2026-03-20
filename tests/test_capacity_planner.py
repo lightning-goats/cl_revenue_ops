@@ -2003,8 +2003,8 @@ class TestSafetyGuards:
         assert ok is True
         assert "No database" in reason
 
-    def test_cooldown_allows_on_db_error(self):
-        """Cooldown allows (fail-open) when database throws."""
+    def test_cooldown_blocks_when_database_errors(self):
+        """Cooldown blocks (fail-closed) when database throws."""
         plugin = MagicMock()
         prof_analyzer = MagicMock()
         prof_analyzer.database.get_recent_planner_actions.side_effect = Exception("db locked")
@@ -2012,7 +2012,7 @@ class TestSafetyGuards:
         planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
 
         ok, reason = planner._check_cooldown("peer1")
-        assert ok is True
+        assert ok is False
         assert "Cooldown check failed" in reason
 
     def test_safety_guards_checks_all_pass(self):
@@ -3304,8 +3304,8 @@ class TestExecuteCycle:
         assert len(result["closes"]) == 0
         assert any("cooldown" in r.lower() for r in result["skipped_reasons"])
 
-    def test_execute_cycle_closes_still_initiate_when_fee_gate_fails(self):
-        """Closes can still be initiated even when fee gate blocks opens."""
+    def test_execute_cycle_does_not_execute_closes_when_fee_gate_fails(self):
+        """Live closes are blocked when the fee gate fails."""
         scid = "200x300x0"
         loser_prof = _mock_profitability(
             scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
@@ -3323,13 +3323,17 @@ class TestExecuteCycle:
             all_flow={scid: loser_flow},
         )
 
-        cfg = _make_cycle_cfg(planner_max_fee_rate_sat_vb=50.0)
+        cfg = _make_cycle_cfg(
+            planner_execute_closes=True,
+            planner_max_fee_rate_sat_vb=50.0,
+        )
 
         result = planner.execute_cycle(cfg)
 
-        # Fee gate blocks opens but not closes
         assert len(result["opens"]) == 0
-        assert len(result["closes"]) == 1  # Close should still proceed
+        assert len(result["closes"]) == 0
+        assert any("exceeds max" in reason for reason in result["skipped_reasons"])
+        plugin.rpc.call.assert_not_called()
 
     def test_execute_cycle_dry_run_mode(self):
         """In dry_run mode, closes record dry_run status without calling close RPC."""
