@@ -6,6 +6,7 @@ and "Loser" channels for capital redeployment (Close).
 """
 
 import json
+import math
 import time
 from typing import Dict, List, Any
 from pyln.client import Plugin
@@ -476,12 +477,138 @@ class CapacityPlanner:
 
         return candidates[:10]  # Max 10 total from this strategy
 
+    def _discover_from_graph(self, existing_peer_ids: set) -> List[Dict]:
+        """Strategy 3: Network centrality scoring via listnodes."""
+        try:
+            nodes = self.plugin.rpc.listnodes().get("nodes", [])
+        except Exception:
+            return []
+
+        if len(nodes) < 800:
+            self.plugin.log(
+                f"Insufficient graph knowledge ({len(nodes)} nodes, need 800+)",
+                level='debug',
+            )
+            return []
+
+        # Get our own node ID
+        try:
+            our_node_id = self.plugin.rpc.getinfo().get("id")
+        except Exception:
+            return []
+
+        scored = []
+        for node in nodes:
+            node_id = node.get("nodeid")
+            if not node_id or node_id == our_node_id or node_id in existing_peer_ids:
+                continue
+
+            # Channel count from the node's channel_count field if available
+            channel_count = node.get("channel_count", 0)
+            if channel_count < 5:
+                continue  # Skip poorly connected nodes
+
+            # Total capacity (if available)
+            total_capacity = node.get("total_capacity", 0)
+            if isinstance(total_capacity, str):
+                total_capacity = (
+                    int(total_capacity.replace("msat", "")) // 1000
+                    if "msat" in total_capacity
+                    else int(total_capacity)
+                )
+
+            # Compute centrality score = channel_count * sqrt(capacity_btc)
+            capacity_btc = total_capacity / 100_000_000 if total_capacity > 0 else 0.001
+            score = channel_count * math.sqrt(capacity_btc)
+
+            scored.append({
+                "peer_id": node_id,
+                "source": "graph",
+                "score": score,
+                "reason": f"Graph centrality: {channel_count} channels, {total_capacity} sat capacity",
+                "channel_count": channel_count,
+                "total_capacity": total_capacity,
+            })
+
+        # Sort by score descending, take top 10
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:10]
+
+    def _score_candidate(self, peer_id: str, base_score: float) -> float:
+        """Enrich candidate score with reputation, uptime, and profit history."""
+        score = base_score
+
+        # Peer reputation (Laplace-smoothed success rate)
+        try:
+            rep = self.profitability.database.get_peer_reputation(peer_id)
+            if rep:
+                rep_score = (rep.get('successes', 0) + 1) / (
+                    rep.get('successes', 0) + rep.get('failures', 0) + 2
+                )
+                score *= rep_score  # 0.0-1.0 multiplier
+        except Exception:
+            pass
+
+        # Profit inheritance from closed channels
+        try:
+            closed_summary = self.profitability.database.get_peer_closed_channel_profit_summary(peer_id)
+            if closed_summary and closed_summary.get('marginal_roi_proxy', 0) > 0:
+                score *= 1.5  # Boost for proven profitable peer
+        except Exception:
+            pass
+
+        # Peer uptime (if available)
+        try:
+            uptime = self.profitability.database.get_peer_uptime_percent(peer_id, duration_seconds=604800)
+            if uptime is not None and uptime < 90.0:
+                score *= (uptime / 100.0)  # Penalize low uptime
+        except Exception:
+            pass
+
+        return score
+
+    def _update_candidate_pool(self, candidates: List[Dict]):
+        """Persist scored candidates to database."""
+        db = self.profitability.database if self.profitability else None
+        if not db:
+            return
+        for candidate in candidates:
+            try:
+                db.record_planner_candidate(
+                    peer_id=candidate["peer_id"],
+                    score=candidate["score"],
+                    source=candidate["source"],
+                    capacity_recommendation_sats=candidate.get("capacity_recommendation_sats"),
+                )
+            except Exception:
+                pass
+        # Prune pool: remove candidates with score < -3.0
+        try:
+            all_candidates = db.get_planner_candidates(min_score=-999.0, limit=100)
+            for c in all_candidates:
+                if c["score"] < -3.0:
+                    db.delete_planner_candidate(c["peer_id"])
+            # If pool > 32, remove lowest scored
+            if len(all_candidates) > 32:
+                to_remove = sorted(all_candidates, key=lambda x: x["score"])[:len(all_candidates) - 32]
+                for c in to_remove:
+                    db.delete_planner_candidate(c["peer_id"])
+        except Exception:
+            pass
+
     def _discover_peers(self, winners: List[Dict], all_profitability, all_flow) -> List[Dict]:
         """Run all discovery strategies and merge candidates."""
         candidates = []
         candidates.extend(self._discover_from_winners(winners))
         candidates.extend(self._discover_from_neighbors(all_profitability))
-        # Strategy 3 (graph centrality) added in Task 9
+
+        # Strategy 3: graph centrality
+        existing_peers = set()
+        for prof in all_profitability.values():
+            pid = getattr(prof, 'peer_id', None)
+            if pid:
+                existing_peers.add(pid)
+        candidates.extend(self._discover_from_graph(existing_peers))
 
         # Deduplicate by peer_id, keeping highest score
         seen = {}
@@ -489,4 +616,13 @@ class CapacityPlanner:
             pid = c["peer_id"]
             if pid not in seen or c["score"] > seen[pid]["score"]:
                 seen[pid] = c
-        return list(seen.values())
+        merged = list(seen.values())
+
+        # Enrich scores with reputation, uptime, profit history
+        for c in merged:
+            c["score"] = self._score_candidate(c["peer_id"], c["score"])
+
+        # Persist to candidate pool
+        self._update_candidate_pool(merged)
+
+        return merged

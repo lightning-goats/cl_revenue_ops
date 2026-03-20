@@ -1245,8 +1245,18 @@ class TestPeerDiscovery:
                 {"source": "patron1", "destination": "peer1"},
             ]
         }
+        plugin.rpc.listnodes.return_value = {"nodes": []}  # Not enough for graph
 
-        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        prof_analyzer = MagicMock()
+        # Make scoring pass-through (no reputation, no profit, no uptime penalty)
+        prof_analyzer.database.get_peer_reputation.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 0, 'marginal_roi_proxy': 0,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 99.0
+        prof_analyzer.database.get_planner_candidates.return_value = []
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
 
         patron_prof = MagicMock()
         patron_prof.peer_id = "patron1"
@@ -1272,6 +1282,7 @@ class TestPeerDiscovery:
         """Orchestrator returns candidates from both strategies."""
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+        plugin.rpc.listnodes.return_value = {"nodes": []}  # Not enough for graph
 
         # Neighbor discovery returns different peers than winners
         plugin.rpc.listchannels.return_value = {
@@ -1280,7 +1291,15 @@ class TestPeerDiscovery:
             ]
         }
 
-        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        prof_analyzer = MagicMock()
+        prof_analyzer.database.get_peer_reputation.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 0, 'marginal_roi_proxy': 0,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 99.0
+        prof_analyzer.database.get_planner_candidates.return_value = []
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
 
         patron_prof = MagicMock()
         patron_prof.peer_id = "patron1"
@@ -1327,3 +1346,476 @@ class TestPeerDiscovery:
 
         candidates = planner._discover_from_neighbors(all_profitability)
         assert len(candidates) <= 10
+
+
+class TestGraphDiscoveryAndScoring:
+    """Tests for graph centrality discovery and composite candidate scoring."""
+
+    def _make_nodes(self, count, channel_count=10, total_capacity=50_000_000,
+                    start_id=0, id_prefix="02"):
+        """Helper to generate mock listnodes output."""
+        nodes = []
+        for i in range(count):
+            nid = f"{id_prefix}{str(start_id + i).zfill(64)}"
+            nodes.append({
+                "nodeid": nid,
+                "alias": f"node_{i}",
+                "channel_count": channel_count,
+                "total_capacity": total_capacity,
+            })
+        return nodes
+
+    def test_discover_from_graph_requires_800_nodes(self):
+        """Graph discovery requires 800+ known nodes."""
+        plugin = MagicMock()
+        plugin.rpc.listnodes.return_value = {
+            "nodes": self._make_nodes(100)
+        }
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph(set())
+        assert result == []
+        # Verify it logged the insufficient nodes message
+        plugin.log.assert_called()
+
+    def test_discover_from_graph_scores_by_centrality(self):
+        """Nodes scored by channel_count * sqrt(capacity)."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+
+        # Create nodes with different channel counts and capacities
+        nodes = [
+            {"nodeid": "node_high", "channel_count": 50, "total_capacity": 100_000_000},
+            {"nodeid": "node_medium", "channel_count": 20, "total_capacity": 50_000_000},
+            {"nodeid": "node_low", "channel_count": 10, "total_capacity": 10_000_000},
+        ]
+        # Pad with 800+ filler nodes (channel_count < 5 so they get filtered)
+        nodes.extend(self._make_nodes(800, channel_count=1))
+
+        plugin.rpc.listnodes.return_value = {"nodes": nodes}
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph(set())
+
+        assert len(result) == 3
+        # Highest score should come first
+        assert result[0]["peer_id"] == "node_high"
+        assert result[1]["peer_id"] == "node_medium"
+        assert result[2]["peer_id"] == "node_low"
+        # Verify scores are decreasing
+        assert result[0]["score"] > result[1]["score"] > result[2]["score"]
+
+    def test_discover_from_graph_excludes_existing_peers(self):
+        """Existing peers are excluded from graph candidates."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+
+        nodes = [
+            {"nodeid": "existing_peer", "channel_count": 100, "total_capacity": 500_000_000},
+            {"nodeid": "new_peer", "channel_count": 20, "total_capacity": 50_000_000},
+        ]
+        nodes.extend(self._make_nodes(800, channel_count=1))
+
+        plugin.rpc.listnodes.return_value = {"nodes": nodes}
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph({"existing_peer"})
+
+        peer_ids = {c["peer_id"] for c in result}
+        assert "existing_peer" not in peer_ids
+        assert "new_peer" in peer_ids
+
+    def test_discover_from_graph_excludes_own_node(self):
+        """Our own node is excluded from candidates."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+
+        nodes = [
+            {"nodeid": "our_node", "channel_count": 100, "total_capacity": 500_000_000},
+            {"nodeid": "other_node", "channel_count": 20, "total_capacity": 50_000_000},
+        ]
+        nodes.extend(self._make_nodes(800, channel_count=1))
+
+        plugin.rpc.listnodes.return_value = {"nodes": nodes}
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph(set())
+
+        peer_ids = {c["peer_id"] for c in result}
+        assert "our_node" not in peer_ids
+        assert "other_node" in peer_ids
+
+    def test_discover_from_graph_skips_poorly_connected(self):
+        """Nodes with < 5 channels are excluded."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+
+        nodes = [
+            {"nodeid": "well_connected", "channel_count": 10, "total_capacity": 50_000_000},
+            {"nodeid": "poorly_connected", "channel_count": 3, "total_capacity": 50_000_000},
+            {"nodeid": "zero_channels", "channel_count": 0, "total_capacity": 50_000_000},
+        ]
+        nodes.extend(self._make_nodes(800, channel_count=1))
+
+        plugin.rpc.listnodes.return_value = {"nodes": nodes}
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph(set())
+
+        peer_ids = {c["peer_id"] for c in result}
+        assert "well_connected" in peer_ids
+        assert "poorly_connected" not in peer_ids
+        assert "zero_channels" not in peer_ids
+
+    def test_discover_from_graph_returns_max_10(self):
+        """Graph discovery returns at most 10 candidates."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+
+        # 20 well-connected nodes + 800 filler
+        nodes = self._make_nodes(20, channel_count=10, total_capacity=50_000_000,
+                                 id_prefix="03")
+        nodes.extend(self._make_nodes(800, channel_count=1))
+
+        plugin.rpc.listnodes.return_value = {"nodes": nodes}
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph(set())
+
+        assert len(result) <= 10
+
+    def test_discover_from_graph_handles_listnodes_error(self):
+        """listnodes RPC failure returns empty list."""
+        plugin = MagicMock()
+        plugin.rpc.listnodes.side_effect = Exception("RPC timeout")
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph(set())
+        assert result == []
+
+    def test_discover_from_graph_handles_getinfo_error(self):
+        """getinfo failure after listnodes returns empty list."""
+        plugin = MagicMock()
+        plugin.rpc.listnodes.return_value = {"nodes": self._make_nodes(900)}
+        plugin.rpc.getinfo.side_effect = Exception("RPC timeout")
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph(set())
+        assert result == []
+
+    def test_discover_from_graph_handles_msat_capacity(self):
+        """Total capacity in msat string format is converted correctly."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+
+        nodes = [
+            {"nodeid": "msat_node", "channel_count": 10,
+             "total_capacity": "50000000000msat"},  # 50M msat = 50k sat
+        ]
+        nodes.extend(self._make_nodes(800, channel_count=1))
+
+        plugin.rpc.listnodes.return_value = {"nodes": nodes}
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph(set())
+
+        assert len(result) == 1
+        assert result[0]["total_capacity"] == 50_000_000  # Converted from msat
+
+    def test_discover_from_graph_missing_fields_graceful(self):
+        """Nodes without channel_count or total_capacity are handled gracefully."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+
+        nodes = [
+            {"nodeid": "no_fields_node"},  # No channel_count, no total_capacity
+            {"nodeid": "has_channels", "channel_count": 10},  # No total_capacity
+        ]
+        nodes.extend(self._make_nodes(800, channel_count=1))
+
+        plugin.rpc.listnodes.return_value = {"nodes": nodes}
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        result = planner._discover_from_graph(set())
+
+        # no_fields_node has channel_count=0 default, so excluded
+        # has_channels has channel_count=10 but total_capacity=0
+        peer_ids = {c["peer_id"] for c in result}
+        assert "no_fields_node" not in peer_ids
+        assert "has_channels" in peer_ids
+
+    # --- _score_candidate tests ---
+
+    def test_score_candidate_with_reputation(self):
+        """Candidate score multiplied by Laplace-smoothed reputation."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+
+        # High success rate: 90/100 -> (90+1)/(100+2) = 0.8922
+        prof_analyzer.database.get_peer_reputation.return_value = {
+            'successes': 90, 'failures': 10, 'score': 0.89,
+        }
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 0, 'marginal_roi_proxy': 0,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 99.0
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        base_score = 1.0
+        result = planner._score_candidate("peer_abc", base_score)
+
+        # (90+1)/(90+10+2) = 91/102 ~= 0.8922
+        expected_rep_multiplier = 91 / 102
+        assert abs(result - base_score * expected_rep_multiplier) < 0.01
+
+    def test_score_candidate_with_profit_inheritance(self):
+        """Returning profitable peers get 1.5x score boost."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+
+        # No reputation data -> no-op (returns default 0.5 smoothed)
+        prof_analyzer.database.get_peer_reputation.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 1, 'marginal_roi_proxy': 0.5,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 99.0
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        base_score = 2.0
+        result = planner._score_candidate("peer_abc", base_score)
+
+        # No reputation, profit boost 1.5x, no uptime penalty
+        assert result == base_score * 1.5
+
+    def test_score_candidate_penalizes_low_uptime(self):
+        """Low uptime peers get penalized score."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+
+        prof_analyzer.database.get_peer_reputation.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 0, 'marginal_roi_proxy': 0,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 70.0
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        base_score = 1.0
+        result = planner._score_candidate("peer_abc", base_score)
+
+        # Low uptime penalty: score *= 70/100 = 0.7
+        assert abs(result - base_score * 0.7) < 0.01
+
+    def test_score_candidate_handles_missing_data(self):
+        """Score survives when all data sources fail."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+
+        prof_analyzer.database.get_peer_reputation.side_effect = Exception("DB error")
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.side_effect = Exception("DB error")
+        prof_analyzer.database.get_peer_uptime_percent.side_effect = Exception("DB error")
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        base_score = 5.0
+        result = planner._score_candidate("peer_abc", base_score)
+
+        assert result == base_score
+
+    def test_score_candidate_no_uptime_penalty_above_90(self):
+        """Peers with >= 90% uptime are not penalized."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+
+        prof_analyzer.database.get_peer_reputation.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 0, 'marginal_roi_proxy': 0,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 95.0
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        base_score = 1.0
+        result = planner._score_candidate("peer_abc", base_score)
+
+        # 95% >= 90% threshold, no penalty applied
+        assert result == base_score
+
+    def test_score_candidate_combined_reputation_and_profit(self):
+        """Reputation and profit inheritance stack multiplicatively."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+
+        # High success rate: (50+1)/(50+10+2) = 51/62
+        prof_analyzer.database.get_peer_reputation.return_value = {
+            'successes': 50, 'failures': 10, 'score': 0.83,
+        }
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 2, 'marginal_roi_proxy': 1.2,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 99.0
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        base_score = 1.0
+        result = planner._score_candidate("peer_abc", base_score)
+
+        expected = base_score * (51 / 62) * 1.5
+        assert abs(result - expected) < 0.01
+
+    # --- _update_candidate_pool tests ---
+
+    def test_update_candidate_pool_persists(self):
+        """Candidates are persisted to database."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        prof_analyzer.database.get_planner_candidates.return_value = []
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        candidates = [
+            {"peer_id": "peer1", "score": 1.5, "source": "graph"},
+            {"peer_id": "peer2", "score": 0.8, "source": "winner"},
+        ]
+        planner._update_candidate_pool(candidates)
+
+        assert prof_analyzer.database.record_planner_candidate.call_count == 2
+        calls = prof_analyzer.database.record_planner_candidate.call_args_list
+        assert calls[0][1]["peer_id"] == "peer1"
+        assert calls[1][1]["peer_id"] == "peer2"
+
+    def test_update_candidate_pool_prunes_low_scores(self):
+        """Candidates with score < -3 are removed."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+
+        # Return existing candidates including one below threshold
+        prof_analyzer.database.get_planner_candidates.return_value = [
+            {"peer_id": "good_peer", "score": 2.0},
+            {"peer_id": "bad_peer", "score": -5.0},
+        ]
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+        planner._update_candidate_pool([])
+
+        # bad_peer should be deleted
+        prof_analyzer.database.delete_planner_candidate.assert_called_once_with("bad_peer")
+
+    def test_update_candidate_pool_prunes_overflow(self):
+        """Pool > 32 entries triggers pruning of lowest scored."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+
+        # Return 35 candidates
+        existing = [{"peer_id": f"peer_{i}", "score": float(i)} for i in range(35)]
+        prof_analyzer.database.get_planner_candidates.return_value = existing
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+        planner._update_candidate_pool([])
+
+        # Should delete 3 lowest (peer_0, peer_1, peer_2)
+        delete_calls = prof_analyzer.database.delete_planner_candidate.call_args_list
+        deleted_ids = {call[0][0] for call in delete_calls}
+        assert "peer_0" in deleted_ids
+        assert "peer_1" in deleted_ids
+        assert "peer_2" in deleted_ids
+
+    def test_update_candidate_pool_no_profitability_noop(self):
+        """No profitability analyzer means no-op."""
+        plugin = MagicMock()
+        planner = CapacityPlanner(plugin, None, MagicMock())
+
+        # Should not raise
+        planner._update_candidate_pool([{"peer_id": "x", "score": 1.0, "source": "graph"}])
+
+    # --- _discover_peers integration with graph + scoring ---
+
+    def test_discover_peers_includes_graph_candidates(self):
+        """_discover_peers includes Strategy 3 graph centrality candidates."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+        plugin.rpc.listchannels.return_value = {"channels": []}
+
+        # Set up listnodes with 800+ nodes and one well-connected candidate
+        nodes = [
+            {"nodeid": "graph_peer", "channel_count": 20, "total_capacity": 100_000_000},
+        ]
+        filler = [
+            {"nodeid": f"filler_{i}", "channel_count": 1, "total_capacity": 100}
+            for i in range(800)
+        ]
+        plugin.rpc.listnodes.return_value = {"nodes": nodes + filler}
+
+        prof_analyzer = MagicMock()
+        prof_analyzer.database.get_peer_reputation.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 0, 'marginal_roi_proxy': 0,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 99.0
+        prof_analyzer.database.get_planner_candidates.return_value = []
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        # No winners, empty profitability/flow
+        candidates = planner._discover_peers([], {}, {})
+
+        sources = {c["source"] for c in candidates}
+        assert "graph" in sources
+
+    def test_discover_peers_enriches_scores(self):
+        """_discover_peers applies _score_candidate to all candidates."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+        plugin.rpc.listchannels.return_value = {"channels": []}
+        plugin.rpc.listnodes.return_value = {"nodes": []}  # Not enough for graph
+
+        prof_analyzer = MagicMock()
+        # Uptime penalty: 50% -> score *= 0.5
+        prof_analyzer.database.get_peer_reputation.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 0, 'marginal_roi_proxy': 0,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 50.0
+        prof_analyzer.database.get_planner_candidates.return_value = []
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        # Winners with high ROI -> score 0.5
+        winners = [
+            {"peer_id": "winner_peer", "roi": 50.0, "scid": "1x1x0"},
+        ]
+
+        candidates = planner._discover_peers(winners, {}, {})
+
+        winner_c = [c for c in candidates if c["peer_id"] == "winner_peer"]
+        assert len(winner_c) == 1
+        # Original score was 50/100 = 0.5, penalized by 50% uptime -> 0.25
+        assert abs(winner_c[0]["score"] - 0.25) < 0.01
+
+    def test_discover_peers_persists_to_pool(self):
+        """_discover_peers calls _update_candidate_pool."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node"}
+        plugin.rpc.listchannels.return_value = {"channels": []}
+        plugin.rpc.listnodes.return_value = {"nodes": []}
+
+        prof_analyzer = MagicMock()
+        prof_analyzer.database.get_peer_reputation.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 0, 'marginal_roi_proxy': 0,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 99.0
+        prof_analyzer.database.get_planner_candidates.return_value = []
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        winners = [
+            {"peer_id": "winner_peer", "roi": 50.0, "scid": "1x1x0"},
+        ]
+
+        planner._discover_peers(winners, {}, {})
+
+        # Should have called record_planner_candidate
+        assert prof_analyzer.database.record_planner_candidate.called
