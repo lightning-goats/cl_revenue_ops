@@ -36,6 +36,10 @@ class CapacityPlanner:
         self.rebalancer = None
         self._pending_closes: Dict[str, int] = {}
 
+    def is_pending_close(self, channel_id: str) -> bool:
+        """Check if a channel is pending close by the planner."""
+        return channel_id in self._pending_closes
+
     def generate_report(self) -> Dict[str, Any]:
         """
         Generate a strategic redeployment report.

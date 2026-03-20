@@ -2040,6 +2040,10 @@ class EVRebalancer:
     def set_profitability_analyzer(self, analyzer: 'ChannelProfitabilityAnalyzer') -> None:
         self._profitability_analyzer = analyzer
 
+    def set_capacity_planner(self, planner) -> None:
+        """Set reference to capacity planner for coordination."""
+        self._capacity_planner = planner
+
     def find_rebalance_candidates(self) -> List[RebalanceCandidate]:
         """
         Find channels that would benefit from rebalancing.
@@ -2165,6 +2169,11 @@ class EVRebalancer:
                 # Skip channels with active jobs
                 if channel_id in active_channels:
                     continue
+
+                # Skip channels pending closure by capacity planner
+                if hasattr(self, '_capacity_planner') and self._capacity_planner:
+                    if self._capacity_planner.is_pending_close(channel_id):
+                        continue
                 
                 # STAGNANT INVENTORY DETECTION
                 # Check if a channel is "Stagnant" (Balanced but not moving for ~1 week)

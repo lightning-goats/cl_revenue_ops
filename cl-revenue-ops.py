@@ -1181,6 +1181,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         safe_plugin, config, database, policy_manager,
     )
     rebalancer.set_profitability_analyzer(profitability_analyzer)
+    rebalancer.set_capacity_planner(capacity_planner)
     # Unified liquidity-cost accounting:
     # - Rebalancer sees Boltz spend as external liquidity cost
     # - Boltz manager sees rebalance spend/reservations as external liquidity cost

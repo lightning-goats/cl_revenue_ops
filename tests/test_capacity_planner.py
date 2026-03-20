@@ -3578,3 +3578,33 @@ class TestExecuteCycle:
         # fundchannel should NOT have been called (nothing to open here, but also
         # the drain should be recorded as dry_run in DB)
         prof.database.update_planner_action.assert_any_call(1, status="dry_run")
+
+
+class TestPendingCloseInterface:
+    """Tests for is_pending_close() coordination interface."""
+
+    def test_pending_close_returns_true_for_known_channel(self):
+        """is_pending_close returns True for channels in _pending_closes."""
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        planner = CapacityPlanner(plugin, prof, flow)
+        planner._pending_closes["123x1x0"] = int(time.time())
+        assert planner.is_pending_close("123x1x0")
+
+    def test_pending_close_returns_false_for_unknown_channel(self):
+        """is_pending_close returns False for channels not in _pending_closes."""
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        planner = CapacityPlanner(plugin, prof, flow)
+        planner._pending_closes["123x1x0"] = int(time.time())
+        assert not planner.is_pending_close("456x2x0")
+
+    def test_pending_close_empty(self):
+        """is_pending_close returns False when no channels are pending close."""
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        planner = CapacityPlanner(plugin, prof, flow)
+        assert not planner.is_pending_close("123x1x0")
