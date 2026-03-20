@@ -128,6 +128,18 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalancer_plugin': str,
     'enable_flow_asymmetry': bool,
     'enable_peer_sync': bool,
+    # Capacity Planner
+    'planner_enabled': bool,
+    'planner_interval': int,
+    'planner_dry_run': bool,
+    'planner_max_opens_per_cycle': int,
+    'planner_max_closes_per_cycle': int,
+    'planner_min_channel_sats': int,
+    'planner_max_channel_sats': int,
+    'planner_min_channel_age_days': int,
+    'planner_min_peer_uptime_pct': float,
+    'planner_max_fee_rate_sat_vb': float,
+    'planner_drain_timeout_hours': int,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -211,6 +223,16 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'expansion_treasury_min_deficit_sats': (0, 100000000),
     'expansion_treasury_onchain_target_sats': (0, 1000000000),
     'hot_channel_protection_max_rebalance_fee_ppm': (0, 100000),
+    # Capacity Planner
+    'planner_interval': (600, 604800),
+    'planner_max_opens_per_cycle': (0, 10),
+    'planner_max_closes_per_cycle': (0, 10),
+    'planner_min_channel_sats': (100000, 100000000),
+    'planner_max_channel_sats': (500000, 1677721500),
+    'planner_min_channel_age_days': (1, 365),
+    'planner_min_peer_uptime_pct': (0.0, 100.0),
+    'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
+    'planner_drain_timeout_hours': (1, 720),
 }
 
 # Valid values for string enum fields
@@ -383,6 +405,19 @@ class Config:
     # ==========================================================================
     routing_intelligence_enabled: bool = False    # Opt-in feature (off by default)
     routing_intelligence_cache_seconds: int = 300  # Cache TTL for routing intel
+
+    # Capacity Planner
+    planner_enabled: bool = False
+    planner_interval: int = 21600               # 6 hours
+    planner_dry_run: bool = True
+    planner_max_opens_per_cycle: int = 1
+    planner_max_closes_per_cycle: int = 1
+    planner_min_channel_sats: int = 500000      # 500k sats
+    planner_max_channel_sats: int = 10000000    # 10M sats
+    planner_min_channel_age_days: int = 30
+    planner_min_peer_uptime_pct: float = 95.0
+    planner_max_fee_rate_sat_vb: float = 50.0
+    planner_drain_timeout_hours: int = 72
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -739,6 +774,19 @@ class ConfigSnapshot:
 
     # Weekly budget cap (hard ceiling over daily burst)
     weekly_budget_sats: int = 35000
+
+    # Capacity Planner
+    planner_enabled: bool = False
+    planner_interval: int = 21600
+    planner_dry_run: bool = True
+    planner_max_opens_per_cycle: int = 1
+    planner_max_closes_per_cycle: int = 1
+    planner_min_channel_sats: int = 500000
+    planner_max_channel_sats: int = 10000000
+    planner_min_channel_age_days: int = 30
+    planner_min_peer_uptime_pct: float = 95.0
+    planner_max_fee_rate_sat_vb: float = 50.0
+    planner_drain_timeout_hours: int = 72
 
     # Version tracking
     version: int = 0
