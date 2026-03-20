@@ -2233,6 +2233,40 @@ def revenue_capacity_report(plugin: Plugin, **kwargs):
         return {"error": f"Report generation failed: {e}"}
 
 
+@plugin.method("revenue-planner-status")
+def revenue_planner_status(plugin: Plugin) -> Dict[str, Any]:
+    """Get capacity planner status — pending actions, last cycle result, config."""
+    if capacity_planner is None:
+        return {"error": "Capacity planner not initialized"}
+    return capacity_planner.get_status()
+
+
+@plugin.method("revenue-planner-candidates")
+def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
+    """List scored peer candidates for channel opens."""
+    if capacity_planner is None:
+        return {"error": "Capacity planner not initialized"}
+    candidates = database.get_planner_candidates(limit=limit)
+    return {"candidates": candidates, "count": len(candidates)}
+
+
+@plugin.method("revenue-planner-execute")
+def revenue_planner_execute(plugin: Plugin) -> Dict[str, Any]:
+    """Manually trigger a capacity planner cycle."""
+    if capacity_planner is None:
+        return {"error": "Capacity planner not initialized"}
+    return capacity_planner.execute_cycle()
+
+
+@plugin.method("revenue-planner-history")
+def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
+    """Get audit log of past planner actions."""
+    if capacity_planner is None:
+        return {"error": "Capacity planner not initialized"}
+    actions = database.get_planner_actions(limit=limit)
+    return {"actions": actions, "count": len(actions)}
+
+
 @plugin.method("revenue-set-fee")
 def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool = False) -> Dict[str, Any]:
     """

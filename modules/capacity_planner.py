@@ -40,6 +40,19 @@ class CapacityPlanner:
         """Check if a channel is pending close by the planner."""
         return channel_id in self._pending_closes
 
+    def get_status(self) -> Dict[str, Any]:
+        """Return planner status for RPC query."""
+        db = self.profitability.database if self.profitability else None
+        cfg = self.config
+        return {
+            "enabled": getattr(cfg, 'planner_enabled', False) if cfg else False,
+            "dry_run": getattr(cfg, 'planner_dry_run', True) if cfg else True,
+            "pending_closes": len(self._pending_closes),
+            "pending_close_channels": list(self._pending_closes.keys()),
+            "candidate_pool_size": len(db.get_planner_candidates()) if db else 0,
+            "recent_actions": db.get_planner_actions(limit=5) if db else [],
+        }
+
     def generate_report(self) -> Dict[str, Any]:
         """
         Generate a strategic redeployment report.
