@@ -916,6 +916,12 @@ class CapacityPlanner:
         except Exception:
             return ChainCostDefaults.CHANNEL_OPEN_COST_SATS
 
+    def _rpc_fundchannel(self, peer_id: str, amount_sats: int) -> Dict[str, Any]:
+        return self.plugin.rpc.call(
+            "fundchannel",
+            {"id": peer_id, "amount": amount_sats, "announce": True},
+        )
+
     def _execute_open(self, peer_id: str, amount_sats: int, cfg, reason: str) -> Dict:
         """Execute a channel open via fundchannel RPC.
 
@@ -982,11 +988,7 @@ class CapacityPlanner:
                 pass  # Connection may already exist
 
             # Fund channel
-            result = self.plugin.rpc.fundchannel(
-                id=peer_id,
-                amount=amount_sats,
-                announce=True,
-            )
+            result = self._rpc_fundchannel(peer_id, amount_sats)
 
             channel_id = result.get("channel_id") or result.get("channelid")
 
@@ -1110,11 +1112,11 @@ class CapacityPlanner:
             except Exception as e:
                 self.plugin.log(
                     f"Error stopping rebalancer job for {channel_id}: {e}",
-                    level='warn',
+                level='warn',
                 )
 
         try:
-            result = self.plugin.rpc.close(id=channel_id)
+            result = self._rpc_close(channel_id)
 
             if db and action_id:
                 try:
@@ -1139,3 +1141,6 @@ class CapacityPlanner:
                 level='error',
             )
             return {"action_id": action_id, "status": "failed", "error": str(e)}
+
+    def _rpc_close(self, channel_id: str) -> Dict[str, Any]:
+        return self.plugin.rpc.call("close", {"id": channel_id})

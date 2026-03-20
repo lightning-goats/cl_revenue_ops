@@ -2416,8 +2416,8 @@ def _make_open_planner():
 
     # Default: feerates for _estimate_open_cost
     plugin.rpc.feerates.return_value = {"perkb": {"opening": 2000}}  # 2 sat/vB
-    # Default: fundchannel succeeds
-    plugin.rpc.fundchannel.return_value = {"channel_id": "123x1x0"}
+    # Default: generic RPC dispatch succeeds
+    plugin.rpc.call.return_value = {"channel_id": "123x1x0"}
 
     planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
     return planner, db
@@ -2426,13 +2426,15 @@ def _make_open_planner():
 class TestChannelOpen:
     """Tests for _execute_open channel open execution."""
 
-    def test_execute_open_calls_fundchannel(self):
-        """Successful open calls plugin.rpc.fundchannel with correct params."""
+    def test_execute_open_calls_generic_rpc_fundchannel(self):
+        """Successful open calls generic RPC dispatch with correct params."""
         planner, db = _make_open_planner()
         cfg = _make_open_cfg()
         result = planner._execute_open("peer1", 2000000, cfg, "test reason")
-        planner.plugin.rpc.fundchannel.assert_called_once_with(
-            id="peer1", amount=2000000, announce=True)
+        planner.plugin.rpc.call.assert_any_call(
+            "fundchannel",
+            {"id": "peer1", "amount": 2000000, "announce": True},
+        )
         assert result["status"] == "completed"
         assert result["channel_id"] == "123x1x0"
 
@@ -2459,7 +2461,7 @@ class TestChannelOpen:
         """Failed fundchannel records action as failed."""
         planner, db = _make_open_planner()
         cfg = _make_open_cfg()
-        planner.plugin.rpc.fundchannel.side_effect = Exception("peer offline")
+        planner.plugin.rpc.call.side_effect = Exception("peer offline")
         result = planner._execute_open("peer1", 2000000, cfg, "test")
         assert result["status"] == "failed"
         assert "peer offline" in result["error"]
@@ -2476,7 +2478,7 @@ class TestChannelOpen:
         """Failed open releases budget reservation."""
         planner, db = _make_open_planner()
         cfg = _make_open_cfg()
-        planner.plugin.rpc.fundchannel.side_effect = Exception("fail")
+        planner.plugin.rpc.call.side_effect = Exception("fail")
         planner._execute_open("peer1", 2000000, cfg, "test")
         db.release_spend_reservation.assert_called_once()
 
@@ -2486,7 +2488,7 @@ class TestChannelOpen:
         dry_cfg = _make_open_cfg(planner_dry_run=True)
         result = planner._execute_open("peer1", 2000000, dry_cfg, "test")
         assert result["status"] == "dry_run"
-        planner.plugin.rpc.fundchannel.assert_not_called()
+        planner.plugin.rpc.call.assert_not_called()
 
     def test_dry_run_records_action(self):
         """Dry run still records the decision in database."""
@@ -2502,7 +2504,7 @@ class TestChannelOpen:
         planner.plugin.rpc.connect.side_effect = Exception("already connected")
         result = planner._execute_open("peer1", 2000000, cfg, "test")
         assert result["status"] == "completed"
-        planner.plugin.rpc.fundchannel.assert_called_once()
+        planner.plugin.rpc.call.assert_called_once()
 
     def test_success_marks_spend_reservation(self):
         """Successful open marks the reservation as spent."""
@@ -2525,7 +2527,7 @@ class TestChannelOpen:
         """Failed open updates action status to failed."""
         planner, db = _make_open_planner()
         cfg = _make_open_cfg()
-        planner.plugin.rpc.fundchannel.side_effect = Exception("out of funds")
+        planner.plugin.rpc.call.side_effect = Exception("out of funds")
         planner._execute_open("peer1", 2000000, cfg, "test")
         db.update_planner_action.assert_called_with(42, status="failed")
 
@@ -2533,7 +2535,7 @@ class TestChannelOpen:
         """Method works when profitability/database is None."""
         plugin = MagicMock()
         plugin.rpc.feerates.return_value = {"perkb": {"opening": 1000}}
-        plugin.rpc.fundchannel.return_value = {"channel_id": "456x2x0"}
+        plugin.rpc.call.return_value = {"channel_id": "456x2x0"}
         planner = CapacityPlanner(plugin, None, MagicMock())
         cfg = _make_open_cfg()
         result = planner._execute_open("peer1", 1000000, cfg, "no db")
@@ -2553,7 +2555,7 @@ class TestChannelOpen:
         """Handles fundchannel returning 'channelid' instead of 'channel_id'."""
         planner, db = _make_open_planner()
         cfg = _make_open_cfg()
-        planner.plugin.rpc.fundchannel.return_value = {"channelid": "789x3x0"}
+        planner.plugin.rpc.call.return_value = {"channelid": "789x3x0"}
         result = planner._execute_open("peer1", 2000000, cfg, "test")
         assert result["channel_id"] == "789x3x0"
 
@@ -2613,16 +2615,16 @@ class TestDirectClose:
 
     # --- _execute_close tests ---
 
-    def test_execute_close_calls_close_rpc(self):
-        """Successful close calls plugin.rpc.close with channel_id."""
+    def test_execute_close_calls_generic_rpc_close(self):
+        """Successful close calls generic RPC close with channel_id."""
         planner, db, pm = _make_close_planner()
         cfg = _make_close_cfg()
 
-        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
         result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
-        planner.plugin.rpc.close.assert_called_once_with(id="100x1x0")
+        planner.plugin.rpc.call.assert_any_call("close", {"id": "100x1x0"})
         assert result["status"] == "completed"
         assert result["action_id"] == 99
         assert result["result"] == {"type": "mutual"}
@@ -2632,7 +2634,7 @@ class TestDirectClose:
         planner, db, pm = _make_close_planner()
         cfg = _make_close_cfg()
 
-        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
         planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
@@ -2645,7 +2647,7 @@ class TestDirectClose:
         planner, db, pm = _make_close_planner()
         cfg = _make_close_cfg()
 
-        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
         planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
@@ -2660,7 +2662,7 @@ class TestDirectClose:
 
         assert result["status"] == "dry_run"
         assert result["action_id"] == 99
-        planner.plugin.rpc.close.assert_not_called()
+        planner.plugin.rpc.call.assert_not_called()
         db.update_planner_action.assert_called_once_with(99, status="dry_run")
 
     def test_execute_close_stops_rebalancer_jobs(self):
@@ -2669,7 +2671,7 @@ class TestDirectClose:
         cfg = _make_close_cfg()
 
         planner.rebalancer.job_manager.has_active_job.return_value = True
-        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
         planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
@@ -2684,7 +2686,7 @@ class TestDirectClose:
         cfg = _make_close_cfg()
 
         planner.rebalancer.job_manager.has_active_job.return_value = False
-        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
         planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
@@ -2695,7 +2697,7 @@ class TestDirectClose:
         planner, db, pm = _make_close_planner()
         cfg = _make_close_cfg()
 
-        planner.plugin.rpc.close.side_effect = Exception("Peer unreachable")
+        planner.plugin.rpc.call.side_effect = Exception("Peer unreachable")
 
         result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
@@ -2708,7 +2710,7 @@ class TestDirectClose:
         planner, db, pm = _make_close_planner(with_rebalancer=False)
         cfg = _make_close_cfg()
 
-        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
         result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
@@ -2815,19 +2817,19 @@ class TestDirectClose:
 
         planner.rebalancer.job_manager.has_active_job.return_value = True
         planner.rebalancer.job_manager.stop_job.side_effect = Exception("Job manager error")
-        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
 
         result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
 
         assert result["status"] == "completed"
-        planner.plugin.rpc.close.assert_called_once_with(id="100x1x0")
+        planner.plugin.rpc.call.assert_any_call("close", {"id": "100x1x0"})
 
     def test_execute_close_db_failure_after_successful_close(self):
         """Close reports success even if DB update fails after close RPC."""
         planner, db, pm = _make_close_planner()
         cfg = _make_close_cfg()
 
-        planner.plugin.rpc.close.return_value = {"type": "mutual"}
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
         db.update_planner_action.side_effect = Exception("DB write failed")
 
         result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
@@ -2918,8 +2920,8 @@ def _make_cycle_planner(feerates_return=None, listfunds_return=None,
     prof_analyzer.database.record_planner_candidate.return_value = None
     prof_analyzer.identify_bleeders_v2.return_value = []
 
-    # fundchannel default
-    plugin.rpc.fundchannel.return_value = {"channel_id": "new_chan_id"}
+    # generic RPC dispatch default for open-path tests
+    plugin.rpc.call.return_value = {"channel_id": "new_chan_id"}
     plugin.rpc.connect.return_value = {}
 
     pm = MagicMock() if with_policy_manager else None
@@ -2984,7 +2986,7 @@ class TestExecuteCycle:
             all_flow={scid: winner_flow},
         )
         # Ensure fundchannel returns a channel id
-        plugin.rpc.fundchannel.return_value = {"channel_id": "opened_chan"}
+        plugin.rpc.call.return_value = {"channel_id": "opened_chan"}
 
         # Ensure positive EV: give closed summary with good history
         prof.database.get_peer_closed_channel_profit_summary.return_value = {
@@ -3019,7 +3021,7 @@ class TestExecuteCycle:
             all_profitability={scid: loser_prof},
             all_flow={scid: loser_flow},
         )
-        plugin.rpc.close.return_value = {"type": "mutual"}
+        plugin.rpc.call.return_value = {"type": "mutual"}
 
         cfg = _make_cycle_cfg(planner_max_closes_per_cycle=1)
 
@@ -3032,7 +3034,7 @@ class TestExecuteCycle:
         assert "ZOMBIE" in closed["reason"]
         assert closed["status"] == "completed"
         # Verify close RPC was actually called
-        plugin.rpc.close.assert_called_once_with(id=scid)
+        plugin.rpc.call.assert_any_call("close", {"id": scid})
 
     def test_execute_cycle_respects_max_opens_per_cycle(self):
         """At most max_opens_per_cycle opens per invocation."""
@@ -3062,7 +3064,7 @@ class TestExecuteCycle:
         prof_az.database.get_peer_closed_channel_profit_summary.return_value = {
             'count': 1, 'marginal_roi_proxy': 0.5, 'daily_net_est_sats': 100,
         }
-        plugin.rpc.fundchannel.return_value = {"channel_id": "chan_opened"}
+        plugin.rpc.call.return_value = {"channel_id": "chan_opened"}
 
         # Only allow 1 open per cycle
         cfg = _make_cycle_cfg(planner_max_opens_per_cycle=1)
@@ -3163,7 +3165,7 @@ class TestExecuteCycle:
         # Fee gate reason should be in skipped_reasons
         assert any("exceeds max" in r for r in result["skipped_reasons"])
         # fundchannel should never have been called
-        plugin.rpc.fundchannel.assert_not_called()
+        plugin.rpc.call.assert_not_called()
 
     def test_execute_cycle_skips_open_for_negative_ev(self):
         """Opens skipped when EV is negative."""
@@ -3308,7 +3310,7 @@ class TestExecuteCycle:
         assert len(result["closes"]) == 1
         assert result["closes"][0]["status"] == "dry_run"
         # close RPC should NOT have been called
-        plugin.rpc.close.assert_not_called()
+        plugin.rpc.call.assert_not_called()
         prof.database.update_planner_action.assert_any_call(1, status="dry_run")
 
 
@@ -3382,8 +3384,7 @@ class TestPlannerIntegration:
         prof_analyzer.database.update_planner_action.assert_any_call(1, status="dry_run")
 
         # --- Assert no RPC mutations (no fundchannel/close calls in dry run) ---
-        plugin.rpc.fundchannel.assert_not_called()
-        plugin.rpc.close.assert_not_called()
+        plugin.rpc.call.assert_not_called()
 
     def test_full_cycle_dry_run_with_open_and_close(self):
         """End-to-end: dry_run cycle with both winner (open) and loser (close)."""
@@ -3446,8 +3447,7 @@ class TestPlannerIntegration:
         assert len(result["closes"]) >= 1
 
         # No actual RPC mutations in dry_run
-        plugin.rpc.fundchannel.assert_not_called()
-        plugin.rpc.close.assert_not_called()
+        plugin.rpc.call.assert_not_called()
 
         # Actions should be recorded as dry_run
         dry_run_calls = [
@@ -3660,4 +3660,3 @@ class TestConstructorCleanup:
         mock_rebalancer = MagicMock()
         planner.rebalancer = mock_rebalancer
         assert planner.rebalancer is mock_rebalancer
-
