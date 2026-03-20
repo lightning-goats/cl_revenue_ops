@@ -3024,6 +3024,56 @@ class TestExecuteCycle:
         assert opened["peer_id"] == winner_prof.peer_id
         assert opened["result"] in ("completed", "dry_run")
 
+    def test_failed_open_does_not_consume_open_slot_or_available_funds(self):
+        """A failed open should not block a later candidate in the same cycle."""
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            listfunds_return={
+                "outputs": [
+                    {"amount_msat": 5_000_000_000, "status": "confirmed"},
+                ],
+                "channels": [],
+            }
+        )
+
+        candidate_a = {"peer_id": "02" + "a" * 64, "score": 10.0, "reason": "first"}
+        candidate_b = {"peer_id": "03" + "b" * 64, "score": 9.0, "reason": "second"}
+        planner._discover_peers = MagicMock(return_value=[candidate_a, candidate_b])
+        planner._identify_winners = MagicMock(return_value=[])
+        planner._identify_losers = MagicMock(return_value=[])
+        planner._update_candidate_pool = MagicMock()
+        planner._calculate_open_ev = MagicMock(return_value=100)
+
+        available_sats_seen = []
+
+        def size_channel(candidate, all_candidates, available_sats, cfg):
+            available_sats_seen.append(available_sats)
+            return 1_000_000
+
+        planner._size_channel = MagicMock(side_effect=size_channel)
+
+        fundchannel_attempts = []
+
+        def rpc_call(method, payload=None):
+            assert method == "fundchannel"
+            fundchannel_attempts.append(payload["id"])
+            if len(fundchannel_attempts) == 1:
+                raise Exception("temporary fundchannel failure")
+            return {"channel_id": "second-open"}
+
+        plugin.rpc.call.side_effect = rpc_call
+
+        cfg = _make_cycle_cfg(planner_max_opens_per_cycle=1)
+
+        result = planner.execute_cycle(cfg)
+
+        assert [open_rec["result"] for open_rec in result["opens"]] == ["failed", "completed"]
+        assert [open_rec["peer_id"] for open_rec in result["opens"]] == [
+            candidate_a["peer_id"],
+            candidate_b["peer_id"],
+        ]
+        assert available_sats_seen == [4_500_000, 4_500_000]
+        assert fundchannel_attempts == [candidate_a["peer_id"], candidate_b["peer_id"]]
+
     def test_execute_cycle_closes_worst_loser(self):
         """Cycle directly closes worst loser when guards pass."""
         # Set up a zombie loser

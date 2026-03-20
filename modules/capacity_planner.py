@@ -212,10 +212,10 @@ class CapacityPlanner:
                     "result": result.get("status", "unknown"),
                     "action_id": result.get("action_id"),
                 })
-                opens_this_cycle += 1
-
-                # Reduce available sats for next candidate
-                available_sats = max(0, available_sats - channel_size)
+                status = result.get("status", "unknown")
+                if status in ("completed", "dry_run"):
+                    opens_this_cycle += 1
+                    available_sats = max(0, available_sats - channel_size)
 
         # 6. Update candidate pool
         self._update_candidate_pool(candidates if fee_ok else [])
