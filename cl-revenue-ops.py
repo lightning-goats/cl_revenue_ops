@@ -1566,8 +1566,26 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log("Capacity planner disabled, loop not started", level='debug')
             return
 
-        # Startup delay: wait for flow + profitability data to warm up
-        startup_delay = 300
+        # Respect the interval from the last cycle (survives restarts).
+        # Fall back to a warmup delay if no prior cycle exists.
+        warmup_delay = 300
+        startup_delay = warmup_delay
+        try:
+            if database:
+                recent = database.get_planner_actions(limit=1)
+                if recent:
+                    last_ts = recent[0].get("created_at", 0)
+                    elapsed = int(time.time()) - last_ts
+                    interval = max(600, config.planner_interval if hasattr(config, 'planner_interval') else 21600)
+                    remaining = interval - elapsed
+                    if remaining > 0:
+                        startup_delay = remaining
+                        plugin.log(f"Planner: last cycle {elapsed}s ago, waiting {remaining}s", level='info')
+                    else:
+                        plugin.log(f"Planner: last cycle {elapsed}s ago, starting after warmup", level='info')
+        except Exception:
+            pass  # Fall back to default warmup delay
+
         if shutdown_event.wait(startup_delay):
             return
 
