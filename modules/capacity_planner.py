@@ -1,8 +1,8 @@
 """
 Capacity Planner Module for cl-revenue-ops
 
-This module identifies "Winner" channels for capital injection (Splice-In)
-and "Loser" channels for capital redeployment (Splice-Out/Close).
+This module identifies "Winner" channels for capital injection
+and "Loser" channels for capital redeployment (Close).
 """
 
 import time
@@ -41,10 +41,8 @@ class CapacityPlanner:
         all_profitability = self.profitability.analyze_all_channels()
         all_flow = self.flow.analyze_all_channels()
 
-        peer_splice_map = self._get_peer_splice_map()
-
-        winners = self._identify_winners(all_profitability, all_flow, peer_splice_map)
-        losers = self._identify_losers(all_profitability, all_flow, peer_splice_map)
+        winners = self._identify_winners(all_profitability, all_flow)
+        losers = self._identify_losers(all_profitability, all_flow)
 
         recommendations = self._generate_recommendations(winners, losers)
 
@@ -77,7 +75,7 @@ class CapacityPlanner:
             sat_per_vb = opening_kvb / 1000.0
 
             if sat_per_vb > 100:
-                return f"HOLD: On-chain fees too high for efficient splicing ({sat_per_vb:.0f} sat/vB)."
+                return f"HOLD: On-chain fees too high for efficient channel operations ({sat_per_vb:.0f} sat/vB)."
             elif sat_per_vb > 50:
                 return f"CAUTION: On-chain fees are elevated ({sat_per_vb:.0f} sat/vB). Consider waiting for lower fees."
             return f"PROCEED: Fee environment is favorable ({sat_per_vb:.0f} sat/vB)."
@@ -85,44 +83,7 @@ class CapacityPlanner:
             self.plugin.log(f"Error checking mempool for capacity report: {e}", level='debug')
             return "UNKNOWN: Could not fetch feerates."
 
-    def _get_peer_splice_map(self) -> Dict[str, bool]:
-        """Identify which peers support splicing (bits 62/63 for option_splice).
-
-        Note: listpeers is the correct RPC for peer-level features.
-        The channels field moved to listpeerchannels in CLN v24+, but
-        peer connection info (including features) remains in listpeers.
-        """
-        splice_map = {}
-        try:
-            peers = self.plugin.rpc.listpeers().get("peers", [])
-            for peer in peers:
-                peer_id = peer.get("id")
-                # Guard against None peer_id from malformed listpeers responses
-                if not peer_id:
-                    continue
-                features = peer.get("features", "")
-                # BOLT 9: option_splice uses feature bits 62 (even=required) / 63 (odd=optional)
-                # CLN provides 'features' as a hex string.
-                # We convert hex to int and check the appropriate bits.
-                if not features:
-                    splice_map[peer_id] = False
-                    continue
-
-                has_splice = False
-                try:
-                    feat_int = int(features, 16)
-                    if (feat_int & (1 << 62)) or (feat_int & (1 << 63)):
-                        has_splice = True
-                except Exception as e:
-                    self.plugin.log(f"Splice feature parse error for {peer_id[:12]}...: {e}", level='debug')
-
-                splice_map[peer_id] = has_splice
-        except Exception as e:
-            self.plugin.log(f"Error mapping peer splice support: {e}", level='debug')
-
-        return splice_map
-
-    def _identify_winners(self, all_profitability, all_flow, peer_splice_map) -> List[Dict[str, Any]]:
+    def _identify_winners(self, all_profitability, all_flow) -> List[Dict[str, Any]]:
         """
         Identify high-performing channels that are capacity-constrained.
         """
@@ -165,13 +126,12 @@ class CapacityPlanner:
                     "flow_ratio": round(flow_metrics.flow_ratio, 4),
                     "turnover": round(turnover, 4),
                     "capacity": prof.capacity_sats,
-                    "peer_supports_splice": peer_splice_map.get(prof.peer_id, False),
                     "rebal_difficulty": rebal_difficulty,
                 })
 
         return winners
 
-    def _identify_losers(self, all_profitability, all_flow, peer_splice_map) -> List[Dict[str, Any]]:
+    def _identify_losers(self, all_profitability, all_flow) -> List[Dict[str, Any]]:
         """
         Identify poor-performing channels for capital extraction.
         """
@@ -239,7 +199,7 @@ class CapacityPlanner:
                     continue
 
             if is_fire_sale or is_stagnant:
-                # PROTECTION: A channel cannot be recommended for "Close" or "Splice-out"
+                # PROTECTION: A channel cannot be recommended for "Close"
                 # until the diagnostic_rebalance has been attempted at least twice in the last 14 days.
                 # Accounting v2.0: Include estimated closure cost
                 estimated_closure_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
@@ -255,7 +215,6 @@ class CapacityPlanner:
                         "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
                         "capacity": prof.capacity_sats,
                         "estimated_closure_cost_sats": estimated_closure_cost,
-                        "peer_supports_splice": peer_splice_map.get(prof.peer_id, False),
                         "rebal_difficulty": round(rebal_difficulty, 2),
                         "opener": opener,
                         "action": "DEFIBRILLATE"
@@ -270,7 +229,6 @@ class CapacityPlanner:
                         "classification": prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
                         "capacity": prof.capacity_sats,
                         "estimated_closure_cost_sats": estimated_closure_cost,
-                        "peer_supports_splice": peer_splice_map.get(prof.peer_id, False),
                         "rebal_difficulty": round(rebal_difficulty, 2),
                         "opener": opener,
                         "action": "CLOSE"
@@ -301,33 +259,19 @@ class CapacityPlanner:
         # Pair winners with closeable losers for capital redeployment
         closeable_idx = 0
         for winner in sorted_winners:
-            has_splice = winner.get('peer_supports_splice', False)
-
             if closeable_idx < len(sorted_closeable):
                 loser = sorted_closeable[closeable_idx]
                 closeable_idx += 1
 
-                if has_splice:
-                    recommendations.append(
-                        f"STRATEGIC REDEPLOYMENT: Close channel {loser['scid']} ({loser['reason']}) "
-                        f"and splice the funds into {winner['scid']} (ROI: {winner['roi']:.1f}%)."
-                    )
-                else:
-                    recommendations.append(
-                        f"REDEPLOYMENT: Close channel {loser['scid']} ({loser['reason']}) "
-                        f"and re-open larger with {winner['scid']} (ROI: {winner['roi']:.1f}%, peer lacks splice support)."
-                    )
+                recommendations.append(
+                    f"REDEPLOYMENT: Close channel {loser['scid']} ({loser['reason']}) "
+                    f"and redeploy funds to {winner['scid']} (ROI: {winner['roi']:.1f}%)."
+                )
             else:
-                if has_splice:
-                    recommendations.append(
-                        f"GROWTH POTENTIAL: {winner['scid']} is a high ROI winner ({winner['roi']:.1f}% ROI). "
-                        f"Consider splicing in more capital."
-                    )
-                else:
-                    recommendations.append(
-                        f"GROWTH POTENTIAL: {winner['scid']} is a winner ({winner['roi']:.1f}% ROI) "
-                        f"but peer lacks splice support. Consider manual close/re-open larger."
-                    )
+                recommendations.append(
+                    f"GROWTH POTENTIAL: {winner['scid']} is a high ROI winner ({winner['roi']:.1f}% ROI). "
+                    f"Consider adding more capital."
+                )
 
         # Recommend unpaired closeable losers
         for loser in sorted_closeable[closeable_idx:]:

@@ -249,7 +249,7 @@ class Config:
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
     boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
-    # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens/splices)
+    # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
     expansion_treasury_min_deficit_sats: int = 250_000
@@ -779,7 +779,7 @@ class ChainCostDefaults:
     # Estimated on-chain costs in sats
     CHANNEL_OPEN_COST_SATS: int = 5000      # ~$3-5 at typical fee rates
     CHANNEL_CLOSE_COST_SATS: int = 3000     # Usually cheaper than open
-    SPLICE_COST_SATS: int = 2000            # Splice tx fee (similar to single input/output)
+
 
     # Estimated channel lifetime
     CHANNEL_LIFETIME_DAYS: int = 365        # 1 year average

@@ -232,7 +232,7 @@ class TestCapacityPlannerFireSale:
         profitability.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
         profitability.database.get_channel_rebalance_success_rate.return_value = None
 
-        losers = planner._identify_losers(all_prof, all_flow, {})
+        losers = planner._identify_losers(all_prof, all_flow)
         # Should not appear as a loser at all (no flow data)
         assert len(losers) == 0
 
@@ -261,7 +261,7 @@ class TestCapacityPlannerFireSale:
         profitability.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
         profitability.database.get_channel_rebalance_success_rate.return_value = None
 
-        losers = planner._identify_losers(all_prof, all_flow, {})
+        losers = planner._identify_losers(all_prof, all_flow)
         # Marginal ROI is -10% (> -50%), so should NOT be fire sale
         fire_sale_losers = [l for l in losers if "FIRE SALE" in l.get("reason", "")]
         assert len(fire_sale_losers) == 0

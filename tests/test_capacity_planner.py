@@ -85,7 +85,6 @@ class TestRebalanceDifficulty:
 
         all_prof = {scid: prof}
         all_flow = {scid: flow}
-        peer_splice_map = {prof.peer_id: False}
 
         # Mock database methods
         prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 3}
@@ -94,7 +93,7 @@ class TestRebalanceDifficulty:
             'success_rate': 0.2, 'avg_cost_ppm': 500, 'avg_amount_sats': 50000,
         }
 
-        losers = planner._identify_losers(all_prof, all_flow, peer_splice_map)
+        losers = planner._identify_losers(all_prof, all_flow)
 
         assert len(losers) == 1
         loser = losers[0]
@@ -128,7 +127,6 @@ class TestRebalanceDifficulty:
 
         all_prof = {scid: prof}
         all_flow = {scid: flow}
-        peer_splice_map = {prof.peer_id: True}
 
         # Success rate = 30% → penalty = (0.5 - 0.3) * 50 = 10
         # Effective ROI = 30 - 10 = 20, which is NOT > 20 → won't be winner
@@ -137,14 +135,14 @@ class TestRebalanceDifficulty:
             'success_rate': 0.3, 'avg_cost_ppm': 800, 'avg_amount_sats': 50000,
         }
 
-        winners = planner._identify_winners(all_prof, all_flow, peer_splice_map)
+        winners = planner._identify_winners(all_prof, all_flow)
 
         # effective_roi = 30 - 10 = 20.0, condition is > 20.0 (strict), so NOT a winner
         assert len(winners) == 0
 
         # Now with higher ROI → still a winner but penalized
         prof.marginal_roi_percent = 40.0
-        winners = planner._identify_winners(all_prof, all_flow, peer_splice_map)
+        winners = planner._identify_winners(all_prof, all_flow)
 
         assert len(winners) == 1
         # ROI should be 40 - 10 = 30
@@ -180,7 +178,7 @@ class TestLoserClassification:
         prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
         prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
 
-        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
         assert len(losers) == 1
         assert losers[0]["reason"] == "ZOMBIE"
         assert losers[0]["action"] == "CLOSE"
@@ -202,7 +200,7 @@ class TestLoserClassification:
         prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
         prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
 
-        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
         assert len(losers) == 1
         assert losers[0]["reason"] == "STAGNANT"
 
@@ -223,7 +221,7 @@ class TestLoserClassification:
         prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 1}
         prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
 
-        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
         assert len(losers) == 1
         assert losers[0]["action"] == "DEFIBRILLATE"
         assert "(NEEDS DEFIBRILLATOR)" in losers[0]["reason"]
@@ -246,7 +244,7 @@ class TestLoserClassification:
         prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
         prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
 
-        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
         # Zombie + remote + marginal_roi > -75% → exempted (not stagnant, so exemption applies)
         assert len(losers) == 0
 
@@ -268,7 +266,7 @@ class TestLoserClassification:
         prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
         prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
 
-        losers = planner._identify_losers({scid: prof}, {scid: flow}, {})
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
         # Zombie + remote + marginal_roi <= -75% → NOT exempted
         assert len(losers) == 1
 
@@ -307,3 +305,58 @@ class TestMempoolRecommendation:
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
         rec = planner._get_mempool_recommendation()
         assert rec.startswith("UNKNOWN")
+
+
+class TestNoSpliceFields:
+    """Verify splice fields are completely removed from planner output."""
+
+    def test_no_splice_fields_in_output(self):
+        """Verify splice fields are completely removed from planner output."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 10_000}}
+
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+
+        # Set up a winner channel
+        winner_scid = "100x200x0"
+        winner_prof = _mock_profitability(
+            scid=winner_scid,
+            marginal_roi_percent=50.0,
+            roi_percent=50.0,
+            classification=ProfitabilityClass.PROFITABLE,
+            days_open=60,
+        )
+        winner_flow = _mock_flow(daily_volume=1_500_000, flow_ratio=0.9, capacity=2_000_000)
+
+        # Set up a loser channel
+        loser_scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=loser_scid,
+            marginal_roi_percent=-80.0,
+            roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE,
+            days_open=120,
+        )
+        loser_flow = _mock_flow(daily_volume=100, flow_ratio=0.5)
+
+        prof_analyzer.analyze_all_channels.return_value = {
+            winner_scid: winner_prof,
+            loser_scid: loser_prof,
+        }
+        flow_analyzer.analyze_all_channels.return_value = {
+            winner_scid: winner_flow,
+            loser_scid: loser_flow,
+        }
+
+        # Mock database methods
+        prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+        report = planner.generate_report()
+
+        for winner in report.get("winners", []):
+            assert "peer_supports_splice" not in winner
+        for loser in report.get("losers", []):
+            assert "peer_supports_splice" not in loser
