@@ -223,6 +223,33 @@ class TestPendingSwapReservation:
         assert result["reserved_24h_sats"] == 0
 
 
+class TestBudgetStatus:
+    """Budget status should include local Boltz pending reserves."""
+
+    def test_pending_swap_reserves_count_toward_budget(self):
+        mgr = _make_manager(daily_budget_sats=300, enforce_budget=True)
+        mgr._get_global_budget_limit = MagicMock(return_value={
+            "budget_sats": 300,
+            "source": "fixed",
+        })
+        mgr.get_boltz_cost_components = MagicMock(return_value={
+            "spent_24h_sats": 40,
+            "reserved_24h_sats": 120,
+            "counted_details": [],
+            "skipped_without_timestamp": 0,
+        })
+        mgr._get_external_liquidity_costs = MagicMock(return_value={
+            "spent_24h_sats": 20,
+            "reserved_24h_sats": 30,
+        })
+
+        result = mgr.get_budget_status()
+
+        assert result["reserved_24h_sats_estimate"] == 150
+        assert result["remaining_24h_sats_estimate"] == 90
+        assert result["boltz_reserved_24h_sats_estimate"] == 120
+
+
 class TestAutoCycleErrorCounter:
     """C3: Error counter should not reset on blocked state."""
 
