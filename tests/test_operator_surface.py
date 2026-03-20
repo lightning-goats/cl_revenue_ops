@@ -61,6 +61,13 @@ def _load_policy_surface_module():
     return mod
 
 
+def test_planner_execute_closes_plugin_option_defaults_false():
+    mod = load_plugin_module()
+
+    assert "revenue-ops-planner-execute-closes" in mod.plugin.options
+    assert mod.plugin.options["revenue-ops-planner-execute-closes"]["default"] == "false"
+
+
 def test_revenue_config_list_mutable_returns_public_controls_only():
     mod = _load_operator_surface_module()
 

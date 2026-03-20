@@ -2619,14 +2619,20 @@ class TestDirectClose:
 
     def test_execute_close_returns_recommended_when_close_execution_disabled(self):
         """Close recommendations are logged, not executed, by default."""
-        planner, db, pm = _make_close_planner()
+        planner, db, pm = _make_close_planner(with_rebalancer=True)
         cfg = _make_close_cfg(planner_execute_closes=False)
 
         result = planner._execute_close("100x1x0", "peer_abc", cfg, "zombie")
 
         assert result["status"] == "recommended"
         planner.plugin.rpc.call.assert_not_called()
+        planner.rebalancer.job_manager.has_active_job.assert_not_called()
+        planner.rebalancer.job_manager.stop_job.assert_not_called()
         db.update_planner_action.assert_called_once_with(99, status="recommended")
+        planner.plugin.log.assert_any_call(
+            "[RECOMMEND] Close 100x1x0 (peer: peer_abc..., reason: zombie)",
+            level='info',
+        )
 
     def test_execute_close_calls_generic_rpc_close(self):
         """Successful close calls generic RPC close with channel_id."""
@@ -2866,7 +2872,7 @@ class TestDirectClose:
 
 def _make_cycle_cfg(planner_enabled=True, planner_max_opens_per_cycle=2,
                     planner_max_closes_per_cycle=2, planner_dry_run=False,
-                    planner_execute_closes=True,
+                    planner_execute_closes=False,
                     planner_max_fee_rate_sat_vb=50.0, min_wallet_reserve=500000,
                     planner_min_channel_sats=500000, planner_max_channel_sats=10000000):
     """Create a mock config snapshot for execute_cycle tests."""
