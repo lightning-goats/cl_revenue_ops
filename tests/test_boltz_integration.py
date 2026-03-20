@@ -164,6 +164,55 @@ class TestBoltzAutoCycleScheduler:
         mod.revenue_boltz_balance_cycle.assert_called_once()
         mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
 
+    def test_auto_cycle_surfaces_treasury_plan_error_without_falling_back(self):
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "error": "treasury planner failed",
+        })
+        mod._build_boltz_balance_plan = MagicMock()
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock()
+        mod.revenue_boltz_balance_cycle = MagicMock()
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert result["error"] == "treasury planner failed"
+        assert result["trigger"] == "scheduler"
+        mod.revenue_boltz_balance_cycle.assert_not_called()
+        mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
+        mod._build_boltz_balance_plan.assert_not_called()
+
+    def test_auto_cycle_uses_treasury_specific_action_cap(self):
+        mod = self._make_module()
+        mod.config.snapshot.return_value = MagicMock(
+            boltz_auto_cycle_enabled=True,
+            boltz_auto_cycle_max_actions=7,
+            expansion_treasury_enabled=True,
+            expansion_treasury_onchain_target_sats=5_000_000,
+            expansion_treasury_min_deficit_sats=250_000,
+            expansion_treasury_preferred_currency="BTC",
+            expansion_treasury_max_actions=3,
+            expansion_treasury_min_source_local_pct=80.0,
+            expansion_treasury_exclude_protected=True,
+        )
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "ok",
+            "recommendations": [{"channel_id": "100x1x0"}],
+            "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
+        })
+        mod._build_boltz_balance_plan = MagicMock()
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+        mod.revenue_boltz_balance_cycle = MagicMock()
+
+        mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        mod.revenue_boltz_expansion_treasury_cycle.assert_called_once()
+        kwargs = mod.revenue_boltz_expansion_treasury_cycle.call_args.kwargs
+        assert kwargs["max_actions"] == 3
+        mod.revenue_boltz_balance_cycle.assert_not_called()
+
 
 class TestBoltzAutoCycleStatus:
     def test_status_includes_treasury_config(self):

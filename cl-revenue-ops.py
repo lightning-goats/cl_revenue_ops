@@ -896,6 +896,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
             last_error=None,
         )
         max_actions = max(1, int(getattr(cfg, 'boltz_auto_cycle_max_actions', 1) if cfg else 1))
+        treasury_max_actions = max(1, int(getattr(cfg, 'expansion_treasury_max_actions', max_actions) if cfg else max_actions))
         treasury_plan = None
         selection = {
             "mode": "idle",
@@ -908,10 +909,15 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                 onchain_target_sats=int(getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000),
                 min_deficit_sats=int(getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000),
                 preferred_currency=str(getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC').upper(),
-                max_actions=int(getattr(cfg, 'expansion_treasury_max_actions', max_actions) if cfg else max_actions),
+                max_actions=treasury_max_actions,
                 min_source_local_pct=float(getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0),
                 exclude_protected=bool(getattr(cfg, 'expansion_treasury_exclude_protected', True)) if cfg else True,
             )
+            if isinstance(treasury_plan, dict) and 'error' in treasury_plan:
+                result = dict(treasury_plan)
+                result['trigger'] = trigger
+                _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
+                return result
             selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=None)
 
         balance_plan = None
@@ -949,7 +955,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
             result = revenue_boltz_expansion_treasury_cycle(
                 plugin=plugin,
                 dry_run=False,
-                max_actions=max_actions,
+                max_actions=treasury_max_actions,
                 allow_concurrent_swaps=False,
             )
         status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
