@@ -91,6 +91,100 @@ class TestBoltzAutoCycleModeSelection:
         assert selection["balance_candidate_count"] == 0
 
 
+class TestBoltzAutoCycleScheduler:
+    def _make_module(self):
+        mod = _load_boltz_plugin_module()
+        mod.boltz_manager = MagicMock(enabled=True)
+        mod.config = MagicMock()
+        mod.config.snapshot.return_value = MagicMock(
+            boltz_auto_cycle_enabled=True,
+            boltz_auto_cycle_max_actions=1,
+            expansion_treasury_enabled=True,
+            expansion_treasury_onchain_target_sats=5_000_000,
+            expansion_treasury_min_deficit_sats=250_000,
+            expansion_treasury_preferred_currency="BTC",
+            expansion_treasury_max_actions=1,
+            expansion_treasury_min_source_local_pct=80.0,
+            expansion_treasury_exclude_protected=True,
+        )
+        return mod
+
+    def test_auto_cycle_executes_treasury_mode_first(self):
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "ok",
+            "recommendations": [{"channel_id": "100x1x0"}],
+            "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
+        })
+        mod._build_boltz_balance_plan = MagicMock()
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+        mod.revenue_boltz_balance_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert result["mode"] == "treasury"
+        assert result["selection_reason"] == "standing_onchain_reserve_below_target"
+        assert result["reserve_deficit_sats"] == 900000
+        assert result["trigger"] == "scheduler"
+        mod.revenue_boltz_expansion_treasury_cycle.assert_called_once()
+        mod.revenue_boltz_balance_cycle.assert_not_called()
+        mod._build_boltz_balance_plan.assert_not_called()
+
+    def test_auto_cycle_falls_back_to_balance_mode(self):
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "at_target",
+            "recommendations": [],
+            "treasury": {"deficit_sats": 0, "min_deficit_sats": 250000},
+        })
+        mod._build_boltz_balance_plan = MagicMock(return_value={
+            "recommendations": [{"channel_id": "200x1x0"}],
+        })
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+        mod.revenue_boltz_balance_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert result["mode"] == "balance"
+        assert result["selection_reason"] == "onchain_reserve_healthy_use_balance_mode"
+        assert result["reserve_deficit_sats"] == 0
+        assert result["trigger"] == "scheduler"
+        mod.revenue_boltz_balance_cycle.assert_called_once()
+        mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
+
+
+class TestBoltzAutoCycleStatus:
+    def test_status_includes_treasury_config(self):
+        mod = _load_boltz_plugin_module()
+        mod.config = MagicMock()
+        mod.config.boltz_auto_cycle_enabled = True
+        mod.config.boltz_auto_cycle_interval_minutes = 15
+        mod.config.boltz_auto_cycle_max_actions = 1
+        mod.config.boltz_auto_cycle_startup_delay_seconds = 120
+        mod.config.expansion_treasury_enabled = True
+        mod.config.expansion_treasury_onchain_target_sats = 5_000_000
+        mod.config.expansion_treasury_min_deficit_sats = 250_000
+
+        result = mod.revenue_boltz_auto_cycle_status(mod.plugin)
+
+        assert result["config"]["boltz_auto_cycle_enabled"] is True
+        assert result["config"]["expansion_treasury_enabled"] is True
+        assert result["config"]["expansion_treasury_onchain_target_sats"] == 5_000_000
+        assert result["config"]["expansion_treasury_min_deficit_sats"] == 250_000
+
+
 class TestDynamicChannelTuning:
     """Tests for _boltz_dynamic_channel_tuning() threshold/sizing logic.
 

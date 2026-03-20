@@ -801,9 +801,11 @@ plugin.add_option(
 )
 
 
-# Boltz auto-cycle mode selection stays at module scope so tests can call it
-# directly, but it lives next to the auto-cycle runtime code rather than near
-# imports.
+def _boltz_auto_cycle_mark_state(**updates):
+    with _boltz_auto_cycle_state_lock:
+        _boltz_auto_cycle_state.update(updates)
+
+
 def _select_boltz_auto_cycle_mode(
     *,
     treasury_plan: Optional[Dict[str, Any]],
@@ -852,6 +854,139 @@ def _select_boltz_auto_cycle_mode(
         "treasury_candidate_count": len(treasury_recommendations),
         "balance_candidate_count": len(balance_recommendations),
     }
+
+
+def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> Dict[str, Any]:
+    """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight)."""
+    if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
+        result = {
+            'status': 'disabled',
+            'reason': 'boltz integration disabled',
+            'trigger': trigger,
+        }
+        _boltz_auto_cycle_mark_state(last_result=result, last_error=None, enabled=False)
+        return result
+
+    cfg = config.snapshot() if config else None
+    enabled = bool(getattr(cfg, 'boltz_auto_cycle_enabled', True)) if cfg else True
+    _boltz_auto_cycle_mark_state(enabled=enabled)
+    if not enabled and not force:
+        result = {
+            'status': 'disabled',
+            'reason': 'boltz auto-cycle disabled by config',
+            'trigger': trigger,
+        }
+        _boltz_auto_cycle_mark_state(last_result=result, last_error=None)
+        return result
+
+    # L-1 FIX: Guard lock release with acquired flag to prevent RuntimeError
+    acquired = _boltz_auto_cycle_run_lock.acquire(blocking=False)
+    if not acquired:
+        result = {'status': 'skipped', 'reason': 'auto-cycle already running', 'trigger': trigger}
+        _boltz_auto_cycle_mark_state(last_result=result)
+        return result
+
+    try:
+        started = int(time.time())
+        start_monotonic = time.monotonic()
+        _boltz_auto_cycle_mark_state(
+            running=True,
+            last_trigger=trigger,
+            last_started_ts=started,
+            last_error=None,
+        )
+        max_actions = max(1, int(getattr(cfg, 'boltz_auto_cycle_max_actions', 1) if cfg else 1))
+        treasury_plan = None
+        selection = {
+            "mode": "idle",
+            "reason": "no_eligible_boltz_actions",
+            "reserve_deficit_sats": 0,
+        }
+
+        if bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False:
+            treasury_plan = _build_boltz_expansion_treasury_plan(
+                onchain_target_sats=int(getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000),
+                min_deficit_sats=int(getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000),
+                preferred_currency=str(getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC').upper(),
+                max_actions=int(getattr(cfg, 'expansion_treasury_max_actions', max_actions) if cfg else max_actions),
+                min_source_local_pct=float(getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0),
+                exclude_protected=bool(getattr(cfg, 'expansion_treasury_exclude_protected', True)) if cfg else True,
+            )
+            selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=None)
+
+        balance_plan = None
+        if selection.get("mode") != "treasury":
+            balance_plan = _build_boltz_balance_plan(
+                max_candidates=max(max(5, int(max_actions) * 5), 20),
+                require_profitable=True,
+                min_marginal_roi=0.0,
+                profit_margin_factor=1.2,
+                expected_horizon_days=3.0,
+                loop_in_currency='LBTC',
+                loop_out_currency='LBTC',
+            )
+            if isinstance(balance_plan, dict) and 'error' in balance_plan:
+                result = balance_plan
+            else:
+                selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=balance_plan)
+                if selection.get("mode") == "balance":
+                    result = revenue_boltz_balance_cycle(
+                        plugin=plugin,
+                        dry_run=False,
+                        max_actions=max_actions,
+                        allow_concurrent_swaps=False,
+                        loop_in_currency='LBTC',
+                        loop_out_currency='LBTC',
+                    )
+                else:
+                    result = {
+                        'status': 'idle',
+                        'executed_count': 0,
+                        'skipped_count': 0,
+                        'reason': selection.get("reason", "no_eligible_boltz_actions"),
+                    }
+        else:
+            result = revenue_boltz_expansion_treasury_cycle(
+                plugin=plugin,
+                dry_run=False,
+                max_actions=max_actions,
+                allow_concurrent_swaps=False,
+            )
+        status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
+        if isinstance(result, dict):
+            result.update({
+                'mode': str(selection.get("mode") or 'idle'),
+                'selection_reason': str(selection.get("reason") or 'no_eligible_boltz_actions'),
+                'reserve_deficit_sats': int(selection.get("reserve_deficit_sats", 0) or 0),
+                'trigger': trigger,
+            })
+        if isinstance(result, dict) and 'error' in result:
+            with _boltz_auto_cycle_state_lock:
+                _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
+            _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
+        else:
+            # C3 FIX: Only reset error counter on actual success, not on blocked/other states
+            status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
+            if status in ('executed', 'dry_run'):
+                with _boltz_auto_cycle_state_lock:
+                    _boltz_auto_cycle_state['consecutive_errors'] = 0
+            _boltz_auto_cycle_mark_state(last_error=None)
+        return result if isinstance(result, dict) else {'status': status, 'result': result}
+    except Exception as e:
+        with _boltz_auto_cycle_state_lock:
+            _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
+        _boltz_auto_cycle_mark_state(last_error=str(e))
+        raise
+    finally:
+        finished = int(time.time())
+        duration_ms = int((time.monotonic() - start_monotonic) * 1000)
+        with _boltz_auto_cycle_state_lock:
+            _boltz_auto_cycle_state['running'] = False
+            _boltz_auto_cycle_state['last_finished_ts'] = finished
+            _boltz_auto_cycle_state['last_duration_ms'] = duration_ms
+            # Preserve last_result if set by success/skip/disabled path, otherwise leave as-is.
+        if acquired:
+            _boltz_auto_cycle_run_lock.release()
 
 
 # =============================================================================
@@ -1371,87 +1506,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 plugin.log("Rebalance check loop stopping due to shutdown signal")
                 break
     
-    def _boltz_auto_cycle_mark_state(**updates):
-        with _boltz_auto_cycle_state_lock:
-            _boltz_auto_cycle_state.update(updates)
-
-    def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> Dict[str, Any]:
-        """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight)."""
-        if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
-            result = {
-                'status': 'disabled',
-                'reason': 'boltz integration disabled',
-                'trigger': trigger,
-            }
-            _boltz_auto_cycle_mark_state(last_result=result, last_error=None, enabled=False)
-            return result
-
-        cfg = config.snapshot() if config else None
-        enabled = bool(getattr(cfg, 'boltz_auto_cycle_enabled', True)) if cfg else True
-        _boltz_auto_cycle_mark_state(enabled=enabled)
-        if not enabled and not force:
-            result = {
-                'status': 'disabled',
-                'reason': 'boltz auto-cycle disabled by config',
-                'trigger': trigger,
-            }
-            _boltz_auto_cycle_mark_state(last_result=result, last_error=None)
-            return result
-
-        # L-1 FIX: Guard lock release with acquired flag to prevent RuntimeError
-        acquired = _boltz_auto_cycle_run_lock.acquire(blocking=False)
-        if not acquired:
-            result = {'status': 'skipped', 'reason': 'auto-cycle already running', 'trigger': trigger}
-            _boltz_auto_cycle_mark_state(last_result=result)
-            return result
-
-        try:
-            started = int(time.time())
-            start_monotonic = time.monotonic()
-            _boltz_auto_cycle_mark_state(
-                running=True,
-                last_trigger=trigger,
-                last_started_ts=started,
-                last_error=None,
-            )
-            max_actions = max(1, int(getattr(cfg, 'boltz_auto_cycle_max_actions', 1) if cfg else 1))
-            result = revenue_boltz_balance_cycle(
-                plugin=plugin,
-                dry_run=False,
-                max_actions=max_actions,
-                allow_concurrent_swaps=False,
-                loop_in_currency='LBTC',
-                loop_out_currency='LBTC',
-            )
-            status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
-            if isinstance(result, dict) and 'error' in result:
-                with _boltz_auto_cycle_state_lock:
-                    _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
-                _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
-            else:
-                # C3 FIX: Only reset error counter on actual success, not on blocked/other states
-                status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
-                if status in ('executed', 'dry_run'):
-                    with _boltz_auto_cycle_state_lock:
-                        _boltz_auto_cycle_state['consecutive_errors'] = 0
-                _boltz_auto_cycle_mark_state(last_error=None)
-            return result if isinstance(result, dict) else {'status': status, 'result': result}
-        except Exception as e:
-            with _boltz_auto_cycle_state_lock:
-                _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
-            _boltz_auto_cycle_mark_state(last_error=str(e))
-            raise
-        finally:
-            finished = int(time.time())
-            duration_ms = int((time.monotonic() - start_monotonic) * 1000)
-            with _boltz_auto_cycle_state_lock:
-                _boltz_auto_cycle_state['running'] = False
-                _boltz_auto_cycle_state['last_finished_ts'] = finished
-                _boltz_auto_cycle_state['last_duration_ms'] = duration_ms
-                # Preserve last_result if set by success/skip/disabled path, otherwise leave as-is.
-            if acquired:
-                _boltz_auto_cycle_run_lock.release()
-
     def boltz_auto_cycle_loop():
         """Background loop for profit-gated Boltz auto-balance cycles."""
         if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
@@ -5355,6 +5409,9 @@ def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
             "boltz_auto_cycle_interval_minutes": int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15)) if config else None,
             "boltz_auto_cycle_max_actions": int(getattr(config, 'boltz_auto_cycle_max_actions', 1)) if config else None,
             "boltz_auto_cycle_startup_delay_seconds": int(getattr(config, 'boltz_auto_cycle_startup_delay_seconds', 120)) if config else None,
+            "expansion_treasury_enabled": bool(getattr(config, 'expansion_treasury_enabled', False)) if config else None,
+            "expansion_treasury_onchain_target_sats": int(getattr(config, 'expansion_treasury_onchain_target_sats', 5_000_000)) if config else None,
+            "expansion_treasury_min_deficit_sats": int(getattr(config, 'expansion_treasury_min_deficit_sats', 250_000)) if config else None,
         },
     })
     return state
