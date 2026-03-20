@@ -1019,13 +1019,7 @@ class CapacityPlanner:
                 }
 
         try:
-            # Connect first (may already be connected)
-            try:
-                self.plugin.rpc.connect(peer_id)
-            except Exception:
-                pass  # Connection may already exist
-
-            # Fund channel
+            # fundchannel auto-connects if CLN knows the peer address (from gossip).
             result = self._rpc_fundchannel(peer_id, amount_sats)
 
             channel_id = result.get("channel_id") or result.get("channelid")

@@ -3962,6 +3962,18 @@ def _on_channel_state_changed_impl(plugin: Plugin, **kwargs):
         plugin.log(f"Channel state change - no channel_id in event: {event}", level='warn')
         return
 
+    # Pre-confirmation states never have an SCID — skip silently
+    pre_confirmation_states = {
+        'CHANNELD_AWAITING_LOCKIN', 'DUALOPEND_AWAITING_LOCKIN',
+        'DUALOPEND_OPEN_INIT', 'OPENINGD',
+    }
+    if new_state in pre_confirmation_states:
+        plugin.log(
+            f"Channel {raw_channel_id[:16]}... entered {new_state} (awaiting confirmation)",
+            level='debug'
+        )
+        return
+
     # Resolve to SCID (events may provide funding txid in `channel_id`)
     channel_id = _resolve_event_channel_scid(event)
     if not channel_id:

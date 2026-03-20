@@ -2439,12 +2439,12 @@ class TestChannelOpen:
         assert result["status"] == "completed"
         assert result["channel_id"] == "123x1x0"
 
-    def test_execute_open_connects_first(self):
-        """Open attempts to connect to peer before funding."""
+    def test_execute_open_does_not_call_connect(self):
+        """fundchannel auto-connects via gossip; no explicit connect call needed."""
         planner, db = _make_open_planner()
         cfg = _make_open_cfg()
         planner._execute_open("peer1", 2000000, cfg, "test")
-        planner.plugin.rpc.connect.assert_called_once_with("peer1")
+        planner.plugin.rpc.connect.assert_not_called()
 
     def test_execute_open_records_action(self):
         """Open execution records action in planner_actions table."""
