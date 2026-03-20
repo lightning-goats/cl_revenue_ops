@@ -181,6 +181,25 @@ class TestBoltzAutoCycleScheduler:
         mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
         mod._build_boltz_balance_plan.assert_not_called()
 
+    def test_auto_cycle_increments_error_counter_on_treasury_plan_error(self):
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "error": "treasury planner failed",
+        })
+        mod._build_boltz_balance_plan = MagicMock()
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock()
+        mod.revenue_boltz_balance_cycle = MagicMock()
+
+        before = dict(mod._boltz_auto_cycle_state)
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+        after = dict(mod._boltz_auto_cycle_state)
+
+        assert result["error"] == "treasury planner failed"
+        assert after["consecutive_errors"] == before["consecutive_errors"] + 1
+        mod.revenue_boltz_balance_cycle.assert_not_called()
+        mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
+        mod._build_boltz_balance_plan.assert_not_called()
+
     def test_auto_cycle_uses_treasury_specific_action_cap(self):
         mod = self._make_module()
         mod.config.snapshot.return_value = MagicMock(

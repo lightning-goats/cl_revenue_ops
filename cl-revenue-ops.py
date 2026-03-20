@@ -916,6 +916,8 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
             if isinstance(treasury_plan, dict) and 'error' in treasury_plan:
                 result = dict(treasury_plan)
                 result['trigger'] = trigger
+                with _boltz_auto_cycle_state_lock:
+                    _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
                 _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
                 return result
             selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=None)
