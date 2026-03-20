@@ -68,6 +68,67 @@ def test_planner_execute_closes_plugin_option_defaults_false():
     assert mod.plugin.options["revenue-ops-planner-execute-closes"]["default"] == "false"
 
 
+def test_planner_execute_closes_option_is_parsed_during_init(monkeypatch):
+    mod = load_plugin_module()
+    mod.shutdown_event.clear()
+
+    options = {
+        name: registration["default"]
+        for name, registration in mod.plugin.options.items()
+        if "default" in registration
+    }
+    options["revenue-ops-planner-execute-closes"] = "true"
+
+    fake_db = MagicMock()
+    fake_db.initialize.return_value = None
+    fake_db.cleanup_stale_reservations.return_value = 0
+    fake_db.get_latest_forward_timestamp.return_value = None
+    fake_db.bulk_insert_forwards.return_value = 0
+    fake_db.has_recent_connection_history.return_value = False
+    fake_db.record_connection_event.return_value = None
+    fake_db.get_all_config_overrides.return_value = {}
+    fake_db.get_config_version.return_value = 0
+
+    fake_rpc = MagicMock()
+    fake_rpc.plugin.return_value = {"plugins": []}
+    fake_rpc.listplugins.return_value = {"plugins": []}
+    fake_rpc.listforwards.return_value = {"forwards": []}
+    fake_rpc.listpeers.return_value = {"peers": []}
+
+    fake_proxy = MagicMock()
+    fake_proxy.rpc = fake_rpc
+    fake_proxy._executor = MagicMock()
+    fake_proxy._async_executor = MagicMock()
+
+    class DummyThread:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(mod, "ThreadSafePluginProxy", lambda plugin: fake_proxy)
+    monkeypatch.setattr(mod, "Database", lambda *args, **kwargs: fake_db)
+    monkeypatch.setattr(mod, "PolicyManager", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "ChannelProfitabilityAnalyzer", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "FlowAnalyzer", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "CapacityPlanner", lambda *args, **kwargs: MagicMock(
+        execute_cycle=MagicMock(return_value={"skipped": True, "reason": "noop"})
+    ))
+    monkeypatch.setattr(mod, "FeeController", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "EVRebalancer", lambda *args, **kwargs: MagicMock(
+        set_profitability_analyzer=MagicMock(),
+        set_capacity_planner=MagicMock(),
+    ))
+    monkeypatch.setattr(mod, "BoltzCliManager", lambda *args, **kwargs: MagicMock(enabled=False))
+    monkeypatch.setattr(mod.threading, "Thread", DummyThread)
+
+    mod.init(options, {}, mod.plugin)
+
+    assert mod.config.planner_execute_closes is True
+
+
 def test_revenue_config_list_mutable_returns_public_controls_only():
     mod = _load_operator_surface_module()
 
