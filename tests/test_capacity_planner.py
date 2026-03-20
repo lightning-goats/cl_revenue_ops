@@ -1819,3 +1819,273 @@ class TestGraphDiscoveryAndScoring:
 
         # Should have called record_planner_candidate
         assert prof_analyzer.database.record_planner_candidate.called
+
+
+class TestSafetyGuards:
+    """Test safety guard methods for capacity planner operations."""
+
+    def _make_planner(self, feerates_return=None, listfunds_return=None,
+                      recent_actions=None, feerates_exc=None, listfunds_exc=None):
+        """Helper to create a planner with mocked RPC and database."""
+        plugin = MagicMock()
+        if feerates_exc:
+            plugin.rpc.feerates.side_effect = feerates_exc
+        else:
+            plugin.rpc.feerates.return_value = feerates_return or {
+                "perkb": {"opening": 10000}
+            }
+        if listfunds_exc:
+            plugin.rpc.listfunds.side_effect = listfunds_exc
+        else:
+            plugin.rpc.listfunds.return_value = listfunds_return or {
+                "outputs": [], "channels": []
+            }
+
+        prof_analyzer = MagicMock()
+        prof_analyzer.database.get_recent_planner_actions.return_value = (
+            recent_actions if recent_actions is not None else []
+        )
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+        return planner
+
+    def _make_cfg(self, max_fee_rate=50.0, min_reserve=500000):
+        """Helper to create a mock config snapshot."""
+        cfg = MagicMock()
+        cfg.planner_max_fee_rate_sat_vb = max_fee_rate
+        cfg.min_wallet_reserve = min_reserve
+        return cfg
+
+    def test_fee_gate_blocks_high_fees(self):
+        """Channel ops blocked when sat/vB > max_fee_rate."""
+        # opening=100000 perkb -> 100 sat/vB, max is 50
+        planner = self._make_planner(feerates_return={
+            "perkb": {"opening": 100000}
+        })
+        cfg = self._make_cfg(max_fee_rate=50.0)
+
+        ok, reason = planner._check_fee_gate(cfg)
+        assert ok is False
+        assert "exceeds max" in reason
+        assert "100" in reason
+
+    def test_fee_gate_allows_low_fees(self):
+        """Channel ops allowed when sat/vB < max_fee_rate."""
+        # opening=10000 perkb -> 10 sat/vB, max is 50
+        planner = self._make_planner(feerates_return={
+            "perkb": {"opening": 10000}
+        })
+        cfg = self._make_cfg(max_fee_rate=50.0)
+
+        ok, reason = planner._check_fee_gate(cfg)
+        assert ok is True
+        assert "acceptable" in reason
+
+    def test_fee_gate_handles_rpc_error(self):
+        """Fee gate returns False when RPC fails."""
+        planner = self._make_planner(feerates_exc=Exception("RPC timeout"))
+        cfg = self._make_cfg()
+
+        ok, reason = planner._check_fee_gate(cfg)
+        assert ok is False
+        assert "Cannot check feerates" in reason
+
+    def test_fee_gate_boundary_equal(self):
+        """Fee gate allows when fee rate equals max exactly."""
+        # opening=50000 perkb -> 50 sat/vB, max is 50
+        planner = self._make_planner(feerates_return={
+            "perkb": {"opening": 50000}
+        })
+        cfg = self._make_cfg(max_fee_rate=50.0)
+
+        ok, reason = planner._check_fee_gate(cfg)
+        assert ok is True
+        assert "acceptable" in reason
+
+    def test_reserve_blocks_insufficient_funds(self):
+        """Open blocked when on-chain balance < reserve + amount."""
+        planner = self._make_planner(listfunds_return={
+            "outputs": [
+                {"amount_msat": 600000_000, "status": "confirmed"},  # 600k sats
+            ],
+            "channels": [],
+        })
+        cfg = self._make_cfg(min_reserve=500000)
+
+        # Only 100k available (600k - 500k reserve), need 200k
+        ok, reason = planner._check_reserve(cfg, required_sats=200000)
+        assert ok is False
+        assert "Insufficient funds" in reason
+
+    def test_reserve_allows_sufficient_funds(self):
+        """Open allowed when balance covers reserve + amount."""
+        planner = self._make_planner(listfunds_return={
+            "outputs": [
+                {"amount_msat": 2000000_000, "status": "confirmed"},  # 2M sats
+            ],
+            "channels": [],
+        })
+        cfg = self._make_cfg(min_reserve=500000)
+
+        # 1.5M available (2M - 500k reserve), need 1M
+        ok, reason = planner._check_reserve(cfg, required_sats=1000000)
+        assert ok is True
+        assert "Available" in reason
+
+    def test_reserve_ignores_unconfirmed_outputs(self):
+        """Reserve check only counts confirmed outputs."""
+        planner = self._make_planner(listfunds_return={
+            "outputs": [
+                {"amount_msat": 300000_000, "status": "confirmed"},    # 300k sats
+                {"amount_msat": 5000000_000, "status": "unconfirmed"},  # 5M unconfirmed
+            ],
+            "channels": [],
+        })
+        cfg = self._make_cfg(min_reserve=200000)
+
+        # Only 100k available (300k confirmed - 200k reserve), need 200k
+        ok, reason = planner._check_reserve(cfg, required_sats=200000)
+        assert ok is False
+        assert "Insufficient funds" in reason
+
+    def test_reserve_handles_rpc_error(self):
+        """Reserve check returns False when RPC fails."""
+        planner = self._make_planner(listfunds_exc=Exception("connection refused"))
+        cfg = self._make_cfg()
+
+        ok, reason = planner._check_reserve(cfg, required_sats=100000)
+        assert ok is False
+        assert "Cannot check funds" in reason
+
+    def test_cooldown_blocks_recent_peer_action(self):
+        """Actions blocked if same peer had action in last 24h."""
+        planner = self._make_planner(recent_actions=[
+            {"peer_id": "peer1", "action": "open", "timestamp": 123456}
+        ])
+
+        ok, reason = planner._check_cooldown("peer1")
+        assert ok is False
+        assert "Cooldown" in reason
+        assert "1 action(s)" in reason
+
+    def test_cooldown_allows_no_recent_actions(self):
+        """Actions allowed when peer has no recent actions."""
+        planner = self._make_planner(recent_actions=[])
+
+        ok, reason = planner._check_cooldown("peer1")
+        assert ok is True
+        assert "No recent actions" in reason
+
+    def test_cooldown_allows_when_no_database(self):
+        """Cooldown allows when no database is available."""
+        plugin = MagicMock()
+        # profitability is None -> no database
+        planner = CapacityPlanner(plugin, None, MagicMock())
+
+        ok, reason = planner._check_cooldown("peer1")
+        assert ok is True
+        assert "No database" in reason
+
+    def test_cooldown_allows_on_db_error(self):
+        """Cooldown allows (fail-open) when database throws."""
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        prof_analyzer.database.get_recent_planner_actions.side_effect = Exception("db locked")
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        ok, reason = planner._check_cooldown("peer1")
+        assert ok is True
+        assert "Cooldown check failed" in reason
+
+    def test_safety_guards_checks_all_pass(self):
+        """_check_safety_guards passes when all checks pass for opens."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 10000}},  # 10 sat/vB
+            listfunds_return={
+                "outputs": [
+                    {"amount_msat": 5000000_000, "status": "confirmed"},  # 5M sats
+                ],
+                "channels": [],
+            },
+            recent_actions=[],
+        )
+        cfg = self._make_cfg(max_fee_rate=50.0, min_reserve=500000)
+
+        ok, reason = planner._check_safety_guards(cfg, "open", "peer1", amount_sats=1000000)
+        assert ok is True
+        assert "All guards passed" in reason
+
+    def test_safety_guards_fee_gate_first(self):
+        """Fee gate failure short-circuits other checks."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 200000}},  # 200 sat/vB
+            listfunds_return={
+                "outputs": [
+                    {"amount_msat": 50000000_000, "status": "confirmed"},  # 50M (plenty)
+                ],
+                "channels": [],
+            },
+            recent_actions=[],
+        )
+        cfg = self._make_cfg(max_fee_rate=50.0)
+
+        ok, reason = planner._check_safety_guards(cfg, "open", "peer1", amount_sats=1000000)
+        assert ok is False
+        assert "exceeds max" in reason
+
+    def test_safety_guards_skips_reserve_for_close(self):
+        """Close actions don't require reserve check."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 10000}},  # 10 sat/vB
+            listfunds_return={
+                "outputs": [
+                    {"amount_msat": 100_000, "status": "confirmed"},  # 100 sats (very low)
+                ],
+                "channels": [],
+            },
+            recent_actions=[],
+        )
+        cfg = self._make_cfg(max_fee_rate=50.0, min_reserve=500000)
+
+        # Close action should pass even with very low balance
+        ok, reason = planner._check_safety_guards(cfg, "close", "peer1", amount_sats=0)
+        assert ok is True
+        assert "All guards passed" in reason
+
+    def test_safety_guards_reserve_blocks_open(self):
+        """Open action fails when reserve is insufficient."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 10000}},  # 10 sat/vB
+            listfunds_return={
+                "outputs": [
+                    {"amount_msat": 600000_000, "status": "confirmed"},  # 600k sats
+                ],
+                "channels": [],
+            },
+            recent_actions=[],
+        )
+        cfg = self._make_cfg(max_fee_rate=50.0, min_reserve=500000)
+
+        # 100k available, need 200k
+        ok, reason = planner._check_safety_guards(cfg, "open", "peer1", amount_sats=200000)
+        assert ok is False
+        assert "Insufficient funds" in reason
+
+    def test_safety_guards_cooldown_blocks(self):
+        """Cooldown blocks even when fee gate and reserve pass."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 10000}},
+            listfunds_return={
+                "outputs": [
+                    {"amount_msat": 5000000_000, "status": "confirmed"},
+                ],
+                "channels": [],
+            },
+            recent_actions=[{"peer_id": "peer1", "action": "open", "timestamp": 123}],
+        )
+        cfg = self._make_cfg(max_fee_rate=50.0, min_reserve=500000)
+
+        ok, reason = planner._check_safety_guards(cfg, "open", "peer1", amount_sats=1000000)
+        assert ok is False
+        assert "Cooldown" in reason

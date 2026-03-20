@@ -596,6 +596,70 @@ class CapacityPlanner:
         except Exception:
             pass
 
+    def _check_fee_gate(self, cfg) -> tuple:
+        """Check on-chain fee rate is acceptable. Returns (ok, reason)."""
+        try:
+            feerates = self.plugin.rpc.feerates(style="perkb")
+            opening_kvb = feerates.get("perkb", {}).get("opening", 1000)
+            sat_per_vb = opening_kvb / 1000.0
+            if sat_per_vb > cfg.planner_max_fee_rate_sat_vb:
+                return False, f"Fee rate {sat_per_vb:.0f} sat/vB exceeds max {cfg.planner_max_fee_rate_sat_vb}"
+            return True, f"Fee rate {sat_per_vb:.0f} sat/vB acceptable"
+        except Exception as e:
+            return False, f"Cannot check feerates: {e}"
+
+    def _check_reserve(self, cfg, required_sats: int) -> tuple:
+        """Check on-chain balance has sufficient reserve after operation."""
+        try:
+            funds = self.plugin.rpc.listfunds()
+            confirmed = sum(
+                o.get("amount_msat", 0) // 1000
+                for o in funds.get("outputs", [])
+                if o.get("status") == "confirmed"
+            )
+            # Handle msat values that might be strings
+            min_reserve = getattr(cfg, 'min_wallet_reserve', 500000)
+            available = confirmed - min_reserve
+            if available < required_sats:
+                return False, f"Insufficient funds: {available} available < {required_sats} required (reserve: {min_reserve})"
+            return True, f"Available: {available} sats (reserve: {min_reserve})"
+        except Exception as e:
+            return False, f"Cannot check funds: {e}"
+
+    def _check_cooldown(self, peer_id: str) -> tuple:
+        """Check 24h cooldown per peer."""
+        db = self.profitability.database if self.profitability else None
+        if not db:
+            return True, "No database available for cooldown check"
+        try:
+            recent = db.get_recent_planner_actions(peer_id, hours=24)
+            if recent:
+                return False, f"Cooldown: {len(recent)} action(s) for peer in last 24h"
+            return True, "No recent actions for peer"
+        except Exception as e:
+            return True, f"Cooldown check failed (allowing): {e}"
+
+    def _check_safety_guards(self, cfg, action_type: str, peer_id: str,
+                              amount_sats: int = 0) -> tuple:
+        """Run all safety checks. Returns (ok, reason)."""
+        # Fee gate applies to all actions
+        fee_ok, fee_reason = self._check_fee_gate(cfg)
+        if not fee_ok:
+            return False, fee_reason
+
+        # Reserve check for opens
+        if action_type == "open":
+            reserve_ok, reserve_reason = self._check_reserve(cfg, amount_sats)
+            if not reserve_ok:
+                return False, reserve_reason
+
+        # Cooldown check
+        cooldown_ok, cooldown_reason = self._check_cooldown(peer_id)
+        if not cooldown_ok:
+            return False, cooldown_reason
+
+        return True, "All guards passed"
+
     def _discover_peers(self, winners: List[Dict], all_profitability, all_flow) -> List[Dict]:
         """Run all discovery strategies and merge candidates."""
         candidates = []
