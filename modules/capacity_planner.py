@@ -408,3 +408,85 @@ class CapacityPlanner:
             )
 
         return recommendations
+
+    def _discover_from_winners(self, winners: List[Dict]) -> List[Dict]:
+        """Strategy 1: Propose existing winners for additional channel opens."""
+        candidates = []
+        for winner in winners:
+            if winner["roi"] > 30.0:  # Only very strong winners
+                candidates.append({
+                    "peer_id": winner["peer_id"],
+                    "source": "winner",
+                    "score": winner["roi"] / 100.0,
+                    "reason": f"Existing winner with {winner['roi']:.1f}% ROI",
+                    "scid": winner.get("scid"),
+                })
+        return candidates
+
+    def _discover_from_neighbors(self, all_profitability) -> List[Dict]:
+        """Strategy 2: Find neighbors of top-earning peers (CLBOSS-inspired)."""
+        candidates = []
+
+        # Get our own node ID
+        try:
+            info = self.plugin.rpc.getinfo()
+            our_node_id = info.get("id")
+        except Exception:
+            return []
+
+        # Sort channels by marginal ROI, take top 3
+        sorted_channels = sorted(
+            all_profitability.values(),
+            key=lambda p: getattr(p, 'marginal_roi_percent', 0),
+            reverse=True
+        )[:3]
+
+        # Get existing peer_ids to exclude
+        existing_peers = set()
+        for prof in all_profitability.values():
+            if hasattr(prof, 'peer_id') and prof.peer_id:
+                existing_peers.add(prof.peer_id)
+
+        for patron in sorted_channels:
+            patron_peer_id = getattr(patron, 'peer_id', None)
+            if not patron_peer_id:
+                continue
+
+            try:
+                channels = self.plugin.rpc.listchannels(source=patron_peer_id)
+                neighbor_ids = set()
+                for ch in channels.get("channels", []):
+                    dest = ch.get("destination")
+                    if dest and dest != our_node_id and dest not in existing_peers:
+                        neighbor_ids.add(dest)
+
+                # Take up to 5 neighbors per patron
+                patron_roi = getattr(patron, 'marginal_roi_percent', 0)
+                for neighbor_id in list(neighbor_ids)[:5]:
+                    candidates.append({
+                        "peer_id": neighbor_id,
+                        "source": "neighbor",
+                        "score": max(patron_roi / 200.0, 0.1),  # Scale patron ROI
+                        "reason": f"Neighbor of top earner {patron_peer_id[:12]}...",
+                        "patron_peer_id": patron_peer_id,
+                    })
+            except Exception as e:
+                self.plugin.log(f"Error discovering neighbors of {patron_peer_id[:12]}: {e}", level='debug')
+                continue
+
+        return candidates[:10]  # Max 10 total from this strategy
+
+    def _discover_peers(self, winners: List[Dict], all_profitability, all_flow) -> List[Dict]:
+        """Run all discovery strategies and merge candidates."""
+        candidates = []
+        candidates.extend(self._discover_from_winners(winners))
+        candidates.extend(self._discover_from_neighbors(all_profitability))
+        # Strategy 3 (graph centrality) added in Task 9
+
+        # Deduplicate by peer_id, keeping highest score
+        seen = {}
+        for c in candidates:
+            pid = c["peer_id"]
+            if pid not in seen or c["score"] > seen[pid]["score"]:
+                seen[pid] = c
+        return list(seen.values())

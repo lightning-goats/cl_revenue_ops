@@ -1038,3 +1038,292 @@ class TestEnrichedLosers:
         # marginal_roi_percent == -50.0, condition is > -50.0 to protect
         # So at exactly -50.0, the channel is NOT protected
         assert len(losers) == 1
+
+
+class TestPeerDiscovery:
+    """Test peer discovery strategies 1 (winners) and 2 (neighbors)."""
+
+    def test_discover_from_winners_returns_high_roi_peers(self):
+        """Strategy 1: only winners with ROI > 30% are proposed."""
+        plugin = MagicMock()
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        winners = [
+            {"peer_id": "peer1", "roi": 50.0, "scid": "1x1x0"},
+            {"peer_id": "peer2", "roi": 25.0, "scid": "2x1x0"},  # Below threshold
+        ]
+        candidates = planner._discover_from_winners(winners)
+        assert len(candidates) == 1
+        assert candidates[0]["peer_id"] == "peer1"
+        assert candidates[0]["source"] == "winner"
+        assert candidates[0]["score"] == 0.5  # 50.0 / 100.0
+        assert candidates[0]["scid"] == "1x1x0"
+        assert "50.0% ROI" in candidates[0]["reason"]
+
+    def test_discover_from_winners_empty_when_all_below_threshold(self):
+        """Strategy 1: no candidates when all winners have ROI <= 30%."""
+        plugin = MagicMock()
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        winners = [
+            {"peer_id": "peer1", "roi": 30.0, "scid": "1x1x0"},  # Exactly 30 (not > 30)
+            {"peer_id": "peer2", "roi": 10.0, "scid": "2x1x0"},
+        ]
+        candidates = planner._discover_from_winners(winners)
+        assert len(candidates) == 0
+
+    def test_discover_from_neighbors_finds_adjacent_peers(self):
+        """Strategy 2: neighbors of top earners are proposed."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        # Mock listchannels to return 3 neighbor destinations
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "patron1", "destination": "neighbor_a"},
+                {"source": "patron1", "destination": "neighbor_b"},
+                {"source": "patron1", "destination": "neighbor_c"},
+            ]
+        }
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        # Build all_profitability with one high-ROI patron
+        patron_prof = MagicMock()
+        patron_prof.peer_id = "patron1"
+        patron_prof.marginal_roi_percent = 80.0
+
+        all_profitability = {"100x200x0": patron_prof}
+
+        candidates = planner._discover_from_neighbors(all_profitability)
+        assert len(candidates) == 3
+        peer_ids = {c["peer_id"] for c in candidates}
+        assert peer_ids == {"neighbor_a", "neighbor_b", "neighbor_c"}
+        for c in candidates:
+            assert c["source"] == "neighbor"
+            assert c["score"] == 0.4  # 80.0 / 200.0
+
+    def test_discover_from_neighbors_excludes_our_node_id(self):
+        """Strategy 2: our own node_id is excluded from candidates."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "patron1", "destination": "our_node_id"},
+                {"source": "patron1", "destination": "neighbor_a"},
+            ]
+        }
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        patron_prof = MagicMock()
+        patron_prof.peer_id = "patron1"
+        patron_prof.marginal_roi_percent = 80.0
+
+        all_profitability = {"100x200x0": patron_prof}
+
+        candidates = planner._discover_from_neighbors(all_profitability)
+        assert len(candidates) == 1
+        assert candidates[0]["peer_id"] == "neighbor_a"
+
+    def test_discover_from_neighbors_excludes_existing_peers(self):
+        """Strategy 2: discovered candidates exclude peers with existing channels."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        # listchannels returns existing_peer as a neighbor
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "patron1", "destination": "existing_peer"},
+                {"source": "patron1", "destination": "new_peer"},
+            ]
+        }
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        patron_prof = MagicMock()
+        patron_prof.peer_id = "patron1"
+        patron_prof.marginal_roi_percent = 80.0
+
+        existing_prof = MagicMock()
+        existing_prof.peer_id = "existing_peer"
+        existing_prof.marginal_roi_percent = 10.0
+
+        all_profitability = {
+            "100x200x0": patron_prof,
+            "200x300x0": existing_prof,
+        }
+
+        candidates = planner._discover_from_neighbors(all_profitability)
+        peer_ids = {c["peer_id"] for c in candidates}
+        assert "existing_peer" not in peer_ids
+        assert "new_peer" in peer_ids
+
+    def test_discover_from_neighbors_limits_per_patron(self):
+        """Strategy 2: max 5 neighbors per patron."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        # Return 10 neighbors for single patron
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "patron1", "destination": f"neighbor_{i}"}
+                for i in range(10)
+            ]
+        }
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        patron_prof = MagicMock()
+        patron_prof.peer_id = "patron1"
+        patron_prof.marginal_roi_percent = 80.0
+
+        all_profitability = {"100x200x0": patron_prof}
+
+        candidates = planner._discover_from_neighbors(all_profitability)
+        assert len(candidates) <= 5
+
+    def test_discover_from_neighbors_handles_rpc_error(self):
+        """Strategy 2: RPC errors are handled gracefully."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+        plugin.rpc.listchannels.side_effect = Exception("RPC timeout")
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        patron_prof = MagicMock()
+        patron_prof.peer_id = "patron1"
+        patron_prof.marginal_roi_percent = 80.0
+
+        all_profitability = {"100x200x0": patron_prof}
+
+        candidates = planner._discover_from_neighbors(all_profitability)
+        assert len(candidates) == 0
+
+    def test_discover_from_neighbors_handles_getinfo_error(self):
+        """Strategy 2: getinfo failure returns empty list."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.side_effect = Exception("RPC timeout")
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        candidates = planner._discover_from_neighbors({"100x200x0": MagicMock()})
+        assert len(candidates) == 0
+
+    def test_discover_from_neighbors_score_floor(self):
+        """Strategy 2: score has a minimum of 0.1 even for low-ROI patrons."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "patron1", "destination": "neighbor_a"},
+            ]
+        }
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        patron_prof = MagicMock()
+        patron_prof.peer_id = "patron1"
+        patron_prof.marginal_roi_percent = 5.0  # 5/200 = 0.025, below 0.1 floor
+
+        all_profitability = {"100x200x0": patron_prof}
+
+        candidates = planner._discover_from_neighbors(all_profitability)
+        assert len(candidates) == 1
+        assert candidates[0]["score"] == 0.1  # Floor applied
+
+    def test_discover_peers_deduplicates_by_peer_id(self):
+        """Orchestrator deduplicates candidates, keeping highest score."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        # Set up neighbor discovery to return peer1 with lower score
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "patron1", "destination": "peer1"},
+            ]
+        }
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        patron_prof = MagicMock()
+        patron_prof.peer_id = "patron1"
+        patron_prof.marginal_roi_percent = 40.0  # score = 0.2
+
+        all_profitability = {"100x200x0": patron_prof}
+
+        # Winners include peer1 with higher ROI (score = 0.5)
+        winners = [
+            {"peer_id": "peer1", "roi": 50.0, "scid": "1x1x0"},
+        ]
+
+        candidates = planner._discover_peers(winners, all_profitability, {})
+
+        # Should be deduplicated to one entry
+        peer1_candidates = [c for c in candidates if c["peer_id"] == "peer1"]
+        assert len(peer1_candidates) == 1
+        # Winner score (0.5) > neighbor score (0.2), so winner entry kept
+        assert peer1_candidates[0]["score"] == 0.5
+        assert peer1_candidates[0]["source"] == "winner"
+
+    def test_discover_peers_merges_both_strategies(self):
+        """Orchestrator returns candidates from both strategies."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        # Neighbor discovery returns different peers than winners
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "patron1", "destination": "neighbor_peer"},
+            ]
+        }
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        patron_prof = MagicMock()
+        patron_prof.peer_id = "patron1"
+        patron_prof.marginal_roi_percent = 60.0
+
+        all_profitability = {"100x200x0": patron_prof}
+
+        winners = [
+            {"peer_id": "winner_peer", "roi": 50.0, "scid": "1x1x0"},
+        ]
+
+        candidates = planner._discover_peers(winners, all_profitability, {})
+
+        sources = {c["source"] for c in candidates}
+        peer_ids = {c["peer_id"] for c in candidates}
+        assert "winner" in sources
+        assert "neighbor" in sources
+        assert "winner_peer" in peer_ids
+        assert "neighbor_peer" in peer_ids
+
+    def test_discover_from_neighbors_max_10_total(self):
+        """Strategy 2: total candidates capped at 10."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        # Each patron returns 5 neighbors, 3 patrons = 15 total, capped to 10
+        def make_channels(source=None):
+            return {
+                "channels": [
+                    {"source": source, "destination": f"neighbor_{source}_{i}"}
+                    for i in range(5)
+                ]
+            }
+        plugin.rpc.listchannels.side_effect = lambda source=None: make_channels(source)
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        all_profitability = {}
+        for i in range(3):
+            prof = MagicMock()
+            prof.peer_id = f"patron_{i}"
+            prof.marginal_roi_percent = 80.0 - i * 10
+            all_profitability[f"{i}00x200x0"] = prof
+
+        candidates = planner._discover_from_neighbors(all_profitability)
+        assert len(candidates) <= 10
