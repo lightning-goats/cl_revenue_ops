@@ -991,17 +991,32 @@ class CapacityPlanner:
 
         # Reserve budget
         reservation_id = f"planner-open-{peer_id[:16]}-{int(time.time())}"
+        reservation_active = False
         if db:
             try:
-                db.reserve_spend(
+                reservation_active = bool(db.reserve_spend(
                     reservation_id=reservation_id,
                     amount_sats=estimated_cost,
                     category="channel_open",
                     subcategory="automated",
                     metadata={"peer_id": peer_id, "amount_sats": amount_sats},
-                )
+                ))
             except Exception as e:
                 self.plugin.log(f"Budget reservation failed: {e}", level='warn')
+                reservation_active = False
+
+            if not reservation_active:
+                if action_id:
+                    try:
+                        db.update_planner_action(action_id, status="failed")
+                    except Exception:
+                        pass
+                return {
+                    "action_id": action_id,
+                    "status": "failed",
+                    "peer_id": peer_id,
+                    "error": "Budget reservation failed",
+                }
 
         try:
             # Connect first (may already be connected)
@@ -1031,6 +1046,7 @@ class CapacityPlanner:
                         reservation_id=reservation_id,
                         actual_spent_sats=estimated_cost,
                         source="capacity_planner",
+                        record_event=True,
                     )
                 except Exception:
                     pass
@@ -1048,7 +1064,7 @@ class CapacityPlanner:
                     db.update_planner_action(action_id, status="failed")
                 except Exception:
                     pass
-            if db:
+            if db and reservation_active:
                 try:
                     db.release_spend_reservation(reservation_id)
                 except Exception:

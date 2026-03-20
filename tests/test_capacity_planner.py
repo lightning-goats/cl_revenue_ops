@@ -2483,6 +2483,20 @@ class TestChannelOpen:
         planner._execute_open("peer1", 2000000, cfg, "test")
         db.release_spend_reservation.assert_called_once()
 
+    def test_execute_open_aborts_when_budget_reservation_fails(self):
+        """A failed budget reservation blocks the open before fundchannel."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        db.reserve_spend.return_value = False
+
+        result = planner._execute_open("peer1", 2000000, cfg, "test")
+
+        assert result["status"] == "failed"
+        assert "Budget reservation failed" in result["error"]
+        planner.plugin.rpc.call.assert_not_called()
+        db.update_planner_action.assert_called_with(42, status="failed")
+        db.release_spend_reservation.assert_not_called()
+
     def test_dry_run_does_not_call_fundchannel(self):
         """Dry run mode logs but does not execute."""
         planner, db = _make_open_planner()
@@ -2515,6 +2529,7 @@ class TestChannelOpen:
         db.mark_spend_reservation_spent.assert_called_once()
         call_kwargs = db.mark_spend_reservation_spent.call_args[1]
         assert call_kwargs["source"] == "capacity_planner"
+        assert call_kwargs["record_event"] is True
 
     def test_success_updates_action_completed(self):
         """Successful open updates action status to completed with channel_id."""

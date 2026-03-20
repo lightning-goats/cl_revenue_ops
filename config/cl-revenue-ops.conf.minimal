@@ -29,7 +29,7 @@ revenue-ops-hot-channel-protection-enabled=true
 
 # Capacity planner
 # Once enabled, planner closes are recommendation-only by default.
-# Set revenue-ops-planner-execute-closes=true only if you want live close RPCs.
+# Set revenue-ops-planner-execute-closes=true and planner-max-closes-per-cycle>0 only if you want live close RPCs.
 #revenue-ops-planner-enabled=true
 #revenue-ops-planner-execute-closes=false
 #revenue-ops-planner-max-opens-per-cycle=1

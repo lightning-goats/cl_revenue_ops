@@ -70,7 +70,7 @@
 # ============================================================================
 
 # Once enabled, planner evaluates opens/closes, but close execution stays off by default.
-# Set revenue-ops-planner-execute-closes=true only for explicit live close RPCs.
+# Set revenue-ops-planner-execute-closes=true and planner-max-closes-per-cycle>0 only for explicit live close RPCs.
 #revenue-ops-planner-enabled=false
 #revenue-ops-planner-dry-run=false
 #revenue-ops-planner-execute-closes=false
