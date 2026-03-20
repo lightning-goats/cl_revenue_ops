@@ -2581,11 +2581,16 @@ class TestChannelOpen:
 # Direct close helpers
 # ---------------------------------------------------------------------------
 
-def _make_close_cfg(planner_dry_run=False, planner_execute_closes=False):
+def _make_close_cfg(
+    planner_dry_run=False,
+    planner_execute_closes=False,
+    planner_max_closes_per_cycle=1,
+):
     """Create a mock config for close tests."""
     cfg = MagicMock()
     cfg.planner_dry_run = planner_dry_run
     cfg.planner_execute_closes = planner_execute_closes
+    cfg.planner_max_closes_per_cycle = planner_max_closes_per_cycle
     return cfg
 
 
@@ -2633,6 +2638,22 @@ class TestDirectClose:
             "[RECOMMEND] Close 100x1x0 (peer: peer_abc..., reason: zombie)",
             level='info',
         )
+
+    def test_execute_close_returns_recommended_when_close_budget_is_zero(self):
+        """Zero close budget suppresses live closes but still records a recommendation."""
+        planner, db, pm = _make_close_planner(with_rebalancer=True)
+        cfg = _make_close_cfg(
+            planner_execute_closes=True,
+            planner_max_closes_per_cycle=0,
+        )
+
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "zombie")
+
+        assert result["status"] == "recommended"
+        planner.plugin.rpc.call.assert_not_called()
+        planner.rebalancer.job_manager.has_active_job.assert_not_called()
+        planner.rebalancer.job_manager.stop_job.assert_not_called()
+        db.update_planner_action.assert_called_once_with(99, status="recommended")
 
     def test_execute_close_calls_generic_rpc_close(self):
         """Successful close calls generic RPC close with channel_id."""
@@ -3126,6 +3147,58 @@ class TestExecuteCycle:
         )
 
         cfg = _make_cycle_cfg(planner_max_closes_per_cycle=1, planner_execute_closes=False)
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["closes"]) == 1
+        assert result["closes"][0]["status"] == "recommended"
+        plugin.rpc.call.assert_not_called()
+
+    def test_execute_cycle_logs_close_recommendation_with_zero_close_budget(self):
+        """Recommendation-only closes bypass the executed-close budget limit."""
+        scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+
+        cfg = _make_cycle_cfg(planner_max_closes_per_cycle=0, planner_execute_closes=False)
+
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["closes"]) == 1
+        assert result["closes"][0]["status"] == "recommended"
+        plugin.rpc.call.assert_not_called()
+
+    def test_execute_cycle_logs_close_recommendation_when_execution_enabled_but_budget_zero(self):
+        """Zero close budget still surfaces close recommendations even with execution enabled."""
+        scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+
+        cfg = _make_cycle_cfg(planner_max_closes_per_cycle=0, planner_execute_closes=True)
 
         result = planner.execute_cycle(cfg)
 
@@ -3671,6 +3744,7 @@ class TestPlannerIntegration:
         mock_config = MagicMock()
         mock_config.planner_enabled = True
         mock_config.planner_dry_run = False
+        mock_config.planner_execute_closes = False
 
         prof_analyzer.database.get_planner_candidates.return_value = [
             {"peer_id": "p1", "score": 0.8},
@@ -3686,6 +3760,7 @@ class TestPlannerIntegration:
 
         assert status["enabled"] is True
         assert status["dry_run"] is False
+        assert status["execute_closes"] is False
         assert status["candidate_pool_size"] == 2
         assert len(status["recent_actions"]) == 1
 

@@ -42,6 +42,7 @@ class CapacityPlanner:
         return {
             "enabled": getattr(cfg, 'planner_enabled', False) if cfg else False,
             "dry_run": getattr(cfg, 'planner_dry_run', False) if cfg else False,
+            "execute_closes": getattr(cfg, 'planner_execute_closes', False) if cfg else False,
             "candidate_pool_size": len(db.get_planner_candidates()) if db else 0,
             "recent_actions": db.get_planner_actions(limit=5) if db else [],
         }
@@ -80,6 +81,12 @@ class CapacityPlanner:
             "recommendations": recommendations,
         }
 
+    def _close_execution_enabled(self, cfg) -> bool:
+        """Return True only when live close execution is explicitly allowed."""
+        if not getattr(cfg, "planner_execute_closes", False):
+            return False
+        return getattr(cfg, "planner_max_closes_per_cycle", 1) > 0
+
     def execute_cycle(self, cfg=None) -> Dict[str, Any]:
         """Main timer-driven cycle. Evaluates and executes open/close decisions."""
         if cfg is None:
@@ -108,11 +115,17 @@ class CapacityPlanner:
         losers = self._identify_losers(all_profitability, all_flow)
 
         # 4. Close worst losers (up to max_closes_per_cycle)
+        close_execution_enabled = self._close_execution_enabled(cfg)
         closes_this_cycle = 0
+        configured_close_limit = getattr(cfg, "planner_max_closes_per_cycle", 0)
+        close_limit = configured_close_limit if configured_close_limit > 0 else None
         closeable = [l for l in losers if l.get("action") == "CLOSE"]
         sorted_closeable = sorted(closeable, key=lambda x: x.get("marginal_roi", 0))
         for loser in sorted_closeable:
-            if closes_this_cycle >= cfg.planner_max_closes_per_cycle:
+            # Recommendation-only close logging should not be suppressed by the
+            # executed-close budget. A zero limit means "no close execution";
+            # recommendation mode still surfaces recommendations in that case.
+            if close_limit is not None and closes_this_cycle >= close_limit:
                 break
             scid = loser.get("scid")
             peer_id = loser.get("peer_id")
@@ -125,7 +138,7 @@ class CapacityPlanner:
                 )
                 continue
 
-            if getattr(cfg, "planner_execute_closes", False):
+            if close_execution_enabled:
                 guards_ok, guards_reason = self._check_safety_guards(
                     cfg, "close", peer_id
                 )
@@ -1114,7 +1127,7 @@ class CapacityPlanner:
             )
             return {"action_id": action_id, "status": "dry_run"}
 
-        if not getattr(cfg, "planner_execute_closes", False):
+        if not self._close_execution_enabled(cfg):
             if db and action_id:
                 try:
                     db.update_planner_action(action_id, status="recommended")

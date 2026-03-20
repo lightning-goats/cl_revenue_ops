@@ -10,6 +10,8 @@
 - The normal workflow is decision explainability first, knob tuning second.
 - Auto fee bands are enabled by default. Manual policy bands are fallback only when an auto band is not yet available.
 - `revenue-policy list|get|find|changes` are diagnostic surfaces. Write actions such as `set` and `delete` remain internal or debug workflows, not the normal operator path.
+- Planner closes are recommendation-only by default.
+- Set `revenue-ops-planner-execute-closes=true` only if you want the capacity planner to issue live close RPCs.
 
 ## Architecture
 

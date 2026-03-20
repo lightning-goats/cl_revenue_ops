@@ -127,17 +127,22 @@ def _run_init_with_stubbed_dependencies(mod, monkeypatch, option_overrides=None)
 
 def test_planner_execute_closes_plugin_option_defaults_false():
     mod = load_plugin_module()
+    snapshot = Config().snapshot()
 
     assert "revenue-ops-planner-execute-closes" in mod.plugin.options
     assert mod.plugin.options["revenue-ops-planner-execute-closes"]["default"] == "false"
+    assert snapshot.planner_execute_closes is False
 
 
 def test_planner_cycle_limit_defaults_match_config():
     mod = load_plugin_module()
     cfg = Config()
+    snapshot = cfg.snapshot()
 
     assert cfg.planner_max_opens_per_cycle == 1
     assert cfg.planner_max_closes_per_cycle == 0
+    assert snapshot.planner_max_opens_per_cycle == 1
+    assert snapshot.planner_max_closes_per_cycle == 0
     assert mod.plugin.options["revenue-ops-planner-max-opens-per-cycle"]["default"] == "1"
     assert mod.plugin.options["revenue-ops-planner-max-closes-per-cycle"]["default"] == "0"
 
@@ -311,3 +316,10 @@ def test_readme_examples_no_longer_advertise_internal_knob_tuning():
     assert "decision explainability" in readme
     assert "revenue-config set enable_vegas_reflex false" not in readme
     assert "lightning-cli revenue-policy set" not in readme
+
+
+def test_readme_states_planner_closes_are_recommendation_only_by_default():
+    readme = Path("README.md").read_text()
+
+    assert "Planner closes are recommendation-only by default." in readme
+    assert "revenue-ops-planner-execute-closes=true" in readme
