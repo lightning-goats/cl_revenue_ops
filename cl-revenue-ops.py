@@ -770,6 +770,16 @@ plugin.add_option(
     description='Log planner decisions without executing (default: false)'
 )
 plugin.add_option(
+    name='revenue-ops-planner-max-opens-per-cycle',
+    default='1',
+    description='Maximum automated channel opens per planner cycle (default: 1)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-max-closes-per-cycle',
+    default='0',
+    description='Maximum planner close executions per cycle when close execution is enabled (default: 0)'
+)
+plugin.add_option(
     name='revenue-ops-planner-min-channel-sats',
     default='500000',
     description='Minimum channel size in sats for automated opens (default: 500000)'
@@ -940,6 +950,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_interval=_safe_int('revenue-ops-planner-interval'),
         planner_dry_run=options.get('revenue-ops-planner-dry-run', 'false').lower() in ('true', '1', 'yes'),
         planner_execute_closes=options.get('revenue-ops-planner-execute-closes', 'false').lower() in ('true', '1', 'yes'),
+        planner_max_opens_per_cycle=_safe_int('revenue-ops-planner-max-opens-per-cycle'),
+        planner_max_closes_per_cycle=_safe_int('revenue-ops-planner-max-closes-per-cycle'),
         planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
         planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),

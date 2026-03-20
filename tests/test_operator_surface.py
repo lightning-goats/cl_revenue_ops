@@ -61,23 +61,20 @@ def _load_policy_surface_module():
     return mod
 
 
-def test_planner_execute_closes_plugin_option_defaults_false():
-    mod = load_plugin_module()
-
-    assert "revenue-ops-planner-execute-closes" in mod.plugin.options
-    assert mod.plugin.options["revenue-ops-planner-execute-closes"]["default"] == "false"
-
-
-def test_planner_execute_closes_option_is_parsed_during_init(monkeypatch):
-    mod = load_plugin_module()
-    mod.shutdown_event.clear()
-
-    options = {
+def _default_plugin_options(mod):
+    return {
         name: registration["default"]
         for name, registration in mod.plugin.options.items()
         if "default" in registration
     }
-    options["revenue-ops-planner-execute-closes"] = "true"
+
+
+def _run_init_with_stubbed_dependencies(mod, monkeypatch, option_overrides=None):
+    mod.shutdown_event.clear()
+
+    options = _default_plugin_options(mod)
+    if option_overrides:
+        options.update(option_overrides)
 
     fake_db = MagicMock()
     fake_db.initialize.return_value = None
@@ -125,8 +122,50 @@ def test_planner_execute_closes_option_is_parsed_during_init(monkeypatch):
     monkeypatch.setattr(mod.threading, "Thread", DummyThread)
 
     mod.init(options, {}, mod.plugin)
+    return mod.config
 
-    assert mod.config.planner_execute_closes is True
+
+def test_planner_execute_closes_plugin_option_defaults_false():
+    mod = load_plugin_module()
+
+    assert "revenue-ops-planner-execute-closes" in mod.plugin.options
+    assert mod.plugin.options["revenue-ops-planner-execute-closes"]["default"] == "false"
+
+
+def test_planner_cycle_limit_defaults_match_config():
+    mod = load_plugin_module()
+    cfg = Config()
+
+    assert cfg.planner_max_opens_per_cycle == 1
+    assert cfg.planner_max_closes_per_cycle == 0
+    assert mod.plugin.options["revenue-ops-planner-max-opens-per-cycle"]["default"] == "1"
+    assert mod.plugin.options["revenue-ops-planner-max-closes-per-cycle"]["default"] == "0"
+
+
+def test_planner_execute_closes_option_is_parsed_during_init(monkeypatch):
+    mod = load_plugin_module()
+    cfg = _run_init_with_stubbed_dependencies(
+        mod,
+        monkeypatch,
+        {"revenue-ops-planner-execute-closes": "true"},
+    )
+
+    assert cfg.planner_execute_closes is True
+
+
+def test_planner_cycle_limits_are_parsed_during_init(monkeypatch):
+    mod = load_plugin_module()
+    cfg = _run_init_with_stubbed_dependencies(
+        mod,
+        monkeypatch,
+        {
+            "revenue-ops-planner-max-opens-per-cycle": "3",
+            "revenue-ops-planner-max-closes-per-cycle": "0",
+        },
+    )
+
+    assert cfg.planner_max_opens_per_cycle == 3
+    assert cfg.planner_max_closes_per_cycle == 0
 
 
 def test_revenue_config_list_mutable_returns_public_controls_only():
