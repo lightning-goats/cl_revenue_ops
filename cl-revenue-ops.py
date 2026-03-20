@@ -8,7 +8,7 @@ principles rather than heuristics.
 
 Dependencies:
 - pyln-client: Core Lightning plugin framework
-- bookkeeper plugin (built-in): On-chain cost attribution (opens/closes/splices) and accounting-grade events
+- bookkeeper plugin (built-in): On-chain cost attribution (opens/closes) and accounting-grade events
 - Local forwards table (SQLite): Routing history for flow analysis (hydrated once on startup)
 - External rebalancer (sling): Executes rebalance payments
 
@@ -715,7 +715,7 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-expansion-treasury-enabled',
     default='false',
-    description='Enable expansion treasury mode (reverse-swap excess LN to on-chain for opens/splices) (default: false)'
+    description='Enable expansion treasury mode (reverse-swap excess LN to on-chain for opens) (default: false)'
 )
 
 plugin.add_option(
@@ -985,7 +985,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         if not bookkeeper_found:
             plugin.log(
                 "Dependency 'bookkeeper' not found. Flow analysis uses the local forwards table (hydrated once at startup). "
-                "Bookkeeper is still recommended for accurate on-chain cost tracking (opens/closes/splices).",
+                "Bookkeeper is still recommended for accurate on-chain cost tracking (opens/closes).",
                 level='info'
             )
         else:
@@ -2838,13 +2838,13 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
       lightning-cli revenue-report summary            # Same as above
       lightning-cli revenue-report peer <peer_id>    # Detailed peer report
       lightning-cli revenue-report policies          # Policy distribution stats
-      lightning-cli revenue-report costs             # Closure/splice cost history
+      lightning-cli revenue-report costs             # Closure cost history
 
     Report Types:
       summary   - Overall node P&L, active channels, warnings
       peer      - Specific peer metrics (profitability, flow, policy)
       policies  - Statistics on policy distribution
-      costs     - Closure/splice costs for capacity planning
+      costs     - Closure costs for capacity planning
     """
     if database is None or policy_manager is None:
         return {"error": "Plugin not initialized"}
@@ -2930,7 +2930,7 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
             }
 
         elif report_type == "costs":
-            # Expose closure/splice/swap costs for capacity planning
+            # Expose closure/swap costs for capacity planning
             now = int(time.time())
             day_ago = now - 86400
             week_ago = now - (7 * 86400)
@@ -2942,20 +2942,11 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
             closure_costs_month = database.get_closure_costs_since(month_ago)
             closure_costs_total = database.get_total_closure_costs()
 
-            splice_costs_day = database.get_splice_costs_since(day_ago)
-            splice_costs_week = database.get_splice_costs_since(week_ago)
-            splice_costs_month = database.get_splice_costs_since(month_ago)
-            splice_costs_total = database.get_total_splice_costs()
-
-            # Get splice summary for detailed breakdown
-            splice_summary = database.get_splice_summary()
-
             # Include default chain cost estimates
             from modules.config import ChainCostDefaults
             estimated_costs = {
                 "channel_open_sats": ChainCostDefaults.CHANNEL_OPEN_COST_SATS,
                 "channel_close_sats": ChainCostDefaults.CHANNEL_CLOSE_COST_SATS,
-                "splice_sats": ChainCostDefaults.SPLICE_COST_SATS,
             }
 
             return {
@@ -2965,13 +2956,6 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
                     "last_7d_sats": closure_costs_week,
                     "last_30d_sats": closure_costs_month,
                     "total_sats": closure_costs_total
-                },
-                "splice_costs": {
-                    "last_24h_sats": splice_costs_day,
-                    "last_7d_sats": splice_costs_week,
-                    "last_30d_sats": splice_costs_month,
-                    "total_sats": splice_costs_total,
-                    "summary": splice_summary
                 },
                 "estimated_defaults": estimated_costs,
                 "generated_at": now
@@ -3203,7 +3187,6 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
                 "opex_sats": pnl.get("opex_sats", 0),
                 "rebalance_cost_sats": pnl.get("rebalance_cost_sats", 0),
                 "closure_cost_sats": pnl.get("closure_cost_sats", 0),
-                "splice_cost_sats": pnl.get("splice_cost_sats", 0),
                 "volume_sats": pnl.get("volume_sats", 0),
                 "forward_count": pnl.get("forward_count", 0),
             },
@@ -3771,19 +3754,6 @@ def _on_channel_state_changed_impl(plugin: Plugin, **kwargs):
         # Don't return - continue to allow normal channel handling
 
     # =========================================================================
-    # Splice Detection (Accounting v2.0)
-    # =========================================================================
-    # Splice is complete when channel transitions FROM CHANNELD_AWAITING_SPLICE
-    # back TO CHANNELD_NORMAL (after splice tx confirms)
-    if old_state == 'CHANNELD_AWAITING_SPLICE' and new_state == 'CHANNELD_NORMAL':
-        plugin.log(
-            f"Splice completed: {channel_id} (was awaiting splice, now normal)",
-            level='info'
-        )
-        _handle_splice_completion(channel_id, peer_id)
-        return
-
-    # =========================================================================
     # Closure Detection
     # =========================================================================
     # States indicating the channel is closing or closed
@@ -4112,169 +4082,6 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
         plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
 
 
-def _handle_splice_completion(channel_id: str, peer_id: Optional[str]) -> None:
-    """
-    Handle a completed splice operation (Accounting v2.0).
-
-    Called when a channel transitions from CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL,
-    indicating the splice transaction has confirmed.
-
-    Args:
-        channel_id: The channel short ID
-        peer_id: The peer node ID
-    """
-    global database, safe_plugin
-
-    if database is None:
-        return
-
-    try:
-        # Get splice data from bookkeeper
-        splice_data = _get_splice_costs_from_bookkeeper(channel_id)
-
-        if splice_data:
-            splice_type = splice_data.get('splice_type', 'splice_in')
-            amount_sats = splice_data.get('amount_sats', 0)
-            fee_sats = splice_data.get('fee_sats', 0)
-            old_capacity = splice_data.get('old_capacity_sats')
-            new_capacity = splice_data.get('new_capacity_sats')
-            txid = splice_data.get('txid')
-        else:
-            # Fallback: try to determine from channel info
-            splice_type = 'splice_in'  # Assume splice_in if we can't determine
-            amount_sats = 0
-            fee_sats = 0
-            old_capacity = None
-            new_capacity = None
-            txid = None
-
-            # Try to get current capacity from listpeerchannels
-            if safe_plugin:
-                try:
-                    peers = safe_plugin.rpc.listpeerchannels()
-                    for ch in peers.get('channels', []):
-                        scid = normalize_scid(ch.get('short_channel_id', ''))
-                        if scid == channel_id:
-                            new_capacity = _parse_msat(ch.get('total_msat', 0)) // 1000
-                            if not peer_id:
-                                peer_id = ch.get('peer_id')
-                            break
-                except Exception as e:
-                    plugin.log(f"Error getting channel info for splice: {e}", level='debug')
-
-            # Estimate splice fee from config if bookkeeper unavailable
-            from modules.config import ChainCostDefaults
-            fee_sats = ChainCostDefaults.SPLICE_COST_SATS
-
-        # Record the splice
-        database.record_splice(
-            channel_id=channel_id,
-            peer_id=peer_id or 'unknown',
-            splice_type=splice_type,
-            amount_sats=amount_sats,
-            fee_sats=fee_sats,
-            old_capacity_sats=old_capacity,
-            new_capacity_sats=new_capacity,
-            txid=txid
-        )
-
-    except Exception as e:
-        plugin.log(f"Error handling splice completion for {channel_id}: {e}", level='error')
-        plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-
-
-def _get_splice_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Query bookkeeper for on-chain fees related to a splice operation.
-
-    Uses bkpr-listaccountevents to find splice-related events for the channel.
-
-    Args:
-        channel_id: The channel short ID
-
-    Returns:
-        Dict with splice_type, amount_sats, fee_sats, old_capacity_sats, new_capacity_sats, txid
-        or None if bookkeeper unavailable or no splice data found
-    """
-    global safe_plugin
-
-    if safe_plugin is None:
-        return None
-
-    try:
-        # Query bookkeeper for account events
-        events = safe_plugin.rpc.call("bkpr-listaccountevents", {"account": channel_id})
-
-        if not events or 'events' not in events:
-            return None
-
-        # Look for recent splice-related events
-        splice_fee_sats = 0
-        splice_txid = None
-        splice_amount = 0
-
-        # Security: Validate events structure
-        all_events = events.get('events', [])
-        if not isinstance(all_events, list):
-            plugin.log(f"Security: Invalid events structure from bookkeeper for splice {channel_id}", level='warn')
-            return None
-
-        for event in all_events:  # Process oldest to newest
-            # Security: Type check each event is a dict
-            if not isinstance(event, dict):
-                continue
-
-            event_type = event.get('type', '')
-            tag = str(event.get('tag', '')).lower()  # Ensure tag is string
-
-            # Look for splice-related tags
-            # Note: CLN bookkeeper may use tags like 'splice', 'splice_in', 'splice_out'
-            if 'splice' in tag:
-                splice_txid = event.get('txid')
-
-                # Parse msat values safely (handles Millisatoshi objects, strings, ints)
-                credit = parse_msat(event.get('credit_msat', 0))
-                debit = parse_msat(event.get('debit_msat', 0))
-
-                splice_amount = (credit - debit) // 1000  # Convert to sats
-
-            # Accumulate on-chain fees for splice
-            if event_type == 'onchain_fee' and 'splice' in tag:
-                # Security: Type check fee values
-                credit_msat = event.get('credit_msat', 0)
-                debit_msat = event.get('debit_msat', 0)
-
-                # Parse msat values safely (handles Millisatoshi objects, strings, ints)
-                credit_msat = parse_msat(credit_msat)
-                debit_msat = parse_msat(debit_msat)
-
-                fee_msat = max(abs(credit_msat), abs(debit_msat))
-                fee_sats = fee_msat // 1000
-
-                # Security: Bounds check (max 50,000 sats per fee event)
-                fee_sats = min(fee_sats, 50000)
-                splice_fee_sats += fee_sats
-
-        # If we found splice data, return it
-        if splice_txid or splice_fee_sats > 0:
-            # Determine splice type from amount
-            splice_type = 'splice_in' if splice_amount >= 0 else 'splice_out'
-
-            return {
-                'splice_type': splice_type,
-                'amount_sats': abs(splice_amount),
-                'fee_sats': splice_fee_sats,
-                'old_capacity_sats': None,  # Would need to track this separately
-                'new_capacity_sats': None,
-                'txid': splice_txid
-            }
-
-        return None
-
-    except Exception as e:
-        plugin.log(f"Bookkeeper query failed for splice on {channel_id}: {e}", level='debug')
-        return None
-
 
 # =============================================================================
 # BOLTZ CLI INTEGRATION (optional)
@@ -4302,7 +4109,7 @@ def revenue_spend_ledger(
     include_reservations: bool = False,
     reservation_limit: int = 50,
 ) -> Dict[str, Any]:
-    """Summary of generic spend ledger events/reservations (for opens/closes/splices/etc.)."""
+    """Summary of generic spend ledger events/reservations (for opens/closes/etc.)."""
     if database is None:
         return {"error": "Database not initialized"}
     try:
@@ -4670,7 +4477,7 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     now = int(time.time())
     since = now - (wh * 3600)
 
-    # Best-effort cleanup for generic spend reservations (e.g. channel open/splice
+    # Best-effort cleanup for generic spend reservations (e.g. channel open
     # reservations) so accepted actions that aren't explicitly settled do not block
     # budget for an entire window. Keep timeout bounded and independent from window size.
     try:
@@ -4688,14 +4495,12 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     revenue_sats = int(database.get_total_routing_revenue(since)) if database else 0
     open_cost_sats = int(database.get_opening_costs_since(since)) if database else 0
     closure_cost_sats = int(database.get_closure_costs_since(since)) if database else 0
-    splice_cost_sats = int(database.get_splice_costs_since(since)) if database else 0
 
     actual_by_category = {
         "rebalance": int(rebalance.get("spent_24h_sats", 0) or 0),
         "boltz": int(boltz.get("spent_24h_sats", 0) or 0),
         "open": open_cost_sats,
         "close": closure_cost_sats,
-        "splice": splice_cost_sats,
         "ledger": int(generic_ledger.get("spent_24h_sats", 0) or 0),
     }
     reserved_by_category = {
@@ -4747,7 +4552,6 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
             "generic_ledger": generic_ledger,
             "open_cost_sats": open_cost_sats,
             "closure_cost_sats": closure_cost_sats,
-            "splice_cost_sats": splice_cost_sats,
         },
     }
 
