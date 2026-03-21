@@ -140,6 +140,37 @@ Core Lightning
 - `revenue-ops-enable-reputation`: Peer success rate weighting
 - `revenue-ops-enable-kelly`: Kelly Criterion position sizing
 
+### Hive Fleet Hint Integration
+
+cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a single adapter:
+
+**Module:** `modules/hive_hints.py` (`HiveHintAdapter`)
+
+**Enable:** `revenue-ops-hive-hints-enabled = true` (disabled by default)
+
+**How it works:**
+- Polls `hive-export-hints` RPC once per fee cycle
+- Caches snapshot with TTL (default 900s, override with `revenue-ops-hive-hints-ttl`)
+- Exposes bounded bias lookups consumed by fee controller, rebalancer, and capacity planner
+
+**Bias bounds (hard-coded, not configurable):**
+- Fee: ±10% max (`get_fee_bias()`)
+- Rebalance: ±15% max (`get_rebalance_bias()`)
+- Member: 0 PPM categorical override (`is_hive_member()`)
+
+**Fail-open:** If cl-hive is unavailable, hints are stale, or the feature is disabled, all lookups return neutral (1.0) and `is_hive_member()` returns False. Local safety rails are never bypassed.
+
+**Gossip oscillation protection:** When a peer was assigned 0-PPM via the member hint, that fee is held for one additional TTL period after hints go stale. This prevents gossip churn from intermittent cl-hive availability.
+
+**Hint fields consumed:**
+- `member` → 0-PPM fleet policy (short-circuits fee pipeline before DTS+PID)
+- `corridor_role` → fee bias (owner +3%, secondary -3%)
+- `competition_bias` → fee bias (integer -1/0/1, ±2%)
+- `traffic_confidence` → weights all biases (0.0-1.0)
+- `peer_quality_score` → rebalance bias (±5%)
+- `rebalance_preference` → rebalance bias (sink +5%, source -5%)
+- `channel_open_hint` → capacity planner scoring (±30%)
+
 ## Safety Constraints
 
 1. **Budget limits**: Daily rebalance spend capped
