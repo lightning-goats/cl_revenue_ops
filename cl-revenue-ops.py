@@ -798,6 +798,16 @@ plugin.add_option(
     default='false',
     description='Allow the capacity planner to execute close RPCs (default: false)'
 )
+plugin.add_option(
+    name='revenue-ops-hive-hints-enabled',
+    default='false',
+    description='Enable bounded fee/rebalance bias from cl_hive fleet hints (default: false)'
+)
+plugin.add_option(
+    name='revenue-ops-hive-hints-ttl',
+    default='0',
+    description='Override hint snapshot TTL in seconds; 0 = use snapshot value (default: 0)'
+)
 
 
 def _boltz_auto_cycle_mark_state(**updates):
@@ -1150,6 +1160,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
         planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
+        hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'false').lower() in ('true', '1', 'yes'),
+        hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
     )
     try:
         config_fields = {f.name for f in dataclasses.fields(Config)}
