@@ -1434,6 +1434,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         fee_controller.hive_hints = hive_hints
     if rebalancer is not None:
         rebalancer.hive_hints = hive_hints
+    if capacity_planner is not None:
+        capacity_planner.hive_hints = hive_hints
 
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client

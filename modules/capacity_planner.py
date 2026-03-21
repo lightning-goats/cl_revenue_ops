@@ -34,17 +34,25 @@ class CapacityPlanner:
         self.policy_manager = policy_manager
         self.config = config
         self.rebalancer = None
+        self.hive_hints = None  # Injected by main plugin
 
     def get_status(self) -> Dict[str, Any]:
         """Return planner status for RPC query."""
         db = self.profitability.database if self.profitability else None
         cfg = self.config
+        hive_open_count = 0
+        if self.hive_hints is not None:
+            try:
+                hive_open_count = len(self.hive_hints.get_open_candidates())
+            except Exception:
+                pass
         return {
             "enabled": getattr(cfg, 'planner_enabled', False) if cfg else False,
             "dry_run": getattr(cfg, 'planner_dry_run', False) if cfg else False,
             "execute_closes": getattr(cfg, 'planner_execute_closes', False) if cfg else False,
             "candidate_pool_size": len(db.get_planner_candidates()) if db else 0,
             "recent_actions": db.get_planner_actions(limit=5) if db else [],
+            "hive_open_candidates": hive_open_count,
         }
 
     def generate_report(self) -> Dict[str, Any]:
@@ -703,6 +711,28 @@ class CapacityPlanner:
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:10]
 
+    def _discover_from_hive(self) -> List[Dict]:
+        """Strategy 4: Propose peers where cl_hive recommends channel opening."""
+        if self.hive_hints is None:
+            return []
+        try:
+            open_candidates = self.hive_hints.get_open_candidates()
+        except Exception:
+            return []
+        candidates = []
+        for peer_id, hint in open_candidates:
+            confidence = hint.get("topology_confidence", 0.0)
+            reason_str = hint.get("reason", "hive_topology")
+            bucket = hint.get("suggested_size_bucket")
+            candidates.append({
+                "peer_id": peer_id,
+                "source": "hive",
+                "score": 0.3 * max(confidence, 0.1),
+                "reason": f"Hive: {reason_str}",
+                "hive_open_hint": hint,
+            })
+        return candidates
+
     def _score_candidate(self, peer_id: str, base_score: float) -> float:
         """Enrich candidate score with reputation, uptime, and profit history."""
         score = base_score
@@ -733,6 +763,19 @@ class CapacityPlanner:
                 score *= (uptime / 100.0)  # Penalize low uptime
         except Exception:
             pass
+
+        # Hive channel-open hint bias (bounded ±30%)
+        if self.hive_hints is not None:
+            try:
+                hint = self.hive_hints.get_channel_open_hint(peer_id)
+                pref = hint.get("open_preference")
+                conf = hint.get("topology_confidence", 0.0)
+                if pref == "open":
+                    score *= 1.0 + (0.20 * conf)
+                elif pref == "avoid":
+                    score *= 1.0 - (0.30 * conf)
+            except Exception:
+                pass
 
         return score
 
@@ -842,6 +885,9 @@ class CapacityPlanner:
             if pid:
                 existing_peers.add(pid)
         candidates.extend(self._discover_from_graph(existing_peers))
+
+        # Strategy 4: hive topology hints
+        candidates.extend(self._discover_from_hive())
 
         # Deduplicate by peer_id, keeping highest score
         seen = {}
