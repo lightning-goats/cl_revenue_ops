@@ -152,6 +152,56 @@ class HiveHintAdapter:
         return 1.0 + bias
 
     # ------------------------------------------------------------------
+    # Channel-open hints
+    # ------------------------------------------------------------------
+
+    VALID_OPEN_PREFS = {"open", "neutral", "avoid"}
+    VALID_SIZE_BUCKETS = {"small", "medium", "large"}
+    VALID_OPEN_REASONS = {
+        "underserved_corridor", "improve_coverage", "reduce_overlap",
+        "member_connectivity", "none",
+    }
+
+    def get_channel_open_hint(self, peer_id: str) -> dict:
+        """Return validated channel_open_hint for peer, or {} if unavailable/invalid."""
+        hint = self._get_peer_hint(peer_id)
+        if not hint:
+            return {}
+        raw = hint.get("channel_open_hint")
+        if not isinstance(raw, dict):
+            return {}
+        result = {}
+        pref = raw.get("open_preference")
+        if pref in self.VALID_OPEN_PREFS:
+            result["open_preference"] = pref
+        conf = raw.get("topology_confidence")
+        if isinstance(conf, (int, float)):
+            result["topology_confidence"] = max(0.0, min(1.0, float(conf)))
+        bucket = raw.get("suggested_size_bucket")
+        if bucket in self.VALID_SIZE_BUCKETS:
+            result["suggested_size_bucket"] = bucket
+        reason = raw.get("reason")
+        if reason in self.VALID_OPEN_REASONS:
+            result["reason"] = reason
+        return result
+
+    def get_open_candidates(self) -> list:
+        """Return list of (peer_id, hint_dict) for peers with open_preference='open'."""
+        if not self.is_fresh():
+            return []
+        results = []
+        for peer_id, hint in self._snapshot.get("hints", {}).items():
+            coh = hint.get("channel_open_hint")
+            if not isinstance(coh, dict):
+                continue
+            if coh.get("open_preference") != "open":
+                continue
+            validated = self.get_channel_open_hint(peer_id)
+            if validated.get("open_preference") == "open":
+                results.append((peer_id, validated))
+        return results
+
+    # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 

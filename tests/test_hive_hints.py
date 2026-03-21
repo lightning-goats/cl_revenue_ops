@@ -342,3 +342,135 @@ class TestSafetyRails:
         for peer_id in ["02aabb", "02ccdd", "02eeff"]:
             assert adapter.get_fee_bias(peer_id) == 1.0
             assert adapter.get_rebalance_bias(peer_id) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Channel-open hints
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_WITH_OPEN_HINTS = {
+    "generated_at": int(time.time()),
+    "ttl_seconds": 900,
+    "hints": {
+        "02open_peer": {
+            "traffic_confidence": 0.8,
+            "channel_open_hint": {
+                "open_preference": "open",
+                "topology_confidence": 0.71,
+                "suggested_size_bucket": "medium",
+                "reason": "underserved_corridor",
+            },
+        },
+        "02avoid_peer": {
+            "traffic_confidence": 0.9,
+            "channel_open_hint": {
+                "open_preference": "avoid",
+                "topology_confidence": 0.85,
+                "suggested_size_bucket": "small",
+                "reason": "reduce_overlap",
+            },
+        },
+        "02neutral_peer": {
+            "traffic_confidence": 0.5,
+            "channel_open_hint": {
+                "open_preference": "neutral",
+                "topology_confidence": 0.3,
+            },
+        },
+        "02no_hint_peer": {
+            "traffic_confidence": 0.6,
+        },
+    },
+}
+
+
+class TestChannelOpenHints:
+    def _make_adapter(self, mock_plugin, snapshot=None):
+        snap = snapshot or SNAPSHOT_WITH_OPEN_HINTS
+        snap = dict(snap)
+        snap["generated_at"] = int(time.time())
+        mock_plugin.rpc.call.return_value = snap
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        return adapter
+
+    def test_get_channel_open_hint_valid(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin)
+        hint = adapter.get_channel_open_hint("02open_peer")
+        assert hint["open_preference"] == "open"
+        assert hint["topology_confidence"] == 0.71
+        assert hint["suggested_size_bucket"] == "medium"
+        assert hint["reason"] == "underserved_corridor"
+
+    def test_get_channel_open_hint_avoid(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin)
+        hint = adapter.get_channel_open_hint("02avoid_peer")
+        assert hint["open_preference"] == "avoid"
+
+    def test_get_channel_open_hint_unknown_peer(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin)
+        assert adapter.get_channel_open_hint("02unknown") == {}
+
+    def test_get_channel_open_hint_no_hint_field(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin)
+        assert adapter.get_channel_open_hint("02no_hint_peer") == {}
+
+    def test_get_channel_open_hint_stale_returns_empty(self, mock_plugin):
+        snap = dict(SNAPSHOT_WITH_OPEN_HINTS)
+        snap["generated_at"] = int(time.time()) - 2000
+        mock_plugin.rpc.call.return_value = snap
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        assert adapter.get_channel_open_hint("02open_peer") == {}
+
+    def test_get_channel_open_hint_invalid_enum_values(self, mock_plugin):
+        snap = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02bad": {
+                    "channel_open_hint": {
+                        "open_preference": "INVALID",
+                        "topology_confidence": 5.0,
+                        "suggested_size_bucket": "huge",
+                        "reason": "because_i_said_so",
+                    },
+                },
+            },
+        }
+        mock_plugin.rpc.call.return_value = snap
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        hint = adapter.get_channel_open_hint("02bad")
+        assert "open_preference" not in hint
+        assert hint["topology_confidence"] == 1.0  # clamped
+        assert "suggested_size_bucket" not in hint
+        assert "reason" not in hint
+
+    def test_get_channel_open_hint_partial_fields(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin)
+        hint = adapter.get_channel_open_hint("02neutral_peer")
+        assert hint["open_preference"] == "neutral"
+        assert hint["topology_confidence"] == 0.3
+        assert "suggested_size_bucket" not in hint
+        assert "reason" not in hint
+
+    def test_get_open_candidates(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin)
+        candidates = adapter.get_open_candidates()
+        assert len(candidates) == 1
+        peer_id, hint = candidates[0]
+        assert peer_id == "02open_peer"
+        assert hint["open_preference"] == "open"
+
+    def test_get_open_candidates_stale_returns_empty(self, mock_plugin):
+        snap = dict(SNAPSHOT_WITH_OPEN_HINTS)
+        snap["generated_at"] = int(time.time()) - 2000
+        mock_plugin.rpc.call.return_value = snap
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        assert adapter.get_open_candidates() == []
+
+    def test_get_open_candidates_no_snapshot(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        assert adapter.get_open_candidates() == []
