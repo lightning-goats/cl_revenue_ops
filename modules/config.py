@@ -422,7 +422,7 @@ class Config:
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
     # Hive Hints integration
-    hive_hints_enabled: bool = False
+    hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -793,7 +793,7 @@ class ConfigSnapshot:
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
     # Hive Hints
-    hive_hints_enabled: bool = False
+    hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0
     # Version tracking
     version: int = 0
