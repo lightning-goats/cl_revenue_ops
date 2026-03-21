@@ -88,6 +88,15 @@ class HiveHintAdapter:
         return hints.get(peer_id, {})
 
     # ------------------------------------------------------------------
+    # Membership
+    # ------------------------------------------------------------------
+
+    def is_hive_member(self, peer_id: str) -> bool:
+        """Return True if peer is a hive fleet member. False if unavailable/stale."""
+        hint = self._get_peer_hint(peer_id)
+        return bool(hint.get("member", False))
+
+    # ------------------------------------------------------------------
     # Fee bias
     # ------------------------------------------------------------------
 

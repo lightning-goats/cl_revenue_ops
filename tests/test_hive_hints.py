@@ -499,3 +499,51 @@ class TestChannelOpenHints:
     def test_get_open_candidates_no_snapshot(self, mock_plugin):
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
         assert adapter.get_open_candidates() == []
+
+
+class TestMemberLookup:
+    def test_is_hive_member_true(self, mock_plugin):
+        mock_plugin.rpc.call.return_value = VALID_SNAPSHOT
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        assert adapter.is_hive_member("02aabbcc") is True
+
+    def test_is_hive_member_false_for_nonmember(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02nonmember": {"member": False, "corridor_role": "none", "competition_bias": 0},
+            },
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        assert adapter.is_hive_member("02nonmember") is False
+
+    def test_is_hive_member_false_for_unknown(self, mock_plugin):
+        mock_plugin.rpc.call.return_value = VALID_SNAPSHOT
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        assert adapter.is_hive_member("02unknown") is False
+
+    def test_is_hive_member_false_when_stale(self, mock_plugin):
+        stale = dict(VALID_SNAPSHOT)
+        stale["generated_at"] = int(time.time()) - 2000
+        mock_plugin.rpc.call.return_value = stale
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        assert adapter.is_hive_member("02aabbcc") is False
+
+    def test_is_hive_member_false_when_field_missing(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02noflag": {"corridor_role": "none", "competition_bias": 0},
+            },
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        assert adapter.is_hive_member("02noflag") is False
