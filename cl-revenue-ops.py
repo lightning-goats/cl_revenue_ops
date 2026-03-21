@@ -1930,7 +1930,8 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
         ),
         "channel_states": channel_states,
         "recent_fee_changes": fee_history,
-        "recent_rebalances": rebalance_history
+        "recent_rebalances": rebalance_history,
+        "hive_hints": hive_hints.get_status() if hive_hints else {"snapshot_fresh": False, "hints_count": 0},
     }
 
 
@@ -2254,6 +2255,7 @@ def revenue_rebalance_debug(
     except Exception as e:
         result["channels"]["error"] = str(e)
 
+    result["hive_hints"] = hive_hints.get_status() if hive_hints else {"snapshot_fresh": False, "hints_count": 0}
     return result
 
 
@@ -2351,6 +2353,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         })
         result["summary"]["total"] += 1
 
+    result["hive_hints"] = hive_hints.get_status() if hive_hints else {"snapshot_fresh": False, "hints_count": 0}
     return result
 
 
