@@ -140,6 +140,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_min_channel_age_days': int,
     'planner_min_peer_uptime_pct': float,
     'planner_max_fee_rate_sat_vb': float,
+    # Hive Hints
+    'hive_hints_enabled': bool,
+    'hive_hints_ttl_seconds': int,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -232,6 +235,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_channel_age_days': (1, 365),
     'planner_min_peer_uptime_pct': (0.0, 100.0),
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
+    'hive_hints_ttl_seconds': (60, 7200),
 }
 
 # Valid values for string enum fields
@@ -417,6 +421,9 @@ class Config:
     planner_min_channel_age_days: int = 30
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
+    # Hive Hints integration
+    hive_hints_enabled: bool = False
+    hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -785,6 +792,9 @@ class ConfigSnapshot:
     planner_min_channel_age_days: int = 30
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
+    # Hive Hints
+    hive_hints_enabled: bool = False
+    hive_hints_ttl_seconds: int = 0
     # Version tracking
     version: int = 0
     
