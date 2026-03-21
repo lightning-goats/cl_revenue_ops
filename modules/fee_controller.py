@@ -1637,6 +1637,9 @@ class FeeController:
         self._askrene_cache_ts: int = 0
         self._askrene_lock = threading.Lock()
 
+        # Hive hints adapter (injected by main plugin; None = disabled)
+        self.hive_hints = None
+
         self._last_decision_summary: Dict[str, Any] = {
             "action": "hold",
             "reason": "not_run",
@@ -1661,6 +1664,16 @@ class FeeController:
 
     def get_last_decision_summary(self) -> Dict[str, Any]:
         return dict(self._last_decision_summary)
+
+    def _get_hive_fee_bias(self, peer_id: str) -> float:
+        """Return bounded multiplicative fee bias from hive hints. 1.0 if unavailable."""
+        if self.hive_hints is None:
+            return 1.0
+        try:
+            bias = self.hive_hints.get_fee_bias(peer_id)
+            return max(0.9, min(1.1, bias))
+        except Exception:
+            return 1.0
 
     def _refresh_askrene_cache(self, cfg) -> None:
         """Refresh AskRene constraints cache (best-effort, 30s TTL)."""
@@ -3448,6 +3461,10 @@ class FeeController:
             )
             raw_dts_target_ppm = int(dts_fee)
             post_pid_target_ppm = int(dts_fee * pid_multiplier)
+            # Hive hint bias: small bounded nudge before hard clamp
+            hive_fee_bias = self._get_hive_fee_bias(peer_id)
+            if hive_fee_bias != 1.0:
+                post_pid_target_ppm = int(post_pid_target_ppm * hive_fee_bias)
             bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
             if bounded_target_ppm != post_pid_target_ppm:
                 bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
@@ -3469,9 +3486,10 @@ class FeeController:
             delta_cap_ppm = damping_info["max_delta_ppm"]
             delta_cap_applied = damping_info["cap_applied"]
 
+            hive_tag = f", hive={hive_fee_bias:.2f}" if hive_fee_bias != 1.0 else ""
             decision_reason = (
                 f"dts_pid (dts={dts_fee}, pid={pid_multiplier:.2f}, "
-                f"flow={flow_state_str})"
+                f"flow={flow_state_str}{hive_tag})"
             )
 
             # Update volume tracking

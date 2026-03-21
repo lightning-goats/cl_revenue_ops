@@ -1901,6 +1901,9 @@ class EVRebalancer:
         # Initialize job manager for async execution
         self.job_manager = JobManager(plugin, config, database)
 
+        # Hive hints adapter (injected by main plugin; None = disabled)
+        self.hive_hints = None
+
     def _set_last_decision_summary(
         self,
         *,
@@ -1920,6 +1923,16 @@ class EVRebalancer:
 
     def get_last_decision_summary(self) -> Dict[str, Any]:
         return dict(self._last_decision_summary)
+
+    def _get_hive_rebalance_bias(self, peer_id: str) -> float:
+        """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""
+        if self.hive_hints is None:
+            return 1.0
+        try:
+            bias = self.hive_hints.get_rebalance_bias(peer_id)
+            return max(0.85, min(1.15, bias))
+        except Exception:
+            return 1.0
 
     @staticmethod
     def _should_skip_futility(fail_count: int, last_error_type: str) -> bool:
@@ -2334,7 +2347,9 @@ class EVRebalancer:
                 dest_state = self.database.get_channel_state(c.to_channel)
                 flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
                 priority = 2 if flow_state == "source" else 1
-                return (priority, c.expected_profit_sats)
+                hive_bias = self._get_hive_rebalance_bias(c.to_peer_id)
+                biased_profit = c.expected_profit_sats * hive_bias
+                return (priority, biased_profit)
 
             candidates.sort(key=sort_key, reverse=True)
 
