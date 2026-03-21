@@ -279,3 +279,66 @@ class TestDiagnostics:
         assert status["snapshot_fresh"] is True
         assert status["hints_count"] == 2
         assert "snapshot_age_seconds" in status
+
+
+# ---------------------------------------------------------------------------
+# Safety rail preservation
+# ---------------------------------------------------------------------------
+
+class TestSafetyRails:
+    """Prove that hive hints cannot override local safety logic."""
+
+    def test_fee_bias_cannot_exceed_ten_percent(self, mock_plugin):
+        """No combination of hint values can produce bias outside [0.9, 1.1]."""
+        extreme_hints = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {},
+        }
+        for role in ["owner", "secondary", "unknown", None]:
+            for comp in [0.0, 1.0, 2.0, 100.0, -50.0]:
+                for conf in [0.0, 0.5, 1.0, 100.0]:
+                    peer_id = f"02test_{role}_{comp}_{conf}"
+                    hint = {"traffic_confidence": conf, "competition_bias": comp}
+                    if role:
+                        hint["corridor_role"] = role
+                    extreme_hints["hints"][peer_id] = hint
+
+        mock_plugin.rpc.call.return_value = extreme_hints
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        for peer_id in extreme_hints["hints"]:
+            bias = adapter.get_fee_bias(peer_id)
+            assert 0.9 <= bias <= 1.1, f"Fee bias {bias} out of range for {peer_id}"
+
+    def test_rebalance_bias_cannot_exceed_fifteen_percent(self, mock_plugin):
+        """No combination of hint values can produce bias outside [0.85, 1.15]."""
+        extreme_hints = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {},
+        }
+        for pref in ["sink", "source", "unknown", None]:
+            for quality in [0.0, 0.5, 1.0, 100.0, -50.0]:
+                for conf in [0.0, 0.5, 1.0, 100.0]:
+                    peer_id = f"02test_{pref}_{quality}_{conf}"
+                    hint = {"traffic_confidence": conf, "peer_quality_score": quality}
+                    if pref:
+                        hint["rebalance_preference"] = pref
+                    extreme_hints["hints"][peer_id] = hint
+
+        mock_plugin.rpc.call.return_value = extreme_hints
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        for peer_id in extreme_hints["hints"]:
+            bias = adapter.get_rebalance_bias(peer_id)
+            assert 0.85 <= bias <= 1.15, f"Rebalance bias {bias} out of range for {peer_id}"
+
+    def test_local_only_behavior_preserved_when_disabled(self, mock_plugin):
+        """When no adapter is set, all biases are neutral."""
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        for peer_id in ["02aabb", "02ccdd", "02eeff"]:
+            assert adapter.get_fee_bias(peer_id) == 1.0
+            assert adapter.get_rebalance_bias(peer_id) == 1.0
