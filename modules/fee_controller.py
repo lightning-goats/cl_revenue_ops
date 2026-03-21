@@ -1639,6 +1639,7 @@ class FeeController:
 
         # Hive hints adapter (injected by main plugin; None = disabled)
         self.hive_hints = None
+        self._hive_member_set_at: Dict[str, int] = {}
 
         self._last_decision_summary: Dict[str, Any] = {
             "action": "hold",
@@ -1674,6 +1675,40 @@ class FeeController:
             return max(0.9, min(1.1, bias))
         except Exception:
             return 1.0
+
+    def _check_hive_member_fee(self, peer_id: str) -> Optional[int]:
+        """Return 0 if peer is a hive member (0-PPM fleet policy), else None.
+
+        This is a categorical trust-based decision, not a continuous bias.
+        It does NOT update DTS posterior or trigger hysteresis sleep.
+
+        Gossip oscillation protection: if a peer was recently set to 0-PPM
+        via the member hint and hints go stale, hold 0-PPM for one
+        additional TTL period before reverting.
+        """
+        if self.hive_hints is None:
+            return None
+
+        try:
+            if self.hive_hints.is_hive_member(peer_id):
+                self._hive_member_set_at[peer_id] = int(time.time())
+                return 0
+        except Exception:
+            pass
+
+        # Grace period: hold 0-PPM for one TTL after hints go stale
+        last_set = self._hive_member_set_at.get(peer_id)
+        if last_set is not None:
+            try:
+                ttl = self.hive_hints._effective_ttl()
+            except Exception:
+                ttl = 900
+            if int(time.time()) - last_set <= ttl * 2:
+                return 0
+            else:
+                del self._hive_member_set_at[peer_id]
+
+        return None
 
     def _refresh_askrene_cache(self, cfg) -> None:
         """Refresh AskRene constraints cache (best-effort, 30s TTL)."""
@@ -2490,6 +2525,23 @@ class FeeController:
                                 skip_reasons["error"] += 1
                         else:
                             skip_reasons["policy_static"] += 1
+                    continue
+
+                # HIVE MEMBER: 0-PPM fleet policy (hint-driven, no DTS/hysteresis)
+                hive_member_fee = self._check_hive_member_fee(peer_id)
+                if hive_member_fee is not None:
+                    channel_info = channels.get(channel_id)
+                    if channel_info:
+                        current_fee = channel_info.get("fee_proportional_millionths", 0)
+                        if current_fee != 0:
+                            try:
+                                self.set_channel_fee(
+                                    channel_id, 0,
+                                    reason="Hive member: 0-PPM fleet policy",
+                                    reason_code=FeeReasonCode.POLICY_STATIC.value
+                                )
+                            except Exception as e:
+                                self.plugin.log(f"Error setting hive member fee for {channel_id}: {e}", level='error')
                     continue
 
                 # DYNAMIC strategy continues to normal fee optimization below
@@ -4142,6 +4194,23 @@ class FeeController:
                         reason_code=FeeReasonCode.POLICY_STATIC.value,
                         channel_info=channel_info
                     )
+
+            # HIVE MEMBER: 0-PPM fleet policy (hint-driven)
+            if self.hive_hints is not None:
+                try:
+                    if self.hive_hints.is_hive_member(peer_id):
+                        self._hive_member_set_at[peer_id] = int(time.time())
+                        self.plugin.log(
+                            f"INITIAL_FEE: {scid[:16]}... -> 0 PPM (hive member)"
+                        )
+                        return self.set_channel_fee(
+                            scid, 0,
+                            reason="Initial fee: hive member",
+                            reason_code=FeeReasonCode.POLICY_STATIC.value,
+                            channel_info=channel_info
+                        )
+                except Exception:
+                    pass
 
             # ── DYNAMIC: DTS prior sample ─────────────────────────────
             ts = GaussianThompsonState()
