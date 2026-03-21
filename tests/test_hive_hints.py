@@ -22,7 +22,7 @@ VALID_SNAPSHOT = {
         "02aabbcc": {
             "member": True,
             "corridor_role": "owner",
-            "competition_bias": 1.2,
+            "competition_bias": 1,
             "peer_quality_score": 0.82,
             "traffic_confidence": 0.74,
             "rebalance_preference": "sink",
@@ -30,7 +30,7 @@ VALID_SNAPSHOT = {
         "02ddeeff": {
             "member": True,
             "corridor_role": "secondary",
-            "competition_bias": 0.8,
+            "competition_bias": -1,
             "peer_quality_score": 0.55,
             "traffic_confidence": 0.90,
             "rebalance_preference": "source",
@@ -160,7 +160,7 @@ class TestFeeBias:
             "hints": {
                 "02extreme": {
                     "corridor_role": "owner",
-                    "competition_bias": 100.0,
+                    "competition_bias": 50,
                     "traffic_confidence": 1.0,
                 },
             },
@@ -178,7 +178,7 @@ class TestFeeBias:
             "hints": {
                 "02lowconf": {
                     "corridor_role": "owner",
-                    "competition_bias": 1.5,
+                    "competition_bias": 1,
                     "traffic_confidence": 0.0,
                 },
             },
@@ -296,7 +296,7 @@ class TestSafetyRails:
             "hints": {},
         }
         for role in ["owner", "secondary", "unknown", None]:
-            for comp in [0.0, 1.0, 2.0, 100.0, -50.0]:
+            for comp in [-1, 0, 1, 50, -50]:
                 for conf in [0.0, 0.5, 1.0, 100.0]:
                     peer_id = f"02test_{role}_{comp}_{conf}"
                     hint = {"traffic_confidence": conf, "competition_bias": comp}
@@ -311,6 +311,31 @@ class TestSafetyRails:
         for peer_id in extreme_hints["hints"]:
             bias = adapter.get_fee_bias(peer_id)
             assert 0.9 <= bias <= 1.1, f"Fee bias {bias} out of range for {peer_id}"
+
+    def test_competition_bias_integer_encoding(self, mock_plugin):
+        """cl-hive exports competition_bias as -1/0/1, not 0.0-2.0."""
+        for comp_val, expected_direction in [(-1, "negative"), (0, "neutral"), (1, "positive")]:
+            snapshot = {
+                "generated_at": int(time.time()),
+                "ttl_seconds": 900,
+                "hints": {
+                    "02test": {
+                        "corridor_role": "none",
+                        "competition_bias": comp_val,
+                        "traffic_confidence": 1.0,
+                    },
+                },
+            }
+            mock_plugin.rpc.call.return_value = snapshot
+            adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+            adapter.poll()
+            bias = adapter.get_fee_bias("02test")
+            if expected_direction == "negative":
+                assert bias < 1.0, f"comp={comp_val} should give negative bias, got {bias}"
+            elif expected_direction == "neutral":
+                assert bias == 1.0, f"comp={comp_val} should give neutral bias, got {bias}"
+            elif expected_direction == "positive":
+                assert bias > 1.0, f"comp={comp_val} should give positive bias, got {bias}"
 
     def test_rebalance_bias_cannot_exceed_fifteen_percent(self, mock_plugin):
         """No combination of hint values can produce bias outside [0.85, 1.15]."""

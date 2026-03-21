@@ -40,7 +40,7 @@ class TestFeeHiveBias:
             "hints": {
                 "02aabb": {
                     "corridor_role": "owner",
-                    "competition_bias": 1.0,
+                    "competition_bias": 1,
                     "traffic_confidence": 1.0,
                 },
             },

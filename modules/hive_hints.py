@@ -112,8 +112,8 @@ class HiveHintAdapter:
 
         comp = hint.get("competition_bias")
         if isinstance(comp, (int, float)):
-            comp = max(0.0, min(2.0, comp))
-            bias += (comp - 1.0) * FEE_COMPETITION_WEIGHT
+            comp = max(-1.0, min(1.0, comp))
+            bias += comp * FEE_COMPETITION_WEIGHT
 
         bias *= confidence
         bias = max(-MAX_FEE_BIAS, min(MAX_FEE_BIAS, bias))
