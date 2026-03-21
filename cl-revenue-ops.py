@@ -8,7 +8,7 @@ principles rather than heuristics.
 
 Dependencies:
 - pyln-client: Core Lightning plugin framework
-- bookkeeper plugin (built-in): On-chain cost attribution (opens/closes/splices) and accounting-grade events
+- bookkeeper plugin (built-in): On-chain cost attribution (opens/closes) and accounting-grade events
 - Local forwards table (SQLite): Routing history for flow analysis (hydrated once on startup)
 - External rebalancer (sling): Executes rebalance payments
 
@@ -25,7 +25,6 @@ import signal
 import atexit
 import re
 import dataclasses
-from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
 import traceback
@@ -33,12 +32,13 @@ from pyln.client import Plugin, RpcError
 
 # Import our modules
 from modules.flow_analysis import FlowAnalyzer, ChannelState
-from modules.fee_controller import PIDFeeController
+from modules.fee_controller import FeeController
 from modules.rebalancer import EVRebalancer
 from modules.config import Config
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
+from modules.hive_hints import HiveHintAdapter
 from modules.policy_manager import (
     PolicyManager,
     FeeStrategy,
@@ -47,10 +47,7 @@ from modules.policy_manager import (
     READ_ONLY_POLICY_ACTIONS,
     TACTICAL_POLICY_ACTIONS,
 )
-from modules.hive_bridge import HiveFeeIntelligenceBridge
-from modules.gossip_keeper import GossipKeepaliveManager
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
-from modules.realtime_surge_defense import RealtimeSurgeDefense, SurgeSample
 from modules.utils import normalize_scid, parse_msat
 
 
@@ -65,14 +62,10 @@ from modules.utils import normalize_scid, parse_msat
 #   - Confidence-weighted measurement noise
 #   - Velocity tracking built into state vector
 #   - Persistent filter state across restarts
-# v2.0.0: Thompson Sampling + AIMD Fee Controller
-#   - Replaces Hill Climbing with Gaussian Thompson Sampling
-#   - AIMD defense layer for rapid failure response
-#   - Fleet-informed priors from hive intelligence
-#   - Contextual posteriors (balance, pheromone, time, corridor role)
-#   - Stigmergic modulation for exploration/exploitation
-#   - P2 fleet integration: elasticity sharing, curve aggregation,
-#     regime coordination, competition avoidance, profitability weighting
+# v2.0.0: DTS+PID Fee Controller
+#   - DTS (Dynamic Thompson Sampling) for Bayesian fee exploration
+#   - PID control loop for smooth convergence
+#   - Contextual posteriors (balance, time, corridor role)
 PLUGIN_VERSION = "2.2.4"
 
 
@@ -156,125 +149,6 @@ class ForceRateLimiter:
 
 # Global rate limiter for force operations (10 calls per 60 seconds)
 force_rate_limiter = ForceRateLimiter(max_calls=10, window_seconds=60)
-_realtime_surge_channel_cache: Dict[str, Dict[str, Any]] = {}
-_realtime_surge_channel_cache_lock = threading.Lock()
-_realtime_surge_channel_cache_refreshed_at = 0.0
-_REALTIME_SURGE_CHANNEL_CACHE_MAX_AGE_SECONDS = 5.0
-
-
-def _get_realtime_surge_channel_info(channel_id: str) -> Optional[Dict[str, Any]]:
-    """Read cached live channel details for surge-defense callbacks."""
-    if not channel_id:
-        return None
-
-    target_scid = normalize_scid(channel_id)
-    if not target_scid:
-        return None
-
-    with _realtime_surge_channel_cache_lock:
-        if (time.time() - _realtime_surge_channel_cache_refreshed_at) > _REALTIME_SURGE_CHANNEL_CACHE_MAX_AGE_SECONDS:
-            return None
-        channel = _realtime_surge_channel_cache.get(target_scid)
-        if channel is None:
-            return None
-        return dict(channel)
-
-
-def _refresh_realtime_surge_channel_cache() -> int:
-    """Refresh surge-defense channel cache outside the hook path."""
-    global _realtime_surge_channel_cache_refreshed_at
-    if safe_plugin is None:
-        return 0
-
-    try:
-        result = safe_plugin.rpc.call("listpeerchannels")
-    except Exception as e:
-        plugin.log(f"Realtime surge defense listpeerchannels refresh failed: {e}", level="debug")
-        return 0
-
-    refreshed: Dict[str, Dict[str, Any]] = {}
-    for channel in result.get("channels", []):
-        scid = normalize_scid(channel.get("short_channel_id", ""))
-        if scid:
-            refreshed[scid] = dict(channel)
-
-    with _realtime_surge_channel_cache_lock:
-        _realtime_surge_channel_cache.clear()
-        _realtime_surge_channel_cache.update(refreshed)
-        _realtime_surge_channel_cache_refreshed_at = time.time()
-
-    return len(refreshed)
-
-
-def _get_realtime_surge_current_fee_ppm(channel_id: str) -> Optional[int]:
-    """Read the live fee so surge overlays capture the exact pre-surge baseline."""
-    channel = _get_realtime_surge_channel_info(channel_id)
-    if not channel:
-        return None
-
-    updates = channel.get("updates")
-    if isinstance(updates, dict):
-        local_updates = updates.get("local")
-        if isinstance(local_updates, dict):
-            fee_ppm = local_updates.get("fee_proportional_millionths")
-            if fee_ppm is not None:
-                try:
-                    return int(fee_ppm)
-                except (TypeError, ValueError):
-                    return None
-
-    fee_ppm = channel.get("fee_proportional_millionths")
-    if fee_ppm is None:
-        return None
-
-    try:
-        return int(fee_ppm)
-    except (TypeError, ValueError):
-        return None
-
-
-def _get_realtime_surge_channel_capacity_msat(channel_id: str) -> Optional[int]:
-    """Read live channel capacity outside the hook path for burst sizing."""
-    channel = _get_realtime_surge_channel_info(channel_id)
-    if not channel:
-        return None
-
-    total_msat = channel.get("total_msat", channel.get("total_msatoshi", 0))
-    try:
-        return parse_msat(total_msat)
-    except Exception:
-        return None
-
-
-def _apply_realtime_surge_fee_overlay(channel_id: str, fee_ppm: int) -> bool:
-    """Apply surge fee overlays with raw setchannel outside the hook path."""
-    if safe_plugin is None or not channel_id:
-        return False
-
-    payload = {
-        "id": normalize_scid(channel_id),
-        "feeppm": int(fee_ppm),
-    }
-    try:
-        safe_plugin.rpc.call("setchannel", payload)
-        return True
-    except Exception as e:
-        plugin.log(f"Realtime surge defense setchannel failed for {channel_id}: {e}", level="debug")
-        return False
-
-
-def _is_realtime_surge_overlay_active(channel_id: str) -> bool:
-    """Let the scheduled fee controller skip channels under temporary surge control."""
-    if realtime_surge_defense is None or not channel_id:
-        return False
-
-    target_scid = normalize_scid(channel_id) or channel_id
-    try:
-        return bool(realtime_surge_defense.is_overlay_active(target_scid))
-    except Exception as e:
-        plugin.log(f"Realtime surge overlay-state check failed for {channel_id}: {e}", level="debug")
-        return False
-
 
 # Initialize the plugin
 plugin = Plugin()
@@ -290,73 +164,8 @@ plugin = Plugin()
 shutdown_event = threading.Event()
 
 # =============================================================================
-# THREAD-SAFE RPC WRAPPER (Phase 5.5: High-Uptime Stability)
+# THREAD-SAFE RPC WRAPPER (High-Uptime Stability)
 # =============================================================================
-
-# =============================================================================
-# CL-HIVE AVAILABILITY CACHE (Performance Optimization)
-# =============================================================================
-# Caches the cl-hive plugin availability check to avoid expensive
-# plugin("list") RPC calls on every channel event. TTL: 60 seconds.
-
-class HiveAvailabilityCache:
-    """Thread-safe cache for cl-hive plugin availability."""
-
-    def __init__(self, ttl_seconds: int = 60):
-        self._available: Optional[bool] = None
-        self._last_check: float = 0
-        self._ttl = ttl_seconds
-        self._lock = threading.Lock()
-
-    def is_available(self, rpc) -> bool:
-        """
-        Check if cl-hive plugin is available (cached).
-
-        Args:
-            rpc: RPC interface for plugin list call
-
-        Returns:
-            True if cl-hive is active, False otherwise
-        """
-        now = time.time()
-
-        with self._lock:
-            # Return cached value if still valid
-            if self._available is not None and (now - self._last_check) < self._ttl:
-                return self._available
-
-        # Cache miss or expired - fetch fresh
-        try:
-            plugins = rpc.plugin("list")
-            available = False
-            for p in plugins.get('plugins', []):
-                if 'cl-hive' in p.get('name', '') and p.get('active', False):
-                    available = True
-                    break
-
-            with self._lock:
-                self._available = available
-                self._last_check = now
-
-            return available
-
-        except Exception:
-            # On error, assume unavailable but don't cache failure long
-            with self._lock:
-                self._available = False
-                self._last_check = now - (self._ttl - 5)  # Retry after 5s
-            return False
-
-    def invalidate(self):
-        """Force cache refresh on next check."""
-        with self._lock:
-            self._available = None
-            self._last_check = 0
-
-
-# Global cache for cl-hive availability (60 second TTL)
-hive_availability_cache = HiveAvailabilityCache(ttl_seconds=60)
-
 
 class RPCTimeoutError(RpcError):
     """Exception raised when an RPC call times out."""
@@ -393,7 +202,7 @@ class ThreadSafeRpcProxy:
     One slow call can't poison 60+ other RPC methods for 60 seconds.
 
     Explicit fire-and-forget calls use a separate 4-thread pool so slow
-    informational hive pushes can't starve the main pool.
+    background pushes can't starve the main pool.
     """
 
     def __init__(self, plugin_instance: Plugin):
@@ -474,10 +283,6 @@ class ThreadSafeRpcProxy:
         timeout = 30
         if config:
             timeout = config.rpc_timeout_seconds
-        # Cross-plugin RPCs (hive-*) relay through CLN and are inherently
-        # slower — give them 2x the normal timeout to avoid spurious failures.
-        if method_name.startswith("hive-"):
-            timeout *= 2
         future = self._submit_main(
             self._rpc.call,
             method_name,
@@ -494,9 +299,8 @@ class ThreadSafeRpcProxy:
     def fire_and_forget(self, method_name: str, payload: Any = None):
         """Submit an RPC call to the async pool without waiting.
 
-        Uses a separate 4-thread pool so hung hive calls can't starve
-        synchronous RPCs.  Tracks failures so the hive bridge circuit
-        breaker still has signal.
+        Uses a separate 4-thread pool so fire-and-forget calls can't
+        starve synchronous RPCs.
         """
         def _run():
             try:
@@ -535,7 +339,7 @@ class ThreadSafePluginProxy:
 
 # Global instances (initialized in init)
 flow_analyzer: Optional[FlowAnalyzer] = None
-fee_controller: Optional[PIDFeeController] = None
+fee_controller: Optional[FeeController] = None
 rebalancer: Optional[EVRebalancer] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
@@ -543,10 +347,8 @@ profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
 capacity_planner: Optional[CapacityPlanner] = None
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
-hive_bridge: Optional[HiveFeeIntelligenceBridge] = None  # v1.6: Hive intelligence
-gossip_keeper: Optional[GossipKeepaliveManager] = None  # Gossip keepalive target discovery
-realtime_surge_defense: Optional[Any] = None  # Issue #67: temporary fee overlay manager
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
+hive_hints: Optional[HiveHintAdapter] = None  # cl_hive fleet hint adapter
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
 _boltz_auto_cycle_run_lock = threading.Lock()
@@ -603,18 +405,6 @@ plugin.add_option(
     description='Interval in seconds for rebalance checks (default: 15 min)'
 )
 
-plugin.add_option(
-    name='revenue-ops-enable-gossip-keepalives',
-    default='false',
-    description='Maintain extra pure P2P peers when total connected peers fall below target (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-target-gossip-peers',
-    default='5',
-    description='Target total connected peers before gossip keepalive dialing stops (default: 5)',
-    opt_type='int'
-)
 
 plugin.add_option(
     name='revenue-ops-target-flow',
@@ -634,57 +424,6 @@ plugin.add_option(
     description='Maximum fee ceiling in PPM (default: 2000)'
 )
 
-plugin.add_option(
-    name='revenue-ops-auto-band-enabled',
-    default='true',
-    description='Enable automatic posterior-driven fee autobands for observed dynamic channels (default: true)'
-)
-
-plugin.add_option(
-    name='revenue-ops-auto-band-min-observations',
-    default='20',
-    description='Minimum Thompson observations before auto-band calibration activates (default: 20)',
-    opt_type='int'
-)
-
-plugin.add_option(
-    name='revenue-ops-auto-band-sigma',
-    default='2.0',
-    description='Posterior standard deviation multiplier used to size auto bands (default: 2.0)'
-)
-
-plugin.add_option(
-    name='revenue-ops-auto-band-min-width-ppm',
-    default='50',
-    description='Minimum width in PPM for auto-calibrated fee bands (default: 50)',
-    opt_type='int'
-)
-
-plugin.add_option(
-    name='revenue-ops-auto-band-recalibrate-interval',
-    default='10',
-    description='Recalibrate automatic fee bands every N fee intervals (default: 10)',
-    opt_type='int'
-)
-
-plugin.add_option(
-    name='revenue-ops-enable-hive-egress-desaturation-bias',
-    default='true',
-    description='Bias dynamic non-hive exits upward when they compete with a saturated local hive egress (default: true)'
-)
-
-plugin.add_option(
-    name='revenue-ops-hive-egress-desaturation-bias-max-ppm',
-    default='100',
-    description='Maximum surcharge applied from the hive egress desaturation bias (default: 100)',
-    opt_type='int'
-)
-
-plugin.add_option(
-    name='revenue-ops-hive-egress-desaturation-bias-weight',
-    default='0.5',
-    description='Blend weight applied to the hive-recommended egress surcharge, 0.0-1.0 (default: 0.5)'
-)
 
 plugin.add_option(
     name='revenue-ops-rebalance-min-profit',
@@ -776,53 +515,6 @@ plugin.add_option(
     description='HTLC slot utilization threshold (0.0-1.0) above which channel is considered congested (default: 0.8)'
 )
 
-plugin.add_option(
-    name='revenue-ops-enable-dynamic-htlcmin',
-    default='false',
-    description='Enable dynamic htlcmin updates to shed small HTLCs during congestion and relax afterward (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-enable-realtime-surge-defense',
-    default='false',
-    description='Enable real-time toxic-flow surge defense with temporary fee overlays on bursty channels (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-window-seconds',
-    default='60',
-    description='Rolling detection window in seconds for real-time surge defense (default: 60)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-trigger-pct',
-    default='0.10',
-    description='Moved-capacity threshold in the rolling window that can trigger surge defense (default: 0.10)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-multiplier-min',
-    default='3.0',
-    description='Minimum fee multiplier applied when surge defense activates (default: 3.0)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-multiplier-max',
-    default='5.0',
-    description='Maximum fee multiplier applied when surge defense activates (default: 5.0)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-cooldown-seconds',
-    default='120',
-    description='Cooldown period before reverting a surge overlay after pressure subsides (default: 120)'
-)
-
-plugin.add_option(
-    name='revenue-ops-surge-setchannel-min-interval-seconds',
-    default='15',
-    description='Minimum seconds between surge-defense setchannel writes per channel (default: 15)'
-)
 
 plugin.add_option(
     name='revenue-ops-enable-reputation',
@@ -843,18 +535,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-kelly-bypass-fleet',
-    default='true',
-    description='If true, bypass Kelly Criterion for hive/fleet destinations where zero-fee internal paths exist (default: true)'
-)
-
-plugin.add_option(
     name='revenue-ops-kelly-fraction',
     default='0.5',
     description='Multiplier for Kelly fraction (default: 0.5 = Half Kelly). Full Kelly (1.0) maximizes growth but has high volatility.'
 )
 
-# Phase 7 options (v1.3.0)
+# Vegas Reflex options
 plugin.add_option(
     name='revenue-ops-vegas-reflex',
     default='true',
@@ -867,37 +553,6 @@ plugin.add_option(
     description='Vegas Reflex decay rate per cycle, 0.0-1.0 (default: 0.85 = ~30min half-life)'
 )
 
-plugin.add_option(
-    name='revenue-ops-scarcity-pricing',
-    default='true',
-    description='Enable HTLC slot scarcity pricing (default: true)'
-)
-
-plugin.add_option(
-    name='revenue-ops-scarcity-threshold',
-    default='0.35',
-    description='Utilization threshold to start scarcity pricing, 0.0-1.0 (default: 0.35)'
-)
-
-plugin.add_option(
-    name='revenue-ops-hive-enabled',
-    default='auto',
-    description='Hive mode: "auto" (detect cl-hive), "true" (require hive), "false" (standalone only)'
-)
-
-plugin.add_option(
-    name='revenue-ops-hive-fee-ppm',
-    default='0',
-    description='Fee rate charged to Hive fleet members (default: 0)',
-    opt_type='int'
-)
-
-plugin.add_option(
-    name='revenue-ops-hive-rebalance-tolerance',
-    default='50',
-    description='Max sats loss tolerance per rebalance to keep channels balanced and earning (default: 50)',
-    opt_type='int'
-)
 
 plugin.add_option(
     name='revenue-ops-rpc-timeout-seconds',
@@ -909,12 +564,6 @@ plugin.add_option(
     name='revenue-ops-rpc-circuit-breaker-seconds',
     default='60',
     description='Cooldown period after an RPC timeout for that method group (default: 60)'
-)
-
-plugin.add_option(
-    name='revenue-ops-hive-bridge-circuit-breaker-enabled',
-    default='false',
-    description='Enable global cl-hive bridge circuit breaker (default: false; timeouts/backpressure still apply)'
 )
 
 plugin.add_option(
@@ -1067,7 +716,7 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-expansion-treasury-enabled',
     default='false',
-    description='Enable expansion treasury mode (reverse-swap excess LN to on-chain for opens/splices) (default: false)'
+    description='Enable expansion treasury mode (reverse-swap excess LN to on-chain for opens) (default: false)'
 )
 
 plugin.add_option(
@@ -1106,6 +755,258 @@ plugin.add_option(
     description='Exclude hot/protected channels from treasury harvesting (default: true)'
 )
 
+plugin.add_option(
+    name='revenue-ops-planner-enabled',
+    default='false',
+    description='Enable automated capacity planner for channel opens/closes (default: false)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-interval',
+    default='21600',
+    description='Seconds between capacity planner evaluation cycles (default: 21600 = 6 hours)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-dry-run',
+    default='false',
+    description='Log planner decisions without executing (default: false)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-max-opens-per-cycle',
+    default='1',
+    description='Maximum automated channel opens per planner cycle (default: 1)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-max-closes-per-cycle',
+    default='0',
+    description='Maximum planner close executions per cycle when close execution is enabled (default: 0)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-min-channel-sats',
+    default='500000',
+    description='Minimum channel size in sats for automated opens (default: 500000)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-max-channel-sats',
+    default='10000000',
+    description='Maximum channel size in sats for automated opens (default: 10000000)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-max-fee-rate',
+    default='50.0',
+    description='Maximum on-chain fee rate (sat/vB) for automated opens/closes (default: 50.0)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-execute-closes',
+    default='false',
+    description='Allow the capacity planner to execute close RPCs (default: false)'
+)
+plugin.add_option(
+    name='revenue-ops-hive-hints-enabled',
+    default='false',
+    description='Enable bounded fee/rebalance bias from cl_hive fleet hints (default: false)'
+)
+plugin.add_option(
+    name='revenue-ops-hive-hints-ttl',
+    default='0',
+    description='Override hint snapshot TTL in seconds; 0 = use snapshot value (default: 0)'
+)
+
+
+def _boltz_auto_cycle_mark_state(**updates):
+    with _boltz_auto_cycle_state_lock:
+        _boltz_auto_cycle_state.update(updates)
+
+
+def _select_boltz_auto_cycle_mode(
+    *,
+    treasury_plan: Optional[Dict[str, Any]],
+    balance_plan: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Pick the next Boltz mode without side effects."""
+    treasury_plan = treasury_plan if isinstance(treasury_plan, dict) else {}
+    balance_plan = balance_plan if isinstance(balance_plan, dict) else {}
+
+    treasury = treasury_plan.get("treasury")
+    treasury = treasury if isinstance(treasury, dict) else {}
+    treasury_recommendations = (
+        list(treasury_plan.get("recommendations", []))
+        if isinstance(treasury_plan.get("recommendations", []), list)
+        else []
+    )
+    balance_recommendations = (
+        list(balance_plan.get("recommendations", []))
+        if isinstance(balance_plan.get("recommendations", []), list)
+        else []
+    )
+    reserve_deficit_sats = int(treasury.get("deficit_sats", 0) or 0)
+
+    if str(treasury_plan.get("status") or "") == "ok" and treasury_recommendations:
+        return {
+            "mode": "treasury",
+            "reason": "standing_onchain_reserve_below_target",
+            "reserve_deficit_sats": reserve_deficit_sats,
+            "treasury_candidate_count": len(treasury_recommendations),
+            "balance_candidate_count": len(balance_recommendations),
+        }
+
+    if balance_recommendations:
+        return {
+            "mode": "balance",
+            "reason": "onchain_reserve_healthy_use_balance_mode",
+            "reserve_deficit_sats": reserve_deficit_sats,
+            "treasury_candidate_count": len(treasury_recommendations),
+            "balance_candidate_count": len(balance_recommendations),
+        }
+
+    return {
+        "mode": "idle",
+        "reason": "no_eligible_boltz_actions",
+        "reserve_deficit_sats": reserve_deficit_sats,
+        "treasury_candidate_count": len(treasury_recommendations),
+        "balance_candidate_count": len(balance_recommendations),
+    }
+
+
+def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> Dict[str, Any]:
+    """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight)."""
+    if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
+        result = {
+            'status': 'disabled',
+            'reason': 'boltz integration disabled',
+            'trigger': trigger,
+        }
+        _boltz_auto_cycle_mark_state(last_result=result, last_error=None, enabled=False)
+        return result
+
+    cfg = config.snapshot() if config else None
+    enabled = bool(getattr(cfg, 'boltz_auto_cycle_enabled', True)) if cfg else True
+    _boltz_auto_cycle_mark_state(enabled=enabled)
+    if not enabled and not force:
+        result = {
+            'status': 'disabled',
+            'reason': 'boltz auto-cycle disabled by config',
+            'trigger': trigger,
+        }
+        _boltz_auto_cycle_mark_state(last_result=result, last_error=None)
+        return result
+
+    # L-1 FIX: Guard lock release with acquired flag to prevent RuntimeError
+    acquired = _boltz_auto_cycle_run_lock.acquire(blocking=False)
+    if not acquired:
+        result = {'status': 'skipped', 'reason': 'auto-cycle already running', 'trigger': trigger}
+        _boltz_auto_cycle_mark_state(last_result=result)
+        return result
+
+    try:
+        started = int(time.time())
+        start_monotonic = time.monotonic()
+        _boltz_auto_cycle_mark_state(
+            running=True,
+            last_trigger=trigger,
+            last_started_ts=started,
+            last_error=None,
+        )
+        max_actions = max(1, int(getattr(cfg, 'boltz_auto_cycle_max_actions', 1) if cfg else 1))
+        treasury_max_actions = max(1, int(getattr(cfg, 'expansion_treasury_max_actions', max_actions) if cfg else max_actions))
+        treasury_plan = None
+        selection = {
+            "mode": "idle",
+            "reason": "no_eligible_boltz_actions",
+            "reserve_deficit_sats": 0,
+        }
+
+        if bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False:
+            treasury_plan = _build_boltz_expansion_treasury_plan(
+                onchain_target_sats=int(getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000),
+                min_deficit_sats=int(getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000),
+                preferred_currency=str(getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC').upper(),
+                max_actions=treasury_max_actions,
+                min_source_local_pct=float(getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0),
+                exclude_protected=bool(getattr(cfg, 'expansion_treasury_exclude_protected', True)) if cfg else True,
+            )
+            if isinstance(treasury_plan, dict) and 'error' in treasury_plan:
+                result = dict(treasury_plan)
+                result['trigger'] = trigger
+                with _boltz_auto_cycle_state_lock:
+                    _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
+                _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
+                return result
+            selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=None)
+
+        balance_plan = None
+        if selection.get("mode") != "treasury":
+            balance_plan = _build_boltz_balance_plan(
+                max_candidates=max(max(5, int(max_actions) * 5), 20),
+                require_profitable=True,
+                min_marginal_roi=0.0,
+                profit_margin_factor=1.2,
+                expected_horizon_days=3.0,
+                loop_in_currency='LBTC',
+                loop_out_currency='LBTC',
+            )
+            if isinstance(balance_plan, dict) and 'error' in balance_plan:
+                result = balance_plan
+            else:
+                selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=balance_plan)
+                if selection.get("mode") == "balance":
+                    result = revenue_boltz_balance_cycle(
+                        plugin=plugin,
+                        dry_run=False,
+                        max_actions=max_actions,
+                        allow_concurrent_swaps=False,
+                        loop_in_currency='LBTC',
+                        loop_out_currency='LBTC',
+                    )
+                else:
+                    result = {
+                        'status': 'idle',
+                        'executed_count': 0,
+                        'skipped_count': 0,
+                        'reason': selection.get("reason", "no_eligible_boltz_actions"),
+                    }
+        else:
+            result = revenue_boltz_expansion_treasury_cycle(
+                plugin=plugin,
+                dry_run=False,
+                max_actions=treasury_max_actions,
+                allow_concurrent_swaps=False,
+            )
+        status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
+        if isinstance(result, dict):
+            result.update({
+                'mode': str(selection.get("mode") or 'idle'),
+                'selection_reason': str(selection.get("reason") or 'no_eligible_boltz_actions'),
+                'reserve_deficit_sats': int(selection.get("reserve_deficit_sats", 0) or 0),
+                'trigger': trigger,
+            })
+        if isinstance(result, dict) and 'error' in result:
+            with _boltz_auto_cycle_state_lock:
+                _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
+            _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
+        else:
+            # C3 FIX: Only reset error counter on actual success, not on blocked/other states
+            status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
+            if status in ('executed', 'dry_run'):
+                with _boltz_auto_cycle_state_lock:
+                    _boltz_auto_cycle_state['consecutive_errors'] = 0
+            _boltz_auto_cycle_mark_state(last_error=None)
+        return result if isinstance(result, dict) else {'status': status, 'result': result}
+    except Exception as e:
+        with _boltz_auto_cycle_state_lock:
+            _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
+        _boltz_auto_cycle_mark_state(last_error=str(e))
+        raise
+    finally:
+        finished = int(time.time())
+        duration_ms = int((time.monotonic() - start_monotonic) * 1000)
+        with _boltz_auto_cycle_state_lock:
+            _boltz_auto_cycle_state['running'] = False
+            _boltz_auto_cycle_state['last_finished_ts'] = finished
+            _boltz_auto_cycle_state['last_duration_ms'] = duration_ms
+            # Preserve last_result if set by success/skip/disabled path, otherwise leave as-is.
+        if acquired:
+            _boltz_auto_cycle_run_lock.release()
+
 
 # =============================================================================
 # INITIALIZATION
@@ -1122,7 +1023,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, hive_bridge, gossip_keeper, realtime_surge_defense, boltz_manager
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -1147,8 +1048,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         """Perform cleanup after shutdown_event is set. Runs via atexit."""
         if safe_plugin and hasattr(safe_plugin, 'rpc'):
             try:
-                safe_plugin.rpc._executor.shutdown(wait=False)
-                safe_plugin.rpc._async_executor.shutdown(wait=False)
+                safe_plugin.rpc._executor.shutdown(wait=True)
+                safe_plugin.rpc._async_executor.shutdown(wait=True)
             except Exception:
                 pass
 
@@ -1172,7 +1073,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Build configuration from options. Filter kwargs against the imported Config
     # dataclass fields so partial deployments (new main file + older modules/config.py)
     # don't crash during init. Unknown fields are dropped with a warning.
-    def _safe_int(key, default=0):
+    def _safe_int(key):
         """Parse option as int with descriptive error on failure."""
         try:
             return int(options[key])
@@ -1205,8 +1106,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_interval=_safe_int('revenue-ops-flow-interval'),
         fee_interval=_safe_int('revenue-ops-fee-interval'),
         rebalance_interval=_safe_int('revenue-ops-rebalance-interval'),
-        enable_gossip_keepalives=options.get('revenue-ops-enable-gossip-keepalives', 'false').lower() == 'true',
-        target_gossip_peers=_safe_int_opt('revenue-ops-target-gossip-peers', '5'),
         hot_channel_protection_enabled=options.get('revenue-ops-hot-channel-protection-enabled', 'true').lower() == 'true',
         hot_channel_protection_override_peers=str(options.get('revenue-ops-hot-channel-protection-override-peers', '') or ''),
         hot_channel_protection_min_velocity=_safe_float_opt('revenue-ops-hot-channel-protection-min-velocity', '0.20'),
@@ -1229,14 +1128,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         target_flow=_safe_int('revenue-ops-target-flow'),
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
-        auto_band_enabled=options.get('revenue-ops-auto-band-enabled', 'true').lower() == 'true',
-        auto_band_min_observations=_safe_int_opt('revenue-ops-auto-band-min-observations', '20'),
-        auto_band_sigma=_safe_float_opt('revenue-ops-auto-band-sigma', '2.0'),
-        auto_band_min_width_ppm=_safe_int_opt('revenue-ops-auto-band-min-width-ppm', '50'),
-        auto_band_recalibrate_interval=_safe_int_opt('revenue-ops-auto-band-recalibrate-interval', '10'),
-        enable_hive_egress_desaturation_bias=options.get('revenue-ops-enable-hive-egress-desaturation-bias', 'true').lower() == 'true',
-        hive_egress_desaturation_bias_max_ppm=_safe_int_opt('revenue-ops-hive-egress-desaturation-bias-max-ppm', '100'),
-        hive_egress_desaturation_bias_weight=_safe_float_opt('revenue-ops-hive-egress-desaturation-bias-weight', '0.5'),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
@@ -1252,32 +1143,27 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         proportional_budget_pct=_safe_float('revenue-ops-proportional-budget-pct'),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
         htlc_congestion_threshold=_safe_float('revenue-ops-htlc-congestion-threshold'),
-        enable_dynamic_htlcmin=options.get('revenue-ops-enable-dynamic-htlcmin', 'false').lower() == 'true',
-        enable_realtime_surge_defense=options.get('revenue-ops-enable-realtime-surge-defense', 'false').lower() == 'true',
-        surge_window_seconds=_safe_int_opt('revenue-ops-surge-window-seconds', '60'),
-        surge_trigger_pct=_safe_float_opt('revenue-ops-surge-trigger-pct', '0.10'),
-        surge_multiplier_min=_safe_float_opt('revenue-ops-surge-multiplier-min', '3.0'),
-        surge_multiplier_max=_safe_float_opt('revenue-ops-surge-multiplier-max', '5.0'),
-        surge_cooldown_seconds=_safe_int_opt('revenue-ops-surge-cooldown-seconds', '120'),
-        surge_setchannel_min_interval_seconds=_safe_int_opt('revenue-ops-surge-setchannel-min-interval-seconds', '15'),
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
         reputation_decay=_safe_float('revenue-ops-reputation-decay'),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
-        kelly_bypass_for_fleet=options['revenue-ops-kelly-bypass-fleet'].lower() == 'true',
         kelly_fraction=_safe_float('revenue-ops-kelly-fraction'),
-        # Phase 7 options (v1.3.0)
+        # Vegas Reflex options
         enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
         vegas_decay_rate=_safe_float('revenue-ops-vegas-decay'),
-        enable_scarcity_pricing=options['revenue-ops-scarcity-pricing'].lower() == 'true',
-        scarcity_threshold=_safe_float('revenue-ops-scarcity-threshold'),
         rpc_timeout_seconds=_safe_int('revenue-ops-rpc-timeout-seconds'),
         rpc_circuit_breaker_seconds=_safe_int('revenue-ops-rpc-circuit-breaker-seconds'),
-        hive_bridge_circuit_breaker_enabled=options.get('revenue-ops-hive-bridge-circuit-breaker-enabled', 'false').lower() == 'true',
         reservation_timeout_hours=_safe_int('revenue-ops-reservation-timeout-hours'),
-        # Phase 9: Hive Integration (cl-hive fleet coordination)
-        hive_enabled=options['revenue-ops-hive-enabled'].lower(),
-        hive_fee_ppm=_safe_int('revenue-ops-hive-fee-ppm'),
-        hive_rebalance_tolerance=_safe_int('revenue-ops-hive-rebalance-tolerance')
+        planner_enabled=options.get('revenue-ops-planner-enabled', 'false').lower() in ('true', '1', 'yes'),
+        planner_interval=_safe_int('revenue-ops-planner-interval'),
+        planner_dry_run=options.get('revenue-ops-planner-dry-run', 'false').lower() in ('true', '1', 'yes'),
+        planner_execute_closes=options.get('revenue-ops-planner-execute-closes', 'false').lower() in ('true', '1', 'yes'),
+        planner_max_opens_per_cycle=_safe_int('revenue-ops-planner-max-opens-per-cycle'),
+        planner_max_closes_per_cycle=_safe_int('revenue-ops-planner-max-closes-per-cycle'),
+        planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
+        planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
+        planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
+        hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'false').lower() in ('true', '1', 'yes'),
+        hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
     )
     try:
         config_fields = {f.name for f in dataclasses.fields(Config)}
@@ -1296,30 +1182,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                f"fee_range=[{config.min_fee_ppm}, {config.max_fee_ppm}], "
                f"dry_run={config.dry_run}")
     
-    # Create thread-safe RPC proxy (Phase 5.5: High-Uptime Stability)
+    # Create thread-safe RPC proxy (High-Uptime Stability)
     # pyln-client opens a new Unix socket per call — thread-safe by design.
     # ThreadSafeRpcProxy adds timeout protection via ThreadPoolExecutor.
     safe_plugin = ThreadSafePluginProxy(plugin)
     plugin.log("Thread-safe RPC proxy initialized", level="info")
-
-    if config.enable_realtime_surge_defense:
-        _refresh_realtime_surge_channel_cache()
-        realtime_surge_defense = RealtimeSurgeDefense(
-            enabled=True,
-            surge_window_seconds=config.surge_window_seconds,
-            surge_trigger_pct=config.surge_trigger_pct,
-            surge_multiplier_min=config.surge_multiplier_min,
-            surge_multiplier_max=config.surge_multiplier_max,
-            surge_cooldown_seconds=config.surge_cooldown_seconds,
-            surge_setchannel_min_interval_seconds=config.surge_setchannel_min_interval_seconds,
-            channel_capacity_msat=_get_realtime_surge_channel_capacity_msat,
-            current_fee_ppm=_get_realtime_surge_current_fee_ppm,
-            apply_fee_callback=_apply_realtime_surge_fee_overlay,
-        )
-        plugin.log("Realtime surge defense enabled", level="info")
-    else:
-        realtime_surge_defense = None
-        plugin.log("Realtime surge defense disabled", level="debug")
 
     # Optional Boltz CLI integration (manual quotes/swaps, wallet ops).
     try:
@@ -1350,7 +1217,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log(f"Warning: Failed to initialize Boltz CLI integration: {e}", level='warn')
 
     # =========================================================================
-    # STARTUP DEPENDENCY CHECKS (Phase 4: Stability & Scaling)
+    # STARTUP DEPENDENCY CHECKS (Stability)
     # Verify external plugins are available before initializing dependent modules
     # =========================================================================
     try:
@@ -1382,7 +1249,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         if not bookkeeper_found:
             plugin.log(
                 "Dependency 'bookkeeper' not found. Flow analysis uses the local forwards table (hydrated once at startup). "
-                "Bookkeeper is still recommended for accurate on-chain cost tracking (opens/closes/splices).",
+                "Bookkeeper is still recommended for accurate on-chain cost tracking (opens/closes).",
                 level='info'
             )
         else:
@@ -1405,7 +1272,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if cleaned > 0:
         plugin.log(f"Startup cleanup: Released {cleaned} stale budget reservations")
 
-    # Phase 7: Load config overrides from database (persisted runtime changes)
+    # Load config overrides from database (persisted runtime changes)
     try:
         override_warnings = config.load_overrides(database)
         if config._version > 0:
@@ -1522,100 +1389,26 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     policy_manager = PolicyManager(database, safe_plugin)
     plugin.log("PolicyManager initialized for peer-level fee/rebalance policies")
 
-    # Initialize hive bridge for competitor intelligence and NNLB health (v1.6)
-    # Respect hive_enabled setting: "auto", "true", "false"
-    if config.hive_enabled == 'false':
-        # Standalone mode - no hive integration
-        hive_bridge = None
-        plugin.log("=" * 60)
-        plugin.log("STANDALONE MODE: Hive integration disabled (hive-enabled=false)")
-        plugin.log("All fee optimization and rebalancing will use local-only algorithms")
-        plugin.log("To join a hive, set revenue-ops-hive-enabled=auto or true")
-        plugin.log("=" * 60)
-    else:
-        # Auto or required hive mode
-        # During plugin init, CLN holds a lock that blocks plugin-to-plugin
-        # RPCs (like hive-status), so we can only check plugin("list") here.
-        # Membership is verified lazily by background threads after init.
-        hive_bridge = HiveFeeIntelligenceBridge(safe_plugin, database, config=config)
-        hive_bridge._init_complete = False  # Block hive calls until init finishes
-        hive_loaded = False
-        max_attempts = 6
-        for attempt in range(max_attempts):
-            try:
-                plugins = safe_plugin.rpc.plugin("list")
-                hive_loaded = any(
-                    "cl-hive" in p.get("name", "") and p.get("active", False)
-                    for p in plugins.get("plugins", [])
-                )
-                if hive_loaded:
-                    break
-            except Exception as e:
-                plugin.log(f"Plugin list check failed: {e}", level="debug")
-            if attempt < max_attempts - 1:
-                wait = 3 if attempt < 2 else 5
-                plugin.log(f"Waiting for cl-hive (attempt {attempt + 1}/{max_attempts})...")
-                # EH-4: Use shutdown_event.wait() so init retry loop is interruptible
-                shutdown_event.wait(wait)
-
-        if hive_loaded:
-            # cl-hive is loaded — report hive mode for startup logging.
-            # Don't seed _hive_available: plugin-to-plugin RPCs are blocked
-            # during init (CLN holds a lock), so background threads must not
-            # attempt hive calls until init completes.  Leave the cache
-            # empty so the first post-init is_available() probe will verify
-            # membership via plugin list.
-            plugin.log("=" * 60)
-            plugin.log("HIVE MODE ACTIVE: cl-hive detected")
-            plugin.log("Hive features enabled:")
-            plugin.log("  - Coordinated fee recommendations")
-            plugin.log("  - Fleet-wide fee intelligence")
-            plugin.log("  - Rebalancing conflict detection")
-            plugin.log("  - Collective defense against drain attacks")
-            plugin.log("  - Anticipatory liquidity predictions")
-            plugin.log("Membership will be verified after init completes")
-            plugin.log("=" * 60)
-        elif config.hive_enabled == 'true':
-            # Required mode but hive not available - warn but continue
-            plugin.log("=" * 60, level='warn')
-            plugin.log("WARNING: hive-enabled=true but cl-hive not loaded!", level='warn')
-            plugin.log("Possible reasons:", level='warn')
-            plugin.log("  - cl-hive plugin not installed or failed to start", level='warn')
-            plugin.log("Hive features will activate when cl-hive becomes available", level='warn')
-            plugin.log("Plugin will continue in standalone mode", level='warn')
-            plugin.log("=" * 60, level='warn')
-        else:
-            plugin.log("=" * 60)
-            plugin.log("STANDALONE MODE: cl-hive not detected (hive-enabled=auto)")
-            plugin.log("All fee optimization and rebalancing will use local-only algorithms")
-            plugin.log("To join a hive: open a channel to any hive member")
-            plugin.log("=" * 60)
-
-    # Initialize profitability analyzer with hive bridge for NNLB health reporting
+    # Initialize profitability analyzer
     profitability_analyzer = ChannelProfitabilityAnalyzer(
-        safe_plugin, config, database, hive_bridge=hive_bridge
+        safe_plugin, config, database
     )
 
-    # Initialize analysis modules with profitability analyzer and hive bridge
+    # Initialize analysis modules
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
-    flow_analyzer.hive_bridge = hive_bridge
-    capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager)
-    capacity_planner.hive_bridge = hive_bridge
-    fee_controller = PIDFeeController(
+    capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager, config=config)
+    fee_controller = FeeController(
         safe_plugin,
         config,
         database,
         policy_manager,
         profitability_analyzer,
-        hive_bridge,
-        temporary_fee_overlay_active=_is_realtime_surge_overlay_active,
     )
     rebalancer = EVRebalancer(
         safe_plugin, config, database, policy_manager,
-        hive_bridge=hive_bridge
     )
-    gossip_keeper = GossipKeepaliveManager(safe_plugin, config, hive_bridge=hive_bridge)
     rebalancer.set_profitability_analyzer(profitability_analyzer)
+    rebalancer.set_capacity_planner(capacity_planner)
     # Unified liquidity-cost accounting:
     # - Rebalancer sees Boltz spend as external liquidity cost
     # - Boltz manager sees rebalance spend/reservations as external liquidity cost
@@ -1626,54 +1419,24 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         boltz_manager.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
         boltz_manager.global_budget_limit_provider = _total_cost_budget_limit_provider
 
-    # =========================================================================
-    # Hive Settlement / Yield Reporting (Issue #42)
-    # =========================================================================
-    # cl-hive supports settlement based on net yield (revenue - costs). We report
-    # routing revenue and operating costs periodically so the fleet can settle
-    # fairly across members with different rebalance spend profiles.
-    YIELD_REPORT_WINDOW_DAYS = 30
-    YIELD_REPORT_INTERVAL_SECONDS = 6 * 3600  # report at most every 6 hours
-    last_yield_report_time = 0
+    # Hive Hints adapter (sole integration boundary with cl_hive)
+    global hive_hints
+    if config.hive_hints_enabled:
+        hive_hints = HiveHintAdapter(
+            safe_plugin,
+            ttl_override=config.hive_hints_ttl_seconds,
+        )
+        plugin.log("HiveHintAdapter initialized — fleet hint bias enabled")
+    else:
+        hive_hints = None
 
-    def _maybe_report_yield_and_costs() -> None:
-        nonlocal last_yield_report_time
-        if not hive_bridge:
-            return
-        try:
-            if not hive_bridge.is_available():
-                return
-        except Exception as e:
-            plugin.log(f"Hive availability check failed: {e}", level='debug')
-            return
+    if fee_controller is not None:
+        fee_controller.hive_hints = hive_hints
+    if rebalancer is not None:
+        rebalancer.hive_hints = hive_hints
+    if capacity_planner is not None:
+        capacity_planner.hive_hints = hive_hints
 
-        now = int(time.time())
-        if last_yield_report_time and (now - last_yield_report_time) < YIELD_REPORT_INTERVAL_SECONDS:
-            return
-
-        try:
-            tlv = profitability_analyzer.get_tlv().get("tlv_sats", 0)
-            pnl = profitability_analyzer.get_pnl_summary(window_days=YIELD_REPORT_WINDOW_DAYS)
-            # H3 FIX: Include Boltz costs in yield report for settlement visibility
-            boltz_cost_sats = 0
-            if boltz_manager is not None:
-                try:
-                    boltz_comps = boltz_manager.get_boltz_cost_components(window_hours=YIELD_REPORT_WINDOW_DAYS * 24)
-                    boltz_cost_sats = int(boltz_comps.get("spent_24h_sats", 0) or 0)
-                except Exception:
-                    pass
-            hive_bridge.report_yield_and_costs(
-                tlv_sats=int(tlv or 0),
-                operating_costs_sats=int(pnl.get("opex_sats", 0) or 0),
-                routing_revenue_sats=int(pnl.get("gross_revenue_sats", 0) or 0),
-                rebalance_costs_sats=int(pnl.get("rebalance_cost_sats", 0) or 0),
-                period_days=YIELD_REPORT_WINDOW_DAYS,
-                boltz_costs_sats=boltz_cost_sats,
-            )
-            last_yield_report_time = now
-        except Exception as e:
-            plugin.log(f"Hive yield/cost report failed (non-fatal): {e}", level="debug")
-    
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
     # We use daemon threads so they don't block shutdown
@@ -1729,10 +1492,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
 
         while not shutdown_event.is_set():
+            # Poll hive hints once per fee cycle
+            if hive_hints is not None:
+                try:
+                    hive_hints.poll()
+                except Exception:
+                    pass  # fail-open
+
             try:
                 plugin.log("Running scheduled fee adjustment...")
                 run_fee_adjustment()
-                _maybe_report_yield_and_costs()
             except (RPCTimeoutError, RPCBreakerOpen) as e:
                 plugin.log(f"RPC degraded in fee adjustment: {e}. Skipping this cycle.", level='warn')
             except Exception as e:
@@ -1783,86 +1552,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 plugin.log("Rebalance check loop stopping due to shutdown signal")
                 break
     
-    def _boltz_auto_cycle_mark_state(**updates):
-        with _boltz_auto_cycle_state_lock:
-            _boltz_auto_cycle_state.update(updates)
-
-    def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> Dict[str, Any]:
-        """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight)."""
-        if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
-            result = {
-                'status': 'disabled',
-                'reason': 'boltz integration disabled',
-                'trigger': trigger,
-            }
-            _boltz_auto_cycle_mark_state(last_result=result, last_error=None, enabled=False)
-            return result
-
-        cfg = config.snapshot() if config else None
-        enabled = bool(getattr(cfg, 'boltz_auto_cycle_enabled', True)) if cfg else True
-        _boltz_auto_cycle_mark_state(enabled=enabled)
-        if not enabled and not force:
-            result = {
-                'status': 'disabled',
-                'reason': 'boltz auto-cycle disabled by config',
-                'trigger': trigger,
-            }
-            _boltz_auto_cycle_mark_state(last_result=result, last_error=None)
-            return result
-
-        # L-1 FIX: Guard lock release with acquired flag to prevent RuntimeError
-        acquired = _boltz_auto_cycle_run_lock.acquire(blocking=False)
-        if not acquired:
-            result = {'status': 'skipped', 'reason': 'auto-cycle already running', 'trigger': trigger}
-            _boltz_auto_cycle_mark_state(last_result=result)
-            return result
-
-        try:
-            started = int(time.time())
-            start_monotonic = time.monotonic()
-            _boltz_auto_cycle_mark_state(
-                running=True,
-                last_trigger=trigger,
-                last_started_ts=started,
-                last_error=None,
-            )
-            max_actions = max(1, int(getattr(cfg, 'boltz_auto_cycle_max_actions', 1) if cfg else 1))
-            result = revenue_boltz_balance_cycle(
-                plugin=plugin,
-                dry_run=False,
-                max_actions=max_actions,
-                allow_concurrent_swaps=False,
-                loop_in_currency='LBTC',
-                loop_out_currency='LBTC',
-            )
-            status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
-            if isinstance(result, dict) and 'error' in result:
-                with _boltz_auto_cycle_state_lock:
-                    _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
-                _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
-            else:
-                # C3 FIX: Only reset error counter on actual success, not on blocked/other states
-                status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
-                if status in ('executed', 'dry_run'):
-                    with _boltz_auto_cycle_state_lock:
-                        _boltz_auto_cycle_state['consecutive_errors'] = 0
-                _boltz_auto_cycle_mark_state(last_error=None)
-            return result if isinstance(result, dict) else {'status': status, 'result': result}
-        except Exception as e:
-            with _boltz_auto_cycle_state_lock:
-                _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
-            _boltz_auto_cycle_mark_state(last_error=str(e))
-            raise
-        finally:
-            finished = int(time.time())
-            duration_ms = int((time.monotonic() - start_monotonic) * 1000)
-            with _boltz_auto_cycle_state_lock:
-                _boltz_auto_cycle_state['running'] = False
-                _boltz_auto_cycle_state['last_finished_ts'] = finished
-                _boltz_auto_cycle_state['last_duration_ms'] = duration_ms
-                # Preserve last_result if set by success/skip/disabled path, otherwise leave as-is.
-            _boltz_auto_cycle_run_lock.release()
-
     def boltz_auto_cycle_loop():
         """Background loop for profit-gated Boltz auto-balance cycles."""
         if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
@@ -1909,6 +1598,56 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
         _boltz_auto_cycle_mark_state(next_run_ts=None, running=False)
 
+    def capacity_planner_loop():
+        """Background loop for automated capacity planning."""
+        if not config.planner_enabled:
+            plugin.log("Capacity planner disabled, loop not started", level='debug')
+            return
+
+        # Respect the interval from the last cycle (survives restarts).
+        # Fall back to a warmup delay if no prior cycle exists.
+        warmup_delay = 300
+        startup_delay = warmup_delay
+        try:
+            if database:
+                recent = database.get_planner_actions(limit=1)
+                if recent:
+                    last_ts = recent[0].get("created_at", 0)
+                    elapsed = int(time.time()) - last_ts
+                    interval = max(600, config.planner_interval if hasattr(config, 'planner_interval') else 21600)
+                    remaining = interval - elapsed
+                    if remaining > 0:
+                        startup_delay = remaining
+                        plugin.log(f"Planner: last cycle {elapsed}s ago, waiting {remaining}s", level='info')
+                    else:
+                        plugin.log(f"Planner: last cycle {elapsed}s ago, starting after warmup", level='info')
+        except Exception:
+            pass  # Fall back to default warmup delay
+
+        if shutdown_event.wait(startup_delay):
+            return
+
+        while not shutdown_event.is_set():
+            try:
+                plugin.log("Running scheduled capacity planner cycle...")
+                result = capacity_planner.execute_cycle()
+                if result.get("skipped"):
+                    plugin.log(f"Planner cycle skipped: {result.get('reason')}", level='debug')
+                else:
+                    opens = len(result.get("opens", []))
+                    closes = len(result.get("closes", []))
+                    plugin.log(f"Planner cycle complete: {opens} opens, {closes} closes")
+            except Exception as e:
+                plugin.log(f"Error in capacity planner cycle: {e}", level='error')
+                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+
+            cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+            interval = max(600, cfg_snap.planner_interval)
+            jitter = int(interval * 0.2)
+            sleep_time = interval + random.randint(-jitter, jitter)
+            if shutdown_event.wait(sleep_time):
+                break
+
     def snapshot_peers_delayed():
         """
         One-time delayed snapshot of connected peers.
@@ -1945,7 +1684,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     def financial_snapshot_loop():
         """
-        Background loop for daily financial snapshots (Phase 8: Dashboard).
+        Background loop for daily financial snapshots (Dashboard).
 
         Takes a snapshot of TLV, balances, and accumulated P&L metrics
         once every 24 hours for historical trend analysis.
@@ -2015,43 +1754,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             f"channels={tlv_data.get('channel_count', 0)}"
         )
 
-    def gossip_maintenance_loop():
-        """Background loop for gossip keepalive maintenance."""
-        startup_delay = 60
-        interval_seconds = 300
-
-        if shutdown_event.wait(startup_delay):
-            plugin.log("Gossip maintenance loop cancelled during startup delay")
-            return
-
-        while not shutdown_event.is_set():
-            try:
-                run_gossip_maintenance()
-            except Exception as e:
-                plugin.log(f"Error in gossip maintenance loop: {e}", level='warn')
-                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-
-            if shutdown_event.wait(interval_seconds):
-                plugin.log("Gossip maintenance loop stopping due to shutdown signal")
-                break
-
-    def realtime_surge_defense_loop():
-        """Background loop that executes queued surge-defense fee overlays."""
-        interval_seconds = 1
-
-        while not shutdown_event.is_set():
-            try:
-                if realtime_surge_defense is not None:
-                    _refresh_realtime_surge_channel_cache()
-                    realtime_surge_defense.process_pending_actions()
-            except Exception as e:
-                plugin.log(f"Error in realtime surge defense worker: {e}", level='warn')
-                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-
-            if shutdown_event.wait(interval_seconds):
-                plugin.log("Realtime surge defense loop stopping due to shutdown signal", level='debug')
-                break
-
     # =========================================================================
     # STARTUP HYGIENE: Clean up orphan jobs from previous runs
     # =========================================================================
@@ -2088,15 +1790,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
-    threading.Thread(target=gossip_maintenance_loop, daemon=True, name="gossip-maintenance").start()
     threading.Thread(target=boltz_auto_cycle_loop, daemon=True, name="boltz-auto-cycle").start()
-    if realtime_surge_defense is not None:
-        threading.Thread(target=realtime_surge_defense_loop, daemon=True, name="realtime-surge-defense").start()
-
-    # Signal that init is complete — hive bridge can now make plugin-to-plugin
-    # RPCs safely (CLN releases its lock after init returns).
-    if hive_bridge:
-        hive_bridge.mark_init_complete()
+    threading.Thread(target=capacity_planner_loop, daemon=True, name="capacity-planner").start()
 
     plugin.log("cl-revenue-ops plugin initialized successfully!")
     return None
@@ -2130,69 +1825,23 @@ def run_flow_analysis():
         balanced = sum(1 for r in results.values() if r.state.is_balanced)
         plugin.log(f"Channel states: {sources} sources, {sinks} sinks, {balanced} balanced")
         
-        # Apply reputation decay (Phase 3: Time-windowing)
+        # Apply reputation decay (Time-windowing)
         # This ensures recent peer behavior matters more than ancient history
         if database and config and config.enable_reputation:
             database.decay_reputation(config.reputation_decay)
             plugin.log(f"Applied reputation decay (factor={config.reputation_decay})")
-
-        # Report flow observations to cl-hive for temporal pattern detection
-        if hive_bridge and hive_bridge.is_available():
-            reported = 0
-            for channel_id, metrics in results.items():
-                try:
-                    hive_bridge.report_flow_observation(
-                        channel_id=channel_id,
-                        inbound_sats=metrics.sats_in,
-                        outbound_sats=metrics.sats_out
-                    )
-                    reported += 1
-                except Exception as e:
-                    plugin.log(f"Flow observation report failed for {channel_id[:12]}...: {e}", level='debug')
-            if reported > 0:
-                plugin.log(f"Reported {reported} flow observations to cl-hive")
-
-        # Report graduated traffic profiles to cl-hive for fleet sharing
-        if flow_analyzer and hasattr(flow_analyzer, 'report_graduated_profiles'):
-            try:
-                graduated = flow_analyzer.report_graduated_profiles(results)
-                if graduated > 0:
-                    plugin.log(f"Reported {graduated} graduated traffic profiles to cl-hive")
-            except Exception as e:
-                plugin.log(f"Traffic profile reporting failed: {e}", level='debug')
 
     except Exception as e:
         plugin.log(f"Flow analysis failed: {e}", level='error')
         raise
 
 
-def run_gossip_maintenance():
-    """Run one gossip keepalive maintenance cycle."""
-    if gossip_keeper is None or config is None:
-        return
-
-    cfg = config.snapshot() if hasattr(config, 'snapshot') else config
-    if not getattr(cfg, 'enable_gossip_keepalives', False):
-        return
-
-    gossip_keeper.config = cfg
-    result = gossip_keeper.maintain_connections()
-    if isinstance(result, dict):
-        attempted = int(result.get('attempted', 0) or 0)
-        connected = int(result.get('connected', 0) or 0)
-        if attempted > 0 or connected > 0:
-            plugin.log(
-                f"Gossip maintenance: attempted={attempted} connected={connected} "
-                f"target={result.get('target')} connected_count={result.get('connected_count')}",
-                level='debug',
-            )
-
 
 def run_fee_adjustment():
     """
-    Module 2: Hill Climbing Fee Controller (Dynamic Pricing)
-    
-    Adjust channel fees using Perturb & Observe optimization.
+    Module 2: DTS+PID Fee Controller (Dynamic Pricing)
+
+    Adjust channel fees using DTS+PID optimization.
     """
     if fee_controller is None:
         plugin.log("Fee controller not initialized", level='error')
@@ -2235,58 +1884,6 @@ def run_rebalance_check():
 # =============================================================================
 
 
-def _default_realtime_surge_defense_status() -> Dict[str, Any]:
-    """Return a stable status payload even when surge defense is unavailable."""
-    return {
-        "enabled": bool(config and getattr(config, "enable_realtime_surge_defense", False)),
-        "active_channel_count": 0,
-        "trigger_count_1h": 0,
-        "trigger_count_24h": 0,
-        "channels": {},
-    }
-
-
-def _normalize_realtime_surge_defense_status(raw_status: Any) -> Dict[str, Any]:
-    """Ensure revenue-status always returns the full surge-defense surface."""
-    status = _default_realtime_surge_defense_status()
-    if not isinstance(raw_status, dict):
-        return status
-
-    status["enabled"] = bool(raw_status.get("enabled", status["enabled"]))
-
-    for key in ("active_channel_count", "trigger_count_1h", "trigger_count_24h"):
-        try:
-            status[key] = max(0, int(raw_status.get(key, status[key])))
-        except (TypeError, ValueError):
-            continue
-
-    raw_channels = raw_status.get("channels")
-    if isinstance(raw_channels, dict):
-        normalized_channels = {}
-        for channel_id, raw_channel in raw_channels.items():
-            channel_status = dict(raw_channel) if isinstance(raw_channel, dict) else {}
-
-            cooldown_remaining_sec = channel_status.get(
-                "cooldown_remaining_sec",
-                channel_status.get("cooldown_remaining_seconds", 0.0),
-            )
-            try:
-                cooldown_remaining_sec = max(0.0, float(cooldown_remaining_sec))
-            except (TypeError, ValueError):
-                cooldown_remaining_sec = 0.0
-
-            channel_status.setdefault("active", False)
-            channel_status.setdefault("baseline_fee_ppm", None)
-            channel_status.setdefault("active_fee_ppm", None)
-            channel_status.setdefault("last_trigger_reason", "")
-            channel_status.setdefault("last_apply_result", "idle")
-            channel_status["cooldown_remaining_sec"] = cooldown_remaining_sec
-            normalized_channels[str(channel_id)] = channel_status
-
-        status["channels"] = normalized_channels
-
-    return status
-
 @plugin.method("revenue-status")
 def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     """
@@ -2312,11 +1909,6 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
             "public_keys": config.public_runtime_keys() if config else [],
             "values": config.public_runtime_dict() if config else {},
         },
-        "realtime_surge_defense": (
-            _normalize_realtime_surge_defense_status(realtime_surge_defense.get_status())
-            if realtime_surge_defense and hasattr(realtime_surge_defense, "get_status")
-            else _default_realtime_surge_defense_status()
-        ),
         "fee_decision": (
             fee_controller.get_last_decision_summary()
             if fee_controller and hasattr(fee_controller, "get_last_decision_summary")
@@ -2340,97 +1932,9 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
         ),
         "channel_states": channel_states,
         "recent_fee_changes": fee_history,
-        "recent_rebalances": rebalance_history
+        "recent_rebalances": rebalance_history,
+        "hive_hints": hive_hints.get_status() if hive_hints else {"snapshot_fresh": False, "hints_count": 0},
     }
-
-
-@plugin.method("revenue-hive-status")
-def revenue_hive_status(plugin: Plugin) -> Dict[str, Any]:
-    """
-    Get the current hive integration status.
-
-    Shows whether hive mode is enabled, active, and available features.
-
-    Usage: lightning-cli revenue-hive-status
-    """
-    try:
-        result = {
-            "hive_enabled_setting": config.hive_enabled if config else "unknown",
-            "mode": "unknown",
-            "hive_bridge_initialized": hive_bridge is not None,
-            "cl_hive_available": False,
-            "features": {
-                "coordinated_fees": False,
-                "fleet_intelligence": False,
-                "rebalance_coordination": False,
-                "collective_defense": False,
-                "anticipatory_liquidity": False,
-                "time_based_fees": False
-            },
-            "bridge_status": None,
-            "recommendations": []
-        }
-
-        if config is None:
-            result["error"] = "Plugin not fully initialized"
-            return result
-
-        # Determine mode and availability
-        if config.hive_enabled == 'false':
-            result["mode"] = "standalone"
-            result["recommendations"].append(
-                "Hive integration is disabled. To enable, set revenue-ops-hive-enabled=auto or true"
-            )
-        elif hive_bridge is None:
-            result["mode"] = "standalone"
-            result["recommendations"].append(
-                "Hive bridge not initialized. Check plugin startup logs."
-            )
-        else:
-            # Check if cl-hive is available
-            result["cl_hive_available"] = hive_bridge.is_available()
-
-            if result["cl_hive_available"]:
-                result["mode"] = "hive"
-                result["features"] = {
-                    "coordinated_fees": True,
-                    "fleet_intelligence": True,
-                    "rebalance_coordination": True,
-                    "collective_defense": True,
-                    "anticipatory_liquidity": True,
-                    "time_based_fees": True
-                }
-            else:
-                result["mode"] = "standalone_degraded" if config.hive_enabled == 'true' else "standalone"
-                if config.hive_enabled == 'true':
-                    result["recommendations"].append(
-                        "hive-enabled=true but hive mode not active. Check if cl-hive is loaded and you are a member."
-                    )
-                    result["recommendations"].append(
-                        "To join a hive: open a channel to any hive member (permissionless join)"
-                    )
-                else:
-                    result["recommendations"].append(
-                        "Not a hive member. Operating in standalone mode."
-                    )
-                    result["recommendations"].append(
-                        "To join a hive: install cl-hive and open a channel to any hive member"
-                    )
-
-            # Get bridge status for diagnostics
-            result["bridge_status"] = hive_bridge.get_status()
-
-        # Add hive-specific config
-        result["hive_config"] = {
-            "hive_fee_ppm": config.hive_fee_ppm,
-            "hive_rebalance_tolerance": config.hive_rebalance_tolerance
-        }
-
-        return result
-
-    except Exception as e:
-        plugin.log(f"Error in revenue-hive-status: {e}", level='error')
-        return {"error": f"Hive status query failed: {e}"}
 
 
 @plugin.method("revenue-rebalance-debug")
@@ -2753,6 +2257,7 @@ def revenue_rebalance_debug(
     except Exception as e:
         result["channels"]["error"] = str(e)
 
+    result["hive_hints"] = hive_hints.get_status() if hive_hints else {"snapshot_fresh": False, "hints_count": 0}
     return result
 
 
@@ -2762,7 +2267,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     Diagnostic command to understand why fee adjustments may not be happening.
 
     Shows:
-    - Hill Climb state for each channel (sleeping, last_update, forward count)
+    - Cycle state for each channel (sleeping, last_update, forward count)
     - Why each channel was skipped in the last cycle
     - Dynamic window status
     - Hysteresis/sleep status
@@ -2773,11 +2278,9 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         return {"error": "Plugin not fully initialized"}
 
     # Import fee controller constants for accurate debug output
-    from modules.fee_controller import HillClimbingFeeController
-    min_obs_hours = HillClimbingFeeController.MIN_OBSERVATION_HOURS
-    min_forwards = HillClimbingFeeController.MIN_FORWARDS_FOR_SIGNAL
-    max_obs_hours = HillClimbingFeeController.MAX_OBSERVATION_HOURS
-    enable_dyn_windows = HillClimbingFeeController.ENABLE_DYNAMIC_WINDOWS
+    from modules.fee_controller import FeeController
+    min_obs_hours = FeeController.MIN_OBSERVATION_HOURS
+    min_forwards = FeeController.MIN_FORWARDS_FOR_SIGNAL
 
     now = int(time.time())
     result = {
@@ -2786,16 +2289,6 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "fee_interval_seconds": config.fee_interval if config else 1800,
             "min_observation_hours": min_obs_hours,
             "min_forwards_for_signal": min_forwards,
-            "max_observation_hours": max_obs_hours,
-            "enable_dynamic_windows": enable_dyn_windows,
-            "auto_band_enabled": bool(getattr(config, "auto_band_enabled", False)) if config else False,
-            "auto_band_min_observations": int(getattr(config, "auto_band_min_observations", 20)) if config else 20,
-            "auto_band_sigma": float(getattr(config, "auto_band_sigma", 2.0)) if config else 2.0,
-            "auto_band_min_width_ppm": int(getattr(config, "auto_band_min_width_ppm", 50)) if config else 50,
-            "auto_band_recalibrate_interval": int(getattr(config, "auto_band_recalibrate_interval", 10)) if config else 10,
-            "enable_hive_egress_desaturation_bias": bool(getattr(config, "enable_hive_egress_desaturation_bias", True)) if config else True,
-            "hive_egress_desaturation_bias_max_ppm": int(getattr(config, "hive_egress_desaturation_bias_max_ppm", 100)) if config else 100,
-            "hive_egress_desaturation_bias_weight": float(getattr(config, "hive_egress_desaturation_bias_weight", 0.5)) if config else 0.5,
         },
         "channels": [],
         "summary": {
@@ -2826,8 +2319,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         hours_since_update = (now - last_update) / 3600.0 if last_update > 0 else 0.0
 
         # Determine skip reason
-        # With ENABLE_DYNAMIC_WINDOWS=True and OR logic:
-        # Channel is ready if EITHER time >= min_obs_hours OR forwards >= min_forwards
+        # Dynamic windows: channel is ready if EITHER time >= min_obs_hours OR forwards >= min_forwards
         skip_reason = None
         status = "ready"
 
@@ -2841,57 +2333,15 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             skip_reason = f"SLEEPING (wake in {mins_until_wake} min)"
             status = "sleeping"
             result["summary"]["sleeping"] += 1
-        elif enable_dyn_windows and (time_ok or forwards_ok):
-            # OR logic: either condition met = ready
+        elif time_ok or forwards_ok:
             status = "ready"
             result["summary"]["ready"] += 1
-        elif not enable_dyn_windows and time_ok:
-            # Legacy: time-only check
-            status = "ready"
-            result["summary"]["ready"] += 1
-        elif not time_ok and not forwards_ok:
-            # Neither condition met - waiting for either
+        else:
             skip_reason = f"WAITING ({forward_count}/{min_forwards} fwds, {hours_since_update:.1f}/{min_obs_hours}h)"
             status = "waiting"
             result["summary"]["waiting_time"] += 1
-        else:
-            status = "ready"
-            result["summary"]["ready"] += 1
 
         chan_state = state_lookup.get(channel_id, {})
-        peer_id = chan_state.get("peer_id")
-        effective_autoband = None
-        auto_band = None
-        hive_egress_desaturation_bias = None
-        if fee_controller is not None:
-            if peer_id and hasattr(fee_controller, "_get_effective_dynamic_fee_autoband_ppm"):
-                band_min_ppm, band_max_ppm, band_source = fee_controller._get_effective_dynamic_fee_autoband_ppm(
-                    channel_id,
-                    peer_id,
-                )
-                if band_min_ppm is not None or band_max_ppm is not None:
-                    effective_autoband = {
-                        "min_ppm": band_min_ppm,
-                        "max_ppm": band_max_ppm,
-                        "source": band_source,
-                    }
-            if hasattr(fee_controller, "_get_channel_auto_band"):
-                auto_band_state = fee_controller._get_channel_auto_band(channel_id)
-                if auto_band_state is not None:
-                    auto_band = {
-                        "min_ppm": auto_band_state.min_ppm,
-                        "max_ppm": auto_band_state.max_ppm,
-                        "optimal_fee_ppm": auto_band_state.optimal_fee_ppm,
-                        "posterior_std": auto_band_state.posterior_std,
-                        "observation_count": auto_band_state.observation_count,
-                        "sigma": auto_band_state.sigma,
-                        "min_width_ppm": auto_band_state.min_width_ppm,
-                        "last_calibrated": auto_band_state.last_calibrated,
-                        "source": auto_band_state.source,
-                    }
-            if hasattr(fee_controller, "_get_last_hive_egress_desaturation_bias"):
-                hive_egress_desaturation_bias = fee_controller._get_last_hive_egress_desaturation_bias(channel_id)
-
         result["channels"].append({
             "channel_id": channel_id[:12] + "..." if len(channel_id) > 12 else channel_id,
             "status": status,
@@ -2902,12 +2352,10 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "last_broadcast_fee_ppm": last_broadcast_fee,
             "last_revenue_rate": round(last_revenue_rate, 2),
             "flow_state": chan_state.get("state", "unknown"),
-            "effective_autoband": effective_autoband,
-            "auto_band": auto_band,
-            "hive_egress_desaturation_bias": hive_egress_desaturation_bias,
         })
         result["summary"]["total"] += 1
 
+    result["hive_hints"] = hive_hints.get_status() if hive_hints else {"snapshot_fresh": False, "hints_count": 0}
     return result
 
 
@@ -2962,9 +2410,9 @@ def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
 def revenue_capacity_report(plugin: Plugin, **kwargs):
     """
     Generate a strategic capital redeployment report.
-    
-    Identifies "Winner" channels for capital injection (Splice-In)
-    and "Loser" channels for capital extraction (Splice-Out/Close).
+
+    Identifies "Winner" channels for capital injection
+    and "Loser" channels for capital extraction or closure.
     """
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
@@ -2974,6 +2422,40 @@ def revenue_capacity_report(plugin: Plugin, **kwargs):
     except Exception as e:
         plugin.log(f"Error generating capacity report: {e}", level='error')
         return {"error": f"Report generation failed: {e}"}
+
+
+@plugin.method("revenue-planner-status")
+def revenue_planner_status(plugin: Plugin) -> Dict[str, Any]:
+    """Get capacity planner status — pending actions, last cycle result, config."""
+    if capacity_planner is None:
+        return {"error": "Capacity planner not initialized"}
+    return capacity_planner.get_status()
+
+
+@plugin.method("revenue-planner-candidates")
+def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
+    """List scored peer candidates for channel opens."""
+    if capacity_planner is None:
+        return {"error": "Capacity planner not initialized"}
+    candidates = database.get_planner_candidates(limit=limit)
+    return {"candidates": candidates, "count": len(candidates)}
+
+
+@plugin.method("revenue-planner-execute")
+def revenue_planner_execute(plugin: Plugin) -> Dict[str, Any]:
+    """Manually trigger a capacity planner cycle."""
+    if capacity_planner is None:
+        return {"error": "Capacity planner not initialized"}
+    return capacity_planner.execute_cycle()
+
+
+@plugin.method("revenue-planner-history")
+def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
+    """Get audit log of past planner actions."""
+    if capacity_planner is None:
+        return {"error": "Capacity planner not initialized"}
+    actions = database.get_planner_actions(limit=limit)
+    return {"actions": actions, "count": len(actions)}
 
 
 @plugin.method("revenue-set-fee")
@@ -3020,98 +2502,6 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
         return {"status": "error", "error": str(e)}
 
 
-@plugin.method("revenue-fee-anchor")
-def revenue_fee_anchor(plugin: Plugin,
-                       action: str,
-                       channel_id: str = "",
-                       target_fee_ppm: int = 0,
-                       confidence: float = 1.0,
-                       base_weight: float = 0.7,
-                       ttl_hours: int = 24,
-                       reason: str = "") -> Dict[str, Any]:
-    """
-    Manage advisor fee anchors (soft fee targets with decaying weight).
-
-    Usage:
-      lightning-cli revenue-fee-anchor action=set channel_id=X target_fee_ppm=N [confidence=0.8] [base_weight=0.7] [ttl_hours=24] [reason="..."]
-      lightning-cli revenue-fee-anchor action=list
-      lightning-cli revenue-fee-anchor action=get channel_id=X
-      lightning-cli revenue-fee-anchor action=clear channel_id=X
-      lightning-cli revenue-fee-anchor action=clear-all
-    """
-    if fee_controller is None:
-        return {"error": "Plugin not fully initialized"}
-
-    if getattr(fee_controller, 'ENABLE_SIMPLIFIED_FEE_PATH', False):
-        return {
-            "status": "deprecated",
-            "message": "Fee anchors are deprecated under simplified fee path. "
-                       "Use revenue-policy with fee_multiplier_min/fee_multiplier_max instead.",
-        }
-
-    if action == "set":
-        if not channel_id:
-            return {"status": "error", "error": "channel_id is required for set"}
-        try:
-            target_fee_ppm = int(target_fee_ppm)
-        except (ValueError, TypeError):
-            return {"status": "error", "error": "target_fee_ppm must be an integer"}
-        if target_fee_ppm < 0:
-            return {"status": "error", "error": "target_fee_ppm must be non-negative"}
-
-        # SCID or PeerID format check
-        if not (re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id) or len(channel_id) == 66):
-            return {"status": "error", "error": "Invalid channel_id format"}
-
-        try:
-            ttl_seconds = int(ttl_hours) * 3600
-        except (ValueError, TypeError):
-            return {"status": "error", "error": "ttl_hours must be an integer"}
-        if ttl_seconds < 3600 or ttl_seconds > 604800:
-            return {"status": "error", "error": "ttl_hours must be between 1 hour and 7 days (168 hours)"}
-
-        try:
-            base_weight = float(base_weight)
-        except (ValueError, TypeError):
-            return {"status": "error", "error": "base_weight must be a number"}
-        try:
-            confidence = float(confidence)
-        except (ValueError, TypeError):
-            return {"status": "error", "error": "confidence must be a number"}
-
-        return fee_controller.set_fee_anchor(
-            channel_id=channel_id,
-            target_fee_ppm=target_fee_ppm,
-            base_weight=base_weight,
-            confidence=confidence,
-            ttl_seconds=ttl_seconds,
-            reason=reason,
-        )
-
-    elif action == "list":
-        anchors = fee_controller.list_fee_anchors()
-        return {"status": "success", "anchors": anchors, "count": len(anchors)}
-
-    elif action == "get":
-        if not channel_id:
-            return {"status": "error", "error": "channel_id is required for get"}
-        anchor = fee_controller.get_fee_anchor(channel_id)
-        if anchor is None:
-            return {"status": "success", "anchor": None, "message": "No active anchor"}
-        return {"status": "success", "anchor": anchor}
-
-    elif action == "clear":
-        if not channel_id:
-            return {"status": "error", "error": "channel_id is required for clear"}
-        return fee_controller.clear_fee_anchor(channel_id)
-
-    elif action == "clear-all":
-        return fee_controller.clear_all_fee_anchors()
-
-    else:
-        return {"status": "error", "error": f"Unknown action: {action}. Use set/list/get/clear/clear-all"}
-
-
 @plugin.method("revenue-rebalance")
 def revenue_rebalance(plugin: Plugin,
                       from_channel: str,
@@ -3156,11 +2546,6 @@ def revenue_rebalance(plugin: Plugin,
                 return {"status": "error", "error": "max_fee_sats must be non-negative"}
         except (ValueError, TypeError):
             return {"status": "error", "error": "max_fee_sats must be an integer or null"}
-
-    # Basic SCID format check
-    for cid in (from_channel, to_channel):
-        if not (":" in cid or "x" in cid):
-            return {"status": "error", "error": f"Invalid channel format for {cid}. Use SCID format."}
 
     try:
         result = rebalancer.manual_rebalance(from_channel, to_channel, amount_sats, max_fee_sats, force=force)
@@ -3496,24 +2881,23 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
       lightning-cli revenue-policy list                           # List all policies
       lightning-cli revenue-policy get <peer_id>                  # Get policy for peer
       lightning-cli revenue-policy find <tag>                     # Find peers by tag
-      lightning-cli revenue-policy changes [since=<timestamp>]    # Get policy changes (cl-hive)
+      lightning-cli revenue-policy changes [since=<timestamp>]    # Get policy changes
       lightning-cli revenue-policy set <peer_id> [options]        # Deprecated for normal operator use
       lightning-cli revenue-policy delete <peer_id>               # Deprecated for normal operator use
       lightning-cli revenue-policy tag <peer_id> <tag>            # Deprecated for normal operator use
       lightning-cli revenue-policy untag <peer_id> <tag>          # Deprecated for normal operator use
 
     Options for 'set':
-      strategy=dynamic|static|hive|passive   Fee control strategy
+      strategy=dynamic|static|passive   Fee control strategy
       rebalance=enabled|disabled|source_only|sink_only   Rebalance mode
       fee_ppm=N   Target fee for static strategy (required if strategy=static)
-      fee_multiplier_min=X.Y   Dynamic fee autoband floor multiplier (uses fee_ppm_target as anchor)
-      fee_multiplier_max=X.Y   Dynamic fee autoband ceiling multiplier (uses fee_ppm_target as anchor)
+      fee_multiplier_min=X.Y   Dynamic fee floor multiplier (uses fee_ppm_target as anchor)
+      fee_multiplier_max=X.Y   Dynamic fee ceiling multiplier (uses fee_ppm_target as anchor)
       expires_in_hours=N       Optional auto-expiry for policy (revert to defaults)
 
     Strategies:
-      dynamic  - Hill Climbing + Scarcity Pricing (default)
+      dynamic  - DTS+PID fee optimization (default)
       static   - Fixed fee (requires fee_ppm)
-      hive     - Zero/low fee for fleet members (cl-hive integration)
       passive  - Do not manage (manual control)
 
     Rebalance Modes:
@@ -3522,14 +2906,14 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
       source_only - Can drain from, cannot fill
       sink_only   - Can fill, cannot drain from
 
-    Options for 'changes' (cl-hive integration):
+    Options for 'changes':
       since=<timestamp>   Unix timestamp. Returns policies changed after this time.
                           If omitted, returns all policies.
 
-    Options for 'batch' (cl-hive integration):
+    Options for 'batch':
       updates='[...]'     JSON array of policy updates. Each entry has:
                           peer_id, strategy, rebalance_mode, fee_ppm_target, tags
-                          Bypasses rate limiting for bulk hive fleet updates.
+                          Bypasses rate limiting for bulk batch updates.
 
     Examples:
       lightning-cli revenue-policy set 02abc... strategy=static fee_ppm=500
@@ -3677,7 +3061,7 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
             }
 
         elif action == "changes":
-            # cl-hive integration: Get policy changes since timestamp
+            # Get policy changes since timestamp
             # Usage: revenue-policy changes [since=<timestamp>]
             since = kwargs.get('since', 0)
             try:
@@ -3695,8 +3079,8 @@ def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
             }
 
         elif action == "batch":
-            # cl-hive integration: Bulk policy updates (bypasses rate limiting)
-            # Usage: revenue-policy batch updates='[{"peer_id": "...", "strategy": "hive"}, ...]'
+            # Bulk policy updates (bypasses rate limiting)
+            # Usage: revenue-policy batch updates='[{"peer_id": "...", "strategy": "..."}, ...]'
             updates_json = kwargs.get('updates', '[]')
             try:
                 import json
@@ -3745,23 +3129,21 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
       lightning-cli revenue-report                    # Summary report
       lightning-cli revenue-report summary            # Same as above
       lightning-cli revenue-report peer <peer_id>    # Detailed peer report
-      lightning-cli revenue-report hive              # List hive fleet members
       lightning-cli revenue-report policies          # Policy distribution stats
-      lightning-cli revenue-report costs             # Closure/splice cost history (cl-hive)
+      lightning-cli revenue-report costs             # Closure cost history
 
     Report Types:
       summary   - Overall node P&L, active channels, warnings
       peer      - Specific peer metrics (profitability, flow, policy)
-      hive      - List of peers with HIVE strategy (for cl-hive)
       policies  - Statistics on policy distribution
-      costs     - Closure/splice costs for capacity planning (cl-hive)
+      costs     - Closure costs for capacity planning
     """
     if database is None or policy_manager is None:
         return {"error": "Plugin not initialized"}
     
     try:
         if report_type == "summary":
-            # Basic summary - expand with Phase 8 P&L when available
+            # Basic summary - expand with P&L when available
             all_policies = policy_manager.get_all_policies()
             
             strategy_counts = {}
@@ -3811,15 +3193,6 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
                 "flow_state": flow_state
             }
         
-        elif report_type == "hive":
-            # List all hive members (for cl-hive integration)
-            hive_peers = policy_manager.get_peers_by_strategy(FeeStrategy.HIVE)
-            return {
-                "type": "hive",
-                "peers": [p.to_dict() for p in hive_peers],
-                "count": len(hive_peers)
-            }
-        
         elif report_type == "policies":
             all_policies = policy_manager.get_all_policies()
 
@@ -3849,7 +3222,7 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
             }
 
         elif report_type == "costs":
-            # cl-hive integration: Expose closure/splice/swap costs for capacity planning
+            # Expose closure/swap costs for capacity planning
             now = int(time.time())
             day_ago = now - 86400
             week_ago = now - (7 * 86400)
@@ -3861,20 +3234,11 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
             closure_costs_month = database.get_closure_costs_since(month_ago)
             closure_costs_total = database.get_total_closure_costs()
 
-            splice_costs_day = database.get_splice_costs_since(day_ago)
-            splice_costs_week = database.get_splice_costs_since(week_ago)
-            splice_costs_month = database.get_splice_costs_since(month_ago)
-            splice_costs_total = database.get_total_splice_costs()
-
-            # Get splice summary for detailed breakdown
-            splice_summary = database.get_splice_summary()
-
             # Include default chain cost estimates
             from modules.config import ChainCostDefaults
             estimated_costs = {
                 "channel_open_sats": ChainCostDefaults.CHANNEL_OPEN_COST_SATS,
                 "channel_close_sats": ChainCostDefaults.CHANNEL_CLOSE_COST_SATS,
-                "splice_sats": ChainCostDefaults.SPLICE_COST_SATS,
             }
 
             return {
@@ -3885,19 +3249,12 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
                     "last_30d_sats": closure_costs_month,
                     "total_sats": closure_costs_total
                 },
-                "splice_costs": {
-                    "last_24h_sats": splice_costs_day,
-                    "last_7d_sats": splice_costs_week,
-                    "last_30d_sats": splice_costs_month,
-                    "total_sats": splice_costs_total,
-                    "summary": splice_summary
-                },
                 "estimated_defaults": estimated_costs,
                 "generated_at": now
             }
 
         else:
-            return {"error": f"Unknown report type: {report_type}. Use 'summary', 'peer', 'hive', 'policies', or 'costs'"}
+            return {"error": f"Unknown report type: {report_type}. Use 'summary', 'peer', 'policies', or 'costs'"}
     
     except Exception as e:
         return {"status": "error", "error": f"Report generation failed: {e}"}
@@ -3962,7 +3319,7 @@ def revenue_hot_channel_protection_peers(plugin: Plugin, action: str = "list", p
 @plugin.method("revenue-config")
 def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = None) -> Dict[str, Any]:
     """
-    Get or set runtime configuration (Phase 7: Dynamic Runtime Configuration).
+    Get or set runtime configuration (Dynamic Runtime Configuration).
     
     Usage:
       lightning-cli revenue-config get           # Get public operator controls
@@ -4044,7 +3401,7 @@ def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = No
 @plugin.method("revenue-dashboard")
 def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
     """
-    Phase 8: The Sovereign Dashboard - P&L Engine
+    P&L Engine
 
     Returns financial health metrics and warnings about underperforming channels.
 
@@ -4122,7 +3479,6 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
                 "opex_sats": pnl.get("opex_sats", 0),
                 "rebalance_cost_sats": pnl.get("rebalance_cost_sats", 0),
                 "closure_cost_sats": pnl.get("closure_cost_sats", 0),
-                "splice_cost_sats": pnl.get("splice_cost_sats", 0),
                 "volume_sats": pnl.get("volume_sats", 0),
                 "forward_count": pnl.get("forward_count", 0),
             },
@@ -4171,8 +3527,6 @@ def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
     }
 
     try:
-        import time
-
         # Get all channels currently tracked in channel_states
         tracked_channels = database.get_all_channel_states()
         tracked_ids = {ch['channel_id'] for ch in tracked_channels}
@@ -4317,54 +3671,6 @@ def revenue_clear_reservations(plugin: Plugin) -> Dict[str, Any]:
         plugin.log(f"Error clearing reservations: {e}", level='error')
         return {"error": str(e)}
 
-
-# =============================================================================
-# HOOKS - React to Lightning events
-# =============================================================================
-
-@plugin.hook("htlc_accepted")
-def on_htlc_accepted(onion: Dict, htlc: Dict, plugin: Plugin, **kwargs) -> Dict[str, str]:
-    """
-    Hook called when an HTLC is accepted.
-
-    This hook must stay fail-open and constant-time. It only extracts the live
-    forwarding fields already present on the hook payload and hands them to the
-    in-memory surge-defense manager.
-    """
-    try:
-        if realtime_surge_defense is None:
-            return {"result": "continue"}
-
-        incoming_peer_id = (
-            kwargs.get("peer_id")
-            or kwargs.get("incoming_peer_id")
-            or kwargs.get("peer")
-            or htlc.get("peer_id")
-        )
-        incoming_channel_id = htlc.get("short_channel_id") or htlc.get("channel_id")
-        outgoing_channel_id = kwargs.get("forward_to") or onion.get("forward_to")
-        amount_raw = (
-            htlc.get("amount")
-            or htlc.get("amount_msat")
-            or htlc.get("amount_msatoshi")
-        )
-        amount_msat = _parse_msat(amount_raw or 0)
-
-        if incoming_peer_id and incoming_channel_id and outgoing_channel_id and amount_msat > 0:
-            realtime_surge_defense.ingest_sample(
-                SurgeSample(
-                    ts=time.time(),
-                    amount_msat=amount_msat,
-                    incoming_peer_id=str(incoming_peer_id),
-                    incoming_channel_id=normalize_scid(incoming_channel_id),
-                    outgoing_channel_id=normalize_scid(outgoing_channel_id),
-                )
-            )
-    except Exception as e:
-        plugin.log(f"Realtime surge defense htlc_accepted failed open: {e}", level="debug")
-        plugin.log(f"Traceback: {traceback.format_exc()}", level="debug")
-
-    return {"result": "continue"}
 
 
 def _resolve_scid_to_peer(scid: str) -> Optional[str]:
@@ -4549,26 +3855,6 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
                 # e.g. insufficient outbound balance — the sender did nothing wrong).
                 database.update_peer_reputation(peer_id, is_success=False)
 
-                # Report failure to cl-hive for pheromone evaporation (Yield Optimization Phase 2)
-                if hive_bridge:
-                    try:
-                        out_channel = forward_event.get("out_channel")
-                        out_channel = normalize_scid(out_channel) if out_channel else None
-                        if out_channel:
-                            out_peer_id = _resolve_scid_to_peer(out_channel)
-                            if out_peer_id:
-                                hive_bridge.report_routing_outcome(
-                                    channel_id=out_channel,
-                                    peer_id=out_peer_id,
-                                    fee_ppm=0,  # Unknown for failures
-                                    success=False,
-                                    amount_sats=0,
-                                    source=peer_id,
-                                    destination=out_peer_id,
-                                )
-                    except Exception as e:
-                        plugin.log(f"FORWARD_EVENT: Hive failure report failed: {e}", level="debug")
-
     # Record successful forwards for flow metrics
     if status == "settled":
         out_channel = forward_event.get("out_channel")
@@ -4594,27 +3880,6 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
             resolved_time,
             resolution_duration,
         )
-
-        # Report routing outcome to cl-hive for stigmergic learning (Yield Optimization Phase 2)
-        if hive_bridge and out_channel:
-            try:
-                out_peer_id = _resolve_scid_to_peer(out_channel)
-                in_peer_id = _resolve_scid_to_peer(in_channel) if in_channel else None
-                amount_sats = out_msat // 1000 if out_msat else 0
-                fee_ppm = (fee_msat * 1_000_000 // out_msat) if out_msat > 0 else 0
-
-                if out_peer_id:
-                    hive_bridge.report_routing_outcome(
-                        channel_id=out_channel,
-                        peer_id=out_peer_id,
-                        fee_ppm=fee_ppm,
-                        success=True,
-                        amount_sats=amount_sats,
-                        source=in_peer_id,
-                        destination=out_peer_id,
-                    )
-            except Exception as e:
-                plugin.log(f"FORWARD_EVENT: Hive routing outcome report failed: {e}", level="debug")
 
 
 @plugin.subscribe("connect")
@@ -4749,6 +4014,18 @@ def _on_channel_state_changed_impl(plugin: Plugin, **kwargs):
         plugin.log(f"Channel state change - no channel_id in event: {event}", level='warn')
         return
 
+    # Pre-confirmation states never have an SCID — skip silently
+    pre_confirmation_states = {
+        'CHANNELD_AWAITING_LOCKIN', 'DUALOPEND_AWAITING_LOCKIN',
+        'DUALOPEND_OPEN_INIT', 'OPENINGD',
+    }
+    if new_state in pre_confirmation_states:
+        plugin.log(
+            f"Channel {raw_channel_id[:16]}... entered {new_state} (awaiting confirmation)",
+            level='debug'
+        )
+        return
+
     # Resolve to SCID (events may provide funding txid in `channel_id`)
     channel_id = _resolve_event_channel_scid(event)
     if not channel_id:
@@ -4760,7 +4037,7 @@ def _on_channel_state_changed_impl(plugin: Plugin, **kwargs):
         return
 
     # =========================================================================
-    # Channel Open Detection (Hive Integration)
+    # Channel Open Detection
     # =========================================================================
     # Channel is opened when it transitions TO CHANNELD_NORMAL from opening states
     opening_states = {
@@ -4777,19 +4054,6 @@ def _on_channel_state_changed_impl(plugin: Plugin, **kwargs):
         )
         _handle_channel_open(channel_id, peer_id, old_state, cause)
         # Don't return - continue to allow normal channel handling
-
-    # =========================================================================
-    # Splice Detection (Accounting v2.0)
-    # =========================================================================
-    # Splice is complete when channel transitions FROM CHANNELD_AWAITING_SPLICE
-    # back TO CHANNELD_NORMAL (after splice tx confirms)
-    if old_state == 'CHANNELD_AWAITING_SPLICE' and new_state == 'CHANNELD_NORMAL':
-        plugin.log(
-            f"Splice completed: {channel_id} (was awaiting splice, now normal)",
-            level='info'
-        )
-        _handle_splice_completion(channel_id, peer_id)
-        return
 
     # =========================================================================
     # Closure Detection
@@ -4904,185 +4168,13 @@ def _determine_closer(close_type: str) -> str:
     return 'unknown'
 
 
-def _notify_hive_of_closure(channel_id: str, peer_id: str, closer: str,
-                             close_type: str, capacity_sats: int = 0,
-                             duration_days: int = 0, total_revenue_sats: int = 0,
-                             total_rebalance_cost_sats: int = 0, net_pnl_sats: int = 0,
-                             forward_count: int = 0) -> bool:
-    """
-    Notify cl-hive plugin of a channel closure if it's available.
-
-    ALL closures are sent to cl-hive for topology awareness.
-    Includes full profitability data to help hive members make decisions.
-
-    Args:
-        channel_id: The closed channel ID
-        peer_id: The peer whose channel closed
-        closer: Who initiated: 'local', 'remote', 'mutual', or 'unknown'
-        close_type: Type of closure
-        capacity_sats: Channel capacity that was closed
-        duration_days: How long channel was open
-        total_revenue_sats: Total routing fees earned
-        total_rebalance_cost_sats: Total rebalancing costs
-        net_pnl_sats: Net profit/loss
-        forward_count: Number of forwards routed
-
-    Returns:
-        True if notification was sent successfully
-    """
-    global safe_plugin
-
-    if safe_plugin is None:
-        return False
-
-    try:
-        # Check if cl-hive plugin is available (cached for performance)
-        if not hive_availability_cache.is_available(safe_plugin.rpc):
-            return False
-
-        # Calculate routing score from forward count
-        routing_score = 0.5  # Default mid-range
-        if forward_count > 100:
-            routing_score = 0.9
-        elif forward_count > 50:
-            routing_score = 0.7
-        elif forward_count > 10:
-            routing_score = 0.5
-        elif forward_count > 0:
-            routing_score = 0.3
-        else:
-            routing_score = 0.1
-
-        # Calculate profitability score
-        profitability_score = 0.5
-        if duration_days > 0 and capacity_sats > 0:
-            # Annualized ROC
-            annual_pnl = (net_pnl_sats / duration_days) * 365 if duration_days > 0 else 0
-            roc_pct = (annual_pnl / capacity_sats) * 100 if capacity_sats > 0 else 0
-            if roc_pct > 10:
-                profitability_score = 0.9
-            elif roc_pct > 5:
-                profitability_score = 0.7
-            elif roc_pct > 0:
-                profitability_score = 0.5
-            elif roc_pct > -5:
-                profitability_score = 0.3
-            else:
-                profitability_score = 0.1
-
-        # Get fee rates if available
-        our_fee_ppm = 0
-        their_fee_ppm = 0
-        forward_volume_sats = 0
-        if database:
-            try:
-                # Get our fee rate from strategy state
-                state = database.get_fee_strategy_state(channel_id)
-                if state:
-                    our_fee_ppm = state.get('current_fee_ppm', 0)
-
-                # Estimate volume from revenue
-                if our_fee_ppm > 0 and total_revenue_sats > 0:
-                    forward_volume_sats = (total_revenue_sats * 1_000_000) // our_fee_ppm
-            except Exception as e:
-                plugin.log(f"Forward volume estimation failed for {channel_id[:12]}...: {e}", level='debug')
-
-        # M-9: Use fire_and_forget since return value is only for logging
-        safe_plugin.rpc.fire_and_forget("hive-channel-closed", {
-            "peer_id": peer_id,
-            "channel_id": channel_id,
-            "closer": closer,
-            "close_type": close_type,
-            "capacity_sats": capacity_sats,
-            "duration_days": duration_days,
-            "total_revenue_sats": total_revenue_sats,
-            "total_rebalance_cost_sats": total_rebalance_cost_sats,
-            "net_pnl_sats": net_pnl_sats,
-            "forward_count": forward_count,
-            "forward_volume_sats": forward_volume_sats,
-            "our_fee_ppm": our_fee_ppm,
-            "their_fee_ppm": their_fee_ppm,
-            "routing_score": routing_score,
-            "profitability_score": profitability_score
-        })
-
-        plugin.log(
-            f"Notified cl-hive of closure: {channel_id} by {closer} "
-            f"(pnl={net_pnl_sats}, forwards={forward_count})",
-            level='info'
-        )
-        return True
-
-    except Exception as e:
-        # Log at warn level for visibility; include channel ID for debugging
-        plugin.log(
-            f"Failed to notify cl-hive of channel closure {channel_id}: {e}",
-            level='warn'
-        )
-        return False
-
-
-def _notify_hive_of_open(channel_id: str, peer_id: str, opener: str,
-                          capacity_sats: int = 0, our_funding_sats: int = 0,
-                          their_funding_sats: int = 0) -> bool:
-    """
-    Notify cl-hive plugin of a channel opening if it's available.
-
-    ALL opens are sent to cl-hive for topology awareness.
-
-    Args:
-        channel_id: The new channel ID
-        peer_id: The peer the channel was opened with
-        opener: Who initiated: 'local' or 'remote'
-        capacity_sats: Total channel capacity
-        our_funding_sats: Amount we funded
-        their_funding_sats: Amount they funded
-
-    Returns:
-        True if notification was sent successfully
-    """
-    global safe_plugin
-
-    if safe_plugin is None:
-        return False
-
-    try:
-        # Check if cl-hive plugin is available (cached for performance)
-        if not hive_availability_cache.is_available(safe_plugin.rpc):
-            return False
-
-        # M-9: Use fire_and_forget since return value is only for logging
-        safe_plugin.rpc.fire_and_forget("hive-channel-opened", {
-            "peer_id": peer_id,
-            "channel_id": channel_id,
-            "opener": opener,
-            "capacity_sats": capacity_sats,
-            "our_funding_sats": our_funding_sats,
-            "their_funding_sats": their_funding_sats
-        })
-
-        plugin.log(
-            f"Notified cl-hive of channel open: {channel_id} with {peer_id[:16]}... ({opener})",
-            level='info'
-        )
-        return True
-
-    except Exception as e:
-        # Log at warn level for visibility; include channel ID for debugging
-        plugin.log(
-            f"Failed to notify cl-hive of channel open {channel_id}: {e}",
-            level='warn'
-        )
-        return False
-
-
 def _handle_channel_open(channel_id: str, peer_id: Optional[str],
                           old_state: str, cause: str) -> None:
     """
     Handle a channel open event.
 
     Called when a channel transitions to CHANNELD_NORMAL from an opening state.
-    Notifies cl-hive for topology awareness.
+    Sets initial fee for the new channel.
 
     Args:
         channel_id: The new channel ID
@@ -5096,44 +4188,6 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
         return
 
     try:
-        # Determine opener from old_state and cause
-        # DUALOPEND states typically mean we initiated (dual-funded)
-        # CHANNELD_AWAITING_LOCKIN typically means remote initiated
-        # M-8: Single RPC call for both opener detection and channel details
-        opener = 'unknown'
-        if cause == 'remote':
-            opener = 'remote'
-        elif cause == 'user':
-            opener = 'local'
-
-        capacity_sats = 0
-        our_funding_sats = 0
-        their_funding_sats = 0
-
-        try:
-            channels = safe_plugin.rpc.call("listpeerchannels", {"id": peer_id})
-            for ch in channels.get('channels', []):
-                scid = normalize_scid(ch.get('short_channel_id', ''))
-                if scid == channel_id:
-                    if opener == 'unknown':
-                        opener = ch.get('opener', 'unknown')
-                    capacity_sats = _parse_msat(ch.get('total_msat', 0)) // 1000
-                    our_funding_sats = _parse_msat(ch.get('funding', {}).get('local_funds_msat', 0)) // 1000
-                    their_funding_sats = _parse_msat(ch.get('funding', {}).get('remote_funds_msat', 0)) // 1000
-                    break
-        except Exception as e:
-            plugin.log(f"Failed to get channel details for {channel_id}: {e}", level='debug')
-
-        # Notify cl-hive
-        _notify_hive_of_open(
-            channel_id=channel_id,
-            peer_id=peer_id,
-            opener=opener,
-            capacity_sats=capacity_sats,
-            our_funding_sats=our_funding_sats,
-            their_funding_sats=their_funding_sats
-        )
-
         # Set initial fee immediately so the channel doesn't sit with CLN
         # defaults until the next periodic fee adjustment cycle.
         if fee_controller is not None:
@@ -5257,8 +4311,6 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
         return
 
     try:
-        import time
-
         # Get channel cost data (opening cost)
         channel_cost = database.get_channel_cost(channel_id)
         open_cost_sats = channel_cost.get('open_cost_sats', 0) if channel_cost else 0
@@ -5325,191 +4377,10 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
         # Clean up active tracking tables now that channel is archived
         database.remove_closed_channel_data(channel_id, peer_id)
 
-        # Notify cl-hive of ALL closures for topology awareness
-        # Includes full profitability data to help hive members make decisions
-        if peer_id:
-            days_open = ((now - opened_at) // 86400) if opened_at else 0
-            net_pnl = total_revenue_sats - (open_cost_sats + closure_cost_sats + total_rebalance_cost_sats)
-            _notify_hive_of_closure(
-                channel_id=channel_id,
-                peer_id=peer_id,
-                closer=closer,
-                close_type=close_type,
-                capacity_sats=capacity_sats,
-                duration_days=days_open,
-                total_revenue_sats=total_revenue_sats,
-                total_rebalance_cost_sats=total_rebalance_cost_sats,
-                net_pnl_sats=net_pnl,
-                forward_count=forward_count
-            )
-
     except Exception as e:
         plugin.log(f"Error archiving closed channel {channel_id}: {e}", level='error')
         plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
 
-
-def _handle_splice_completion(channel_id: str, peer_id: Optional[str]) -> None:
-    """
-    Handle a completed splice operation (Accounting v2.0).
-
-    Called when a channel transitions from CHANNELD_AWAITING_SPLICE to CHANNELD_NORMAL,
-    indicating the splice transaction has confirmed.
-
-    Args:
-        channel_id: The channel short ID
-        peer_id: The peer node ID
-    """
-    global database, safe_plugin
-
-    if database is None:
-        return
-
-    try:
-        # Get splice data from bookkeeper
-        splice_data = _get_splice_costs_from_bookkeeper(channel_id)
-
-        if splice_data:
-            splice_type = splice_data.get('splice_type', 'splice_in')
-            amount_sats = splice_data.get('amount_sats', 0)
-            fee_sats = splice_data.get('fee_sats', 0)
-            old_capacity = splice_data.get('old_capacity_sats')
-            new_capacity = splice_data.get('new_capacity_sats')
-            txid = splice_data.get('txid')
-        else:
-            # Fallback: try to determine from channel info
-            splice_type = 'splice_in'  # Assume splice_in if we can't determine
-            amount_sats = 0
-            fee_sats = 0
-            old_capacity = None
-            new_capacity = None
-            txid = None
-
-            # Try to get current capacity from listpeerchannels
-            if safe_plugin:
-                try:
-                    peers = safe_plugin.rpc.listpeerchannels()
-                    for ch in peers.get('channels', []):
-                        scid = normalize_scid(ch.get('short_channel_id', ''))
-                        if scid == channel_id:
-                            new_capacity = _parse_msat(ch.get('total_msat', 0)) // 1000
-                            if not peer_id:
-                                peer_id = ch.get('peer_id')
-                            break
-                except Exception as e:
-                    plugin.log(f"Error getting channel info for splice: {e}", level='debug')
-
-            # Estimate splice fee from config if bookkeeper unavailable
-            from modules.config import ChainCostDefaults
-            fee_sats = ChainCostDefaults.SPLICE_COST_SATS
-
-        # Record the splice
-        database.record_splice(
-            channel_id=channel_id,
-            peer_id=peer_id or 'unknown',
-            splice_type=splice_type,
-            amount_sats=amount_sats,
-            fee_sats=fee_sats,
-            old_capacity_sats=old_capacity,
-            new_capacity_sats=new_capacity,
-            txid=txid
-        )
-
-    except Exception as e:
-        plugin.log(f"Error handling splice completion for {channel_id}: {e}", level='error')
-        plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-
-
-def _get_splice_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Query bookkeeper for on-chain fees related to a splice operation.
-
-    Uses bkpr-listaccountevents to find splice-related events for the channel.
-
-    Args:
-        channel_id: The channel short ID
-
-    Returns:
-        Dict with splice_type, amount_sats, fee_sats, old_capacity_sats, new_capacity_sats, txid
-        or None if bookkeeper unavailable or no splice data found
-    """
-    global safe_plugin
-
-    if safe_plugin is None:
-        return None
-
-    try:
-        # Query bookkeeper for account events
-        events = safe_plugin.rpc.call("bkpr-listaccountevents", {"account": channel_id})
-
-        if not events or 'events' not in events:
-            return None
-
-        # Look for recent splice-related events
-        splice_fee_sats = 0
-        splice_txid = None
-        splice_amount = 0
-
-        # Security: Validate events structure
-        all_events = events.get('events', [])
-        if not isinstance(all_events, list):
-            plugin.log(f"Security: Invalid events structure from bookkeeper for splice {channel_id}", level='warn')
-            return None
-
-        for event in all_events:  # Process oldest to newest
-            # Security: Type check each event is a dict
-            if not isinstance(event, dict):
-                continue
-
-            event_type = event.get('type', '')
-            tag = str(event.get('tag', '')).lower()  # Ensure tag is string
-
-            # Look for splice-related tags
-            # Note: CLN bookkeeper may use tags like 'splice', 'splice_in', 'splice_out'
-            if 'splice' in tag:
-                splice_txid = event.get('txid')
-
-                # Parse msat values safely (handles Millisatoshi objects, strings, ints)
-                credit = parse_msat(event.get('credit_msat', 0))
-                debit = parse_msat(event.get('debit_msat', 0))
-
-                splice_amount = (credit - debit) // 1000  # Convert to sats
-
-            # Accumulate on-chain fees for splice
-            if event_type == 'onchain_fee' and 'splice' in tag:
-                # Security: Type check fee values
-                credit_msat = event.get('credit_msat', 0)
-                debit_msat = event.get('debit_msat', 0)
-
-                # Parse msat values safely (handles Millisatoshi objects, strings, ints)
-                credit_msat = parse_msat(credit_msat)
-                debit_msat = parse_msat(debit_msat)
-
-                fee_msat = max(abs(credit_msat), abs(debit_msat))
-                fee_sats = fee_msat // 1000
-
-                # Security: Bounds check (max 50,000 sats per fee event)
-                fee_sats = min(fee_sats, 50000)
-                splice_fee_sats += fee_sats
-
-        # If we found splice data, return it
-        if splice_txid or splice_fee_sats > 0:
-            # Determine splice type from amount
-            splice_type = 'splice_in' if splice_amount >= 0 else 'splice_out'
-
-            return {
-                'splice_type': splice_type,
-                'amount_sats': abs(splice_amount),
-                'fee_sats': splice_fee_sats,
-                'old_capacity_sats': None,  # Would need to track this separately
-                'new_capacity_sats': None,
-                'txid': splice_txid
-            }
-
-        return None
-
-    except Exception as e:
-        plugin.log(f"Bookkeeper query failed for splice on {channel_id}: {e}", level='debug')
-        return None
 
 
 # =============================================================================
@@ -5538,7 +4409,7 @@ def revenue_spend_ledger(
     include_reservations: bool = False,
     reservation_limit: int = 50,
 ) -> Dict[str, Any]:
-    """Summary of generic spend ledger events/reservations (for opens/closes/splices/etc.)."""
+    """Summary of generic spend ledger events/reservations (for opens/closes/etc.)."""
     if database is None:
         return {"error": "Database not initialized"}
     try:
@@ -5906,7 +4777,7 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     now = int(time.time())
     since = now - (wh * 3600)
 
-    # Best-effort cleanup for generic spend reservations (e.g. channel open/splice
+    # Best-effort cleanup for generic spend reservations (e.g. channel open
     # reservations) so accepted actions that aren't explicitly settled do not block
     # budget for an entire window. Keep timeout bounded and independent from window size.
     try:
@@ -5924,14 +4795,12 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     revenue_sats = int(database.get_total_routing_revenue(since)) if database else 0
     open_cost_sats = int(database.get_opening_costs_since(since)) if database else 0
     closure_cost_sats = int(database.get_closure_costs_since(since)) if database else 0
-    splice_cost_sats = int(database.get_splice_costs_since(since)) if database else 0
 
     actual_by_category = {
         "rebalance": int(rebalance.get("spent_24h_sats", 0) or 0),
         "boltz": int(boltz.get("spent_24h_sats", 0) or 0),
         "open": open_cost_sats,
         "close": closure_cost_sats,
-        "splice": splice_cost_sats,
         "ledger": int(generic_ledger.get("spent_24h_sats", 0) or 0),
     }
     reserved_by_category = {
@@ -5983,7 +4852,6 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
             "generic_ledger": generic_ledger,
             "open_cost_sats": open_cost_sats,
             "closure_cost_sats": closure_cost_sats,
-            "splice_cost_sats": splice_cost_sats,
         },
     }
 
@@ -6108,7 +4976,7 @@ def _boltz_dynamic_channel_tuning(*,
     # Positive velocity means source-ness increasing (more urgently draining) in this model.
     drain_accel_score = max(0.0, min(1.0, kalman_velocity / (0.05 / 24.0)))  # saturate at ~0.05/day (velocity is per-hour)
 
-    # H2 FIX: Hive anticipatory liquidity signal — predicted depletion boosts urgency
+    # Anticipatory liquidity signal -- predicted depletion boosts urgency
     anticipatory_urgency = 0.0
     if predicted_depletion_hours is not None and predicted_depletion_hours > 0:
         # Saturate at 6h: anything <6h gets max urgency
@@ -6333,28 +5201,6 @@ def _build_boltz_balance_plan(
     budget_status = bm.budget()
     pending_swaps = _boltz_pending_swap_count()
 
-    # H2 FIX: Query hive anticipatory data once for all channels
-    _antic_predictions: Dict[str, Any] = {}
-    if hive_bridge is not None:
-        try:
-            antic = hive_bridge.safe_call("hive-anticipatory-status")
-            if isinstance(antic, dict):
-                _antic_predictions = antic.get("channel_predictions", {}) or {}
-        except Exception:
-            pass
-
-    # F2 FIX: Pre-fetch hive rebalance recommendations to check for free fleet paths
-    _hive_rebal_recs: Dict[str, Dict[str, Any]] = {}
-    if hive_bridge is not None:
-        try:
-            rebal_resp = hive_bridge.safe_call("hive-rebalance-recommendations", {"prediction_hours": 24})
-            if isinstance(rebal_resp, dict):
-                for rec_item in (rebal_resp.get("recommendations") or []):
-                    if isinstance(rec_item, dict) and rec_item.get("channel_id"):
-                        _hive_rebal_recs[str(rec_item["channel_id"])] = rec_item
-        except Exception:
-            pass
-
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
@@ -6395,14 +5241,7 @@ def _build_boltz_balance_plan(
                 })
                 continue
 
-        # H2 FIX: Extract per-channel depletion prediction from pre-fetched hive data
         predicted_depletion_hours = None
-        ch_pred = _antic_predictions.get(channel_id, {})
-        if isinstance(ch_pred, dict) and "predicted_depletion_hours" in ch_pred:
-            try:
-                predicted_depletion_hours = float(ch_pred["predicted_depletion_hours"])
-            except (TypeError, ValueError):
-                pass
 
         tuning = _boltz_dynamic_channel_tuning(
             local_pct=local_pct,
@@ -6473,22 +5312,6 @@ def _build_boltz_balance_plan(
             })
             continue
 
-        # F2 FIX: Check hive route availability before recommending Boltz
-        hive_route_available = False
-        hive_rec = _hive_rebal_recs.get(str(channel_id), {})
-        if isinstance(hive_rec, dict) and hive_rec.get("fleet_path_available") and hive_rec.get("recommendation") == "use_fleet_path":
-            hive_route_available = True
-
-        if hive_route_available:
-            skipped.append({
-                "channel_id": channel_id,
-                "peer_id": peer_id,
-                "reason": "hive_route_available",
-                "direction": direction,
-                "note": "Free hive circular rebalance available; skipping Boltz",
-            })
-            continue
-
         try:
             quote_resp = bm.quote(
                 amount_sats=amount_sats,
@@ -6540,8 +5363,6 @@ def _build_boltz_balance_plan(
             "raw_amount_sats": raw_amount,
             "flow_state": flow_state,
             "policy_gate": policy_reason,
-            "hive_route_checked": hive_bridge is not None,
-            "hive_route_available": False,
             "profitability": None if prof is None else {
                 "classification": prof_class,
                 "net_profit_sats": getattr(prof, "net_profit_sats", None),
@@ -6658,6 +5479,9 @@ def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
             "boltz_auto_cycle_interval_minutes": int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15)) if config else None,
             "boltz_auto_cycle_max_actions": int(getattr(config, 'boltz_auto_cycle_max_actions', 1)) if config else None,
             "boltz_auto_cycle_startup_delay_seconds": int(getattr(config, 'boltz_auto_cycle_startup_delay_seconds', 120)) if config else None,
+            "expansion_treasury_enabled": bool(getattr(config, 'expansion_treasury_enabled', False)) if config else None,
+            "expansion_treasury_onchain_target_sats": int(getattr(config, 'expansion_treasury_onchain_target_sats', 5_000_000)) if config else None,
+            "expansion_treasury_min_deficit_sats": int(getattr(config, 'expansion_treasury_min_deficit_sats', 250_000)) if config else None,
         },
     })
     return state

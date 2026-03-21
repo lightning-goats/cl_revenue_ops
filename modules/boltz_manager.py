@@ -1021,10 +1021,11 @@ class BoltzCliManager:
         external = self._get_external_liquidity_costs()
         external_spent = max(0, self._parse_int(external.get("spent_24h_sats"), 0))
         external_reserved = max(0, self._parse_int(external.get("reserved_24h_sats"), 0))
+        local_reserved = max(0, self._parse_int(local.get("reserved_24h_sats"), 0))
         total_spent = boltz_spent + external_spent
-        total_reserved = external_reserved  # Boltz swaps currently do not reserve budget
+        total_reserved = local_reserved + external_reserved
 
-        boltz_remaining = max(0, budget - boltz_spent)
+        boltz_remaining = max(0, budget - boltz_spent - local_reserved)
         remaining = max(0, budget - total_spent - total_reserved)
         return {
             "daily_budget_sats": budget,
@@ -1035,6 +1036,7 @@ class BoltzCliManager:
             # Component breakdowns preserved for visibility and debugging.
             "boltz_spent_24h_sats_estimate": boltz_spent,
             "boltz_remaining_24h_sats_estimate": boltz_remaining,
+            "boltz_reserved_24h_sats_estimate": local_reserved,
             "external_liquidity_costs": external,
             "budget_source": budget_info.get("source"),
             "budget_info": budget_info,

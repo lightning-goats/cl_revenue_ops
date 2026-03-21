@@ -1,10 +1,10 @@
 """
-Tests for PolicyManager - especially cl-hive integration points.
+Tests for PolicyManager - policy management and validation.
 
 Tests:
-- Policy batch operations (bulk updates from cl-hive)
-- Policy changes API (change log for cl-hive sync)
-- HIVE strategy handling
+- Policy batch operations (bulk updates)
+- Policy changes API (change log)
+- Strategy handling (dynamic/static/passive)
 - Rate limiting and validation
 """
 
@@ -41,18 +41,6 @@ class TestPolicyManagerInit:
         assert pm is not None
         assert pm.database == mock_database
 
-    def test_init_loads_policies_from_db(self, mock_database, mock_plugin):
-        """PolicyManager loads existing policies from database on init."""
-        # PolicyManager uses lazy loading, so we need to set the policy explicitly
-        pm = PolicyManager(mock_database, mock_plugin)
-
-        # Set a policy to test retrieval
-        pm.set_policy("02" + "a" * 64, strategy="hive")
-
-        # Should retrieve the policy
-        policy = pm.get_policy("02" + "a" * 64)
-        assert policy.strategy == FeeStrategy.HIVE
-
     def test_internal_set_policy_remains_available_for_coordination_code(self, mock_database, mock_plugin):
         """Direct PolicyManager writes remain available for internal callers."""
         pm = PolicyManager(mock_database, mock_plugin)
@@ -64,7 +52,7 @@ class TestPolicyManagerInit:
 
 
 class TestPolicyBatchOperations:
-    """Test batch policy operations for cl-hive integration."""
+    """Test batch policy operations."""
 
     def test_batch_update_creates_policies(self, mock_database, mock_plugin, sample_policy_updates):
         """Batch update creates multiple policies in one call."""
@@ -75,24 +63,14 @@ class TestPolicyBatchOperations:
         assert len(results) == 3
         assert all(isinstance(p, PeerPolicy) for p in results)
 
-    def test_batch_update_applies_hive_strategy(self, mock_database, mock_plugin, sample_peer_ids):
-        """Batch update correctly sets HIVE strategy."""
-        pm = PolicyManager(mock_database, mock_plugin)
-
-        updates = [{"peer_id": sample_peer_ids[0], "strategy": "hive"}]
-        results = pm.set_policies_batch(updates)
-
-        assert len(results) == 1
-        assert results[0].strategy == FeeStrategy.HIVE
-
     def test_batch_update_applies_rebalance_modes(self, mock_database, mock_plugin, sample_peer_ids):
         """Batch update correctly sets rebalance modes."""
         pm = PolicyManager(mock_database, mock_plugin)
 
         updates = [
-            {"peer_id": sample_peer_ids[0], "strategy": "hive", "rebalance_mode": "sink_only"},
-            {"peer_id": sample_peer_ids[1], "strategy": "hive", "rebalance_mode": "source_only"},
-            {"peer_id": sample_peer_ids[2], "strategy": "hive", "rebalance_mode": "disabled"},
+            {"peer_id": sample_peer_ids[0], "strategy": "dynamic", "rebalance_mode": "sink_only"},
+            {"peer_id": sample_peer_ids[1], "strategy": "static", "rebalance_mode": "source_only"},
+            {"peer_id": sample_peer_ids[2], "strategy": "passive", "rebalance_mode": "disabled"},
         ]
         results = pm.set_policies_batch(updates)
 
@@ -113,7 +91,7 @@ class TestPolicyBatchOperations:
         pm = PolicyManager(mock_database, mock_plugin)
 
         # Create more than MAX_BATCH_SIZE updates
-        updates = [{"peer_id": f"02{'a' * 62}{i:02x}", "strategy": "hive"} for i in range(101)]
+        updates = [{"peer_id": f"02{'a' * 62}{i:02x}", "strategy": "dynamic"} for i in range(101)]
 
         with pytest.raises(ValueError) as exc_info:
             pm.set_policies_batch(updates)
@@ -124,7 +102,7 @@ class TestPolicyBatchOperations:
         """Batch update with invalid peer_id raises ValueError."""
         pm = PolicyManager(mock_database, mock_plugin)
 
-        updates = [{"peer_id": "invalid", "strategy": "hive"}]
+        updates = [{"peer_id": "invalid", "strategy": "dynamic"}]
 
         with pytest.raises(ValueError) as exc_info:
             pm.set_policies_batch(updates)
@@ -156,11 +134,11 @@ class TestPolicyBatchOperations:
 
         # Now update only strategy via batch
         results = pm.set_policies_batch([
-            {"peer_id": sample_peer_ids[0], "strategy": "hive"}
+            {"peer_id": sample_peer_ids[0], "strategy": "dynamic"}
         ])
 
         # Rebalance mode should be preserved
-        assert results[0].strategy == FeeStrategy.HIVE
+        assert results[0].strategy == FeeStrategy.DYNAMIC
         assert results[0].rebalance_mode == RebalanceMode.DISABLED
 
     def test_batch_update_updates_timestamp(self, mock_database, mock_plugin, sample_peer_ids):
@@ -169,7 +147,7 @@ class TestPolicyBatchOperations:
 
         before = int(time.time())
         results = pm.set_policies_batch([
-            {"peer_id": sample_peer_ids[0], "strategy": "hive"}
+            {"peer_id": sample_peer_ids[0], "strategy": "dynamic"}
         ])
         after = int(time.time())
 
@@ -177,7 +155,7 @@ class TestPolicyBatchOperations:
 
 
 class TestPolicyChangesAPI:
-    """Test policy changes API for cl-hive sync."""
+    """Test policy changes API for sync."""
 
     def test_get_policy_changes_since_returns_list(self, mock_database, mock_plugin):
         """get_policy_changes_since returns a list (may be empty with mock db)."""
@@ -223,7 +201,7 @@ class TestPolicyChangesAPI:
         """Policy.to_dict() includes fields needed for changes API."""
         policy = PeerPolicy(
             peer_id=sample_peer_ids[0],
-            strategy=FeeStrategy.HIVE,
+            strategy=FeeStrategy.DYNAMIC,
             rebalance_mode=RebalanceMode.SINK_ONLY,
             updated_at=int(time.time())
         )
@@ -236,42 +214,6 @@ class TestPolicyChangesAPI:
         assert "updated_at" in d
 
 
-class TestHiveStrategy:
-    """Test HIVE strategy specific behavior."""
-
-    def test_hive_strategy_sets_zero_fee_target(self, mock_database, mock_plugin, sample_peer_ids):
-        """HIVE strategy peers should default to zero fee target."""
-        pm = PolicyManager(mock_database, mock_plugin)
-
-        pm.set_policy(sample_peer_ids[0], strategy="hive")
-
-        policy = pm.get_policy(sample_peer_ids[0])
-        assert policy.strategy == FeeStrategy.HIVE
-        # HIVE strategy typically means 0 or very low fee
-
-    def test_hive_strategy_allows_all_rebalance_modes(self, mock_database, mock_plugin, sample_peer_ids):
-        """HIVE strategy works with all rebalance modes."""
-        pm = PolicyManager(mock_database, mock_plugin)
-
-        modes = ["enabled", "disabled", "source_only", "sink_only"]
-
-        for i, mode in enumerate(modes):
-            pm.set_policy(sample_peer_ids[i], strategy="hive", rebalance_mode=mode)
-            policy = pm.get_policy(sample_peer_ids[i])
-            assert policy.strategy == FeeStrategy.HIVE
-            assert policy.rebalance_mode.value == mode
-
-    def test_hive_strategy_can_be_tagged(self, mock_database, mock_plugin, sample_peer_ids):
-        """HIVE strategy peers can have tags applied."""
-        pm = PolicyManager(mock_database, mock_plugin)
-
-        pm.set_policy(sample_peer_ids[0], strategy="hive")
-        pm.add_tag(sample_peer_ids[0], "fleet-member")
-
-        policy = pm.get_policy(sample_peer_ids[0])
-        assert "fleet-member" in policy.tags
-
-
 class TestRateLimiting:
     """Test policy change rate limiting."""
 
@@ -280,10 +222,10 @@ class TestRateLimiting:
         pm = PolicyManager(mock_database, mock_plugin)
 
         # Should not raise
-        pm.set_policy(sample_peer_ids[0], strategy="hive")
+        pm.set_policy(sample_peer_ids[0], strategy="dynamic")
 
         policy = pm.get_policy(sample_peer_ids[0])
-        assert policy.strategy == FeeStrategy.HIVE
+        assert policy.strategy == FeeStrategy.DYNAMIC
 
     def test_batch_bypasses_rate_limit(self, mock_database, mock_plugin, sample_peer_ids):
         """Batch operations bypass per-peer rate limiting."""
@@ -291,9 +233,9 @@ class TestRateLimiting:
 
         # Create many updates (more than rate limit would allow individually)
         updates = [
-            {"peer_id": sample_peer_ids[0], "strategy": "hive"},
             {"peer_id": sample_peer_ids[0], "strategy": "dynamic"},
-            {"peer_id": sample_peer_ids[0], "strategy": "hive"},
+            {"peer_id": sample_peer_ids[0], "strategy": "static"},
+            {"peer_id": sample_peer_ids[0], "strategy": "dynamic"},
         ]
 
         # Should not raise - batch bypasses rate limit
@@ -314,30 +256,30 @@ class TestPeerPolicyDataclass:
         """PeerPolicy.to_dict() returns complete dict representation."""
         policy = PeerPolicy(
             peer_id=sample_peer_ids[0],
-            strategy=FeeStrategy.HIVE,
+            strategy=FeeStrategy.DYNAMIC,
             rebalance_mode=RebalanceMode.ENABLED,
             fee_ppm_target=0,
-            tags=["fleet-member"],
+            tags=["priority"],
             updated_at=int(time.time())
         )
 
         d = policy.to_dict()
 
         assert d["peer_id"] == sample_peer_ids[0]
-        assert d["strategy"] == "hive"
+        assert d["strategy"] == "dynamic"
         assert d["rebalance_mode"] == "enabled"
-        assert "fleet-member" in d["tags"]
+        assert "priority" in d["tags"]
 
     def test_peer_policy_has_tag(self, sample_peer_ids):
         """PeerPolicy.has_tag() correctly checks for tags."""
         policy = PeerPolicy(
             peer_id=sample_peer_ids[0],
-            strategy=FeeStrategy.HIVE,
-            tags=["fleet-member", "priority"]
+            strategy=FeeStrategy.STATIC,
+            tags=["priority", "important"]
         )
 
-        assert policy.has_tag("fleet-member")
         assert policy.has_tag("priority")
+        assert policy.has_tag("important")
         assert not policy.has_tag("other")
 
     def test_peer_policy_default_values(self, sample_peer_ids):
@@ -366,8 +308,8 @@ class TestPeerPolicyDataclass:
         assert min_mult <= max_mult
 
 
-class TestFeeAutobandPolicy:
-    """Test fee autoband storage in policy manager."""
+class TestFeeBandPolicy:
+    """Test fee band storage in policy manager."""
 
     def test_set_policy_persists_fee_autoband_multipliers(self, mock_database, mock_plugin, sample_peer_ids):
         pm = PolicyManager(mock_database, mock_plugin)
@@ -402,7 +344,7 @@ class TestValidation:
 
         for invalid_id in invalid_ids:
             with pytest.raises(ValueError):
-                pm.set_policy(invalid_id, strategy="hive")
+                pm.set_policy(invalid_id, strategy="dynamic")
 
     def test_valid_peer_id_accepted(self, mock_database, mock_plugin):
         """Valid peer IDs are accepted."""
@@ -416,6 +358,6 @@ class TestValidation:
         ]
 
         for valid_id in valid_ids:
-            pm.set_policy(valid_id, strategy="hive")
+            pm.set_policy(valid_id, strategy="dynamic")
             policy = pm.get_policy(valid_id)
             assert policy.peer_id == valid_id

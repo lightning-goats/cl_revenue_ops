@@ -1,6 +1,6 @@
-"""Tests for rebalancer traffic-aware conflict check (Task 5)."""
+"""Tests for rebalancer core behavior."""
 
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 
 def _candidate(
@@ -40,22 +40,8 @@ def _candidate(
     )
 
 
-def _make_safe_hive_bridge(**conflict_return):
-    """Create a MagicMock hive_bridge with safe defaults for execute_rebalance.
-
-    The execute_rebalance method is ~430 lines with many hive_bridge calls.
-    This helper sets return values that let execution proceed through all
-    phases without hitting MagicMock format-string issues.
-    """
-    bridge = MagicMock()
-    bridge.check_rebalance_conflict.return_value = conflict_return or {"conflict": False}
-    bridge.check_circular_flow_risk.return_value = {"risk": False}
-    bridge.query_fleet_rebalance_path.return_value = None  # Skip fleet path phase
-    return bridge
-
-
-class TestTrafficAwareConflictCheck:
-    """Verify execute_rebalance passes direction/amount to check_rebalance_conflict."""
+class TestRebalancerDryRun:
+    """Verify dry_run mode doesn't actually execute rebalances."""
 
     def _make_rebalancer(self, mock_plugin, mock_database, dry_run=True):
         from modules.config import Config
@@ -68,118 +54,11 @@ class TestTrafficAwareConflictCheck:
         mock_database.update_rebalance_result = MagicMock()
         return r
 
-    def test_direction_and_amount_passed_to_conflict_check(
-        self, mock_plugin, mock_database
-    ):
-        """check_rebalance_conflict receives direction='outbound' and amount_sats."""
-        r = self._make_rebalancer(mock_plugin, mock_database)
-        r.hive_bridge = _make_safe_hive_bridge(conflict=False)
-
-        cand = _candidate(amount_sats=75000)
-        r.execute_rebalance(cand)
-
-        r.hive_bridge.check_rebalance_conflict.assert_called_once_with(
-            peer_id=cand.to_peer_id,
-            direction="outbound",
-            amount_sats=75000,
-        )
-
-    def test_peak_hour_logged_but_rebalance_not_blocked(
-        self, mock_plugin, mock_database
-    ):
-        """Peak hour info is logged at 'info' level but rebalance proceeds."""
-        r = self._make_rebalancer(mock_plugin, mock_database)
-        r.hive_bridge = _make_safe_hive_bridge(
-            conflict=False,
-            peer_in_peak_hours=True,
-            suggested_window_utc=["03:00", "07:00"],
-        )
-
-        cand = _candidate()
-        result = r.execute_rebalance(cand)
-
-        # Rebalance should proceed (dry_run returns success)
-        assert result["success"] is True
-
-        # Verify TRAFFIC_INTEL was logged
-        log_calls = [
-            c for c in mock_plugin.log.call_args_list
-            if "TRAFFIC_INTEL" in str(c)
-        ]
-        assert len(log_calls) >= 1
-        logged_msg = str(log_calls[0])
-        assert "peer in peak hours" in logged_msg
-        assert "suggested window" in logged_msg
-
-    def test_peak_hour_without_suggested_window(
-        self, mock_plugin, mock_database
-    ):
-        """Peak hour logged even when no suggested_window_utc is provided."""
-        r = self._make_rebalancer(mock_plugin, mock_database)
-        r.hive_bridge = _make_safe_hive_bridge(
-            conflict=False,
-            peer_in_peak_hours=True,
-        )
+    def test_dry_run_does_not_start_sling_job(self, mock_plugin, mock_database):
+        """In dry_run mode, execute_rebalance should record but not start a sling job."""
+        r = self._make_rebalancer(mock_plugin, mock_database, dry_run=True)
 
         cand = _candidate()
         result = r.execute_rebalance(cand)
 
         assert result["success"] is True
-
-        log_calls = [
-            c for c in mock_plugin.log.call_args_list
-            if "TRAFFIC_INTEL" in str(c)
-        ]
-        assert len(log_calls) >= 1
-        logged_msg = str(log_calls[0])
-        assert "peer in peak hours" in logged_msg
-        assert "suggested window" not in logged_msg
-
-    def test_no_peak_hour_no_traffic_intel_log(
-        self, mock_plugin, mock_database
-    ):
-        """When peer_in_peak_hours is false, no TRAFFIC_INTEL line is logged."""
-        r = self._make_rebalancer(mock_plugin, mock_database)
-        r.hive_bridge = _make_safe_hive_bridge(
-            conflict=False,
-            peer_in_peak_hours=False,
-        )
-
-        cand = _candidate()
-        r.execute_rebalance(cand)
-
-        log_calls = [
-            c for c in mock_plugin.log.call_args_list
-            if "TRAFFIC_INTEL" in str(c)
-        ]
-        assert len(log_calls) == 0
-
-    def test_conflict_with_peak_hours_skips_fleet_path_and_logs_both(
-        self, mock_plugin, mock_database
-    ):
-        """When conflict=True AND peer_in_peak_hours=True, both are logged."""
-        r = self._make_rebalancer(mock_plugin, mock_database)
-        r.hive_bridge = _make_safe_hive_bridge(
-            conflict=True,
-            reason="Fleet member active on same peer",
-            peer_in_peak_hours=True,
-            suggested_window_utc=["04:00", "08:00"],
-        )
-
-        cand = _candidate()
-        result = r.execute_rebalance(cand)
-
-        # Rebalance still proceeds (conflict only skips fleet path, doesn't block)
-        assert result["success"] is True
-
-        # Both FLEET_CONFLICT and TRAFFIC_INTEL should be logged
-        fleet_logs = [
-            c for c in mock_plugin.log.call_args_list
-            if "FLEET_CONFLICT" in str(c)
-        ]
-        traffic_logs = [
-            c for c in mock_plugin.log.call_args_list
-            if "TRAFFIC_INTEL" in str(c)
-        ]
-        assert len(fleet_logs) >= 1
-        assert len(traffic_logs) >= 1

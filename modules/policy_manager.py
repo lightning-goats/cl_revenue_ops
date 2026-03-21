@@ -4,7 +4,7 @@ Policy Manager module for cl-revenue-ops
 Implements the Policy-Driven architecture for managing peer behavior.
 Replaces the legacy ignored_peers system with a centralized, declarative
 policy system that supports:
-- Fee strategies: dynamic, static, hive, passive
+- Fee strategies: dynamic, static, passive
 - Rebalance modes: enabled, disabled, source_only, sink_only
 - Tags for grouping and filtering peers
 
@@ -16,7 +16,7 @@ v2.0 Improvements:
 - Auto-policy suggestions from profitability data
 - Batch policy operations
 
-Phase 9 Preparation: Provides API hooks for cl-hive integration.
+Provides API hooks for external integration.
 """
 
 import json
@@ -57,9 +57,8 @@ TACTICAL_POLICY_ACTIONS = frozenset({"set", "delete", "tag", "untag", "batch"})
 
 class FeeStrategy(Enum):
     """Fee control strategy for a peer."""
-    DYNAMIC = "dynamic"   # Hill Climbing + Scarcity (Default)
+    DYNAMIC = "dynamic"   # DTS+PID fee optimization (Default)
     STATIC = "static"     # Fixed fee (User Override)
-    HIVE = "hive"         # 0-Fee / Low Fee (Fleet Member)
     PASSIVE = "passive"   # Do nothing (manual control)
 
 
@@ -485,7 +484,7 @@ class PolicyManager:
         """
         Get all policy changes since a given timestamp.
 
-        This method is designed for cl-hive integration, allowing efficient
+        Get all policy changes since a given timestamp, allowing efficient
         polling for policy updates without fetching all policies.
 
         Args:
@@ -534,7 +533,7 @@ class PolicyManager:
         """
         Get the timestamp of the most recent policy change.
 
-        Useful for cl-hive to check if there are any new changes
+        Useful for checking if there are any new changes
         without fetching all changes.
 
         Returns:
@@ -575,7 +574,7 @@ class PolicyManager:
 
         Args:
             peer_id: 66-character hex public key
-            strategy: Fee strategy (dynamic, static, hive, passive)
+            strategy: Fee strategy (dynamic, static, passive)
             rebalance_mode: Rebalance mode (enabled, disabled, source_only, sink_only)
             fee_ppm_target: Target fee for static strategy
             tags: List of string tags (replaces existing tags)
@@ -910,19 +909,6 @@ class PolicyManager:
         if policy.strategy == FeeStrategy.STATIC and policy.fee_ppm_target is not None:
             return policy.fee_ppm_target
         return None
-    
-    def is_hive_peer(self, peer_id: str) -> bool:
-        """
-        Check if this peer is a Hive fleet member.
-        
-        Args:
-            peer_id: 66-character hex public key
-            
-        Returns:
-            True if peer has HIVE strategy
-        """
-        policy = self.get_policy(peer_id)
-        return policy.strategy == FeeStrategy.HIVE
     
     def get_fee_multiplier_bounds(self, peer_id: str) -> tuple:
         """

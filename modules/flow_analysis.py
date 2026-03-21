@@ -33,9 +33,12 @@ import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime, timedelta
-
 from pyln.client import Plugin, RpcError
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 
 # =============================================================================
@@ -50,15 +53,6 @@ MIN_FORWARDS_FOR_HIGH_CONFIDENCE = 20  # Need 20+ forwards for confidence = 1.0
 MIN_CONFIDENCE = 0.1  # Never fully ignore flow state
 MAX_CONFIDENCE = 1.0
 CONFIDENCE_RECENCY_HALFLIFE_DAYS = 3.0  # Confidence decays by 50% every 3 days of no activity
-
-# Improvement #2: Graduated Flow Multipliers
-# multiplier = 1.0 + (flow_ratio * gradient) instead of fixed 1.25/0.80
-# Security: Bounded to 0.5 - 2.0 range
-ENABLE_GRADUATED_MULTIPLIERS = True
-GRADUATED_MULTIPLIER_GRADIENT = 0.5  # multiplier change per unit flow_ratio
-MIN_FLOW_MULTIPLIER = 0.5  # Security: Floor
-MAX_FLOW_MULTIPLIER = 2.0  # Security: Ceiling
-MULTIPLIER_DEADBAND = 0.1  # Ignore flow_ratio changes smaller than this
 
 # Improvement #3: Flow Velocity Tracking
 # velocity = (current_ratio - previous_ratio) / time_hours
@@ -189,8 +183,6 @@ class KalmanFlowState:
 TEMPORAL_GRADUATION_DAYS = 7
 TEMPORAL_MIN_DAILY_FORWARDS = 10
 TEMPORAL_EMA_ALPHA = 0.3
-TEMPORAL_PEAK_PERCENTILE = 0.75
-TEMPORAL_QUIET_PERCENTILE = 0.25
 
 
 @dataclass
@@ -225,8 +217,15 @@ class TemporalProfile:
             self.diurnal_strength = 0.0
             return
 
+        if np is None:
+            # numpy unavailable, skip derived field computation
+            self.burstiness = 0.0
+            self.quiet_hours = []
+            self.peak_hours = []
+            self.diurnal_strength = 0.0
+            return
+
         # Burstiness = coefficient of variation
-        import numpy as np
         arr = np.array(self.hourly_out)
         mean_val = np.mean(arr)
         if mean_val > 0:
@@ -250,62 +249,6 @@ class TemporalProfile:
             self.diurnal_strength = max(0.0, -autocorr_12)
         else:
             self.diurnal_strength = 0.0
-
-    def predicted_outflow(self, current_hour: int, horizon_hours: int) -> float:
-        """Sum expected outflow sats for the next horizon_hours."""
-        total = 0.0
-        for h in range(horizon_hours):
-            hour_idx = (current_hour + h) % 24
-            total += self.hourly_out[hour_idx]
-        return total
-
-    def predicted_inflow(self, current_hour: int, horizon_hours: int) -> float:
-        """Sum expected inflow sats for the next horizon_hours."""
-        total = 0.0
-        for h in range(horizon_hours):
-            hour_idx = (current_hour + h) % 24
-            total += self.hourly_in[hour_idx]
-        return total
-
-    def is_quiet_now(self, current_hour: int) -> bool:
-        """Whether current_hour falls in a quiet period."""
-        return current_hour in self.quiet_hours
-
-    def next_quiet_window(self, current_hour: int) -> tuple:
-        """Find the next quiet window: (start_hour, duration_hours).
-
-        If currently in a quiet window, returns the current window.
-        Returns (current_hour, 0) if no quiet hours defined.
-        """
-        if not self.quiet_hours:
-            return (current_hour, 0)
-
-        quiet_set = set(self.quiet_hours)
-
-        # Find the start of the next (or current) quiet window
-        # by scanning forward from current_hour
-        for offset in range(24):
-            h = (current_hour + offset) % 24
-            if h in quiet_set:
-                # Found a quiet hour — walk backward to find the true start
-                # of this contiguous quiet window
-                start = h
-                for back in range(1, 24):
-                    prev = (h - back) % 24
-                    if prev in quiet_set:
-                        start = prev
-                    else:
-                        break
-                # Count duration forward from start
-                duration = 0
-                for d in range(24):
-                    if (start + d) % 24 in quiet_set:
-                        duration += 1
-                    else:
-                        break
-                return (start, duration)
-
-        return (current_hour, 0)
 
     def to_dict(self) -> dict:
         return {
@@ -359,7 +302,6 @@ def update_temporal_profile(existing: TemporalProfile,
     Returns:
         Updated TemporalProfile with blended values and recomputed derived fields.
     """
-    import time as _time
     updated = TemporalProfile()
     is_first = all(v == 0.0 for v in existing.hourly_out)
     alpha = TEMPORAL_EMA_ALPHA
@@ -384,82 +326,12 @@ def update_temporal_profile(existing: TemporalProfile,
     updated.observation_days = existing.observation_days
     if daily_forwards >= TEMPORAL_MIN_DAILY_FORWARDS:
         updated.observation_days += 1
-    updated.last_updated = int(_time.time())
+    updated.last_updated = int(time.time())
 
     # Recompute derived fields
     updated._recompute_derived()
 
     return updated
-
-
-# --- Depletion forecast constants ---
-MAX_FORECAST_HORIZON = 24
-KALMAN_TREND_CLAMP_LOW = -0.5
-KALMAN_TREND_CLAMP_HIGH = 1.0
-BURSTINESS_LOW = 0.5
-BURSTINESS_HIGH = 1.0
-BUFFER_MULT_LOW = 1.0
-BUFFER_MULT_MED = 1.3
-BUFFER_MULT_HIGH = 1.6
-
-
-def get_buffer_multiplier(burstiness: float) -> float:
-    """Map burstiness score to forecast buffer multiplier."""
-    if burstiness < BURSTINESS_LOW:
-        return BUFFER_MULT_LOW
-    elif burstiness > BURSTINESS_HIGH:
-        return BUFFER_MULT_HIGH
-    else:
-        return BUFFER_MULT_MED
-
-
-def estimate_depletion_hours(current_balance_sats: float,
-                              depletion_target_sats: float,
-                              current_hour: int,
-                              kalman_velocity_per_hour: float,
-                              temporal_profile: TemporalProfile) -> float:
-    """Estimate hours until channel balance drops to depletion_target_sats.
-
-    Combines the hourly histogram (seasonal pattern) with Kalman velocity
-    (trend deviation). Returns float('inf') if no depletion within horizon.
-
-    Args:
-        current_balance_sats: Current outbound balance
-        depletion_target_sats: Balance level that triggers depletion
-        current_hour: Current hour UTC (0-23)
-        kalman_velocity_per_hour: Kalman-estimated outflow rate (sats/hour)
-        temporal_profile: The channel's TemporalProfile
-    """
-    drain_needed = current_balance_sats - depletion_target_sats
-    if drain_needed <= 0:
-        return 0.0
-
-    # Compute Kalman trend factor
-    # kalman_velocity_per_hour <= 0 means no Kalman signal available → no trend adjustment
-    historical_avg = sum(temporal_profile.hourly_out) / 24.0
-    if kalman_velocity_per_hour > 0 and historical_avg > 0:
-        trend_factor = (kalman_velocity_per_hour - historical_avg) / historical_avg
-        trend_factor = max(KALMAN_TREND_CLAMP_LOW, min(KALMAN_TREND_CLAMP_HIGH, trend_factor))
-    else:
-        trend_factor = 0.0
-
-    cumulative = 0.0
-    for h in range(MAX_FORECAST_HORIZON):
-        hour_idx = (current_hour + h) % 24
-        net_out = temporal_profile.hourly_out[hour_idx] - temporal_profile.hourly_in[hour_idx]
-        net_out *= (1.0 + trend_factor)
-        net_out = max(net_out, 0.0)  # only count net outflow
-
-        prev_cumulative = cumulative
-        cumulative += net_out
-
-        if cumulative >= drain_needed:
-            # Interpolate partial hour
-            remaining_in_hour = drain_needed - prev_cumulative
-            partial = remaining_in_hour / max(net_out, 1.0)
-            return float(h) + partial
-
-    return float('inf')
 
 
 class KalmanFlowFilter:
@@ -501,8 +373,8 @@ class KalmanFlowFilter:
 
     def _ensure_positive_definite(self) -> None:
         """Ensure covariance matrix stays positive definite."""
-        self.state.variance_ratio = max(1e-6, self.state.variance_ratio)
-        self.state.variance_velocity = max(1e-6, self.state.variance_velocity)
+        self.state.variance_ratio = max(1e-4, self.state.variance_ratio)
+        self.state.variance_velocity = max(1e-4, self.state.variance_velocity)
         det = self.state.variance_ratio * self.state.variance_velocity - self.state.covariance ** 2
         if det <= 0:
             max_cov = math.sqrt(self.state.variance_ratio * self.state.variance_velocity) * 0.9
@@ -573,6 +445,10 @@ class KalmanFlowFilter:
         Returns:
             Innovation (prediction error) for diagnostics
         """
+        # B2 FIX: Reject NaN/Inf observations without resetting state.
+        if not math.isfinite(observed_ratio):
+            return 0.0
+
         # Measurement noise adaptation based on confidence
         # Low confidence = high noise = trust observation less
         r = KALMAN_BASE_MEASUREMENT_NOISE / max(0.1, confidence * KALMAN_CONFIDENCE_SCALING)
@@ -809,8 +685,6 @@ class FlowAnalyzer:
         except Exception:
             pass  # Non-critical — filters will still work from fresh defaults
 
-        self.hive_bridge = None  # Set externally for traffic profile reporting
-
     # =========================================================================
     # v2.1 KALMAN FILTER METHODS
     # =========================================================================
@@ -871,13 +745,8 @@ class FlowAnalyzer:
             net = (bucket.get('out', 0) or 0) - (bucket.get('in', 0) or 0)
             net_flows.append(net)
 
-        if not net_flows:
-            return 1.0
-
         # Calculate coefficient of variation (CV) of net flow changes
         changes = [abs(net_flows[i] - net_flows[i-1]) for i in range(1, len(net_flows))]
-        if not changes:
-            return 1.0
 
         mean_change = sum(changes) / len(changes)
         mean_flow = sum(abs(nf) for nf in net_flows) / len(net_flows)
@@ -900,7 +769,6 @@ class FlowAnalyzer:
         observed_ratio: float,
         confidence: float,
         daily_buckets: List[Dict[str, int]],
-        prev_ts: int,
         has_observation: bool = True
     ) -> Tuple[float, float, float, bool, int]:
         """
@@ -911,7 +779,6 @@ class FlowAnalyzer:
             observed_ratio: Raw flow ratio from per-forward data
             confidence: Observation confidence (0.1 to 1.0)
             daily_buckets: Daily flow data for volatility calculation
-            prev_ts: Previous update timestamp
             has_observation: If False, run predict-only (no update).
                 Prevents feeding a fake 0.0 observation when no flow data exists.
 
@@ -1008,6 +875,85 @@ class FlowAnalyzer:
 
         return max(-1.0, min(1.0, raw_ratio)), len(recent_entries)
 
+    def _apply_kalman_reclassification(
+        self,
+        metrics: 'FlowMetrics',
+        channel_id: str,
+        capacity: int,
+        our_balance: int,
+        channel_daily: List[Dict[str, int]],
+        raw_entries: List,
+        last_forward_ts: int,
+    ) -> None:
+        """Apply Kalman filter and reclassify channel state based on the result.
+
+        Mutates *metrics* in place: sets kalman_* fields and potentially
+        overrides ``metrics.state`` when the filter has converged.
+
+        Steps performed:
+        1. Compute raw observation via ``_compute_raw_kalman_observation``
+        2. Calculate observation confidence
+        3. Call ``_apply_kalman_filter``
+        4. Set ``metrics.kalman_*`` fields
+        5. Check convergence (uncertainty + observation-count thresholds)
+        6. Re-classify ``metrics.state`` based on ``kalman_ratio``
+        7. Fallback to balance position for the BALANCED zone
+        """
+        if not ENABLE_KALMAN_FILTER:
+            return
+
+        raw_observation, raw_count = self._compute_raw_kalman_observation(
+            channel_id, capacity, raw_entries
+        )
+        kalman_confidence = (
+            self._calculate_confidence(raw_count, last_forward_ts)
+            if raw_count > 0
+            else metrics.confidence
+        )
+
+        kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change, obs_count = \
+            self._apply_kalman_filter(
+                channel_id=channel_id,
+                observed_ratio=raw_observation,
+                confidence=kalman_confidence,
+                daily_buckets=channel_daily,
+                has_observation=True,
+            )
+        metrics.kalman_flow_ratio = kalman_ratio
+        metrics.kalman_velocity = kalman_velocity
+        metrics.kalman_uncertainty = kalman_uncertainty
+        metrics.kalman_regime_change = regime_change
+
+        # Use Kalman estimate for state classification only when the filter
+        # has converged (low uncertainty) AND has accumulated enough
+        # observations.  Without the observation count check, fresh/purged
+        # filters declare "confident" (low variance) after just 1-2 cycles
+        # while the flow_ratio estimate is still near 0.0, incorrectly
+        # overriding EMA with BALANCED.
+        kalman_converged = (
+            kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY
+            and obs_count >= KALMAN_MIN_OBSERVATIONS
+        )
+        if not metrics.is_congested and kalman_converged:
+            if kalman_ratio > self.config.source_threshold:
+                metrics.state = ChannelState.SOURCE
+            elif kalman_ratio < self.config.sink_threshold:
+                metrics.state = ChannelState.SINK
+            else:
+                # Kalman ratio is small — use balance position as
+                # structural signal (matching EMA fallback logic).
+                outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
+                if outbound_ratio < 0.25:
+                    metrics.state = ChannelState.SOURCE
+                elif outbound_ratio > 0.75:
+                    metrics.state = ChannelState.SINK
+                else:
+                    turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
+                    if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
+                        metrics.state = ChannelState.BALANCED_ACTIVE
+                    else:
+                        metrics.state = ChannelState.BALANCED
+
     # =========================================================================
     # v2.0 IMPROVEMENT METHODS
     # =========================================================================
@@ -1047,39 +993,9 @@ class FlowAnalyzer:
         # Security: enforce bounds
         return max(MIN_CONFIDENCE, min(MAX_CONFIDENCE, confidence))
 
-    def _calculate_graduated_multiplier(self, flow_ratio: float, confidence: float) -> float:
-        """
-        Calculate graduated flow multiplier based on flow magnitude.
-
-        Instead of fixed 1.25/0.80 multipliers, scale proportionally:
-        multiplier = 1.0 + (|flow_ratio| * gradient * sign(flow_ratio))
-
-        For sources (positive ratio): higher multiplier (raise fees)
-        For sinks (negative ratio): lower multiplier (lower fees)
-
-        Security: Bounded to MIN_FLOW_MULTIPLIER - MAX_FLOW_MULTIPLIER
-        """
-        if not ENABLE_GRADUATED_MULTIPLIERS:
-            return 1.0
-
-        # Apply deadband - ignore small flow_ratio changes
-        if abs(flow_ratio) < MULTIPLIER_DEADBAND:
-            return 1.0
-
-        # Calculate raw multiplier
-        # Positive flow_ratio (source) -> multiplier > 1.0
-        # Negative flow_ratio (sink) -> multiplier < 1.0
-        raw_multiplier = 1.0 + (flow_ratio * GRADUATED_MULTIPLIER_GRADIENT)
-
-        # Weight by confidence (low confidence = closer to 1.0)
-        weighted_multiplier = 1.0 + (raw_multiplier - 1.0) * confidence
-
-        # Security: enforce bounds
-        return max(MIN_FLOW_MULTIPLIER, min(MAX_FLOW_MULTIPLIER, weighted_multiplier))
-
     def _calculate_velocity(
         self, flow_ratio: float, previous_ratio: float,
-        previous_timestamp: int, forward_count: int
+        previous_timestamp: int
     ) -> float:
         """
         Calculate flow velocity (rate of change of flow_ratio).
@@ -1109,7 +1025,9 @@ class FlowAnalyzer:
 
         # Security: outlier detection
         # If velocity is extreme relative to expected, likely manipulation
-        expected_max = VELOCITY_OUTLIER_THRESHOLD * abs(flow_ratio + 0.01)  # +0.01 avoid div0
+        # B1 FIX: Use abs(flow_ratio) + 0.01, not abs(flow_ratio + 0.01).
+        # The 0.01 is a floor to avoid zero threshold, not a shift.
+        expected_max = VELOCITY_OUTLIER_THRESHOLD * (abs(flow_ratio) + 0.01)
         if abs(raw_velocity) > expected_max:
             self.plugin.log(
                 f"Velocity outlier detected: {raw_velocity:.4f} > {expected_max:.4f}, clamping",
@@ -1155,8 +1073,6 @@ class FlowAnalyzer:
 
         # MA-7: Use sample variance (N-1 divisor) for unbiased estimate
         mean_net = sum(net_flows) / len(net_flows)
-        if len(net_flows) < 2:
-            return BASE_EMA_DECAY
         variance = sum((x - mean_net) ** 2 for x in net_flows) / (len(net_flows) - 1)
         std_dev = math.sqrt(variance) if variance > 0 else 0
 
@@ -1188,7 +1104,6 @@ class FlowAnalyzer:
         Returns:
             Dict mapping channel_id to FlowMetrics
         """
-        results = {}
         self._analyze_all_running = True
 
         try:
@@ -1253,8 +1168,6 @@ class FlowAnalyzer:
                 self._calculate_ema_flow(channel_daily, adaptive_decay)
 
             # Extract HTLC information for congestion detection
-            htlc_min = channel.get("htlc_min_msat", 0)
-            htlc_max = channel.get("htlc_max_msat", 0)
             active_htlcs = channel.get("active_htlcs", 0)
             max_htlcs = channel.get("max_htlcs", 483)
 
@@ -1275,8 +1188,6 @@ class FlowAnalyzer:
                 ema_out=ema_out,
                 capacity=capacity,
                 our_balance=our_balance,
-                htlc_min=htlc_min,
-                htlc_max=htlc_max,
                 active_htlcs=active_htlcs,
                 max_htlcs=max_htlcs,
                 # v2.0 parameters
@@ -1288,56 +1199,15 @@ class FlowAnalyzer:
             )
 
             # v2.1: Apply Kalman filter for improved flow estimation
-            if ENABLE_KALMAN_FILTER:
-                # Compute raw observation from per-forward data (not EMA-smoothed)
-                raw_entries = raw_flow_data.get(channel_id, [])
-                raw_observation, raw_count = self._compute_raw_kalman_observation(
-                    channel_id, capacity, raw_entries
-                )
-                kalman_confidence = self._calculate_confidence(raw_count, last_forward_ts) if raw_count > 0 else metrics.confidence
-
-                kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change, obs_count = \
-                    self._apply_kalman_filter(
-                        channel_id=channel_id,
-                        observed_ratio=raw_observation,
-                        confidence=kalman_confidence,
-                        daily_buckets=channel_daily,
-                        prev_ts=prev_ts,
-                        has_observation=True  # FIX: Must be True unconditionally so idle channels decay to 0
-                    )
-                metrics.kalman_flow_ratio = kalman_ratio
-                metrics.kalman_velocity = kalman_velocity
-                metrics.kalman_uncertainty = kalman_uncertainty
-                metrics.kalman_regime_change = regime_change
-
-                # Use Kalman estimate for state classification only when the filter
-                # has converged (low uncertainty) AND has accumulated enough observations.
-                # Without the observation count check, fresh/purged filters declare
-                # "confident" (low variance) after just 1-2 cycles while the flow_ratio
-                # estimate is still near 0.0, incorrectly overriding EMA with BALANCED.
-                kalman_converged = (
-                    kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY
-                    and obs_count >= KALMAN_MIN_OBSERVATIONS
-                )
-                if not metrics.is_congested and kalman_converged:
-                    if kalman_ratio > self.config.source_threshold:
-                        metrics.state = ChannelState.SOURCE
-                    elif kalman_ratio < self.config.sink_threshold:
-                        metrics.state = ChannelState.SINK
-                    else:
-                        # Kalman ratio is small — use balance position as
-                        # structural signal (matching EMA fallback logic).
-                        outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
-                        if outbound_ratio < 0.25:
-                            metrics.state = ChannelState.SOURCE
-                        elif outbound_ratio > 0.75:
-                            metrics.state = ChannelState.SINK
-                        else:
-                            turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
-                            if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-                                metrics.state = ChannelState.BALANCED_ACTIVE
-                            else:
-                                metrics.state = ChannelState.BALANCED
+            self._apply_kalman_reclassification(
+                metrics=metrics,
+                channel_id=channel_id,
+                capacity=capacity,
+                our_balance=our_balance,
+                channel_daily=channel_daily,
+                raw_entries=raw_flow_data.get(channel_id, []),
+                last_forward_ts=last_forward_ts,
+            )
 
             results[channel_id] = metrics
 
@@ -1485,8 +1355,6 @@ class FlowAnalyzer:
             self._calculate_ema_flow(channel_daily, adaptive_decay)
 
         # Extract HTLC information
-        htlc_min = channel.get("htlc_min_msat", 0)
-        htlc_max = channel.get("htlc_max_msat", 0)
         active_htlcs = channel.get("active_htlcs", 0)
         max_htlcs = channel.get("max_htlcs", 483)
 
@@ -1506,8 +1374,6 @@ class FlowAnalyzer:
             ema_out=ema_out,
             capacity=capacity,
             our_balance=our_balance,
-            htlc_min=htlc_min,
-            htlc_max=htlc_max,
             active_htlcs=active_htlcs,
             max_htlcs=max_htlcs,
             # v2.0 parameters
@@ -1519,54 +1385,17 @@ class FlowAnalyzer:
         )
 
         # v2.1: Apply Kalman filter
-        if ENABLE_KALMAN_FILTER:
-            # Compute raw observation from per-forward data (not EMA-smoothed)
-            raw_entries = self.database.get_continuous_net_flow_channel(
+        self._apply_kalman_reclassification(
+            metrics=metrics,
+            channel_id=channel_id,
+            capacity=capacity,
+            our_balance=our_balance,
+            channel_daily=channel_daily,
+            raw_entries=self.database.get_continuous_net_flow_channel(
                 channel_id, window_hours=self.config.flow_window_days * 24
-            )
-            raw_observation, raw_count = self._compute_raw_kalman_observation(
-                channel_id, capacity, raw_entries
-            )
-            kalman_confidence = self._calculate_confidence(raw_count, last_forward_ts) if raw_count > 0 else metrics.confidence
-
-            kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change, obs_count = \
-                self._apply_kalman_filter(
-                    channel_id=channel_id,
-                    observed_ratio=raw_observation,
-                    confidence=kalman_confidence,
-                    daily_buckets=channel_daily,
-                    prev_ts=prev_ts,
-                    has_observation=True  # FIX: Must be True unconditionally so idle channels decay to 0
-                )
-            metrics.kalman_flow_ratio = kalman_ratio
-            metrics.kalman_velocity = kalman_velocity
-            metrics.kalman_uncertainty = kalman_uncertainty
-            metrics.kalman_regime_change = regime_change
-
-            # Re-classify using Kalman only when converged (matching analyze_all_channels)
-            kalman_converged = (
-                kalman_uncertainty < KALMAN_CONVERGENCE_UNCERTAINTY
-                and obs_count >= KALMAN_MIN_OBSERVATIONS
-            )
-            if not metrics.is_congested and kalman_converged:
-                if kalman_ratio > self.config.source_threshold:
-                    metrics.state = ChannelState.SOURCE
-                elif kalman_ratio < self.config.sink_threshold:
-                    metrics.state = ChannelState.SINK
-                else:
-                    # Kalman ratio is small — use balance position as
-                    # structural signal (matching EMA fallback logic).
-                    outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
-                    if outbound_ratio < 0.25:
-                        metrics.state = ChannelState.SOURCE
-                    elif outbound_ratio > 0.75:
-                        metrics.state = ChannelState.SINK
-                    else:
-                        turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
-                        if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-                            metrics.state = ChannelState.BALANCED_ACTIVE
-                        else:
-                            metrics.state = ChannelState.BALANCED
+            ),
+            last_forward_ts=last_forward_ts,
+        )
 
         # I-9: Skip DB persistence when called during bulk analyze_all_channels(),
         # which does its own DB writes. This avoids redundant writes and potential
@@ -1597,7 +1426,6 @@ class FlowAnalyzer:
         sats_in: int, sats_out: int, capacity: int,
         ema_in: float = 0.0, ema_out: float = 0.0,
         our_balance: int = 0,
-        htlc_min: int = 0, htlc_max: int = 0,
         active_htlcs: int = 0, max_htlcs: int = 483,
         # v2.0 parameters
         forward_count: int = 0,
@@ -1685,11 +1513,10 @@ class FlowAnalyzer:
 
         # v2.0: Calculate flow velocity
         velocity = self._calculate_velocity(
-            flow_ratio, previous_ratio, previous_ratio_ts, forward_count
+            flow_ratio, previous_ratio, previous_ratio_ts
         )
 
-        # v2.0: Calculate graduated multiplier (weighted by confidence)
-        flow_multiplier = self._calculate_graduated_multiplier(flow_ratio, confidence)
+        flow_multiplier = 1.0
 
         return FlowMetrics(
             channel_id=channel_id,
@@ -1800,9 +1627,6 @@ class FlowAnalyzer:
 
             total_weight += weight
 
-        if total_weight <= 0:
-            return 0.0, 0.0, 0, 0, 0, 0
-
         ema_in /= total_weight
         ema_out /= total_weight
 
@@ -1854,107 +1678,4 @@ class FlowAnalyzer:
                 return channel
         return None
     
-    def get_channel_state(self, channel_id: str) -> ChannelState:
-        """
-        Get the cached state of a channel.
 
-        Args:
-            channel_id: The channel to check
-
-        Returns:
-            The channel's current state classification
-        """
-        state_data = self.database.get_channel_state(channel_id)
-        if state_data:
-            state_str = state_data.get("state", "unknown")
-            # BUG FIX: Validate state string before enum conversion
-            try:
-                return ChannelState(state_str)
-            except ValueError:
-                self.plugin.log(
-                    f"Invalid state '{state_str}' in database for channel {channel_id}, returning UNKNOWN",
-                    level='warning'
-                )
-                return ChannelState.UNKNOWN
-        return ChannelState.UNKNOWN
-    
-    def get_sources(self) -> List[Dict[str, Any]]:
-        """Get all channels classified as SOURCE (draining)."""
-        return self.database.get_channels_by_state("source")
-    
-    def get_sinks(self) -> List[Dict[str, Any]]:
-        """Get all channels classified as SINK (filling)."""
-        return self.database.get_channels_by_state("sink")
-    
-    def get_balanced(self) -> List[Dict[str, Any]]:
-        """Get all channels classified as BALANCED."""
-        return self.database.get_channels_by_state("balanced")
-
-    def report_graduated_profiles(self, all_flow: Dict[str, 'FlowMetrics']) -> int:
-        """
-        Report graduated temporal profiles to cl-hive for fleet sharing.
-
-        Called after analyze_all_channels(). Only reports profiles that have
-        graduated (7+ days observation). Maps flow_analysis fields to
-        hive traffic profile fields.
-
-        Args:
-            all_flow: Dict of channel_id -> FlowMetrics from analyze_all_channels()
-
-        Returns:
-            Number of profiles successfully reported
-        """
-        import json
-
-        if not self.hive_bridge:
-            return 0
-
-        reported = 0
-        for channel_id, metrics in all_flow.items():
-            # Load temporal profile from database
-            try:
-                profile_json = self.database.load_temporal_profile(channel_id)
-                if not profile_json:
-                    continue
-                profile = TemporalProfile.from_dict(json.loads(profile_json))
-            except Exception:
-                continue
-
-            if not profile.graduated:
-                continue
-
-            # Map flow_direction: source=outbound_heavy, sink=inbound_heavy
-            if metrics.flow_ratio > 0.1:
-                drain_direction = "outbound_heavy"
-            elif metrics.flow_ratio < -0.1:
-                drain_direction = "inbound_heavy"
-            else:
-                drain_direction = "balanced"
-
-            # Classify profile type by volume + forward size heuristic
-            avg_forward = metrics.daily_volume / max(metrics.forward_count, 1)
-            if metrics.daily_volume > 5_000_000 and avg_forward < 50_000:
-                profile_type = "retail"
-            elif metrics.daily_volume < 2_000_000 and avg_forward > 200_000:
-                profile_type = "wholesale"
-            else:
-                profile_type = "mixed"
-
-            try:
-                success = self.hive_bridge.report_traffic_profile(
-                    peer_id=metrics.peer_id,
-                    profile_type=profile_type,
-                    peak_hours_utc=profile.peak_hours,
-                    quiet_hours_utc=profile.quiet_hours,
-                    avg_forward_size_sats=float(avg_forward),
-                    daily_volume_sats=float(metrics.daily_volume),
-                    drain_direction=drain_direction,
-                    confidence=metrics.confidence,
-                    observation_window_hours=profile.observation_days * 24,
-                )
-                if success:
-                    reported += 1
-            except Exception:
-                pass
-
-        return reported

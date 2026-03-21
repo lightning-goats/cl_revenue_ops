@@ -1,9 +1,6 @@
 import pytest
-import time
 from unittest.mock import MagicMock
 from pathlib import Path
-from types import SimpleNamespace
-
 from modules.config import Config
 from tests.plugin_test_utils import load_plugin_module
 
@@ -25,24 +22,6 @@ def test_internal_knobs_are_not_public():
     assert "enable_vegas_reflex" not in cfg.public_runtime_keys()
     assert "thompson_prior_std_fee" not in cfg.public_runtime_keys()
     assert "sling_target_sink" not in cfg.public_runtime_keys()
-
-
-def test_auto_band_config_defaults_enabled():
-    cfg = Config()
-
-    assert cfg.auto_band_enabled is True
-    assert cfg.auto_band_min_observations == 20
-    assert cfg.auto_band_sigma == 2.0
-    assert cfg.auto_band_min_width_ppm == 50
-    assert cfg.auto_band_recalibrate_interval == 10
-
-
-def test_hive_egress_desaturation_bias_defaults_enabled():
-    cfg = Config()
-
-    assert cfg.enable_hive_egress_desaturation_bias is True
-    assert cfg.hive_egress_desaturation_bias_max_ppm == 100
-    assert cfg.hive_egress_desaturation_bias_weight == 0.5
 
 
 def test_public_runtime_dict_returns_only_public_keys():
@@ -80,6 +59,118 @@ def _load_policy_surface_module():
     mod = load_plugin_module()
     mod.policy_manager = MagicMock()
     return mod
+
+
+def _default_plugin_options(mod):
+    return {
+        name: registration["default"]
+        for name, registration in mod.plugin.options.items()
+        if "default" in registration
+    }
+
+
+def _run_init_with_stubbed_dependencies(mod, monkeypatch, option_overrides=None):
+    mod.shutdown_event.clear()
+
+    options = _default_plugin_options(mod)
+    if option_overrides:
+        options.update(option_overrides)
+
+    fake_db = MagicMock()
+    fake_db.initialize.return_value = None
+    fake_db.cleanup_stale_reservations.return_value = 0
+    fake_db.get_latest_forward_timestamp.return_value = None
+    fake_db.bulk_insert_forwards.return_value = 0
+    fake_db.has_recent_connection_history.return_value = False
+    fake_db.record_connection_event.return_value = None
+    fake_db.get_all_config_overrides.return_value = {}
+    fake_db.get_config_version.return_value = 0
+
+    fake_rpc = MagicMock()
+    fake_rpc.plugin.return_value = {"plugins": []}
+    fake_rpc.listplugins.return_value = {"plugins": []}
+    fake_rpc.listforwards.return_value = {"forwards": []}
+    fake_rpc.listpeers.return_value = {"peers": []}
+
+    fake_proxy = MagicMock()
+    fake_proxy.rpc = fake_rpc
+    fake_proxy._executor = MagicMock()
+    fake_proxy._async_executor = MagicMock()
+
+    class DummyThread:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(mod, "ThreadSafePluginProxy", lambda plugin: fake_proxy)
+    monkeypatch.setattr(mod, "Database", lambda *args, **kwargs: fake_db)
+    monkeypatch.setattr(mod, "PolicyManager", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "ChannelProfitabilityAnalyzer", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "FlowAnalyzer", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "CapacityPlanner", lambda *args, **kwargs: MagicMock(
+        execute_cycle=MagicMock(return_value={"skipped": True, "reason": "noop"})
+    ))
+    monkeypatch.setattr(mod, "FeeController", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "EVRebalancer", lambda *args, **kwargs: MagicMock(
+        set_profitability_analyzer=MagicMock(),
+        set_capacity_planner=MagicMock(),
+    ))
+    monkeypatch.setattr(mod, "BoltzCliManager", lambda *args, **kwargs: MagicMock(enabled=False))
+    monkeypatch.setattr(mod.threading, "Thread", DummyThread)
+
+    mod.init(options, {}, mod.plugin)
+    return mod.config
+
+
+def test_planner_execute_closes_plugin_option_defaults_false():
+    mod = load_plugin_module()
+    snapshot = Config().snapshot()
+
+    assert "revenue-ops-planner-execute-closes" in mod.plugin.options
+    assert mod.plugin.options["revenue-ops-planner-execute-closes"]["default"] == "false"
+    assert snapshot.planner_execute_closes is False
+
+
+def test_planner_cycle_limit_defaults_match_config():
+    mod = load_plugin_module()
+    cfg = Config()
+    snapshot = cfg.snapshot()
+
+    assert cfg.planner_max_opens_per_cycle == 1
+    assert cfg.planner_max_closes_per_cycle == 0
+    assert snapshot.planner_max_opens_per_cycle == 1
+    assert snapshot.planner_max_closes_per_cycle == 0
+    assert mod.plugin.options["revenue-ops-planner-max-opens-per-cycle"]["default"] == "1"
+    assert mod.plugin.options["revenue-ops-planner-max-closes-per-cycle"]["default"] == "0"
+
+
+def test_planner_execute_closes_option_is_parsed_during_init(monkeypatch):
+    mod = load_plugin_module()
+    cfg = _run_init_with_stubbed_dependencies(
+        mod,
+        monkeypatch,
+        {"revenue-ops-planner-execute-closes": "true"},
+    )
+
+    assert cfg.planner_execute_closes is True
+
+
+def test_planner_cycle_limits_are_parsed_during_init(monkeypatch):
+    mod = load_plugin_module()
+    cfg = _run_init_with_stubbed_dependencies(
+        mod,
+        monkeypatch,
+        {
+            "revenue-ops-planner-max-opens-per-cycle": "3",
+            "revenue-ops-planner-max-closes-per-cycle": "2",
+        },
+    )
+
+    assert cfg.planner_max_opens_per_cycle == 3
+    assert cfg.planner_max_closes_per_cycle == 2
 
 
 def test_revenue_config_list_mutable_returns_public_controls_only():
@@ -184,107 +275,6 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
     assert "config" not in result
 
 
-def test_revenue_fee_debug_reports_effective_auto_band_details():
-    peer_id = "02" + "a" * 64
-    mod = load_plugin_module()
-    mod.database = MagicMock()
-    mod.config = Config()
-    mod.fee_controller = MagicMock()
-    mod.database.get_all_fee_strategy_states.return_value = [
-        {
-            "channel_id": "123x456x0",
-            "is_sleeping": 0,
-            "sleep_until": 0,
-            "last_update": int(time.time()) - 3600,
-            "forward_count_since_update": 5,
-            "last_broadcast_fee_ppm": 220,
-            "last_revenue_rate": 1.5,
-        }
-    ]
-    mod.database.get_all_channel_states.return_value = [
-        {
-            "channel_id": "123x456x0",
-            "peer_id": peer_id,
-            "state": "balanced",
-        }
-    ]
-    mod.fee_controller._get_effective_dynamic_fee_autoband_ppm.return_value = (200, 300, "auto")
-    mod.fee_controller._get_channel_auto_band.return_value = SimpleNamespace(
-        min_ppm=200,
-        max_ppm=300,
-        optimal_fee_ppm=250,
-        posterior_std=25.0,
-        observation_count=27,
-        sigma=2.0,
-        min_width_ppm=50,
-        last_calibrated=1_773_506_400,
-        source="auto",
-    )
-
-    result = mod.revenue_fee_debug(mod.plugin)
-
-    channel = result["channels"][0]
-    assert channel["effective_autoband"] == {
-        "min_ppm": 200,
-        "max_ppm": 300,
-        "source": "auto",
-    }
-    assert channel["auto_band"]["optimal_fee_ppm"] == 250
-    assert channel["auto_band"]["observation_count"] == 27
-
-
-def test_revenue_fee_debug_reports_hive_egress_desaturation_bias_details():
-    peer_id = "02" + "b" * 64
-    mod = load_plugin_module()
-    mod.database = MagicMock()
-    mod.config = Config()
-    mod.fee_controller = MagicMock()
-    mod.database.get_all_fee_strategy_states.return_value = [
-        {
-            "channel_id": "123x456x0",
-            "is_sleeping": 0,
-            "sleep_until": 0,
-            "last_update": int(time.time()) - 3600,
-            "forward_count_since_update": 5,
-            "last_broadcast_fee_ppm": 220,
-            "last_revenue_rate": 1.5,
-        }
-    ]
-    mod.database.get_all_channel_states.return_value = [
-        {
-            "channel_id": "123x456x0",
-            "peer_id": peer_id,
-            "state": "balanced",
-        }
-    ]
-    mod.fee_controller._get_effective_dynamic_fee_autoband_ppm.return_value = (None, None, None)
-    mod.fee_controller._get_channel_auto_band.return_value = None
-    mod.fee_controller._get_last_hive_egress_desaturation_bias.return_value = {
-        "matched": True,
-        "applied": True,
-        "recommended_surcharge_ppm": 80,
-        "applied_surcharge_ppm": 40,
-        "confidence": 0.9,
-        "severity": "critical",
-        "reason": "Competes with critical saturated hive egress",
-        "saturated_hive_channel_id": "999x1x0",
-    }
-
-    result = mod.revenue_fee_debug(mod.plugin)
-
-    channel = result["channels"][0]
-    assert channel["hive_egress_desaturation_bias"] == {
-        "matched": True,
-        "applied": True,
-        "recommended_surcharge_ppm": 80,
-        "applied_surcharge_ppm": 40,
-        "confidence": 0.9,
-        "severity": "critical",
-        "reason": "Competes with critical saturated hive egress",
-        "saturated_hive_channel_id": "999x1x0",
-    }
-
-
 @pytest.mark.parametrize(
     ("action", "peer_id", "kwargs"),
     [
@@ -292,7 +282,7 @@ def test_revenue_fee_debug_reports_hive_egress_desaturation_bias_details():
         ("delete", "02" + "a" * 64, {}),
         ("tag", "02" + "a" * 64, {"tag": "whale"}),
         ("untag", "02" + "a" * 64, {"tag": "whale"}),
-        ("batch", None, {"updates": [{"peer_id": "02" + "a" * 64, "strategy": "hive"}]}),
+        ("batch", None, {"updates": [{"peer_id": "02" + "a" * 64, "strategy": "dynamic"}]}),
     ],
 )
 def test_revenue_policy_mutations_are_deprecated_for_normal_operator_use(action, peer_id, kwargs):
@@ -308,7 +298,7 @@ def test_revenue_policy_mutations_are_deprecated_for_normal_operator_use(action,
 def test_revenue_policy_list_remains_available_for_transition_diagnostics():
     mod = _load_policy_surface_module()
     policy = MagicMock()
-    policy.to_dict.return_value = {"peer_id": "02" + "a" * 64, "strategy": "hive"}
+    policy.to_dict.return_value = {"peer_id": "02" + "a" * 64, "strategy": "dynamic"}
     mod.policy_manager.get_all_policies.return_value = [policy]
 
     result = mod.revenue_policy(mod.plugin, "list")
@@ -326,3 +316,18 @@ def test_readme_examples_no_longer_advertise_internal_knob_tuning():
     assert "decision explainability" in readme
     assert "revenue-config set enable_vegas_reflex false" not in readme
     assert "lightning-cli revenue-policy set" not in readme
+
+
+def test_readme_states_planner_closes_are_recommendation_only_by_default():
+    readme = Path("README.md").read_text()
+
+    assert "Planner closes are recommendation-only by default." in readme
+    assert "revenue-ops-planner-execute-closes=true" in readme
+
+
+def test_readme_describes_boltz_treasury_first_boundary():
+    readme = Path("README.md").read_text()
+
+    assert "standing on-chain reserve" in readme
+    assert "treasury mode first" in readme
+    assert "does not replace channel rebalancing" in readme

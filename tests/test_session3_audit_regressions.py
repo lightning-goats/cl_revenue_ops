@@ -304,7 +304,7 @@ class TestEffectiveCostFallback:
         analyzer.database.get_channel_cost.return_value = {
             'open_cost_sats': 5000, 'rebalance_cost_sats': 10000
         }
-        analyzer.database.get_total_splice_costs.return_value = 0
+
 
         # Success rate of 10% — previously this would have inflated
         # 10000 / 0.10 = 100000 (10x inflation!)
@@ -333,7 +333,7 @@ class TestEffectiveCostFallback:
         analyzer.database.get_channel_cost.return_value = {
             'open_cost_sats': 5000, 'rebalance_cost_sats': 10000
         }
-        analyzer.database.get_total_splice_costs.return_value = 0
+
 
         # Recent spend < total rebalance costs, so the isolation logic applies
         analyzer.database.get_channel_rebalance_success_rate.return_value = {
@@ -360,7 +360,7 @@ class TestEffectiveCostFallback:
         analyzer.database.get_channel_cost.return_value = {
             'open_cost_sats': 5000, 'rebalance_cost_sats': 10000
         }
-        analyzer.database.get_total_splice_costs.return_value = 0
+
         analyzer.database.get_channel_rebalance_success_rate.return_value = None
 
         costs = analyzer._get_channel_costs("100x1x0", "02" + "ab" * 32, "abc123")

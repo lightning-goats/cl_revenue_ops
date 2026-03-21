@@ -2,12 +2,11 @@
 Regression tests for fee_controller.py audit (Session 2, 2026-03-02).
 
 Tests cover:
-- C-1: Alpha Sequence priority chain integration test
+- C-1: Fee Priority Chain priority chain integration test
 - C-2: _adjust_channel_fee end-to-end test
 - I-1: NaN guard on update_posterior
-- I-2: Zero-fee probe TTL expiry
+- I-2: Exploration-flag TTL expiry
 - I-8: VegasReflexState unit tests
-- I-9: calculate_scarcity_multiplier unit tests
 """
 
 import pytest
@@ -28,23 +27,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.fee_controller import (
     VegasReflexState,
-    calculate_scarcity_multiplier,
     GaussianThompsonState,
-    HillClimbingFeeController,
-    AIMDDefenseState,
-    ThompsonAIMDState,
+    FeeController,
+    ChannelFeeState,
+    ChannelCycleState,
     FeeAdjustment,
+    FeeReasonCode,
 )
 from modules.config import Config
 
 
-def _make_fc(mock_plugin, mock_database, policy_manager=None, hive_bridge=None):
+def _make_fc(mock_plugin, mock_database, policy_manager=None):
     """Create a fee controller with mocked dependencies."""
     config = MagicMock(spec=Config)
-    return HillClimbingFeeController(
+    return FeeController(
         mock_plugin, config, mock_database,
         policy_manager=policy_manager,
-        hive_bridge=hive_bridge,
     )
 
 
@@ -53,15 +51,9 @@ def _make_config_snapshot(**overrides):
     defaults = {
         'min_fee_ppm': 10,
         'max_fee_ppm': 5000,
-        'hive_fee_ppm': 0,
-        'enable_reputation': False,
-        'enable_scarcity_pricing': False,
-        'scarcity_threshold': 0.30,
-        'ema_smoothing_alpha': 0.3,
         'fee_interval': 1800,
         'inbound_fee_estimate_ppm': 200,
         'thompson_prior_std_fee': 200.0,
-        'hive_min_confidence_for_prior': 0.3,
         'routing_intelligence_enabled': False,
     }
     defaults.update(overrides)
@@ -76,41 +68,6 @@ def _make_config_snapshot(**overrides):
 
 
 # =============================================================================
-# I-9: calculate_scarcity_multiplier unit tests
-# =============================================================================
-
-class TestScarcityMultiplier:
-    """Unit tests for calculate_scarcity_multiplier (I-9)."""
-
-    def test_above_threshold_returns_1(self):
-        """No premium when outbound ratio >= threshold."""
-        assert calculate_scarcity_multiplier(0.50, 0.30) == 1.0
-        assert calculate_scarcity_multiplier(0.30, 0.30) == 1.0
-
-    def test_at_zero_returns_max(self):
-        """Maximum premium (3.0x) when outbound ratio is 0."""
-        result = calculate_scarcity_multiplier(0.0, 0.30)
-        assert result == 3.0
-
-    def test_linear_interpolation_midpoint(self):
-        """At midpoint of threshold, multiplier should be ~2.0."""
-        # threshold=0.30, ratio=0.15 → depth = 1 - 0.15/0.30 = 0.5
-        # multiplier = 1.0 + 0.5 * 2.0 = 2.0
-        result = calculate_scarcity_multiplier(0.15, 0.30)
-        assert abs(result - 2.0) < 0.01
-
-    def test_zero_threshold_returns_1(self):
-        """Safety: avoid division by zero when threshold is 0."""
-        assert calculate_scarcity_multiplier(0.10, 0.0) == 1.0
-
-    def test_clamped_to_bounds(self):
-        """Result is always between 1.0 and 3.0."""
-        # Negative ratio should not produce < 1.0
-        result = calculate_scarcity_multiplier(-0.1, 0.30)
-        assert 1.0 <= result <= 3.0
-
-
-# =============================================================================
 # I-8: VegasReflexState unit tests
 # =============================================================================
 
@@ -118,20 +75,20 @@ class TestVegasReflexState:
     """Unit tests for VegasReflexState (I-8)."""
 
     def test_no_spike_no_intensity(self):
-        """Below 2x spike ratio → no intensity buildup."""
+        """Below 2x spike ratio -> no intensity buildup."""
         state = VegasReflexState()
         state.update(current_sat_vb=10.0, ma_sat_vb=10.0)
         assert state.intensity < 0.01
         assert state.get_floor_multiplier() == 1.0
 
     def test_extreme_spike_sets_max_intensity(self):
-        """4x+ spike ratio → immediate max intensity (1.0)."""
+        """4x+ spike ratio -> immediate max intensity (1.0)."""
         state = VegasReflexState()
         state.update(current_sat_vb=50.0, ma_sat_vb=10.0)  # 5x spike
         assert state.intensity == 1.0
 
     def test_max_intensity_floor_multiplier(self):
-        """Max intensity → 3.0x floor multiplier."""
+        """Max intensity -> 3.0x floor multiplier."""
         state = VegasReflexState()
         state.intensity = 1.0
         mult = state.get_floor_multiplier()
@@ -153,7 +110,7 @@ class TestVegasReflexState:
         state.update(current_sat_vb=25.0, ma_sat_vb=10.0)  # 2.5x
         first_intensity = state.intensity
         assert state.consecutive_spikes == 1
-        # Second moderate spike → confirmed
+        # Second moderate spike -> confirmed
         state.update(current_sat_vb=25.0, ma_sat_vb=10.0)
         assert state.consecutive_spikes == 2
         assert state.intensity > first_intensity * state.decay_rate
@@ -215,14 +172,14 @@ class TestNaNGuardUpdatePosterior:
 
 
 # =============================================================================
-# I-2: Zero-fee probe TTL expiry
+# I-2: Exploration-flag TTL expiry
 # =============================================================================
 
 class TestProbeTTL:
-    """Tests for zero-fee probe TTL expiry (I-2)."""
+    """Tests for bounded-exploration flag TTL expiry (I-2)."""
 
     def test_fresh_probe_returned(self, mock_database):
-        """Probe set recently should be returned."""
+        """Legacy exploration flag set recently should be returned."""
         from modules.database import Database
 
         # We need a real-ish database for this test
@@ -234,7 +191,7 @@ class TestProbeTTL:
         assert not is_expired, "Fresh probe should not be expired"
 
     def test_stale_probe_expired(self):
-        """Probe older than 24h should be treated as expired."""
+        """Legacy exploration flag older than 24h should be treated as expired."""
         probe = {"channel_id": "123x456x0", "probe_type": "zero_fee", "started_at": int(time.time()) - 90000}
         started_at = probe.get("started_at", 0)
         max_age = 86400  # 24h
@@ -242,7 +199,7 @@ class TestProbeTTL:
         assert is_expired, "Stale probe (>24h) should be expired"
 
     def test_probe_without_timestamp_not_expired(self):
-        """Probe with started_at=0 should not be expired (backward compat)."""
+        """Legacy exploration flag with started_at=0 should not expire (backward compat)."""
         probe = {"channel_id": "123x456x0", "probe_type": "zero_fee", "started_at": 0}
         started_at = probe.get("started_at", 0)
         max_age = 86400
@@ -251,17 +208,16 @@ class TestProbeTTL:
 
 
 # =============================================================================
-# C-1: Alpha Sequence priority chain integration test
+# C-1: Fee Priority Chain priority chain integration test
 # =============================================================================
 
-class TestAlphaSequencePriority:
-    """Integration tests for the Alpha Sequence priority chain (C-1).
+class TestFeePriorityChain:
+    """Integration tests for the Fee Priority Chain priority chain (C-1).
 
     Tests verify the correct priority order:
-    1. HIVE Safety (fleet members → enforced hive_fee_ppm)
-    2. Congestion (saturated HTLC slots → ceiling fee)
-    3. Zero-Fee Probe (dead channel → 0 PPM)
-    4. Thompson+AIMD (primary optimization)
+    1. Congestion (saturated HTLC slots -> ceiling fee)
+    2. Bounded low-fee exploration (legacy exploration flag)
+    3. DTS+PID (primary optimization)
     """
 
     def _make_fc_with_state(self, mock_plugin, mock_database):
@@ -275,7 +231,6 @@ class TestAlphaSequencePriority:
         # Database mocks
         mock_database.get_channel_probe.return_value = None
         mock_database.get_volume_since.return_value = 1000
-        mock_database.get_weighted_volume_since.return_value = 1000
         mock_database.get_forward_count_since.return_value = 5
         mock_database.get_peer_uptime_percent.return_value = 100.0
         mock_database.get_channel_state.return_value = {
@@ -306,13 +261,10 @@ class TestAlphaSequencePriority:
         mock_plugin.rpc.setchannelfee.return_value = {}
         mock_plugin.rpc.feerates.return_value = {"perkw": {"opening": 1000}}
 
-        # Ensure Thompson path is used
-        fc.ENABLE_THOMPSON_AIMD = True
-
         return fc, cfg
 
-    def test_congestion_overrides_thompson(self, mock_plugin, mock_database):
-        """Congested channel should get ceiling fee, not Thompson sample."""
+    def test_congestion_overrides_dts_pid(self, mock_plugin, mock_database):
+        """Congested channel should get ceiling fee, not DTS+PID sample."""
         fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
 
         channel_id = "123x456x0"
@@ -327,10 +279,12 @@ class TestAlphaSequencePriority:
         result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
         assert result is not None
-        assert "CONGESTION" in result.reason
+        assert result.reason_code == FeeReasonCode.CONGESTION.value
+        assert result.reason.startswith("CONGESTION:")
+        assert not result.reason.startswith("DTS+PID:")
 
-    def test_probe_overrides_thompson(self, mock_plugin, mock_database):
-        """Channel under zero-fee probe should get 0 PPM fee (from non-zero)."""
+    def test_probe_uses_bounded_low_fee_exploration(self, mock_plugin, mock_database):
+        """Channel under exploration should use a bounded low non-zero fee."""
         fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
         mock_database.get_channel_probe.return_value = {
             "channel_id": "123x456x0",
@@ -342,7 +296,7 @@ class TestAlphaSequencePriority:
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
-        # Channel has a non-zero fee that needs to be overridden to 0
+        # Channel has a non-zero fee that should be pulled into bounded exploration.
         channel_info = {
             "fee_proportional_millionths": 200,
             "capacity": 2_000_000,
@@ -353,11 +307,17 @@ class TestAlphaSequencePriority:
         result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
         assert result is not None
-        assert "ZERO_FEE_PROBE" in result.reason
-        assert result.new_fee_ppm == 0
+        assert result.reason_code == FeeReasonCode.LOW_FEE_EXPLORATION.value
+        assert result.reason.startswith("EXPLORATION:")
+        assert "exploration" in result.reason.lower()
+        assert "zero" not in result.reason.lower()
+        assert "probe" not in result.reason.lower()
+        assert result.new_fee_ppm >= cfg.min_fee_ppm
+        assert result.new_fee_ppm > 0
+        assert result.new_fee_ppm < channel_info["fee_proportional_millionths"]
 
     def test_congestion_beats_probe(self, mock_plugin, mock_database):
-        """Congestion priority is higher than zero-fee probe."""
+        """Congestion priority is higher than bounded low-fee exploration."""
         fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
         mock_database.get_channel_probe.return_value = {
             "channel_id": "123x456x0",
@@ -378,43 +338,16 @@ class TestAlphaSequencePriority:
 
         assert result is not None
         # Congestion should win over probe
-        assert "CONGESTION" in result.reason
-
-    def test_hive_peer_gets_enforced_fee(self, mock_plugin, mock_database):
-        """HIVE peer always gets hive_fee_ppm regardless of other signals."""
-        from modules.policy_manager import PolicyManager
-
-        policy_mgr = MagicMock(spec=PolicyManager)
-        policy_mgr.is_hive_peer.return_value = True
-
-        fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
-        fc.policy_manager = policy_mgr
-
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-        channel_info = {
-            "fee_proportional_millionths": 500,  # Non-zero = needs enforcement
-            "capacity": 2_000_000,
-            "spendable_msat": "1000000000msat",
-        }
-        state = {"state": "congested", "forward_count": 50}  # Would trigger congestion
-
-        # Mock set_channel_fee to return success
-        fc.set_channel_fee = MagicMock(return_value={"success": True})
-
-        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
-
-        assert result is not None
-        assert "HIVE_SAFETY" in result.reason
-        assert result.new_fee_ppm == cfg.hive_fee_ppm
+        assert result.reason_code == FeeReasonCode.CONGESTION.value
+        assert result.reason.startswith("CONGESTION:")
 
 
 # =============================================================================
-# C-2: _adjust_channel_fee end-to-end test (Thompson path)
+# C-2: _adjust_channel_fee end-to-end test (DTS+PID path)
 # =============================================================================
 
 class TestAdjustChannelFeeEndToEnd:
-    """End-to-end tests for _adjust_channel_fee Thompson+AIMD path (C-2)."""
+    """End-to-end tests for _adjust_channel_fee DTS+PID path (C-2)."""
 
     def _make_fc_full(self, mock_plugin, mock_database):
         """Create fully mocked fee controller for end-to-end testing."""
@@ -426,7 +359,6 @@ class TestAdjustChannelFeeEndToEnd:
         # Database
         mock_database.get_channel_probe.return_value = None
         mock_database.get_volume_since.return_value = 50_000
-        mock_database.get_weighted_volume_since.return_value = 50_000
         mock_database.get_forward_count_since.return_value = 10
         mock_database.get_peer_uptime_percent.return_value = 99.5
         mock_database.get_channel_state.return_value = {
@@ -458,12 +390,10 @@ class TestAdjustChannelFeeEndToEnd:
         mock_plugin.rpc.setchannelfee.return_value = {}
         mock_plugin.rpc.feerates.return_value = {"perkw": {"opening": 1000}}
 
-        fc.ENABLE_THOMPSON_AIMD = True
-
         return fc, cfg
 
-    def test_thompson_produces_valid_fee(self, mock_plugin, mock_database):
-        """Thompson+AIMD path should produce a fee within floor-ceiling bounds."""
+    def test_dts_pid_produces_valid_fee(self, mock_plugin, mock_database):
+        """DTS+PID path should produce a fee within floor-ceiling bounds."""
         fc, cfg = self._make_fc_full(mock_plugin, mock_database)
 
         channel_id = "123x456x0"
@@ -476,16 +406,21 @@ class TestAdjustChannelFeeEndToEnd:
         }
         state = {"state": "source", "forward_count": 50, "sats_out": 10000}
 
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=150)
+        ts_state.thompson.sample_fee = lambda floor, ceiling: min(ceiling, 400)
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
         result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
         assert result is not None
         assert isinstance(result, FeeAdjustment)
+        assert result.reason_code == FeeReasonCode.DTS_PID_SAMPLE.value
+        assert result.reason.startswith("DTS+PID:")
         assert result.new_fee_ppm >= 1, "Fee should not be negative"
         assert result.new_fee_ppm <= cfg.max_fee_ppm + 100, "Fee should not exceed ceiling + buffer"
-        assert "thompson" in result.reason.lower() or "dts_pid" in result.reason.lower() or result.reason.startswith("CONGESTION")
 
-    def test_thompson_state_saved_after_adjustment(self, mock_plugin, mock_database):
-        """Thompson state should be saved to database after adjustment."""
+    def test_state_saved_after_adjustment(self, mock_plugin, mock_database):
+        """Channel fee state should be saved to database after adjustment."""
         fc, cfg = self._make_fc_full(mock_plugin, mock_database)
 
         channel_id = "123x456x0"
@@ -502,13 +437,13 @@ class TestAdjustChannelFeeEndToEnd:
 
         # Verify database was called to persist state
         assert mock_database.update_fee_strategy_state.called, \
-            "Thompson state should be saved after adjustment"
+            "Fee state should be saved after adjustment"
 
     def test_sleeping_channel_returns_none(self, mock_plugin, mock_database):
         """Channel in sleep mode should return None (no adjustment)."""
         fc, cfg = self._make_fc_full(mock_plugin, mock_database)
 
-        # Override to indicate sleeping — revenue rate matches last known rate
+        # Override to indicate sleeping -- revenue rate matches last known rate
         # to avoid triggering the wake-up spike detection
         now = int(time.time())
         mock_database.get_fee_strategy_state.return_value = {
@@ -525,10 +460,6 @@ class TestAdjustChannelFeeEndToEnd:
             "last_volume_sats": 50_000,
             "v2_state_json": None,
         }
-        # Revenue rate: volume * fee / 1M / hours
-        # = 100 * 150 / 1M / 1h = 0.015 sats/hr
-        # Last rate: 0.01. Change: |0.015 - 0.01| / 0.01 = 0.5 → still > WAKE_UP_THRESHOLD
-        # Need volume low enough: 0 volume → rate=0, last_rate=0.01 → uses zero-to-positive=1.0
         # Use 0 volume to get rate=0, and last_rate=0 to trigger zero-to-zero path
         mock_database.get_volume_since.return_value = 0
         mock_database.get_fee_strategy_state.return_value["last_revenue_rate"] = 0.0
@@ -546,330 +477,148 @@ class TestAdjustChannelFeeEndToEnd:
 
         assert result is None, "Sleeping channel should not produce a fee adjustment"
 
+    def test_sleeping_channel_uses_raw_chain_fee_for_wake_detection(self, mock_plugin, mock_database):
+        """A seeded min-fee must not create phantom revenue and false wake-ups."""
+        fc, cfg = self._make_fc_full(mock_plugin, mock_database)
 
-# =============================================================================
-# Additional AIMD unit tests
-# =============================================================================
-
-class TestAIMDDefenseState:
-    """Tests for AIMD defense behavior."""
-
-    def test_success_streak_increases_modifier(self):
-        """10 consecutive successes should increase modifier by +0.02."""
-        state = AIMDDefenseState()
-        state.aimd_modifier = 0.8
-        for _ in range(10):
-            state.record_outcome(success_score=0.9)
-        assert state.aimd_modifier == pytest.approx(0.82, abs=0.01)
-
-    def test_failure_streak_decreases_modifier(self):
-        """3 consecutive failures should multiplicatively decrease modifier."""
-        state = AIMDDefenseState()
-        state.aimd_modifier = 1.0
-        for _ in range(3):
-            state.record_outcome(success_score=0.1)
-        assert state.aimd_modifier < 1.0
-        assert state.aimd_modifier == pytest.approx(0.85, abs=0.01)
-
-    def test_exploration_suppresses_failure(self):
-        """Failures during exploration should not trigger AIMD decrease."""
-        state = AIMDDefenseState()
-        initial = state.aimd_modifier
-        for _ in range(5):
-            state.record_outcome(success_score=0.1, is_exploring=True)
-        assert state.aimd_modifier == initial
-        assert state.consecutive_failures == 0
-
-    def test_neutral_zone_no_change(self):
-        """Scores between 0.3 and 0.7 should not change counters."""
-        state = AIMDDefenseState()
-        state.consecutive_successes = 5
-        state.consecutive_failures = 0
-        state.record_outcome(success_score=0.5)
-        assert state.consecutive_successes == 5  # Unchanged
-        assert state.consecutive_failures == 0
-
-    def test_modifier_bounded(self):
-        """Modifier should never go below 0.5 or above 1.5."""
-        state = AIMDDefenseState()
-        # Many failures
-        for _ in range(100):
-            state.last_decrease_time = 0  # bypass cooldown
-            state.record_outcome(success_score=0.1)
-        assert state.aimd_modifier >= 0.5
-
-        # Many successes
-        state.aimd_modifier = 1.4
-        for _ in range(200):
-            state.record_outcome(success_score=0.9)
-        assert state.aimd_modifier <= 1.5
-
-
-# =============================================================================
-# Simplified Fee Path Integration Tests
-# =============================================================================
-
-class TestSimplifiedFeePath:
-    """Integration tests for the simplified Thompson+AIMD path.
-
-    Verifies that with ENABLE_SIMPLIFIED_FEE_PATH = True (the default):
-    1. Fees are produced within configured bounds
-    2. Elasticity tracker state is NOT updated
-    3. Historical response curve state is NOT updated
-    4. AIMD defense still applies
-    5. Scarcity pricing still applies (via bounds multiplier)
-    6. Hive coordination blend still applies
-    """
-
-    def _make_fc(self, mock_plugin, mock_database, *, hive_bridge=None):
-        """Create a fee controller configured for the simplified path."""
-        fc = _make_fc(mock_plugin, mock_database, hive_bridge=hive_bridge)
-
-        cfg = _make_config_snapshot()
-        fc.config.snapshot.return_value = cfg
-
-        # Database mocks
-        mock_database.get_channel_probe.return_value = None
-        mock_database.get_volume_since.return_value = 50_000
-        mock_database.get_weighted_volume_since.return_value = 50_000
-        mock_database.get_forward_count_since.return_value = 10
-        mock_database.get_peer_uptime_percent.return_value = 99.5
-        mock_database.get_channel_state.return_value = {
-            "kalman_flow_ratio": 0.5,
-            "kalman_velocity": 0.0,
-        }
+        now = int(time.time())
+        channel_id = "123x456x1"
+        peer_id = "02" + "b" * 64
         mock_database.get_fee_strategy_state.return_value = {
-            "last_revenue_rate": 5.0,
-            "last_fee_ppm": 150,
+            "last_revenue_rate": 0.0,
+            "last_fee_ppm": 0,
             "trend_direction": 1,
             "step_ppm": 50,
-            "last_update": int(time.time()) - 7200,
+            "last_update": now - 3600,
             "consecutive_same_direction": 0,
-            "is_sleeping": 0,
-            "sleep_until": 0,
-            "stable_cycles": 0,
-            "forward_count_since_update": 10,
-            "last_volume_sats": 50_000,
+            "is_sleeping": 1,
+            "sleep_until": now + 3600,
+            "stable_cycles": 5,
+            "forward_count_since_update": 0,
+            "last_volume_sats": 0,
             "v2_state_json": None,
         }
-        mock_database.get_last_forward_time.return_value = int(time.time()) - 1800
-        mock_database.get_failure_count.return_value = (0, 0)
-        mock_database.get_channel_cost_history.return_value = []
-        mock_database.get_channel_rebalance_success_rate.return_value = None
-        mock_database.get_peer_latency_stats.return_value = {'avg': 0.0, 'std': 0.0, 'count': 0}
-        mock_database.update_fee_strategy_state = MagicMock()
-        mock_database.record_fee_change = MagicMock()
+        mock_database.get_volume_since.return_value = 100_000
+        mock_database.get_forward_count_since.return_value = 0
 
-        # RPC mocks
-        mock_plugin.rpc.setchannelfee.return_value = {}
-        mock_plugin.rpc.feerates.return_value = {"perkw": {"opening": 1000}}
+        channel_info = {
+            "fee_proportional_millionths": 0,
+            "capacity": 2_000_000,
+            "spendable_msat": "1000000000msat",
+        }
+        state = {"state": "balanced", "forward_count": 0}
 
-        # Ensure we are on the simplified Thompson+AIMD path
-        fc.ENABLE_THOMPSON_AIMD = True
-        assert fc.ENABLE_SIMPLIFIED_FEE_PATH is True, "Default should be True"
+        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
-        return fc, cfg
+        assert result is None
+        assert fc._channel_fee_states[channel_id].is_sleeping is True
 
-    def _channel_info(self, *, current_fee_ppm=150, outbound_pct=50.0):
-        """Create channel_info dict with configurable fee and balance."""
-        capacity_sats = 2_000_000
-        spendable_sats = int(capacity_sats * (outbound_pct / 100.0))
-        return {
-            "fee_proportional_millionths": current_fee_ppm,
-            "capacity": capacity_sats,
-            "spendable_msat": f"{spendable_sats * 1000}msat",
+    def test_gossip_refresh_eligibility_uses_broadcast_age_not_observation_cursor(self, mock_plugin, mock_database):
+        fc, _cfg = self._make_fc_full(mock_plugin, mock_database)
+        now = int(time.time())
+        channel_id = "123x456x2"
+        state = ChannelCycleState(
+            last_update=now - 300,
+            last_broadcast_fee_ppm=150,
+            last_gossip_refresh=now - 172800,
+        )
+        state.last_broadcast_at = now - 172800
+        mock_database.get_last_forward_time.return_value = now - 172800
+
+        assert fc._should_force_gossip_refresh(channel_id, state, now) is True
+
+    def test_gossip_refresh_respects_feature_gate_and_cooldown(self, mock_plugin, mock_database):
+        fc, _cfg = self._make_fc_full(mock_plugin, mock_database)
+        now = int(time.time())
+        channel_id = "123x456x3"
+        state = ChannelCycleState(
+            last_update=now - 300,
+            last_broadcast_fee_ppm=150,
+            last_gossip_refresh=now - 3600,
+        )
+        state.last_broadcast_at = now - 172800
+        mock_database.get_last_forward_time.return_value = now - 172800
+
+        assert fc._should_force_gossip_refresh(channel_id, state, now) is False
+
+        fc.ENABLE_GOSSIP_REFRESH = False
+        state.last_gossip_refresh = now - 172800
+        assert fc._should_force_gossip_refresh(channel_id, state, now) is False
+
+    def test_alpha_guard_updates_observation_cursor_only(self, mock_plugin, mock_database):
+        fc, cfg = self._make_fc_full(mock_plugin, mock_database)
+        channel_id = "123x456x4"
+        peer_id = "02" + "c" * 64
+        now = int(time.time())
+
+        cycle = ChannelCycleState(
+            last_revenue_rate=5.0,
+            last_fee_ppm=500,
+            last_broadcast_fee_ppm=500,
+            last_update=now - 7200,
+        )
+        cycle.last_broadcast_at = now - 172800
+        fc._cycle_states[channel_id] = cycle
+
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=500)
+        ts_state.last_revenue_rate = 5.0
+        ts_state.last_fee_ppm = 500
+        ts_state.last_broadcast_fee_ppm = 500
+        ts_state.last_update = now - 7200
+        ts_state.last_broadcast_at = now - 172800
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 501
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
+        channel_info = {
+            "fee_proportional_millionths": 500,
+            "capacity": 2_000_000,
+            "spendable_msat": "1000000000msat",
             "opener": "local",
         }
+        state = {"state": "balanced", "forward_count": 50, "sats_out": 10000}
 
-    def _default_state(self):
-        return {"state": "balanced", "forward_count": 50, "sats_out": 10000}
+        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
-    # ------------------------------------------------------------------
-    # Test 1: Fee within configured bounds
-    # ------------------------------------------------------------------
-    def test_produces_fee_within_bounds(self, mock_plugin, mock_database):
-        """Simplified path should produce a fee within [min_fee_ppm, max_fee_ppm]."""
-        fc, cfg = self._make_fc(mock_plugin, mock_database)
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-        channel_info = self._channel_info()
+        assert result is None
+        assert fc._cycle_states[channel_id].last_update >= now
+        assert fc._cycle_states[channel_id].last_broadcast_at == cycle.last_broadcast_at
+        assert fc._channel_fee_states[channel_id].last_broadcast_at == ts_state.last_broadcast_at
 
-        result = fc._adjust_channel_fee(
-            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
+    def test_successful_broadcast_updates_both_observation_and_broadcast_timestamps(self, mock_plugin, mock_database):
+        fc, cfg = self._make_fc_full(mock_plugin, mock_database)
+        channel_id = "123x456x5"
+        peer_id = "02" + "d" * 64
+        now = int(time.time())
+
+        cycle = ChannelCycleState(
+            last_revenue_rate=5.0,
+            last_fee_ppm=500,
+            last_broadcast_fee_ppm=500,
+            last_update=now - 7200,
         )
+        cycle.last_broadcast_at = now - 172800
+        fc._cycle_states[channel_id] = cycle
 
-        assert result is not None
-        assert isinstance(result, FeeAdjustment)
-        assert result.new_fee_ppm >= cfg.min_fee_ppm
-        assert result.new_fee_ppm <= cfg.max_fee_ppm
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=500)
+        ts_state.last_revenue_rate = 5.0
+        ts_state.last_fee_ppm = 500
+        ts_state.last_broadcast_fee_ppm = 500
+        ts_state.last_update = now - 7200
+        ts_state.last_broadcast_at = now - 172800
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 1200
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
 
-    # ------------------------------------------------------------------
-    # Test 2: Elasticity tracker NOT updated
-    # ------------------------------------------------------------------
-    def test_does_not_update_elasticity_tracker(self, mock_plugin, mock_database):
-        """Simplified path must NOT call elasticity tracker add_observation."""
-        fc, cfg = self._make_fc(mock_plugin, mock_database)
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-        channel_info = self._channel_info()
-
-        # Seed some elasticity data to verify it's unchanged after adjustment
-        from modules.fee_controller import ThompsonAIMDState, ElasticityTracker
-        ts_state = fc._get_thompson_aimd_state(channel_id, peer_id)
-        tracker_before = ts_state.get_elasticity_tracker()
-        data_before = tracker_before.to_dict()
-
-        result = fc._adjust_channel_fee(
-            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
-        )
-
-        assert result is not None
-        # Re-fetch the state and verify elasticity data is unchanged
-        ts_state_after = fc._get_thompson_aimd_state(channel_id, peer_id)
-        tracker_after = ts_state_after.get_elasticity_tracker()
-        data_after = tracker_after.to_dict()
-        assert data_before == data_after, (
-            "Elasticity tracker should not be updated in simplified path"
-        )
-
-    # ------------------------------------------------------------------
-    # Test 3: Historical response curve NOT updated
-    # ------------------------------------------------------------------
-    def test_does_not_update_historical_curve(self, mock_plugin, mock_database):
-        """Simplified path must NOT call historical_curve.add_observation."""
-        fc, cfg = self._make_fc(mock_plugin, mock_database)
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-        channel_info = self._channel_info()
-
-        from modules.fee_controller import HistoricalResponseCurve
-        ts_state = fc._get_thompson_aimd_state(channel_id, peer_id)
-        curve_before = ts_state.get_historical_curve()
-        data_before = curve_before.to_dict()
-
-        result = fc._adjust_channel_fee(
-            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
-        )
-
-        assert result is not None
-        ts_state_after = fc._get_thompson_aimd_state(channel_id, peer_id)
-        curve_after = ts_state_after.get_historical_curve()
-        data_after = curve_after.to_dict()
-        assert data_before == data_after, (
-            "Historical response curve should not be updated in simplified path"
-        )
-
-    # ------------------------------------------------------------------
-    # Test 4: AIMD defense still applies (failure streaks lower fee)
-    # ------------------------------------------------------------------
-    def test_aimd_defense_applies(self, mock_plugin, mock_database):
-        """Failure streaks should reduce the AIMD modifier, lowering the fee."""
-        fc, cfg = self._make_fc(mock_plugin, mock_database)
-        fc.ENABLE_DTS_PID = False  # AIMD defense is legacy path only
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-        channel_info = self._channel_info(current_fee_ppm=500)
-
-        # First: get a baseline fee with no AIMD pressure
-        result_baseline = fc._adjust_channel_fee(
-            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
-        )
-        assert result_baseline is not None
-
-        # Now inject a failure streak into the AIMD state
-        ts_state = fc._get_thompson_aimd_state(channel_id, peer_id)
-        for _ in range(10):
-            ts_state.aimd.last_decrease_time = 0  # bypass cooldown
-            ts_state.aimd.record_outcome(success_score=0.05)
-        assert ts_state.aimd.aimd_modifier < 1.0, "AIMD modifier should have decreased"
-
-        # Re-run fee adjustment — AIMD should pull the fee down
-        result_defense = fc._adjust_channel_fee(
-            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
-        )
-        assert result_defense is not None
-        assert "aimd_defense" in result_defense.reason.lower() or "defense" in result_defense.reason.lower(), (
-            f"Expected AIMD defense reason, got: {result_defense.reason}"
-        )
-
-    # ------------------------------------------------------------------
-    # Test 5: Scarcity pricing raises floor via bounds multiplier
-    # ------------------------------------------------------------------
-    def test_scarcity_raises_floor(self, mock_plugin, mock_database):
-        """Low outbound ratio should raise the fee floor via bounds multiplier."""
-        fc, cfg = self._make_fc(mock_plugin, mock_database)
-        cfg.enable_scarcity_pricing = True
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-
-        # Normal balance (50%) — baseline
-        channel_info_normal = self._channel_info(outbound_pct=50.0)
-        result_normal = fc._adjust_channel_fee(
-            channel_id, peer_id, self._default_state(), channel_info_normal, cfg=cfg
-        )
-
-        # Scarce balance (10%) — should have higher floor
-        channel_info_scarce = self._channel_info(outbound_pct=10.0)
-        mock_database.get_channel_state.return_value = {
-            "kalman_flow_ratio": 0.1,
-            "kalman_velocity": 0.0,
+        channel_info = {
+            "fee_proportional_millionths": 500,
+            "capacity": 2_000_000,
+            "spendable_msat": "1000000000msat",
+            "opener": "local",
         }
-        result_scarce = fc._adjust_channel_fee(
-            channel_id, peer_id,
-            {"state": "sink", "forward_count": 50, "sats_out": 10000},
-            channel_info_scarce, cfg=cfg
-        )
+        state = {"state": "balanced", "forward_count": 50, "sats_out": 10000}
 
-        assert result_normal is not None
-        assert result_scarce is not None
-        # With very low outbound (10%), the liquidity bucket multiplier raises
-        # the floor, so the fee should be >= the normal-balance fee
-        assert result_scarce.new_fee_ppm >= cfg.min_fee_ppm
-
-    # ------------------------------------------------------------------
-    # Test 6: Hive coordination blend applies
-    # ------------------------------------------------------------------
-    def test_hive_coordination_blend(self, mock_plugin, mock_database):
-        """When hive bridge provides a recommendation, fee should be blended."""
-        hive_bridge = MagicMock()
-        hive_bridge.is_available.return_value = True
-        hive_bridge.query_coordinated_fee_recommendation.return_value = {
-            "recommended_fee_ppm": 500,
-            "confidence": 0.9,
-            "corridor_role": "primary",
-            "defense_multiplier": 1.0,
-            "pheromone_level": 0.8,
-            "adjustment_reason": "test_coord",
-        }
-        hive_bridge.query_defense_status.return_value = None
-        hive_bridge.query_hive_prior.return_value = None
-        # Return None for fee intelligence to avoid competitor-adjusted bounds path
-        hive_bridge.query_fee_intelligence.return_value = None
-        # Fleet-aware adjustment returns unchanged fee
-        hive_bridge.check_internal_competition_for_peer.return_value = None
-
-        fc, cfg = self._make_fc(mock_plugin, mock_database, hive_bridge=hive_bridge)
-        fc.ENABLE_HIVE_COORDINATION = True
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-        channel_info = self._channel_info(current_fee_ppm=100)
-
-        result = fc._adjust_channel_fee(
-            channel_id, peer_id, self._default_state(), channel_info, cfg=cfg
-        )
+        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
 
         assert result is not None
-        # The hive recommends 500 ppm. With HIVE_COORDINATION_WEIGHT=0.5,
-        # the blended fee should be pulled toward 500 from wherever Thompson
-        # sampled. The exact value depends on the Thompson sample, but the
-        # recommendation should have been queried.  It may be called more than
-        # once (e.g. during Thompson prior initialization and during the blend).
-        assert hive_bridge.query_coordinated_fee_recommendation.call_count >= 1
-        # Verify the coordination blend call included local_balance_pct
-        blend_calls = [
-            c for c in hive_bridge.query_coordinated_fee_recommendation.call_args_list
-            if 'local_balance_pct' in (c.kwargs or {})
-        ]
-        assert len(blend_calls) == 1, "Expected exactly one coordination blend call"
-        assert result.new_fee_ppm >= cfg.min_fee_ppm
-        assert result.new_fee_ppm <= cfg.max_fee_ppm
+        assert fc._cycle_states[channel_id].last_update >= now
+        assert fc._cycle_states[channel_id].last_broadcast_at >= now
+        assert fc._channel_fee_states[channel_id].last_broadcast_at >= now

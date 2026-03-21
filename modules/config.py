@@ -4,10 +4,8 @@ Configuration module for cl-revenue-ops
 Contains the Config dataclass that holds all tunable parameters
 for the Revenue Operations plugin.
 
-Phase 7 additions:
-- ConfigSnapshot: Immutable snapshot for thread-safe cycle execution
-- Runtime configuration updates via RPC
-- Vegas Reflex and Scarcity Pricing settings
+Includes ConfigSnapshot for immutable, thread-safe cycle execution
+and runtime configuration updates via RPC.
 """
 
 import math
@@ -39,16 +37,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'flow_interval': int,
     'fee_interval': int,
     'rebalance_interval': int,
-    'enable_gossip_keepalives': bool,
-    'target_gossip_peers': int,
     'paused': bool,
     'min_fee_ppm': int,
     'max_fee_ppm': int,
-    'auto_band_enabled': bool,
-    'auto_band_min_observations': int,
-    'auto_band_sigma': float,
-    'auto_band_min_width_ppm': int,
-    'auto_band_recalibrate_interval': int,
     'daily_budget_sats': int,
     'weekly_budget_sats': int,
     'total_cost_budget_mode': str,
@@ -67,18 +58,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'boltz_auto_cycle_interval_minutes': int,
     'boltz_auto_cycle_max_actions': int,
     'boltz_auto_cycle_startup_delay_seconds': int,
-    'enable_dynamic_htlcmin': bool,
-    'enable_realtime_surge_defense': bool,
-    'surge_window_seconds': int,
-    'surge_trigger_pct': float,
-    'surge_multiplier_min': float,
-    'surge_multiplier_max': float,
-    'surge_cooldown_seconds': int,
-    'surge_setchannel_min_interval_seconds': int,
-    'enable_dynamic_htlcmax': bool,
-    'htlcmax_source_pct': float,
-    'htlcmax_sink_pct': float,
-    'htlcmax_balanced_pct': float,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -92,7 +71,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'htlc_congestion_threshold': float,
     'enable_reputation': bool,
     'enable_kelly': bool,
-    'kelly_bypass_for_fleet': bool,
     'enable_proportional_budget': bool,
     'proportional_budget_pct': float,
     'kelly_fraction': float,
@@ -118,19 +96,12 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_cooldown_hours': int,
     'futility_cooldown_hours': int,
     'inbound_fee_estimate_ppm': int,
-    # Phase 7 additions
+    # Vegas Reflex
     'enable_vegas_reflex': bool,
     'vegas_decay_rate': float,
-    'enable_scarcity_pricing': bool,
-    'scarcity_threshold': float,
-    # Hive Parameters
-    'hive_enabled': str,  # "auto", "true", "false"
-    'hive_fee_ppm': int,
-    'hive_rebalance_tolerance': int,
-    # Phase 1: Operational Hardening
+    # Operational Hardening
     'rpc_timeout_seconds': int,
     'rpc_circuit_breaker_seconds': int,
-    'hive_bridge_circuit_breaker_enabled': bool,
     'rpc_pool_size': int,
     'reservation_timeout_hours': int,
     # Issue #28: Revenue rate smoothing
@@ -139,39 +110,14 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'enable_velocity_gate': bool,
     'min_velocity_threshold': float,
     'new_channel_grace_days': int,
-    # Thompson Sampling + AIMD (v1.7.0)
+    # DTS (Discounted Thompson Sampling) parameters
     'thompson_prior_std_fee': int,
     'thompson_observation_decay_hours': int,
     'thompson_max_observations': int,
     'thompson_min_observations': int,
-    'aimd_failure_threshold': int,
-    'aimd_success_threshold': int,
-    'aimd_multiplicative_decrease': float,
-    'aimd_additive_increase_ppm': int,
-    'aimd_min_decrease_interval': int,
-    'hive_prior_weight': float,
-    'hive_min_confidence_for_prior': float,
     # Routing Intelligence Integration
     'routing_intelligence_enabled': bool,
     'routing_intelligence_cache_seconds': int,
-    # Comprehensive Hive Data Integration
-    'hive_defense_status_enabled': bool,
-    'hive_defense_status_cache_seconds': int,
-    'hive_peer_quality_enabled': bool,
-    'hive_peer_quality_cache_seconds': int,
-    'hive_decision_history_enabled': bool,
-    'hive_decision_history_days': int,
-    'hive_channel_flags_enabled': bool,
-    'hive_mcf_targets_enabled': bool,
-    'hive_mcf_targets_cache_seconds': int,
-    'hive_nnlb_enabled': bool,
-    'hive_nnlb_min_amount': int,
-    'hive_nnlb_auto_execute': bool,
-    'hive_channel_ages_enabled': bool,
-    'hive_channel_ages_cache_seconds': int,
-    'enable_hive_egress_desaturation_bias': bool,
-    'hive_egress_desaturation_bias_max_ppm': int,
-    'hive_egress_desaturation_bias_weight': float,
     # Fields present in CONFIG_FIELD_RANGES that need type registration
     'base_fee_msat': int,
     'flow_window_days': int,
@@ -182,6 +128,21 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalancer_plugin': str,
     'enable_flow_asymmetry': bool,
     'enable_peer_sync': bool,
+    # Capacity Planner
+    'planner_enabled': bool,
+    'planner_interval': int,
+    'planner_dry_run': bool,
+    'planner_execute_closes': bool,
+    'planner_max_opens_per_cycle': int,
+    'planner_max_closes_per_cycle': int,
+    'planner_min_channel_sats': int,
+    'planner_max_channel_sats': int,
+    'planner_min_channel_age_days': int,
+    'planner_min_peer_uptime_pct': float,
+    'planner_max_fee_rate_sat_vb': float,
+    # Hive Hints
+    'hive_hints_enabled': bool,
+    'hive_hints_ttl_seconds': int,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -192,10 +153,6 @@ DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset()
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
     'max_fee_ppm': (1, 100000),
-    'auto_band_min_observations': (1, 500),
-    'auto_band_sigma': (0.1, 10.0),
-    'auto_band_min_width_ppm': (1, 10000),
-    'auto_band_recalibrate_interval': (1, 1000),
     'daily_budget_sats': (0, 10000000),
     'weekly_budget_sats': (0, 70_000_000),
     'total_cost_budget_profit_pct': (0.0, 1.0),
@@ -208,22 +165,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
     'htlc_congestion_threshold': (0.0, 1.0),
-    'surge_window_seconds': (1, 3600),
-    'surge_trigger_pct': (0.0, 1.0),
-    'surge_multiplier_min': (1.0, 100.0),
-    'surge_multiplier_max': (1.0, 100.0),
-    'surge_cooldown_seconds': (1, 86400),
-    'surge_setchannel_min_interval_seconds': (1, 3600),
     'reputation_decay': (0.0, 1.0),
     'proportional_budget_pct': (0.0, 1.0),
     'kelly_fraction': (0.0, 1.0),
     'vegas_decay_rate': (0.0, 1.0),
-    'scarcity_threshold': (0.0, 1.0),
-    'htlcmax_source_pct': (0.01, 1.0),
-    'htlcmax_sink_pct': (0.01, 1.0),
-    'htlcmax_balanced_pct': (0.01, 1.0),
-    'hive_fee_ppm': (0, 100000),
-    'hive_rebalance_tolerance': (0, 100000),
     'sling_chunk_size_sats': (1, 50000000),
     'sling_max_hops': (2, 20),
     'sling_parallel_jobs': (1, 10),
@@ -244,34 +189,17 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # Issue #30: Velocity gate for rebalancing
     'min_velocity_threshold': (0.0, 1.0),
     'new_channel_grace_days': (0, 30),
-    # Thompson Sampling + AIMD (v1.7.0)
+    # DTS (Discounted Thompson Sampling) parameters
     'thompson_prior_std_fee': (10, 500),
     'thompson_observation_decay_hours': (24, 720),  # 1 day to 30 days
     'thompson_max_observations': (50, 500),
     'thompson_min_observations': (1, 20),
-    'aimd_failure_threshold': (1, 10),
-    'aimd_success_threshold': (3, 30),
-    'aimd_multiplicative_decrease': (0.5, 0.95),
-    'aimd_additive_increase_ppm': (1, 20),
-    'aimd_min_decrease_interval': (300, 86400),  # 5 min to 24 hours
-    'hive_prior_weight': (0.0, 1.0),
-    'hive_min_confidence_for_prior': (0.0, 1.0),
     # Routing Intelligence Integration
     'routing_intelligence_cache_seconds': (60, 3600),  # 1 min to 1 hour
-    # Comprehensive Hive Data Integration
-    'hive_defense_status_cache_seconds': (10, 300),    # 10 sec to 5 min
-    'hive_peer_quality_cache_seconds': (60, 1800),     # 1 min to 30 min
-    'hive_decision_history_days': (1, 90),             # 1 to 90 days
-    'hive_mcf_targets_cache_seconds': (60, 1800),      # 1 min to 30 min
-    'hive_nnlb_min_amount': (10000, 10000000),         # 10k to 10M sats
-    'hive_channel_ages_cache_seconds': (300, 86400),   # 5 min to 24 hours
-    'hive_egress_desaturation_bias_max_ppm': (0, 1000),
-    'hive_egress_desaturation_bias_weight': (0.0, 1.0),
     # Additional range validations
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
     'rebalance_interval': (60, 86400),
-    'target_gossip_peers': (0, 100),
     'max_concurrent_jobs': (1, 20),
     'sling_job_timeout_seconds': (60, 7200),
     'askrene_max_age_sec': (10, 86400),
@@ -298,11 +226,20 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'expansion_treasury_min_deficit_sats': (0, 100000000),
     'expansion_treasury_onchain_target_sats': (0, 1000000000),
     'hot_channel_protection_max_rebalance_fee_ppm': (0, 100000),
+    # Capacity Planner
+    'planner_interval': (600, 604800),
+    'planner_max_opens_per_cycle': (0, 10),
+    'planner_max_closes_per_cycle': (0, 10),
+    'planner_min_channel_sats': (100000, 100000000),
+    'planner_max_channel_sats': (500000, 1677721500),
+    'planner_min_channel_age_days': (1, 365),
+    'planner_min_peer_uptime_pct': (0.0, 100.0),
+    'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
+    'hive_hints_ttl_seconds': (60, 7200),
 }
 
 # Valid values for string enum fields
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
-    'hive_enabled': ('auto', 'true', 'false'),
     'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
     'total_cost_budget_mode': ('fixed', 'profit_pct'),
     'rebalancer_plugin': ('sling',),
@@ -324,8 +261,6 @@ class Config:
     flow_interval: int = 3600      # 1 hour
     fee_interval: int = 1800       # 30 minutes (matches option default)
     rebalance_interval: int = 900  # 15 minutes
-    enable_gossip_keepalives: bool = False
-    target_gossip_peers: int = 5
     # Hot-channel protection (Sling aggressiveness for fast-draining, high-profit channels)
     hot_channel_protection_enabled: bool = True
     hot_channel_protection_override_peers: str = ''  # CSV fallback; DB override table preferred
@@ -339,22 +274,7 @@ class Config:
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
     boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
-    # Dynamic HTLC Min
-    enable_dynamic_htlcmin: bool = False
-    # Real-time surge defense
-    enable_realtime_surge_defense: bool = False
-    surge_window_seconds: int = 60
-    surge_trigger_pct: float = 0.10
-    surge_multiplier_min: float = 3.0
-    surge_multiplier_max: float = 5.0
-    surge_cooldown_seconds: int = 120
-    surge_setchannel_min_interval_seconds: int = 15
-    # Dynamic HTLC Max
-    enable_dynamic_htlcmax: bool = False
-    htlcmax_source_pct: float = 0.10     # Sources restricted to 10% chunks
-    htlcmax_sink_pct: float = 1.0        # Sinks wide open (100%)
-    htlcmax_balanced_pct: float = 0.50   # Balanced channels restricted to 50%
-    # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens/splices)
+    # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
     expansion_treasury_min_deficit_sats: int = 250_000
@@ -375,11 +295,6 @@ class Config:
     min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)
     max_fee_ppm: int = 5000        # Ceiling fee in PPM
     base_fee_msat: int = 0         # Base fee (we focus on PPM)
-    auto_band_enabled: bool = True
-    auto_band_min_observations: int = 20
-    auto_band_sigma: float = 2.0
-    auto_band_min_width_ppm: int = 50
-    auto_band_recalibrate_interval: int = 10
     
     # Rebalancing parameters
     rebalance_min_profit: int = 10     # Min profit in sats to trigger (legacy, used when ppm=0)
@@ -408,16 +323,15 @@ class Config:
     total_cost_budget_window_hours: int = 24  # Window for profit-based budget calculation
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
 
-    # Revenue-Proportional Budget (Phase 7: Dynamic Budget Scaling)
+    # Revenue-Proportional Budget
     enable_proportional_budget: bool = True   # Scale daily budget based on revenue (Issue #22)
     proportional_budget_pct: float = 0.30     # Budget = max(daily_budget_sats, revenue_24h * pct)
                                                # Default 30% of 24h revenue
     
-    # Phase 1: Operational Hardening
+    # RPC Hardening
     rpc_timeout_seconds: int = 15
     rpc_circuit_breaker_seconds: int = 60
-    hive_bridge_circuit_breaker_enabled: bool = False  # Global hive bridge circuit breaker (disabled by default)
-    rpc_pool_size: int = 5             # Number of RPC worker processes (Phase 2)
+    rpc_pool_size: int = 5             # Number of RPC worker processes
     reservation_timeout_hours: int = 4  # Hours before stale budget reservations auto-release
     
     # HTLC Congestion threshold
@@ -428,17 +342,13 @@ class Config:
     reputation_decay: float = 0.98  # Decay factor per flow_interval (default hourly)
                                      # 0.98^24 ≈ 0.61, meaning old data loses ~40% weight daily
 
-    # Kelly Criterion Position Sizing (Phase 4: Risk Management)
+    # Kelly Criterion Position Sizing
     enable_kelly: bool = False       # If True, scale rebalance budget by Kelly fraction (opt-in)
-    kelly_bypass_for_fleet: bool = True  # If True, skip Kelly for hive/fleet destinations
-                                          # Fleet paths are ~free (0 ppm internal), so Kelly's
-                                          # EV gate is counterproductive — it kills candidates
-                                          # before the fleet path optimizer can apply zero-fee routing.
     kelly_fraction: float = 0.5      # Multiplier for Kelly fraction (0.5 = Half Kelly)
                                       # Full Kelly (1.0) maximizes growth but has high volatility
                                       # Half Kelly (0.5) reduces volatility drag significantly
     
-    # Async Job Queue (Phase 4: Stability & Scaling)
+    # Async Job Queue
     max_concurrent_jobs: int = 5              # Max number of concurrent sling rebalance jobs
     sling_job_timeout_seconds: int = 7200     # Timeout for sling jobs (2 hours default)
     sling_chunk_size_sats: int = 500000       # Amount per sling rebalance attempt (500k sats)
@@ -447,7 +357,7 @@ class Config:
     askrene_layer: str = 'xpay'               # Layer name for askrene-listlayers
     askrene_max_age_sec: int = 900            # Max constraint age (seconds) to consider fresh
 
-    # Enhanced Sling Integration (Phase 6)
+    # Sling Integration
     sling_max_hops: int = 5                   # Max route hops (shorter = faster, more reliable)
     sling_parallel_jobs: int = 2              # Concurrent route attempts per job
     sling_target_sink: float = 0.40           # Balance target for sink channels (want more inbound)
@@ -465,19 +375,11 @@ class Config:
     # Runtime dependency flags (set during init based on listplugins)
     sling_available: bool = True   # Set to False if sling plugin not detected
     
-    # Phase 7 additions (v1.3.0)
+    # Vegas Reflex (mempool spike defense)
     enable_vegas_reflex: bool = True       # Mempool spike defense
     vegas_decay_rate: float = 0.85         # Per-cycle decay (~30min half-life)
-    enable_scarcity_pricing: bool = True   # HTLC slot scarcity pricing
-    scarcity_threshold: float = 0.35       # Start pricing at 35% utilization
     
-    # Hive Parameters (v1.4.0 - Strategic Rebalance Exemption)
-    # v1.6.0 - Added hive_enabled for standalone/hive mode control
-    hive_enabled: str = 'auto'         # "auto" = detect cl-hive, "true" = require hive, "false" = standalone
-    hive_fee_ppm: int = 0              # The fee we charge fleet members (default 0)
-    hive_rebalance_tolerance: int = 50 # Max sats loss allowed per rebalance to keep channels earning
-    
-    # Deferred (v1.4.0)
+    # Deferred features
     enable_flow_asymmetry: bool = False    # Rare liquidity premium
     enable_peer_sync: bool = False         # Peer-level fee syncing
 
@@ -493,73 +395,35 @@ class Config:
     new_channel_grace_days: int = 7        # Days before velocity gate applies to new channels
 
     # ==========================================================================
-    # Thompson Sampling + AIMD Fee Optimization (v1.7.0)
+    # DTS (Discounted Thompson Sampling) Parameters
     # ==========================================================================
-    # Primary algorithm: Gaussian Thompson Sampling with contextual bandits
-    # Defense layer: AIMD for rapid response to routing failures
-    #
-    # Thompson Sampling parameters
     thompson_prior_std_fee: int = 100         # Default prior uncertainty in ppm
     thompson_observation_decay_hours: int = 168  # 7-day half-life for observations
     thompson_max_observations: int = 200      # Bounded memory per channel
     thompson_min_observations: int = 3        # Minimum before trusting posterior
 
-    # AIMD Defense parameters
-    aimd_failure_threshold: int = 3           # Failures before multiplicative decrease
-    aimd_success_threshold: int = 10          # Successes before additive increase
-    aimd_multiplicative_decrease: float = 0.85  # 15% reduction on failure streak
-    aimd_additive_increase_ppm: int = 5       # +5 ppm per success streak
-    aimd_min_decrease_interval: int = 3600    # 1 hour cooldown between decreases
-
-    # Hive Prior Integration
-    hive_prior_weight: float = 0.6            # Weight for hive-informed priors
-    hive_min_confidence_for_prior: float = 0.3  # Min confidence to use hive data
 
     # ==========================================================================
-    # Routing Intelligence Integration (cl-hive pheromone/corridor data)
+    # Routing Intelligence Integration
     # ==========================================================================
-    # When enabled, Thompson sampling priors are weighted by pheromone data
-    # from cl-hive's routing intelligence system.
     routing_intelligence_enabled: bool = False    # Opt-in feature (off by default)
     routing_intelligence_cache_seconds: int = 300  # Cache TTL for routing intel
 
-    # ==========================================================================
-    # Comprehensive Hive Data Integration (v1.8.0)
-    # ==========================================================================
-    # Integration with cl-hive for enhanced fee optimization and rebalancing.
-    # Each integration can be individually enabled/disabled.
-
-    # Defense status: Prevent overriding defensive fees during attacks
-    hive_defense_status_enabled: bool = True
-    hive_defense_status_cache_seconds: int = 60     # Short TTL - attacks are time-sensitive
-
-    # Peer quality: Adjust optimization intensity based on peer quality
-    hive_peer_quality_enabled: bool = True
-    hive_peer_quality_cache_seconds: int = 300      # 5 minute cache
-
-    # Decision history: Learn from past fee changes
-    hive_decision_history_enabled: bool = True
-    hive_decision_history_days: int = 30            # Days of history to consider
-
-    # Channel flags: Identify hive-internal channels
-    hive_channel_flags_enabled: bool = True
-
-    # MCF targets: Use multi-commodity flow analysis for rebalancing
-    hive_mcf_targets_enabled: bool = False          # Opt-in, may conflict with manual rebalancing
-    hive_mcf_targets_cache_seconds: int = 300       # 5 minute cache
-
-    # NNLB opportunities: Low-cost hive-internal rebalancing
-    hive_nnlb_enabled: bool = False                 # Opt-in
-    hive_nnlb_min_amount: int = 50000               # Minimum sats to consider
-    hive_nnlb_auto_execute: bool = False            # Require manual trigger by default
-
-    # Channel ages: Exploration/exploitation based on maturity
-    hive_channel_ages_enabled: bool = True
-    hive_channel_ages_cache_seconds: int = 3600     # 1 hour cache - ages change slowly
-    enable_hive_egress_desaturation_bias: bool = True
-    hive_egress_desaturation_bias_max_ppm: int = 100
-    hive_egress_desaturation_bias_weight: float = 0.5
-
+    # Capacity Planner
+    planner_enabled: bool = False
+    planner_interval: int = 21600               # 6 hours
+    planner_dry_run: bool = False
+    planner_execute_closes: bool = False
+    planner_max_opens_per_cycle: int = 1
+    planner_max_closes_per_cycle: int = 0
+    planner_min_channel_sats: int = 500000      # 500k sats
+    planner_max_channel_sats: int = 10000000    # 10M sats
+    planner_min_channel_age_days: int = 30
+    planner_min_peer_uptime_pct: float = 95.0
+    planner_max_fee_rate_sat_vb: float = 50.0
+    # Hive Hints integration
+    hive_hints_enabled: bool = False
+    hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -567,11 +431,7 @@ class Config:
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants on direct construction."""
-        if self.surge_multiplier_min > self.surge_multiplier_max:
-            raise ValueError(
-                f"surge_multiplier_min ({self.surge_multiplier_min}) cannot exceed "
-                f"surge_multiplier_max ({self.surge_multiplier_max})"
-            )
+        pass
     
     def snapshot(self) -> 'ConfigSnapshot':
         """
@@ -625,9 +485,6 @@ class Config:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
                 # high_liquidity_threshold is very small (e.g., < 0.05).
                 self.low_liquidity_threshold = max(0.0, self.high_liquidity_threshold - 0.05)
-        if hasattr(self, 'surge_multiplier_min') and hasattr(self, 'surge_multiplier_max'):
-            if self.surge_multiplier_min > self.surge_multiplier_max:
-                self.surge_multiplier_min = self.surge_multiplier_max
         return list(self._override_warnings)
 
     def _apply_override(self, key: str, value: str) -> None:
@@ -734,10 +591,6 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
-            if key == 'surge_multiplier_min' and typed_value > self.surge_multiplier_max:
-                return {"error": f"surge_multiplier_min ({typed_value}) cannot exceed surge_multiplier_max ({self.surge_multiplier_max})"}
-            if key == 'surge_multiplier_max' and typed_value < self.surge_multiplier_min:
-                return {"error": f"surge_multiplier_max ({typed_value}) cannot be less than surge_multiplier_min ({self.surge_multiplier_min})"}
             # AUDIT FIX I-5: Validate sink/source threshold cross-field consistency
             if key == 'sink_threshold' and typed_value >= self.source_threshold:
                 return {"error": f"sink_threshold ({typed_value}) must be less than source_threshold ({self.source_threshold})"}
@@ -793,8 +646,6 @@ class ConfigSnapshot:
     flow_interval: int
     fee_interval: int
     rebalance_interval: int
-    enable_gossip_keepalives: bool
-    target_gossip_peers: int
     paused: bool
     hot_channel_protection_enabled: bool
     hot_channel_protection_override_peers: str
@@ -808,18 +659,6 @@ class ConfigSnapshot:
     boltz_auto_cycle_interval_minutes: int
     boltz_auto_cycle_max_actions: int
     boltz_auto_cycle_startup_delay_seconds: int
-    enable_dynamic_htlcmin: bool
-    enable_realtime_surge_defense: bool
-    surge_window_seconds: int
-    surge_trigger_pct: float
-    surge_multiplier_min: float
-    surge_multiplier_max: float
-    surge_cooldown_seconds: int
-    surge_setchannel_min_interval_seconds: int
-    enable_dynamic_htlcmax: bool
-    htlcmax_source_pct: float
-    htlcmax_sink_pct: float
-    htlcmax_balanced_pct: float
     expansion_treasury_enabled: bool
     expansion_treasury_onchain_target_sats: int
     expansion_treasury_min_deficit_sats: int
@@ -840,11 +679,6 @@ class ConfigSnapshot:
     min_fee_ppm: int
     max_fee_ppm: int
     base_fee_msat: int
-    auto_band_enabled: bool
-    auto_band_min_observations: int
-    auto_band_sigma: float
-    auto_band_min_width_ppm: int
-    auto_band_recalibrate_interval: int
     
     # Rebalancing parameters
     rebalance_min_profit: int
@@ -884,7 +718,6 @@ class ConfigSnapshot:
 
     # Kelly Criterion Position Sizing
     enable_kelly: bool
-    kelly_bypass_for_fleet: bool
     kelly_fraction: float
     
     # Async Job Queue
@@ -892,7 +725,7 @@ class ConfigSnapshot:
     sling_job_timeout_seconds: int
     sling_chunk_size_sats: int
 
-    # Enhanced Sling Integration (Phase 6)
+    # Sling Integration
     sling_max_hops: int
     sling_parallel_jobs: int
     sling_target_sink: float
@@ -909,28 +742,19 @@ class ConfigSnapshot:
     # Runtime dependency flags
     sling_available: bool
     
-    # Phase 7 additions (v1.3.0)
+    # Vegas Reflex (mempool spike defense)
     enable_vegas_reflex: bool
     vegas_decay_rate: float
-    enable_scarcity_pricing: bool
-    scarcity_threshold: float
     
-    # Deferred (v1.4.0)
+    # Deferred features
     enable_flow_asymmetry: bool
     enable_peer_sync: bool
 
-    # Phase 1: Operational Hardening
+    # RPC Hardening
     rpc_timeout_seconds: int
     rpc_circuit_breaker_seconds: int
-    hive_bridge_circuit_breaker_enabled: bool
     rpc_pool_size: int
     reservation_timeout_hours: int
-
-    # Hive Parameters (v1.4.0) - MAJOR-12 FIX: Added missing fields
-    # v1.6.0 - Added hive_enabled for standalone/hive mode control
-    hive_enabled: str
-    hive_fee_ppm: int
-    hive_rebalance_tolerance: int
 
     # Issue #28: Revenue rate EMA smoothing
     ema_smoothing_alpha: float
@@ -940,41 +764,14 @@ class ConfigSnapshot:
     min_velocity_threshold: float
     new_channel_grace_days: int
 
-    # Thompson Sampling + AIMD (v1.7.0)
+    # DTS (Discounted Thompson Sampling) parameters
     thompson_prior_std_fee: int
     thompson_observation_decay_hours: int
     thompson_max_observations: int
     thompson_min_observations: int
-    aimd_failure_threshold: int
-    aimd_success_threshold: int
-    aimd_multiplicative_decrease: float
-    aimd_additive_increase_ppm: int
-    aimd_min_decrease_interval: int
-    hive_prior_weight: float
-    hive_min_confidence_for_prior: float
-
     # Routing Intelligence Integration
     routing_intelligence_enabled: bool
     routing_intelligence_cache_seconds: int
-
-    # Comprehensive Hive Data Integration (v1.8.0)
-    hive_defense_status_enabled: bool = True
-    hive_defense_status_cache_seconds: int = 60
-    hive_peer_quality_enabled: bool = True
-    hive_peer_quality_cache_seconds: int = 300
-    hive_decision_history_enabled: bool = True
-    hive_decision_history_days: int = 30
-    hive_channel_flags_enabled: bool = True
-    hive_mcf_targets_enabled: bool = False
-    hive_mcf_targets_cache_seconds: int = 300
-    hive_nnlb_enabled: bool = False
-    hive_nnlb_min_amount: int = 50000
-    hive_nnlb_auto_execute: bool = False
-    hive_channel_ages_enabled: bool = True
-    hive_channel_ages_cache_seconds: int = 3600
-    enable_hive_egress_desaturation_bias: bool = True
-    hive_egress_desaturation_bias_max_ppm: int = 100
-    hive_egress_desaturation_bias_weight: float = 0.5
 
     # M-27: xpay/askrene parameters (were missing from snapshot)
     askrene_layer: str = 'xpay'
@@ -983,6 +780,21 @@ class ConfigSnapshot:
     # Weekly budget cap (hard ceiling over daily burst)
     weekly_budget_sats: int = 35000
 
+    # Capacity Planner
+    planner_enabled: bool = False
+    planner_interval: int = 21600
+    planner_dry_run: bool = False
+    planner_execute_closes: bool = False
+    planner_max_opens_per_cycle: int = 1
+    planner_max_closes_per_cycle: int = 0
+    planner_min_channel_sats: int = 500000
+    planner_max_channel_sats: int = 10000000
+    planner_min_channel_age_days: int = 30
+    planner_min_peer_uptime_pct: float = 95.0
+    planner_max_fee_rate_sat_vb: float = 50.0
+    # Hive Hints
+    hive_hints_enabled: bool = False
+    hive_hints_ttl_seconds: int = 0
     # Version tracking
     version: int = 0
     
@@ -1022,7 +834,7 @@ class ChainCostDefaults:
     # Estimated on-chain costs in sats
     CHANNEL_OPEN_COST_SATS: int = 5000      # ~$3-5 at typical fee rates
     CHANNEL_CLOSE_COST_SATS: int = 3000     # Usually cheaper than open
-    SPLICE_COST_SATS: int = 2000            # Splice tx fee (similar to single input/output)
+
 
     # Estimated channel lifetime
     CHANNEL_LIFETIME_DAYS: int = 365        # 1 year average

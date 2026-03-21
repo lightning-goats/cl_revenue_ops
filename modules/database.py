@@ -3,7 +3,7 @@ Database module for cl-revenue-ops
 
 Handles SQLite persistence for:
 - Channel flow states and history
-- Hill Climbing fee controller state
+- Fee controller state
 - Fee change history
 - Rebalance history
 
@@ -224,7 +224,7 @@ class Database:
     Provides persistence for:
     - Channel states (source/sink/balanced classification)
     - Flow metrics history
-    - Hill Climbing fee controller state
+    - Fee controller state
     - Fee change audit log
     - Rebalance history
     
@@ -243,7 +243,7 @@ class Database:
         """
         self.db_path = os.path.expanduser(db_path)
         self.plugin = plugin
-        # Thread-local storage for connections (Phase 5.5: Database Thread Safety)
+        # Thread-local storage for connections (Thread Safety)
         self._local = threading.local()
         # EH-6: Track all thread connections for shutdown cleanup
         self._thread_connections: list = []
@@ -260,46 +260,53 @@ class Database:
         Returns:
             sqlite3.Connection: Thread-local database connection
         """
-        if not hasattr(self._local, 'conn') or self._local.conn is None:
-            # Ensure directory exists (guard against bare filename with no directory)
-            db_dir = os.path.dirname(self.db_path)
-            if db_dir:
-                os.makedirs(db_dir, exist_ok=True)
-            
-            # Create new connection for this thread
-            self._local.conn = sqlite3.connect(
-                self.db_path,
-                isolation_level=None  # Autocommit mode
-            )
-            self._local.conn.row_factory = sqlite3.Row
-            
+        if hasattr(self._local, 'conn') and self._local.conn is not None:
+            return self._local.conn
+
+        # Ensure directory exists (guard against bare filename with no directory)
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
+        # Create new connection for this thread in a local variable so that
+        # a PRAGMA failure does not leave a half-configured connection in
+        # thread-local storage (connection leak prevention).
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+
             # Enable Write-Ahead Logging for better multi-thread concurrency
             # WAL allows readers and writers to operate concurrently
-            wal_result = self._local.conn.execute("PRAGMA journal_mode=WAL;").fetchone()
+            wal_result = conn.execute("PRAGMA journal_mode=WAL;").fetchone()
             if wal_result and wal_result[0] != 'wal':
                 self.plugin.log(
                     f"Database: WAL mode not enabled (got '{wal_result[0]}'), "
                     f"falling back to default journal mode",
                     level='warn'
                 )
-            
+
             # Reduce "database is locked" errors under contention
-            self._local.conn.execute("PRAGMA busy_timeout=5000;")
+            conn.execute("PRAGMA busy_timeout=5000;")
             # Reasonable durability/performance tradeoff for WAL mode
-            self._local.conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
             # D3 FIX: Enforce foreign key constraints (defined but previously unenforced)
-            self._local.conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA foreign_keys=ON;")
             # Enable incremental auto-vacuum so PRAGMA incremental_vacuum works.
             # Only takes effect on a fresh (empty) database; harmless no-op otherwise.
-            self._local.conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
-            # EH-6: Track connection for shutdown cleanup
-            with self._thread_conn_lock:
-                self._thread_connections.append(self._local.conn)
-            self.plugin.log(
-                f"Database: Created new thread-local connection (thread={threading.current_thread().name})",
-                level='debug'
-            )
-        return self._local.conn
+            conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
+        except Exception:
+            conn.close()
+            raise
+
+        # EH-6: Track connection for shutdown cleanup — only after full success
+        with self._thread_conn_lock:
+            self._thread_connections.append(conn)
+        self._local.conn = conn
+        self.plugin.log(
+            f"Database: Created new thread-local connection (thread={threading.current_thread().name})",
+            level='debug'
+        )
+        return conn
 
     def close_connection(self) -> None:
         """
@@ -380,7 +387,7 @@ class Database:
 
     # Maximum reasonable fee for a single on-chain operation (50,000 sats ~ $50)
     MAX_FEE_SATS: int = 50000
-    # Maximum reasonable splice/capacity amount (100 BTC in sats)
+    # Maximum reasonable capacity amount (100 BTC in sats)
     MAX_AMOUNT_SATS: int = 10_000_000_000
     # Channel ID format: short_channel_id like "123x456x789" or "123456x789x0"
     CHANNEL_ID_PATTERN = r'^\d+x\d+x\d+$'
@@ -479,7 +486,7 @@ class Database:
             )
             return 0
         amount_sats = int(amount_sats)
-        # Allow negative for splice_out, but clamp magnitude
+        # Allow negative amounts, but clamp magnitude
         if abs(amount_sats) > self.MAX_AMOUNT_SATS:
             sign = 1 if amount_sats >= 0 else -1
             self.plugin.log(
@@ -520,19 +527,7 @@ class Database:
         """)
         
         
-        # PID state table - stores controller state per channel
-        # LEGACY: Kept for backward compatibility, but Hill Climbing uses fee_strategy_state
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS pid_state (
-                channel_id TEXT PRIMARY KEY,
-                integral REAL NOT NULL DEFAULT 0,
-                last_error REAL NOT NULL DEFAULT 0,
-                last_fee_ppm INTEGER NOT NULL DEFAULT 0,
-                last_update INTEGER NOT NULL
-            )
-        """)
-        
-        # NEW: Fee Strategy State table for Hill Climbing controller
+        # Fee Strategy State table for fee controller
         # Stores state for the revenue-maximizing Perturb & Observe algorithm
         # UPDATED: Uses last_revenue_rate (REAL) for rate-based feedback instead of
         # last_revenue_sats to measure revenue per hour since last fee change.
@@ -598,7 +593,7 @@ class Database:
                 resolved_time INTEGER DEFAULT 0
             )
         """)
-        # Phase 2: Ensure forwards schema is idempotent and restart-safe
+        # Ensure forwards schema is idempotent and restart-safe
         self._migrate_forwards_schema(conn)
 
         
@@ -676,11 +671,12 @@ class Database:
             VALUES (1, 0, 0, 0)
         """)
 
-        # Channel Probes table for Zero-Fee Probe Defibrillator
+        # Channel exploration flags. Legacy rows may still carry probe_type='zero_fee',
+        # but the fee controller now interprets the flag as bounded low-fee exploration.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS channel_probes (
                 channel_id TEXT PRIMARY KEY,
-                probe_type TEXT NOT NULL,  -- 'zero_fee'
+                probe_type TEXT NOT NULL,  -- legacy 'zero_fee' or current 'bounded_low_fee'
                 started_at INTEGER NOT NULL
             )
         """)
@@ -725,7 +721,7 @@ class Database:
         except sqlite3.OperationalError:
             pass
 
-        # Config overrides table (Phase 7: Dynamic Runtime Configuration)
+        # Config overrides table (Dynamic Runtime Configuration)
         # Stores operator overrides that persist across restarts
         conn.execute("""
             CREATE TABLE IF NOT EXISTS config_overrides (
@@ -736,7 +732,7 @@ class Database:
             )
         """)
         
-        # Mempool fee history (Phase 7: Vegas Reflex MA calculation)
+        # Mempool fee history (Vegas Reflex MA calculation)
         # Tracks on-chain fee rates for detecting spikes
         conn.execute("""
             CREATE TABLE IF NOT EXISTS mempool_fee_history (
@@ -804,7 +800,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_budget_reservations_status ON budget_reservations(status, reserved_at)")
 
         # Generic spend reservations/events for unified total-cost budget gating.
-        # Used by actions outside the rebalance engine (e.g. channel open/close/splice proposals)
+        # Used by actions outside the rebalance engine (e.g. channel open/close proposals)
         # to reserve and optionally record spend against the same budget envelope.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS spend_reservations (
@@ -838,7 +834,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_events_time ON spend_events(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_events_category ON spend_events(category, timestamp)")
 
-        # Phase 8: Financial Snapshots for P&L Dashboard
+        # Financial Snapshots for P&L Dashboard
         # Records daily node state for TLV tracking and trend analysis
         conn.execute("""
             CREATE TABLE IF NOT EXISTS financial_snapshots (
@@ -900,28 +896,6 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_channels_peer ON closed_channels(peer_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_channels_time ON closed_channels(closed_at)")
 
-        # Splice Costs table (Accounting v2.0)
-        # Tracks on-chain fees for splice-in and splice-out operations
-        # Splices modify channel capacity without closing/reopening
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS splice_costs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT NOT NULL,
-                peer_id TEXT NOT NULL,
-                splice_type TEXT NOT NULL,  -- 'splice_in' or 'splice_out'
-                amount_sats INTEGER NOT NULL,  -- Amount added (positive) or removed (negative)
-                fee_sats INTEGER NOT NULL,
-                old_capacity_sats INTEGER,
-                new_capacity_sats INTEGER,
-                txid TEXT,
-                timestamp INTEGER NOT NULL
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_splice_costs_channel ON splice_costs(channel_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_splice_costs_time ON splice_costs(timestamp)")
-        # Prevent duplicate splice records when txid is known (Security: idempotency)
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_splice_costs_unique ON splice_costs(channel_id, txid) WHERE txid IS NOT NULL")
-
         # Schema migration: Add deadband hysteresis columns to fee_strategy_state
         # SQLite doesn't support IF NOT EXISTS for columns, so we wrap in try/except
         try:
@@ -975,7 +949,7 @@ class Database:
         # v2.0 Migration: Add columns for fee algorithm improvements
         # - forward_count_since_update: Dynamic observation windows (Improvement #2)
         # - last_volume_sats: For elasticity tracking
-        # - v2_state_json: JSON blob for complex state (historical curve, elasticity, Thompson)
+        # - v2_state_json: JSON blob for DTS+PID state (posterior, PID integral/derivative)
         try:
             conn.execute("ALTER TABLE fee_strategy_state ADD COLUMN forward_count_since_update INTEGER DEFAULT 0")
             self.plugin.log("Added forward_count_since_update column to fee_strategy_state")
@@ -1099,25 +1073,46 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
-        # Fee anchors table: advisor-set soft fee targets with decaying weight
+        # Capacity Planner tables
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS fee_anchors (
-                channel_id TEXT PRIMARY KEY,
-                target_fee_ppm INTEGER NOT NULL,
-                base_weight REAL NOT NULL DEFAULT 0.7,
-                confidence REAL NOT NULL DEFAULT 1.0,
-                ttl_seconds INTEGER NOT NULL DEFAULT 86400,
-                reason TEXT DEFAULT '',
-                set_at INTEGER NOT NULL
+            CREATE TABLE IF NOT EXISTS planner_candidates (
+                peer_id TEXT PRIMARY KEY,
+                score REAL NOT NULL DEFAULT 0.0,
+                source TEXT NOT NULL,
+                last_evaluated INTEGER NOT NULL,
+                capacity_recommendation_sats INTEGER,
+                connect_successes INTEGER DEFAULT 0,
+                connect_failures INTEGER DEFAULT 0,
+                metadata_json TEXT
             )
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_candidates_score ON planner_candidates(score)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS planner_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_type TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                channel_id TEXT,
+                amount_sats INTEGER,
+                estimated_cost_sats INTEGER,
+                actual_cost_sats INTEGER,
+                status TEXT NOT NULL DEFAULT 'planned',
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                reason TEXT,
+                metadata_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_status ON planner_actions(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_peer ON planner_actions(peer_id)")
 
         self.plugin.log("Database initialized successfully")
     
 
     def _migrate_forwards_schema(self, conn: sqlite3.Connection) -> None:
         """
-        Phase 2: Make forwards ingestion idempotent and restart-safe.
+        Make forwards ingestion idempotent and restart-safe.
 
         - Adds resolved_time column if missing
         - Backfills resolved_time from timestamp + resolution_time (best-effort)
@@ -1573,8 +1568,12 @@ class Database:
     # Channel Probe Methods
     # =========================================================================
 
-    def set_channel_probe(self, channel_id: str, probe_type: str = 'zero_fee'):
-        """Sets the probe flag for a channel."""
+    def set_channel_probe(self, channel_id: str, probe_type: str = 'bounded_low_fee'):
+        """Sets the bounded-exploration flag for a channel.
+
+        The legacy probe_type='zero_fee' value is still accepted for backward
+        compatibility with older callers and persisted rows.
+        """
         conn = self._get_connection()
         now = int(time.time())
         conn.execute("""
@@ -1583,11 +1582,11 @@ class Database:
         """, (channel_id, probe_type, now))
 
     def get_channel_probe(self, channel_id: str, max_age_seconds: int = 86400) -> Optional[Dict[str, Any]]:
-        """Gets the probe flag for a channel, returning None if expired.
+        """Gets the bounded-exploration flag for a channel, returning None if expired.
 
         Args:
             channel_id: Channel to check
-            max_age_seconds: Maximum age of probe before auto-expiry (default 24h)
+            max_age_seconds: Maximum age of exploration before auto-expiry (default 24h)
         """
         conn = self._get_connection()
         row = conn.execute(
@@ -1597,7 +1596,7 @@ class Database:
         if row is None:
             return None
         probe = dict(row)
-        # Auto-expire stale probes to prevent permanent 0-fee
+        # Auto-expire stale flags to prevent permanent exploration mode.
         started_at = probe.get("started_at", 0)
         if started_at > 0 and (int(time.time()) - started_at) > max_age_seconds:
             conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
@@ -1605,17 +1604,17 @@ class Database:
         return probe
 
     def clear_channel_probe(self, channel_id: str):
-        """Clears the probe flag for a channel."""
+        """Clears the bounded-exploration flag for a channel."""
         conn = self._get_connection()
         conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
     
     # =========================================================================
-    # Fee Strategy State Methods (Hill Climbing Controller)
+    # Fee Strategy State Methods
     # =========================================================================
     
     def get_fee_strategy_state(self, channel_id: str) -> Dict[str, Any]:
         """
-        Get Hill Climbing fee strategy state for a channel.
+        Get fee strategy state for a channel.
 
         Used by the revenue-maximizing Perturb & Observe algorithm.
 
@@ -1693,7 +1692,7 @@ class Database:
                                    v2_state_json: str = '{}',
                                    last_update: int = None):
         """
-        Update Hill Climbing fee strategy state for a channel.
+        Update fee strategy state for a channel.
 
         Called after each fee adjustment iteration to record the state
         for the next observation period.
@@ -1712,7 +1711,7 @@ class Database:
             stable_cycles: Number of consecutive stable cycles (for hysteresis)
             forward_count_since_update: v2.0 - Forwards since last fee change
             last_volume_sats: v2.0 - Volume during last period (for elasticity)
-            v2_state_json: v2.0 - JSON blob for historical curve, elasticity, Thompson state
+            v2_state_json: v2.0 - JSON blob for DTS+PID state (posterior, PID integral/derivative)
         """
         conn = self._get_connection()
         ts = last_update if last_update is not None else int(time.time())
@@ -1991,7 +1990,7 @@ class Database:
         return int((row['total_fees_msat'] or 0) // 1000) if row else 0
 
     # =========================================================================
-    # Phase 8: Financial Snapshots for P&L Dashboard
+    # Financial Snapshots for P&L Dashboard
     # =========================================================================
 
     def record_financial_snapshot(self, local_balance_sats: int, remote_balance_sats: int,
@@ -3234,7 +3233,7 @@ class Database:
             """
             Bulk insert forwards from RPC hydration.
 
-            Phase 2: Idempotent insert using INSERT OR IGNORE under a UNIQUE index.
+            Idempotent insert using INSERT OR IGNORE under a UNIQUE index.
             Wrapped in a single transaction for performance (10-100x faster than
             autocommit per-row on large forward sets).
 
@@ -3485,15 +3484,15 @@ class Database:
         """
         Record a completed forward for real-time tracking.
 
-        Phase 2: Use canonical forward times (received_time/resolved_time) and
+        Use canonical forward times (received_time/resolved_time) and
         INSERT OR IGNORE under a UNIQUE index to prevent double-dips on restart.
 
         Backward compatible:
           - Legacy call: record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time)
-          - Phase 2 call: record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat,
+          - Canonical call: record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat,
                                          received_time, resolved_time[, resolution_time])
         """
-        # Parse legacy vs Phase 2 call patterns
+        # Parse legacy vs canonical call patterns
         received_time: int = 0
         resolved_time: int = 0
         resolution_time: float = 0.0
@@ -4011,12 +4010,6 @@ class Database:
         ).fetchone()
         total_closure_cost_sats = closure_row["total"] if closure_row else 0
 
-        # Total splice costs from splice_costs table (Accounting v2.0)
-        splice_row = conn.execute(
-            "SELECT COALESCE(SUM(fee_sats), 0) as total FROM splice_costs"
-        ).fetchone()
-        total_splice_cost_sats = splice_row["total"] if splice_row else 0
-
         # Current forward count from forwards table
         count_row = conn.execute(
             "SELECT COUNT(*) as total FROM forwards"
@@ -4038,7 +4031,6 @@ class Database:
             "total_rebalance_cost_sats": total_rebalance_cost_sats,
             "total_opening_cost_sats": total_opening_cost_sats,
             "total_closure_cost_sats": total_closure_cost_sats,  # Accounting v2.0
-            "total_splice_cost_sats": total_splice_cost_sats,  # Accounting v2.0
             "total_forwards": total_forwards
         }
     
@@ -4532,7 +4524,7 @@ class Database:
                 )
                 deleted["kalman_state"] = cursor.rowcount
 
-                # L11 FIX: Clean up fee_strategy_state and pid_state to prevent
+                # L11 FIX: Clean up fee_strategy_state to prevent
                 # orphaned rows from accumulating on nodes with frequent channel turnover.
                 try:
                     cursor = conn.execute(
@@ -4540,15 +4532,6 @@ class Database:
                         (channel_id,)
                     )
                     deleted["fee_strategy_state"] = cursor.rowcount
-                except Exception:
-                    pass  # Table may not exist on older schemas
-
-                try:
-                    cursor = conn.execute(
-                        "DELETE FROM pid_state WHERE channel_id = ?",
-                        (channel_id,)
-                    )
-                    deleted["pid_state"] = cursor.rowcount
                 except Exception:
                     pass  # Table may not exist on older schemas
 
@@ -4572,186 +4555,6 @@ class Database:
                 level='error'
             )
             return deleted
-
-    # =========================================================================
-    # Splice Cost Tracking (Accounting v2.0)
-    # =========================================================================
-
-    def record_splice(
-        self,
-        channel_id: str,
-        peer_id: str,
-        splice_type: str,
-        amount_sats: int,
-        fee_sats: int,
-        old_capacity_sats: Optional[int] = None,
-        new_capacity_sats: Optional[int] = None,
-        txid: Optional[str] = None
-    ) -> bool:
-        """
-        Record a splice operation and its on-chain cost.
-
-        Splices modify channel capacity without closing/reopening the channel.
-        This tracks the on-chain fees for accurate P&L accounting.
-
-        Args:
-            channel_id: The channel short ID (SCID)
-            peer_id: The peer node ID
-            splice_type: Type of splice ('splice_in' or 'splice_out')
-            amount_sats: Amount added (positive for splice_in) or removed (negative for splice_out)
-            fee_sats: On-chain fee paid for the splice transaction
-            old_capacity_sats: Channel capacity before splice
-            new_capacity_sats: Channel capacity after splice
-            txid: The splice transaction ID
-
-        Returns:
-            True if recorded successfully, False otherwise
-        """
-        try:
-            # Security: Input validation
-            if not self._validate_channel_id(channel_id):
-                self.plugin.log(
-                    f"Security: Invalid channel_id format '{channel_id}', skipping splice record",
-                    level='warn'
-                )
-                return False
-
-            if not self._validate_peer_id(peer_id):
-                self.plugin.log(
-                    f"Security: Invalid peer_id format for {channel_id}, rejecting splice record",
-                    level='warn'
-                )
-                return False
-
-            # Security: Sanitize fee and amount values
-            fee_sats = self._sanitize_fee(fee_sats, "splice_fee")
-            amount_sats = self._sanitize_amount(amount_sats, "splice_amount")
-            if old_capacity_sats is not None:
-                old_capacity_sats = self._sanitize_amount(old_capacity_sats, "old_capacity")
-            if new_capacity_sats is not None:
-                new_capacity_sats = self._sanitize_amount(new_capacity_sats, "new_capacity")
-
-            # Validate splice_type
-            valid_splice_types = {'splice_in', 'splice_out'}
-            if splice_type not in valid_splice_types:
-                self.plugin.log(
-                    f"Security: Invalid splice_type '{splice_type}', defaulting to 'splice_in'",
-                    level='warn'
-                )
-                splice_type = 'splice_in'
-
-            conn = self._get_connection()
-            now = int(time.time())
-
-            # Use INSERT OR IGNORE to prevent duplicate records when txid is known
-            # The UNIQUE index on (channel_id, txid) WHERE txid IS NOT NULL handles idempotency
-            cursor = conn.execute("""
-                INSERT OR IGNORE INTO splice_costs
-                (channel_id, peer_id, splice_type, amount_sats, fee_sats,
-                 old_capacity_sats, new_capacity_sats, txid, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (channel_id, peer_id, splice_type, amount_sats, fee_sats,
-                  old_capacity_sats, new_capacity_sats, txid, now))
-
-            # Check if insert was actually performed via cursor.rowcount
-            if cursor.rowcount > 0:
-                self.plugin.log(
-                    f"Recorded splice for {channel_id}: type={splice_type}, "
-                    f"amount={amount_sats} sats, fee={fee_sats} sats",
-                    level='info'
-                )
-            else:
-                self.plugin.log(
-                    f"Duplicate splice ignored for {channel_id} txid={txid}",
-                    level='debug'
-                )
-            return True
-
-        except Exception as e:
-            self.plugin.log(f"Error recording splice for {channel_id}: {e}", level='error')
-            return False
-
-    def get_channel_splice_history(self, channel_id: str) -> List[Dict[str, Any]]:
-        """
-        Get splice history for a specific channel.
-
-        Args:
-            channel_id: The channel short ID
-
-        Returns:
-            List of splice records, ordered by timestamp (most recent first)
-        """
-        conn = self._get_connection()
-        rows = conn.execute("""
-            SELECT * FROM splice_costs
-            WHERE channel_id = ?
-            ORDER BY timestamp DESC
-        """, (channel_id,)).fetchall()
-
-        return [dict(row) for row in rows]
-
-    def get_total_splice_costs(self) -> int:
-        """
-        Get the total splice costs across all channels.
-
-        Returns:
-            Total splice costs in sats
-        """
-        conn = self._get_connection()
-        row = conn.execute("""
-            SELECT COALESCE(SUM(fee_sats), 0) as total
-            FROM splice_costs
-        """).fetchone()
-
-        return row["total"] if row else 0
-
-    def get_splice_costs_since(self, since_timestamp: int) -> int:
-        """
-        Get splice costs since a specific timestamp (for windowed P&L).
-
-        Args:
-            since_timestamp: Unix timestamp to query from
-
-        Returns:
-            Total splice costs in sats since the timestamp
-        """
-        conn = self._get_connection()
-        row = conn.execute("""
-            SELECT COALESCE(SUM(fee_sats), 0) as total
-            FROM splice_costs
-            WHERE timestamp >= ?
-        """, (since_timestamp,)).fetchone()
-
-        return row["total"] if row else 0
-
-    def get_splice_summary(self) -> Dict[str, Any]:
-        """
-        Get summary statistics for all splice operations.
-
-        Returns:
-            Dict with aggregate statistics for splices
-        """
-        conn = self._get_connection()
-
-        row = conn.execute("""
-            SELECT
-                COUNT(*) as splice_count,
-                COALESCE(SUM(CASE WHEN splice_type = 'splice_in' THEN 1 ELSE 0 END), 0) as splice_in_count,
-                COALESCE(SUM(CASE WHEN splice_type = 'splice_out' THEN 1 ELSE 0 END), 0) as splice_out_count,
-                COALESCE(SUM(CASE WHEN splice_type = 'splice_in' THEN amount_sats ELSE 0 END), 0) as total_splice_in_sats,
-                COALESCE(SUM(CASE WHEN splice_type = 'splice_out' THEN ABS(amount_sats) ELSE 0 END), 0) as total_splice_out_sats,
-                COALESCE(SUM(fee_sats), 0) as total_fees_sats
-            FROM splice_costs
-        """).fetchone()
-
-        return dict(row) if row else {
-            "splice_count": 0,
-            "splice_in_count": 0,
-            "splice_out_count": 0,
-            "total_splice_in_sats": 0,
-            "total_splice_out_sats": 0,
-            "total_fees_sats": 0
-        }
 
     # =========================================================================
     # Channel Failure Tracking Methods (Persistent Backoff)
@@ -5329,7 +5132,7 @@ class Database:
         return cur.rowcount > 0
 
     # =========================================================================
-    # Config Overrides Methods (Phase 7: Dynamic Runtime Configuration)
+    # Config Overrides Methods (Dynamic Runtime Configuration)
     # =========================================================================
     
     def get_config_override(self, key: str) -> Optional[str]:
@@ -5421,7 +5224,129 @@ class Database:
             raise
     
     # =========================================================================
-    # Mempool Fee History Methods (Phase 7: Vegas Reflex)
+    # Capacity Planner
+    # =========================================================================
+
+    def record_planner_candidate(self, peer_id: str, score: float, source: str,
+                                  capacity_recommendation_sats: int = None,
+                                  metadata: dict = None) -> None:
+        """Record or update a planner candidate peer."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT OR REPLACE INTO planner_candidates
+            (peer_id, score, source, last_evaluated, capacity_recommendation_sats, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (peer_id, score, source, int(time.time()),
+              capacity_recommendation_sats,
+              json.dumps(metadata) if metadata else None))
+
+    def get_planner_candidates(self, min_score: float = -999.0, source: str = None,
+                                limit: int = 32) -> List[Dict[str, Any]]:
+        """Get planner candidates, optionally filtered by score and source."""
+        conn = self._get_connection()
+        if source:
+            rows = conn.execute("""
+                SELECT * FROM planner_candidates
+                WHERE score >= ? AND source = ?
+                ORDER BY score DESC LIMIT ?
+            """, (min_score, source, limit)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM planner_candidates
+                WHERE score >= ?
+                ORDER BY score DESC LIMIT ?
+            """, (min_score, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_candidate_score(self, peer_id: str, delta: float) -> None:
+        """Increment a candidate's score by delta."""
+        conn = self._get_connection()
+        conn.execute("""
+            UPDATE planner_candidates SET score = score + ?, last_evaluated = ?
+            WHERE peer_id = ?
+        """, (delta, int(time.time()), peer_id))
+
+    def delete_planner_candidate(self, peer_id: str) -> None:
+        """Remove a candidate from the pool."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM planner_candidates WHERE peer_id = ?", (peer_id,))
+
+    def record_planner_action(self, action_type: str, peer_id: str,
+                               amount_sats: int = None, estimated_cost_sats: int = None,
+                               reason: str = None, channel_id: str = None,
+                               metadata: dict = None) -> int:
+        """Record a planner action and return its id."""
+        conn = self._get_connection()
+        cursor = conn.execute("""
+            INSERT INTO planner_actions
+            (action_type, peer_id, channel_id, amount_sats, estimated_cost_sats,
+             status, created_at, reason, metadata_json)
+            VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?)
+        """, (action_type, peer_id, channel_id, amount_sats, estimated_cost_sats,
+              int(time.time()), reason,
+              json.dumps(metadata) if metadata else None))
+        return cursor.lastrowid
+
+    def update_planner_action(self, action_id: int, status: str = None,
+                               actual_cost_sats: int = None, channel_id: str = None,
+                               completed_at: int = None) -> None:
+        """Update a planner action's status and/or cost."""
+        conn = self._get_connection()
+        updates = []
+        params = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if actual_cost_sats is not None:
+            updates.append("actual_cost_sats = ?")
+            params.append(actual_cost_sats)
+        if channel_id is not None:
+            updates.append("channel_id = ?")
+            params.append(channel_id)
+        if completed_at is not None:
+            updates.append("completed_at = ?")
+            params.append(completed_at)
+        elif status in ("completed", "failed"):
+            updates.append("completed_at = ?")
+            params.append(int(time.time()))
+        if updates:
+            params.append(action_id)
+            conn.execute(f"UPDATE planner_actions SET {', '.join(updates)} WHERE id = ?", params)
+
+    def get_planner_action(self, action_id: int) -> Optional[Dict[str, Any]]:
+        """Get a single planner action by id."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT * FROM planner_actions WHERE id = ?", (action_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_planner_actions(self, status: str = None, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get planner actions, optionally filtered by status."""
+        conn = self._get_connection()
+        if status:
+            rows = conn.execute("""
+                SELECT * FROM planner_actions WHERE status = ?
+                ORDER BY created_at DESC LIMIT ?
+            """, (status, limit)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM planner_actions
+                ORDER BY created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_planner_actions(self, peer_id: str, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get recent planner actions for a peer (for cooldown checks)."""
+        conn = self._get_connection()
+        since = int(time.time()) - (hours * 3600)
+        rows = conn.execute("""
+            SELECT * FROM planner_actions
+            WHERE peer_id = ? AND created_at >= ?
+            ORDER BY created_at DESC
+        """, (peer_id, since)).fetchall()
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Mempool Fee History Methods (Vegas Reflex)
     # =========================================================================
     
     def record_mempool_fee(self, sat_per_vbyte: float) -> None:
@@ -5460,57 +5385,6 @@ class Database:
         ).fetchone()
         return row['avg_fee'] if row and row['avg_fee'] else 1.0
     
-    # =========================================================================
-    # Fee Anchors: Advisor-set soft fee targets with decaying weight
-    # =========================================================================
-
-    def set_fee_anchor(self, channel_id: str, target_fee_ppm: int,
-                       base_weight: float = 0.7, confidence: float = 1.0,
-                       ttl_seconds: int = 86400, reason: str = '') -> None:
-        """Upsert a fee anchor for a channel."""
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT OR REPLACE INTO fee_anchors
-            (channel_id, target_fee_ppm, base_weight, confidence, ttl_seconds, reason, set_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (channel_id, target_fee_ppm, base_weight, confidence,
-              ttl_seconds, reason, int(time.time())))
-
-    def get_fee_anchor(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        """Get the fee anchor for a channel, or None if not set/expired."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT * FROM fee_anchors WHERE channel_id = ?", (channel_id,)
-        ).fetchone()
-        if row:
-            return dict(row)
-        return None
-
-    def get_all_fee_anchors(self) -> List[Dict[str, Any]]:
-        """Get all fee anchors."""
-        conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM fee_anchors").fetchall()
-        return [dict(r) for r in rows]
-
-    def delete_fee_anchor(self, channel_id: str) -> None:
-        """Delete the fee anchor for a channel."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM fee_anchors WHERE channel_id = ?", (channel_id,))
-
-    def delete_all_fee_anchors(self) -> None:
-        """Delete all fee anchors."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM fee_anchors")
-
-    def prune_expired_fee_anchors(self) -> int:
-        """Delete expired fee anchors. Returns count deleted."""
-        conn = self._get_connection()
-        now = int(time.time())
-        cursor = conn.execute(
-            "DELETE FROM fee_anchors WHERE set_at + ttl_seconds < ?", (now,)
-        )
-        return cursor.rowcount
-
     def close(self):
         """Close the thread-local database connection (if any).
 

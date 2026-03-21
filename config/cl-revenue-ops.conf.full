@@ -1,4 +1,4 @@
-# --- CL-REVENUE-OPS v2.1 CONFIGURATION ---
+# --- CL-REVENUE-OPS CONFIGURATION ---
 # Copy to ~/.lightning/config or include via `include cl-revenue-ops.conf`
 #
 # QUICK START (Production):
@@ -15,14 +15,6 @@
 #revenue-ops-dry-run=true
 
 # ============================================================================
-# CL-HIVE INTEGRATION
-# ============================================================================
-
-# Fee rate for hive member channels (0 = free routing between fleet)
-# When cl-hive sets a peer's strategy to HIVE, this fee is applied
-#revenue-ops-hive-fee-ppm=0
-
-# ============================================================================
 # FLOW ANALYSIS
 # ============================================================================
 
@@ -32,17 +24,11 @@
 # Flow analysis interval in seconds (1 hour default)
 #revenue-ops-flow-interval=3600
 
-# Maintain extra pure P2P peers when total connectivity falls below target
-#revenue-ops-enable-gossip-keepalives=false
-
-# Target total connected peers (channel peers count toward this target)
-#revenue-ops-target-gossip-peers=5
-
 # Historical window for flow averaging (days)
 #revenue-ops-flow-window-days=7
 
 # ============================================================================
-# FEE MANAGEMENT (Hill Climbing Algorithm v2.0)
+# FEE MANAGEMENT (DTS+PID Fee Optimization)
 # ============================================================================
 
 # Fee adjustment interval in seconds
@@ -58,46 +44,12 @@
 # RECOMMENDATION: 2500-5000 ppm depending on channel positioning
 #revenue-ops-max-fee-ppm=5000
 
-# --- Scarcity Pricing (v2.0) ---
-# Apply fee multiplier when outbound liquidity is scarce
-# Protects valuable liquidity from being underpriced
-
-# Enable scarcity pricing
-#revenue-ops-scarcity-pricing=true
-
-# Outbound ratio below which scarcity pricing kicks in (0.15 = 15%)
-#revenue-ops-scarcity-threshold=0.35
-
-# --- Vegas Reflex (v2.0) ---
+# --- Vegas Reflex ---
 # Dynamically raise fee floor during mempool congestion
 # Protects against underpricing when on-chain costs spike
 
 # Enable Vegas Reflex mempool-aware floor adjustment
 #revenue-ops-vegas-reflex=true
-
-# Dynamically raise htlcmin during congestion and relax it after pressure subsides
-#revenue-ops-enable-dynamic-htlcmin=false
-
-# Enable real-time toxic-flow surge defense with temporary fee overlays
-#revenue-ops-enable-realtime-surge-defense=false
-
-# Rolling detection window in seconds for surge-defense burst analysis
-#revenue-ops-surge-window-seconds=60
-
-# Fraction of channel capacity moved in the window required before triggering
-#revenue-ops-surge-trigger-pct=0.10
-
-# Minimum multiplier applied to the current fee when surge defense activates
-#revenue-ops-surge-multiplier-min=3.0
-
-# Maximum multiplier applied to the current fee when surge defense activates
-#revenue-ops-surge-multiplier-max=5.0
-
-# Cooldown before reverting the exact pre-surge fee after pressure subsides
-#revenue-ops-surge-cooldown-seconds=120
-
-# Minimum interval between setchannel writes for surge defense on one channel
-#revenue-ops-surge-setchannel-min-interval-seconds=15
 
 # ============================================================================
 # REBALANCING
@@ -112,6 +64,22 @@
 
 # Rebalancer backend (only 'sling' supported)
 #revenue-ops-rebalancer=sling
+
+# ============================================================================
+# CAPACITY PLANNER
+# ============================================================================
+
+# Once enabled, planner evaluates opens/closes, but close execution stays off by default.
+# Set revenue-ops-planner-execute-closes=true and planner-max-closes-per-cycle>0 only for explicit live close RPCs.
+#revenue-ops-planner-enabled=false
+#revenue-ops-planner-dry-run=false
+#revenue-ops-planner-execute-closes=false
+#revenue-ops-planner-interval=21600
+#revenue-ops-planner-max-opens-per-cycle=1
+#revenue-ops-planner-max-closes-per-cycle=0
+#revenue-ops-planner-min-channel-sats=500000
+#revenue-ops-planner-max-channel-sats=10000000
+#revenue-ops-planner-max-fee-rate=50.0
 
 # ============================================================================
 # CAPITAL SAFETY (Global Capital Controls)
@@ -192,7 +160,6 @@
 # revenue-ops-min-fee-ppm=50
 # revenue-ops-max-fee-ppm=1500
 # revenue-ops-fee-interval=1800
-# revenue-ops-scarcity-pricing=true
 # revenue-ops-proportional-budget=true
 # revenue-ops-proportional-budget-pct=0.15
 # revenue-ops-enable-kelly=true
@@ -205,20 +172,7 @@
 # revenue-ops-min-fee-ppm=150
 # revenue-ops-max-fee-ppm=5000
 # revenue-ops-fee-interval=3600
-# revenue-ops-scarcity-pricing=true
 # revenue-ops-daily-budget-sats=2000
 # revenue-ops-proportional-budget=false
 # revenue-ops-enable-kelly=true
 # revenue-ops-kelly-fraction=0.3
-
-# --- CL-HIVE FLEET MEMBER ---
-# Optimized for coordinated hive routing
-#
-# revenue-ops-dry-run=false
-# revenue-ops-hive-fee-ppm=0
-# revenue-ops-min-fee-ppm=100
-# revenue-ops-max-fee-ppm=2500
-# revenue-ops-fee-interval=1800
-# revenue-ops-scarcity-pricing=true
-# revenue-ops-proportional-budget=true
-# revenue-ops-proportional-budget-pct=0.10

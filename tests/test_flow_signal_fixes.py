@@ -729,8 +729,8 @@ class TestConsumerVelocityConversion:
         assert std_dev_correct < std_dev_wrong
 
 
-class TestThompsonExtrapolation:
-    """Tests for Thompson posterior f_star clamping (Fix 4)."""
+class TestDTSExtrapolation:
+    """Tests for DTS posterior f_star clamping (Fix 4)."""
 
     def test_f_star_allows_extrapolation_above(self):
         """f_star should be allowed to exceed 1.0 (extrapolate beyond tested range)."""
@@ -795,3 +795,168 @@ class TestAskReneClamp:
         p = (historical_p * 0.3) + (askrene_p * 0.7)
 
         assert p > 0, f"Blended probability must be positive: {p}"
+
+
+# =========================================================================
+# Kalman PD Enforcement: minimum variance floor
+# =========================================================================
+
+# =========================================================================
+# Bug B1: Velocity outlier formula shift bug
+# =========================================================================
+
+class TestB1VelocityOutlierFormula:
+    """abs(flow_ratio)+0.01 not abs(flow_ratio+0.01).
+
+    When flow_ratio ~ -0.01, abs(-0.01+0.01)=0.0 makes expected_max=0.0,
+    clamping ALL non-zero velocities to zero and breaking trend detection.
+    """
+
+    def test_velocity_not_zeroed_at_negative_001(self):
+        """Velocity must survive when flow_ratio is near -0.01."""
+        from modules.flow_analysis import FlowAnalyzer
+
+        plugin = MagicMock()
+        config = MagicMock()
+        config.flow_window_days = 7
+        db = MagicMock()
+        analyzer = FlowAnalyzer(plugin, config, db)
+
+        now = int(time.time())
+        previous_timestamp = now - 7200  # 2 hours ago
+
+        velocity = analyzer._calculate_velocity(
+            flow_ratio=-0.01,
+            previous_ratio=-0.05,
+            previous_timestamp=previous_timestamp,
+        )
+
+        # Without fix: abs(-0.01+0.01)=0.0, expected_max=0.0, velocity clamped to 0.0
+        # With fix:    abs(-0.01)+0.01=0.02, expected_max=0.06, velocity ~0.02
+        assert velocity != 0.0, (
+            f"Velocity should NOT be zero: flow_ratio=-0.01 near the old "
+            f"abs(ratio+0.01) singularity.  Got {velocity}"
+        )
+        assert velocity == pytest.approx(0.02, abs=0.005), (
+            f"Expected velocity ~0.02 (delta 0.04 / 2h), got {velocity}"
+        )
+
+
+class TestKalmanPDEnforcement:
+    """Kalman filter must enforce positive-definite covariance before update."""
+
+    def test_zero_variance_does_not_produce_nan(self):
+        """If variance reaches zero, filter must not produce NaN."""
+        from modules.flow_analysis import KalmanFlowFilter
+
+        kf = KalmanFlowFilter()
+        # Force variance to near-zero
+        kf.state.variance_ratio = 1e-8
+        kf.state.variance_velocity = 1e-8
+        kf.state.covariance = 0.0
+        # Update should not crash or produce NaN
+        kf.update(observed_ratio=0.5, confidence=1.0)
+        assert math.isfinite(kf.state.flow_ratio)
+        assert math.isfinite(kf.state.flow_velocity)
+        assert kf.state.variance_ratio >= 1e-4
+
+
+# =========================================================================
+# Bug B2: Kalman update() NaN/Inf input guard
+# =========================================================================
+
+class TestB2KalmanNaNInputGuard:
+    """NaN/Inf observed_ratio must be rejected without resetting Kalman state.
+
+    Without the guard, NaN propagates through innovation -> gain -> state,
+    and the late NaN guard at line 623 resets all accumulated state.
+    """
+
+    def test_nan_observation_preserves_state(self):
+        """Feeding NaN should return 0.0 and leave state unchanged."""
+        from modules.flow_analysis import KalmanFlowFilter
+
+        kf = KalmanFlowFilter()
+        # Build up meaningful state with two valid observations
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        kf.update(0.3, confidence=0.8)
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        kf.update(0.35, confidence=0.8)
+
+        # Snapshot state before the bad observation
+        snap_ratio = kf.state.flow_ratio
+        snap_velocity = kf.state.flow_velocity
+        snap_variance = kf.state.variance_ratio
+        snap_count = kf.state.observation_count
+
+        # Feed NaN — must be silently rejected
+        result = kf.update(float('nan'), confidence=0.8)
+
+        assert result == 0.0, "NaN observation should return 0.0"
+        assert kf.state.flow_ratio == snap_ratio, "State must not change on NaN"
+        assert kf.state.flow_velocity == snap_velocity, "Velocity must not change on NaN"
+        assert kf.state.variance_ratio == snap_variance, "Variance must not change on NaN"
+        assert kf.state.observation_count == snap_count, "Count must not change on NaN"
+
+    def test_inf_observation_preserves_state(self):
+        """Feeding Inf should return 0.0 and leave state unchanged."""
+        from modules.flow_analysis import KalmanFlowFilter
+
+        kf = KalmanFlowFilter()
+        # Build up meaningful state with two valid observations
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        kf.update(0.3, confidence=0.8)
+        kf.predict(dt_hours=1.0, volatility=1.0)
+        kf.update(0.35, confidence=0.8)
+
+        # Snapshot state before the bad observation
+        snap_ratio = kf.state.flow_ratio
+        snap_velocity = kf.state.flow_velocity
+        snap_variance = kf.state.variance_ratio
+        snap_count = kf.state.observation_count
+
+        # Feed Inf — must be silently rejected
+        result = kf.update(float('inf'), confidence=0.8)
+
+        assert result == 0.0, "Inf observation should return 0.0"
+        assert kf.state.flow_ratio == snap_ratio, "State must not change on Inf"
+        assert kf.state.flow_velocity == snap_velocity, "Velocity must not change on Inf"
+        assert kf.state.variance_ratio == snap_variance, "Variance must not change on Inf"
+        assert kf.state.observation_count == snap_count, "Count must not change on Inf"
+
+
+# =========================================================================
+# Bug B3: prev_ts parameter unused in _apply_kalman_filter
+# =========================================================================
+
+class TestB3PrevTsRemoved:
+    """prev_ts parameter is accepted but never read — remove it."""
+
+    def test_apply_kalman_filter_no_prev_ts_param(self):
+        import inspect
+        from modules.flow_analysis import FlowAnalyzer
+        sig = inspect.signature(FlowAnalyzer._apply_kalman_filter)
+        param_names = list(sig.parameters.keys())
+        assert "prev_ts" not in param_names
+
+
+# =========================================================================
+# F2: Kalman reclassification extraction
+# =========================================================================
+
+class TestF2KalmanReclassificationExtraction:
+    """Kalman reclassification block is extracted into a shared method."""
+
+    def test_shared_method_exists(self):
+        from modules.flow_analysis import FlowAnalyzer
+        assert hasattr(FlowAnalyzer, '_apply_kalman_reclassification')
+
+    def test_shared_method_signature(self):
+        import inspect
+        from modules.flow_analysis import FlowAnalyzer
+        sig = inspect.signature(FlowAnalyzer._apply_kalman_reclassification)
+        param_names = list(sig.parameters.keys())
+        # Must accept these parameters (self excluded from check)
+        for expected in ['metrics', 'channel_id', 'capacity', 'our_balance',
+                         'channel_daily', 'raw_entries', 'last_forward_ts']:
+            assert expected in param_names, f"Missing parameter: {expected}"

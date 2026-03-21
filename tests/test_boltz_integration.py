@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import pytest
 
 from modules.boltz_manager import BoltzCliConfig, BoltzCliManager
+from tests.plugin_test_utils import load_plugin_module
 
 
 def _make_manager(**overrides):
@@ -24,6 +25,232 @@ def _make_manager(**overrides):
     rpc = MagicMock()
     mgr = BoltzCliManager(plugin, rpc, cfg)
     return mgr
+
+
+def _load_boltz_plugin_module():
+    mod = load_plugin_module()
+    mod.plugin.log = MagicMock()
+    return mod
+
+
+class TestBoltzAutoCycleModeSelection:
+    def test_prefers_treasury_when_reserve_below_target(self):
+        mod = _load_boltz_plugin_module()
+
+        selection = mod._select_boltz_auto_cycle_mode(
+            treasury_plan={
+                "status": "ok",
+                "recommendations": [{"channel_id": "100x1x0"}],
+                "treasury": {"deficit_sats": 700000, "min_deficit_sats": 250000},
+            },
+            balance_plan={
+                "recommendations": [{"channel_id": "200x1x0"}],
+            },
+        )
+
+        assert selection["mode"] == "treasury"
+        assert selection["reason"] == "standing_onchain_reserve_below_target"
+        assert selection["reserve_deficit_sats"] == 700000
+        assert selection["treasury_candidate_count"] == 1
+        assert selection["balance_candidate_count"] == 1
+
+    def test_falls_back_to_balance_when_treasury_is_at_target(self):
+        mod = _load_boltz_plugin_module()
+
+        selection = mod._select_boltz_auto_cycle_mode(
+            treasury_plan={
+                "status": "at_target",
+                "recommendations": [],
+                "treasury": {"deficit_sats": 0, "min_deficit_sats": 250000},
+            },
+            balance_plan={
+                "recommendations": [{"channel_id": "200x1x0"}],
+            },
+        )
+
+        assert selection["mode"] == "balance"
+        assert selection["reason"] == "onchain_reserve_healthy_use_balance_mode"
+        assert selection["treasury_candidate_count"] == 0
+        assert selection["balance_candidate_count"] == 1
+
+    def test_returns_idle_when_no_mode_has_candidates(self):
+        mod = _load_boltz_plugin_module()
+
+        selection = mod._select_boltz_auto_cycle_mode(
+            treasury_plan={
+                "status": "at_target",
+                "recommendations": [],
+                "treasury": {"deficit_sats": 0},
+            },
+            balance_plan={"recommendations": []},
+        )
+
+        assert selection["mode"] == "idle"
+        assert selection["reason"] == "no_eligible_boltz_actions"
+        assert selection["treasury_candidate_count"] == 0
+        assert selection["balance_candidate_count"] == 0
+
+
+class TestBoltzAutoCycleScheduler:
+    def _make_module(self):
+        mod = _load_boltz_plugin_module()
+        mod.boltz_manager = MagicMock(enabled=True)
+        mod.config = MagicMock()
+        mod.config.snapshot.return_value = MagicMock(
+            boltz_auto_cycle_enabled=True,
+            boltz_auto_cycle_max_actions=1,
+            expansion_treasury_enabled=True,
+            expansion_treasury_onchain_target_sats=5_000_000,
+            expansion_treasury_min_deficit_sats=250_000,
+            expansion_treasury_preferred_currency="BTC",
+            expansion_treasury_max_actions=1,
+            expansion_treasury_min_source_local_pct=80.0,
+            expansion_treasury_exclude_protected=True,
+        )
+        return mod
+
+    def test_auto_cycle_executes_treasury_mode_first(self):
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "ok",
+            "recommendations": [{"channel_id": "100x1x0"}],
+            "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
+        })
+        mod._build_boltz_balance_plan = MagicMock()
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+        mod.revenue_boltz_balance_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert result["mode"] == "treasury"
+        assert result["selection_reason"] == "standing_onchain_reserve_below_target"
+        assert result["reserve_deficit_sats"] == 900000
+        assert result["trigger"] == "scheduler"
+        mod.revenue_boltz_expansion_treasury_cycle.assert_called_once()
+        mod.revenue_boltz_balance_cycle.assert_not_called()
+        mod._build_boltz_balance_plan.assert_not_called()
+
+    def test_auto_cycle_falls_back_to_balance_mode(self):
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "at_target",
+            "recommendations": [],
+            "treasury": {"deficit_sats": 0, "min_deficit_sats": 250000},
+        })
+        mod._build_boltz_balance_plan = MagicMock(return_value={
+            "recommendations": [{"channel_id": "200x1x0"}],
+        })
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+        mod.revenue_boltz_balance_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert result["mode"] == "balance"
+        assert result["selection_reason"] == "onchain_reserve_healthy_use_balance_mode"
+        assert result["reserve_deficit_sats"] == 0
+        assert result["trigger"] == "scheduler"
+        mod.revenue_boltz_balance_cycle.assert_called_once()
+        mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
+
+    def test_auto_cycle_surfaces_treasury_plan_error_without_falling_back(self):
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "error": "treasury planner failed",
+        })
+        mod._build_boltz_balance_plan = MagicMock()
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock()
+        mod.revenue_boltz_balance_cycle = MagicMock()
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert result["error"] == "treasury planner failed"
+        assert result["trigger"] == "scheduler"
+        mod.revenue_boltz_balance_cycle.assert_not_called()
+        mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
+        mod._build_boltz_balance_plan.assert_not_called()
+
+    def test_auto_cycle_increments_error_counter_on_treasury_plan_error(self):
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "error": "treasury planner failed",
+        })
+        mod._build_boltz_balance_plan = MagicMock()
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock()
+        mod.revenue_boltz_balance_cycle = MagicMock()
+
+        before = dict(mod._boltz_auto_cycle_state)
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+        after = dict(mod._boltz_auto_cycle_state)
+
+        assert result["error"] == "treasury planner failed"
+        assert after["consecutive_errors"] == before["consecutive_errors"] + 1
+        mod.revenue_boltz_balance_cycle.assert_not_called()
+        mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
+        mod._build_boltz_balance_plan.assert_not_called()
+
+    def test_auto_cycle_uses_treasury_specific_action_cap(self):
+        mod = self._make_module()
+        mod.config.snapshot.return_value = MagicMock(
+            boltz_auto_cycle_enabled=True,
+            boltz_auto_cycle_max_actions=7,
+            expansion_treasury_enabled=True,
+            expansion_treasury_onchain_target_sats=5_000_000,
+            expansion_treasury_min_deficit_sats=250_000,
+            expansion_treasury_preferred_currency="BTC",
+            expansion_treasury_max_actions=3,
+            expansion_treasury_min_source_local_pct=80.0,
+            expansion_treasury_exclude_protected=True,
+        )
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "ok",
+            "recommendations": [{"channel_id": "100x1x0"}],
+            "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
+        })
+        mod._build_boltz_balance_plan = MagicMock()
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+        mod.revenue_boltz_balance_cycle = MagicMock()
+
+        mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        mod.revenue_boltz_expansion_treasury_cycle.assert_called_once()
+        kwargs = mod.revenue_boltz_expansion_treasury_cycle.call_args.kwargs
+        assert kwargs["max_actions"] == 3
+        mod.revenue_boltz_balance_cycle.assert_not_called()
+
+
+class TestBoltzAutoCycleStatus:
+    def test_status_includes_treasury_config(self):
+        mod = _load_boltz_plugin_module()
+        mod.config = MagicMock()
+        mod.config.boltz_auto_cycle_enabled = True
+        mod.config.boltz_auto_cycle_interval_minutes = 15
+        mod.config.boltz_auto_cycle_max_actions = 1
+        mod.config.boltz_auto_cycle_startup_delay_seconds = 120
+        mod.config.expansion_treasury_enabled = True
+        mod.config.expansion_treasury_onchain_target_sats = 5_000_000
+        mod.config.expansion_treasury_min_deficit_sats = 250_000
+
+        result = mod.revenue_boltz_auto_cycle_status(mod.plugin)
+
+        assert result["config"]["boltz_auto_cycle_enabled"] is True
+        assert result["config"]["expansion_treasury_enabled"] is True
+        assert result["config"]["expansion_treasury_onchain_target_sats"] == 5_000_000
+        assert result["config"]["expansion_treasury_min_deficit_sats"] == 250_000
 
 
 class TestDynamicChannelTuning:

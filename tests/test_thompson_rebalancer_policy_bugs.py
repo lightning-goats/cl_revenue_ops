@@ -1,14 +1,15 @@
 """
-Tests for Thompson Sampling, Rebalancer, and Policy Engine bug fixes.
+Tests for DTS posterior, Rebalancer, and Policy Engine bug fixes.
 
 Covers:
 1. Rebalancer: fee_paid_sats → actual_fee_sats kwarg fix (P0 crash)
-2. Thompson: Double revenue_weight removed from update_contextual
-3. Thompson: Double revenue_factor removed from _recompute_posterior
-4. Thompson: Legacy migration includes time_bucket (5-tuple)
-5. Thompson: Cold-start explore_std clamped to MIN_STD
+2. DTS: Double revenue_weight removed from update_contextual
+3. DTS: Double revenue_factor removed from _recompute_posterior
+4. DTS: Legacy migration includes time_bucket (5-tuple)
+5. DTS: Cold-start explore_std clamped to MIN_STD
 6. Policy: set_policies_batch validates fee_ppm, tags, multiplier bounds
 7. Config: _apply_override enforces range validation
+8. Rebalancer: _estimate_push_ev passes channel SCID (not peer_id) to turnover calc
 """
 
 import pytest
@@ -56,7 +57,7 @@ class TestRebalancerTimeoutKwarg:
         # Mock _get_channel_local_balance to simulate partial transfer
         jm._get_channel_local_balance = MagicMock(return_value=510000)
         jm.stop_job = MagicMock(return_value=True)
-        jm._report_outcome_to_hive = MagicMock()
+        jm._report_outcome = MagicMock()
         # E3 FIX: Mock _get_sling_stats and _parse_msat to return proper values
         # so fee_sats stays an int (prevents MagicMock propagation through arithmetic)
         jm._get_sling_stats = MagicMock(return_value={})
@@ -101,7 +102,7 @@ class TestRebalancerTimeoutKwarg:
         # No transfer
         jm._get_channel_local_balance = MagicMock(return_value=500000)
         jm.stop_job = MagicMock(return_value=True)
-        jm._report_outcome_to_hive = MagicMock()
+        jm._report_outcome = MagicMock()
 
         # Should not raise
         jm._handle_job_timeout(job)
@@ -112,20 +113,20 @@ class TestRebalancerTimeoutKwarg:
 
 
 # =============================================================================
-# Fix 2: Thompson update_contextual double revenue_weight
+# Fix 2: DTS update_contextual double revenue_weight
 # =============================================================================
 
-class TestThompsonContextualRevenueWeight:
+class TestDTSContextualRevenueWeight:
     """
     Bug: update_contextual applied revenue_weight twice — once in learning_rate
     via (1 + revenue_weight), and again as multiplier on the update direction.
     """
 
-    def _make_thompson_state(self):
-        """Create a GaussianThompsonState for testing."""
+    def _make_dts_state(self):
+        """Create a GaussianThompsonState for DTS testing."""
         from modules.fee_controller import GaussianThompsonState
         state = GaussianThompsonState()
-        # Context key format: "balance:pheromone:time:role"
+        # Context key format: "balance:time:role"
         # Use a key with "normal" time and "P" role
         ctx_key = "mid:med:normal:P"
         # 4-tuple format: (mean, precision, count, last_update)
@@ -135,7 +136,7 @@ class TestThompsonContextualRevenueWeight:
 
     def test_low_revenue_still_moves_mean(self):
         """Low-revenue observations should still update the contextual posterior (proper Bayesian)."""
-        state, ctx_key = self._make_thompson_state()
+        state, ctx_key = self._make_dts_state()
 
         # Low revenue rate (1 sat/hr)
         state.update_contextual(
@@ -153,7 +154,7 @@ class TestThompsonContextualRevenueWeight:
 
     def test_high_revenue_does_not_overshoot(self):
         """High-revenue observations should not overshoot due to double-weighting."""
-        state, ctx_key = self._make_thompson_state()
+        state, ctx_key = self._make_dts_state()
 
         # High revenue rate (200 sat/hr)
         state.update_contextual(
@@ -170,8 +171,8 @@ class TestThompsonContextualRevenueWeight:
 
     def test_revenue_impact_is_bounded(self):
         """Higher revenue should have proportionally more impact, but bounded by precision."""
-        state_high, ctx_key = self._make_thompson_state()
-        state_low = self._make_thompson_state()[0]
+        state_high, ctx_key = self._make_dts_state()
+        state_low = self._make_dts_state()[0]
         state_low.contextual_posteriors[ctx_key] = (200.0, 1.0 / (50.0 ** 2), 5, 0)
 
         # Same fee, different revenue
@@ -191,10 +192,10 @@ class TestThompsonContextualRevenueWeight:
 
 
 # =============================================================================
-# Fix 3: Thompson _recompute_posterior double revenue_factor
+# Fix 3: DTS _recompute_posterior double revenue_factor
 # =============================================================================
 
-class TestThompsonPosteriorRevenueDoubleCount:
+class TestDTSPosteriorRevenueDoubleCount:
     """
     Bug: _recompute_posterior applied revenue_factor on top of base_weight
     which already includes revenue from update_posterior line 1333.
@@ -256,84 +257,6 @@ class TestThompsonPosteriorRevenueDoubleCount:
         move_low = abs(state_low.posterior_mean - 200)
 
         assert move_low > 10, f"Low-revenue posterior barely moved: {move_low}"
-
-
-# =============================================================================
-# Fix 4: Legacy migration includes time_bucket
-# =============================================================================
-
-class TestThompsonLegacyMigration:
-    """
-    Bug: Legacy observation migration created 4-tuples missing time_bucket.
-    New observations are 5-tuples (fee, revenue_rate, weight, timestamp, time_bucket).
-    """
-
-    def test_migrated_observations_are_5_tuples(self):
-        """from_v2_dict should create 5-tuple observations with time_bucket."""
-        from modules.fee_controller import ThompsonAIMDState
-
-        legacy_data = {
-            "historical_curve": {
-                "observations": [
-                    {"fee_ppm": 150, "revenue_rate": 50.0, "forward_count": 8, "timestamp": 1000000},
-                    {"fee_ppm": 200, "revenue_rate": 100.0, "forward_count": 15, "timestamp": 1000100},
-                ]
-            },
-            "elasticity": {},
-        }
-
-        state = ThompsonAIMDState.from_v2_dict(legacy_data)
-
-        for obs in state.thompson.observations:
-            assert len(obs) == 5, f"Migrated observation should be 5-tuple, got {len(obs)}-tuple: {obs}"
-            assert obs[4] in ("low", "normal", "peak"), \
-                f"time_bucket should be a valid bucket, got {obs[4]}"
-
-    def test_migrated_default_time_bucket_is_normal(self):
-        """Legacy observations without time_bucket should default to 'normal'."""
-        from modules.fee_controller import ThompsonAIMDState
-
-        legacy_data = {
-            "historical_curve": {
-                "observations": [
-                    {"fee_ppm": 150, "revenue_rate": 50.0, "forward_count": 5, "timestamp": 1000000},
-                ]
-            },
-            "elasticity": {},
-        }
-
-        state = ThompsonAIMDState.from_v2_dict(legacy_data)
-        assert state.thompson.observations[0][4] == "normal"
-
-
-# =============================================================================
-# Fix 5: Cold-start explore_std clamped to MIN_STD
-# =============================================================================
-
-class TestThompsonColdStartClamping:
-    """
-    Bug: Cold-start path didn't clamp explore_std to MIN_STD, unlike the
-    normal observation path which does: max(self.MIN_STD, ...).
-    """
-
-    def test_cold_start_explore_std_has_minimum(self):
-        """sample_fee in cold-start should never use explore_std below MIN_STD."""
-        from modules.fee_controller import GaussianThompsonState
-
-        state = GaussianThompsonState()
-        state.observations = []  # Ensure cold start
-        state.prior_std_fee = 1  # Artificially tiny prior
-
-        # With pheromone modulation that further reduces exploration
-        state.set_context_modulation(pheromone_level=100.0, corridor_role="P")
-
-        # Sample many times and check the spread
-        samples = [state.sample_fee(floor=10, ceiling=10000) for _ in range(100)]
-
-        # With clamping, even with tiny prior_std and high pheromone,
-        # the spread should be at least MIN_STD (10 ppm)
-        spread = max(samples) - min(samples)
-        assert spread >= 1, "Cold-start should have minimum exploration spread"
 
 
 # =============================================================================
@@ -416,7 +339,7 @@ class TestPolicyBatchValidation:
             pm.set_policies_batch([{
                 "peer_id": "02" + "a" * 64,
                 "fee_ppm_target": 500,
-                "tags": ["hive", "test"],
+                "tags": ["priority", "test"],
                 "fee_multiplier_min": 0.5,
                 "fee_multiplier_max": 3.0,
                 "strategy": "dynamic",
@@ -511,3 +434,65 @@ class TestConfigOverrideRangeValidation:
         # enable_reputation is a bool in CONFIG_FIELD_TYPES but NOT in CONFIG_FIELD_RANGES
         config._apply_override('enable_reputation', 'false')
         assert config.enable_reputation is False
+
+
+# =============================================================================
+# Fix 8: Push EV passes channel SCID (not peer_id) to _calculate_turnover_rate
+# =============================================================================
+
+class TestPushEVTurnoverChannelId:
+    """
+    Bug: _estimate_push_ev passed src_peer_id (66-char hex) to
+    _calculate_turnover_rate, which expects a channel SCID (e.g. "123x456x0").
+    This caused get_channel_state to miss the lookup and fall back to the
+    default turnover rate, making EV calculations inaccurate.
+    """
+
+    def _make_rebalancer(self):
+        """Create an EVRebalancer with mock dependencies."""
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        plugin = MagicMock()
+        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        database = MagicMock()
+        database.get_channel_state.return_value = {
+            "sats_in": 500_000,
+            "sats_out": 300_000,
+        }
+        r = EVRebalancer(plugin, cfg, database)
+        return r, database
+
+    def test_turnover_receives_scid_not_peer_id(self):
+        """_estimate_push_ev should pass the channel SCID to _calculate_turnover_rate."""
+        r, database = self._make_rebalancer()
+
+        src_channel = "750000x1234x0"    # SCID format: contains 'x'
+        src_peer_id = "02" + "ab" * 32   # 66-char hex peer ID
+        src_info = {
+            "capacity": 10_000_000,
+            "peer_id": src_peer_id,
+            "fee_ppm": 500,
+        }
+        src_ratio = 0.80  # overfull, triggers push logic
+
+        # Mock _estimate_inbound_fee and _estimate_expected_fee_sats
+        r._estimate_inbound_fee = MagicMock(return_value=100)
+        r._estimate_expected_fee_sats = MagicMock(return_value=50)
+
+        dest_scids = ["800000x5678x1"]
+        dest_peer_ids = ["03" + "cd" * 32]
+
+        result = r._estimate_push_ev(src_channel, src_info, src_ratio, dest_scids, dest_peer_ids)
+
+        # _calculate_turnover_rate calls database.get_channel_state.
+        # Verify it was called with the SCID, not the peer_id.
+        channel_id_arg = database.get_channel_state.call_args[0][0]
+        assert "x" in channel_id_arg, (
+            f"_calculate_turnover_rate received '{channel_id_arg}' which looks like a "
+            f"peer_id, not a channel SCID. Expected an SCID containing 'x'."
+        )
+        assert channel_id_arg == src_channel, (
+            f"Expected _calculate_turnover_rate to receive '{src_channel}', "
+            f"got '{channel_id_arg}'"
+        )

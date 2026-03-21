@@ -59,7 +59,6 @@ def mock_rpc():
 
     rpc.plugin.return_value = {
         "plugins": [
-            {"name": "cl-hive", "active": True},
             {"name": "cl-revenue-ops", "active": True}
         ]
     }
@@ -111,12 +110,12 @@ def sample_policy_updates(sample_peer_ids):
     return [
         {
             "peer_id": sample_peer_ids[0],
-            "strategy": "hive",
+            "strategy": "dynamic",
             "rebalance_mode": "enabled"
         },
         {
             "peer_id": sample_peer_ids[1],
-            "strategy": "hive",
+            "strategy": "static",
             "rebalance_mode": "sink_only"
         },
         {
@@ -162,19 +161,3 @@ def sample_channel_opened_payload(sample_peer_ids, sample_channel_id):
     }
 
 
-@pytest.fixture
-def mock_hive_bridge(mock_plugin, mock_rpc):
-    """
-    Create a HiveFeeIntelligenceBridge with hive availability pre-set.
-
-    This properly sets both _hive_available and _availability_check_time
-    so that is_available() returns the cached value without doing a fresh check.
-    """
-    import time
-    from modules.hive_bridge import HiveFeeIntelligenceBridge
-
-    mock_plugin.rpc = mock_rpc
-    bridge = HiveFeeIntelligenceBridge(mock_plugin, None)
-    bridge._hive_available = True
-    bridge._availability_check_time = time.time()  # Set fresh timestamp
-    return bridge

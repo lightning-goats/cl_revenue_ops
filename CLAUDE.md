@@ -27,8 +27,6 @@ No build system - this is a CLN plugin deployed by copying `cl-revenue-ops.py` a
 ## Architecture
 
 ```
-cl-hive (Coordination Layer - optional)
-    ↓
 cl-revenue-ops (Execution Layer - "The CFO")
     ↓
 sling (Rebalancing Engine - required)
@@ -36,39 +34,38 @@ sling (Rebalancing Engine - required)
 Core Lightning
 ```
 
-### Module Organization (10 modules)
+### Module Organization (8 modules)
 
 | Module | Purpose |
 |--------|---------|
-| `fee_controller.py` | Thompson Sampling + AIMD fee optimization, Vegas Reflex, Scarcity Pricing |
+| `fee_controller.py` | DTS+PID fee optimization, Vegas Reflex, congestion handling |
 | `rebalancer.py` | EV-based rebalancing, sling integration, futility circuit breaker |
 | `flow_analysis.py` | Sink/Source detection, Kalman-filtered flow estimation with NaN recovery |
-| `policy_manager.py` | Per-peer policy engine (dynamic/static/passive/hive) |
+| `policy_manager.py` | Per-peer policy engine (dynamic/static/passive) |
 | `profitability_analyzer.py` | P&L calculation, ROC metrics, capacity recommendations |
 | `capacity_planner.py` | Channel sizing recommendations ("Winners & Losers") |
-| `hive_bridge.py` | cl-hive integration, MCF assignments, Kalman velocity sharing |
-| `database.py` | SQLite with WAL mode, 32 tables, accounting + Kalman state persistence |
+| `boltz_manager.py` | Submarine swap integration |
+| `database.py` | SQLite with WAL mode, accounting + Kalman state persistence |
 | `config.py` | Hot-reloadable configuration |
 | `utils.py` | Shared utility functions |
 
 ### Key Algorithms
 
-**The Alpha Sequence** (Fee Priority):
-1. **HIVE Safety**: Fleet members → Enforced hive_fee_ppm (usually 0)
-2. **Congestion Check**: HTLC slots saturated → Ceiling fee
-3. **Zero-Fee Probe**: Dead channel defibrillator → 0 PPM
-4. **Thompson+AIMD**: Primary fee optimization → Bayesian sampling + defensive AIMD
-
-**Post-Thompson Modifiers** (applied after fee sampling):
-- **Vegas Reflex**: Mempool spike > 200% → Raises fee floor (pre-bounds)
-- **Scarcity Pricing**: Local balance < threshold → Linear increase (1.0x-3.0x via bounds multiplier)
-- **Hive Coordination**: Fleet-aware fee blending and competition avoidance
+**Fee Pipeline** (DTS+PID):
+1. **Policy Check**: Static → fixed fee; Passive → skip; Dynamic → continue
+2. **Cycle State**: Sleeping/insufficient data → skip
+3. **Hard Bounds**: Chain cost floor, Vegas Reflex floor, rebalance cost floor, flow ceiling
+4. **Congestion Override**: HTLC slots saturated → ceiling fee
+5. **Zero-Fee Probe**: Dead channel defibrillator → 0 PPM
+6. **DTS Market Fee**: Discounted Thompson Sampling from Gaussian posterior (gamma=0.95)
+7. **PID Inventory Multiplier**: Balance-error-driven 0.1x-10.0x fee scaling
+8. **Final Fee**: clamp(dts_fee × pid_multiplier, hard_floor, hard_ceiling)
+9. **Change Suppression**: Alpha Guard, Gossip Hysteresis, Idempotency
 
 **EV-Based Rebalancing**:
 - Only rebalance if `Expected_Revenue > Rebalance_Cost`
 - Volume-weighted inventory targets
 - Futility circuit breaker (10 failures → stop)
-- Strategic exemption for Hive peers
 
 **Kalman Flow Estimation** (in `flow_analysis.py`):
 - State vector: [flow_ratio, velocity] with 2x2 covariance matrix
@@ -90,7 +87,7 @@ Core Lightning
 - Prevents cascade failures
 
 **Policy Engine**:
-- Strategies: dynamic, static, passive, hive
+- Strategies: dynamic, static, passive
 - Per-policy fee bounds override global settings
 - Time-limited policies with auto-expiry
 - Rate limiting: 10 changes/minute per peer
@@ -102,6 +99,7 @@ Core Lightning
 | `channel_history` | Flow state, fees, volume tracking |
 | `rebalance_log` | Rebalance attempts and results |
 | `fee_history` | Fee change audit log |
+| `fee_strategy_state` | DTS+PID state (posterior, PID integral/derivative) |
 | `daily_snapshots` | Daily financial snapshots |
 | `policies` | Per-peer policy settings |
 | `closed_channels` | P&L for closed channels |
@@ -121,9 +119,6 @@ Core Lightning
 ### Recommended
 - **bookkeeper plugin**: For accurate on-chain cost tracking
 
-### Optional
-- **cl-hive**: For fleet coordination
-
 ## Configuration Categories
 
 ### Intervals
@@ -142,9 +137,39 @@ Core Lightning
 
 ### Advanced Features
 - `revenue-ops-vegas-reflex`: Mempool spike defense
-- `revenue-ops-scarcity-pricing`: Low balance fee increase
 - `revenue-ops-enable-reputation`: Peer success rate weighting
 - `revenue-ops-enable-kelly`: Kelly Criterion position sizing
+
+### Hive Fleet Hint Integration
+
+cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a single adapter:
+
+**Module:** `modules/hive_hints.py` (`HiveHintAdapter`)
+
+**Enable:** `revenue-ops-hive-hints-enabled = true` (disabled by default)
+
+**How it works:**
+- Polls `hive-export-hints` RPC once per fee cycle
+- Caches snapshot with TTL (default 900s, override with `revenue-ops-hive-hints-ttl`)
+- Exposes bounded bias lookups consumed by fee controller, rebalancer, and capacity planner
+
+**Bias bounds (hard-coded, not configurable):**
+- Fee: ±10% max (`get_fee_bias()`)
+- Rebalance: ±15% max (`get_rebalance_bias()`)
+- Member: 0 PPM categorical override (`is_hive_member()`)
+
+**Fail-open:** If cl-hive is unavailable, hints are stale, or the feature is disabled, all lookups return neutral (1.0) and `is_hive_member()` returns False. Local safety rails are never bypassed.
+
+**Gossip oscillation protection:** When a peer was assigned 0-PPM via the member hint, that fee is held for one additional TTL period after hints go stale. This prevents gossip churn from intermittent cl-hive availability.
+
+**Hint fields consumed:**
+- `member` → 0-PPM fleet policy (short-circuits fee pipeline before DTS+PID)
+- `corridor_role` → fee bias (owner +3%, secondary -3%)
+- `competition_bias` → fee bias (integer -1/0/1, ±2%)
+- `traffic_confidence` → weights all biases (0.0-1.0)
+- `peer_quality_score` → rebalance bias (±5%)
+- `rebalance_preference` → rebalance bias (sink +5%, source -5%)
+- `channel_open_hint` → capacity planner scoring (±30%)
 
 ## Safety Constraints
 
@@ -156,13 +181,13 @@ Core Lightning
 
 ## Development Notes
 
-- Main plugin file: `cl-revenue-ops.py` (~146KB)
+- Main plugin file: `cl-revenue-ops.py` (~5,800 lines)
 - All config hot-reloadable via `revenue-config set`
 - Supports CLN's `setconfig` for runtime changes
 
 ## Testing Conventions
 
-- Test files in `tests/` directory
+- Test files in `tests/` directory (488 tests across 26 files)
 - Use pytest fixtures for mocking
 - Mock RPC calls and sling responses
 - Test categories: fee, rebalance, policy, flow, accounting
@@ -172,37 +197,21 @@ Core Lightning
 ```
 cl-revenue-ops/
 ├── cl-revenue-ops.py       # Main plugin entry point
-├── modules/                # 10 modules
-│   ├── fee_controller.py   # Thompson Sampling + Alpha Sequence
+├── modules/                # 8 modules
+│   ├── fee_controller.py   # DTS+PID fee optimization
 │   ├── rebalancer.py       # EV-based rebalancing
 │   ├── flow_analysis.py    # Sink/Source detection + Kalman filter
 │   ├── policy_manager.py   # Per-peer policies
 │   ├── profitability_analyzer.py  # P&L and ROC
 │   ├── capacity_planner.py # Channel recommendations
-│   ├── hive_bridge.py      # cl-hive integration
-│   ├── database.py         # SQLite layer (32 tables)
+│   ├── boltz_manager.py    # Submarine swap integration
+│   ├── database.py         # SQLite layer
 │   ├── config.py           # Configuration
 │   └── utils.py            # Shared utilities
 ├── config/
 │   ├── cl-revenue-ops.conf.full     # Full config with all options documented
 │   └── cl-revenue-ops.conf.minimal  # Quick-start production config
-├── tests/                  # 514 tests across 21 files
+├── tests/                  # 488 tests across 26 files
 ├── migrations/             # Database migrations
 └── docs/                   # Documentation
-    ├── specs/              # Technical specifications
-    ├── planning/           # Implementation plans
-    └── audits/             # Security audits
 ```
-
-## Integration with cl-hive
-
-When used with cl-hive:
-- cl-hive sets `strategy=hive` on fleet members via `revenue-policy`
-- Hive members get zero-fee routing
-- Strategic exemption allows negative-EV rebalances to Hive peers
-- cl-hive coordinates topology; cl-revenue-ops executes
-
-Standalone usage:
-- Works fully without cl-hive
-- All features available independently
-- Use policies to manually configure per-peer behavior
