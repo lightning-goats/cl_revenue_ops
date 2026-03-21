@@ -38,6 +38,7 @@ from modules.config import Config
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
+from modules.hive_hints import HiveHintAdapter
 from modules.policy_manager import (
     PolicyManager,
     FeeStrategy,
@@ -347,6 +348,7 @@ capacity_planner: Optional[CapacityPlanner] = None
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
+hive_hints: Optional[HiveHintAdapter] = None  # cl_hive fleet hint adapter
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
 _boltz_auto_cycle_run_lock = threading.Lock()
@@ -1417,6 +1419,22 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         boltz_manager.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
         boltz_manager.global_budget_limit_provider = _total_cost_budget_limit_provider
 
+    # Hive Hints adapter (sole integration boundary with cl_hive)
+    global hive_hints
+    if config.hive_hints_enabled:
+        hive_hints = HiveHintAdapter(
+            safe_plugin,
+            ttl_override=config.hive_hints_ttl_seconds,
+        )
+        plugin.log("HiveHintAdapter initialized — fleet hint bias enabled")
+    else:
+        hive_hints = None
+
+    if fee_controller is not None:
+        fee_controller.hive_hints = hive_hints
+    if rebalancer is not None:
+        rebalancer.hive_hints = hive_hints
+
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
     # We use daemon threads so they don't block shutdown
@@ -1472,6 +1490,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
 
         while not shutdown_event.is_set():
+            # Poll hive hints once per fee cycle
+            if hive_hints is not None:
+                try:
+                    hive_hints.poll()
+                except Exception:
+                    pass  # fail-open
+
             try:
                 plugin.log("Running scheduled fee adjustment...")
                 run_fee_adjustment()
