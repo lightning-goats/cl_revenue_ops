@@ -867,6 +867,42 @@ def _select_boltz_auto_cycle_mode(
     }
 
 
+def _select_boltz_currency(direction: str, amount_sats: int) -> str:
+    """Compare BTC vs LBTC quote for a swap and return the cheaper currency.
+
+    Prefers LBTC when costs are equal (faster settlement).
+    Falls back to LBTC if quoting fails.
+    """
+    bm = _require_boltz_manager()
+    swap_type = "submarine" if direction == "loop_in" else "reverse"
+
+    try:
+        btc_quote = bm.quote(amount_sats, swap_type=swap_type, currency="BTC")
+        btc_fee = int(btc_quote.get("estimated_total_fee_sats", 0) or 0)
+    except Exception:
+        btc_fee = float('inf')
+
+    try:
+        lbtc_quote = bm.quote(amount_sats, swap_type=swap_type, currency="LBTC")
+        lbtc_fee = int(lbtc_quote.get("estimated_total_fee_sats", 0) or 0)
+    except Exception:
+        lbtc_fee = float('inf')
+
+    if btc_fee == float('inf') and lbtc_fee == float('inf'):
+        return "LBTC"  # fallback
+
+    # Prefer LBTC when equal (faster settlement)
+    if lbtc_fee <= btc_fee:
+        chosen, reason = "LBTC", f"LBTC={lbtc_fee} <= BTC={btc_fee}"
+    else:
+        chosen, reason = "BTC", f"BTC={btc_fee} < LBTC={lbtc_fee}"
+
+    if plugin:
+        plugin.log(f"Boltz currency selection ({direction}, {amount_sats}sats): {chosen} ({reason})", level='debug')
+
+    return chosen
+
+
 def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> Dict[str, Any]:
     """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight)."""
     if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
@@ -941,8 +977,8 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                 min_marginal_roi=0.0,
                 profit_margin_factor=1.2,
                 expected_horizon_days=3.0,
-                loop_in_currency='LBTC',
-                loop_out_currency='LBTC',
+                loop_in_currency='auto',
+                loop_out_currency='auto',
             )
             if isinstance(balance_plan, dict) and 'error' in balance_plan:
                 result = balance_plan
@@ -954,8 +990,8 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                         dry_run=False,
                         max_actions=max_actions,
                         allow_concurrent_swaps=False,
-                        loop_in_currency='LBTC',
-                        loop_out_currency='LBTC',
+                        loop_in_currency='auto',
+                        loop_out_currency='auto',
                     )
                 else:
                     result = {
@@ -5628,10 +5664,24 @@ def revenue_boltz_balance_cycle(
 
         try:
             bm = _require_boltz_manager()
+
+            # Resolve currency: "auto" compares BTC vs LBTC and picks cheaper
             if direction == "loop_in":
-                res = bm.loop_in(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=loop_in_currency)
+                currency = loop_in_currency
+                if currency == "auto":
+                    try:
+                        currency = _select_boltz_currency("loop_in", amount_sats)
+                    except Exception:
+                        currency = "LBTC"
+                res = bm.loop_in(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=currency)
             elif direction == "loop_out":
-                res = bm.loop_out(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=loop_out_currency)
+                currency = loop_out_currency
+                if currency == "auto":
+                    try:
+                        currency = _select_boltz_currency("loop_out", amount_sats)
+                    except Exception:
+                        currency = "LBTC"
+                res = bm.loop_out(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=currency)
             else:
                 raise BoltzCliError(f"Unknown direction: {direction}")
 
