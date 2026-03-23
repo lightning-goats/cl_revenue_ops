@@ -764,6 +764,21 @@ class CapacityPlanner:
         except Exception:
             pass
 
+        # Prefer clearnet peers (more reliable, lower latency)
+        try:
+            node_info = self.plugin.rpc.listnodes(id=peer_id)
+            nodes = node_info.get("nodes", [])
+            if nodes:
+                addresses = nodes[0].get("addresses", [])
+                has_clearnet = any(
+                    a.get("type") in ("ipv4", "ipv6")
+                    for a in addresses
+                )
+                if has_clearnet:
+                    score *= 1.25  # 25% boost for clearnet-reachable peers
+        except Exception:
+            pass
+
         # Hive channel-open hint bias (bounded ±30%)
         if self.hive_hints is not None:
             try:
@@ -985,6 +1000,21 @@ class CapacityPlanner:
         except Exception:
             return ChainCostDefaults.CHANNEL_OPEN_COST_SATS
 
+    @staticmethod
+    def _parse_min_chan_size_error(error_msg: str) -> int:
+        """Extract peer's minimum channel size from a 'below min chan size' error.
+
+        Returns the minimum in sats, or 0 if the error doesn't match.
+        """
+        import re
+        match = re.search(r'min chan size of ([0-9.]+) BTC', error_msg)
+        if match:
+            try:
+                return int(float(match.group(1)) * 100_000_000)
+            except (ValueError, OverflowError):
+                pass
+        return 0
+
     def _rpc_fundchannel(self, peer_id: str, amount_sats: int) -> Dict[str, Any]:
         return self.plugin.rpc.call(
             "fundchannel",
@@ -1097,6 +1127,36 @@ class CapacityPlanner:
             return {"action_id": action_id, "status": "completed", "channel_id": channel_id, "peer_id": peer_id}
 
         except Exception as e:
+            error_msg = str(e)
+
+            # Retry with peer's minimum if we tried too small
+            retry_amount = self._parse_min_chan_size_error(error_msg)
+            if retry_amount and retry_amount > amount_sats and retry_amount <= cfg.planner_max_channel_sats:
+                # Check if we can afford the retry
+                try:
+                    funds = self.plugin.rpc.listfunds()
+                    onchain = sum(
+                        o.get("amount_msat", 0) // 1000
+                        for o in funds.get("outputs", [])
+                        if o.get("status") == "confirmed"
+                    )
+                    reserve = int(onchain * getattr(cfg, 'planner_reserve_pct', 0.20))
+                    if onchain - reserve >= retry_amount:
+                        self.plugin.log(
+                            f"Retrying channel open to {peer_id[:16]}... at peer minimum "
+                            f"{retry_amount} sats (was {amount_sats})",
+                            level='info'
+                        )
+                        # Release old reservation, retry will make a new one
+                        if db and reservation_active:
+                            try:
+                                db.release_spend_reservation(reservation_id)
+                            except Exception:
+                                pass
+                        return self._execute_open(peer_id, retry_amount, cfg, reason=f"retry: peer min {retry_amount}")
+                except Exception as retry_err:
+                    self.plugin.log(f"Retry check failed: {retry_err}", level='debug')
+
             # Failure: update action and release reservation
             if db and action_id:
                 try:
@@ -1110,7 +1170,7 @@ class CapacityPlanner:
                     pass
 
             self.plugin.log(f"Channel open failed for {peer_id[:16]}...: {e}", level='error')
-            return {"action_id": action_id, "status": "failed", "error": str(e), "peer_id": peer_id}
+            return {"action_id": action_id, "status": "failed", "error": error_msg, "peer_id": peer_id}
 
     def _check_close_allowed(self, peer_id: str) -> tuple:
         """Check if a channel close is allowed for this peer.
