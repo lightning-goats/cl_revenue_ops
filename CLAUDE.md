@@ -160,7 +160,7 @@ cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a s
 
 **Fail-open:** If cl-hive is unavailable, hints are stale, or the feature is disabled, all lookups return neutral (1.0) and `is_hive_member()` returns False. Local safety rails are never bypassed.
 
-**Gossip oscillation protection:** When a peer was assigned 0-PPM via the member hint, that fee is held for one additional TTL period after hints go stale. This prevents gossip churn from intermittent cl-hive availability.
+**Gossip oscillation protection:** When a peer was assigned 0-PPM via the member hint, that fee is held for up to 2x TTL from last application after hints go stale. This prevents gossip churn from intermittent cl-hive availability.
 
 **Hint fields consumed:**
 - `member` → 0-PPM fleet policy (short-circuits fee pipeline before DTS+PID)
