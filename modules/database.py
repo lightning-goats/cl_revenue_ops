@@ -3762,8 +3762,31 @@ class Database:
             FROM forwards
             WHERE timestamp >= ?
         """, (since_timestamp,)).fetchone()
-        
+
         return row['total_volume_msat'] // 1000 if row else 0
+
+    def get_top_route_pairs(self, days: int = 30, min_forwards: int = 3, limit: int = 20) -> List[Dict[str, Any]]:
+        """Return top revenue-generating (in_channel, out_channel) pairs.
+
+        Each row contains the channel IDs, total fees, forward count, and
+        average fee per forward.  Used by capacity planner, rebalancer, and
+        Boltz planner for route-aware decision-making.
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days * 86400)
+        rows = conn.execute("""
+            SELECT in_channel, out_channel,
+                   SUM(fee_msat) as total_fee_msat,
+                   COUNT(*) as forward_count,
+                   AVG(fee_msat) as avg_fee_msat
+            FROM forwards
+            WHERE timestamp >= ? AND fee_msat > 0
+            GROUP BY in_channel, out_channel
+            HAVING forward_count >= ?
+            ORDER BY total_fee_msat DESC
+            LIMIT ?
+        """, (cutoff, min_forwards, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     def get_total_forward_count_since(self, since_timestamp: int) -> int:
         """Get total forward count since a timestamp."""

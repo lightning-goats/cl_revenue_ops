@@ -5270,6 +5270,17 @@ def _build_boltz_balance_plan(
     planner_funding_deficit = int(planner_coord.get("funding_deficit_sats", 0) or 0)
     sling_exhausted = bool(planner_coord.get("sling_exhausted", False))
 
+    # Route-pair awareness: protect inbound legs of top revenue routes from loop-out drain
+    route_pair_in_channels = set()
+    try:
+        pairs = database.get_top_route_pairs(days=30, min_forwards=3, limit=10)
+        for p in pairs:
+            in_ch = str(p.get("in_channel", "")).replace(":", "x")
+            if in_ch:
+                route_pair_in_channels.add(in_ch)
+    except Exception:
+        pass
+
     # Refresh profitability cache on demand.
     if profitability_analyzer is not None:
         try:
@@ -5514,6 +5525,7 @@ def _build_boltz_balance_plan(
         #   - flow_bonus: source channels naturally refill local, so draining is safe
         #   - sling_bonus: if sling can't rebalance, Boltz is the only option
         #   - planner_bonus: capacity planner needs on-chain funds for a channel open
+        #   - route_penalty: don't drain inbound legs of top revenue routes
         multi_goal_value = 0.0
         if direction == "loop_out":
             excess_ratio = max(0.0, min(1.0, (local_pct - 50.0) / 50.0))
@@ -5522,7 +5534,8 @@ def _build_boltz_balance_plan(
             flow_bonus = 1.3 if flow_state in ('source',) else 1.0
             sling_bonus = 1.2 if sling_impossible else 1.0
             planner_bonus = 1.25 if planner_funding_deficit > 0 else 1.0
-            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus * planner_bonus
+            route_penalty = 0.5 if scid_display in route_pair_in_channels else 1.0
+            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus * planner_bonus * route_penalty
 
         candidate = {
             "channel_id": channel_id,

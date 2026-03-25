@@ -2389,13 +2389,26 @@ class EVRebalancer:
                 push_candidates.sort(key=lambda c: c.expected_profit_sats, reverse=True)
                 candidates.extend(push_candidates[:remaining_slots])
 
+            # Route-pair awareness: boost channels that are outbound legs of top revenue routes
+            route_pair_out_channels = set()
+            try:
+                pairs = self.database.get_top_route_pairs(days=30, min_forwards=3, limit=10)
+                for p in pairs:
+                    out_ch = str(p.get("out_channel", "")).replace(":", "x")
+                    if out_ch:
+                        route_pair_out_channels.add(out_ch)
+            except Exception:
+                pass
+
             # Sort by priority
             def sort_key(c):
                 dest_state = self.database.get_channel_state(c.to_channel)
                 flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
                 priority = 2 if flow_state == "source" else 1
+                # Boost channels on proven revenue routes
+                route_bonus = 1.3 if c.to_channel in route_pair_out_channels else 1.0
                 hive_bias = self._get_hive_rebalance_bias(c.to_peer_id)
-                biased_profit = c.expected_profit_sats * hive_bias
+                biased_profit = c.expected_profit_sats * hive_bias * route_bonus
                 return (priority, biased_profit)
 
             candidates.sort(key=sort_key, reverse=True)

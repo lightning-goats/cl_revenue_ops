@@ -807,19 +807,7 @@ class CapacityPlanner:
 
         # Query top revenue-generating (in_channel, out_channel) pairs from last 30 days
         try:
-            conn = db._get_connection()
-            cutoff = int(time.time()) - 30 * 86400
-            rows = conn.execute("""
-                SELECT in_channel, out_channel,
-                       SUM(fee_msat) as total_fee_msat,
-                       COUNT(*) as forward_count
-                FROM forwards
-                WHERE timestamp >= ? AND fee_msat > 0
-                GROUP BY in_channel, out_channel
-                HAVING forward_count >= 3
-                ORDER BY total_fee_msat DESC
-                LIMIT 20
-            """, (cutoff,)).fetchall()
+            rows = db.get_top_route_pairs(days=30, min_forwards=3, limit=20)
         except Exception:
             return []
 
