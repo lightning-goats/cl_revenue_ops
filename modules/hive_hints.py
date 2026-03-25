@@ -211,6 +211,20 @@ class HiveHintAdapter:
         return results
 
     # ------------------------------------------------------------------
+    # Fleet fee prior
+    # ------------------------------------------------------------------
+
+    def get_fleet_fee_prior(self, peer_id: str) -> int | None:
+        """Return fleet-observed fee median for a peer, or None."""
+        hint = self._get_peer_hint(peer_id)
+        if not hint:
+            return None
+        fee = hint.get("fleet_fee_median")
+        if isinstance(fee, (int, float)) and fee > 0:
+            return int(fee)
+        return None
+
+    # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 

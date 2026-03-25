@@ -4365,15 +4365,33 @@ class FeeController:
             ts = GaussianThompsonState()
             ts.prior_std_fee = cfg.thompson_prior_std_fee
 
-            # Use network-informed prior if available
+            # Try fleet-informed prior first (most reliable — real forward data)
+            fleet_prior = None
+            if self.hive_hints:
+                try:
+                    fleet_fee = self.hive_hints.get_fleet_fee_prior(peer_id)
+                    if fleet_fee and fleet_fee > 0:
+                        fleet_prior = {"mean": fleet_fee, "std": 50}
+                        self.plugin.log(
+                            f"INITIAL_FEE: {scid[:16]}... using fleet prior "
+                            f"(mean={fleet_fee}, std=50)"
+                        )
+                except Exception:
+                    pass
+
+            # Fall back to network gossip prior
             network_prior = self._get_network_fee_prior(peer_id, scid)
-            if network_prior:
-                ts.prior_mean_fee = network_prior["mean"]
-                ts.prior_std_fee = network_prior["std"]
-                self.plugin.log(
-                    f"INITIAL_FEE: {scid[:16]}... using network prior "
-                    f"(mean={network_prior['mean']}, std={network_prior['std']})"
-                )
+
+            # Apply best available: fleet > network > default
+            prior = fleet_prior or network_prior
+            if prior:
+                ts.prior_mean_fee = prior["mean"]
+                ts.prior_std_fee = prior["std"]
+                if not fleet_prior and network_prior:
+                    self.plugin.log(
+                        f"INITIAL_FEE: {scid[:16]}... using network prior "
+                        f"(mean={network_prior['mean']}, std={network_prior['std']})"
+                    )
 
             initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
 

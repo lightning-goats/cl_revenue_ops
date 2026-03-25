@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import MagicMock
 
 from modules.fee_controller import FeeController, GaussianThompsonState, ChannelFeeState
+from modules.hive_hints import HiveHintAdapter
 
 
 @pytest.fixture
@@ -276,3 +277,36 @@ class TestNeighborFeeAwareness:
         # Stale entries should have been evicted
         stale_remaining = sum(1 for k in fc._neighbor_fee_cache if k.startswith("neighbor_fee_stale_"))
         assert stale_remaining == 0
+
+
+class TestFleetFeePriors:
+    def test_fleet_prior_used_for_initial_fee(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        adapter = MagicMock()
+        adapter.get_fleet_fee_prior.return_value = 350
+        fc.hive_hints = adapter
+        # Fleet prior should be available
+        fee = adapter.get_fleet_fee_prior("02peer")
+        assert fee == 350
+
+    def test_fleet_prior_none_when_no_data(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {"02peer": {"member": True}}
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter.poll()
+        assert adapter.get_fleet_fee_prior("02peer") is None
+
+    def test_fleet_prior_from_hint(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {"02peer": {"member": True, "fleet_fee_median": 250}}
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter.poll()
+        assert adapter.get_fleet_fee_prior("02peer") == 250
