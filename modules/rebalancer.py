@@ -1890,6 +1890,12 @@ class EVRebalancer:
         # Optional callback injected by cl-revenue-ops to provide unified total-cost budget limit.
         self.global_budget_limit_provider = None
 
+        self._capacity_planner = None  # Set via set_capacity_planner()
+        # Exhaustion tracking: cached after each cycle for Boltz coordination
+        self._last_depleted_count: int = 0
+        self._last_profitable_count: int = 0
+        self._last_cycle_ts: int = 0
+
         self._last_decision_summary: Dict[str, Any] = {
             "action": "hold",
             "reason": "not_run",
@@ -1923,6 +1929,20 @@ class EVRebalancer:
 
     def get_last_decision_summary(self) -> Dict[str, Any]:
         return dict(self._last_decision_summary)
+
+    def get_boltz_coordination(self) -> Dict[str, Any]:
+        """Return rebalancer exhaustion state for Boltz integration.
+
+        When depleted channels exist but 0 profitable candidates were found,
+        the rebalancer is exhausted and Boltz should be more aggressive.
+        """
+        exhausted = (self._last_depleted_count > 0 and self._last_profitable_count == 0)
+        return {
+            "sling_exhausted": exhausted,
+            "depleted_count": self._last_depleted_count,
+            "profitable_count": self._last_profitable_count,
+            "cycle_ts": self._last_cycle_ts,
+        }
 
     def _get_hive_rebalance_bias(self, peer_id: str) -> float:
         """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""
@@ -2148,6 +2168,14 @@ class EVRebalancer:
             # Get set of channels with active jobs
             active_channels = set(self.job_manager.active_channels)
             
+            # Hoist planner loser lookup once (avoid per-channel call)
+            planner_loser_scids: set = set()
+            if self._capacity_planner is not None:
+                try:
+                    planner_loser_scids = self._capacity_planner.get_boltz_coordination().get("loser_scids", set())
+                except Exception:
+                    pass
+
             depleted_channels = []
             source_channels = []
 
@@ -2184,6 +2212,10 @@ class EVRebalancer:
                 
                 # Skip channels with active jobs
                 if channel_id in active_channels:
+                    continue
+
+                # Skip channels the capacity planner has marked for closure
+                if channel_id in planner_loser_scids:
                     continue
 
                 # STAGNANT INVENTORY DETECTION
@@ -3714,6 +3746,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     f"(flow={b['flow_state']})",
                     level='info'
                 )
+
+        # Track exhaustion for Boltz coordination: depleted channels exist
+        # but no profitable rebalance is possible → Boltz should step up
+        try:
+            self._last_depleted_count = len(depleted_channels)
+        except Exception:
+            pass
+        self._last_profitable_count = len(candidates)
+        self._last_cycle_ts = int(time.time())
 
         return candidates
 

@@ -951,13 +951,25 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
             "reserve_deficit_sats": 0,
         }
 
-        # Fetch capacity planner coordination signals for Boltz integration
+        # Fetch coordination signals from capacity planner and rebalancer
         _planner_coord = None
         if capacity_planner is not None:
             try:
                 _planner_coord = capacity_planner.get_boltz_coordination()
             except Exception:
                 pass
+        _rebalancer_coord = None
+        if rebalancer is not None:
+            try:
+                _rebalancer_coord = rebalancer.get_boltz_coordination()
+            except Exception:
+                pass
+        # Merge rebalancer exhaustion into planner coord for single-param passing
+        if _planner_coord is None:
+            _planner_coord = {}
+        if _rebalancer_coord:
+            _planner_coord["sling_exhausted"] = _rebalancer_coord.get("sling_exhausted", False)
+            _planner_coord["sling_depleted_count"] = _rebalancer_coord.get("depleted_count", 0)
 
         if bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False:
             treasury_plan = _build_boltz_expansion_treasury_plan(
@@ -5250,10 +5262,11 @@ def _build_boltz_balance_plan(
     if not channels:
         return {"error": "No normal channels available"}
 
-    # Planner coordination: avoid loser channels, factor in funding needs
+    # Planner + rebalancer coordination: avoid loser channels, factor in funding needs
     planner_coord = planner_coordination if isinstance(planner_coordination, dict) else {}
     planner_loser_scids = set(planner_coord.get("loser_scids", set()))
     planner_funding_deficit = int(planner_coord.get("funding_deficit_sats", 0) or 0)
+    sling_exhausted = bool(planner_coord.get("sling_exhausted", False))
 
     # Refresh profitability cache on demand.
     if profitability_analyzer is not None:
@@ -5467,9 +5480,14 @@ def _build_boltz_balance_plan(
 
         # Sling-impossible channels get a relaxed profit threshold: when traditional rebalancing
         # can't work (all sources have negative spread), Boltz is the only option.
+        # sling_exhausted: system-wide signal (depleted channels exist, 0 profitable rebalances)
         effective_profit_margin = float(profit_margin_factor)
         if sling_impossible:
             effective_profit_margin = max(0.5, effective_profit_margin * 0.6)
+        elif sling_exhausted and direction == "loop_in":
+            # Rebalancer is stuck globally — Boltz loop-ins should be more willing
+            effective_profit_margin = max(0.8, effective_profit_margin * 0.8)
+        if effective_profit_margin != float(profit_margin_factor):
             required_profit_threshold_sats = int(round(estimated_fee_sats * effective_profit_margin))
 
         passes_profit_guard = (expected_gross_uplift_sats >= required_profit_threshold_sats) if require_profitable else True
