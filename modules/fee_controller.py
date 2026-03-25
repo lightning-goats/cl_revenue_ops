@@ -1682,9 +1682,10 @@ class FeeController:
     def _get_network_fee_prior(self, peer_id: str, scid: str) -> dict | None:
         """Get informed prior from network gossip data for a channel.
 
-        Uses the peer's own fee rates as a market signal to set a better
-        starting prior than the flat default. Returns dict with 'mean'
-        and 'std', or None if no data available.
+        Uses the peer's own fee rates as a market signal, weighted by
+        channel capacity. Larger channels are more credible fee signals
+        than small dormant ones. Returns dict with 'mean' and 'std',
+        or None if no data available.
         """
         try:
             channels = self.plugin.rpc.listchannels(source=peer_id)
@@ -1692,19 +1693,40 @@ class FeeController:
             if not peer_channels:
                 return None
 
-            fees = []
+            weighted_fees = []
             for ch in peer_channels:
                 fee_ppm = ch.get("fee_per_millionth", 0)
-                if 1 <= fee_ppm <= 10000:
-                    fees.append(fee_ppm)
+                if not (1 <= fee_ppm <= 10000):
+                    continue
+                # Weight by capacity — bigger channels = more credible signal
+                capacity = max(1, ch.get("satoshis", ch.get("amount_msat", 1000000) // 1000))
+                weight = capacity / 1_000_000  # Normalize to BTC
+                weighted_fees.append((fee_ppm, weight))
 
-            if not fees:
+            if not weighted_fees:
                 return None
 
-            fees.sort()
-            median_fee = fees[len(fees) // 2]
-            fee_spread = max(fees) - min(fees) if len(fees) > 1 else median_fee
-            prior_std = max(50, fee_spread // 2)
+            # Capacity-weighted median
+            weighted_fees.sort(key=lambda x: x[0])
+            total_weight = sum(w for _, w in weighted_fees)
+            if total_weight <= 0:
+                return None
+
+            cumulative = 0.0
+            median_fee = weighted_fees[0][0]
+            for fee, w in weighted_fees:
+                cumulative += w
+                if cumulative >= total_weight * 0.5:
+                    median_fee = fee
+                    break
+
+            # Std from weighted spread
+            if len(weighted_fees) > 1:
+                min_fee = weighted_fees[0][0]
+                max_fee = weighted_fees[-1][0]
+                prior_std = max(50, (max_fee - min_fee) // 2)
+            else:
+                prior_std = max(50, median_fee // 2)
 
             return {"mean": median_fee, "std": prior_std}
         except Exception:
@@ -3683,19 +3705,31 @@ class FeeController:
             if bounded_target_ppm != post_pid_target_ppm:
                 bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
 
-            # Rebalance cost awareness: soft upward nudge toward cost recovery
-            # Blends 30% toward rebalance cost when DTS target is below it.
-            # This nudges fees up to help recover costs without setting a hard
-            # floor that kills traffic.
+            # Rebalance cost awareness: routing-value-scaled nudge toward cost recovery
+            # Channels with real routing revenue get a stronger nudge because the
+            # rebalance cost can actually be recovered. Stagnant channels get a
+            # weaker nudge — no point pushing fees up on a dead channel.
             if rebalance_cost_ppm > 0 and post_pid_target_ppm < rebalance_cost_ppm:
                 pre_nudge = post_pid_target_ppm
+
+                # Scale nudge strength by routing value
+                # Active channel (>10 sats/hr): full 30% nudge
+                # Moderate channel (1-10 sats/hr): 15-30% nudge
+                # Stagnant channel (<1 sat/hr): 5% nudge (barely noticeable)
+                if current_revenue_rate >= 10.0:
+                    nudge_strength = 0.30
+                elif current_revenue_rate >= 1.0:
+                    nudge_strength = 0.15 + 0.15 * (current_revenue_rate / 10.0)
+                else:
+                    nudge_strength = 0.05
+
                 post_pid_target_ppm = int(
-                    post_pid_target_ppm * 0.7 + rebalance_cost_ppm * 0.3
+                    post_pid_target_ppm * (1.0 - nudge_strength) + rebalance_cost_ppm * nudge_strength
                 )
                 self.plugin.log(
                     f"REBALANCE_COST_NUDGE: {channel_id[:12]}... target nudged "
-                    f"{pre_nudge}->{post_pid_target_ppm} ppm toward rebalance cost "
-                    f"{rebalance_cost_ppm} ppm",
+                    f"{pre_nudge}->{post_pid_target_ppm} ppm (strength={nudge_strength:.0%}, "
+                    f"revenue={current_revenue_rate:.1f}sats/hr, cost={rebalance_cost_ppm}ppm)",
                     level='debug'
                 )
 
