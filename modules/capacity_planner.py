@@ -804,6 +804,25 @@ class CapacityPlanner:
         except Exception:
             pass
 
+        # Large-channel peer bonus: peers whose existing channels are large
+        # serve high-value payment traffic (bigger HTLCs). Opening a channel
+        # to them captures more of the payment size distribution.
+        try:
+            peer_channels = self.plugin.rpc.listchannels(destination=peer_id)
+            capacities = [
+                ch.get("satoshis", 0)
+                for ch in peer_channels.get("channels", [])
+                if ch.get("active", False) and ch.get("satoshis", 0) > 0
+            ]
+            if capacities:
+                median_cap = sorted(capacities)[len(capacities) // 2]
+                if median_cap >= 10_000_000:  # 10M+ sat channels = large-payment peer
+                    score *= 1.2  # 20% boost
+                elif median_cap >= 5_000_000:  # 5M+ = medium-large
+                    score *= 1.1  # 10% boost
+        except Exception:
+            pass
+
         return score
 
     def _update_candidate_pool(self, candidates: List[Dict]):
@@ -935,9 +954,11 @@ class CapacityPlanner:
 
     def _size_channel(self, candidate: Dict, all_candidates: List[Dict],
                        available_sats: int, cfg) -> int:
-        """ROI-proportional channel sizing.
+        """ROI-proportional channel sizing with competitive awareness.
 
         Allocates available funds proportionally to candidate scores.
+        Biases toward larger channels when the peer's other channels are large
+        (to be competitive for large-payment routing).
         Clamps to [min_channel, max_channel] and never exceeds 50% of available.
         """
         if not all_candidates:
@@ -951,6 +972,29 @@ class CapacityPlanner:
 
         # Never more than half remaining
         raw_size = min(raw_size, available_sats // 2)
+
+        # Competitive sizing: if peer's other channels are large, size up
+        # to be competitive for large-payment routing (HTLC max scales with
+        # channel capacity). A 2M sat channel among 10M+ neighbors misses
+        # all the large payment traffic.
+        peer_id = candidate.get("peer_id")
+        if peer_id:
+            try:
+                peer_channels = self.plugin.rpc.listchannels(destination=peer_id)
+                capacities = [
+                    ch.get("satoshis", 0)
+                    for ch in peer_channels.get("channels", [])
+                    if ch.get("active", False) and ch.get("satoshis", 0) > 0
+                ]
+                if capacities:
+                    median_cap = sorted(capacities)[len(capacities) // 2]
+                    # If peer's median channel is larger than our planned size,
+                    # try to match at least 50% of their median
+                    competitive_floor = median_cap // 2
+                    if competitive_floor > raw_size and competitive_floor <= available_sats // 2:
+                        raw_size = min(competitive_floor, cfg.planner_max_channel_sats)
+            except Exception:
+                pass
 
         # Clamp to config bounds
         return max(cfg.planner_min_channel_sats,
