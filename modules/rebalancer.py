@@ -2911,6 +2911,19 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             source_success_prob = max(0.1, 0.8 ** source_fail_count)
             expected_income = int(expected_income * source_success_prob)
 
+        # Corridor ownership: owned corridors have higher utilization
+        # because we're the primary routing path for that flow.
+        if self.hive_hints:
+            try:
+                hint = self.hive_hints._get_peer_hint(dest_peer_id)
+                corridor_role = hint.get("corridor_role", "none") if hint else "none"
+                if corridor_role == "owner":
+                    expected_income = int(expected_income * 1.20)  # 20% boost
+                elif corridor_role == "secondary":
+                    expected_income = int(expected_income * 0.90)  # 10% reduction
+            except Exception:
+                pass
+
         turnover_weight = min(1.0, source_turnover_rate * 7)
         # I-2 FIX: Use source channel's own utilization probability for opportunity cost,
         # not the destination's expected_utilization. These are independent probabilistic events.
@@ -3647,6 +3660,22 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
                 score += 20
 
+            # Hive hint: prefer sources where fleet says liquidity is flowing IN (sink)
+            # These sources are naturally replenishing, so draining them costs less.
+            if self.hive_hints:
+                try:
+                    source_peer = info.get("peer_id", "")
+                    if source_peer:
+                        source_hint = self.hive_hints._get_peer_hint(source_peer)
+                        if source_hint:
+                            source_pref = source_hint.get("rebalance_preference")
+                            if source_pref == "sink":
+                                score += 30  # Strongly prefer sinking sources
+                            elif source_pref == "source":
+                                score -= 20  # Avoid draining sources the fleet says are already draining
+                except Exception:
+                    pass
+
             # RELIABILITY PENALTY: Penalize sources with recent failures
             fails = self.job_manager.get_source_failure_count(cid)
             if fails > 0:
@@ -3656,7 +3685,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     f"Applying reliability penalty to {cid}: -{penalty:.1f} (fails: {fails:.1f})",
                     level='debug'
                 )
-            
+
             candidates.append((cid, info, score, weighted_opp_cost))
 
         # Sort by score (highest first) so Sling tries most profitable sources first

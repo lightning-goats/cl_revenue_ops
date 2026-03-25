@@ -1728,6 +1728,21 @@ class FeeController:
             else:
                 prior_std = max(50, median_fee // 2)
 
+            # Hive quality signal: high-quality peers get tighter priors (faster convergence)
+            if self.hive_hints:
+                try:
+                    hint = self.hive_hints._get_peer_hint(peer_id)
+                    if hint:
+                        quality = hint.get("peer_quality_score")
+                        if isinstance(quality, (int, float)) and quality > 0:
+                            quality = max(0.0, min(1.0, quality))
+                            # High quality (0.8+) → tighten std by up to 40%
+                            # Low quality (0.2-) → widen std by up to 30%
+                            quality_factor = 1.0 - (quality - 0.5) * 0.8  # 0.5→1.0, 1.0→0.6, 0.0→1.4
+                            prior_std = max(30, int(prior_std * quality_factor))
+                except Exception:
+                    pass
+
             return {"mean": median_fee, "std": prior_std}
         except Exception:
             return None
