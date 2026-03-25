@@ -5288,7 +5288,54 @@ def _build_boltz_balance_plan(
                 })
                 continue
 
+        # --- Enrichment: DTS posterior, rebalance feasibility, hive hints ---
+        dts_summary = None
+        if fee_controller is not None:
+            try:
+                dts_summary = fee_controller.get_dts_summary(channel_id)
+            except Exception:
+                pass
+        broadcast_fee_ppm = int((dts_summary or {}).get("broadcast_fee_ppm", 0) or 0)
+        posterior_mean = float((dts_summary or {}).get("posterior_mean", 0) or 0)
+        posterior_std = float((dts_summary or {}).get("posterior_std", 200) or 200)
+
+        # Rebalance feasibility: if sling can't rebalance this channel, Boltz is the only option
+        rebal_success = None
+        sling_impossible = False
+        if database is not None:
+            try:
+                rebal_success = database.get_channel_rebalance_success_rate(channel_id, window_days=7)
+            except Exception:
+                pass
+        if rebal_success is not None:
+            # 3+ attempts with 0% success in last 7 days = sling can't do it
+            if rebal_success.get("total", 0) >= 3 and rebal_success.get("success_rate", 1.0) == 0.0:
+                sling_impossible = True
+
+        # Hive hints: rebalance preference and peer quality (via bounded bias)
+        hive_rebal_bias = 1.0
+        if hive_hints is not None:
+            try:
+                hive_rebal_bias = hive_hints.get_rebalance_bias(peer_id)
+            except Exception:
+                pass
+
+        # Predicted depletion hours from Kalman velocity
         predicted_depletion_hours = None
+        kalman_velocity = float(state_row.get('kalman_velocity', 0.0) or 0.0)
+        kalman_ratio = float(state_row.get('kalman_flow_ratio', 0.0) or 0.0)
+        # Source channels (positive ratio = draining local): estimate hours until depleted
+        if kalman_ratio > 0.1 and local_sats > 0 and capacity_sats > 0:
+            # Velocity is flow_ratio change per hour; translate to approximate drain rate
+            # A flow_ratio of 0.5 means ~75% outbound; net drain ≈ ratio * throughput
+            # Use daily_contrib as a proxy: revenue = volume * fee_ppm / 1e6
+            # So volume ≈ revenue * 1e6 / fee_ppm (when fee > 0)
+            est_fee = max(broadcast_fee_ppm, 50)  # floor at 50 to avoid division issues
+            if daily_contrib_est > 0:
+                daily_volume_est = daily_contrib_est * 1_000_000 / est_fee
+                net_drain_sats_per_day = daily_volume_est * min(1.0, kalman_ratio)
+                if net_drain_sats_per_day > 0:
+                    predicted_depletion_hours = (local_sats / net_drain_sats_per_day) * 24.0
 
         tuning = _boltz_dynamic_channel_tuning(
             local_pct=local_pct,
@@ -5379,9 +5426,33 @@ def _build_boltz_balance_plan(
         # This is intentionally cautious and is only used as a profit guard/ranking signal.
         severity_factor = max(0.1, min(1.0, severity))
         expected_gross_uplift_sats = int(max(0.0, daily_contrib_est) * float(expected_horizon_days) * severity_factor)
+
+        # DTS posterior uplift: if the channel has a proven high fee (tight posterior),
+        # use the posterior mean to estimate potential revenue even if recent history is thin.
+        dts_uplift_sats = 0
+        if posterior_mean > 0 and posterior_std < 100:
+            # Tight posterior = confident fee estimate; project revenue from rebalanced capacity
+            # Conservative: use 50% of the amount as volume estimate over the horizon
+            projected_volume = amount_sats * 0.5
+            dts_uplift_sats = int(projected_volume * posterior_mean / 1_000_000 * float(expected_horizon_days))
+        # Use the better of historical and DTS-projected uplift
+        expected_gross_uplift_sats = max(expected_gross_uplift_sats, dts_uplift_sats)
+
         required_profit_threshold_sats = int(round(estimated_fee_sats * float(profit_margin_factor)))
+
+        # Sling-impossible channels get a relaxed profit threshold: when traditional rebalancing
+        # can't work (all sources have negative spread), Boltz is the only option.
+        effective_profit_margin = float(profit_margin_factor)
+        if sling_impossible:
+            effective_profit_margin = max(0.5, effective_profit_margin * 0.6)
+            required_profit_threshold_sats = int(round(estimated_fee_sats * effective_profit_margin))
+
         passes_profit_guard = (expected_gross_uplift_sats >= required_profit_threshold_sats) if require_profitable else True
         expected_net_sats = expected_gross_uplift_sats - estimated_fee_sats
+
+        # Apply hive rebalance bias to the net estimate (±15% bounded)
+        if hive_rebal_bias != 1.0:
+            expected_net_sats = int(expected_net_sats * hive_rebal_bias)
 
         # Additional guard for loop-in with no channel pinning support.
         non_pinned_penalty = 0.7 if direction == "loop_in" else 1.0
@@ -5421,26 +5492,42 @@ def _build_boltz_balance_plan(
             "economics": {
                 "estimated_swap_fee_sats": estimated_fee_sats,
                 "expected_gross_uplift_sats": expected_gross_uplift_sats,
+                "dts_uplift_sats": dts_uplift_sats,
                 "expected_net_sats": expected_net_sats,
                 "risk_adjusted_net_sats": risk_adjusted_net_sats,
-                "profit_margin_factor": profit_margin_factor,
+                "profit_margin_factor": effective_profit_margin,
                 "passes_profit_guard": bool(passes_profit_guard),
+                "sling_impossible": sling_impossible,
                 "loop_in_non_pinnable": direction == "loop_in",
+            },
+            "dts": {
+                "broadcast_fee_ppm": broadcast_fee_ppm,
+                "posterior_mean": round(posterior_mean, 1) if posterior_mean else None,
+                "posterior_std": round(posterior_std, 1) if posterior_std else None,
+            },
+            "hive": {
+                "rebalance_bias": round(hive_rebal_bias, 3),
             },
             "quote": quote_resp,
             "score": {
                 "severity": round(severity, 4),
                 "daily_contribution_estimate_sats": int(daily_contrib_est),
                 "risk_adjusted_net_sats": risk_adjusted_net_sats,
+                "broadcast_fee_ppm": broadcast_fee_ppm,
+                "sling_impossible": sling_impossible,
+                "predicted_depletion_hours": round(predicted_depletion_hours, 1) if predicted_depletion_hours is not None else None,
             }
         }
         candidates.append(candidate)
 
-    # Sort by profit-safe first, then best estimated net, then severity.
+    # Sort by: profit-safe first, sling-impossible boost, best estimated net,
+    # high broadcast fee (revenue at stake), protection score, severity.
     candidates.sort(
         key=lambda c: (
             1 if c.get("economics", {}).get("passes_profit_guard") else 0,
+            1 if c.get("economics", {}).get("sling_impossible") else 0,
             int(c.get("economics", {}).get("risk_adjusted_net_sats", 0) or 0),
+            int(c.get("score", {}).get("broadcast_fee_ppm", 0) or 0),
             float(c.get("dynamic_tuning", {}).get("protection_score", 0.0) or 0.0),
             float(c.get("score", {}).get("severity", 0.0) or 0.0),
         ),

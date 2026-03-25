@@ -3061,6 +3061,29 @@ class FeeController:
             reason_code=FeeReasonCode.GOSSIP_REFRESH.value
         )
 
+    def get_dts_summary(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Return DTS posterior and cycle state summary for external consumers (e.g. Boltz planner).
+
+        Returns None if no state exists for the channel.
+        """
+        fee_state = self._channel_fee_states.get(channel_id)
+        cycle_state = self._cycle_states.get(channel_id)
+        if fee_state is None and cycle_state is None:
+            return None
+        ts = fee_state.thompson if fee_state else None
+        broadcast_fee = 0
+        if fee_state:
+            broadcast_fee = fee_state.last_broadcast_fee_ppm
+        elif cycle_state:
+            broadcast_fee = cycle_state.last_broadcast_fee_ppm
+        return {
+            "posterior_mean": ts.posterior_mean if ts else None,
+            "posterior_std": ts.posterior_std if ts else None,
+            "broadcast_fee_ppm": broadcast_fee,
+            "forward_count": (fee_state.forward_count_since_update if fee_state
+                              else cycle_state.forward_count_since_update if cycle_state else 0),
+        }
+
     def _get_fee_step_cap(self, current_fee_ppm: int, woke_from_sleep: bool) -> int:
         """Return the maximum allowed per-cycle fee move for the current mode."""
         ratio = (
