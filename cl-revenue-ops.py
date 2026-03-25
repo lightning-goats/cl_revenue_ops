@@ -3550,6 +3550,181 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+@plugin.method("revenue-health")
+def revenue_health(plugin: Plugin) -> Dict[str, Any]:
+    """
+    Consolidated health check -- single command for full operational picture.
+
+    Usage: lightning-cli revenue-health
+
+    Returns P&L, fee convergence, rebalance state, budget health,
+    channel classification trends, and coordination status.
+    """
+    now = int(time.time())
+    result = {"generated_at": now}
+
+    # --- 1. Financial health (1-day and 7-day) ---
+    if profitability_analyzer and database:
+        try:
+            pnl_1d = profitability_analyzer.get_pnl_summary(1)
+            pnl_7d = profitability_analyzer.get_pnl_summary(7)
+            roc_7d = profitability_analyzer.calculate_roc(7)
+            result["financials"] = {
+                "today": {
+                    "revenue_sats": pnl_1d.get("gross_revenue_sats", 0),
+                    "costs_sats": pnl_1d.get("opex_sats", 0),
+                    "net_profit_sats": pnl_1d.get("net_profit_sats", 0),
+                    "forward_count": pnl_1d.get("forward_count", 0),
+                    "volume_sats": pnl_1d.get("volume_sats", 0),
+                },
+                "week": {
+                    "revenue_sats": pnl_7d.get("gross_revenue_sats", 0),
+                    "costs_sats": pnl_7d.get("opex_sats", 0),
+                    "net_profit_sats": pnl_7d.get("net_profit_sats", 0),
+                    "forward_count": pnl_7d.get("forward_count", 0),
+                    "operating_margin_pct": round(pnl_7d.get("operating_margin_pct", 0.0), 1),
+                    "annualized_roc_pct": round(roc_7d.get("annualized_roc_pct", 0.0), 2),
+                },
+            }
+        except Exception as e:
+            result["financials"] = {"error": str(e)}
+
+    # --- 2. Channel classifications ---
+    if profitability_analyzer:
+        try:
+            all_prof = profitability_analyzer.analyze_all_channels()
+            classifications = {}
+            for prof in all_prof.values():
+                cls = getattr(getattr(prof, 'classification', None), 'value', 'unknown')
+                classifications[cls] = classifications.get(cls, 0) + 1
+            result["channels"] = {
+                "total": len(all_prof),
+                "classifications": classifications,
+            }
+        except Exception as e:
+            result["channels"] = {"error": str(e)}
+
+    # --- 3. Fee convergence ---
+    if fee_controller:
+        try:
+            sparse_count = 0
+            converged_count = 0
+            sleeping_count = 0
+            total_managed = 0
+            for cid, fs in list(fee_controller._channel_fee_states.items()):
+                total_managed += 1
+                ts = fs.thompson
+                if ts.posterior_std < 50:
+                    converged_count += 1
+                if fs.is_sleeping:
+                    sleeping_count += 1
+            for cid, cs in list(fee_controller._cycle_states.items()):
+                if cid not in fee_controller._channel_fee_states:
+                    total_managed += 1
+                    if cs.is_sleeping:
+                        sleeping_count += 1
+            # Sparse detection from last cycle log isn't stored; approximate
+            sparse_count = max(0, total_managed - converged_count)
+            result["fees"] = {
+                "managed_channels": total_managed,
+                "converged": converged_count,
+                "still_learning": sparse_count,
+                "sleeping": sleeping_count,
+            }
+        except Exception as e:
+            result["fees"] = {"error": str(e)}
+
+    # --- 4. Rebalance state ---
+    if rebalancer:
+        try:
+            coord = rebalancer.get_boltz_coordination()
+            decision = rebalancer.get_last_decision_summary()
+            active_jobs = rebalancer.job_manager.active_job_count if hasattr(rebalancer, 'job_manager') else 0
+            result["rebalancer"] = {
+                "last_action": decision.get("action"),
+                "last_reason": decision.get("reason"),
+                "active_jobs": active_jobs,
+                "depleted_channels": coord.get("depleted_count", 0),
+                "profitable_candidates": coord.get("profitable_count", 0),
+                "sling_exhausted": coord.get("sling_exhausted", False),
+            }
+        except Exception as e:
+            result["rebalancer"] = {"error": str(e)}
+
+    # --- 5. Budget health ---
+    try:
+        budget = _total_cost_budget_status()
+        if isinstance(budget, dict):
+            result["budget"] = {
+                "effective_budget_sats": budget.get("effective_budget_sats", 0),
+                "total_spent_sats": budget.get("actual_spent_total", 0),
+                "remaining_sats": budget.get("remaining_sats", 0),
+                "spent_by_category": budget.get("actual_spent_by_category", {}),
+                "utilization_pct": round(
+                    100.0 * budget.get("actual_spent_total", 0) / max(1, budget.get("effective_budget_sats", 1)), 1
+                ),
+            }
+    except Exception as e:
+        result["budget"] = {"error": str(e)}
+
+    # --- 6. Boltz state ---
+    if boltz_manager and getattr(boltz_manager, 'enabled', False):
+        try:
+            with _boltz_auto_cycle_state_lock:
+                cycle_state = dict(_boltz_auto_cycle_state)
+            result["boltz"] = {
+                "last_mode": cycle_state.get("last_result", {}).get("mode") if isinstance(cycle_state.get("last_result"), dict) else None,
+                "last_status": cycle_state.get("last_result", {}).get("status") if isinstance(cycle_state.get("last_result"), dict) else None,
+                "consecutive_errors": cycle_state.get("consecutive_errors", 0),
+                "running": cycle_state.get("running", False),
+            }
+        except Exception as e:
+            result["boltz"] = {"error": str(e)}
+    else:
+        result["boltz"] = {"enabled": False}
+
+    # --- 7. Planner state ---
+    if capacity_planner:
+        try:
+            coord = capacity_planner.get_boltz_coordination()
+            status = capacity_planner.get_status()
+            result["planner"] = {
+                "enabled": status.get("enabled", False),
+                "loser_close_candidates": len(coord.get("loser_scids", set())),
+                "funding_deficit_sats": coord.get("funding_deficit_sats", 0),
+                "candidate_pool_size": status.get("candidate_pool_size", 0),
+            }
+        except Exception as e:
+            result["planner"] = {"error": str(e)}
+
+    # --- 8. Hive fleet ---
+    if hive_hints:
+        try:
+            result["hive"] = hive_hints.get_status()
+        except Exception:
+            result["hive"] = {"snapshot_fresh": False}
+    else:
+        result["hive"] = {"enabled": False}
+
+    # --- 9. Route pairs (top 5 revenue routes) ---
+    if database:
+        try:
+            pairs = database.get_top_route_pairs(days=7, min_forwards=2, limit=5)
+            result["top_routes"] = [
+                {
+                    "in_channel": str(p.get("in_channel", "")).replace(":", "x"),
+                    "out_channel": str(p.get("out_channel", "")).replace(":", "x"),
+                    "fee_sats_7d": int(p.get("total_fee_msat", 0)) // 1000,
+                    "forward_count": int(p.get("forward_count", 0)),
+                }
+                for p in pairs
+            ]
+        except Exception:
+            result["top_routes"] = []
+
+    return result
+
+
 @plugin.method("revenue-cleanup-closed")
 def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
     """
