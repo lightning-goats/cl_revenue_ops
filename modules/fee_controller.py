@@ -2752,7 +2752,8 @@ class FeeController:
                                 self.set_channel_fee(
                                     channel_id, 0,
                                     reason="Hive member: 0-PPM fleet policy",
-                                    reason_code=FeeReasonCode.POLICY_STATIC.value
+                                    reason_code=FeeReasonCode.POLICY_STATIC.value,
+                                    enforce_limits=False
                                 )
                             except Exception as e:
                                 self.plugin.log(f"Error setting hive member fee for {channel_id}: {e}", level='error')
@@ -4533,6 +4534,7 @@ class FeeController:
                             scid, 0,
                             reason="Initial fee: hive member",
                             reason_code=FeeReasonCode.POLICY_STATIC.value,
+                            enforce_limits=False,
                             channel_info=channel_info
                         )
                 except Exception:
