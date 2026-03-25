@@ -3362,22 +3362,13 @@ class FeeController:
             base_floor_ppm = rebalance_floor_ppm
 
         # =====================================================================
-        # Per-channel rebalance cost floor (all flow states)
+        # Per-channel rebalance cost awareness (all flow states)
         # =====================================================================
-        # If we spent X PPM rebalancing a channel, pricing below X guarantees
-        # a loss. This is a soft floor: DTS may want a lower market fee, but
-        # we still enforce the floor and log a warning so operators know.
+        # If we spent X PPM rebalancing a channel, we want to recover that cost
+        # over time — but NOT by setting a hard floor that kills traffic.
+        # Instead, the rebalance cost biases the DTS target upward (applied
+        # later in the pipeline as a soft nudge, not a hard clamp).
         rebalance_cost_ppm = self._get_channel_rebalance_cost_ppm(channel_id)
-        if rebalance_cost_ppm > 0:
-            effective_floor = max(cfg.min_fee_ppm, rebalance_cost_ppm)
-            if effective_floor > base_floor_ppm:
-                self.plugin.log(
-                    f"REBALANCE_COST_FLOOR: {channel_id[:12]}... floor raised from "
-                    f"{base_floor_ppm} to {effective_floor} ppm "
-                    f"(last rebalance cost: {rebalance_cost_ppm} ppm)",
-                    level='info'
-                )
-                base_floor_ppm = effective_floor
 
         # =====================================================================
         # Issue #20: Flow-Based Ceiling Reduction
@@ -3656,13 +3647,20 @@ class FeeController:
             if bounded_target_ppm != post_pid_target_ppm:
                 bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
 
-            # Warn when DTS market fee is below the rebalance cost floor
+            # Rebalance cost awareness: soft upward nudge toward cost recovery
+            # Blends 30% toward rebalance cost when DTS target is below it.
+            # This nudges fees up to help recover costs without setting a hard
+            # floor that kills traffic.
             if rebalance_cost_ppm > 0 and post_pid_target_ppm < rebalance_cost_ppm:
+                pre_nudge = post_pid_target_ppm
+                post_pid_target_ppm = int(
+                    post_pid_target_ppm * 0.7 + rebalance_cost_ppm * 0.3
+                )
                 self.plugin.log(
-                    f"REBALANCE_COST_FLOOR: {channel_id[:12]}... DTS+PID target "
-                    f"{post_pid_target_ppm} ppm is below rebalance cost "
-                    f"{rebalance_cost_ppm} ppm — channel may be unprofitable to rebalance",
-                    level='warning'
+                    f"REBALANCE_COST_NUDGE: {channel_id[:12]}... target nudged "
+                    f"{pre_nudge}->{post_pid_target_ppm} ppm toward rebalance cost "
+                    f"{rebalance_cost_ppm} ppm",
+                    level='debug'
                 )
 
             blended_target_ppm, blend_info = self._blend_fee_target(
