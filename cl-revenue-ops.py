@@ -5051,11 +5051,12 @@ def _boltz_dynamic_channel_tuning(*,
     # keep target at least 10pp above trigger, bounded for safety
     eff_low_target = min(85.0, max(float(low_target_pct), eff_low_trigger + 10.0, float(low_target_pct) + target_boost))
 
-    # Loop-out can also become mildly more assertive for hot profitable channels (harvest excess),
-    # but keep it conservative relative to loop-in protection.
-    out_adjust = 5.0 * max(0.0, min(1.0, hotness_score))
-    eff_high_trigger = max(60.0, min(float(high_trigger_pct), float(high_trigger_pct) - out_adjust))
-    eff_high_target = min(float(high_target_pct) + out_adjust, float(high_target_pct) + 5.0)
+    # Loop-out: primary Boltz action (generates on-chain funds + rebalances).
+    # Profitable source channels get a lower trigger to enable more loop-out opportunities.
+    # source_signal adds up to 5pp extra for channels with natural local refill.
+    out_adjust = 10.0 * max(0.0, min(1.0, hotness_score)) + 5.0 * source_signal
+    eff_high_trigger = max(55.0, min(float(high_trigger_pct), float(high_trigger_pct) - out_adjust))
+    eff_high_target = min(float(high_target_pct) + out_adjust * 0.5, float(high_target_pct) + 10.0)
 
     return {
         'hotness_score': round(hotness_score, 4),
@@ -5461,6 +5462,22 @@ def _build_boltz_balance_plan(
             # Make loop-in more conservative because it cannot be channel-pinned with current boltzcli.
             passes_profit_guard = passes_profit_guard and (risk_adjusted_net_sats > 0)
 
+        # Multi-goal value for loop-outs: one swap achieves both on-chain fund generation
+        # AND channel rebalancing.  Higher score = more beneficial to drain this channel.
+        #   - excess_ratio: how much local balance exceeds 50% (0-1)
+        #   - profitability: marginal ROI signal (0-1)
+        #   - fee_value: broadcast fee indicating revenue potential from freed remote cap
+        #   - flow_bonus: source channels naturally refill local, so draining is safe
+        #   - sling_bonus: if sling can't rebalance, Boltz is the only option
+        multi_goal_value = 0.0
+        if direction == "loop_out":
+            excess_ratio = max(0.0, min(1.0, (local_pct - 50.0) / 50.0))
+            roi_signal = max(0.0, min(1.0, (float(marginal_roi or 0.0)) / 25.0))
+            fee_signal = min(1.0, broadcast_fee_ppm / 500.0) if broadcast_fee_ppm > 0 else 0.0
+            flow_bonus = 1.3 if flow_state in ('source',) else 1.0
+            sling_bonus = 1.2 if sling_impossible else 1.0
+            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus
+
         candidate = {
             "channel_id": channel_id,
             "peer_id": peer_id,
@@ -5510,6 +5527,7 @@ def _build_boltz_balance_plan(
             },
             "quote": quote_resp,
             "score": {
+                "multi_goal_value": round(multi_goal_value, 4),
                 "severity": round(severity, 4),
                 "daily_contribution_estimate_sats": int(daily_contrib_est),
                 "risk_adjusted_net_sats": risk_adjusted_net_sats,
@@ -5520,11 +5538,13 @@ def _build_boltz_balance_plan(
         }
         candidates.append(candidate)
 
-    # Sort by: profit-safe first, sling-impossible boost, best estimated net,
-    # high broadcast fee (revenue at stake), protection score, severity.
+    # Sort: loop-outs first (generate on-chain funds + rebalance), then by multi-goal
+    # value, profit safety, sling impossibility, estimated net, and severity.
     candidates.sort(
         key=lambda c: (
+            1 if c.get("direction") == "loop_out" else 0,
             1 if c.get("economics", {}).get("passes_profit_guard") else 0,
+            float(c.get("score", {}).get("multi_goal_value", 0.0) or 0.0),
             1 if c.get("economics", {}).get("sling_impossible") else 0,
             int(c.get("economics", {}).get("risk_adjusted_net_sats", 0) or 0),
             int(c.get("score", {}).get("broadcast_fee_ppm", 0) or 0),
