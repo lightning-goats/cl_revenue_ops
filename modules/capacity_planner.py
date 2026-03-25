@@ -675,19 +675,41 @@ class CapacityPlanner:
 
             try:
                 channels = self.plugin.rpc.listchannels(source=patron_peer_id)
-                neighbor_ids = set()
+                patron_roi = getattr(patron, 'marginal_roi_percent', 0)
+                # Score neighbors by capacity and fee competitiveness, not random order
+                scored_neighbors = []
                 for ch in channels.get("channels", []):
                     dest = ch.get("destination")
-                    if dest and dest != our_node_id and dest not in existing_peers:
-                        neighbor_ids.add(dest)
+                    if not dest or dest == our_node_id or dest in existing_peers:
+                        continue
+                    cap = ch.get("amount_msat", 0)
+                    if isinstance(cap, str):
+                        cap = int(cap.replace("msat", "")) // 1000 if "msat" in cap else int(cap)
+                    elif isinstance(cap, (int, float)):
+                        cap = int(cap) // 1000
+                    else:
+                        cap = 0
+                    fee_ppm = ch.get("fee_per_millionth", 0) or 0
+                    # Skip expensive or tiny channels (only filter when data is available)
+                    if fee_ppm > 1500:
+                        continue
+                    if cap > 0 and cap < 200000:
+                        continue
+                    # Score: patron ROI scaled, boosted by capacity and low fees
+                    base = max(patron_roi / 200.0, 0.1)
+                    if cap > 5_000_000:
+                        base *= 1.15
+                    if 0 < fee_ppm < 100:
+                        base *= 1.10
+                    scored_neighbors.append((dest, base))
+                scored_neighbors.sort(key=lambda x: x[1], reverse=True)
 
-                # Take up to 5 neighbors per patron
-                patron_roi = getattr(patron, 'marginal_roi_percent', 0)
-                for neighbor_id in list(neighbor_ids)[:5]:
+                # Take top 5 neighbors per patron
+                for neighbor_id, neighbor_score in scored_neighbors[:5]:
                     candidates.append({
                         "peer_id": neighbor_id,
                         "source": "neighbor",
-                        "score": max(patron_roi / 200.0, 0.1),  # Scale patron ROI
+                        "score": neighbor_score,
                         "reason": f"Neighbor of top earner {patron_peer_id[:12]}...",
                         "patron_peer_id": patron_peer_id,
                     })
@@ -753,6 +775,115 @@ class CapacityPlanner:
         # Sort by score descending, take top 10
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:10]
+
+    def _discover_from_route_pairs(self, all_profitability) -> List[Dict]:
+        """Strategy 5: Analyze actual forward pairs to find high-revenue routes.
+
+        Instead of guessing which neighbors are valuable from gossip topology,
+        look at which (in_channel, out_channel) pairs generate the most fees.
+        The peers on the other end of profitable routes — and their neighbors —
+        are strong candidates for new channels.
+        """
+        db = self.profitability.database if self.profitability else None
+        if not db:
+            return []
+
+        try:
+            our_node_id = self.plugin.rpc.getinfo().get("id")
+        except Exception:
+            return []
+
+        # Get existing peers to exclude
+        existing_peers = set()
+        # Map channel_id → peer_id for route pair lookups
+        channel_to_peer = {}
+        for prof in all_profitability.values():
+            pid = getattr(prof, 'peer_id', None)
+            if pid:
+                existing_peers.add(pid)
+            scid = getattr(prof, 'channel_id', None) or getattr(prof, 'scid', None)
+            if scid and pid:
+                channel_to_peer[str(scid).replace(':', 'x')] = pid
+
+        # Query top revenue-generating (in_channel, out_channel) pairs from last 30 days
+        try:
+            conn = db._get_connection()
+            cutoff = int(time.time()) - 30 * 86400
+            rows = conn.execute("""
+                SELECT in_channel, out_channel,
+                       SUM(fee_msat) as total_fee_msat,
+                       COUNT(*) as forward_count
+                FROM forwards
+                WHERE timestamp >= ? AND fee_msat > 0
+                GROUP BY in_channel, out_channel
+                HAVING forward_count >= 3
+                ORDER BY total_fee_msat DESC
+                LIMIT 20
+            """, (cutoff,)).fetchall()
+        except Exception:
+            return []
+
+        if not rows:
+            return []
+
+        # For the top pairs, find which peers are involved and look for their neighbors
+        candidates = []
+        pair_peers = set()  # Peers already on profitable routes
+        for row in rows:
+            in_ch = str(row['in_channel']).replace(':', 'x')
+            out_ch = str(row['out_channel']).replace(':', 'x')
+            total_fee_sats = int(row['total_fee_msat']) // 1000
+            fwd_count = int(row['forward_count'])
+
+            in_peer = channel_to_peer.get(in_ch)
+            out_peer = channel_to_peer.get(out_ch)
+            if in_peer:
+                pair_peers.add(in_peer)
+            if out_peer:
+                pair_peers.add(out_peer)
+
+        # For each peer on a profitable route, find THEIR neighbors as candidates
+        # The logic: if peer A → us → peer B is a profitable route,
+        # then A's other neighbors and B's other neighbors are likely also valuable
+        for route_peer in list(pair_peers)[:5]:
+            try:
+                channels = self.plugin.rpc.listchannels(source=route_peer)
+                for ch in channels.get("channels", []):
+                    dest = ch.get("destination")
+                    if not dest or dest == our_node_id or dest in existing_peers:
+                        continue
+                    # Score based on fee capacity of the route
+                    capacity = ch.get("amount_msat", 0)
+                    if isinstance(capacity, str):
+                        capacity = int(capacity.replace("msat", "")) // 1000 if "msat" in capacity else int(capacity)
+                    else:
+                        capacity = int(capacity) // 1000
+                    fee_ppm = ch.get("fee_per_millionth", 0)
+                    # Prefer neighbors with reasonable fees and decent capacity
+                    if fee_ppm > 1000 or capacity < 500000:
+                        continue
+                    score = 0.3  # Base score for route-pair discovery
+                    if capacity > 5_000_000:
+                        score *= 1.2
+                    if fee_ppm < 200:
+                        score *= 1.1
+                    candidates.append({
+                        "peer_id": dest,
+                        "source": "route_pair",
+                        "score": score,
+                        "reason": f"Neighbor of route-pair peer {route_peer[:12]}...",
+                        "route_peer_id": route_peer,
+                    })
+            except Exception:
+                continue
+
+        # Deduplicate and limit
+        seen = {}
+        for c in candidates:
+            pid = c["peer_id"]
+            if pid not in seen or c["score"] > seen[pid]["score"]:
+                seen[pid] = c
+        return list(seen.values())[:10]
 
     def _discover_from_hive(self) -> List[Dict]:
         """Strategy 4: Propose peers where cl_hive recommends channel opening."""
@@ -1015,6 +1146,9 @@ class CapacityPlanner:
 
         # Strategy 4: hive topology hints
         candidates.extend(self._discover_from_hive())
+
+        # Strategy 5: route-pair analysis (neighbors of peers on profitable routes)
+        candidates.extend(self._discover_from_route_pairs(all_profitability))
 
         # Deduplicate by peer_id, keeping highest score
         seen = {}
