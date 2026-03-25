@@ -2654,20 +2654,53 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # Safety: keep per-action size bounded.
         dynamic_chunk_cap = max(self.config.rebalance_min_amount, min(dynamic_chunk_cap, self.config.rebalance_max_amount, max(1, capacity // 4)))
         rebalance_amount = min(desired_amount, dynamic_chunk_cap)
+
+        # AskRene constraint: don't exceed 75% of max believed routable amount.
+        # This improves success rates by staying within CLN's liquidity beliefs.
+        try:
+            dest_sling_scid = self.job_manager._to_sling_scid(dest_channel)
+            askrene_max = self.job_manager._askrene_max_sats_for_scid_dir(dest_sling_scid)
+            if askrene_max is not None and askrene_max > 0:
+                askrene_cap = int(askrene_max * 0.75)
+                if askrene_cap < rebalance_amount and askrene_cap >= self.config.rebalance_min_amount:
+                    self.plugin.log(
+                        f"ASKRENE_CAP: {dest_channel[:12]}... clamped from {rebalance_amount:,} to "
+                        f"{askrene_cap:,} sats (AskRene max: {askrene_max:,})",
+                        level='debug'
+                    )
+                    rebalance_amount = askrene_cap
+        except Exception:
+            pass  # AskRene is optional
+
         amount_msat = rebalance_amount * 1000
-        
-        # BROADCAST FEE ALIGNMENT: Use confirmed broadcast fee for EV
-        # This prevents "Self-Arbitrage" where we pay for a rebalance expecting to
-        # earn at the internal target fee, but Hysteresis blocked the update so we're
-        # actually still selling liquidity at a lower broadcast fee.
+
+        # FEE FOR EV: Use the LOWER of broadcast fee and DTS posterior mean.
+        # Broadcast fee = what the network actually sees (conservative baseline).
+        # DTS posterior mean = what we believe the market fee is (may be higher
+        # if hysteresis blocked an update, or lower if we're about to drop).
+        # Using the lower prevents overestimating income.
         fee_state = self.database.get_fee_strategy_state(dest_channel)
         broadcast_fee_ppm = fee_state.get("last_broadcast_fee_ppm", 0)
-        
+
         # Fallback to listpeerchannels fee if no broadcast fee recorded
         if broadcast_fee_ppm <= 0:
             broadcast_fee_ppm = dest_info.get("fee_ppm", 0)
-        
-        outbound_fee_ppm = broadcast_fee_ppm
+
+        # Use DTS posterior mean if available (more accurate than broadcast)
+        dts_fee_ppm = broadcast_fee_ppm
+        try:
+            v2_json = fee_state.get("v2_state_json") if fee_state else None
+            if v2_json:
+                import json
+                dts_data = json.loads(v2_json) if isinstance(v2_json, str) else v2_json
+                posterior_mean = dts_data.get("posterior_mean")
+                if isinstance(posterior_mean, (int, float)) and posterior_mean > 0:
+                    dts_fee_ppm = int(posterior_mean)
+        except Exception:
+            pass
+
+        # Conservative: use the lower of broadcast and DTS estimate
+        outbound_fee_ppm = min(broadcast_fee_ppm, dts_fee_ppm) if dts_fee_ppm > 0 else broadcast_fee_ppm
         inbound_fee_ppm = self._estimate_inbound_fee(dest_info.get("peer_id", ""))
 
         dest_peer_id = dest_info.get("peer_id", "")
@@ -2869,6 +2902,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             expected_utilization = max(min(dest_turnover_rate * cooldown_days, 1.0), 0.05)
 
         expected_income = int((rebalance_amount * expected_utilization * outbound_fee_ppm) // 1_000_000)
+
+        # Source reliability: discount income by probability the rebalance succeeds.
+        # Uses primary source's failure history — high failure count = lower success prob.
+        source_fail_count = self.job_manager.get_source_failure_count(primary_source_id)
+        if source_fail_count > 0:
+            # Exponential decay: 0 fails=100%, 1 fail=80%, 2 fails=64%, 4 fails=41%
+            source_success_prob = max(0.1, 0.8 ** source_fail_count)
+            expected_income = int(expected_income * source_success_prob)
 
         turnover_weight = min(1.0, source_turnover_rate * 7)
         # I-2 FIX: Use source channel's own utilization probability for opportunity cost,
