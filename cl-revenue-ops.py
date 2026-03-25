@@ -1494,6 +1494,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalancer.hive_hints = hive_hints
     if capacity_planner is not None:
         capacity_planner.hive_hints = hive_hints
+        capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
+        capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
 
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client

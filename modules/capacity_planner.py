@@ -35,6 +35,9 @@ class CapacityPlanner:
         self.config = config
         self.rebalancer = None
         self.hive_hints = None  # Injected by main plugin
+        # Unified budget provider: injected by main plugin for cross-module budget gating
+        self.global_budget_limit_provider = None
+        self.external_liquidity_cost_provider = None
         # Coordination signals: cached from last execute_cycle for Boltz integration
         self._last_loser_scids: set = set()        # SCIDs with action=CLOSE
         self._last_funding_deficit_sats: int = 0    # On-chain shortfall for next open
@@ -937,6 +940,39 @@ class CapacityPlanner:
         except Exception as e:
             return False, f"Cooldown check failed: {e}"
 
+    def _check_unified_budget(self, estimated_cost_sats: int) -> tuple:
+        """Check unified liquidity budget has room for this operation."""
+        provider = getattr(self, "global_budget_limit_provider", None)
+        if not callable(provider):
+            return True, "No unified budget provider"
+        try:
+            budget_info = provider()
+            if not isinstance(budget_info, dict):
+                return True, "Budget provider returned non-dict"
+            budget = int(budget_info.get("effective_budget_sats", 0) or 0)
+            if budget <= 0:
+                return True, "Budget provider returned zero limit"
+            remaining = int(budget_info.get("remaining_sats", budget) or budget)
+            # Also check external costs if available
+            ext_provider = getattr(self, "external_liquidity_cost_provider", None)
+            if callable(ext_provider):
+                try:
+                    ext = ext_provider()
+                    if isinstance(ext, dict):
+                        remaining -= int(ext.get("spent_24h_sats", 0) or 0)
+                        remaining -= int(ext.get("reserved_24h_sats", 0) or 0)
+                except Exception:
+                    pass
+            if estimated_cost_sats > max(0, remaining):
+                return False, (
+                    f"Unified budget: estimated cost {estimated_cost_sats} sats "
+                    f"exceeds remaining {remaining} sats (budget: {budget})"
+                )
+            return True, f"Unified budget OK: {remaining} remaining of {budget}"
+        except Exception as e:
+            # Fail-open: don't block opens on budget provider errors
+            return True, f"Budget check failed (fail-open): {e}"
+
     def _check_safety_guards(self, cfg, action_type: str, peer_id: str,
                               amount_sats: int = 0) -> tuple:
         """Run all safety checks. Returns (ok, reason)."""
@@ -950,6 +986,11 @@ class CapacityPlanner:
             reserve_ok, reserve_reason = self._check_reserve(cfg, amount_sats)
             if not reserve_ok:
                 return False, reserve_reason
+            # Unified budget check: on-chain costs count against the global liquidity budget
+            estimated_chain_cost = int(amount_sats * 0.002) + ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+            budget_ok, budget_reason = self._check_unified_budget(estimated_chain_cost)
+            if not budget_ok:
+                return False, budget_reason
 
         # Cooldown check
         cooldown_ok, cooldown_reason = self._check_cooldown(peer_id)

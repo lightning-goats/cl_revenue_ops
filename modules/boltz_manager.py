@@ -632,6 +632,13 @@ class BoltzCliManager:
         }
 
     def _get_global_budget_limit(self) -> Dict[str, Any]:
+        """Return the unified liquidity budget.
+
+        When the global provider is set (normal operation), Boltz draws from
+        the same universal budget as the rebalancer and capacity planner.
+        The boltz_daily_budget_sats config is only used as a last-resort
+        fallback if the unified provider is not registered.
+        """
         provider = getattr(self, "global_budget_limit_provider", None)
         if not callable(provider):
             return {"budget_sats": max(0, int(self.cfg.daily_budget_sats)), "source": "boltz_cfg"}
@@ -640,20 +647,20 @@ class BoltzCliManager:
             if isinstance(data, dict):
                 if "effective_budget_sats" in data:
                     return {
-                        "budget_sats": max(0, self._parse_int(data.get("effective_budget_sats"), self.cfg.daily_budget_sats)),
-                        "source": str(data.get("source") or "provider"),
+                        "budget_sats": max(0, self._parse_int(data.get("effective_budget_sats"), 0)),
+                        "source": str(data.get("source") or "unified"),
                         **{k: v for k, v in data.items() if k != "effective_budget_sats"},
                     }
                 if "budget_sats" in data:
                     return {
-                        "budget_sats": max(0, self._parse_int(data.get("budget_sats"), self.cfg.daily_budget_sats)),
-                        "source": str(data.get("source") or "provider"),
+                        "budget_sats": max(0, self._parse_int(data.get("budget_sats"), 0)),
+                        "source": str(data.get("source") or "unified"),
                         **{k: v for k, v in data.items() if k != "budget_sats"},
                     }
             if isinstance(data, (int, float, str)):
-                return {"budget_sats": max(0, self._parse_int(data, self.cfg.daily_budget_sats)), "source": "provider_scalar"}
+                return {"budget_sats": max(0, self._parse_int(data, 0)), "source": "unified_scalar"}
         except Exception as e:
-            self.plugin.log(f"BOLTZ: global budget limit provider failed: {e}", level="warn")
+            self.plugin.log(f"BOLTZ: unified budget provider failed: {e}", level="warn")
         return {"budget_sats": max(0, int(self.cfg.daily_budget_sats)), "source": "boltz_cfg_fallback"}
 
     def get_boltz_cost_components(self, window_hours: int = 24) -> Dict[str, Any]:
