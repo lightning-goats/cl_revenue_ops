@@ -1811,6 +1811,63 @@ class FeeController:
         except Exception:
             return None
 
+    def _get_competitive_undercut_pct(self, peer_id: str, channel_id: str) -> float:
+        """Calculate intelligent undercut percentage based on competitive position.
+
+        Considers our channel capacity vs competitors:
+        - We're the largest channel to this peer → small undercut (5%), we already win on capacity
+        - We're mid-pack → moderate undercut (10%), need fee advantage
+        - We're the smallest → aggressive undercut (15%), fee is our only edge
+        - High-fee corridor (median > 300 PPM) → undercut more (extra 5%)
+        - Low-fee corridor (median < 100 PPM) → undercut less (halved)
+
+        Returns undercut as a fraction (e.g., 0.10 for 10% undercut).
+        Returns 0.0 if insufficient data.
+        """
+        try:
+            our_id = self.plugin.rpc.getinfo().get("id", "")
+            channels = self.plugin.rpc.listchannels(destination=peer_id)
+            all_channels = channels.get("channels", [])
+
+            # Find our capacity and competitor capacities
+            our_capacity = 0
+            competitor_capacities = []
+            for ch in all_channels:
+                cap = ch.get("satoshis", ch.get("amount_msat", 0) // 1000)
+                if not cap or cap <= 0:
+                    continue
+                if ch.get("source") == our_id:
+                    our_capacity = max(our_capacity, cap)
+                elif ch.get("active", False):
+                    competitor_capacities.append(cap)
+
+            if not competitor_capacities or our_capacity <= 0:
+                return 0.10  # Default 10% when no data
+
+            # Where do we rank by capacity?
+            competitor_capacities.sort(reverse=True)
+            total_competitors = len(competitor_capacities)
+            larger_than_us = sum(1 for c in competitor_capacities if c > our_capacity)
+            our_rank_pct = larger_than_us / total_competitors  # 0.0 = largest, 1.0 = smallest
+
+            # Base undercut scales with our weakness
+            # Largest (rank 0.0) → 5%, mid-pack (0.5) → 10%, smallest (1.0) → 15%
+            base_undercut = 0.05 + (our_rank_pct * 0.10)
+
+            # Corridor value adjustment
+            neighbor_median = self._get_neighbor_fee_median(peer_id)
+            if neighbor_median is not None:
+                if neighbor_median > 300:
+                    base_undercut += 0.05  # High-fee corridor, undercut more aggressively
+                elif neighbor_median < 100:
+                    base_undercut *= 0.5   # Low-fee corridor, undercut less (margins are thin)
+
+            # Cap at 20% max undercut
+            return min(0.20, max(0.03, base_undercut))
+
+        except Exception:
+            return 0.10  # Default on error
+
     def _get_channel_rebalance_cost_ppm(self, channel_id: str) -> int:
         """Get the effective per-PPM rebalance cost for a channel.
 
@@ -3718,14 +3775,14 @@ class FeeController:
                                 (prior_prec * ts.posterior_mean + obs_prec * neighbor_median) / total_prec
                             )
                             ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
-            # Competitive undercut: target 10% below neighbor median to attract traffic.
-            # Only applies when we're ABOVE the undercut target (never pushes fees UP).
-            # On sparse channels, also biases the DTS posterior toward the undercut
-            # target so the learning converges there instead of at the market median.
-            # Once real forward data arrives, DTS takes over and may move the fee
-            # above or below the undercut level based on actual demand.
+            # Competitive undercut: price below neighbor median based on our
+            # competitive position. Larger channels need less undercut (they win
+            # on capacity). Smaller channels undercut more (fee is their edge).
+            # High-fee corridors get more aggressive undercut. Low-fee corridors
+            # get less (margins are thin).
             if neighbor_median is not None:
-                undercut_target = int(neighbor_median * 0.90)  # 10% below market
+                undercut_pct = self._get_competitive_undercut_pct(peer_id, channel_id)
+                undercut_target = int(neighbor_median * (1.0 - undercut_pct))
                 undercut_target = max(floor_ppm, undercut_target)  # Never below floor
 
                 # Pipeline: cap target at undercut level (only pulls DOWN)
@@ -3735,7 +3792,7 @@ class FeeController:
                     self.plugin.log(
                         f"FEE: {channel_id[:16]}... competitive undercut: "
                         f"{pre_undercut}->{undercut_target}ppm "
-                        f"(market={neighbor_median}, target=90%)",
+                        f"(market={neighbor_median}, undercut={undercut_pct:.0%})",
                         level='debug'
                     )
 
