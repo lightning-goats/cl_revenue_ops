@@ -483,8 +483,21 @@ class CapacityPlanner:
 
             # Route-pair protection: channels on proven revenue routes have network value
             # beyond their individual ROI.  Closing one kills the paired channel's revenue.
-            if scid_display in route_pair_channels and prof.marginal_roi_percent > -30.0:
-                continue  # Protect revenue route channels
+            # Hive corridor channels on revenue routes get extra protection.
+            is_on_revenue_route = scid_display in route_pair_channels
+            is_hive_corridor = False
+            if self.hive_hints is not None:
+                try:
+                    fee_bias = self.hive_hints.get_fee_bias(prof.peer_id)
+                    is_hive_corridor = fee_bias != 1.0  # Any non-neutral bias = corridor member
+                except Exception:
+                    pass
+            if is_on_revenue_route:
+                # Hive corridor channels on revenue routes: protect until -50% ROI
+                # Regular revenue route channels: protect until -30% ROI
+                route_close_threshold = -50.0 if is_hive_corridor else -30.0
+                if prof.marginal_roi_percent > route_close_threshold:
+                    continue  # Protect revenue route channels
 
             # Hard bleeder bypass -- skip defibrillation gate
             bleeder_info = bleeders.get(scid)

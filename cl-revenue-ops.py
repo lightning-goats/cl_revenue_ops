@@ -5526,6 +5526,7 @@ def _build_boltz_balance_plan(
         #   - sling_bonus: if sling can't rebalance, Boltz is the only option
         #   - planner_bonus: capacity planner needs on-chain funds for a channel open
         #   - route_bonus: loop-out through inbound revenue legs creates headroom for more inbound traffic
+        #   - hive_bonus: hive rebalance bias compounds with route-pair signal
         multi_goal_value = 0.0
         if direction == "loop_out":
             excess_ratio = max(0.0, min(1.0, (local_pct - 50.0) / 50.0))
@@ -5535,7 +5536,8 @@ def _build_boltz_balance_plan(
             sling_bonus = 1.2 if sling_impossible else 1.0
             planner_bonus = 1.25 if planner_funding_deficit > 0 else 1.0
             route_bonus = 1.3 if scid_display in route_pair_in_channels else 1.0
-            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus * planner_bonus * route_bonus
+            hive_bonus = hive_rebal_bias  # ±15% from fleet hints, compounds with route signal
+            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus * planner_bonus * route_bonus * hive_bonus
 
         candidate = {
             "channel_id": channel_id,
