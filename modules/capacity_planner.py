@@ -35,6 +35,23 @@ class CapacityPlanner:
         self.config = config
         self.rebalancer = None
         self.hive_hints = None  # Injected by main plugin
+        # Coordination signals: cached from last execute_cycle for Boltz integration
+        self._last_loser_scids: set = set()        # SCIDs with action=CLOSE
+        self._last_funding_deficit_sats: int = 0    # On-chain shortfall for next open
+        self._last_best_candidate: dict = {}        # Top candidate that needs funding
+        self._last_cycle_ts: int = 0
+
+    def get_boltz_coordination(self) -> Dict[str, Any]:
+        """Return signals for Boltz planner coordination.
+
+        Called by the Boltz auto-cycle to avoid working against the capacity planner.
+        """
+        return {
+            "loser_scids": set(self._last_loser_scids),
+            "funding_deficit_sats": self._last_funding_deficit_sats,
+            "best_candidate": dict(self._last_best_candidate) if self._last_best_candidate else None,
+            "cycle_ts": self._last_cycle_ts,
+        }
 
     def get_status(self) -> Dict[str, Any]:
         """Return planner status for RPC query."""
@@ -122,6 +139,13 @@ class CapacityPlanner:
         winners = self._identify_winners(all_profitability, all_flow)
         losers = self._identify_losers(all_profitability, all_flow)
 
+        # Publish loser SCIDs for Boltz coordination (avoid loop-out through doomed channels)
+        self._last_loser_scids = {
+            l.get("scid") for l in losers
+            if l.get("action") == "CLOSE" and l.get("scid")
+        }
+        self._last_cycle_ts = int(time.time())
+
         # 4. Close worst losers (up to max_closes_per_cycle)
         close_execution_enabled = self._close_execution_enabled(cfg)
         closes_this_cycle = 0
@@ -176,6 +200,9 @@ class CapacityPlanner:
 
         # 5. Discover and open channels (up to max_opens_per_cycle)
         candidates = []
+        # Reset funding coordination before evaluating opens
+        self._last_funding_deficit_sats = 0
+        self._last_best_candidate = {}
         if fee_ok:
             candidates = self._discover_peers(winners, all_profitability, all_flow)
 
@@ -192,6 +219,19 @@ class CapacityPlanner:
                 available_sats = max(0, confirmed - min_reserve)
             except Exception as e:
                 self.plugin.log(f"Cannot determine available funds: {e}", level='debug')
+
+            # Detect funding deficit: best candidate needs more than available
+            if candidates:
+                top = max(candidates, key=lambda c: c.get("score", 0))
+                min_open = getattr(cfg, 'planner_min_channel_sats', 500000)
+                if available_sats < min_open:
+                    self._last_funding_deficit_sats = max(0, min_open - available_sats)
+                    self._last_best_candidate = {
+                        "peer_id": top.get("peer_id"),
+                        "score": top.get("score"),
+                        "source": top.get("source"),
+                        "min_amount_sats": min_open,
+                    }
 
             opens_this_cycle = 0
             for candidate in sorted(candidates, key=lambda c: c.get("score", 0), reverse=True):

@@ -951,6 +951,14 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
             "reserve_deficit_sats": 0,
         }
 
+        # Fetch capacity planner coordination signals for Boltz integration
+        _planner_coord = None
+        if capacity_planner is not None:
+            try:
+                _planner_coord = capacity_planner.get_boltz_coordination()
+            except Exception:
+                pass
+
         if bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False:
             treasury_plan = _build_boltz_expansion_treasury_plan(
                 onchain_target_sats=int(getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000),
@@ -959,6 +967,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                 max_actions=treasury_max_actions,
                 min_source_local_pct=float(getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0),
                 exclude_protected=bool(getattr(cfg, 'expansion_treasury_exclude_protected', True)) if cfg else True,
+                planner_coordination=_planner_coord,
             )
             if isinstance(treasury_plan, dict) and 'error' in treasury_plan:
                 result = dict(treasury_plan)
@@ -979,6 +988,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                 expected_horizon_days=3.0,
                 loop_in_currency='auto',
                 loop_out_currency='auto',
+                planner_coordination=_planner_coord,
             )
             if isinstance(balance_plan, dict) and 'error' in balance_plan:
                 result = balance_plan
@@ -5153,6 +5163,7 @@ def _build_boltz_expansion_treasury_plan(
     expected_horizon_days: float = 3.0,
     max_amount_sats: int = 1_500_000,
     min_amount_sats: int = 100_000,
+    planner_coordination: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     bm = _require_boltz_manager()
     onchain_confirmed_sats = _get_confirmed_onchain_sats()
@@ -5200,6 +5211,7 @@ def _build_boltz_expansion_treasury_plan(
         expected_horizon_days=float(expected_horizon_days),
         loop_out_currency=str(preferred_currency).upper(),
         loop_in_currency="LBTC",
+        planner_coordination=planner_coordination,
     )
     if "error" in base_plan:
         base_plan["treasury"] = treasury
@@ -5227,6 +5239,7 @@ def _build_boltz_balance_plan(
     expected_horizon_days: float = 3.0,
     loop_out_currency: str = "LBTC",
     loop_in_currency: str = "LBTC",
+    planner_coordination: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if fee_controller is None or database is None:
         return {"error": "Plugin not initialized"}
@@ -5236,6 +5249,11 @@ def _build_boltz_balance_plan(
     channels = fee_controller._get_channels_info()
     if not channels:
         return {"error": "No normal channels available"}
+
+    # Planner coordination: avoid loser channels, factor in funding needs
+    planner_coord = planner_coordination if isinstance(planner_coordination, dict) else {}
+    planner_loser_scids = set(planner_coord.get("loser_scids", set()))
+    planner_funding_deficit = int(planner_coord.get("funding_deficit_sats", 0) or 0)
 
     # Refresh profitability cache on demand.
     if profitability_analyzer is not None:
@@ -5257,6 +5275,12 @@ def _build_boltz_balance_plan(
         if only_channel_id and str(channel_id).replace(':', 'x') != str(only_channel_id).replace(':', 'x'):
             continue
         if only_peer_id and peer_id != only_peer_id:
+            continue
+
+        # Skip channels marked for closure by capacity planner (avoid wasting swap fees)
+        scid_display = str(channel_id).replace(':', 'x')
+        if planner_loser_scids and scid_display in planner_loser_scids:
+            skipped.append({"channel_id": channel_id, "peer_id": peer_id, "reason": "planner_loser_close_pending"})
             continue
 
         capacity_sats = int(ch.get("capacity", 0) or 0)
@@ -5469,6 +5493,7 @@ def _build_boltz_balance_plan(
         #   - fee_value: broadcast fee indicating revenue potential from freed remote cap
         #   - flow_bonus: source channels naturally refill local, so draining is safe
         #   - sling_bonus: if sling can't rebalance, Boltz is the only option
+        #   - planner_bonus: capacity planner needs on-chain funds for a channel open
         multi_goal_value = 0.0
         if direction == "loop_out":
             excess_ratio = max(0.0, min(1.0, (local_pct - 50.0) / 50.0))
@@ -5476,7 +5501,8 @@ def _build_boltz_balance_plan(
             fee_signal = min(1.0, broadcast_fee_ppm / 500.0) if broadcast_fee_ppm > 0 else 0.0
             flow_bonus = 1.3 if flow_state in ('source',) else 1.0
             sling_bonus = 1.2 if sling_impossible else 1.0
-            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus
+            planner_bonus = 1.25 if planner_funding_deficit > 0 else 1.0
+            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus * planner_bonus
 
         candidate = {
             "channel_id": channel_id,
@@ -5576,6 +5602,11 @@ def _build_boltz_balance_plan(
         "total_candidates": len(candidates),
         "skipped_count": len(skipped),
         "skipped_examples": skipped[:20],
+        "planner_coordination": {
+            "loser_scids_excluded": len(planner_loser_scids),
+            "funding_deficit_sats": planner_funding_deficit,
+            "best_open_candidate": planner_coord.get("best_candidate"),
+        } if planner_coord else None,
     }
 
 
