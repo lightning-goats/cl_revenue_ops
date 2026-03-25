@@ -1462,7 +1462,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             safe_plugin,
             ttl_override=config.hive_hints_ttl_seconds,
         )
-        plugin.log("HiveHintAdapter initialized — fleet hint bias enabled")
+        plugin.log("HiveHintAdapter initialized - fleet hint bias enabled")
     else:
         hive_hints = None
 
