@@ -67,3 +67,46 @@ class TestNetworkInformedPriors:
         result = fc._get_network_fee_prior("02peer", "123x1x0")
         assert result is not None
         assert result["mean"] == 200  # Only sane value
+
+
+class TestRebalanceCostFloor:
+    def test_cost_ppm_from_rebalance(self, mock_plugin, mock_config, mock_database):
+        mock_database.get_last_rebalance_cost.return_value = {
+            "cost_sats": 500, "amount_sats": 1_000_000
+        }
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
+        assert cost == 500  # 500 sats / 1M sats * 1M = 500 PPM
+
+    def test_cost_ppm_zero_when_no_history(self, mock_plugin, mock_config, mock_database):
+        mock_database.get_last_rebalance_cost.return_value = None
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
+        assert cost == 0
+
+    def test_cost_ppm_zero_on_error(self, mock_plugin, mock_config, mock_database):
+        mock_database.get_last_rebalance_cost.side_effect = Exception("DB error")
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
+        assert cost == 0
+
+    def test_cost_ppm_handles_zero_amount(self, mock_plugin, mock_config, mock_database):
+        mock_database.get_last_rebalance_cost.return_value = {
+            "cost_sats": 500, "amount_sats": 0
+        }
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
+        assert cost == 0
+
+    def test_cost_ppm_handles_none_cost(self, mock_plugin, mock_config, mock_database):
+        mock_database.get_last_rebalance_cost.return_value = {
+            "cost_sats": None, "amount_sats": 1_000_000
+        }
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
+        assert cost == 0
+
+    def test_cost_ppm_no_database(self, mock_plugin, mock_config):
+        fc = FeeController(mock_plugin, mock_config, None)
+        cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
+        assert cost == 0

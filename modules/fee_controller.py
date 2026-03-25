@@ -1707,6 +1707,26 @@ class FeeController:
         except Exception:
             return None
 
+    def _get_channel_rebalance_cost_ppm(self, channel_id: str) -> int:
+        """Get the effective per-PPM rebalance cost for a channel.
+
+        Uses the most recent successful rebalance to calculate what fee
+        is needed to break even. Returns 0 if no rebalance history.
+        """
+        if not self.database:
+            return 0
+        try:
+            row = self.database.get_last_rebalance_cost(channel_id)
+            if not row:
+                return 0
+            cost_sats = int(row.get("cost_sats", 0) or 0)
+            amount_sats = int(row.get("amount_sats", 0) or 0)
+            if amount_sats <= 0 or cost_sats <= 0:
+                return 0
+            return int((cost_sats * 1_000_000) / amount_sats)
+        except Exception:
+            return 0
+
     def _check_hive_member_fee(self, peer_id: str) -> Optional[int]:
         """Return 0 if peer is a hive member (0-PPM fleet policy), else None.
 
@@ -3288,6 +3308,24 @@ class FeeController:
             base_floor_ppm = rebalance_floor_ppm
 
         # =====================================================================
+        # Per-channel rebalance cost floor (all flow states)
+        # =====================================================================
+        # If we spent X PPM rebalancing a channel, pricing below X guarantees
+        # a loss. This is a soft floor: DTS may want a lower market fee, but
+        # we still enforce the floor and log a warning so operators know.
+        rebalance_cost_ppm = self._get_channel_rebalance_cost_ppm(channel_id)
+        if rebalance_cost_ppm > 0:
+            effective_floor = max(cfg.min_fee_ppm, rebalance_cost_ppm)
+            if effective_floor > base_floor_ppm:
+                self.plugin.log(
+                    f"REBALANCE_COST_FLOOR: {channel_id[:12]}... floor raised from "
+                    f"{base_floor_ppm} to {effective_floor} ppm "
+                    f"(last rebalance cost: {rebalance_cost_ppm} ppm)",
+                    level='info'
+                )
+                base_floor_ppm = effective_floor
+
+        # =====================================================================
         # Issue #20: Flow-Based Ceiling Reduction
         # =====================================================================
         # High-fee channels with no flow for extended periods get lower ceiling
@@ -3552,6 +3590,15 @@ class FeeController:
             if bounded_target_ppm != post_pid_target_ppm:
                 bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
 
+            # Warn when DTS market fee is below the rebalance cost floor
+            if rebalance_cost_ppm > 0 and post_pid_target_ppm < rebalance_cost_ppm:
+                self.plugin.log(
+                    f"REBALANCE_COST_FLOOR: {channel_id[:12]}... DTS+PID target "
+                    f"{post_pid_target_ppm} ppm is below rebalance cost "
+                    f"{rebalance_cost_ppm} ppm — channel may be unprofitable to rebalance",
+                    level='warning'
+                )
+
             blended_target_ppm, blend_info = self._blend_fee_target(
                 current_fee_ppm=current_fee_ppm,
                 bounded_target_ppm=bounded_target_ppm,
@@ -3738,14 +3785,17 @@ class FeeController:
         volatility_note = " [VOLATILITY_RESET]" if volatility_reset else ""
         applied_delta = int(new_fee_ppm) - int(current_fee_ppm)
         applied_dir = "up" if applied_delta > 0 else ("down" if applied_delta < 0 else "flat")
+        rebal_cost_tag = f", rebal_cost_floor:{rebalance_cost_ppm}ppm" if rebalance_cost_ppm > 0 else ""
         target_summary = (
             f"targets=dts:{raw_dts_target_ppm}, post_pid:{post_pid_target_ppm}, "
             f"bounded:{bounded_target_ppm}, blended:{blended_target_ppm}, applied:{applied_target_ppm}, "
             f"blend:{target_blend_ratio:.2f}, bound:{bound_reason}, cap:{delta_cap_reason}({delta_cap_ppm}ppm), "
             f"wake:{wake_reason}, sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
+            f"{rebal_cost_tag}"
             if raw_dts_target_ppm is not None else
             f"targets=n/a, blend:{target_blend_ratio:.2f}, wake:{wake_reason}, "
             f"sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
+            f"{rebal_cost_tag}"
         )
 
         common_reason_suffix = (
@@ -3894,6 +3944,7 @@ class FeeController:
                     "wake_reason": wake_reason,
                     "sparse_data_conservative": sparse_data_conservative,
                     "exploration_mode": exploration_mode,
+                    "rebalance_cost_floor_ppm": rebalance_cost_ppm,
                 },
                 reason_code=fee_reason_code,
             )

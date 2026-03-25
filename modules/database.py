@@ -1897,7 +1897,38 @@ class Database:
         if row and row['last_time']:
             return row['last_time']
         return None
-    
+
+    def get_last_rebalance_cost(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Get the most recent completed rebalance cost for a channel.
+
+        Looks up the last successful rebalance where this channel was either
+        the source or destination, and returns the cost and amount so the
+        caller can derive an effective PPM cost.
+
+        Args:
+            channel_id: The channel short ID (SCID)
+
+        Returns:
+            Dict with 'cost_sats' and 'amount_sats', or None if no history.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT actual_fee_sats, amount_sats FROM rebalance_history "
+                "WHERE (from_channel = ? OR to_channel = ?) "
+                "AND status = 'success' "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (channel_id, channel_id)
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "cost_sats": row["actual_fee_sats"],
+                "amount_sats": row["amount_sats"],
+            }
+        except Exception:
+            return None
+
     def get_diagnostic_rebalance_stats(self, channel_id: str, days: int = 14) -> Dict[str, Any]:
         """
         Get stats for diagnostic rebalance attempts for a channel.
