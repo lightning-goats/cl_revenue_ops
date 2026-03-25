@@ -171,3 +171,108 @@ class TestConfidenceScaledBlend:
         fc = FeeController(mock_plugin, mock_config, mock_database)
         ratio = fc._get_target_blend_ratio(False, True, posterior_std=10.0)
         assert ratio == 0.10  # Sparse rate, no confidence boost
+
+
+class TestNeighborFeeAwareness:
+    def test_neighbor_median_computed(self, mock_plugin, mock_config, mock_database):
+        mock_plugin.rpc.getinfo.return_value = {"id": "02our_node"}
+        mock_plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "02node1", "fee_per_millionth": 100, "active": True},
+                {"source": "02node2", "fee_per_millionth": 150, "active": True},
+                {"source": "02node3", "fee_per_millionth": 200, "active": True},
+                {"source": "02node4", "fee_per_millionth": 300, "active": True},
+                {"source": "02node5", "fee_per_millionth": 500, "active": True},
+            ]
+        }
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        median = fc._get_neighbor_fee_median("02peer123")
+        assert median == 200
+
+    def test_neighbor_none_with_few_channels(self, mock_plugin, mock_config, mock_database):
+        mock_plugin.rpc.getinfo.return_value = {"id": "02our_node"}
+        mock_plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "02node1", "fee_per_millionth": 100, "active": True},
+            ]
+        }
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        assert fc._get_neighbor_fee_median("02peer") is None
+
+    def test_neighbor_excludes_our_node(self, mock_plugin, mock_config, mock_database):
+        mock_plugin.rpc.getinfo.return_value = {"id": "02our_node"}
+        mock_plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "02our_node", "fee_per_millionth": 999, "active": True},
+                {"source": "02node1", "fee_per_millionth": 100, "active": True},
+                {"source": "02node2", "fee_per_millionth": 200, "active": True},
+                {"source": "02node3", "fee_per_millionth": 300, "active": True},
+            ]
+        }
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        median = fc._get_neighbor_fee_median("02peer")
+        assert median == 200  # Our 999 excluded
+
+    def test_neighbor_cached(self, mock_plugin, mock_config, mock_database):
+        mock_plugin.rpc.getinfo.return_value = {"id": "02our_node"}
+        mock_plugin.rpc.listchannels.return_value = {"channels": [
+            {"source": f"02node{i}", "fee_per_millionth": 100 + i * 50, "active": True}
+            for i in range(5)
+        ]}
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc._get_neighbor_fee_median("02peer")
+        fc._get_neighbor_fee_median("02peer")
+        # listchannels called only once due to cache
+        assert mock_plugin.rpc.listchannels.call_count == 1
+
+    def test_neighbor_excludes_inactive_channels(self, mock_plugin, mock_config, mock_database):
+        mock_plugin.rpc.getinfo.return_value = {"id": "02our_node"}
+        mock_plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "02node1", "fee_per_millionth": 100, "active": True},
+                {"source": "02node2", "fee_per_millionth": 200, "active": False},
+                {"source": "02node3", "fee_per_millionth": 300, "active": True},
+                {"source": "02node4", "fee_per_millionth": 400, "active": True},
+            ]
+        }
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        median = fc._get_neighbor_fee_median("02peer")
+        assert median == 300  # Inactive node2 excluded; [100, 300, 400] -> 300
+
+    def test_neighbor_excludes_extreme_fees(self, mock_plugin, mock_config, mock_database):
+        mock_plugin.rpc.getinfo.return_value = {"id": "02our_node"}
+        mock_plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {"source": "02node1", "fee_per_millionth": 0, "active": True},
+                {"source": "02node2", "fee_per_millionth": 100, "active": True},
+                {"source": "02node3", "fee_per_millionth": 200, "active": True},
+                {"source": "02node4", "fee_per_millionth": 300, "active": True},
+                {"source": "02node5", "fee_per_millionth": 50000, "active": True},
+            ]
+        }
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        median = fc._get_neighbor_fee_median("02peer")
+        assert median == 200  # 0 and 50000 filtered out; [100, 200, 300] -> 200
+
+    def test_neighbor_none_on_rpc_error(self, mock_plugin, mock_config, mock_database):
+        mock_plugin.rpc.getinfo.side_effect = Exception("RPC error")
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        assert fc._get_neighbor_fee_median("02peer") is None
+
+    def test_neighbor_cache_eviction(self, mock_plugin, mock_config, mock_database):
+        """Stale entries older than 1 hour are evicted when cache exceeds 500."""
+        mock_plugin.rpc.getinfo.return_value = {"id": "02our_node"}
+        mock_plugin.rpc.listchannels.return_value = {"channels": [
+            {"source": f"02node{i}", "fee_per_millionth": 100 + i * 50, "active": True}
+            for i in range(5)
+        ]}
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        # Fill cache with 501 stale entries
+        old_ts = time.time() - 7200  # 2 hours old
+        for i in range(501):
+            fc._neighbor_fee_cache[f"neighbor_fee_stale_{i}"] = {"value": 100, "ts": old_ts}
+        # Trigger eviction by calling the method
+        fc._get_neighbor_fee_median("02peer_new")
+        # Stale entries should have been evicted
+        stale_remaining = sum(1 for k in fc._neighbor_fee_cache if k.startswith("neighbor_fee_stale_"))
+        assert stale_remaining == 0

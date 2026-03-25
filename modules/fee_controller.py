@@ -1641,6 +1641,9 @@ class FeeController:
         self.hive_hints = None
         self._hive_member_set_at: Dict[str, int] = {}
 
+        # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
+        self._neighbor_fee_cache: Dict[str, Dict] = {}
+
         self._last_decision_summary: Dict[str, Any] = {
             "action": "hold",
             "reason": "not_run",
@@ -1704,6 +1707,48 @@ class FeeController:
             prior_std = max(50, fee_spread // 2)
 
             return {"mean": median_fee, "std": prior_std}
+        except Exception:
+            return None
+
+    def _get_neighbor_fee_median(self, peer_id: str) -> int | None:
+        """Get median fee charged by other nodes to the same peer.
+
+        Returns None if insufficient data (need >= 3 neighbors).
+        Result is cached for 30 minutes to avoid expensive listchannels calls.
+        """
+        # Evict stale entries when cache grows large
+        if len(self._neighbor_fee_cache) > 500:
+            now = time.time()
+            stale_keys = [
+                k for k, v in self._neighbor_fee_cache.items()
+                if (now - v["ts"]) > 3600
+            ]
+            for k in stale_keys:
+                del self._neighbor_fee_cache[k]
+
+        # Check cache first
+        cache_key = f"neighbor_fee_{peer_id}"
+        cached = self._neighbor_fee_cache.get(cache_key)
+        if cached and (time.time() - cached["ts"]) < 1800:
+            return cached["value"]
+
+        try:
+            our_id = self.plugin.rpc.getinfo().get("id", "")
+            channels = self.plugin.rpc.listchannels(destination=peer_id)
+            fees = [
+                ch.get("fee_per_millionth", 0)
+                for ch in channels.get("channels", [])
+                if ch.get("source") != our_id
+                and ch.get("active", False)
+                and 1 <= ch.get("fee_per_millionth", 0) <= 10000
+            ]
+            result = None
+            if len(fees) >= 3:
+                fees.sort()
+                result = fees[len(fees) // 2]
+
+            self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
+            return result
         except Exception:
             return None
 
@@ -3595,6 +3640,18 @@ class FeeController:
             hive_fee_bias = self._get_hive_fee_bias(peer_id)
             if hive_fee_bias != 1.0:
                 post_pid_target_ppm = int(post_pid_target_ppm * hive_fee_bias)
+            # Neighbor fee context: soft attraction toward market median
+            # Only pull DOWN toward market, never up — being cheaper is fine.
+            neighbor_median = self._get_neighbor_fee_median(peer_id)
+            if neighbor_median is not None:
+                if post_pid_target_ppm > neighbor_median * 2:
+                    adjusted = int(post_pid_target_ppm * 0.8 + neighbor_median * 0.2)
+                    self.plugin.log(
+                        f"FEE: {channel_id[:16]}... neighbor median {neighbor_median}ppm, "
+                        f"adjusted {post_pid_target_ppm}->{adjusted}ppm",
+                        level='debug'
+                    )
+                    post_pid_target_ppm = adjusted
             bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
             if bounded_target_ppm != post_pid_target_ppm:
                 bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
