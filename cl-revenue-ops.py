@@ -3655,13 +3655,14 @@ def revenue_health(plugin: Plugin) -> Dict[str, Any]:
     try:
         budget = _total_cost_budget_status()
         if isinstance(budget, dict):
+            actual_spent = int(budget.get("actual_spent_sats", 0) or 0)
             result["budget"] = {
                 "effective_budget_sats": budget.get("effective_budget_sats", 0),
-                "total_spent_sats": budget.get("actual_spent_total", 0),
+                "total_spent_sats": actual_spent,
                 "remaining_sats": budget.get("remaining_sats", 0),
                 "spent_by_category": budget.get("actual_spent_by_category", {}),
                 "utilization_pct": round(
-                    100.0 * budget.get("actual_spent_total", 0) / max(1, budget.get("effective_budget_sats", 1)), 1
+                    100.0 * actual_spent / max(1, budget.get("effective_budget_sats", 1)), 1
                 ),
             }
     except Exception as e:
