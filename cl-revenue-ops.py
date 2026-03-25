@@ -3891,13 +3891,14 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
                 # e.g. insufficient outbound balance — the sender did nothing wrong).
                 database.update_peer_reputation(peer_id, is_success=False)
 
-    # Record failed forward as weak negative DTS signal
+    # Record failed forward as weak negative DTS signal (amount-weighted)
     if status == "failed" and in_channel and fee_controller is not None:
         try:
             cfs = fee_controller._channel_fee_states.get(in_channel)
             current_fee = cfs.last_fee_ppm if cfs else 0
             if current_fee > 0:
-                fee_controller.record_failed_forward(in_channel, current_fee)
+                failed_in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
+                fee_controller.record_failed_forward(in_channel, current_fee, amount_msat=failed_in_msat)
         except Exception:
             pass
 

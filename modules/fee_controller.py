@@ -1733,19 +1733,41 @@ class FeeController:
             return cached["value"]
 
         try:
+            now = time.time()
             our_id = self.plugin.rpc.getinfo().get("id", "")
             channels = self.plugin.rpc.listchannels(destination=peer_id)
-            fees = [
-                ch.get("fee_per_millionth", 0)
-                for ch in channels.get("channels", [])
-                if ch.get("source") != our_id
-                and ch.get("active", False)
-                and 1 <= ch.get("fee_per_millionth", 0) <= 10000
-            ]
+
+            # Collect fee + weight pairs (weight = capacity * recency)
+            weighted_fees = []
+            for ch in channels.get("channels", []):
+                if ch.get("source") == our_id:
+                    continue
+                if not ch.get("active", False):
+                    continue
+                fee_ppm = ch.get("fee_per_millionth", 0)
+                if not (1 <= fee_ppm <= 10000):
+                    continue
+                # Weight by capacity (bigger channels = more credible signal)
+                capacity = max(1, ch.get("satoshis", ch.get("amount_msat", 1000000) // 1000))
+                # Weight by recency (recently updated = more active)
+                last_update = ch.get("last_update", 0)
+                age_days = max(0.1, (now - last_update) / 86400) if last_update > 0 else 30.0
+                recency_weight = 1.0 / age_days  # Recent channels weight more
+                weight = (capacity / 1_000_000) * recency_weight
+                weighted_fees.append((fee_ppm, weight))
+
             result = None
-            if len(fees) >= 3:
-                fees.sort()
-                result = fees[len(fees) // 2]
+            if len(weighted_fees) >= 3:
+                # Weighted median: sort by fee, find the fee at cumulative 50% weight
+                weighted_fees.sort(key=lambda x: x[0])
+                total_weight = sum(w for _, w in weighted_fees)
+                if total_weight > 0:
+                    cumulative = 0.0
+                    for fee, w in weighted_fees:
+                        cumulative += w
+                        if cumulative >= total_weight * 0.5:
+                            result = fee
+                            break
 
             self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
             return result
@@ -4877,12 +4899,17 @@ class FeeController:
     # -----------------------------------------------------------------
     # Failed-forward DTS observation
     # -----------------------------------------------------------------
-    def record_failed_forward(self, channel_id: str, current_fee_ppm: int) -> None:
+    def record_failed_forward(self, channel_id: str, current_fee_ppm: int,
+                              amount_msat: int = 0) -> None:
         """Record a failed forward as a weak negative fee observation.
 
         A forward offered to our channel but not settled suggests the fee
-        may be too high relative to alternatives.  Record as a soft signal
-        at 80 % of current fee with low weight (1/10th of a real forward).
+        may be too high relative to alternatives. Larger failed forwards
+        carry more weight — someone trying to route 5M sats through us
+        is a stronger signal than a 1000 sat probe.
+
+        Base weight: 10% of a settled forward.
+        Amount boost: up to 3x for large forwards (>1M sats).
         """
         if not channel_id or current_fee_ppm <= 0:
             return
@@ -4895,10 +4922,18 @@ class FeeController:
 
         implied_fee = int(current_fee_ppm * 0.8)
         try:
-            # Use the existing Bayesian update with very low precision
-            # This gives it ~1/10th the weight of a real settled forward
             prior_precision = 1.0 / max(state.MIN_STD ** 2, state.posterior_std ** 2)
-            obs_precision = prior_precision * 0.1  # 10 % weight
+
+            # Base weight: 10% of a settled forward
+            # Amount boost: log scale, large forwards (>1M sats) get up to 3x
+            base_weight = 0.1
+            if amount_msat > 0:
+                amount_sats = amount_msat / 1000
+                # 1K sats → 1x, 100K sats → 2x, 1M+ sats → 3x
+                amount_boost = min(3.0, 1.0 + math.log10(max(1, amount_sats)) / 3.0)
+                base_weight *= amount_boost
+
+            obs_precision = prior_precision * base_weight
 
             total_precision = prior_precision + obs_precision
             if total_precision > 0:
