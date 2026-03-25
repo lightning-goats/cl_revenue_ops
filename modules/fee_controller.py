@@ -1676,6 +1676,37 @@ class FeeController:
         except Exception:
             return 1.0
 
+    def _get_network_fee_prior(self, peer_id: str, scid: str) -> dict | None:
+        """Get informed prior from network gossip data for a channel.
+
+        Uses the peer's own fee rates as a market signal to set a better
+        starting prior than the flat default. Returns dict with 'mean'
+        and 'std', or None if no data available.
+        """
+        try:
+            channels = self.plugin.rpc.listchannels(source=peer_id)
+            peer_channels = channels.get("channels", [])
+            if not peer_channels:
+                return None
+
+            fees = []
+            for ch in peer_channels:
+                fee_ppm = ch.get("fee_per_millionth", 0)
+                if 1 <= fee_ppm <= 10000:
+                    fees.append(fee_ppm)
+
+            if not fees:
+                return None
+
+            fees.sort()
+            median_fee = fees[len(fees) // 2]
+            fee_spread = max(fees) - min(fees) if len(fees) > 1 else median_fee
+            prior_std = max(50, fee_spread // 2)
+
+            return {"mean": median_fee, "std": prior_std}
+        except Exception:
+            return None
+
     def _check_hive_member_fee(self, peer_id: str) -> Optional[int]:
         """Return 0 if peer is a hive member (0-PPM fleet policy), else None.
 
@@ -4215,8 +4246,18 @@ class FeeController:
             # ── DYNAMIC: DTS prior sample ─────────────────────────────
             ts = GaussianThompsonState()
             ts.prior_std_fee = cfg.thompson_prior_std_fee
-            initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
 
+            # Use network-informed prior if available
+            network_prior = self._get_network_fee_prior(peer_id, scid)
+            if network_prior:
+                ts.prior_mean_fee = network_prior["mean"]
+                ts.prior_std_fee = network_prior["std"]
+                self.plugin.log(
+                    f"INITIAL_FEE: {scid[:16]}... using network prior "
+                    f"(mean={network_prior['mean']}, std={network_prior['std']})"
+                )
+
+            initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
 
             self.plugin.log(
                 f"INITIAL_FEE: {scid[:16]}... -> {initial_fee} PPM "
