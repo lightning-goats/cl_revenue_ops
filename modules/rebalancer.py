@@ -2363,6 +2363,21 @@ class EVRebalancer:
                     if src_fail_count < 3:
                         continue
 
+                    # Profitability guard: don't drain highly profitable channels.
+                    # A channel with high ROI is earning well even while overfull —
+                    # draining it costs rebalance fees and may reduce future revenue.
+                    # Prefer draining low-ROI overfull channels instead.
+                    if self._profitability_analyzer is not None:
+                        try:
+                            src_prof = self._profitability_analyzer.get_profitability(src_id)
+                            if src_prof is not None:
+                                src_roi = getattr(src_prof, 'marginal_roi_percent', 0.0) or 0.0
+                                if src_roi > 20.0:
+                                    # >20% marginal ROI: skip push — channel is earning well
+                                    continue
+                        except Exception:
+                            pass
+
                     # Build push candidate: drain src_id, liquidity flows to depleted channels
                     dest_scids = [d[0] for d in depleted_channels[:5]]
                     dest_peer_ids = [d[1].get("peer_id", "") for d in depleted_channels[:5]]
