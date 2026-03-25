@@ -792,6 +792,18 @@ class CapacityPlanner:
             except Exception:
                 pass
 
+        # Inbound fee penalty: expensive-to-rebalance peers are less valuable
+        try:
+            inbound_data = self.profitability.database.get_historical_inbound_fee_ppm(peer_id)
+            if inbound_data and isinstance(inbound_data, dict):
+                median_inbound = inbound_data.get('median_fee_ppm', 0)
+                if isinstance(median_inbound, (int, float)) and median_inbound > 200:
+                    # Penalize: >200 PPM inbound = 10-40% penalty
+                    penalty = min(0.4, (median_inbound - 200) / 1000)
+                    score *= (1.0 - penalty)
+        except Exception:
+            pass
+
         return score
 
     def _update_candidate_pool(self, candidates: List[Dict]):
@@ -978,9 +990,18 @@ class CapacityPlanner:
 
         on_chain_cost = open_cost + close_cost
 
-        # Estimate rebalance costs
-        # Conservative: assume 10% of revenue goes to rebalancing
-        rebal_cost_per_day = daily_revenue * 0.1
+        # Estimate rebalance costs using actual peer inbound fee history
+        rebal_cost_per_day = daily_revenue * 0.1  # Default: 10% of revenue
+        try:
+            inbound_data = self.profitability.database.get_historical_inbound_fee_ppm(peer_id)
+            if inbound_data and isinstance(inbound_data, dict):
+                median_inbound_ppm = inbound_data.get('median_fee_ppm', 0)
+                if median_inbound_ppm > 0:
+                    # Daily rebalance cost = daily_volume * inbound_fee_rate
+                    daily_volume_est = channel_size_sats * 0.3  # Same utilization assumption
+                    rebal_cost_per_day = (daily_volume_est * median_inbound_ppm) / 1_000_000
+        except Exception:
+            pass  # Fallback to 10% default
 
         # Conservative 6-month lifetime estimate
         lifetime_days = 180

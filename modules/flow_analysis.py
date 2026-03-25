@@ -27,6 +27,7 @@ Bookkeeper is used elsewhere for on-chain cost attribution, but flow analysis it
 does not require it.
 """
 
+import json
 import time
 import math
 import threading
@@ -935,9 +936,29 @@ class FlowAnalyzer:
             and obs_count >= KALMAN_MIN_OBSERVATIONS
         )
         if not metrics.is_congested and kalman_converged:
-            if kalman_ratio > self.config.source_threshold:
+            # DTS dampening: when fee controller is still exploratory (high
+            # posterior variance), widen flow thresholds to bias toward BALANCED.
+            # This prevents premature SOURCE/SINK labels from triggering fee
+            # moves while the fee controller is still exploring.
+            source_thresh = self.config.source_threshold
+            sink_thresh = self.config.sink_threshold
+            try:
+                fee_state = self.database.get_fee_strategy_state(channel_id)
+                if fee_state:
+                    v2_json = fee_state.get('v2_state_json', '{}') or '{}'
+                    v2_data = json.loads(v2_json) if isinstance(v2_json, str) else v2_json
+                    ts = v2_data.get('thompson_state', {})
+                    variance = ts.get('posterior_variance', 10000)
+                    if isinstance(variance, (int, float)) and variance > 10000:
+                        # DTS still exploring (std > 100 PPM): widen thresholds by 50%
+                        source_thresh *= 1.5
+                        sink_thresh *= 1.5
+            except Exception:
+                pass
+
+            if kalman_ratio > source_thresh:
                 metrics.state = ChannelState.SOURCE
-            elif kalman_ratio < self.config.sink_threshold:
+            elif kalman_ratio < sink_thresh:
                 metrics.state = ChannelState.SINK
             else:
                 # Kalman ratio is small — use balance position as

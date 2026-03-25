@@ -20,6 +20,7 @@ Classifications:
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple
 from enum import Enum
+import json
 import time
 import threading
 
@@ -2186,9 +2187,28 @@ class ChannelProfitabilityAnalyzer:
             return ProfitabilityClass.STAGNANT_CANDIDATE
         
         # 3. Standard ROI Classifications
-        if roi > self.PROFITABLE_ROI_THRESHOLD:
+        # DTS confidence: widen thresholds for channels with proven fee posteriors
+        # so temporary revenue dips don't trigger harsh reclassifications.
+        profitable_thresh = self.PROFITABLE_ROI_THRESHOLD
+        underwater_thresh = self.UNDERWATER_ROI_THRESHOLD
+        if channel_id:
+            try:
+                fee_state = self.database.get_fee_strategy_state(channel_id)
+                if fee_state:
+                    v2_json = fee_state.get('v2_state_json', '{}') or '{}'
+                    v2_data = json.loads(v2_json) if isinstance(v2_json, str) else v2_json
+                    ts = v2_data.get('thompson_state', {})
+                    variance = ts.get('posterior_variance', 10000)
+                    if isinstance(variance, (int, float)) and variance < 2500:  # std < 50 PPM
+                        # Proven fee channel: widen thresholds by 50%
+                        profitable_thresh *= 0.5   # Easier to be PROFITABLE (5% vs 10%)
+                        underwater_thresh *= 1.5   # Harder to be UNDERWATER (-15% vs -10%)
+            except Exception:
+                pass
+
+        if roi > profitable_thresh:
             return ProfitabilityClass.PROFITABLE
-        elif roi < self.UNDERWATER_ROI_THRESHOLD:
+        elif roi < underwater_thresh:
             return ProfitabilityClass.UNDERWATER
         else:
             return ProfitabilityClass.BREAK_EVEN
