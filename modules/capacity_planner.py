@@ -452,6 +452,14 @@ class CapacityPlanner:
             # SCID formatting check - ensure 'x' separator
             scid_display = scid.replace(':', 'x')
 
+            # Hive member protection -- never recommend closing fleet channels
+            if self.hive_hints is not None:
+                try:
+                    if self.hive_hints.is_hive_member(prof.peer_id):
+                        continue
+                except Exception:
+                    pass
+
             # Kalman confidence gate -- skip closure if data unreliable
             if flow_metrics:
                 confidence = getattr(flow_metrics, 'confidence', 1.0)
