@@ -4774,6 +4774,40 @@ class FeeController:
                     
         except RpcError as e:
             self.plugin.log(f"Error getting channel info: {e}", level='error')
-        
+
         return channels
-    
+
+    # -----------------------------------------------------------------
+    # Failed-forward DTS observation
+    # -----------------------------------------------------------------
+    def record_failed_forward(self, channel_id: str, current_fee_ppm: int) -> None:
+        """Record a failed forward as a weak negative fee observation.
+
+        A forward offered to our channel but not settled suggests the fee
+        may be too high relative to alternatives.  Record as a soft signal
+        at 80 % of current fee with low weight (1/10th of a real forward).
+        """
+        if not channel_id or current_fee_ppm <= 0:
+            return
+        fee_state = self._channel_fee_states.get(channel_id)
+        if not fee_state:
+            return
+        state = fee_state.thompson
+        if not isinstance(state, GaussianThompsonState):
+            return
+
+        implied_fee = int(current_fee_ppm * 0.8)
+        try:
+            # Use the existing Bayesian update with very low precision
+            # This gives it ~1/10th the weight of a real settled forward
+            prior_precision = 1.0 / max(state.MIN_STD ** 2, state.posterior_std ** 2)
+            obs_precision = prior_precision * 0.1  # 10 % weight
+
+            total_precision = prior_precision + obs_precision
+            if total_precision > 0:
+                new_mean = (prior_precision * state.posterior_mean + obs_precision * implied_fee) / total_precision
+                state.posterior_mean = float(new_mean)
+                state.posterior_std = float(max(state.MIN_STD, (1.0 / total_precision) ** 0.5))
+        except Exception:
+            pass
+

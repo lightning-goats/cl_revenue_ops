@@ -3,7 +3,7 @@ import time
 import pytest
 from unittest.mock import MagicMock
 
-from modules.fee_controller import FeeController, GaussianThompsonState
+from modules.fee_controller import FeeController, GaussianThompsonState, ChannelFeeState
 
 
 @pytest.fixture
@@ -110,3 +110,46 @@ class TestRebalanceCostFloor:
         fc = FeeController(mock_plugin, mock_config, None)
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0
+
+
+class TestFailedForwardObservation:
+    def test_failed_forward_adjusts_posterior(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = GaussianThompsonState()
+        state.posterior_mean = 500.0
+        state.posterior_std = 50.0
+        cfs = ChannelFeeState(thompson=state)
+        fc._channel_fee_states["123x1x0"] = cfs
+
+        original_mean = state.posterior_mean
+        fc.record_failed_forward("123x1x0", 500)
+
+        # Should pull mean down slightly (toward 80% of 500 = 400)
+        assert state.posterior_mean < original_mean
+        assert state.posterior_mean > 400  # But not all the way to 400
+
+    def test_failed_forward_no_crash_missing_state(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        # No state for this channel — should not crash
+        fc.record_failed_forward("999x1x0", 500)
+
+    def test_failed_forward_no_crash_zero_fee(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.record_failed_forward("123x1x0", 0)  # Should not crash
+
+    def test_failed_forward_no_crash_empty_channel_id(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.record_failed_forward("", 500)  # Should not crash
+
+    def test_failed_forward_preserves_min_std(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = GaussianThompsonState()
+        state.posterior_mean = 500.0
+        state.posterior_std = float(GaussianThompsonState.MIN_STD)
+        cfs = ChannelFeeState(thompson=state)
+        fc._channel_fee_states["123x1x0"] = cfs
+
+        fc.record_failed_forward("123x1x0", 500)
+
+        # Std should never drop below MIN_STD
+        assert state.posterior_std >= GaussianThompsonState.MIN_STD
