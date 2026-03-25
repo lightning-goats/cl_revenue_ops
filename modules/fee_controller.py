@@ -1773,7 +1773,7 @@ class FeeController:
                 capacity = max(1, ch.get("satoshis", ch.get("amount_msat", 1000000) // 1000))
                 # Weight by recency (recently updated = more active)
                 last_update = ch.get("last_update", 0)
-                age_days = max(0.1, (now - last_update) / 86400) if last_update > 0 else 30.0
+                age_days = max(0.1, max(0, now - last_update) / 86400) if last_update > 0 else 30.0
                 recency_weight = 1.0 / age_days  # Recent channels weight more
                 weight = (capacity / 1_000_000) * recency_weight
                 weighted_fees.append((fee_ppm, weight))
@@ -1812,7 +1812,9 @@ class FeeController:
             amount_sats = int(row.get("amount_sats", 0) or 0)
             if amount_sats <= 0 or cost_sats <= 0:
                 return 0
-            return int((cost_sats * 1_000_000) / amount_sats)
+            cost_ppm = int((cost_sats * 1_000_000) / amount_sats)
+            # Cap at 5000 PPM to prevent astronomical values from tiny rebalances
+            return min(5000, cost_ppm)
         except Exception:
             return 0
 
@@ -3701,11 +3703,8 @@ class FeeController:
                                 (prior_prec * ts.posterior_mean + obs_prec * neighbor_median) / total_prec
                             )
                             ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
-            bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
-            if bounded_target_ppm != post_pid_target_ppm:
-                bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
-
             # Rebalance cost awareness: routing-value-scaled nudge toward cost recovery
+            # Applied BEFORE bounding so the nudge actually reaches the blending step.
             # Channels with real routing revenue get a stronger nudge because the
             # rebalance cost can actually be recovered. Stagnant channels get a
             # weaker nudge — no point pushing fees up on a dead channel.
@@ -3732,6 +3731,10 @@ class FeeController:
                     f"revenue={current_revenue_rate:.1f}sats/hr, cost={rebalance_cost_ppm}ppm)",
                     level='debug'
                 )
+
+            bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
+            if bounded_target_ppm != post_pid_target_ppm:
+                bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
 
             blended_target_ppm, blend_info = self._blend_fee_target(
                 current_fee_ppm=current_fee_ppm,
