@@ -3718,6 +3718,40 @@ class FeeController:
                                 (prior_prec * ts.posterior_mean + obs_prec * neighbor_median) / total_prec
                             )
                             ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
+            # Competitive undercut: target 10% below neighbor median to attract traffic.
+            # Only applies when we're ABOVE the undercut target (never pushes fees UP).
+            # On sparse channels, also biases the DTS posterior toward the undercut
+            # target so the learning converges there instead of at the market median.
+            # Once real forward data arrives, DTS takes over and may move the fee
+            # above or below the undercut level based on actual demand.
+            if neighbor_median is not None:
+                undercut_target = int(neighbor_median * 0.90)  # 10% below market
+                undercut_target = max(floor_ppm, undercut_target)  # Never below floor
+
+                # Pipeline: cap target at undercut level (only pulls DOWN)
+                if post_pid_target_ppm > undercut_target:
+                    pre_undercut = post_pid_target_ppm
+                    post_pid_target_ppm = undercut_target
+                    self.plugin.log(
+                        f"FEE: {channel_id[:16]}... competitive undercut: "
+                        f"{pre_undercut}->{undercut_target}ppm "
+                        f"(market={neighbor_median}, target=90%)",
+                        level='debug'
+                    )
+
+                # Posterior: bias DTS learning toward undercut on sparse channels
+                if sparse_data_conservative and ts_state and ts_state.thompson:
+                    ts = ts_state.thompson
+                    if ts.posterior_mean > undercut_target and ts.posterior_std >= 50:
+                        prior_prec = 1.0 / max(ts.MIN_STD ** 2, ts.posterior_std ** 2)
+                        obs_prec = prior_prec * 0.10  # 10% weight
+                        total_prec = prior_prec + obs_prec
+                        if total_prec > 0:
+                            ts.posterior_mean = float(
+                                (prior_prec * ts.posterior_mean + obs_prec * undercut_target) / total_prec
+                            )
+                            ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
+
             # Rebalance cost awareness: routing-value-scaled nudge toward cost recovery
             # Applied BEFORE bounding so the nudge actually reaches the blending step.
             # Channels with real routing revenue get a stronger nudge because the
