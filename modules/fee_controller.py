@@ -2932,12 +2932,19 @@ class FeeController:
         self,
         woke_from_sleep: bool,
         sparse_data_conservative: bool,
+        posterior_std: float = 100.0,
     ) -> float:
         ratio = self.NORMAL_TARGET_BLEND_RATIO
         if woke_from_sleep:
             ratio = min(ratio, self.WAKE_TARGET_BLEND_RATIO)
         if sparse_data_conservative:
             ratio = min(ratio, self.SPARSE_TARGET_BLEND_RATIO)
+
+        # Confidence boost: tight posterior → faster convergence
+        if posterior_std < 100.0 and not sparse_data_conservative:
+            confidence_factor = 1.0 + max(0.0, (100.0 - posterior_std) / 100.0)
+            ratio = min(0.60, ratio * confidence_factor)  # Cap at 60%
+
         return ratio
 
     def _blend_fee_target(
@@ -2946,11 +2953,13 @@ class FeeController:
         bounded_target_ppm: int,
         woke_from_sleep: bool,
         sparse_data_conservative: bool,
+        posterior_std: float = 100.0,
     ) -> Tuple[int, Dict[str, Any]]:
         """Move part-way toward the bounded target before delta capping."""
         blend_ratio = self._get_target_blend_ratio(
             woke_from_sleep=woke_from_sleep,
             sparse_data_conservative=sparse_data_conservative,
+            posterior_std=posterior_std,
         )
         requested_delta = int(bounded_target_ppm) - int(current_fee_ppm)
         blended_delta = int(round(requested_delta * blend_ratio))
@@ -3604,6 +3613,7 @@ class FeeController:
                 bounded_target_ppm=bounded_target_ppm,
                 woke_from_sleep=woke_from_sleep,
                 sparse_data_conservative=sparse_data_conservative,
+                posterior_std=ts_state.thompson.posterior_std,
             )
             target_blend_ratio = blend_info["blend_ratio"]
             new_fee_ppm, damping_info = self._apply_damped_fee_target(

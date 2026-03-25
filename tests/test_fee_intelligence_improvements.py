@@ -153,3 +153,21 @@ class TestFailedForwardObservation:
 
         # Std should never drop below MIN_STD
         assert state.posterior_std >= GaussianThompsonState.MIN_STD
+
+
+class TestConfidenceScaledBlend:
+    def test_high_confidence_increases_blend(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        sparse_ratio = fc._get_target_blend_ratio(False, True, posterior_std=100.0)
+        confident_ratio = fc._get_target_blend_ratio(False, False, posterior_std=20.0)
+        assert confident_ratio > sparse_ratio
+
+    def test_blend_capped_at_sixty_percent(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        ratio = fc._get_target_blend_ratio(False, False, posterior_std=1.0)
+        assert ratio <= 0.60
+
+    def test_sparse_data_not_boosted(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        ratio = fc._get_target_blend_ratio(False, True, posterior_std=10.0)
+        assert ratio == 0.10  # Sparse rate, no confidence boost
