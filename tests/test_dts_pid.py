@@ -950,6 +950,8 @@ def _make_fc_for_dts_pid(mock_plugin, mock_database):
     }
     mock_database.get_last_forward_time.return_value = int(time.time()) - 1800
     mock_database.get_failure_count.return_value = (0, 0)
+    mock_database.get_last_rebalance_cost.return_value = None
+    mock_database.get_historical_inbound_fee_ppm.return_value = None
     mock_database.get_channel_cost_history.return_value = []
     mock_database.get_channel_rebalance_success_rate.return_value = None
     mock_database.get_peer_latency_stats.return_value = {"avg": 0.0, "std": 0.0, "count": 0}
