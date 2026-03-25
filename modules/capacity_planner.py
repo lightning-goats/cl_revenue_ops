@@ -410,6 +410,20 @@ class CapacityPlanner:
 
         from .profitability_analyzer import ProfitabilityClass, ChannelRole
 
+        # Route-pair protection: channels on top revenue routes get higher closure bar
+        route_pair_channels = set()
+        db = self.profitability.database if self.profitability else None
+        if db:
+            try:
+                pairs = db.get_top_route_pairs(days=30, min_forwards=3, limit=10)
+                for p in pairs:
+                    for key in ("in_channel", "out_channel"):
+                        ch = str(p.get(key, "")).replace(":", "x")
+                        if ch:
+                            route_pair_channels.add(ch)
+            except Exception:
+                pass
+
         # Get bleeder classification for all channels
         bleeders = {}
         try:
@@ -466,6 +480,11 @@ class CapacityPlanner:
             # If inbound gateway, require much worse marginal ROI before closure
             if is_inbound_gateway and prof.marginal_roi_percent > -50.0:
                 continue  # Protect inbound gateways
+
+            # Route-pair protection: channels on proven revenue routes have network value
+            # beyond their individual ROI.  Closing one kills the paired channel's revenue.
+            if scid_display in route_pair_channels and prof.marginal_roi_percent > -30.0:
+                continue  # Protect revenue route channels
 
             # Hard bleeder bypass -- skip defibrillation gate
             bleeder_info = bleeders.get(scid)

@@ -2389,16 +2389,22 @@ class EVRebalancer:
                 push_candidates.sort(key=lambda c: c.expected_profit_sats, reverse=True)
                 candidates.extend(push_candidates[:remaining_slots])
 
-            # Route-pair awareness: boost channels that are outbound legs of top revenue routes
+            # Route-pair awareness: identify channels on proven revenue routes
             route_pair_out_channels = set()
+            route_pair_in_channels = set()
             try:
                 pairs = self.database.get_top_route_pairs(days=30, min_forwards=3, limit=10)
                 for p in pairs:
                     out_ch = str(p.get("out_channel", "")).replace(":", "x")
+                    in_ch = str(p.get("in_channel", "")).replace(":", "x")
                     if out_ch:
                         route_pair_out_channels.add(out_ch)
+                    if in_ch:
+                        route_pair_in_channels.add(in_ch)
             except Exception:
                 pass
+            # Store for use in _select_source_candidates
+            self._cycle_route_pair_in_channels = route_pair_in_channels
 
             # Sort by priority
             def sort_key(c):
@@ -3735,6 +3741,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                                 score -= 20  # Avoid draining sources the fleet says are already draining
                 except Exception:
                     pass
+
+            # Route-pair bonus: inbound revenue legs are ideal sources.
+            # Draining local balance creates headroom for the inbound traffic
+            # that generates fees on this route.
+            route_pair_ins = getattr(self, '_cycle_route_pair_in_channels', set())
+            if normalized in route_pair_ins:
+                score += 40
 
             # RELIABILITY PENALTY: Penalize sources with recent failures
             fails = self.job_manager.get_source_failure_count(cid)
