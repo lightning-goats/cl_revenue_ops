@@ -293,6 +293,7 @@ class TestBoundedExplorationEndToEnd:
 
         mock_database.get_channel_probe.return_value = {"started": int(time.time()) - 7200}
         mock_database.clear_channel_probe = MagicMock()
+        mock_database.get_last_rebalance_cost.return_value = None
         mock_database.get_volume_since.return_value = 0
         mock_database.get_forward_count_since.return_value = 0
         mock_database.get_peer_uptime_percent.return_value = 100.0

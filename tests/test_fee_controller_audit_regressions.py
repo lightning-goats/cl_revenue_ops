@@ -230,6 +230,7 @@ class TestFeePriorityChain:
 
         # Database mocks
         mock_database.get_channel_probe.return_value = None
+        mock_database.get_last_rebalance_cost.return_value = None
         mock_database.get_volume_since.return_value = 1000
         mock_database.get_forward_count_since.return_value = 5
         mock_database.get_peer_uptime_percent.return_value = 100.0
@@ -358,6 +359,7 @@ class TestAdjustChannelFeeEndToEnd:
 
         # Database
         mock_database.get_channel_probe.return_value = None
+        mock_database.get_last_rebalance_cost.return_value = None
         mock_database.get_volume_since.return_value = 50_000
         mock_database.get_forward_count_since.return_value = 10
         mock_database.get_peer_uptime_percent.return_value = 99.5
