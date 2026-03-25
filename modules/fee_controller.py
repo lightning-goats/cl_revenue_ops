@@ -3643,6 +3643,20 @@ class FeeController:
                         level='debug'
                     )
                     post_pid_target_ppm = adjusted
+
+                # Sparse channel learning: feed neighbor median as weak DTS
+                # observation so the posterior tightens even without forwards.
+                if sparse_data_conservative and ts_state and ts_state.thompson:
+                    ts = ts_state.thompson
+                    if ts.posterior_std >= 100:  # Still very uncertain
+                        prior_prec = 1.0 / max(ts.MIN_STD ** 2, ts.posterior_std ** 2)
+                        obs_prec = prior_prec * 0.15  # 15% weight — weaker than forward
+                        total_prec = prior_prec + obs_prec
+                        if total_prec > 0:
+                            ts.posterior_mean = float(
+                                (prior_prec * ts.posterior_mean + obs_prec * neighbor_median) / total_prec
+                            )
+                            ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
             bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
             if bounded_target_ppm != post_pid_target_ppm:
                 bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
