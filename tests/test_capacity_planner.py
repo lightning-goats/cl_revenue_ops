@@ -1056,6 +1056,27 @@ class TestEnrichedLosers:
         # So at exactly -50.0, the channel is NOT protected
         assert len(losers) == 1
 
+    def test_route_pair_protection_uses_corridor_role_not_competition_bias(self):
+        """Competition bias alone must not grant corridor-level close protection."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof(scid=scid, marginal_roi_percent=-40.0)
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+        prof_analyzer.database.get_top_route_pairs.return_value = [
+            {"in_channel": scid, "out_channel": "900x1x0", "total_fee_msat": 50_000, "forward_count": 5}
+        ]
+
+        planner.hive_hints = MagicMock()
+        planner.hive_hints.is_hive_member.return_value = False
+        planner.hive_hints.get_corridor_role.return_value = "none"
+        planner.hive_hints.get_fee_bias.return_value = 1.02
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+
 
 class TestPeerDiscovery:
     """Test peer discovery strategies 1 (winners) and 2 (neighbors)."""
@@ -1250,6 +1271,54 @@ class TestPeerDiscovery:
         candidates = planner._discover_from_neighbors(all_profitability)
         assert len(candidates) == 1
         assert candidates[0]["score"] == 0.1  # Floor applied
+
+    def test_discover_from_route_pairs_considers_all_route_peers(self):
+        """Strategy 5 should not silently drop the 6th profitable route peer."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        def listchannels_side_effect(source):
+            return {
+                "channels": [
+                    {
+                        "source": source,
+                        "destination": f"neighbor_for_{source}",
+                        "amount_msat": "2000000000msat",
+                        "fee_per_millionth": 100,
+                    }
+                ]
+            }
+
+        plugin.rpc.listchannels.side_effect = listchannels_side_effect
+
+        prof_analyzer = MagicMock()
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        all_profitability = {}
+        route_rows = []
+        for index in range(6):
+            scid = f"{index + 1}x1x0"
+            peer_id = f"route_peer_{index}"
+            prof = MagicMock()
+            prof.peer_id = peer_id
+            prof.channel_id = scid
+            prof.scid = scid
+            all_profitability[scid] = prof
+            route_rows.append({
+                "in_channel": scid,
+                "out_channel": f"{index + 1}x1x1",
+                "total_fee_msat": (index + 1) * 10_000,
+                "forward_count": 5,
+            })
+
+        prof_analyzer.database.get_top_route_pairs.return_value = route_rows
+
+        candidates = planner._discover_from_route_pairs(all_profitability)
+
+        assert len(candidates) == 6
+        assert {c["peer_id"] for c in candidates} == {
+            f"neighbor_for_route_peer_{index}" for index in range(6)
+        }
 
     def test_discover_peers_deduplicates_by_peer_id(self):
         """Orchestrator deduplicates candidates, keeping highest score."""

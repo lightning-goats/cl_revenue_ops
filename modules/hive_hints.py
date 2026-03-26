@@ -25,6 +25,8 @@ REBAL_QUALITY_WEIGHT = 0.05    # peer_quality_score: +/-5%
 class HiveHintAdapter:
     """Adapter that polls cl_hive for fleet hints and exposes bounded bias lookups."""
 
+    VALID_CORRIDOR_ROLES = {"owner", "secondary", "contested", "none"}
+
     def __init__(self, plugin, ttl_override: int = 0):
         self._plugin = plugin
         self._ttl_override = ttl_override
@@ -95,6 +97,14 @@ class HiveHintAdapter:
         """Return True if peer is a hive fleet member. False if unavailable/stale."""
         hint = self._get_peer_hint(peer_id)
         return bool(hint.get("member", False))
+
+    def get_corridor_role(self, peer_id: str) -> str:
+        """Return validated corridor_role, or 'none' if unavailable."""
+        hint = self._get_peer_hint(peer_id)
+        role = hint.get("corridor_role")
+        if role in self.VALID_CORRIDOR_ROLES:
+            return role
+        return "none"
 
     # ------------------------------------------------------------------
     # Fee bias

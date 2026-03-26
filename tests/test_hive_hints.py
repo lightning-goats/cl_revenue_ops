@@ -281,6 +281,28 @@ class TestDiagnostics:
         assert "snapshot_age_seconds" in status
 
 
+class TestCorridorRole:
+    def test_returns_valid_corridor_role_for_fresh_snapshot(self, mock_plugin):
+        snapshot = dict(VALID_SNAPSHOT)
+        snapshot["generated_at"] = int(time.time())
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_corridor_role("02aabbcc") == "owner"
+        assert adapter.get_corridor_role("02ddeeff") == "secondary"
+
+    def test_returns_none_for_unknown_or_stale_snapshot(self, mock_plugin):
+        snapshot = dict(VALID_SNAPSHOT)
+        snapshot["generated_at"] = int(time.time()) - 2000
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_corridor_role("02unknown") == "none"
+        assert adapter.get_corridor_role("02aabbcc") == "none"
+
+
 # ---------------------------------------------------------------------------
 # Safety rail preservation
 # ---------------------------------------------------------------------------

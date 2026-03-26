@@ -496,8 +496,8 @@ class CapacityPlanner:
             is_hive_corridor = False
             if self.hive_hints is not None:
                 try:
-                    fee_bias = self.hive_hints.get_fee_bias(prof.peer_id)
-                    is_hive_corridor = fee_bias != 1.0  # Any non-neutral bias = corridor member
+                    corridor_role = self.hive_hints.get_corridor_role(prof.peer_id)
+                    is_hive_corridor = corridor_role in {"owner", "secondary", "contested"}
                 except Exception:
                     pass
             if is_on_revenue_route:
@@ -856,24 +856,27 @@ class CapacityPlanner:
 
         # For the top pairs, find which peers are involved and look for their neighbors
         candidates = []
-        pair_peers = set()  # Peers already on profitable routes
+        route_peer_scores = {}
         for row in rows:
             in_ch = str(row['in_channel']).replace(':', 'x')
             out_ch = str(row['out_channel']).replace(':', 'x')
             total_fee_sats = int(row['total_fee_msat']) // 1000
-            fwd_count = int(row['forward_count'])
 
             in_peer = channel_to_peer.get(in_ch)
             out_peer = channel_to_peer.get(out_ch)
             if in_peer:
-                pair_peers.add(in_peer)
+                route_peer_scores[in_peer] = route_peer_scores.get(in_peer, 0) + total_fee_sats
             if out_peer:
-                pair_peers.add(out_peer)
+                route_peer_scores[out_peer] = route_peer_scores.get(out_peer, 0) + total_fee_sats
 
         # For each peer on a profitable route, find THEIR neighbors as candidates
         # The logic: if peer A → us → peer B is a profitable route,
         # then A's other neighbors and B's other neighbors are likely also valuable
-        for route_peer in list(pair_peers)[:5]:
+        ranked_route_peers = [
+            peer_id for peer_id, _score in
+            sorted(route_peer_scores.items(), key=lambda item: item[1], reverse=True)
+        ]
+        for route_peer in ranked_route_peers:
             try:
                 channels = self.plugin.rpc.listchannels(source=route_peer)
                 for ch in channels.get("channels", []):
