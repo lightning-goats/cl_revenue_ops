@@ -172,9 +172,11 @@ class TestLiveHiveContract:
         hints = adapter._snapshot["hints"]
 
         assert hints[PEER_QUALITY]["peer_quality_score"] == 0.81
+        assert hints[PEER_QUALITY]["traffic_confidence"] == 0.3
         assert hints[PEER_QUALITY]["member"] is False
         assert hints[PEER_TRAFFIC]["traffic_confidence"] == 0.73
         assert hints[PEER_TRAFFIC]["member"] is False
+        assert adapter.get_rebalance_bias(PEER_QUALITY) > 1.0
 
     def test_dominant_rebalance_direction_flows_through(self, live_snapshot):
         adapter = _build_adapter(live_snapshot)

@@ -303,6 +303,47 @@ class TestCorridorRole:
         assert adapter.get_corridor_role("02aabbcc") == "none"
 
 
+class TestCorridorUtilizationBias:
+    def test_owner_biases_up(self, mock_plugin):
+        snapshot = dict(VALID_SNAPSHOT)
+        snapshot["generated_at"] = int(time.time())
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        bias = adapter.get_corridor_utilization_bias("02aabbcc")
+        assert bias > 1.0
+        assert bias <= 1.1
+
+    def test_secondary_biases_down(self, mock_plugin):
+        snapshot = dict(VALID_SNAPSHOT)
+        snapshot["generated_at"] = int(time.time())
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        bias = adapter.get_corridor_utilization_bias("02ddeeff")
+        assert bias < 1.0
+        assert bias >= 0.9
+
+    def test_zero_confidence_neutralizes(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02peer": {
+                    "corridor_role": "owner",
+                    "traffic_confidence": 0.0,
+                },
+            },
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_corridor_utilization_bias("02peer") == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Safety rail preservation
 # ---------------------------------------------------------------------------

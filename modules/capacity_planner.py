@@ -1268,18 +1268,10 @@ class CapacityPlanner:
             # Assume 30% utilization and 150 PPM average fee
             daily_revenue = channel_size_sats * 0.3 * 150 / 1_000_000
 
-        # Hive demand signal: fleet says this peer is sink (receiving) or source (draining)
+        # Hive demand signal: apply bounded, confidence-weighted fleet bias
         if self.hive_hints:
             try:
-                hint = self.hive_hints._get_peer_hint(peer_id)
-                if hint:
-                    pref = hint.get("rebalance_preference")
-                    if pref == "sink":
-                        # Fleet sees inbound flow — opening here meets demand
-                        daily_revenue *= 1.25  # 25% boost
-                    elif pref == "source":
-                        # Fleet sees outbound flow — we'd compete with drain
-                        daily_revenue *= 0.80  # 20% reduction
+                daily_revenue *= self.hive_hints.get_rebalance_bias(peer_id)
             except Exception:
                 pass
 

@@ -14,12 +14,15 @@ import time
 # Hard-coded bias caps -- not configurable by design
 MAX_FEE_BIAS = 0.10          # +/-10% max fee effect
 MAX_REBALANCE_BIAS = 0.15    # +/-15% max rebalance score effect
+MAX_CORRIDOR_UTILIZATION_BIAS = 0.10  # +/-10% max utilization effect
 
 # Per-field contribution weights
 FEE_CORRIDOR_WEIGHT = 0.03   # corridor_role: +/-3%
 FEE_COMPETITION_WEIGHT = 0.02  # competition_bias: +/-2%
 REBAL_PREFERENCE_WEIGHT = 0.05  # rebalance_preference: +/-5%
 REBAL_QUALITY_WEIGHT = 0.05    # peer_quality_score: +/-5%
+CORRIDOR_OWNER_UTILIZATION_WEIGHT = 0.10
+CORRIDOR_SECONDARY_UTILIZATION_WEIGHT = 0.05
 
 
 class HiveHintAdapter:
@@ -105,6 +108,28 @@ class HiveHintAdapter:
         if role in self.VALID_CORRIDOR_ROLES:
             return role
         return "none"
+
+    def get_corridor_utilization_bias(self, peer_id: str) -> float:
+        """Return utilization multiplier from corridor role in [0.9, 1.1]. 1.0 if unavailable."""
+        hint = self._get_peer_hint(peer_id)
+        if not hint:
+            return 1.0
+
+        confidence = hint.get("traffic_confidence")
+        if not isinstance(confidence, (int, float)) or confidence <= 0:
+            return 1.0
+        confidence = min(confidence, 1.0)
+
+        role = self.get_corridor_role(peer_id)
+        bias = 0.0
+        if role == "owner":
+            bias += CORRIDOR_OWNER_UTILIZATION_WEIGHT
+        elif role == "secondary":
+            bias -= CORRIDOR_SECONDARY_UTILIZATION_WEIGHT
+
+        bias *= confidence
+        bias = max(-MAX_CORRIDOR_UTILIZATION_BIAS, min(MAX_CORRIDOR_UTILIZATION_BIAS, bias))
+        return 1.0 + bias
 
     # ------------------------------------------------------------------
     # Fee bias

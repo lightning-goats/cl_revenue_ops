@@ -2388,6 +2388,21 @@ class TestOpenEV:
         # Should not crash; uses ChainCostDefaults fallback
         assert isinstance(ev, float)
 
+    def test_ev_uses_public_rebalance_bias_from_hive_hints(self):
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 1000}},
+            closed_summary=None,
+        )
+        planner.hive_hints = MagicMock(spec=["get_rebalance_bias"])
+        planner.hive_hints.get_rebalance_bias.return_value = 1.10
+        cfg = self._make_cfg()
+
+        ev = planner._calculate_open_ev("peer1", 5000000, cfg)
+
+        daily_revenue = (5000000 * 0.3 * 150 / 1_000_000) * 1.10
+        expected_ev = (daily_revenue * 180) - ((daily_revenue * 0.1) * 180) - (140 + 200)
+        assert abs(ev - expected_ev) < 1.0
+
     def test_ev_negative_closed_summary_uses_fallback(self):
         """Negative daily_net_est_sats in closed summary triggers fallback."""
         planner = self._make_planner(
