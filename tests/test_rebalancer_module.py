@@ -139,6 +139,141 @@ class TestManualRebalanceBudgetBypass:
         mock_database.reserve_budget.assert_not_called()
 
 
+class TestHiveLiquidityReporting:
+    def test_build_hive_liquidity_state_payload_includes_directional_needs_and_activity(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer, ActiveJob, JobStatus
+
+        cfg = Config(dry_run=True)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        source_peer = "02" + "c" * 64
+        dest_peer = "02" + "d" * 64
+        running_candidate = _candidate(
+            primary_source_peer_id=source_peer,
+            to_peer_id=dest_peer,
+            amount_sats=75_000,
+        )
+        r.job_manager._active_jobs["222x333x0"] = ActiveJob(
+            scid="222:333:0",
+            scid_normalized="222x333x0",
+            source_candidates=["111:222:0"],
+            start_time=int(time.time()),
+            candidate=running_candidate,
+            rebalance_id=1,
+            target_amount_sats=75_000,
+            initial_local_sats=100_000,
+            max_fee_ppm=2_000,
+            status=JobStatus.RUNNING,
+        )
+
+        depleted_channels = [
+            ("222x333x0", {"peer_id": dest_peer, "capacity": 2_000_000}, 0.05),
+        ]
+        source_channels = [
+            ("111x222x0", {"peer_id": source_peer, "capacity": 3_000_000}, 0.95),
+        ]
+        profitable_candidates = [
+            _candidate(
+                primary_source_peer_id=source_peer,
+                to_peer_id=dest_peer,
+                amount_sats=75_000,
+            )
+        ]
+
+        payload = r._build_hive_liquidity_state_payload(
+            depleted_channels,
+            source_channels,
+            profitable_candidates,
+        )
+
+        assert payload["depleted_channels"] == [{
+            "peer_id": dest_peer,
+            "local_pct": 0.05,
+            "capacity_sats": 2_000_000,
+        }]
+        assert payload["saturated_channels"] == [{
+            "peer_id": source_peer,
+            "local_pct": 0.95,
+            "capacity_sats": 3_000_000,
+        }]
+        assert payload["rebalancing_active"] is True
+        assert set(payload["rebalancing_peers"]) == {source_peer, dest_peer}
+        assert payload["liquidity_needs"][0]["source_peer_id"] == source_peer
+        assert payload["liquidity_needs"][0]["destination_peer_id"] == dest_peer
+        assert payload["liquidity_needs"][0]["capacity_sats"] == 75_000
+
+    def test_report_hive_liquidity_state_calls_local_rpc(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        depleted_channels = [
+            ("222x333x0", {"peer_id": "02" + "d" * 64, "capacity": 2_000_000}, 0.05),
+        ]
+        source_channels = [
+            ("111x222x0", {"peer_id": "02" + "c" * 64, "capacity": 3_000_000}, 0.95),
+        ]
+
+        r._report_hive_liquidity_state(depleted_channels, source_channels, [])
+
+        calls = _rpc_calls_for(mock_plugin, "hive-report-liquidity-state")
+        assert len(calls) == 1
+        params = calls[0][0][1]
+        assert params["depleted_channels"][0]["peer_id"] == "02" + "d" * 64
+        assert params["saturated_channels"][0]["peer_id"] == "02" + "c" * 64
+
+    def test_find_rebalance_candidates_reports_state_even_without_profitable_candidates(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            dry_run=True,
+            low_liquidity_threshold=0.2,
+            high_liquidity_threshold=0.8,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        source_peer = "02" + "c" * 64
+        dest_peer = "02" + "d" * 64
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x222x0": {
+                "peer_id": source_peer,
+                "capacity": 3_000_000,
+                "spendable_sats": 2_900_000,
+            },
+            "222x333x0": {
+                "peer_id": dest_peer,
+                "capacity": 2_000_000,
+                "spendable_sats": 100_000,
+            },
+        })
+        r._analyze_rebalance_ev = MagicMock(return_value=None)
+
+        result = r.find_rebalance_candidates()
+
+        assert result == []
+        calls = _rpc_calls_for(mock_plugin, "hive-report-liquidity-state")
+        assert len(calls) == 1
+        params = calls[0][0][1]
+        assert params["depleted_channels"][0]["peer_id"] == dest_peer
+        assert params["saturated_channels"][0]["peer_id"] == source_peer
+
+
 class TestJobMonitorPrefersSlingStats:
     def test_monitor_jobs_treats_success_count_as_success_even_if_balance_delta_zero(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -1382,6 +1517,3 @@ class TestLastDecisionSummary:
         assert summary["dominant_input"] == "daily_budget_sats"
         assert summary["safety_block"] is True
         assert summary["budget_blocked"] is True
-
-
-

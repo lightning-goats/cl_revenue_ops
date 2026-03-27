@@ -1944,6 +1944,86 @@ class EVRebalancer:
             "cycle_ts": self._last_cycle_ts,
         }
 
+    def _build_hive_liquidity_state_payload(
+        self,
+        depleted_channels: List[Tuple[str, Dict[str, Any], float]],
+        source_channels: List[Tuple[str, Dict[str, Any], float]],
+        candidates: List[RebalanceCandidate],
+    ) -> Dict[str, Any]:
+        """Build a local cl-hive liquidity-state payload from the current cycle."""
+        depleted_payload = []
+        for _channel_id, info, local_pct in depleted_channels:
+            peer_id = str(info.get("peer_id") or "").strip()
+            capacity_sats = int(info.get("capacity", 0) or 0)
+            if not peer_id:
+                continue
+            depleted_payload.append({
+                "peer_id": peer_id,
+                "local_pct": float(local_pct),
+                "capacity_sats": capacity_sats,
+            })
+
+        saturated_payload = []
+        for _channel_id, info, local_pct in source_channels:
+            peer_id = str(info.get("peer_id") or "").strip()
+            capacity_sats = int(info.get("capacity", 0) or 0)
+            if not peer_id:
+                continue
+            saturated_payload.append({
+                "peer_id": peer_id,
+                "local_pct": float(local_pct),
+                "capacity_sats": capacity_sats,
+            })
+
+        liquidity_needs = []
+        seen_pairs = set()
+        for candidate in candidates[:10]:
+            source_peer_id = str(candidate.primary_source_peer_id or "").strip()
+            destination_peer_id = str(candidate.to_peer_id or "").strip()
+            if (
+                not source_peer_id
+                or not destination_peer_id
+                or source_peer_id == destination_peer_id
+            ):
+                continue
+            pair = (source_peer_id, destination_peer_id)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            liquidity_needs.append({
+                "source_peer_id": source_peer_id,
+                "destination_peer_id": destination_peer_id,
+                "capacity_sats": int(candidate.amount_sats),
+                "priority_tier": "high" if candidate.expected_profit_sats > 0 else "medium",
+                "flow_state": candidate.dest_flow_state,
+                "expected_profit_sats": int(candidate.expected_profit_sats),
+            })
+
+        return {
+            "depleted_channels": depleted_payload,
+            "saturated_channels": saturated_payload,
+            "rebalancing_active": self.job_manager.active_job_count > 0,
+            "rebalancing_peers": self.job_manager.get_active_rebalancing_peers(),
+            "liquidity_needs": liquidity_needs,
+        }
+
+    def _report_hive_liquidity_state(
+        self,
+        depleted_channels: List[Tuple[str, Dict[str, Any], float]],
+        source_channels: List[Tuple[str, Dict[str, Any], float]],
+        candidates: List[RebalanceCandidate],
+    ) -> None:
+        """Fail-open local report of current liquidity state into cl-hive."""
+        payload = self._build_hive_liquidity_state_payload(
+            depleted_channels,
+            source_channels,
+            candidates,
+        )
+        try:
+            self.plugin.rpc.call("hive-report-liquidity-state", payload)
+        except Exception as e:
+            self.plugin.log(f"HIVE: liquidity state report failed: {e}", level='debug')
+
     def _get_hive_rebalance_bias(self, peer_id: str) -> float:
         """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""
         if self.hive_hints is None:
@@ -2105,6 +2185,9 @@ class EVRebalancer:
         - Uses ephemeral fee cache for listchannels calls
         """
         candidates = []
+        channels: Dict[str, Dict[str, Any]] = {}
+        depleted_channels: List[Tuple[str, Dict[str, Any], float]] = []
+        source_channels: List[Tuple[str, Dict[str, Any], float]] = []
 
         # Initialize ephemeral fee cache for this run (cleared at end)
         self._fee_cache: Dict[Tuple[str, int], Optional[int]] = {}
@@ -2145,6 +2228,7 @@ class EVRebalancer:
                     f"No rebalance slots available ({self.job_manager.active_job_count}/"
                     f"{self.job_manager.max_concurrent_jobs} jobs active)"
                 )
+                self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
             
             # Check capital controls (pass cfg for thread-safe config access)
@@ -2156,6 +2240,7 @@ class EVRebalancer:
                     safety_block=True,
                     budget_blocked=True,
                 )
+                self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
             
             channels = self._get_channels_with_balances()
@@ -2167,6 +2252,7 @@ class EVRebalancer:
                     safety_block=False,
                     budget_blocked=False,
                 )
+                self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
             
             # Note: _peer_inbound_fees cache is now populated by _get_channels_with_balances()
@@ -2185,9 +2271,6 @@ class EVRebalancer:
                     planner_loser_scids = self._capacity_planner.get_boltz_coordination().get("loser_scids", set())
                 except Exception:
                     pass
-
-            depleted_channels = []
-            source_channels = []
 
             hot_override_depletion_thresholds = {}  # peer_id -> ratio threshold override
             try:
@@ -2274,6 +2357,7 @@ class EVRebalancer:
                     safety_block=False,
                     budget_blocked=False,
                 )
+                self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
 
             self.plugin.log(
@@ -2447,6 +2531,7 @@ class EVRebalancer:
                     safety_block=False,
                     budget_blocked=False,
                 )
+            self._report_hive_liquidity_state(depleted_channels, source_channels, selected)
             return selected
         
         finally:
