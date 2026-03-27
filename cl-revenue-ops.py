@@ -5013,6 +5013,34 @@ def _normalize_total_cost_budget_mode(mode: Optional[str]) -> str:
     return "profit_pct" if m in ("profit", "profit_pct", "profit-percent", "percentage") else "fixed"
 
 
+_CANONICAL_TOTAL_COST_LEDGER_CATEGORIES = frozenset({"channel_open", "channel_close"})
+
+
+def _normalize_generic_ledger_for_total_cost_budget(generic_ledger: Dict[str, Any]) -> Dict[str, Any]:
+    """Exclude canonical open/close spend events from the generic ledger budget bucket."""
+    normalized = dict(generic_ledger or {})
+    spent_by_category = normalized.get("spent_by_category")
+    if not isinstance(spent_by_category, dict) or not spent_by_category:
+        normalized.setdefault("counted_spent_categories", {})
+        normalized.setdefault("excluded_spent_categories", {})
+        return normalized
+
+    counted_spent_categories = {}
+    excluded_spent_categories = {}
+    for category, amount in spent_by_category.items():
+        amount_int = int(amount or 0)
+        if str(category) in _CANONICAL_TOTAL_COST_LEDGER_CATEGORIES:
+            excluded_spent_categories[str(category)] = amount_int
+        else:
+            counted_spent_categories[str(category)] = amount_int
+
+    normalized["raw_spent_24h_sats"] = int(normalized.get("spent_24h_sats", 0) or 0)
+    normalized["spent_24h_sats"] = sum(counted_spent_categories.values())
+    normalized["counted_spent_categories"] = counted_spent_categories
+    normalized["excluded_spent_categories"] = excluded_spent_categories
+    return normalized
+
+
 def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, Any]:
     """Unified budget status across rebalances, Boltz swaps, and on-chain liquidity ops."""
     if config is None or database is None:
@@ -5039,6 +5067,7 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     generic_ledger = database.get_spend_ledger_summary(window_hours=wh) if database else {
         "spent_24h_sats": 0, "reserved_24h_sats": 0, "spent_by_category": {}, "reserved_by_category": {}
     }
+    generic_ledger = _normalize_generic_ledger_for_total_cost_budget(generic_ledger)
     revenue_sats = int(database.get_total_routing_revenue(since)) if database else 0
     open_cost_sats = int(database.get_opening_costs_since(since)) if database else 0
     closure_cost_sats = int(database.get_closure_costs_since(since)) if database else 0

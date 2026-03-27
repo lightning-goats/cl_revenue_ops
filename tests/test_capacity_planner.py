@@ -2084,6 +2084,28 @@ class TestSafetyGuards:
         assert ok is False
         assert "Cooldown check failed" in reason
 
+    def test_unified_budget_blocks_when_provider_raises(self):
+        """Configured unified budget provider errors must block opens."""
+        planner = self._make_planner()
+        planner.global_budget_limit_provider = MagicMock(side_effect=Exception("budget offline"))
+
+        ok, reason = planner._check_unified_budget(estimated_cost_sats=500)
+
+        assert ok is False
+        assert "Budget check failed" in reason
+
+    def test_unified_budget_blocks_zero_budget(self):
+        """A zero effective unified budget should reject new spend."""
+        planner = self._make_planner()
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 0, "remaining_sats": 0}
+        )
+
+        ok, reason = planner._check_unified_budget(estimated_cost_sats=500)
+
+        assert ok is False
+        assert "zero limit" in reason
+
     def test_safety_guards_checks_all_pass(self):
         """_check_safety_guards passes when all checks pass for opens."""
         planner = self._make_planner(
@@ -2940,14 +2962,15 @@ class TestDirectClose:
         assert "passive" in reason
 
     def test_close_allowed_on_policy_exception(self):
-        """If policy check raises exception, close is allowed (fail-open)."""
+        """Policy lookup failures must block auto-close decisions."""
         planner, db, pm = _make_close_planner()
 
         pm.get_policy.side_effect = Exception("DB error")
 
         allowed, reason = planner._check_close_allowed("peer_abc")
 
-        assert allowed is True
+        assert allowed is False
+        assert "Policy unavailable" in reason
 
     def test_execute_close_stop_job_exception_continues(self):
         """Close proceeds even if stop_job raises an exception."""

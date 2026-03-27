@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import MagicMock
 from pathlib import Path
+from types import SimpleNamespace
 from modules.config import Config
 from tests.plugin_test_utils import load_plugin_module
 
@@ -256,6 +257,64 @@ def test_revenue_config_allows_public_resets():
 
     assert result["status"] == "success"
     assert "removed" in result["message"]
+
+
+def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
+    mod = load_plugin_module()
+    mod.config = SimpleNamespace(
+        total_cost_budget_window_hours=24,
+        reservation_timeout_hours=4,
+        total_cost_budget_mode="fixed",
+        daily_budget_sats=2000,
+        total_cost_budget_profit_pct=0.30,
+        total_cost_budget_profit_pct_cap=0.75,
+    )
+    mod.database = MagicMock()
+    mod.database.get_spend_ledger_summary.return_value = {
+        "spent_24h_sats": 72,
+        "reserved_24h_sats": 23,
+        "spent_by_category": {
+            "channel_open": 50,
+            "channel_close": 15,
+            "misc_ops": 7,
+        },
+        "reserved_by_category": {
+            "channel_open": 20,
+            "misc_ops": 3,
+        },
+    }
+    mod.database.get_total_routing_revenue.return_value = 500
+    mod.database.get_opening_costs_since.return_value = 100
+    mod.database.get_closure_costs_since.return_value = 30
+    mod._rebalance_liquidity_cost_components = MagicMock(
+        return_value={"spent_24h_sats": 11, "reserved_24h_sats": 2}
+    )
+    mod._boltz_liquidity_cost_components = MagicMock(
+        return_value={"spent_24h_sats": 5, "reserved_24h_sats": 4}
+    )
+
+    result = mod._total_cost_budget_status(window_hours=24)
+
+    assert result["actual_spent_by_category"] == {
+        "rebalance": 11,
+        "boltz": 5,
+        "open": 100,
+        "close": 30,
+        "ledger": 7,
+    }
+    assert result["actual_spent_sats"] == 153
+    assert result["reserved_by_category"] == {
+        "rebalance": 2,
+        "boltz": 4,
+        "ledger": 23,
+    }
+    assert result["reserved_sats"] == 29
+    assert result["components"]["generic_ledger"]["spent_24h_sats"] == 7
+    assert result["components"]["generic_ledger"]["counted_spent_categories"] == {"misc_ops": 7}
+    assert result["components"]["generic_ledger"]["excluded_spent_categories"] == {
+        "channel_open": 50,
+        "channel_close": 15,
+    }
 
 
 def test_revenue_status_operator_controls_hide_internal_knob_dump():

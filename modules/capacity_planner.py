@@ -1110,10 +1110,10 @@ class CapacityPlanner:
         try:
             budget_info = provider()
             if not isinstance(budget_info, dict):
-                return True, "Budget provider returned non-dict"
+                return False, "Budget provider returned non-dict"
             budget = int(budget_info.get("effective_budget_sats", 0) or 0)
             if budget <= 0:
-                return True, "Budget provider returned zero limit"
+                return False, "Unified budget provider returned zero limit"
             remaining = int(budget_info.get("remaining_sats", budget) or budget)
             # Also check external costs if available
             ext_provider = getattr(self, "external_liquidity_cost_provider", None)
@@ -1132,8 +1132,7 @@ class CapacityPlanner:
                 )
             return True, f"Unified budget OK: {remaining} remaining of {budget}"
         except Exception as e:
-            # Fail-open: don't block opens on budget provider errors
-            return True, f"Budget check failed (fail-open): {e}"
+            return False, f"Budget check failed: {e}"
 
     def _check_safety_guards(self, cfg, action_type: str, peer_id: str,
                               amount_sats: int = 0) -> tuple:
@@ -1525,6 +1524,7 @@ class CapacityPlanner:
 
         except Exception as e:
             self.plugin.log(f"Policy check failed for {peer_id[:12]}...: {e}", level='warn')
+            return False, "Policy unavailable"
 
         return True, "Close allowed"
 
