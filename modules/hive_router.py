@@ -34,6 +34,7 @@ class HiveRouter:
     """
 
     LAYER_NAME = "hive-fleet"
+    LOCAL_LAYER = "revenue-local"
 
     def __init__(self, plugin, hive_hints):
         """
@@ -47,6 +48,7 @@ class HiveRouter:
         self._member_ids: Set[str] = set()
         self._our_id: Optional[str] = None
         self._last_refresh: float = 0
+        self.profitability_analyzer = None  # Injected by main plugin
 
     def _get_our_id(self) -> Optional[str]:
         if self._our_id:
@@ -89,6 +91,7 @@ class HiveRouter:
                 self._cache_member_ids()
                 self.available = True
                 self._last_refresh = time.time()
+                self.refresh_local_layer()
                 return True
         except Exception:
             pass
@@ -185,6 +188,7 @@ class HiveRouter:
                     f"Refreshed layer ({updated} channel dirs at 0 fee, "
                     f"{len(member_ids)} fleet nodes biased)",
                 )
+            self.refresh_local_layer()
             return self.available
 
         except Exception as e:
@@ -223,7 +227,9 @@ class HiveRouter:
                 "source": our_id,
                 "destination": dest_peer_id,
                 "amount_msat": amount_msat,
-                "layers": ["auto.localchans", "auto.sourcefree", self.LAYER_NAME],
+                "layers": ["auto.localchans", "auto.sourcefree", self.LAYER_NAME,
+                           "hive-reputation", "hive-corridors", "hive-traffic",
+                           self.LOCAL_LAYER],
                 "maxfee_msat": max_fee_msat,
                 "final_cltv": 18,
             })
@@ -320,3 +326,98 @@ class HiveRouter:
         # (hive_hints may know from gossip state, but we don't have that
         # data here without RPC; return neutral for now)
         return 1.0
+
+    # ------------------------------------------------------------------
+    # revenue-local layer (profitability biases + job reservations)
+    # ------------------------------------------------------------------
+
+    PROFITABILITY_BIAS = {
+        "profitable": 3,
+        "break_even": 0,
+        "underwater": -3,
+        "stagnant_candidate": -5,
+        "zombie": -8,
+    }
+
+    def refresh_local_layer(self) -> bool:
+        """Create revenue-local layer with profitability biases.
+
+        Biases channels by their profitability classification so getroutes
+        prefers routing through profitable channels and avoids zombies.
+        """
+        if not self.plugin or not self.profitability_analyzer:
+            return False
+
+        try:
+            try:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.LOCAL_LAYER})
+            except Exception:
+                pass
+
+            self.plugin.rpc.call("askrene-create-layer", {"layer": self.LOCAL_LAYER})
+
+            channels = self.plugin.rpc.listpeerchannels()
+            biased = 0
+
+            for ch in channels.get("channels", []):
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                scid = ch.get("short_channel_id", "")
+                if not scid:
+                    continue
+
+                # Get profitability classification
+                prof = self.profitability_analyzer.get_profitability(scid)
+                if not prof:
+                    continue
+
+                classification = getattr(
+                    getattr(prof, "classification", None), "value", None
+                )
+                bias = self.PROFITABILITY_BIAS.get(classification, 0)
+                if bias == 0:
+                    continue
+
+                for direction in (0, 1):
+                    try:
+                        self.plugin.rpc.call("askrene-bias-channel", {
+                            "layer": self.LOCAL_LAYER,
+                            "short_channel_id_dir": f"{scid}/{direction}",
+                            "bias": bias,
+                            "description": f"profitability={classification}",
+                        })
+                        biased += 1
+                    except Exception:
+                        pass
+
+            if biased > 0:
+                self._log(f"Refreshed {self.LOCAL_LAYER} ({biased} profitability biases)")
+            return True
+
+        except Exception as e:
+            self._log(f"Local layer refresh failed: {e}")
+            return False
+
+    def reserve_for_job(self, scid: str, amount_msat: int) -> bool:
+        """Reserve capacity on a channel for an in-flight rebalance job."""
+        if not self.plugin:
+            return False
+        try:
+            self.plugin.rpc.call("askrene-reserve", {
+                "path": [{"short_channel_id_dir": f"{scid}/0", "amount_msat": amount_msat}]
+            })
+            return True
+        except Exception:
+            return False
+
+    def unreserve_for_job(self, scid: str, amount_msat: int) -> bool:
+        """Release reserved capacity after a rebalance job completes."""
+        if not self.plugin:
+            return False
+        try:
+            self.plugin.rpc.call("askrene-unreserve", {
+                "path": [{"short_channel_id_dir": f"{scid}/0", "amount_msat": amount_msat}]
+            })
+            return True
+        except Exception:
+            return False
