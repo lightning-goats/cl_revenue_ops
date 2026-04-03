@@ -3288,9 +3288,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 capped_budget_ppm = (max_budget_msat * 1_000_000) // amount_msat
                 max_fee_ppm = min(max_fee_ppm, max(1, capped_budget_ppm)) if capped_budget_ppm > 0 else max_fee_ppm
 
-        expected_fee_sats = self._estimate_expected_fee_sats(dest_peer_id, rebalance_amount)
-        # Never let expected fee exceed the max budget (it's a ceiling)
-        expected_fee_sats = min(expected_fee_sats, max_budget_sats)
+        # Fleet rebalances at 0 inbound cost: expected fee is near-zero
+        # (fleet peers charge 0). Don't re-estimate with _estimate_expected_fee_sats
+        # which returns the non-fleet estimate and cancels out the income.
+        if inbound_fee_ppm == 0 and weighted_opp_cost == 0:
+            expected_fee_sats = 0
+        else:
+            expected_fee_sats = self._estimate_expected_fee_sats(dest_peer_id, rebalance_amount)
+            # Never let expected fee exceed the max budget (it's a ceiling)
+            expected_fee_sats = min(expected_fee_sats, max_budget_sats)
 
         expected_profit = expected_income - expected_fee_sats - expected_source_loss
         
