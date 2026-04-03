@@ -1005,6 +1005,23 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
             if isinstance(balance_plan, dict) and 'error' in balance_plan:
                 result = balance_plan
             else:
+                # Detect when profitability data is completely missing —
+                # all channels skipped with no_profitability_data means the
+                # profitability analyzer hasn't produced results yet.
+                if isinstance(balance_plan, dict):
+                    skipped_examples = balance_plan.get("skipped_examples", [])
+                    total_candidates = balance_plan.get("total_candidates", 0)
+                    no_prof_count = sum(
+                        1 for s in skipped_examples
+                        if s.get("reason") == "no_profitability_data"
+                    )
+                    if total_candidates == 0 and no_prof_count > 0 and no_prof_count == len(skipped_examples):
+                        plugin.log(
+                            f"cl-revenue-ops: Boltz auto-cycle: all {no_prof_count} channels "
+                            "lack profitability data — profitability analyzer may not have run yet",
+                            level='warn',
+                        )
+
                 selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=balance_plan)
                 if selection.get("mode") == "balance":
                     result = revenue_boltz_balance_cycle(
@@ -1016,11 +1033,22 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                         loop_out_currency='auto',
                     )
                 else:
+                    reason = selection.get("reason", "no_eligible_boltz_actions")
+                    # Surface profitability gap in the reason
+                    if isinstance(balance_plan, dict):
+                        skipped_examples = balance_plan.get("skipped_examples", [])
+                        total_candidates = balance_plan.get("total_candidates", 0)
+                        no_prof_count = sum(
+                            1 for s in skipped_examples
+                            if s.get("reason") == "no_profitability_data"
+                        )
+                        if total_candidates == 0 and no_prof_count > 0:
+                            reason = f"no_profitability_data ({no_prof_count} channels)"
                     result = {
                         'status': 'idle',
                         'executed_count': 0,
                         'skipped_count': 0,
-                        'reason': selection.get("reason", "no_eligible_boltz_actions"),
+                        'reason': reason,
                     }
         else:
             result = revenue_boltz_expansion_treasury_cycle(
