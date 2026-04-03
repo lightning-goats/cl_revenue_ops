@@ -83,10 +83,11 @@ class TestRebalanceHiveBias:
         mock_database.get_peer_uptime_percent.return_value = 100.0
         mock_database.get_channel_state.return_value = {"state": "balanced"}
 
-        reb.hive_hints = MagicMock(spec=["get_rebalance_bias"])
+        reb.hive_hints = MagicMock(spec=["get_rebalance_bias", "is_hive_member"])
         reb.hive_hints.get_rebalance_bias.side_effect = (
             lambda peer_id: {"peer_a": 1.15, "peer_b": 0.85}[peer_id]
         )
+        reb.hive_hints.is_hive_member.return_value = False
 
         sources = [
             ("200x1x0", {"peer_id": "peer_b", "spendable_sats": 1_000_000, "capacity": 5_000_000, "fee_ppm": 50}, 0.9),
@@ -176,8 +177,9 @@ class TestRebalanceHiveBias:
             cfg=mock_config,
         )
 
-        reb.hive_hints = MagicMock(spec=["get_corridor_utilization_bias"])
+        reb.hive_hints = MagicMock(spec=["get_corridor_utilization_bias", "is_hive_member"])
         reb.hive_hints.get_corridor_utilization_bias.return_value = 1.10
+        reb.hive_hints.is_hive_member.return_value = False
         with_bias = reb._analyze_rebalance_ev(
             dest_channel="222x1x0",
             dest_info=dest_info,

@@ -129,6 +129,10 @@ class RebalanceCandidate:
     # Optional for backward compatibility; when absent, callers may fall back to primary_source_peer_id.
     source_candidate_peer_ids: List[str] = field(default_factory=list)
 
+    # Hive route discovery: if askrene found a cheap fleet route, store hop count
+    # so start_job can tighten sling's maxhops for better route matching.
+    hive_route_hops: int = 0
+
     # Backwards compatibility property
     @property
     def from_channel(self) -> str:
@@ -479,12 +483,23 @@ class JobManager:
             # - target: Flow-aware balance target
             # - outppm: Cap per-hop fee; also used as sole source signal when no candidates
             # =================================================================
+            # If askrene found a hive route, tighten maxhops so sling
+            # discovers the same short path through fleet peers.
+            maxhops = self.config.sling_max_hops
+            if candidate.hive_route_hops > 0:
+                maxhops = min(maxhops, candidate.hive_route_hops + 1)
+                self.plugin.log(
+                    f"HIVE ROUTE: Tightening maxhops to {maxhops} "
+                    f"(askrene found {candidate.hive_route_hops}-hop route)",
+                    level='debug'
+                )
+
             job_params = {
                 "scid": to_scid,
                 "direction": direction,
                 "amount": chunk_size,
                 "maxppm": maxppm,
-                "maxhops": self.config.sling_max_hops,
+                "maxhops": maxhops,
                 "target": target,
                 "paralleljobs": self.config.sling_parallel_jobs,
             }
@@ -2047,6 +2062,157 @@ class EVRebalancer:
         except Exception:
             return 1.0
 
+    # =========================================================================
+    # ASKRENE HIVE ROUTE DISCOVERY
+    # =========================================================================
+
+    def _refresh_hive_askrene_layer(self) -> bool:
+        """
+        Create or refresh an askrene layer with hive member channels at 0 fee.
+
+        This makes getroutes prefer paths through fleet peers.
+        Layer is transient (not persistent) and recreated each cycle.
+
+        Returns:
+            True if layer was successfully created, False if askrene unavailable.
+        """
+        if not self.hive_hints or not self.plugin:
+            return False
+
+        try:
+            # Remove stale layer if it exists
+            try:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": "hive-fleet"})
+            except Exception:
+                pass
+
+            # Create fresh layer
+            self.plugin.rpc.call("askrene-create-layer", {"layer": "hive-fleet"})
+
+            # Get our channels to find hive member channels
+            channels = self.plugin.rpc.listpeerchannels()
+            our_id = self._get_our_node_id()
+            if not our_id:
+                return False
+
+            updated = 0
+            for ch in channels.get("channels", []):
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                peer_id = ch.get("peer_id", "")
+                scid = ch.get("short_channel_id", "")
+                if not peer_id or not scid or not self.hive_hints.is_hive_member(peer_id):
+                    continue
+
+                # Override both directions of hive channels to 0 fee
+                for direction in (0, 1):
+                    scid_dir = f"{scid}/{direction}"
+                    try:
+                        self.plugin.rpc.call("askrene-update-channel", {
+                            "layer": "hive-fleet",
+                            "short_channel_id_dir": scid_dir,
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        })
+                        updated += 1
+                    except Exception:
+                        pass
+
+            if updated > 0:
+                self.plugin.log(
+                    f"ASKRENE: Refreshed hive-fleet layer ({updated} channel directions at 0 fee)",
+                    level='debug'
+                )
+            return updated > 0
+
+        except Exception as e:
+            # askrene not available (older CLN or plugin not loaded)
+            self.plugin.log(f"ASKRENE: Layer refresh failed (likely not available): {e}", level='debug')
+            return False
+
+    def _discover_hive_route(self, dest_peer_id: str, amount_sats: int) -> Optional[Dict]:
+        """
+        Use askrene getroutes to find a cheap circular route through hive peers.
+
+        Asks getroutes to find a path from us back to us via the destination
+        peer, using the hive-fleet layer so fleet channels are zero-fee.
+
+        Args:
+            dest_peer_id: The destination peer we want to rebalance toward
+            amount_sats: Amount to rebalance
+
+        Returns:
+            Dict with 'fee_ppm', 'hops', 'source_scid' if found, None otherwise.
+        """
+        if not self.plugin:
+            return None
+
+        our_id = self._get_our_node_id()
+        if not our_id:
+            return None
+
+        amount_msat = amount_sats * 1000
+        # Allow generous fee for discovery — we'll use the actual route cost
+        max_fee_msat = amount_msat // 100  # 1% cap for discovery
+
+        try:
+            result = self.plugin.rpc.call("getroutes", {
+                "source": our_id,
+                "destination": dest_peer_id,
+                "amount_msat": amount_msat,
+                "layers": ["auto.localchans", "auto.sourcefree", "hive-fleet"],
+                "maxfee_msat": max_fee_msat,
+                "final_cltv": 18,
+            })
+
+            routes = result.get("routes", [])
+            if not routes:
+                return None
+
+            # Take the first (best) route
+            route = routes[0]
+            path = route.get("path", [])
+            if not path:
+                return None
+
+            # Calculate total fee from the route
+            total_fee_msat = sum(
+                hop.get("amount_msat", 0) - amount_msat
+                for hop in path[:1]  # Fee is the difference at the first hop
+            ) if path else 0
+
+            # More accurate: fee = first hop amount - final amount
+            first_hop_amount = path[0].get("amount_msat", amount_msat) if path else amount_msat
+            total_fee_msat = first_hop_amount - amount_msat
+
+            fee_ppm = (total_fee_msat * 1_000_000) // amount_msat if amount_msat > 0 else 0
+
+            # Extract the source channel (first hop leaves through this channel)
+            source_scid = path[0].get("short_channel_id", "") if path else ""
+
+            hops = len(path)
+
+            self.plugin.log(
+                f"ASKRENE: Found hive route to {dest_peer_id[:12]}... "
+                f"({hops} hops, {fee_ppm} ppm, via {source_scid})",
+                level='info'
+            )
+
+            return {
+                "fee_ppm": fee_ppm,
+                "hops": hops,
+                "source_scid": source_scid,
+                "path": path,
+            }
+
+        except Exception as e:
+            self.plugin.log(
+                f"ASKRENE: Route discovery failed for {dest_peer_id[:12]}...: {e}",
+                level='debug'
+            )
+            return None
+
     @staticmethod
     def _should_skip_futility(fail_count: int, last_error_type: str) -> bool:
         """
@@ -2266,6 +2432,9 @@ class EVRebalancer:
             
             # Note: _peer_inbound_fees cache is now populated by _get_channels_with_balances()
             # This provides actual peer fees from listpeerchannels.updates.remote
+
+            # Refresh askrene hive-fleet layer for route discovery (best effort)
+            self._askrene_available = self._refresh_hive_askrene_layer()
             
             # Hoist peer connection status call - do it once instead of per-candidate
             peer_status = self._get_peer_connection_status()
@@ -2875,14 +3044,43 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         dest_peer_id = dest_info.get("peer_id", "")
 
+        # HIVE ROUTE DISCOVERY: Try askrene to find cheap routes through fleet
+        # before falling back to generic source selection.
+        hive_route = None
+        if getattr(self, '_askrene_available', False) and dest_peer_id:
+            hive_route = self._discover_hive_route(dest_peer_id, rebalance_amount)
+            if hive_route and hive_route.get("fee_ppm", 9999) < inbound_fee_ppm:
+                # Hive route is cheaper than estimated inbound — use its fee
+                inbound_fee_ppm = hive_route["fee_ppm"]
+                self.plugin.log(
+                    f"HIVE ROUTE: Using askrene-discovered fee {inbound_fee_ppm} ppm "
+                    f"for {dest_peer_id[:12]}... ({hive_route.get('hops', '?')} hops)",
+                    level='info'
+                )
+
         # Get ALL profitable source candidates (sorted by score, best first)
         source_candidates = self._select_source_candidates(
             sources, rebalance_amount, dest_channel, outbound_fee_ppm, inbound_fee_ppm,
             peer_status=peer_status,
         )
-        
-        if not source_candidates: 
+
+        if not source_candidates:
             return None
+
+        # If askrene found a hive route, boost its source channel to the top
+        if hive_route and hive_route.get("source_scid"):
+            hive_scid = hive_route["source_scid"].replace(":", "x")
+            # Move the hive route's source to position 0 if it's in the list
+            for i, (cid, info, score, opp) in enumerate(source_candidates):
+                if cid.replace(":", "x") == hive_scid:
+                    if i > 0:
+                        source_candidates.insert(0, source_candidates.pop(i))
+                        self.plugin.log(
+                            f"HIVE ROUTE: Promoted {cid} to primary source "
+                            f"(askrene route via fleet, {hive_route.get('fee_ppm', '?')} ppm)",
+                            level='info'
+                        )
+                    break
         
         # Extract just the SCIDs for the candidate list
         source_scids = [cid for cid, _, _, _ in source_candidates]
@@ -3165,6 +3363,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             dynamic_budget_override_sats=int(hot_budget_override_sats),
             dynamic_channel_profit_budget_sats=int(hot_channel_profit_budget_sats),
             recommended_cooldown_hours=float(hot_cooldown_hours),
+            hive_route_hops=hive_route.get("hops", 0) if hive_route else 0,
         )
 
     def _calculate_turnover_rate(self, channel_id: str, capacity: int) -> float:
@@ -3433,6 +3632,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         Prioritizes historical actual costs over heuristics.
 
         Priority order:
+        0. Hive member - direct channel, 0 fee
         1. Historical data (high confidence) - Use median, most accurate
         2. Historical data (medium) - Blend with last-hop fee
         3. Historical data (low) - Use with buffer
@@ -3443,6 +3643,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         Returns:
             Estimated inbound fee in PPM
         """
+        # Priority 0: Hive fleet members have direct channels with 0 fee
+        if self.hive_hints and peer_id and self.hive_hints.is_hive_member(peer_id):
+            self.plugin.log(
+                f"INBOUND FEE EST [{peer_id[:12]}...]: Hive fleet member, 0 PPM",
+                level='debug'
+            )
+            return 0
+
         # =====================================================================
         # Historical-First Fee Estimation
         # =====================================================================
@@ -3733,6 +3941,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             source_capacity = info.get("capacity", 1)
             source_turnover_rate = self._calculate_turnover_rate(cid, source_capacity)
 
+            # HIVE FLEET: If source peer is a hive member, they charge us
+            # 0 fee — the first hop is free.  This dramatically improves the
+            # spread for circular routes through the fleet.
+            is_hive_source = False
+            if self.hive_hints and pid:
+                is_hive_source = self.hive_hints.is_hive_member(pid)
+                if is_hive_source:
+                    source_fee_ppm = 0
+
             # E5 FIX: Reuse state from source protection check above (line 3244)
             # instead of making a duplicate DB query for the same channel.
             flow_state = state.get("state", "balanced") if state else "balanced"
@@ -3827,6 +4044,17 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             source_peer = info.get("peer_id", "")
             if source_peer:
                 score += int(round((self._get_hive_rebalance_bias(source_peer) - 1.0) * 200))
+
+            # HIVE FLEET BONUS: Strongly prefer hive member sources.
+            # Routes through fleet peers have a free first hop, making
+            # circular rebalances much cheaper.
+            if is_hive_source:
+                score += 200
+                self.plugin.log(
+                    f"HIVE SOURCE BONUS: +200 priority for {cid[:12]}... "
+                    f"(peer {pid[:12]}... is fleet member, fee=0)",
+                    level='debug'
+                )
 
             # Route-pair bonus: inbound revenue legs are ideal sources.
             # Draining local balance creates headroom for the inbound traffic
