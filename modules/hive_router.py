@@ -398,25 +398,33 @@ class HiveRouter:
             self._log(f"Local layer refresh failed: {e}")
             return False
 
-    def reserve_for_job(self, scid: str, amount_msat: int) -> bool:
-        """Reserve capacity on a channel for an in-flight rebalance job."""
+    def reserve_for_job(self, scid: str, amount_msat: int, direction: str = "pull") -> bool:
+        """Reserve capacity on a channel for an in-flight rebalance job.
+
+        Args:
+            scid: Channel SCID
+            amount_msat: Amount being rebalanced
+            direction: "pull" (liquidity into channel, dir=1) or "push" (out, dir=0)
+        """
         if not self.plugin:
             return False
+        askrene_dir = 1 if direction == "pull" else 0
         try:
             self.plugin.rpc.call("askrene-reserve", {
-                "path": [{"short_channel_id_dir": f"{scid}/0", "amount_msat": amount_msat}]
+                "path": [{"short_channel_id_dir": f"{scid}/{askrene_dir}", "amount_msat": amount_msat}]
             })
             return True
         except Exception:
             return False
 
-    def unreserve_for_job(self, scid: str, amount_msat: int) -> bool:
+    def unreserve_for_job(self, scid: str, amount_msat: int, direction: str = "pull") -> bool:
         """Release reserved capacity after a rebalance job completes."""
         if not self.plugin:
             return False
+        askrene_dir = 1 if direction == "pull" else 0
         try:
             self.plugin.rpc.call("askrene-unreserve", {
-                "path": [{"short_channel_id_dir": f"{scid}/0", "amount_msat": amount_msat}]
+                "path": [{"short_channel_id_dir": f"{scid}/{askrene_dir}", "amount_msat": amount_msat}]
             })
             return True
         except Exception:

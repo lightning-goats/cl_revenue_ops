@@ -271,6 +271,18 @@ class GaussianThompsonState:
 
         return int(max(floor_ppm, min(ceiling_ppm, round(optimal_fee))))
 
+    def scale_variance(self, factor: float) -> None:
+        """Scale posterior variance to encourage exploration.
+
+        Widens (factor > 1) or narrows (factor < 1) the posterior
+        standard deviation.  Capped at prior_std to prevent runaway
+        exploration beyond the original prior uncertainty.
+        """
+        self.posterior_std = min(
+            float(self.prior_std_fee),
+            max(float(self.MIN_STD), self.posterior_std * factor)
+        )
+
     def sample_fee(self, floor: int, ceiling: int) -> int:
         """
         Sample a fee from the posterior distribution.
