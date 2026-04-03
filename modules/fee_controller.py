@@ -3751,6 +3751,25 @@ class FeeController:
             # =====================================================================
             # DTS: Sample Fee from posterior
             # =====================================================================
+
+            # Centrality-based DTS exploration boost: high-centrality corridor
+            # owners may have higher fee optima.  Widen the posterior variance
+            # to encourage exploration of higher fees on structurally important peers.
+            if self.hive_hints:
+                try:
+                    centrality = self.hive_hints.get_centrality(peer_id)
+                    corridor_role = self.hive_hints.get_corridor_role(peer_id)
+                    if centrality > 0.03 and corridor_role == "owner":
+                        if hasattr(ts_state.thompson, 'scale_variance'):
+                            ts_state.thompson.scale_variance(1.5)
+                        self.plugin.log(
+                            f"DTS EXPLORE BOOST: {peer_id[:12]}... "
+                            f"(centrality={centrality:.4f}, role={corridor_role})",
+                            level='debug'
+                        )
+                except Exception:
+                    pass  # Thompson impl may not support scale_variance; graceful degradation
+
             dts_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
 
             # =============================================================
