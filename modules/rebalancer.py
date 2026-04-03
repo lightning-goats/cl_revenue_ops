@@ -3628,31 +3628,36 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         except Exception:
             pass
 
-        # No historical data - fall back to heuristics
+        # Priority 4: getroutes with fleet layers (replaces last-hop + route + fallback)
+        # All fleet intelligence (corridors, traffic, reputation, profitability)
+        # is encoded in askrene layers — a single getroutes call captures it all.
+        if self.hive_router and self.hive_router.available:
+            route = self.hive_router.discover_route(peer_id, amount_msat // 1000)
+            if route and route.fee_ppm >= 0:
+                estimate = route.fee_ppm
+                # Ensure estimate respects failure floor
+                if failed_floor > 0 and estimate <= failed_floor:
+                    estimate = failed_floor + 25
+                self.plugin.log(
+                    f"INBOUND FEE EST [{peer_id[:12]}...]: Fleet-aware getroutes "
+                    f"{estimate} PPM ({route.hops} hops, fail_floor={failed_floor})",
+                    level='debug'
+                )
+                return estimate
+
+        # Priority 5: Last-hop fee + buffer (legacy fallback when no fleet layers)
         if last_hop is not None:
             estimate = last_hop + self.config.inbound_fee_estimate_ppm
-
-            # Ensure our estimate is strictly above the proven failure floor
             if failed_floor > 0 and estimate <= failed_floor:
-                estimate = failed_floor + 25  # Small buffer above the known failure point
-
+                estimate = failed_floor + 25
             self.plugin.log(
-                f"INBOUND FEE EST [{peer_id[:12]}...]: Last-hop based "
+                f"INBOUND FEE EST [{peer_id[:12]}...]: Last-hop fallback "
                 f"{estimate} PPM (last_hop={last_hop}, fail_floor={failed_floor})",
                 level='debug'
             )
             return estimate
 
-        route_fee = self._get_route_fee_estimate(peer_id, amount_msat)
-        if route_fee:
-            self.plugin.log(
-                f"INBOUND FEE EST [{peer_id[:12]}...]: Route-based "
-                f"{route_fee} PPM",
-                level='debug'
-            )
-            return route_fee
-
-        # Ultimate fallback: use configured estimate (not hardcoded 1000 PPM)
+        # Priority 6: Configured default
         fallback = self.config.inbound_fee_estimate_ppm
         self.plugin.log(
             f"INBOUND FEE EST [{peer_id[:12]}...]: Default fallback {fallback} PPM",
