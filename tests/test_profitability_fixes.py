@@ -291,12 +291,8 @@ class TestRoiSortingAndVolume:
 
         result = analyzer.analyze_channel("111x222x0")
         assert result is not None
-        # contribution = (100 + 0) // 2 = 50; capacity = 2_000_000
-        # roi = 50 / 2_000_000 = 0.000025
-        expected_roi = 50 / 2_000_000
-        assert abs(result.roi_percent - expected_roi * 100) < 0.001
-        # Crucially, NOT 1.0 * 100 = 100%
-        assert result.roi_percent < 1.0
+        # Zero cost + positive contribution = 100% synthetic ROI (free money)
+        assert abs(result.roi_percent - 100.0) < 0.01
 
     def test_zero_cost_no_contribution_is_zero(self):
         """Zero-cost channel with no revenue -> roi = 0."""

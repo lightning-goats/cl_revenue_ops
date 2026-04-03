@@ -496,10 +496,15 @@ class ChannelProfitabilityAnalyzer:
             if costs.total_cost_sats > 0:
                 roi = net_profit / costs.total_cost_sats
             else:
-                # No costs recorded (e.g. remote open, no rebalancing)
-                # Infinite ROI if contributing value, 0 otherwise
-                # Zero-cost channels: use Return on Capacity for meaningful ranking
-                roi = total_contribution / max(1, capacity) if total_contribution > 0 else 0.0
+                # No costs recorded (e.g. remote open, no rebalancing).
+                # A channel earning revenue with zero cost is profitable by
+                # definition.  Use a synthetic ROI that guarantees PROFITABLE
+                # classification when there's real contribution, and Return on
+                # Capacity otherwise for ranking among zero-revenue peers.
+                if total_contribution > 0:
+                    roi = 1.0  # 100% — free money
+                else:
+                    roi = total_contribution / max(1, capacity)
 
             # Cost/fee per sat routed (physical throughput per channel, not double-counted)
             total_volume = max(revenue.volume_routed_sats, revenue.sourced_volume_sats)
