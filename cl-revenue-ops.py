@@ -1537,6 +1537,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if rebalancer is not None and hive_router is not None:
         rebalancer.hive_router = hive_router
 
+    if hive_router is not None and profitability_analyzer is not None:
+        hive_router.profitability_analyzer = profitability_analyzer
+
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
     # We use daemon threads so they don't block shutdown
