@@ -41,12 +41,34 @@ class HiveHintAdapter:
     # ------------------------------------------------------------------
 
     def poll(self):
-        """Fetch a fresh hint snapshot from cl_hive. Fail-open on any error."""
+        """Fetch a fresh hint snapshot. Prefers CLN datastore (fast local read),
+        falls back to hive-export-hints RPC (cross-plugin, may timeout).
+
+        cl-hive pushes hints to datastore key ["hive", "hints"] each cycle.
+        Reading from datastore is a direct lightningd call with no cross-plugin
+        round-trip, eliminating the timeout problem.
+        """
+        raw = None
+
+        # Priority 1: Read from CLN datastore (fast, no cross-plugin RPC)
         try:
-            raw = self._plugin.rpc.call("hive-export-hints")
-        except Exception as e:
-            self._plugin.log(f"HIVE_HINTS: poll failed: {e}", level='debug')
-            return
+            import json as _json
+            ds = self._plugin.rpc.listdatastore(key=["hive", "hints"])
+            entries = ds.get("datastore", [])
+            if entries:
+                data_str = entries[0].get("string", "")
+                if data_str:
+                    raw = _json.loads(data_str)
+        except Exception:
+            pass
+
+        # Priority 2: Fall back to cross-plugin RPC if datastore empty
+        if raw is None:
+            try:
+                raw = self._plugin.rpc.call("hive-export-hints")
+            except Exception as e:
+                self._plugin.log(f"HIVE_HINTS: poll failed: {e}", level='debug')
+                return
 
         if not self._validate_snapshot(raw):
             self._plugin.log("HIVE_HINTS: invalid snapshot schema, ignoring", level='debug')
