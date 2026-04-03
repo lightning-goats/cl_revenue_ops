@@ -1382,30 +1382,29 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # FORWARDS TABLE HYDRATION (TODO #19: Double-Dip Fix)
     # =========================================================================
     # The forwards table is populated in real-time by forward_event hook.
-    # However, when the plugin restarts, we may have gaps in the data.
-    # This hydration fills those gaps by calling listforwards RPC ONCE on startup.
-    # After this, flow_analysis.py uses only local DB (no more RPC calls).
+    # Startup hydration is skipped — the hook catches up naturally.
+    # Only hydrate on first-ever startup (empty table).
     # =========================================================================
     try:
-        # Check DB head: get timestamp of the most recent forward
         last_forward_ts = database.get_latest_forward_timestamp()
         now = int(time.time())
 
         if last_forward_ts is None:
-            # Empty database - hydrate from flow_window_days ago (or 14 days default)
+            # First-ever startup: hydrate recent history so flow analysis has data
             hydrate_days = max(config.flow_window_days, 14)
             start_time = now - (hydrate_days * 86400)
             plugin.log(f"Forwards table empty. Hydrating last {hydrate_days} days of forwards...")
-        elif (now - last_forward_ts) < 600:
-            # Table was updated within the last 10 minutes — the real-time
-            # forward_event hook kept it current.  Skip the expensive
-            # listforwards RPC (can return millions of rows on busy nodes).
-            plugin.log("Forwards table is current; skipping hydration", level='debug')
-            start_time = None
         else:
-            # Have data but a gap exists — fetch what we missed while offline
-            start_time = max(0, last_forward_ts - 3600)
-            plugin.log(f"Hydrating forwards since {time.strftime('%Y-%m-%d %H:%M', time.localtime(start_time))}...")
+            # Table has data — forward_event hook keeps it current.
+            # Skip the expensive listforwards RPC at startup.
+            start_time = None
+            gap_hours = (now - last_forward_ts) / 3600
+            if gap_hours > 1:
+                plugin.log(
+                    f"Forwards table has {gap_hours:.1f}h gap — "
+                    f"forward_event hook will catch up naturally",
+                    level='debug'
+                )
 
         if start_time is not None:
             # Fetch from RPC - this is the ONLY listforwards call we make.
