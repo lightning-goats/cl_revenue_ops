@@ -407,7 +407,7 @@ class BoltzCliManager:
             decode = self.rpc.call("decodepay", {"bolt11": invoice})
         except Exception:
             try:
-                decode = self.rpc.call("decodepay", {"invoice": invoice})
+                decode = self.rpc.call("decode", {"string": invoice})
             except Exception as e:
                 raise BoltzCliError(f"decodepay failed for external reverse swap invoice: {e}")
 
