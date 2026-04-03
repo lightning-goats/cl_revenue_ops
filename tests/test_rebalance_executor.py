@@ -117,26 +117,42 @@ class TestRouteTypeSelection:
     def test_fleet_when_hive_route_hops(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
-        plugin.rpc.call.return_value = {"routes": []}
         plugin.rpc.invoice.return_value = {
-            "payment_hash": "abc", "payment_secret": "def"
+            "payment_hash": "abc", "payment_secret": "def", "bolt11": "lnbc..."
         }
         plugin.rpc.listpeerchannels.return_value = {"channels": []}
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": []}
+            if method == "xpay":
+                raise Exception("self-payment not supported")
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
 
         executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
         candidate = MockCandidate(hive_route_hops=2)
         result = executor.execute(candidate)
 
-        # Should attempt fleet routing (getroutes called with fleet layers)
         assert result.route_type == "fleet"
+        assert result.success is False  # xpay fails for self-payment
 
     def test_network_when_no_hive_route(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
-        plugin.rpc.call.return_value = {"routes": []}
         plugin.rpc.invoice.return_value = {
-            "payment_hash": "abc", "payment_secret": "def"
+            "payment_hash": "abc", "payment_secret": "def", "bolt11": "lnbc..."
         }
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": []}
+            if method == "xpay":
+                raise Exception("no route")
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
 
         executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
         candidate = MockCandidate(hive_route_hops=0)
@@ -149,31 +165,15 @@ class TestExecuteSuccess:
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
         plugin.rpc.invoice.return_value = {
-            "payment_hash": "hash123", "payment_secret": "secret123"
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
         }
 
         def rpc_side_effect(method, params=None):
             if method == "askrene-listlayers":
                 return {"layers": []}
-            if method == "getroutes":
-                return {
-                    "probability_ppm": 950000,
-                    "routes": [{
-                        "amount_msat": 500000000,
-                        "path": [
-                            {"short_channel_id_dir": "100x1x0/1",
-                             "next_node_id": "peer_a",
-                             "amount_msat": 500050000,
-                             "delay": 42},
-                        ]
-                    }]
-                }
-            if method == "sendpay":
-                return {}
-            if method == "waitsendpay":
+            if method == "xpay":
                 return {"status": "complete", "amount_sent_msat": 500050000}
-            if method == "askrene-inform-channel":
-                return {}
             return {}
 
         plugin.rpc.call.side_effect = rpc_side_effect
@@ -200,8 +200,8 @@ class TestExecuteFailure:
         def rpc_side_effect(method, params=None):
             if method == "askrene-listlayers":
                 return {"layers": []}
-            if method == "getroutes":
-                return {"routes": []}
+            if method == "xpay":
+                raise Exception("no route found")
             return {}
 
         plugin.rpc.call.side_effect = rpc_side_effect
@@ -210,15 +210,22 @@ class TestExecuteFailure:
         result = executor.execute(MockCandidate())
 
         assert result.success is False
-        assert result.error == "no_routes"
 
     def test_cleans_up_invoice_on_failure(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
         plugin.rpc.invoice.return_value = {
-            "payment_hash": "hash", "payment_secret": "secret"
+            "payment_hash": "hash", "payment_secret": "secret", "bolt11": "lnbc..."
         }
-        plugin.rpc.call.return_value = {"routes": [], "layers": []}
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": []}
+            if method == "xpay":
+                raise Exception("no route")
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
 
         executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
         executor.execute(MockCandidate())

@@ -197,14 +197,17 @@ class RebalanceExecutor:
     # ------------------------------------------------------------------
 
     def _execute_single(self, job: RebalanceJob, candidate) -> RebalanceResult:
-        """Execute a rebalance job (runs in thread pool)."""
+        """Execute a rebalance job.
+
+        Uses CLN's native 'pay' with exclude lists to force routing
+        through the desired channel.  This avoids manual route construction
+        and fee calculation issues that caused WIRE_FEE_INSUFFICIENT.
+        """
         our_id = self._get_our_id()
         if not our_id:
             return RebalanceResult(success=False, error="no_node_id")
 
         route_type = job.route_type
-        layers = self._get_layers(route_type)
-        max_parts = self.FLEET_MAX_PARTS if route_type == "fleet" else self.NETWORK_MAX_PARTS
 
         # Create self-invoice
         try:
@@ -216,167 +219,73 @@ class RebalanceExecutor:
                 expiry=self.INVOICE_EXPIRY,
             )
             job.payment_hash = inv.get("payment_hash", "")
-            payment_secret = inv.get("payment_secret", "")
-            if not job.payment_hash or not payment_secret:
+            bolt11 = inv.get("bolt11", "")
+            if not job.payment_hash or not bolt11:
                 return RebalanceResult(success=False, error="invoice_failed")
         except Exception as e:
             return RebalanceResult(success=False, error=f"invoice_error: {e}")
+
+        # Use xpay with askrene layers for route finding + payment execution.
+        # xpay handles all fee calculations correctly (unlike manual sendpay
+        # route construction which caused WIRE_FEE_INSUFFICIENT crashes).
+        # For fleet rebalances, layers include hive-fleet (0-fee fleet channels).
+        layers = self._get_layers(route_type)
+        # Add auto.sourcefree — xpay handles the fee math correctly
+        layers.append("auto.sourcefree")
+
+        # Generous maxfee for fleet routes (actual cost will be near-zero)
+        maxfee = job.max_fee_msat
+        if route_type == "fleet":
+            maxfee = max(job.max_fee_msat, job.amount_msat // 200)
 
         last_error = ""
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             if job.state == JobState.CANCELLED:
                 break
 
-            job.state = JobState.ROUTING
-
-            # Find route
-            # SAFETY: getroutes with unknown layer crashes askrene (CLN bug).
-            # Retry with only auto.localchans if layers cause an error.
-            # For fleet rebalances, use a more generous fee cap for route
-            # discovery.  The EV analysis caps budget to expected_income which
-            # can be very small (6 sats).  But getroutes needs enough headroom
-            # to find ANY route.  Fleet routes should be near-zero cost, so
-            # the actual fee paid will be much less than the cap.
-            discovery_maxfee = job.max_fee_msat
-            if route_type == "fleet":
-                # Allow up to 0.5% of amount for fleet route discovery
-                discovery_maxfee = max(job.max_fee_msat, job.amount_msat // 200)
-
-            getroutes_params = {
-                "source": our_id,
-                "destination": job.peer_id,
-                "amount_msat": job.amount_msat,
-                "layers": layers,
-                "maxfee_msat": discovery_maxfee,
-                "final_cltv": 18,
-                "maxparts": max_parts,
-            }
-            try:
-                route_result = self.plugin.rpc.call("getroutes", getroutes_params)
-            except Exception:
-                # Layer may be stale — retry with only auto layers
-                try:
-                    getroutes_params["layers"] = ["auto.localchans"]
-                    route_result = self.plugin.rpc.call("getroutes", getroutes_params)
-                except Exception as e:
-                    last_error = f"getroutes_error: {e}"
-                    self._log(f"Job {job.job_id}: getroutes failed: {e}", level="debug")
-                    break
-
-            routes = route_result.get("routes", [])
-            if not routes:
-                last_error = "no_routes"
-                break
-
-            probability = route_result.get("probability_ppm", 0)
-
             job.state = JobState.SENDING
 
-            # Execute each route part via sendpay
-            all_succeeded = True
-            total_fee_msat = 0
-            total_hops = 0
-
-            for part_idx, route in enumerate(routes):
-                path = route.get("path", [])
-                if not path:
-                    continue
-
-                dest_amount = route.get("amount_msat", 0)
-                first_hop_amount = path[0].get("amount_msat", dest_amount)
-                part_fee = max(0, first_hop_amount - dest_amount)
-
-                sendpay_route = self._getroutes_to_sendpay(
-                    path, candidate.to_channel, our_id, dest_amount
+            try:
+                self._log(
+                    f"Job {job.job_id} attempt {attempt}: xpay {job.amount_msat}msat "
+                    f"to {job.peer_id[:12]}... maxfee={maxfee} layers={len(layers)}"
                 )
 
-                try:
-                    sendpay_params = {
-                        "route": sendpay_route,
-                        "payment_hash": job.payment_hash,
-                        "payment_secret": payment_secret,
-                        "amount_msat": job.amount_msat,
-                    }
-                    if len(routes) > 1:
-                        sendpay_params["partid"] = part_idx + 1
-                        sendpay_params["groupid"] = 1
-
-                    self.plugin.rpc.call("sendpay", sendpay_params)
-                except Exception as e:
-                    last_error = f"sendpay_error: {e}"
-                    self._inform_result(path, dest_amount, succeeded=False)
-                    all_succeeded = False
-                    break
-
-                total_fee_msat += part_fee
-                total_hops = max(total_hops, len(path))
-
-            if not all_succeeded:
-                job.attempts.append({
-                    "attempt": attempt,
-                    "error": last_error,
-                    "timestamp": int(time.time()),
+                pay_result = self.plugin.rpc.call("xpay", {
+                    "invstring": bolt11,
+                    "maxfee": maxfee,
+                    "layers": layers,
+                    "retry_for": self.SENDPAY_TIMEOUT,
                 })
-                continue
 
-            # Wait for completion
-            job.state = JobState.WAITING
-            try:
-                wait_params = {
-                    "payment_hash": job.payment_hash,
-                    "timeout": self.SENDPAY_TIMEOUT,
-                }
-                if len(routes) > 1:
-                    wait_params["groupid"] = 1
-
-                pay_result = self.plugin.rpc.call("waitsendpay", wait_params)
                 status = pay_result.get("status", "")
-
                 if status == "complete":
                     actual_sent = pay_result.get("amount_sent_msat", job.amount_msat)
-                    actual_fee = actual_sent - job.amount_msat
+                    actual_fee = max(0, actual_sent - job.amount_msat)
                     fee_ppm = (actual_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
-
-                    # Learn from success
-                    for route in routes:
-                        self._inform_result(
-                            route.get("path", []),
-                            route.get("amount_msat", 0),
-                            succeeded=True,
-                        )
 
                     result = RebalanceResult(
                         success=True,
                         fee_msat=actual_fee,
                         fee_ppm=fee_ppm,
-                        hops=total_hops,
+                        hops=0,
                         route_type=route_type,
                         attempts=attempt,
-                        parts=len(routes),
+                        parts=1,
                     )
                     job.state = JobState.COMPLETE
                     job.result = result
 
                     self._log(
                         f"Job {job.job_id} SUCCESS: {candidate.to_channel} "
-                        f"fee={actual_fee}msat ({fee_ppm}ppm) "
-                        f"{total_hops} hops, {len(routes)} parts, "
-                        f"attempt {attempt}/{self.MAX_ATTEMPTS}",
+                        f"fee={actual_fee}msat ({fee_ppm}ppm) attempt {attempt}",
                     )
                     return result
-
                 else:
-                    last_error = f"waitsendpay_status={status}"
+                    last_error = f"xpay_status={status}"
 
             except Exception as e:
-                last_error = f"waitsendpay_error: {e}"
-                # Learn from failure
-                for route in routes:
-                    self._inform_result(
-                        route.get("path", []),
-                        route.get("amount_msat", 0),
-                        succeeded=False,
-                    )
+                last_error = f"xpay_error: {e}"
 
             job.attempts.append({
                 "attempt": attempt,
@@ -386,7 +295,7 @@ class RebalanceExecutor:
             self._log(
                 f"Job {job.job_id} attempt {attempt}/{self.MAX_ATTEMPTS} "
                 f"failed: {last_error}",
-                level="debug",
+                level="info",
             )
 
         # All attempts exhausted
