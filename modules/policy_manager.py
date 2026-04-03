@@ -197,6 +197,7 @@ class PolicyManager:
         """
         self.database = database
         self.plugin = plugin
+        self.hive_hints = None  # Injected by main plugin for corridor-aware policies
 
         # In-memory cache with write-through pattern (v2.0)
         self._cache: Dict[str, PeerPolicy] = {}
@@ -1071,6 +1072,80 @@ class PolicyManager:
             self.plugin.log(f"PolicyManager: Error generating suggestions: {e}", level='warn')
 
         return suggestions
+
+    # =========================================================================
+    # Corridor-Aware Auto-Policies
+    # =========================================================================
+
+    def apply_corridor_policies(self) -> int:
+        """Auto-set protective policies for corridor owner channels.
+
+        Corridor owners get:
+        - strategy=DYNAMIC (active fee optimization)
+        - rebalance_mode=ENABLED (allow rebalancing to maintain liquidity)
+        - tag='corridor_owner' for identification
+
+        Fleet members get:
+        - strategy=HIVE (0-fee fleet policy)
+        - rebalance_mode=ENABLED
+
+        Only applies to peers without explicit manual policies.
+        Returns count of policies applied.
+        """
+        if not self.hive_hints:
+            return 0
+
+        applied = 0
+        try:
+            # Get all channels to find peers
+            channels = self.plugin.rpc.listpeerchannels()
+            for ch in channels.get("channels", []):
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                peer_id = ch.get("peer_id", "")
+                if not peer_id:
+                    continue
+
+                # Check current policy — skip if manually set
+                current = self.get_policy(peer_id)
+                if current.peer_id and current.tags and "manual" in current.tags:
+                    continue
+
+                is_member = self.hive_hints.is_hive_member(peer_id)
+                corridor_role = self.hive_hints.get_corridor_role(peer_id)
+
+                if is_member:
+                    # Fleet members: HIVE strategy (0-fee)
+                    if current.strategy != FeeStrategy.HIVE:
+                        self.set_policy(
+                            peer_id,
+                            strategy=FeeStrategy.HIVE.value,
+                            rebalance_mode=RebalanceMode.ENABLED.value,
+                            tags=["corridor_owner", "auto_fleet"],
+                            reason="Auto: fleet member",
+                        )
+                        applied += 1
+                elif corridor_role == "owner":
+                    # Corridor owners: DYNAMIC + protected
+                    if not (current.tags and "corridor_owner" in current.tags):
+                        self.set_policy(
+                            peer_id,
+                            strategy=FeeStrategy.DYNAMIC.value,
+                            rebalance_mode=RebalanceMode.ENABLED.value,
+                            tags=["corridor_owner", "auto_corridor"],
+                            reason=f"Auto: corridor owner (role={corridor_role})",
+                        )
+                        applied += 1
+
+        except Exception as e:
+            self.plugin.log(f"PolicyManager: Corridor policy error: {e}", level='warn')
+
+        if applied > 0:
+            self.plugin.log(
+                f"PolicyManager: Applied {applied} corridor-aware policies",
+                level='info'
+            )
+        return applied
 
     # =========================================================================
     # v2.0 Batch Operations

@@ -1522,6 +1522,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         fee_controller.hive_hints = hive_hints
     if rebalancer is not None:
         rebalancer.hive_hints = hive_hints
+    if profitability_analyzer is not None:
+        profitability_analyzer.hive_hints = hive_hints
+    if policy_manager is not None:
+        policy_manager.hive_hints = hive_hints
     if capacity_planner is not None:
         capacity_planner.hive_hints = hive_hints
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
@@ -1599,6 +1603,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             if hive_hints is not None:
                 try:
                     hive_hints.poll()
+                except Exception:
+                    pass  # fail-open
+
+            # Apply corridor-aware auto-policies (runs after hint refresh)
+            if policy_manager is not None and hive_hints is not None:
+                try:
+                    policy_manager.apply_corridor_policies()
                 except Exception:
                     pass  # fail-open
 

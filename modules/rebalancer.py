@@ -4122,12 +4122,94 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         return {}
 
+    def _execute_xpay_rebalance(
+        self, candidate: RebalanceCandidate, rebalance_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        """Execute a circular rebalance via xpay using askrene fleet layers.
+
+        Creates a self-invoice and pays it via xpay with all fleet
+        intelligence layers active.  xpay uses getroutes internally,
+        so the payment routes through zero-fee fleet peers.
+
+        Returns:
+            Dict with success/error, or None if xpay is unavailable.
+        """
+        try:
+            amount_msat = candidate.amount_msat
+            max_fee_msat = candidate.max_budget_msat
+
+            # Create a self-invoice
+            import secrets as _secrets
+            label = f"hive-rebal-{_secrets.token_hex(8)}"
+            inv = self.plugin.rpc.invoice(
+                amount_msat=amount_msat,
+                label=label,
+                description="hive fleet rebalance",
+                expiry=300,
+            )
+            bolt11 = inv.get("bolt11")
+            if not bolt11:
+                return None
+
+            # Pay via xpay with all fleet layers
+            layers = [
+                "auto.localchans", "auto.sourcefree",
+                "hive-fleet", "hive-reputation",
+                "hive-corridors", "hive-traffic",
+                "revenue-local",
+            ]
+
+            self.plugin.log(
+                f"XPAY FLEET REBALANCE: {candidate.to_channel} "
+                f"amount={amount_msat}msat maxfee={max_fee_msat}msat "
+                f"hive_route_hops={candidate.hive_route_hops}",
+                level='info'
+            )
+
+            pay_result = self.plugin.rpc.call("xpay", {
+                "invstring": bolt11,
+                "maxfee": max_fee_msat,
+                "layers": layers,
+                "retry_for": 60,
+            })
+
+            status = pay_result.get("status", "")
+            if status == "complete":
+                fee_msat = pay_result.get("amount_sent_msat", amount_msat) - amount_msat
+                fee_ppm = (fee_msat * 1_000_000) // amount_msat if amount_msat > 0 else 0
+                self.plugin.log(
+                    f"XPAY FLEET REBALANCE SUCCESS: {candidate.to_channel} "
+                    f"fee={fee_msat}msat ({fee_ppm}ppm)",
+                    level='info'
+                )
+                # Record success in database
+                if rebalance_id:
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'completed',
+                        fee_paid_sats=fee_msat // 1000,
+                    )
+                return {"success": True, "message": f"xpay fleet rebalance completed ({fee_ppm}ppm)"}
+            else:
+                self.plugin.log(
+                    f"XPAY FLEET REBALANCE FAILED: {candidate.to_channel} "
+                    f"status={status}",
+                    level='warn'
+                )
+                return None  # Fall through to sling
+
+        except Exception as e:
+            self.plugin.log(
+                f"XPAY FLEET REBALANCE ERROR: {e} — falling back to sling",
+                level='debug'
+            )
+            return None  # xpay unavailable or failed, fall through to sling
+
     def execute_rebalance(self, candidate: RebalanceCandidate, enforce_budget: bool = True, **kwargs) -> Dict[str, Any]:
         """
         Execute a rebalance for the given candidate.
 
-        Uses the async JobManager to spawn sling background jobs.
-        This plugin acts as the "Strategist" while sling workers handle execution.
+        Uses xpay for fleet rebalances (routes through askrene layers),
+        falling back to sling background jobs for non-fleet routes.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         with self._pending_lock:
@@ -4294,8 +4376,20 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         self._pending.pop(candidate.to_channel, None)
                     return result
 
-            # Async execution via JobManager (sling background jobs)
-            res = self.job_manager.start_job(candidate, rebalance_id)
+            # Fleet rebalance via xpay: when a hive route was discovered,
+            # use xpay (which respects askrene layers) for the circular payment.
+            # This routes through fleet peers at 0 fee, which sling can't do
+            # because it doesn't use askrene layers.
+            if candidate.hive_route_hops > 0:
+                xpay_result = self._execute_xpay_rebalance(candidate, rebalance_id)
+                if xpay_result is not None:
+                    res = xpay_result
+                else:
+                    # xpay failed or unavailable — fall through to sling
+                    res = self.job_manager.start_job(candidate, rebalance_id)
+            else:
+                # Standard sling execution (no fleet route)
+                res = self.job_manager.start_job(candidate, rebalance_id)
 
             if res.get("success"):
                 self._set_last_decision_summary(

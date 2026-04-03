@@ -1709,12 +1709,9 @@ class FeeController:
                 else:
                     multiplier *= 0.97  # -3% during quiet
 
-            # Drain direction adjustment
-            drain = self.hive_hints.get_drain_direction(peer_id)
-            if drain == "inbound_heavy":
-                multiplier *= 0.97  # Slight discount to attract inbound
-            elif drain == "outbound_heavy":
-                multiplier *= 1.03  # Slight premium for outbound service
+            # Drain direction is handled by hive-traffic askrene layer
+            # (bias-channel in the rebalancing direction).  Applying it here
+            # as well would double-incentivize the same direction.
 
             # Clamp to [0.9, 1.1]
             return max(0.9, min(1.1, multiplier))
@@ -1793,9 +1790,22 @@ class FeeController:
     def _get_neighbor_fee_median(self, peer_id: str) -> int | None:
         """Get median fee charged by other nodes to the same peer.
 
-        Returns None if insufficient data (need >= 3 neighbors).
-        Result is cached for 30 minutes to avoid expensive listchannels calls.
+        Prefers fleet-aggregated optimal fee estimate (from hive intelligence)
+        when available, falling back to gossip-based listchannels scan.
+
+        Returns None if insufficient data (need >= 3 neighbors for gossip).
+        Result is cached for 30 minutes to avoid expensive calls.
         """
+        # Fleet intelligence: use hive-aggregated optimal fee when available
+        # This is derived from multiple fleet members' observations and is
+        # more current than gossip (which can be hours stale).
+        if self.hive_hints:
+            try:
+                optimal = self.hive_hints.get_optimal_fee_estimate(peer_id)
+                if optimal and optimal > 0:
+                    return optimal
+            except Exception:
+                pass
         # Evict stale entries when cache grows large
         if len(self._neighbor_fee_cache) > 500:
             now = time.time()

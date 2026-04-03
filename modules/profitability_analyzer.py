@@ -351,6 +351,7 @@ class ChannelProfitabilityAnalyzer:
         self.plugin = plugin
         self.config = config
         self.database = database
+        self.hive_hints = None  # Injected by main plugin for routing-aware classification
 
         # Cache for profitability data (refreshed periodically)
         # TS-7: Cache reads without lock are safe under CPython GIL (dict reads are atomic).
@@ -2208,6 +2209,20 @@ class ChannelProfitabilityAnalyzer:
                         # Proven fee channel: widen thresholds by 50%
                         profitable_thresh *= 0.5   # Easier to be PROFITABLE (5% vs 10%)
                         underwater_thresh *= 1.5   # Harder to be UNDERWATER (-15% vs -10%)
+            except Exception:
+                pass
+
+        # 4. Routing structural value: protect channels that are structurally
+        # important even if their ROI is poor.  A corridor-owner or high-centrality
+        # channel should not be classified UNDERWATER or ZOMBIE — upgrade to
+        # BREAK_EVEN so close recommendations don't target it.
+        if roi < underwater_thresh and self.hive_hints and peer_id:
+            try:
+                centrality = self.hive_hints.get_centrality(peer_id)
+                corridor_role = self.hive_hints.get_corridor_role(peer_id)
+                is_member = self.hive_hints.is_hive_member(peer_id)
+                if is_member or corridor_role == "owner" or centrality > 0.03:
+                    return ProfitabilityClass.BREAK_EVEN
             except Exception:
                 pass
 
