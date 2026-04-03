@@ -39,6 +39,7 @@ from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
 from modules.hive_hints import HiveHintAdapter
+from modules.hive_router import HiveRouter
 from modules.policy_manager import (
     PolicyManager,
     FeeStrategy,
@@ -349,6 +350,7 @@ safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrap
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 hive_hints: Optional[HiveHintAdapter] = None  # cl_hive fleet hint adapter
+hive_router = None  # HiveRouter: shared askrene fleet route discovery
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
 _boltz_auto_cycle_run_lock = threading.Lock()
@@ -1524,6 +1526,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         capacity_planner.hive_hints = hive_hints
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
         capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
+
+    # Hive Router (shared askrene fleet route discovery)
+    global hive_router
+    hive_router = None
+    if hive_hints is not None:
+        hive_router = HiveRouter(safe_plugin, hive_hints)
+        plugin.log("HiveRouter initialized - fleet route discovery enabled")
+
+    if rebalancer is not None and hive_router is not None:
+        rebalancer.hive_router = hive_router
 
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
@@ -5770,7 +5782,13 @@ def _build_boltz_balance_plan(
             planner_bonus = 1.25 if planner_funding_deficit > 0 else 1.0
             route_bonus = 1.3 if scid_display in route_pair_in_channels else 1.0
             hive_bonus = hive_rebal_bias  # ±15% from fleet hints, compounds with route signal
-            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus * planner_bonus * route_bonus * hive_bonus
+            # Hive topology: prefer swaps that benefit fleet structure
+            hive_topo = 1.0
+            if hive_router and hive_router.available:
+                hive_topo = hive_router.score_channel_for_hive(
+                    peer_id, direction, liquidity_ratio=local_pct / 100.0
+                )
+            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus * planner_bonus * route_bonus * hive_bonus * hive_topo
 
         candidate = {
             "channel_id": channel_id,
@@ -6098,7 +6116,21 @@ def revenue_boltz_balance_cycle(
                         currency = _select_boltz_currency("loop_out", amount_sats)
                     except Exception:
                         currency = "LBTC"
-                res = bm.loop_out(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=currency)
+                # Hive route discovery: find cheaper first-hop through fleet
+                exec_ch_id = ch_id
+                exec_peer_id = peer_id
+                if hive_router and hive_router.available and peer_id:
+                    try:
+                        hr = hive_router.discover_route(peer_id, amount_sats)
+                        if hr and hr.source_scid and hr.fee_ppm < 200:
+                            exec_ch_id = hr.source_scid
+                            plugin.log(
+                                f"BOLTZ HIVE ROUTE: Using fleet path for loop-out "
+                                f"({hr.hops} hops, {hr.fee_ppm} ppm, via {hr.source_scid})",
+                            )
+                    except Exception:
+                        pass  # Fall back to original channel selection
+                res = bm.loop_out(amount_sats=amount_sats, channel_id=exec_ch_id, peer_id=exec_peer_id, currency=currency)
             else:
                 raise BoltzCliError(f"Unknown direction: {direction}")
 
