@@ -1987,6 +1987,7 @@ class EVRebalancer:
         # Hive hints adapter (injected by main plugin; None = disabled)
         self.hive_hints = None
         self._hive_router = None  # HiveRouter for fleet route discovery
+        self.rebalance_executor = None  # RebalanceExecutor (replaces sling when available)
 
     @property
     def hive_router(self):
@@ -4519,17 +4520,43 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         self._pending.pop(candidate.to_channel, None)
                     return result
 
-            # Fleet rebalances: use getroutes + sendpay (layer-aware circular
-            # routing through fleet peers at near-zero cost).
-            # Non-fleet rebalances: use sling background jobs.
-            if candidate.hive_route_hops > 0:
-                fleet_result = self._execute_fleet_rebalance(candidate, rebalance_id)
-                if fleet_result is not None:
-                    res = fleet_result
-                else:
-                    # Fleet route failed — fall back to sling
-                    res = self.job_manager.start_job(candidate, rebalance_id)
-            else:
+            # RebalanceExecutor: native getroutes+sendpay for ALL rebalances.
+            # Fleet routes use hive-* layers (0-fee fleet paths).
+            # Network routes use revenue-* layers (best available paths).
+            # Falls back to sling if executor unavailable or fails.
+            res = None
+            if self.rebalance_executor:
+                try:
+                    exec_result = self.rebalance_executor.execute(candidate)
+                    if exec_result.success:
+                        res = {
+                            "success": True,
+                            "message": (
+                                f"Rebalance completed via {exec_result.route_type} engine "
+                                f"({exec_result.fee_ppm}ppm, {exec_result.hops} hops, "
+                                f"{exec_result.parts} parts, {exec_result.attempts} attempts)"
+                            ),
+                        }
+                        # Record success in database
+                        if rebalance_id:
+                            self.database.update_rebalance_result(
+                                rebalance_id, 'completed',
+                                fee_paid_sats=exec_result.fee_msat // 1000,
+                            )
+                    else:
+                        self.plugin.log(
+                            f"RebalanceExecutor failed: {exec_result.error} — "
+                            f"falling back to sling",
+                            level='debug'
+                        )
+                except Exception as e:
+                    self.plugin.log(
+                        f"RebalanceExecutor error: {e} — falling back to sling",
+                        level='debug'
+                    )
+
+            # Sling fallback: if executor didn't handle it
+            if res is None:
                 res = self.job_manager.start_job(candidate, rebalance_id)
 
             if res.get("success"):
