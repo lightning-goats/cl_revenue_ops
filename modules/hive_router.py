@@ -225,13 +225,25 @@ class HiveRouter:
         max_fee_msat = amount_msat // 100  # 1% discovery cap
 
         try:
+            # Build layer list from what actually exists — avoids errors
+            # when cl-hive hasn't created optional layers yet
+            layers = ["auto.localchans", "auto.sourcefree"]
+            try:
+                existing = self.plugin.rpc.call("askrene-listlayers", {})
+                existing_names = {l.get("layer") for l in existing.get("layers", [])}
+                for candidate in [self.LAYER_NAME, "hive-reputation",
+                                  "hive-corridors", "hive-traffic", self.LOCAL_LAYER]:
+                    if candidate in existing_names:
+                        layers.append(candidate)
+            except Exception:
+                # If listlayers fails, just use auto layers
+                pass
+
             result = self.plugin.rpc.call("getroutes", {
                 "source": our_id,
                 "destination": dest_peer_id,
                 "amount_msat": amount_msat,
-                "layers": ["auto.localchans", "auto.sourcefree", self.LAYER_NAME,
-                           "hive-reputation", "hive-corridors", "hive-traffic",
-                           self.LOCAL_LAYER],
+                "layers": layers,
                 "maxfee_msat": max_fee_msat,
                 "final_cltv": 18,
             })

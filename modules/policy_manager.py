@@ -1115,14 +1115,15 @@ class PolicyManager:
                 corridor_role = self.hive_hints.get_corridor_role(peer_id)
 
                 if is_member:
-                    # Fleet members: HIVE strategy (0-fee)
-                    if current.strategy != FeeStrategy.HIVE:
+                    # Fleet members: STATIC 0-fee policy
+                    if not (current.tags and "auto_fleet" in current.tags):
                         self.set_policy(
                             peer_id,
-                            strategy=FeeStrategy.HIVE.value,
+                            strategy=FeeStrategy.STATIC.value,
+                            fee_ppm_target=0,
                             rebalance_mode=RebalanceMode.ENABLED.value,
                             tags=["corridor_owner", "auto_fleet"],
-                            reason="Auto: fleet member",
+                            reason="Auto: fleet member (0-fee)",
                         )
                         applied += 1
                 elif corridor_role == "owner":
