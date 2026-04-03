@@ -251,9 +251,32 @@ class RebalanceExecutor:
                 last_error = "no_route_back"
                 self._log(f"Job {job.job_id}: no route from {job.peer_id[:12]}... back to us")
             else:
-                # Prepend our outgoing channel as first hop
+                # Prepend our outgoing channel as first hop.
+                # getroute(fromid=dest_peer) returns amounts from dest_peer's
+                # perspective.  We need to send dest_peer enough to cover:
+                # - route[0].amount_msat (what dest_peer forwards to next hop)
+                # - dest_peer's own forwarding fee (from gossip)
                 first_hop_scid = candidate.to_channel.replace(":", "x")
-                first_hop_amount = route[0].get("amount_msat", job.amount_msat)
+                forward_amount = route[0].get("amount_msat", job.amount_msat)
+
+                # Get dest peer's fee for this channel from gossip
+                dest_fee_ppm = 0
+                dest_base_msat = 0
+                try:
+                    chans = self.plugin.rpc.listpeerchannels(id=job.peer_id)
+                    for ch in chans.get("channels", []):
+                        if ch.get("short_channel_id") == first_hop_scid:
+                            updates = ch.get("updates", {})
+                            remote = updates.get("remote", {})
+                            dest_fee_ppm = int(remote.get("fee_proportional_millionths", 0) or 0)
+                            dest_base_msat = int(remote.get("fee_base_msat", 0) or 0)
+                            break
+                except Exception:
+                    pass
+
+                # Amount we send = what they forward + their fee
+                dest_fee_msat = dest_base_msat + (forward_amount * dest_fee_ppm) // 1_000_000
+                first_hop_amount = forward_amount + dest_fee_msat
                 first_hop_delay = route[0].get("delay", 18) + 6
 
                 full_route = [{
