@@ -168,12 +168,18 @@ class TestExecuteSuccess:
             "payment_hash": "hash123", "payment_secret": "secret123",
             "bolt11": "lnbc5u1..."
         }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {"id": "our_id", "channel": "200x1x0", "amount_msat": 500000000, "delay": 18}
+            ]
+        }
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete", "amount_sent_msat": 500050000
+        }
 
         def rpc_side_effect(method, params=None):
             if method == "askrene-listlayers":
                 return {"layers": []}
-            if method == "xpay":
-                return {"status": "complete", "amount_sent_msat": 500050000}
             return {}
 
         plugin.rpc.call.side_effect = rpc_side_effect
