@@ -2092,10 +2092,10 @@ class EVRebalancer:
         source_channels: List[Tuple[str, Dict[str, Any], float]],
         candidates: List[RebalanceCandidate],
     ) -> None:
-        """Fail-open, non-blocking report of liquidity state to cl-hive.
+        """Push liquidity state to CLN datastore for cl-hive to read.
 
-        Uses a background thread with short timeout to avoid blocking
-        the rebalance cycle when cl-hive is slow to respond.
+        Uses datastore (fast local write) instead of cross-plugin RPC
+        that was timing out every cycle.
         """
         payload = self._build_hive_liquidity_state_payload(
             depleted_channels,
@@ -2103,16 +2103,15 @@ class EVRebalancer:
             candidates,
         )
 
-        def _send():
-            try:
-                self.plugin.rpc.call("hive-report-liquidity-state", payload)
-            except Exception as e:
-                self.plugin.log(f"HIVE: liquidity state report failed: {e}", level='debug')
-
-        import threading as _threading
-        t = _threading.Thread(target=_send, daemon=True)
-        t.start()
-        # Don't join — fire and forget. If cl-hive is slow, we don't block.
+        try:
+            import json as _json
+            self.plugin.rpc.datastore(
+                key=["revenue", "liquidity-state"],
+                string=_json.dumps(payload),
+                mode="create-or-replace",
+            )
+        except Exception as e:
+            self.plugin.log(f"HIVE: liquidity state datastore write failed: {e}", level='debug')
 
     def _get_hive_rebalance_bias(self, peer_id: str) -> float:
         """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""

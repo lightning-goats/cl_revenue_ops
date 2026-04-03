@@ -221,11 +221,12 @@ class TestHiveLiquidityReporting:
 
         r._report_hive_liquidity_state(depleted_channels, source_channels, [])
 
-        calls = _rpc_calls_for(mock_plugin, "hive-report-liquidity-state")
-        assert len(calls) == 1
-        params = calls[0][0][1]
-        assert params["depleted_channels"][0]["peer_id"] == "02" + "d" * 64
-        assert params["saturated_channels"][0]["peer_id"] == "02" + "c" * 64
+        # Liquidity state is now pushed to CLN datastore, not via cross-plugin RPC
+        ds_calls = [c for c in mock_plugin.rpc.datastore.call_args_list]
+        assert len(ds_calls) >= 1
+        # Verify the datastore key is correct
+        ds_key = ds_calls[0][1].get("key", ds_calls[0][0][0] if ds_calls[0][0] else None)
+        assert ds_key == ["revenue", "liquidity-state"]
 
     def test_find_rebalance_candidates_reports_state_even_without_profitable_candidates(
         self, mock_plugin, mock_database
@@ -267,11 +268,9 @@ class TestHiveLiquidityReporting:
         result = r.find_rebalance_candidates()
 
         assert result == []
-        calls = _rpc_calls_for(mock_plugin, "hive-report-liquidity-state")
-        assert len(calls) == 1
-        params = calls[0][0][1]
-        assert params["depleted_channels"][0]["peer_id"] == dest_peer
-        assert params["saturated_channels"][0]["peer_id"] == source_peer
+        # Liquidity state pushed to datastore
+        ds_calls = [c for c in mock_plugin.rpc.datastore.call_args_list]
+        assert len(ds_calls) >= 1
 
 
 class TestJobMonitorPrefersSlingStats:

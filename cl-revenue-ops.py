@@ -1936,7 +1936,33 @@ def run_fee_adjustment():
     try:
         adjustments = fee_controller.adjust_all_fees()
         plugin.log(f"Fee adjustment complete: {len(adjustments)} channels adjusted")
-        
+
+        # Push status + profitability to datastore for cl-hive Bridge
+        # (eliminates cross-plugin revenue-status/revenue-profitability RPCs)
+        try:
+            import json as _json
+            status_data = {
+                "operator_controls": {
+                    "values": config.public_runtime_dict() if config else {},
+                },
+                "fee_decision": (
+                    fee_controller.get_last_decision_summary()
+                    if hasattr(fee_controller, "get_last_decision_summary")
+                    else {}
+                ),
+            }
+            safe_plugin.rpc.datastore(
+                key=["revenue", "status"],
+                string=_json.dumps(status_data),
+                mode="create-or-replace",
+            )
+
+            # NOTE: revenue-profitability is too large for datastore (47 channels
+            # of detailed data).  The Bridge's get_profitability() call is
+            # infrequent and can stay as cross-plugin RPC fallback.
+        except Exception:
+            pass  # Datastore push is best-effort
+
     except Exception as e:
         plugin.log(f"Fee adjustment failed: {e}", level='error')
         raise
