@@ -4400,7 +4400,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         if rebalance_id:
                             self.database.update_rebalance_result(
                                 rebalance_id, 'completed',
-                                fee_paid_sats=exec_result.fee_msat // 1000,
+                                actual_fee_sats=exec_result.fee_msat // 1000,
                             )
                     else:
                         res = {
