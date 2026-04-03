@@ -1918,6 +1918,7 @@ class EVRebalancer:
         dominant_input: Optional[str],
         safety_block: bool,
         budget_blocked: bool,
+        error_detail: Optional[str] = None,
     ) -> None:
         self._last_decision_summary = {
             "action": action,
@@ -1926,6 +1927,8 @@ class EVRebalancer:
             "safety_block": bool(safety_block),
             "budget_blocked": bool(budget_blocked),
         }
+        if error_detail:
+            self._last_decision_summary["error_detail"] = error_detail
 
     def get_last_decision_summary(self) -> Dict[str, Any]:
         return dict(self._last_decision_summary)
@@ -2245,12 +2248,18 @@ class EVRebalancer:
             
             channels = self._get_channels_with_balances()
             if not channels:
+                reason = (
+                    "rpc_error_channel_balances"
+                    if self._last_balance_error
+                    else "no_channel_balance_data"
+                )
                 self._set_last_decision_summary(
                     action="hold",
-                    reason="no_channel_balance_data",
+                    reason=reason,
                     dominant_input="channel_balances",
                     safety_block=False,
                     budget_blocked=False,
+                    error_detail=self._last_balance_error,
                 )
                 self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
@@ -3886,74 +3895,94 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         return status
 
     def _get_channels_with_balances(self) -> Dict[str, Dict[str, Any]]:
-        """Get all channels with their current balances and fee info."""
-        channels = {}
-        try:
-            listfunds = self.plugin.rpc.listfunds()
-            # Use listpeerchannels instead of deprecated listpeers (CLN 23.08+)
-            listpeerchannels = self.plugin.rpc.listpeerchannels()
-            
-            # Build peer info map from listpeerchannels
-            peer_info = {}
-            for ch in listpeerchannels.get("channels", []):
-                scid = ch.get("short_channel_id")
-                if scid and ch.get("state") == "CHANNELD_NORMAL":
-                    # Extract peer's inbound fee from updates.remote (what they charge us)
-                    updates = ch.get("updates", {})
-                    remote_updates = updates.get("remote", {})
-                    peer_inbound_fee_ppm = remote_updates.get("fee_proportional_millionths")
-                    peer_inbound_base_msat = remote_updates.get("fee_base_msat")
-                    
-                    peer_info[scid] = {
-                        "peer_id": ch.get("peer_id"),
-                        "fee_ppm": ch.get("fee_proportional_millionths", 0),
-                        "base_fee_msat": ch.get("fee_base_msat", 0),
-                        "htlcs": len(ch.get("htlcs", [])),
-                        # Peer's inbound fee - what they charge for last hop to us
-                        "peer_inbound_fee_ppm": peer_inbound_fee_ppm,
-                        "peer_inbound_base_msat": peer_inbound_base_msat
+        """Get all channels with their current balances and fee info.
+
+        Retries once on RPC failure.  Stores the last error in
+        ``_last_balance_error`` so callers can include it in diagnostics.
+        """
+        self._last_balance_error: Optional[str] = None
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            channels: Dict[str, Dict[str, Any]] = {}
+            try:
+                listfunds = self.plugin.rpc.listfunds()
+                # Use listpeerchannels instead of deprecated listpeers (CLN 23.08+)
+                listpeerchannels = self.plugin.rpc.listpeerchannels()
+
+                # Build peer info map from listpeerchannels
+                peer_info = {}
+                for ch in listpeerchannels.get("channels", []):
+                    scid = ch.get("short_channel_id")
+                    if scid and ch.get("state") == "CHANNELD_NORMAL":
+                        # Extract peer's inbound fee from updates.remote (what they charge us)
+                        updates = ch.get("updates", {})
+                        remote_updates = updates.get("remote", {})
+                        peer_inbound_fee_ppm = remote_updates.get("fee_proportional_millionths")
+                        peer_inbound_base_msat = remote_updates.get("fee_base_msat")
+
+                        peer_info[scid] = {
+                            "peer_id": ch.get("peer_id"),
+                            "fee_ppm": ch.get("fee_proportional_millionths", 0),
+                            "base_fee_msat": ch.get("fee_base_msat", 0),
+                            "htlcs": len(ch.get("htlcs", [])),
+                            # Peer's inbound fee - what they charge for last hop to us
+                            "peer_inbound_fee_ppm": peer_inbound_fee_ppm,
+                            "peer_inbound_base_msat": peer_inbound_base_msat
+                        }
+
+                # Get balances from listfunds
+                for channel in listfunds.get("channels", []):
+                    if channel.get("state") != "CHANNELD_NORMAL":
+                        continue
+
+                    scid = channel.get("short_channel_id", "")
+                    if not scid:
+                        continue
+
+                    our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
+                    amount_msat = self._parse_msat(channel.get("amount_msat", 0))
+
+                    info = peer_info.get(scid, {})
+                    channels[scid] = {
+                        "capacity": amount_msat // 1000,
+                        "spendable_sats": our_amount_msat // 1000,
+                        "peer_id": info.get("peer_id", channel.get("peer_id", "")),
+                        "fee_ppm": info.get("fee_ppm", 0),
+                        "base_fee_msat": info.get("base_fee_msat", 0),
+                        "htlcs": info.get("htlcs", 0),
+                        # Peer's actual inbound fee from updates.remote (None if unavailable)
+                        "peer_inbound_fee_ppm": info.get("peer_inbound_fee_ppm"),
+                        "peer_inbound_base_msat": info.get("peer_inbound_base_msat")
                     }
-            
-            # Get balances from listfunds
-            for channel in listfunds.get("channels", []):
-                if channel.get("state") != "CHANNELD_NORMAL":
-                    continue
-                    
-                scid = channel.get("short_channel_id", "")
-                if not scid:
-                    continue
-                
-                our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
-                amount_msat = self._parse_msat(channel.get("amount_msat", 0))
-                
-                info = peer_info.get(scid, {})
-                channels[scid] = {
-                    "capacity": amount_msat // 1000,
-                    "spendable_sats": our_amount_msat // 1000,
-                    "peer_id": info.get("peer_id", channel.get("peer_id", "")),
-                    "fee_ppm": info.get("fee_ppm", 0),
-                    "base_fee_msat": info.get("base_fee_msat", 0),
-                    "htlcs": info.get("htlcs", 0),
-                    # Peer's actual inbound fee from updates.remote (None if unavailable)
-                    "peer_inbound_fee_ppm": info.get("peer_inbound_fee_ppm"),
-                    "peer_inbound_base_msat": info.get("peer_inbound_base_msat")
-                }
-            
-            # Populate peer_id -> peer inbound fee cache for _get_last_hop_fee()
-            # This allows _estimate_inbound_fee() to use actual fees instead of gossip
-            self._peer_inbound_fees = {}
-            for scid, info in channels.items():
-                peer_id = info.get("peer_id")
-                if peer_id and info.get("peer_inbound_fee_ppm") is not None:
-                    self._peer_inbound_fees[peer_id] = {
-                        "fee_ppm": info["peer_inbound_fee_ppm"],
-                        "base_msat": info.get("peer_inbound_base_msat", 0) or 0
-                    }
-                
-        except Exception as e:
-            self.plugin.log(f"Error getting channel balances: {e}", level='error')
-        
-        return channels
+
+                # Populate peer_id -> peer inbound fee cache for _get_last_hop_fee()
+                # This allows _estimate_inbound_fee() to use actual fees instead of gossip
+                self._peer_inbound_fees = {}
+                for scid, info in channels.items():
+                    peer_id = info.get("peer_id")
+                    if peer_id and info.get("peer_inbound_fee_ppm") is not None:
+                        self._peer_inbound_fees[peer_id] = {
+                            "fee_ppm": info["peer_inbound_fee_ppm"],
+                            "base_msat": info.get("peer_inbound_base_msat", 0) or 0
+                        }
+
+                return channels
+
+            except Exception as e:
+                self._last_balance_error = str(e)
+                if attempt < max_attempts:
+                    self.plugin.log(
+                        f"RPC error getting channel balances (attempt {attempt}/{max_attempts}), retrying: {e}",
+                        level='warn',
+                    )
+                    time.sleep(1)
+                else:
+                    self.plugin.log(
+                        f"RPC error getting channel balances after {max_attempts} attempts: {e}",
+                        level='error',
+                    )
+
+        return {}
 
     def execute_rebalance(self, candidate: RebalanceCandidate, enforce_budget: bool = True, **kwargs) -> Dict[str, Any]:
         """
