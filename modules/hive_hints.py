@@ -251,6 +251,23 @@ class HiveHintAdapter:
             return int(val)
         return 0
 
+    def get_fleet_balance(self, peer_id: str) -> dict:
+        """Return fleet member balance data from hints (pushed by cl-hive).
+
+        Returns dict with capacity_sats, available_sats, topology — or empty dict.
+        Eliminates the need for a separate hive-fleet-balances RPC.
+        """
+        hint = self._get_peer_hint(peer_id)
+        cap = hint.get("fleet_capacity_sats")
+        avail = hint.get("fleet_available_sats")
+        if isinstance(cap, (int, float)) and isinstance(avail, (int, float)):
+            return {
+                "capacity_sats": int(cap),
+                "available_sats": int(avail),
+                "topology": hint.get("fleet_topology", []),
+            }
+        return {}
+
     # ------------------------------------------------------------------
     # Channel-open hints
     # ------------------------------------------------------------------

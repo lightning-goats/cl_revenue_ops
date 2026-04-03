@@ -347,33 +347,21 @@ class HiveRouter:
     # ------------------------------------------------------------------
 
     def refresh_fleet_balances(self) -> None:
-        """Query cl-hive for fleet member channel balances.
+        """Populate fleet member balances from hints (no separate RPC needed).
 
-        Caches per-member capacity, available liquidity, and topology.
-        Skips refresh if cache is less than 5 minutes old to avoid
-        RPC timeouts on every rebalance cycle.
+        Fleet member balance data (capacity, available, topology) is now
+        pushed as part of hive-export-hints.  This eliminates the
+        hive-fleet-balances RPC that timed out every cycle.
         """
-        if not self.plugin:
+        if not self.hive_hints:
             return
-        # Cache for 5 minutes to avoid timeout stalls
-        if self._fleet_balances and (time.time() - self._last_refresh) < 300:
-            return
-        try:
-            result = self.plugin.rpc.call("hive-fleet-balances")
-            if isinstance(result, dict) and "members" in result:
-                balances = {}
-                for m in result.get("members", []):
-                    pid = m.get("peer_id", "")
-                    if pid:
-                        balances[pid] = {
-                            "capacity_sats": int(m.get("capacity_sats", 0)),
-                            "available_sats": int(m.get("available_sats", 0)),
-                            "topology": m.get("topology", []),
-                        }
-                self._fleet_balances = balances
-                self._log(f"Refreshed fleet balances ({len(balances)} members)")
-        except Exception as e:
-            self._log(f"Fleet balance refresh failed: {e}")
+        balances = {}
+        for mid in self._member_ids:
+            bal = self.hive_hints.get_fleet_balance(mid)
+            if bal:
+                balances[mid] = bal
+        if balances:
+            self._fleet_balances = balances
 
     def get_fleet_member_balance(self, peer_id: str) -> Optional[Dict]:
         """Get cached balance state for a fleet member.

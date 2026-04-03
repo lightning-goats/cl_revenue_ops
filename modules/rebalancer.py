@@ -2971,6 +2971,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         dest_peer_id = dest_info.get("peer_id", "")
 
+        self.plugin.log(
+            f"EV DEBUG [{dest_channel[:12]}...]: outbound_fee={outbound_fee_ppm}ppm "
+            f"(broadcast={broadcast_fee_ppm}, dts={dts_fee_ppm}), "
+            f"inbound_fee={inbound_fee_ppm}ppm, amount={rebalance_amount}",
+            level='info'
+        )
+
         # HIVE ROUTE DISCOVERY: Try askrene to find cheap routes through fleet
         # before falling back to generic source selection.
         hive_route = None
@@ -2982,7 +2989,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     "hops": hr.hops,
                     "source_scid": hr.source_scid,
                 }
-            if hive_route and hive_route.get("fee_ppm", 9999) < inbound_fee_ppm:
+            if hive_route and hive_route.get("fee_ppm", 9999) <= inbound_fee_ppm:
                 # Hive route is cheaper than estimated inbound — use its fee
                 inbound_fee_ppm = hive_route["fee_ppm"]
                 self.plugin.log(
