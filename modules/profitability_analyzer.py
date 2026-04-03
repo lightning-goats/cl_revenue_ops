@@ -352,6 +352,7 @@ class ChannelProfitabilityAnalyzer:
         self.config = config
         self.database = database
         self.hive_hints = None  # Injected by main plugin for routing-aware classification
+        self.rpc_cache = None
 
         # Cache for profitability data (refreshed periodically)
         # TS-7: Cache reads without lock are safe under CPython GIL (dict reads are atomic).
@@ -1405,7 +1406,7 @@ class ChannelProfitabilityAnalyzer:
 
         try:
             # Get on-chain balance from listfunds
-            listfunds = self.plugin.rpc.listfunds()
+            listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
 
             for output in listfunds.get("outputs", []):
                 if output.get("status") == "confirmed":
@@ -1446,8 +1447,8 @@ class ChannelProfitabilityAnalyzer:
         channels = {}
         
         try:
-            result = self.plugin.rpc.listpeerchannels()
-            
+            result = self.rpc_cache.listpeerchannels() if self.rpc_cache else self.plugin.rpc.listpeerchannels()
+
             for channel in result.get("channels", []):
                 state = channel.get("state", "")
                 if state != "CHANNELD_NORMAL":

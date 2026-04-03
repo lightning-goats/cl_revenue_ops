@@ -1618,6 +1618,7 @@ class FeeController:
         self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
         self.temporary_fee_overlay_active = temporary_fee_overlay_active
+        self.rpc_cache = None
         if self.policy_manager and hasattr(self.policy_manager, "register_on_change"):
             try:
                 self.policy_manager.register_on_change(self._handle_policy_change)
@@ -5107,8 +5108,8 @@ class FeeController:
         channels = {}
         
         try:
-            result = self.plugin.rpc.listpeerchannels()
-            
+            result = self.rpc_cache.listpeerchannels() if self.rpc_cache else self.plugin.rpc.listpeerchannels()
+
             for channel in result.get("channels", []):
                 if channel.get("state") != "CHANNELD_NORMAL":
                     continue

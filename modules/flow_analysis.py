@@ -663,6 +663,7 @@ class FlowAnalyzer:
         self.plugin = plugin
         self.config = config
         self.database = database
+        self.rpc_cache = None
         # v2.1: Kalman filter state cache (channel_id -> KalmanFlowFilter)
         self._kalman_filters: Dict[str, KalmanFlowFilter] = {}
         self._kalman_lock = threading.Lock()
@@ -1664,9 +1665,9 @@ class FlowAnalyzer:
         - htlcs: List of currently active HTLCs
         """
         try:
-            result = self.plugin.rpc.listpeerchannels()
+            result = self.rpc_cache.listpeerchannels() if self.rpc_cache else self.plugin.rpc.listpeerchannels()
             channels = []
-            
+
             # listpeerchannels returns channels grouped by peer
             for channel_info in result.get("channels", []):
                 if channel_info.get("state") == "CHANNELD_NORMAL":

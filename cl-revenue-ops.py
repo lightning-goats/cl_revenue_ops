@@ -1542,6 +1542,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalancer.rpc_cache = rpc_cache
     plugin.log("RebalanceExecutor initialized - native rebalance engine enabled")
 
+    if fee_controller is not None:
+        fee_controller.rpc_cache = rpc_cache
+    if profitability_analyzer is not None:
+        profitability_analyzer.rpc_cache = rpc_cache
+    if policy_manager is not None:
+        policy_manager.rpc_cache = rpc_cache
+    if flow_analyzer is not None:
+        flow_analyzer.rpc_cache = rpc_cache
+
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
     # We use daemon threads so they don't block shutdown

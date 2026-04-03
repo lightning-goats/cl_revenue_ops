@@ -198,6 +198,7 @@ class PolicyManager:
         self.database = database
         self.plugin = plugin
         self.hive_hints = None  # Injected by main plugin for corridor-aware policies
+        self.rpc_cache = None
 
         # In-memory cache with write-through pattern (v2.0)
         self._cache: Dict[str, PeerPolicy] = {}
@@ -1098,7 +1099,7 @@ class PolicyManager:
         applied = 0
         try:
             # Get all channels to find peers
-            channels = self.plugin.rpc.listpeerchannels()
+            channels = self.rpc_cache.listpeerchannels() if self.rpc_cache else self.plugin.rpc.listpeerchannels()
             for ch in channels.get("channels", []):
                 if ch.get("state") != "CHANNELD_NORMAL":
                     continue
