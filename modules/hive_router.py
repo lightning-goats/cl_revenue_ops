@@ -225,12 +225,12 @@ class HiveRouter:
         max_fee_msat = amount_msat // 100  # 1% discovery cap
 
         try:
-            # Build layer list from what actually exists — avoids errors
-            # when cl-hive hasn't created optional layers yet
-            # NOTE: auto.sourcefree must NOT be used for circular rebalancing.
-            # It makes our outgoing channels appear free in getroutes, but
-            # sendpay requires real fees — causing WIRE_FEE_INSUFFICIENT.
-            layers = ["auto.localchans"]
+            # Build layer list from what actually exists.
+            # auto.sourcefree IS included here because discover_route() is for
+            # fee ESTIMATION (EV analysis, inbound cost), not sendpay execution.
+            # The executor's _get_layers() correctly excludes auto.sourcefree
+            # for the actual sendpay route construction.
+            layers = ["auto.localchans", "auto.sourcefree"]
             try:
                 existing = self.plugin.rpc.call("askrene-listlayers", {})
                 existing_names = {l.get("layer") for l in existing.get("layers", [])}
