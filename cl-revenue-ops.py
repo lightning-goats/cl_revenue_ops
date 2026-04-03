@@ -1141,11 +1141,19 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             except Exception:
                 pass
 
+        # Shutdown RebalanceExecutor thread pool
+        if rebalancer and rebalancer.rebalance_executor:
+            try:
+                rebalancer.rebalance_executor.shutdown()
+            except Exception:
+                pass
+
+        # Legacy: stop any sling jobs still running
         if rebalancer and rebalancer.job_manager:
             try:
                 stopped = rebalancer.job_manager.stop_all_jobs(reason="plugin_shutdown")
                 if stopped > 0:
-                    plugin.log(f"Stopped {stopped} active rebalance jobs", level='info')
+                    plugin.log(f"Stopped {stopped} active sling jobs", level='info')
             except Exception:
                 pass
 

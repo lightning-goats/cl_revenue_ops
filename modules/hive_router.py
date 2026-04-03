@@ -312,11 +312,14 @@ class HiveRouter:
     def refresh_fleet_balances(self) -> None:
         """Query cl-hive for fleet member channel balances.
 
-        Caches per-member capacity, available liquidity, and topology
-        so the rebalancer can size fleet rebalances without overloading
-        intermediary members.
+        Caches per-member capacity, available liquidity, and topology.
+        Skips refresh if cache is less than 5 minutes old to avoid
+        RPC timeouts on every rebalance cycle.
         """
         if not self.plugin:
+            return
+        # Cache for 5 minutes to avoid timeout stalls
+        if self._fleet_balances and (time.time() - self._last_refresh) < 300:
             return
         try:
             result = self.plugin.rpc.call("hive-fleet-balances")
