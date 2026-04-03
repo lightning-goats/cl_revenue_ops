@@ -3301,11 +3301,20 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         else:
             profit_threshold = self.config.rebalance_min_profit
 
+        # Fleet rebalances at 0 inbound cost: lower threshold since cost is
+        # essentially free.  Even small expected income is profitable when
+        # routing through fleet peers at 0 fee.
+        if inbound_fee_ppm == 0 and weighted_opp_cost == 0:
+            profit_threshold = max(1, profit_threshold // 5)
+
         # Check Profit against Dynamic Threshold
         if expected_profit < profit_threshold:
             self.plugin.log(
-                f"REBALANCE SKIPPED: Profit {expected_profit} < Threshold {profit_threshold}",
-                level='debug'
+                f"REBALANCE SKIPPED [{dest_channel[:12]}...]: "
+                f"profit={expected_profit} < threshold={profit_threshold} "
+                f"(income={expected_income}, fee={expected_fee_sats}, "
+                f"source_loss={expected_source_loss}, util={expected_utilization:.2f})",
+                level='info'
             )
             return None
 
