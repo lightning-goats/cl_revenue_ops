@@ -1571,8 +1571,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     def flow_analysis_loop():
         """Background loop for flow analysis."""
-        # Initial delay to let lightningd fully start (interruptible)
-        if shutdown_event.wait(10):
+        # Staggered startup: flow at 30s (was 10s) to avoid thundering herd
+        if shutdown_event.wait(30):
             plugin.log("Flow analysis loop cancelled during startup delay")
             return
         
@@ -1614,8 +1614,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     def fee_adjustment_loop():
         """Background loop for fee adjustment."""
-        # Initial delay to let flow analysis run first (interruptible)
-        if shutdown_event.wait(60):
+        # Staggered startup: fees at 90s (was 60s) to avoid thundering herd
+        if shutdown_event.wait(90):
             plugin.log("Fee adjustment loop cancelled during startup delay")
             return
 
@@ -1660,8 +1660,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         if not config.sling_available:
             plugin.log("Sling not found — rebalancing uses RebalanceExecutor only (native getroutes+sendpay)")
         
-        # Initial delay to let other analyses run first (interruptible)
-        if shutdown_event.wait(120):
+        # Staggered startup: rebalance at 180s (was 120s) to avoid thundering herd
+        if shutdown_event.wait(180):
             plugin.log("Rebalance check loop cancelled during startup delay")
             return
         
