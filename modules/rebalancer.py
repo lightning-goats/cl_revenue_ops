@@ -254,6 +254,9 @@ class JobManager:
         self._last_exclusion_sync: float = 0
         self._policy_manager_ref = None
 
+        # HiveRouter for askrene job reservations (injected by EVRebalancer)
+        self.hive_router = None
+
     @staticmethod
     def _classify_sling_error(error_msg: str) -> str:
         """Classify a sling error message for failure-informed routing."""
@@ -1102,6 +1105,14 @@ class JobManager:
         # H-4: Ensure reservation_id is str to match DB column type
         self.database.mark_budget_spent(str(job.rebalance_id), fee_sats)
 
+        # Release askrene reservation before stopping
+        if self.hive_router:
+            job_ref = self._active_jobs.get(job.scid_normalized)
+            if job_ref and hasattr(job_ref, 'candidate') and job_ref.candidate:
+                self.hive_router.unreserve_for_job(
+                    job_ref.scid, job_ref.candidate.amount_msat,
+                )
+
         # Stop the job
         self.stop_job(job.scid_normalized, reason="success")
 
@@ -1150,6 +1161,14 @@ class JobManager:
             self.database.mark_budget_spent(str(job.rebalance_id), partial_fee_sats)
         else:
             self.database.release_budget_reservation(str(job.rebalance_id))
+
+        # Release askrene reservation before stopping
+        if self.hive_router:
+            job_ref = self._active_jobs.get(job.scid_normalized)
+            if job_ref and hasattr(job_ref, 'candidate') and job_ref.candidate:
+                self.hive_router.unreserve_for_job(
+                    job_ref.scid, job_ref.candidate.amount_msat,
+                )
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
@@ -1202,6 +1221,14 @@ class JobManager:
         # L-17: Budget was actually spent (overspent), mark as spent not released
         # H-4: Ensure reservation_id is str to match DB column type
         self.database.mark_budget_spent(str(job.rebalance_id), actual_cost_sats)
+
+        # Release askrene reservation before stopping
+        if self.hive_router:
+            job_ref = self._active_jobs.get(job.scid_normalized)
+            if job_ref and hasattr(job_ref, 'candidate') and job_ref.candidate:
+                self.hive_router.unreserve_for_job(
+                    job_ref.scid, job_ref.candidate.amount_msat,
+                )
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="exceeded_budget")
@@ -1272,6 +1299,14 @@ class JobManager:
             self.database.mark_budget_spent(str(job.rebalance_id), fee_sats)
         else:
             self.database.release_budget_reservation(str(job.rebalance_id))
+
+        # Release askrene reservation before stopping
+        if self.hive_router:
+            job_ref = self._active_jobs.get(job.scid_normalized)
+            if job_ref and hasattr(job_ref, 'candidate') and job_ref.candidate:
+                self.hive_router.unreserve_for_job(
+                    job_ref.scid, job_ref.candidate.amount_msat,
+                )
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="timeout")
@@ -1924,7 +1959,17 @@ class EVRebalancer:
 
         # Hive hints adapter (injected by main plugin; None = disabled)
         self.hive_hints = None
-        self.hive_router = None  # HiveRouter for fleet route discovery
+        self._hive_router = None  # HiveRouter for fleet route discovery
+
+    @property
+    def hive_router(self):
+        return self._hive_router
+
+    @hive_router.setter
+    def hive_router(self, value):
+        self._hive_router = value
+        # Propagate to job_manager so _handle_job_* methods can call unreserve
+        self.job_manager.hive_router = value
 
     def _set_last_decision_summary(
         self,
@@ -4256,6 +4301,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     budget_blocked=False,
                 )
                 job_started = True
+                if self.hive_router:
+                    self.hive_router.reserve_for_job(
+                        candidate.to_channel.replace(":", "x"),
+                        candidate.amount_msat,
+                    )
                 # Clean up pending entry - job is now tracked by JobManager
                 with self._pending_lock:
                     self._pending.pop(candidate.to_channel, None)
