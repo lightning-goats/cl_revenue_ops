@@ -1,0 +1,272 @@
+"""
+hive_router — Shared askrene fleet route discovery for cl-revenue-ops.
+
+Manages a transient askrene layer with zero-fee overrides for hive fleet
+member channels.  Consumers (rebalancer, Boltz) call discover_route() to
+find cheap circular paths through the fleet.
+
+Degrades gracefully when askrene is unavailable (CLN < 24.11).
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set
+
+
+@dataclass
+class HiveRoute:
+    """A route discovered through the hive fleet via askrene."""
+    fee_ppm: int
+    hops: int
+    source_scid: str
+    path: List[Dict[str, Any]] = field(default_factory=list)
+    probability_ppm: int = 0
+
+
+class HiveRouter:
+    """
+    Fleet-aware route discovery using CLN askrene layers.
+
+    Creates a transient 'hive-fleet' layer where fleet member channels
+    are zero-fee, enabling getroutes to discover cheap circular paths.
+    """
+
+    LAYER_NAME = "hive-fleet"
+
+    def __init__(self, plugin, hive_hints):
+        """
+        Args:
+            plugin: CLN plugin reference for RPC calls
+            hive_hints: HiveHintAdapter for fleet membership queries
+        """
+        self.plugin = plugin
+        self.hive_hints = hive_hints
+        self.available: bool = False
+        self._member_ids: Set[str] = set()
+        self._our_id: Optional[str] = None
+        self._last_refresh: float = 0
+
+    def _get_our_id(self) -> Optional[str]:
+        if self._our_id:
+            return self._our_id
+        try:
+            info = self.plugin.rpc.getinfo()
+            self._our_id = info.get("id")
+        except Exception:
+            pass
+        return self._our_id
+
+    def _log(self, msg: str, level: str = "debug") -> None:
+        if self.plugin:
+            self.plugin.log(f"[HiveRouter] {msg}", level=level)
+
+    # ------------------------------------------------------------------
+    # Layer Management
+    # ------------------------------------------------------------------
+
+    def refresh_layer(self) -> bool:
+        """Recreate the hive-fleet askrene layer with zero-fee fleet channels.
+
+        Also applies positive node bias (+5) on fleet members to gently
+        prefer fleet paths for multi-hop routes.
+
+        Returns:
+            True if layer was created successfully.
+        """
+        if not self.hive_hints or not self.plugin:
+            return False
+
+        try:
+            # Remove stale layer
+            try:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.LAYER_NAME})
+            except Exception:
+                pass
+
+            self.plugin.rpc.call("askrene-create-layer", {"layer": self.LAYER_NAME})
+
+            our_id = self._get_our_id()
+            if not our_id:
+                return False
+
+            channels = self.plugin.rpc.listpeerchannels()
+            member_ids: Set[str] = set()
+            updated = 0
+
+            for ch in channels.get("channels", []):
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                peer_id = ch.get("peer_id", "")
+                scid = ch.get("short_channel_id", "")
+                if not peer_id or not scid:
+                    continue
+                if not self.hive_hints.is_hive_member(peer_id):
+                    continue
+
+                member_ids.add(peer_id)
+
+                for direction in (0, 1):
+                    try:
+                        self.plugin.rpc.call("askrene-update-channel", {
+                            "layer": self.LAYER_NAME,
+                            "short_channel_id_dir": f"{scid}/{direction}",
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        })
+                        updated += 1
+                    except Exception:
+                        pass
+
+            # Apply node-level bias so getroutes prefers fleet paths
+            for mid in member_ids:
+                for direction in ("in", "out"):
+                    try:
+                        self.plugin.rpc.call("askrene-bias-node", {
+                            "layer": self.LAYER_NAME,
+                            "node": mid,
+                            "direction": direction,
+                            "bias": 5,
+                            "description": "hive fleet preference",
+                        })
+                    except Exception:
+                        pass
+
+            self._member_ids = member_ids
+            self._last_refresh = time.time()
+            self.available = updated > 0
+
+            if updated > 0:
+                self._log(
+                    f"Refreshed layer ({updated} channel dirs at 0 fee, "
+                    f"{len(member_ids)} fleet nodes biased)",
+                )
+            return self.available
+
+        except Exception as e:
+            self._log(f"Layer refresh failed (askrene likely unavailable): {e}")
+            self.available = False
+            return False
+
+    # ------------------------------------------------------------------
+    # Route Discovery
+    # ------------------------------------------------------------------
+
+    def discover_route(
+        self, dest_peer_id: str, amount_sats: int
+    ) -> Optional[HiveRoute]:
+        """Find cheapest route through fleet to a destination peer.
+
+        Args:
+            dest_peer_id: Destination node pubkey
+            amount_sats: Amount to route
+
+        Returns:
+            HiveRoute if found, None otherwise.
+        """
+        if not self.available or not self.plugin:
+            return None
+
+        our_id = self._get_our_id()
+        if not our_id:
+            return None
+
+        amount_msat = amount_sats * 1000
+        max_fee_msat = amount_msat // 100  # 1% discovery cap
+
+        try:
+            result = self.plugin.rpc.call("getroutes", {
+                "source": our_id,
+                "destination": dest_peer_id,
+                "amount_msat": amount_msat,
+                "layers": ["auto.localchans", "auto.sourcefree", self.LAYER_NAME],
+                "maxfee_msat": max_fee_msat,
+                "final_cltv": 18,
+            })
+
+            routes = result.get("routes", [])
+            if not routes:
+                return None
+
+            route = routes[0]
+            path = route.get("path", [])
+            if not path:
+                return None
+
+            first_hop_amount = path[0].get("amount_msat", amount_msat)
+            total_fee_msat = first_hop_amount - amount_msat
+            fee_ppm = (total_fee_msat * 1_000_000) // amount_msat if amount_msat > 0 else 0
+            source_scid = path[0].get("short_channel_id", "")
+            probability = result.get("probability_ppm", 0)
+
+            self._log(
+                f"Route to {dest_peer_id[:12]}...: "
+                f"{len(path)} hops, {fee_ppm} ppm, via {source_scid}, "
+                f"prob={probability/10000:.1f}%",
+                level="info",
+            )
+
+            return HiveRoute(
+                fee_ppm=fee_ppm,
+                hops=len(path),
+                source_scid=source_scid,
+                path=path,
+                probability_ppm=probability,
+            )
+
+        except Exception as e:
+            self._log(f"Route discovery to {dest_peer_id[:12]}... failed: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Membership Helpers
+    # ------------------------------------------------------------------
+
+    def get_hive_members(self) -> Set[str]:
+        """Return cached set of fleet member pubkeys."""
+        return set(self._member_ids)
+
+    def is_hive_member(self, peer_id: str) -> bool:
+        """Check if peer is a fleet member (uses cached set)."""
+        return peer_id in self._member_ids
+
+    # ------------------------------------------------------------------
+    # Topology Scoring
+    # ------------------------------------------------------------------
+
+    def score_channel_for_hive(
+        self,
+        peer_id: str,
+        direction: str,
+        liquidity_ratio: float = 0.5,
+    ) -> float:
+        """Score how beneficial a Boltz swap on this channel is for fleet topology.
+
+        Returns a multiplier: 1.0 = neutral, >1.0 = beneficial.
+
+        Args:
+            peer_id: Channel peer's pubkey
+            direction: 'out' for loop-out, 'in' for loop-in
+            liquidity_ratio: Current local/capacity ratio (0-1)
+        """
+        if not self._member_ids:
+            return 1.0
+
+        if peer_id in self._member_ids:
+            if direction == "out":
+                # Loop-out through fleet peer: creates inbound on fleet channel.
+                # More beneficial when our side is heavy (high ratio).
+                boost = 1.2 + 0.3 * max(0, liquidity_ratio - 0.5)
+                return min(1.5, boost)
+            elif direction == "in":
+                # Loop-in on fleet peer channel: builds outbound toward fleet.
+                # More beneficial when our side is light (low ratio).
+                boost = 1.1 + 0.2 * max(0, 0.5 - liquidity_ratio)
+                return min(1.3, boost)
+
+        # Non-fleet peer — check if any fleet member is adjacent
+        # (hive_hints may know from gossip state, but we don't have that
+        # data here without RPC; return neutral for now)
+        return 1.0
