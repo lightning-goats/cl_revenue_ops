@@ -2672,9 +2672,11 @@ class EVRebalancer:
         """
         dest_state = self.database.get_channel_state(dest_channel)
         dest_flow_state = dest_state.get("state", "unknown") if dest_state else "unknown"
-        
-        if dest_flow_state == "sink": 
-            return None
+
+        # NOTE: Sink channels are NOT skipped. A depleted channel (low outbound)
+        # is classified as "sink" by flow analysis, but it needs rebalancing
+        # precisely BECAUSE it's depleted. Skipping sinks prevents all depleted
+        # channels from being rebalanced.
         
         # FLAP PROTECTION: Skip unstable destination peers
         # Peers with low uptime (high disconnect rate) are unreliable rebalance targets
