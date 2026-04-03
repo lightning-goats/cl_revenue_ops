@@ -532,7 +532,9 @@ class ChannelProfitabilityAnalyzer:
             # Classify
             classification = self._classify_channel(
                 roi, net_profit, last_routed, days_open,
-                channel_id=channel_id
+                channel_id=channel_id,
+                peer_id=peer_id,
+                forward_count=revenue.forward_count,
             )
 
             profitability = ChannelProfitability(
@@ -2148,7 +2150,9 @@ class ChannelProfitabilityAnalyzer:
     
     def _classify_channel(self, roi: float, net_profit: int,
                          last_routed: Optional[int], days_open: int,
-                         channel_id: Optional[str] = None) -> ProfitabilityClass:
+                         channel_id: Optional[str] = None,
+                         peer_id: Optional[str] = None,
+                         forward_count: int = 0) -> ProfitabilityClass:
         """Classify a channel based on profitability metrics."""
         
         # Check for inactivity
@@ -2216,12 +2220,14 @@ class ChannelProfitabilityAnalyzer:
         # important even if their ROI is poor.  A corridor-owner or high-centrality
         # channel should not be classified UNDERWATER or ZOMBIE — upgrade to
         # BREAK_EVEN so close recommendations don't target it.
+        # Fleet member protection only applies when the channel has non-zero forwards
+        # (i.e. it is actually routing traffic), preventing protection of dead channels.
         if roi < underwater_thresh and self.hive_hints and peer_id:
             try:
                 centrality = self.hive_hints.get_centrality(peer_id)
                 corridor_role = self.hive_hints.get_corridor_role(peer_id)
                 is_member = self.hive_hints.is_hive_member(peer_id)
-                if is_member or corridor_role == "owner" or centrality > 0.03:
+                if (is_member and forward_count > 0) or corridor_role == "owner" or centrality > 0.03:
                     return ProfitabilityClass.BREAK_EVEN
             except Exception:
                 pass

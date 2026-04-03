@@ -185,3 +185,174 @@ class TestHiveRouterLayerDetection:
 
         assert result is True
         assert router.available is True
+
+
+class MockProfitability:
+    def __init__(self, classification_value):
+        self.classification = MagicMock()
+        self.classification.value = classification_value
+
+
+class TestLocalLayer:
+    def test_profitable_channel_gets_positive_bias(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"state": "CHANNELD_NORMAL", "peer_id": "peer_a", "short_channel_id": "100x1x0"},
+            ]
+        }
+
+        profitability_analyzer = MagicMock()
+        profitability_analyzer.get_profitability.return_value = MockProfitability("profitable")
+
+        router = HiveRouter(plugin, MockHiveHints())
+        router.profitability_analyzer = profitability_analyzer
+        result = router.refresh_local_layer()
+
+        assert result is True
+        bias_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c[0][0] == "askrene-bias-channel"
+        ]
+        assert len(bias_calls) == 2  # Both directions
+        assert all(c[0][1]["bias"] == 3 for c in bias_calls)
+
+    def test_underwater_channel_gets_negative_bias(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"state": "CHANNELD_NORMAL", "peer_id": "peer_b", "short_channel_id": "200x1x0"},
+            ]
+        }
+
+        profitability_analyzer = MagicMock()
+        profitability_analyzer.get_profitability.return_value = MockProfitability("underwater")
+
+        router = HiveRouter(plugin, MockHiveHints())
+        router.profitability_analyzer = profitability_analyzer
+        router.refresh_local_layer()
+
+        bias_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c[0][0] == "askrene-bias-channel"
+        ]
+        assert all(c[0][1]["bias"] == -3 for c in bias_calls)
+
+    def test_zombie_channel_gets_strong_negative_bias(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"state": "CHANNELD_NORMAL", "peer_id": "peer_c", "short_channel_id": "300x1x0"},
+            ]
+        }
+
+        profitability_analyzer = MagicMock()
+        profitability_analyzer.get_profitability.return_value = MockProfitability("zombie")
+
+        router = HiveRouter(plugin, MockHiveHints())
+        router.profitability_analyzer = profitability_analyzer
+        router.refresh_local_layer()
+
+        bias_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c[0][0] == "askrene-bias-channel"
+        ]
+        assert all(c[0][1]["bias"] == -8 for c in bias_calls)
+
+    def test_no_profitability_analyzer_returns_false(self):
+        router = HiveRouter(MagicMock(), MockHiveHints())
+        router.profitability_analyzer = None
+        assert router.refresh_local_layer() is False
+
+    def test_break_even_channel_gets_no_bias(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"state": "CHANNELD_NORMAL", "peer_id": "peer_d", "short_channel_id": "400x1x0"},
+            ]
+        }
+
+        profitability_analyzer = MagicMock()
+        profitability_analyzer.get_profitability.return_value = MockProfitability("break_even")
+
+        router = HiveRouter(plugin, MockHiveHints())
+        router.profitability_analyzer = profitability_analyzer
+        router.refresh_local_layer()
+
+        bias_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c[0][0] == "askrene-bias-channel"
+        ]
+        assert len(bias_calls) == 0
+
+
+class TestReservations:
+    def test_reserve_pull_uses_direction_1(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.reserve_for_job("100x1x0", 500_000, direction="pull")
+
+        assert result is True
+        plugin.rpc.call.assert_called_once_with("askrene-reserve", {
+            "path": [{"short_channel_id_dir": "100x1x0/1", "amount_msat": 500_000}]
+        })
+
+    def test_reserve_push_uses_direction_0(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.reserve_for_job("100x1x0", 300_000, direction="push")
+
+        assert result is True
+        plugin.rpc.call.assert_called_once_with("askrene-reserve", {
+            "path": [{"short_channel_id_dir": "100x1x0/0", "amount_msat": 300_000}]
+        })
+
+    def test_unreserve_pull_uses_direction_1(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.unreserve_for_job("200x1x0", 100_000, direction="pull")
+
+        assert result is True
+        plugin.rpc.call.assert_called_once_with("askrene-unreserve", {
+            "path": [{"short_channel_id_dir": "200x1x0/1", "amount_msat": 100_000}]
+        })
+
+    def test_unreserve_push_uses_direction_0(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.unreserve_for_job("200x1x0", 200_000, direction="push")
+
+        assert result is True
+        plugin.rpc.call.assert_called_once_with("askrene-unreserve", {
+            "path": [{"short_channel_id_dir": "200x1x0/0", "amount_msat": 200_000}]
+        })
+
+    def test_reserve_returns_false_on_error(self):
+        plugin = MagicMock()
+        plugin.rpc.call.side_effect = Exception("askrene error")
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.reserve_for_job("100x1x0", 500_000, direction="pull")
+
+        assert result is False
+
+    def test_unreserve_returns_false_on_error(self):
+        plugin = MagicMock()
+        plugin.rpc.call.side_effect = Exception("askrene error")
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.unreserve_for_job("100x1x0", 500_000, direction="pull")
+
+        assert result is False

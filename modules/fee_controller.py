@@ -1708,8 +1708,7 @@ class FeeController:
             if not isinstance(confidence, (int, float)) or confidence <= 0.5:
                 return 1.0
 
-            import time as _time
-            current_hour = int(_time.strftime("%H"))
+            current_hour = int(time.strftime("%H"))
 
             multiplier = 1.0
 
