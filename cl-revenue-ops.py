@@ -1656,10 +1656,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     def rebalance_check_loop():
         """Background loop for rebalance checks."""
-        # Skip rebalancing entirely if sling is not available
+        # RebalanceExecutor is the primary engine; sling is optional legacy
         if not config.sling_available:
-            plugin.log("Rebalance loop disabled: sling plugin not found")
-            return
+            plugin.log("Sling not found — rebalancing uses RebalanceExecutor only (native getroutes+sendpay)")
         
         # Initial delay to let other analyses run first (interruptible)
         if shutdown_event.wait(120):
@@ -2658,8 +2657,7 @@ def revenue_rebalance(plugin: Plugin,
         if not allowed:
             return {"status": "error", "error": msg}
 
-    if config and not config.sling_available:
-        return {"error": "Rebalancing disabled: sling plugin not found. Install cln-sling to enable."}
+    # Sling is no longer required — RebalanceExecutor handles all rebalances
 
     # L-21: Validate SCID format
     for cid in (from_channel, to_channel):
