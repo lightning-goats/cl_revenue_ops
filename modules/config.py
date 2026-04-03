@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
     'db_path',
     'dry_run',  # Safety: don't allow enabling dry_run to hide actions
-    'sling_available',  # L15 FIX: Runtime dependency flag, set during init only
 })
 
 PUBLIC_RUNTIME_KEYS = (
@@ -76,19 +75,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'kelly_fraction': float,
     'reputation_decay': float,
     'max_concurrent_jobs': int,
-    'sling_job_timeout_seconds': int,
-    'sling_chunk_size_sats': int,
-    'sling_max_hops': int,
     'askrene_layer': str,
     'askrene_max_age_sec': int,
-    'sling_parallel_jobs': int,
-    'sling_target_sink': float,
-    'sling_target_source': float,
-    'sling_target_balanced': float,
-    'sling_outppm_fallback': int,
-    'sling_deplete_pct_sink': float,
-    'sling_deplete_pct_source': float,
-    'sling_deplete_pct_balanced': float,
     'rebalance_min_profit': int,
     'rebalance_min_profit_ppm': int,
     'rebalance_max_amount': int,
@@ -125,7 +113,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'target_flow': int,
     'source_threshold': float,
     'sink_threshold': float,
-    'rebalancer_plugin': str,
     'enable_flow_asymmetry': bool,
     'enable_peer_sync': bool,
     # Capacity Planner
@@ -169,16 +156,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'proportional_budget_pct': (0.0, 1.0),
     'kelly_fraction': (0.0, 1.0),
     'vegas_decay_rate': (0.0, 1.0),
-    'sling_chunk_size_sats': (1, 50000000),
-    'sling_max_hops': (2, 20),
-    'sling_parallel_jobs': (1, 10),
-    'sling_target_sink': (0.1, 0.9),
-    'sling_target_source': (0.1, 0.9),
-    'sling_target_balanced': (0.1, 0.9),
-    'sling_outppm_fallback': (0, 10000),
-    'sling_deplete_pct_sink': (0.01, 0.50),
-    'sling_deplete_pct_source': (0.01, 0.50),
-    'sling_deplete_pct_balanced': (0.01, 0.50),
     'rebalance_min_profit_ppm': (0, 100000),
     'rpc_timeout_seconds': (1, 300),
     'rpc_circuit_breaker_seconds': (0, 3600),
@@ -201,7 +178,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'fee_interval': (60, 86400),
     'rebalance_interval': (60, 86400),
     'max_concurrent_jobs': (1, 20),
-    'sling_job_timeout_seconds': (60, 7200),
     'askrene_max_age_sec': (10, 86400),
     'base_fee_msat': (0, 10000),
     'rebalance_min_profit': (0, 1000000),
@@ -242,7 +218,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
     'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
     'total_cost_budget_mode': ('fixed', 'profit_pct'),
-    'rebalancer_plugin': ('sling',),
 }
 
 
@@ -308,9 +283,6 @@ class Config:
     futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
     inbound_fee_estimate_ppm: int = 50  # Route cost buffer added on top of last-hop fee (PPM)
     
-    # Rebalancer plugin selection
-    rebalancer_plugin: str = 'sling'  # Only sling is supported
-    
     # Profitability tracking
     estimated_open_cost_sats: int = 5000  # Estimated on-chain fee for channel open
     
@@ -349,32 +321,16 @@ class Config:
                                       # Half Kelly (0.5) reduces volatility drag significantly
     
     # Async Job Queue
-    max_concurrent_jobs: int = 5              # Max number of concurrent sling rebalance jobs
-    sling_job_timeout_seconds: int = 7200     # Timeout for sling jobs (2 hours default)
-    sling_chunk_size_sats: int = 500000       # Amount per sling rebalance attempt (500k sats)
+    max_concurrent_jobs: int = 5              # Max number of concurrent rebalance jobs
 
     # AskRene (xpay) constraint integration
     askrene_layer: str = 'xpay'               # Layer name for askrene-listlayers
     askrene_max_age_sec: int = 900            # Max constraint age (seconds) to consider fresh
 
-    # Sling Integration
-    sling_max_hops: int = 5                   # Max route hops (shorter = faster, more reliable)
-    sling_parallel_jobs: int = 2              # Concurrent route attempts per job
-    sling_target_sink: float = 0.40           # Balance target for sink channels (want more inbound)
-    sling_target_source: float = 0.65         # Balance target for source channels (want more outbound)
-    sling_target_balanced: float = 0.50       # Balance target for balanced channels
-    sling_outppm_fallback: int = 500          # Max fee PPM for outppm fallback (0 = disabled)
-    sling_deplete_pct_sink: float = 0.10      # Aggressive drain for sink sources
-    sling_deplete_pct_source: float = 0.35    # Protective for source channels
-    sling_deplete_pct_balanced: float = 0.20  # Sling default
-
     # Safety flags
     paused: bool = False           # If True, suppress automated executor actions
     dry_run: bool = False          # If True, log but don't execute
-    
-    # Runtime dependency flags (set during init based on listplugins)
-    sling_available: bool = True   # Set to False if sling plugin not detected
-    
+
     # Vegas Reflex (mempool spike defense)
     enable_vegas_reflex: bool = True       # Mempool spike defense
     vegas_decay_rate: float = 0.85         # Per-cycle decay (~30min half-life)
@@ -691,9 +647,6 @@ class ConfigSnapshot:
     futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
 
-    # Rebalancer plugin selection
-    rebalancer_plugin: str
-    
     # Profitability tracking
     estimated_open_cost_sats: int
     
@@ -722,26 +675,10 @@ class ConfigSnapshot:
     
     # Async Job Queue
     max_concurrent_jobs: int
-    sling_job_timeout_seconds: int
-    sling_chunk_size_sats: int
-
-    # Sling Integration
-    sling_max_hops: int
-    sling_parallel_jobs: int
-    sling_target_sink: float
-    sling_target_source: float
-    sling_target_balanced: float
-    sling_outppm_fallback: int
-    sling_deplete_pct_sink: float
-    sling_deplete_pct_source: float
-    sling_deplete_pct_balanced: float
 
     # Safety flags
     dry_run: bool
-    
-    # Runtime dependency flags
-    sling_available: bool
-    
+
     # Vegas Reflex (mempool spike defense)
     enable_vegas_reflex: bool
     vegas_decay_rate: float

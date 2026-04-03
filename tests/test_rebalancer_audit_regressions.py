@@ -473,7 +473,6 @@ class TestB1MaxFeePpmRederive:
             rebalance_min_profit_ppm=0,
             rebalance_cooldown_hours=24,
             flow_window_days=7,
-            sling_chunk_size_sats=500_000,
             hot_channel_protection_enabled=False,
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)

@@ -334,7 +334,7 @@ class TestParallelJobsParameter:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(sling_parallel_jobs=3)
+        cfg = Config()
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         mock_plugin.rpc.listfunds.return_value = {
@@ -348,7 +348,7 @@ class TestParallelJobsParameter:
         sling_job_call = mock_plugin.rpc.call.call_args_list[0]
         assert sling_job_call[0][0] == "sling-job"
         params = sling_job_call[0][1]
-        assert params["paralleljobs"] == 3
+        assert params["paralleljobs"] == 2  # hardcoded legacy default
 
 
 class TestFlowAwareDepletion:
@@ -358,11 +358,7 @@ class TestFlowAwareDepletion:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(
-            sling_deplete_pct_sink=0.10,
-            sling_deplete_pct_source=0.35,
-            sling_deplete_pct_balanced=0.20,
-        )
+        cfg = Config()
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         mock_plugin.rpc.listfunds.return_value = {
@@ -509,7 +505,7 @@ class TestPushDirection:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(sling_target_balanced=0.50)
+        cfg = Config()
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         mock_plugin.rpc.listfunds.return_value = {
@@ -528,7 +524,7 @@ class TestPushDirection:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(sling_target_balanced=0.50)
+        cfg = Config()
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         mock_plugin.rpc.listfunds.return_value = {
@@ -549,7 +545,7 @@ class TestPushDirection:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(sling_target_source=0.65)
+        cfg = Config()
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         mock_plugin.rpc.listfunds.return_value = {
@@ -621,9 +617,9 @@ class TestSlingOnce:
         assert params["amount"] == 100000
         assert params["maxppm"] == 500
         assert params["onceamount"] == 200000
-        assert params["maxhops"] == cfg.sling_max_hops
+        assert params["maxhops"] == 5  # hardcoded legacy default
         # paralleljobs included when > 1 (default is 2)
-        assert params["paralleljobs"] == cfg.sling_parallel_jobs
+        assert params["paralleljobs"] == 2  # hardcoded legacy default
 
     def test_execute_once_with_candidates(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -999,7 +995,7 @@ class TestSlingOnceNewParams:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(sling_max_hops=3)
+        cfg = Config()
         jm = JobManager(mock_plugin, cfg, mock_database)
         mock_plugin.rpc.call.return_value = {"status": "ok"}
 
@@ -1008,13 +1004,13 @@ class TestSlingOnceNewParams:
         sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
         assert len(sling_once_calls) == 1
         params = sling_once_calls[0][0][1]
-        assert params["maxhops"] == 3
+        assert params["maxhops"] == 5  # hardcoded legacy default
 
-    def test_execute_once_explicit_maxhops_overrides_config(self, mock_plugin, mock_database):
+    def test_execute_once_explicit_maxhops_overrides_default(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(sling_max_hops=5)
+        cfg = Config()
         jm = JobManager(mock_plugin, cfg, mock_database)
         mock_plugin.rpc.call.return_value = {"status": "ok"}
 
@@ -1064,7 +1060,7 @@ class TestSlingOnceNewParams:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(sling_parallel_jobs=3)
+        cfg = Config()
         jm = JobManager(mock_plugin, cfg, mock_database)
         mock_plugin.rpc.call.return_value = {"status": "ok"}
 
@@ -1073,17 +1069,17 @@ class TestSlingOnceNewParams:
         sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
         assert len(sling_once_calls) == 1
         params = sling_once_calls[0][0][1]
-        assert params["paralleljobs"] == 3
+        assert params["paralleljobs"] == 2  # hardcoded legacy default
 
-    def test_execute_once_omits_paralleljobs_when_one(self, mock_plugin, mock_database):
+    def test_execute_once_omits_paralleljobs_when_explicit_one(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(sling_parallel_jobs=1)
+        cfg = Config()
         jm = JobManager(mock_plugin, cfg, mock_database)
         mock_plugin.rpc.call.return_value = {"status": "ok"}
 
-        jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500)
+        jm.execute_once(scid="123x456x0", direction="pull", amount=100000, maxppm=500, paralleljobs=1)
 
         sling_once_calls = _rpc_calls_for(mock_plugin, "sling-once")
         assert len(sling_once_calls) == 1
@@ -1429,7 +1425,6 @@ class TestNoDeplestedSourceDiagnostics:
         cfg = Config(
             low_liquidity_threshold=0.20,
             high_liquidity_threshold=0.80,
-            sling_available=True,
         )
         pm = MagicMock(spec=PolicyManager)
         pm.should_rebalance.return_value = True

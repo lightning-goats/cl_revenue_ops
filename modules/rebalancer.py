@@ -6,15 +6,17 @@ MODULE 3: EV-Based Rebalancing (Profit-Aware with Opportunity Cost)
 This module implements Expected Value (EV) based rebalancing decisions.
 This module only triggers rebalances when the math shows positive expected profit.
 
-Architecture Pattern: "Strategist, Manager, and Driver"
+Architecture Pattern: "Strategist and Executor"
 - STRATEGIST (EVRebalancer): Calculates EV, determines IF and HOW MUCH to rebalance
-- MANAGER (JobManager): Manages lifecycle of background sling jobs
-- DRIVER (Sling plugin): Actually executes the payments in the background
+- EXECUTOR (RebalanceExecutor): Actually executes payments via native getroutes+sendpay
 
 Async Job Queue
 - Decouples decision-making from execution
 - Allows concurrent rebalancing attempts
-- Uses sling-job (background) instead of sling-once (blocking)
+
+Note: JobManager (sling-based) is retained as deprecated legacy code.
+      It is no longer called from the active rebalance path but diagnostic
+      RPCs may still reference it for active job counts.
 """
 
 import math
@@ -37,7 +39,7 @@ if TYPE_CHECKING:
 
 
 class JobStatus(Enum):
-    """Status of a sling background job."""
+    """Status of a background rebalance job (legacy: sling; current: RebalanceExecutor)."""
     PENDING = "pending"
     RUNNING = "running"
     SUCCESS = "success"
@@ -204,18 +206,12 @@ class ActiveJob:
 
 class JobManager:
     """
-    Manages the lifecycle of Sling background rebalancing jobs.
+    DEPRECATED: Sling-based background rebalancing job manager.
 
-    Responsibilities:
-    - Start new sling-job workers
-    - Monitor job progress via sling-stats
-    - Stop jobs on success, timeout, or error
-    - Record results to database
-
-    Key Design Decision:
-    We use sling-job for TACTICAL rebalancing (one-off moves), not permanent
-    pegging. As soon as any successful payment is detected or timeout is reached,
-    we DELETE the job to prevent infinite spending.
+    JobManager is no longer called from the active rebalance path.
+    RebalanceExecutor (native getroutes+sendpay) replaced it as the primary
+    execution engine. This class is retained because diagnostic RPCs may still
+    reference it for active job counts. Do not add new sling dependencies here.
     """
 
     # Default timeout: 2 hours (configurable)
@@ -230,13 +226,12 @@ class JobManager:
         self._active_jobs: Dict[str, ActiveJob] = {}
         self._jobs_lock = threading.Lock()
 
-        # Configurable settings
-        self.job_timeout_seconds = getattr(config, 'sling_job_timeout_seconds',
-                                           self.DEFAULT_JOB_TIMEOUT_SECONDS)
+        # Configurable settings (legacy sling options; kept for backward compat with orphan cleanup)
+        self.job_timeout_seconds = self.DEFAULT_JOB_TIMEOUT_SECONDS
         self.max_concurrent_jobs = getattr(config, 'max_concurrent_jobs', 5)
 
-        # Chunk size for sling rebalances (sats per attempt)
-        self.chunk_size_sats = getattr(config, 'sling_chunk_size_sats', 500000)
+        # Chunk size (legacy; kept for diagnostics)
+        self.chunk_size_sats = 500000
 
         # AskRene integration (read-only): use constraints for preflight sizing + intelligence.
         self._askrene_cache_ts = 0
@@ -468,41 +463,41 @@ class JobManager:
             flow_state = candidate.dest_flow_state
             direction = candidate.direction
 
+            # DEPRECATED: sling-specific target/balance logic (legacy, not active)
+            _sling_target_source = 0.65
+            _sling_target_sink = 0.40
+            _sling_target_balanced = 0.50
+            _sling_deplete_pct_sink = 0.10
+            _sling_deplete_pct_source = 0.35
+            _sling_deplete_pct_balanced = 0.20
+            _sling_max_hops = 5
+            _sling_parallel_jobs = 2
+            _sling_outppm_fallback = 500
+
             if direction == "push":
-                # Push: target is the local balance ratio to drain DOWN to
                 if flow_state == "source":
-                    target = 1.0 - self.config.sling_target_source
+                    target = 1.0 - _sling_target_source
                 elif flow_state == "sink":
-                    target = 1.0 - self.config.sling_target_sink
+                    target = 1.0 - _sling_target_sink
                 else:
-                    target = 1.0 - self.config.sling_target_balanced
+                    target = 1.0 - _sling_target_balanced
             else:
-                # Pull: existing logic unchanged
                 if flow_state == "sink":
-                    target = self.config.sling_target_sink
+                    target = _sling_target_sink
                 elif flow_state == "source":
-                    target = self.config.sling_target_source
+                    target = _sling_target_source
                 else:
-                    target = self.config.sling_target_balanced
+                    target = _sling_target_balanced
 
             self.plugin.log(
-                f"Starting sling-job: {to_scid} {'<-' if direction == 'pull' else '->'} "
+                f"Starting sling-job (legacy): {to_scid} {'<-' if direction == 'pull' else '->'} "
                 f"[{len(source_scids_sling)} candidates], "
                 f"primary={primary_source}, dir={direction}, amount={chunk_size}, "
-                f"maxppm={maxppm}, maxhops={self.config.sling_max_hops}, "
+                f"maxppm={maxppm}, maxhops={_sling_max_hops}, "
                 f"target={target} (flow={flow_state}), budget_sats={candidate.max_budget_sats}"
             )
 
-            # =================================================================
-            # PHASE 6: Enhanced Sling Parameters
-            # =================================================================
-            # - maxhops: Shorter routes are faster and more reliable
-            # - target: Flow-aware balance target
-            # - outppm: Cap per-hop fee; also used as sole source signal when no candidates
-            # =================================================================
-            # If askrene found a hive route, tighten maxhops so sling
-            # discovers the same short path through fleet peers.
-            maxhops = self.config.sling_max_hops
+            maxhops = _sling_max_hops
             if candidate.hive_route_hops > 0:
                 maxhops = min(maxhops, candidate.hive_route_hops + 1)
                 self.plugin.log(
@@ -518,36 +513,31 @@ class JobManager:
                 "maxppm": maxppm,
                 "maxhops": maxhops,
                 "target": target,
-                "paralleljobs": self.config.sling_parallel_jobs,
+                "paralleljobs": _sling_parallel_jobs,
             }
 
-            # Flow-aware depletion: how aggressively to drain source candidates
             if flow_state == "sink":
-                deplete_pct = self.config.sling_deplete_pct_sink
+                deplete_pct = _sling_deplete_pct_sink
             elif flow_state == "source":
-                deplete_pct = self.config.sling_deplete_pct_source
+                deplete_pct = _sling_deplete_pct_source
             else:
-                deplete_pct = self.config.sling_deplete_pct_balanced
+                deplete_pct = _sling_deplete_pct_balanced
 
             job_params["depleteuptopercent"] = deplete_pct
 
-            # EV v2.0: Asymmetric depletion tied to actual source excess capital.
-            # Instead of a fixed chunk_size * 2 limit, compute how much the primary
-            # source is overweight and allow Sling to drain exactly that amount.
             try:
                 primary_source_scid = candidate.source_candidates[0] if candidate.source_candidates else None
                 source_state = self.database.get_channel_state(primary_source_scid) if primary_source_scid else None
                 if source_state and source_state.get("capacity", 0) > 0:
                     source_cap = source_state["capacity"]
                     source_bal = self._get_channel_local_balance(primary_source_scid)
-                    # Use the SOURCE channel's own flow state (not the destination's)
                     source_flow = source_state.get("state", "balanced")
                     if source_flow == "source":
-                        source_target_ratio = self.config.sling_target_source
+                        source_target_ratio = _sling_target_source
                     elif source_flow == "sink":
-                        source_target_ratio = self.config.sling_target_sink
+                        source_target_ratio = _sling_target_sink
                     else:
-                        source_target_ratio = self.config.sling_target_balanced
+                        source_target_ratio = _sling_target_balanced
                     source_target_sats = int(source_cap * source_target_ratio)
                     actual_excess = max(0, source_bal - source_target_sats)
                     job_params["depleteuptoamount"] = max(100_000, actual_excess)
@@ -556,22 +546,18 @@ class JobManager:
             except Exception:
                 job_params["depleteuptoamount"] = max(100_000, chunk_size * 2)
 
-            # Add candidates if we have them
             if source_scids_sling:
                 job_params["candidates"] = source_scids_sling
 
-            # Add outppm to cap source-side fee (if configured)
-            if self.config.sling_outppm_fallback > 0:
+            if _sling_outppm_fallback > 0:
                 if not source_scids_sling:
-                    # No candidates - outppm is the only source-selection signal
-                    job_params["outppm"] = self.config.sling_outppm_fallback
+                    job_params["outppm"] = _sling_outppm_fallback
                     self.plugin.log(
-                        f"No candidates for {to_scid}, using outppm={self.config.sling_outppm_fallback} fallback",
+                        f"No candidates for {to_scid}, using outppm={_sling_outppm_fallback} fallback",
                         level='info'
                     )
                 else:
-                    # Have candidates; outppm still caps per-hop fee for all routes
-                    job_params["outppm"] = self.config.sling_outppm_fallback
+                    job_params["outppm"] = _sling_outppm_fallback
 
             self.plugin.rpc.call("sling-job", job_params)
             
@@ -1497,9 +1483,9 @@ class JobManager:
         if outppm and outppm > 0:
             params["outppm"] = outppm
 
-        # Apply config defaults for params not explicitly provided
+        # Apply defaults for params not explicitly provided (legacy sling defaults)
         if maxhops is None:
-            maxhops = self.config.sling_max_hops
+            maxhops = 5  # legacy sling default
         params["maxhops"] = maxhops
 
         if depleteuptopercent is not None:
@@ -1509,7 +1495,7 @@ class JobManager:
             params["depleteuptoamount"] = depleteuptoamount
 
         if paralleljobs is None:
-            paralleljobs = self.config.sling_parallel_jobs
+            paralleljobs = 2  # legacy sling default
         if paralleljobs > 1:
             params["paralleljobs"] = paralleljobs
 
@@ -1930,11 +1916,11 @@ class EVRebalancer:
 
     This class acts as the "Strategist" - it calculates EV and determines
     IF and HOW MUCH to rebalance. The actual execution is delegated to
-    the JobManager which manages sling background jobs.
+    RebalanceExecutor (native getroutes+sendpay).
 
     Thread Safety (I-13, I-14, S-9):
     The rebalance cycle runs single-threaded on a timer. Candidate evaluation,
-    EV calculation, and sling job dispatch all happen within one timer callback.
+    EV calculation, and executor dispatch all happen within one timer callback.
     No locking is needed for cycle-local state because only one cycle runs at
     a time. The _pending dict is the only shared state (accessed by async job
     callbacks) and is protected by _pending_lock.
@@ -1987,7 +1973,7 @@ class EVRebalancer:
         # Hive hints adapter (injected by main plugin; None = disabled)
         self.hive_hints = None
         self._hive_router = None  # HiveRouter for fleet route discovery
-        self.rebalance_executor = None  # RebalanceExecutor (replaces sling when available)
+        self.rebalance_executor = None  # RebalanceExecutor (native getroutes+sendpay)
 
     @property
     def hive_router(self):
@@ -2030,7 +2016,7 @@ class EVRebalancer:
         """
         exhausted = (self._last_depleted_count > 0 and self._last_profitable_count == 0)
         return {
-            "sling_exhausted": exhausted,
+            "rebalancer_exhausted": exhausted,
             "depleted_count": self._last_depleted_count,
             "profitable_count": self._last_profitable_count,
             "cycle_ts": self._last_cycle_ts,
@@ -2920,7 +2906,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # ZERO-TOLERANCE: Evaluate EV on the actual execution unit (one chunk).
         # This matches the "stop after first success" execution model.
         #
-        dynamic_chunk_cap = int(self.config.sling_chunk_size_sats)
+        dynamic_chunk_cap = int(getattr(self.config, 'sling_chunk_size_sats', 500000))
         if hot_profile.get('eligible'):
             try:
                 dynamic_chunk_cap = int(dynamic_chunk_cap * float(hot_profile.get('chunk_multiplier', 1.0) or 1.0))
@@ -4582,7 +4568,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             else:
                 self.database.update_rebalance_result(
                     rebalance_id, 'failed',
-                    error_message=result.get("error", "sling-once failed")
+                    error_message=result.get("error", "rebalance failed")
                 )
 
             return {
@@ -4705,7 +4691,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 rebalance_id, 'failed',
                 error_message=once_result.get("error", "")
             )
-            result = {"success": False, "error": once_result.get("error", "sling-once failed")}
+            result = {"success": False, "error": once_result.get("error", "rebalance failed")}
 
         # Include capital controls warning in result (unless force=True)
         if not capital_ok and not force:

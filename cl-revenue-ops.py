@@ -10,7 +10,7 @@ Dependencies:
 - pyln-client: Core Lightning plugin framework
 - bookkeeper plugin (built-in): On-chain cost attribution (opens/closes) and accounting-grade events
 - Local forwards table (SQLite): Routing history for flow analysis (hydrated once on startup)
-- External rebalancer (sling): Executes rebalance payments
+- Native rebalancer (RebalanceExecutor): Executes rebalance payments via getroutes+sendpay
 
 Author: Lightning Goats Team
 License: MIT
@@ -446,12 +446,6 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-rebalancer',
-    default='sling',
-    description='Rebalancer plugin to use (default: sling)'
-)
-
-plugin.add_option(
     name='revenue-ops-daily-budget-sats',
     default='5000',
     description='Max rebalancing fees to spend in 24 hours - acts as floor when proportional budget enabled (default: 5000)'
@@ -609,7 +603,7 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-hot-channel-protection-max-chunk-multiplier',
     default='4.0',
-    description='Max multiplier on sling chunk size for hot-channel protection (default: 4.0)'
+    description='Max multiplier on rebalance chunk size for hot-channel protection (default: 4.0)'
 )
 
 plugin.add_option(
@@ -970,8 +964,8 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
         if _planner_coord is None:
             _planner_coord = {}
         if _rebalancer_coord:
-            _planner_coord["sling_exhausted"] = _rebalancer_coord.get("sling_exhausted", False)
-            _planner_coord["sling_depleted_count"] = _rebalancer_coord.get("depleted_count", 0)
+            _planner_coord["rebalancer_exhausted"] = _rebalancer_coord.get("rebalancer_exhausted", False)
+            _planner_coord["rebalancer_depleted_count"] = _rebalancer_coord.get("depleted_count", 0)
 
         if bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False:
             treasury_plan = _build_boltz_expansion_treasury_plan(
@@ -1148,15 +1142,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             except Exception:
                 pass
 
-        # Legacy: stop any sling jobs still running
-        if rebalancer and rebalancer.job_manager:
-            try:
-                stopped = rebalancer.job_manager.stop_all_jobs(reason="plugin_shutdown")
-                if stopped > 0:
-                    plugin.log(f"Stopped {stopped} active sling jobs", level='info')
-            except Exception:
-                pass
-
         if database:
             try:
                 database.close_all_connections()
@@ -1227,7 +1212,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
-        rebalancer_plugin=options['revenue-ops-rebalancer'],
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
         weekly_budget_sats=_safe_int('revenue-ops-weekly-budget-sats'),
         total_cost_budget_mode=options.get('revenue-ops-total-cost-budget-mode', 'fixed').lower(),
@@ -1327,19 +1311,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             
         active_plugins = [p.get("name", "").lower() for p in plugins_result.get("plugins", [])]
         
-        # Check for sling plugin
-        sling_found = any("sling" in name for name in active_plugins)
-        if not sling_found:
-            plugin.log(
-                "Dependency 'sling' not found. Rebalancing module disabled. "
-                "Install cln-sling to enable rebalancing.",
-                level='warn'
-            )
-            config.sling_available = False
-        else:
-            plugin.log("Dependency check: sling plugin detected")
-            config.sling_available = True
-        
+        plugin.log("Rebalancing uses native RebalanceExecutor (getroutes+sendpay)")
+
         # Check for bookkeeper plugin
         bookkeeper_found = any("bookkeeper" in name for name in active_plugins)
         if not bookkeeper_found:
@@ -1353,10 +1326,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             
     except Exception as e:
         plugin.log(f"Error checking plugin dependencies: {e}", level='warn')
-        # EH-10: Fail-closed — assume sling unavailable if check fails
-        config.sling_available = False
-    
-    
+
+
     # Initialize database
     database = Database(config.db_path, safe_plugin)
     database.initialize()
@@ -1552,7 +1523,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hive_router.profitability_analyzer = profitability_analyzer
 
     # RebalanceExecutor: native getroutes+sendpay rebalance engine
-    # Replaces sling for all rebalances when available; sling remains as fallback
     from modules.rebalance_executor import RebalanceExecutor
     rebalance_executor = RebalanceExecutor(
         plugin=safe_plugin,
@@ -1655,10 +1625,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     def rebalance_check_loop():
         """Background loop for rebalance checks."""
-        # RebalanceExecutor is the primary engine; sling is optional legacy
-        if not config.sling_available:
-            plugin.log("Sling not found — rebalancing uses RebalanceExecutor only (native getroutes+sendpay)")
-        
         # Staggered startup: rebalance at 180s (was 120s) to avoid thundering herd
         if shutdown_event.wait(180):
             plugin.log("Rebalance check loop cancelled during startup delay")
@@ -1887,36 +1853,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             f"channels={tlv_data.get('channel_count', 0)}"
         )
 
-    # =========================================================================
-    # STARTUP HYGIENE: Clean up orphan jobs from previous runs
-    # =========================================================================
-    if rebalancer and config.sling_available:
-        try:
-            rebalancer.job_manager.cleanup_orphans()
-        except Exception as e:
-            plugin.log(f"Warning: Could not clean up orphan jobs: {e}", level='warn')
-
-        # M-11: Clean up stale budget reservations from crashed jobs
-        try:
-            database.cleanup_stale_reservations()
-        except Exception as e:
-            plugin.log(f"Warning: Could not clean up stale reservations: {e}", level='warn')
-
-        # PHASE 6: Sync peer exclusions with sling on startup
-        try:
-            rebalancer.job_manager.sync_peer_exclusions(policy_manager)
-        except Exception as e:
-            plugin.log(f"Warning: Could not sync peer exclusions: {e}", level='warn')
-
-        # Sling hygiene: stats retention settings.
-        # NOTE: setconfig on plugin-owned options (sling-*) triggers a segfault
-        # in CLN v25.12.1 (configvar_finalize_overrides). These must be set in
-        # the CLN config file at startup instead:
-        #   sling-stats-delete-failures-age=30
-        #   sling-stats-delete-successes-age=30
-        #   sling-candidates-min-age=144
-        plugin.log("Sling hygiene: configure stats retention in CLN config (setconfig unsafe on v25.12.1)", level='debug')
-    
     # Start background threads (daemon=True so they don't block shutdown)
     threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()
     threading.Thread(target=fee_adjustment_loop, daemon=True, name="fee-adjustment").start()
@@ -2107,7 +2043,7 @@ def revenue_rebalance_debug(
     max_candidates = max(0, int(max_candidates or 0))
 
     result = {
-        "sling_available": config.sling_available if config else False,
+        "executor_available": True,
         "dry_run": config.dry_run if config else False,
         "filters": {
             "channel_id": filter_channel_id or None,
@@ -2136,10 +2072,6 @@ def revenue_rebalance_debug(
         },
         "rejection_reasons": []
     }
-
-    if not config.sling_available:
-        result["rejection_reasons"].append("Sling plugin not available - rebalancing disabled")
-        return result
 
     cfg = config.snapshot()
     result["thresholds"] = {
@@ -3718,7 +3650,7 @@ def revenue_health(plugin: Plugin) -> Dict[str, Any]:
                 "active_jobs": active_jobs,
                 "depleted_channels": coord.get("depleted_count", 0),
                 "profitable_candidates": coord.get("profitable_count", 0),
-                "sling_exhausted": coord.get("sling_exhausted", False),
+                "rebalancer_exhausted": coord.get("rebalancer_exhausted", False),
             }
         except Exception as e:
             result["rebalancer"] = {"error": str(e)}
@@ -3937,13 +3869,11 @@ def revenue_clear_reservations(plugin: Plugin) -> Dict[str, Any]:
     """
     Clear all active budget reservations (Issue #33).
 
-    Use this command after manually stopping sling jobs to release their
-    budget reservations. This resets the reservation system so new
-    rebalances can use the daily budget.
+    Use this command to release stale budget reservations. This resets
+    the reservation system so new rebalances can use the daily budget.
 
     Typical workflow:
-    1. lightning-cli sling-deletejob all   # Stop all sling jobs
-    2. lightning-cli revenue-clear-reservations  # Release budget
+    1. lightning-cli revenue-clear-reservations  # Release budget
 
     Returns:
         {
@@ -5545,7 +5475,7 @@ def _build_boltz_balance_plan(
     planner_coord = planner_coordination if isinstance(planner_coordination, dict) else {}
     planner_loser_scids = set(planner_coord.get("loser_scids", set()))
     planner_funding_deficit = int(planner_coord.get("funding_deficit_sats", 0) or 0)
-    sling_exhausted = bool(planner_coord.get("sling_exhausted", False))
+    rebalancer_exhausted = bool(planner_coord.get("rebalancer_exhausted", False))
 
     # Route-pair awareness: protect inbound legs of top revenue routes from loop-out drain
     route_pair_in_channels = set()
@@ -5627,18 +5557,18 @@ def _build_boltz_balance_plan(
         posterior_mean = float((dts_summary or {}).get("posterior_mean", 0) or 0)
         posterior_std = float((dts_summary or {}).get("posterior_std", 200) or 200)
 
-        # Rebalance feasibility: if sling can't rebalance this channel, Boltz is the only option
+        # Rebalance feasibility: if native rebalancer can't rebalance this channel, Boltz is the only option
         rebal_success = None
-        sling_impossible = False
+        rebalance_impossible = False
         if database is not None:
             try:
                 rebal_success = database.get_channel_rebalance_success_rate(channel_id, window_days=7)
             except Exception:
                 pass
         if rebal_success is not None:
-            # 3+ attempts with 0% success in last 7 days = sling can't do it
+            # 3+ attempts with 0% success in last 7 days = rebalancer can't do it
             if rebal_success.get("total", 0) >= 3 and rebal_success.get("success_rate", 1.0) == 0.0:
-                sling_impossible = True
+                rebalance_impossible = True
 
         # Hive hints: rebalance preference and peer quality (via bounded bias)
         hive_rebal_bias = 1.0
@@ -5768,13 +5698,13 @@ def _build_boltz_balance_plan(
 
         required_profit_threshold_sats = int(round(estimated_fee_sats * float(profit_margin_factor)))
 
-        # Sling-impossible channels get a relaxed profit threshold: when traditional rebalancing
+        # Rebalance-impossible channels get a relaxed profit threshold: when native rebalancing
         # can't work (all sources have negative spread), Boltz is the only option.
-        # sling_exhausted: system-wide signal (depleted channels exist, 0 profitable rebalances)
+        # rebalancer_exhausted: system-wide signal (depleted channels exist, 0 profitable rebalances)
         effective_profit_margin = float(profit_margin_factor)
-        if sling_impossible:
+        if rebalance_impossible:
             effective_profit_margin = max(0.5, effective_profit_margin * 0.6)
-        elif sling_exhausted and direction == "loop_in":
+        elif rebalancer_exhausted and direction == "loop_in":
             # Rebalancer is stuck globally — Boltz loop-ins should be more willing
             effective_profit_margin = max(0.8, effective_profit_margin * 0.8)
         if effective_profit_margin != float(profit_margin_factor):
@@ -5800,7 +5730,7 @@ def _build_boltz_balance_plan(
         #   - profitability: marginal ROI signal (0-1)
         #   - fee_value: broadcast fee indicating revenue potential from freed remote cap
         #   - flow_bonus: source channels naturally refill local, so draining is safe
-        #   - sling_bonus: if sling can't rebalance, Boltz is the only option
+        #   - rebalance_bonus: if native rebalancer can't rebalance, Boltz is the only option
         #   - planner_bonus: capacity planner needs on-chain funds for a channel open
         #   - route_bonus: loop-out through inbound revenue legs creates headroom for more inbound traffic
         #   - hive_bonus: hive rebalance bias compounds with route-pair signal
@@ -5810,7 +5740,7 @@ def _build_boltz_balance_plan(
             roi_signal = max(0.0, min(1.0, (float(marginal_roi or 0.0)) / 25.0))
             fee_signal = min(1.0, broadcast_fee_ppm / 500.0) if broadcast_fee_ppm > 0 else 0.0
             flow_bonus = 1.3 if flow_state in ('source',) else 1.0
-            sling_bonus = 1.2 if sling_impossible else 1.0
+            rebalance_bonus = 1.2 if rebalance_impossible else 1.0
             planner_bonus = 1.25 if planner_funding_deficit > 0 else 1.0
             route_bonus = 1.3 if scid_display in route_pair_in_channels else 1.0
             hive_bonus = hive_rebal_bias  # ±15% from fleet hints, compounds with route signal
@@ -5820,7 +5750,7 @@ def _build_boltz_balance_plan(
                 hive_topo = hive_router.score_channel_for_hive(
                     peer_id, direction, liquidity_ratio=local_pct / 100.0
                 )
-            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * sling_bonus * planner_bonus * route_bonus * hive_bonus * hive_topo
+            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * rebalance_bonus * planner_bonus * route_bonus * hive_bonus * hive_topo
 
         candidate = {
             "channel_id": channel_id,
@@ -5858,7 +5788,7 @@ def _build_boltz_balance_plan(
                 "risk_adjusted_net_sats": risk_adjusted_net_sats,
                 "profit_margin_factor": effective_profit_margin,
                 "passes_profit_guard": bool(passes_profit_guard),
-                "sling_impossible": sling_impossible,
+                "rebalance_impossible": rebalance_impossible,
                 "loop_in_non_pinnable": direction == "loop_in",
             },
             "dts": {
@@ -5876,20 +5806,20 @@ def _build_boltz_balance_plan(
                 "daily_contribution_estimate_sats": int(daily_contrib_est),
                 "risk_adjusted_net_sats": risk_adjusted_net_sats,
                 "broadcast_fee_ppm": broadcast_fee_ppm,
-                "sling_impossible": sling_impossible,
+                "rebalance_impossible": rebalance_impossible,
                 "predicted_depletion_hours": round(predicted_depletion_hours, 1) if predicted_depletion_hours is not None else None,
             }
         }
         candidates.append(candidate)
 
     # Sort: loop-outs first (generate on-chain funds + rebalance), then by multi-goal
-    # value, profit safety, sling impossibility, estimated net, and severity.
+    # value, profit safety, rebalance impossibility, estimated net, and severity.
     candidates.sort(
         key=lambda c: (
             1 if c.get("direction") == "loop_out" else 0,
             1 if c.get("economics", {}).get("passes_profit_guard") else 0,
             float(c.get("score", {}).get("multi_goal_value", 0.0) or 0.0),
-            1 if c.get("economics", {}).get("sling_impossible") else 0,
+            1 if c.get("economics", {}).get("rebalance_impossible") else 0,
             int(c.get("economics", {}).get("risk_adjusted_net_sats", 0) or 0),
             int(c.get("score", {}).get("broadcast_fee_ppm", 0) or 0),
             float(c.get("dynamic_tuning", {}).get("protection_score", 0.0) or 0.0),
