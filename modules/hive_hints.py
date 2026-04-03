@@ -211,6 +211,46 @@ class HiveHintAdapter:
             return max(0, min(100, int(val)))
         return 50
 
+    def get_traffic_confidence(self, peer_id: str) -> float:
+        """Return traffic confidence score in [0.0, 1.0] (0.0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("traffic_confidence")
+        if isinstance(val, (int, float)):
+            return max(0.0, min(1.0, float(val)))
+        return 0.0
+
+    def get_peak_hours(self, peer_id: str) -> list:
+        """Return peak traffic hours UTC (empty list if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("peak_hours_utc")
+        if isinstance(val, list):
+            return [int(h) for h in val if isinstance(h, (int, float)) and 0 <= h <= 23]
+        return []
+
+    def get_drain_direction(self, peer_id: str) -> str:
+        """Return drain direction: inbound_heavy|outbound_heavy|balanced."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("drain_direction")
+        if val in ("inbound_heavy", "outbound_heavy", "balanced"):
+            return val
+        return "balanced"
+
+    def get_fee_elasticity(self, peer_id: str) -> float:
+        """Return estimated price elasticity (0.0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("fee_elasticity")
+        if isinstance(val, (int, float)):
+            return float(val)
+        return 0.0
+
+    def get_optimal_fee_estimate(self, peer_id: str) -> int:
+        """Return fleet-estimated optimal fee PPM (0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("optimal_fee_estimate_ppm")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        return 0
+
     # ------------------------------------------------------------------
     # Channel-open hints
     # ------------------------------------------------------------------

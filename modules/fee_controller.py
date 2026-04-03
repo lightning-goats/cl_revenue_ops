@@ -1679,6 +1679,49 @@ class FeeController:
         except Exception:
             return 1.0
 
+    def _get_temporal_fee_adjustment(self, peer_id: str) -> float:
+        """Return temporal fee multiplier (0.9-1.1) based on traffic patterns.
+
+        During peak hours for a peer: maintain/increase fees (1.0-1.1)
+        During quiet hours: reduce slightly to attract flow (0.9-1.0)
+        Drain direction: inbound_heavy peers get slight reduction, outbound_heavy get increase.
+
+        Gated by traffic_confidence > 0.5 to avoid acting on noisy data.
+        """
+        if not self.hive_hints:
+            return 1.0
+
+        try:
+            confidence = self.hive_hints.get_traffic_confidence(peer_id)
+            if not isinstance(confidence, (int, float)) or confidence <= 0.5:
+                return 1.0
+
+            import time as _time
+            current_hour = int(_time.strftime("%H"))
+
+            multiplier = 1.0
+
+            # Peak/quiet hour adjustment
+            peak_hours = self.hive_hints.get_peak_hours(peer_id)
+            if peak_hours:
+                if current_hour in peak_hours:
+                    multiplier *= 1.05  # +5% during peak
+                else:
+                    multiplier *= 0.97  # -3% during quiet
+
+            # Drain direction adjustment
+            drain = self.hive_hints.get_drain_direction(peer_id)
+            if drain == "inbound_heavy":
+                multiplier *= 0.97  # Slight discount to attract inbound
+            elif drain == "outbound_heavy":
+                multiplier *= 1.03  # Slight premium for outbound service
+
+            # Clamp to [0.9, 1.1]
+            return max(0.9, min(1.1, multiplier))
+
+        except Exception:
+            return 1.0
+
     def _get_network_fee_prior(self, peer_id: str, scid: str) -> dict | None:
         """Get informed prior from network gossip data for a channel.
 
@@ -3792,6 +3835,10 @@ class FeeController:
             hive_fee_bias = self._get_hive_fee_bias(peer_id)
             if hive_fee_bias != 1.0:
                 post_pid_target_ppm = int(post_pid_target_ppm * hive_fee_bias)
+            # Temporal fee adjustment from traffic patterns
+            temporal_adj = self._get_temporal_fee_adjustment(peer_id)
+            if temporal_adj != 1.0:
+                post_pid_target_ppm = int(post_pid_target_ppm * temporal_adj)
             # Neighbor fee context: soft attraction toward market median
             # Only pull DOWN toward market, never up — being cheaper is fine.
             neighbor_median = self._get_neighbor_fee_median(peer_id)
