@@ -2876,8 +2876,12 @@ class FeeController:
                 skip_reasons["error"] += 1
 
         # Garbage Collection: Prune state for closed channels (TODO #18)
+        # SAFETY: Only prune when we have a meaningful channel list.
+        # If listpeerchannels timed out, channels is empty and we'd
+        # wipe all 47 fee strategy states (destructive data loss).
         active_channel_ids = set(channels.keys())
-        self._prune_stale_states(active_channel_ids)
+        if len(active_channel_ids) >= 5:
+            self._prune_stale_states(active_channel_ids)
 
         # Log summary when no adjustments made (helps diagnose issues)
         if len(adjustments) == 0 and len(channel_states) > 0:
