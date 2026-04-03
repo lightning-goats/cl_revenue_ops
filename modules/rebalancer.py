@@ -4181,17 +4181,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
     def _execute_fleet_rebalance(
         self, candidate: RebalanceCandidate, rebalance_id: Optional[int]
     ) -> Optional[Dict[str, Any]]:
-        """Execute a circular rebalance using getroutes + sendpay.
+        """DEPRECATED: Superseded by RebalanceExecutor.
 
-        For fleet rebalances, sling can't use askrene layers so it finds
-        expensive non-fleet routes.  Instead, we:
-        1. Use getroutes (with all fleet layers) to find the 0-fee path
-        2. Convert the getroutes path to sendpay route format
-        3. Execute the circular payment via sendpay (which CAN self-pay)
-        4. Wait for completion via waitsendpay
-
-        Returns:
-            Dict with success/error, or None to fall back to sling.
+        Kept as stub for backward compatibility during migration.
+        RebalanceExecutor handles both fleet and network rebalances.
         """
         if not self.hive_router or not self.hive_router.available:
             return None
@@ -4205,7 +4198,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             max_fee_msat = candidate.max_budget_msat
 
             # Find route through fleet layers
-            layers = ["auto.localchans", "auto.sourcefree"]
+            layers = ["auto.localchans"]
             try:
                 existing = self.plugin.rpc.call("askrene-listlayers", {})
                 for l in existing.get("layers", []):
@@ -4523,8 +4516,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # RebalanceExecutor: native getroutes+sendpay for ALL rebalances.
             # Fleet routes use hive-* layers (0-fee fleet paths).
             # Network routes use revenue-* layers (best available paths).
-            # Falls back to sling if executor unavailable or fails.
-            res = None
             if self.rebalance_executor:
                 try:
                     exec_result = self.rebalance_executor.execute(candidate)
@@ -4537,59 +4528,58 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                                 f"{exec_result.parts} parts, {exec_result.attempts} attempts)"
                             ),
                         }
-                        # Record success in database
                         if rebalance_id:
                             self.database.update_rebalance_result(
                                 rebalance_id, 'completed',
                                 fee_paid_sats=exec_result.fee_msat // 1000,
                             )
                     else:
-                        self.plugin.log(
-                            f"RebalanceExecutor failed: {exec_result.error} — "
-                            f"falling back to sling",
-                            level='debug'
-                        )
+                        res = {
+                            "success": False,
+                            "error": exec_result.error or "no_routes",
+                            "message": (
+                                f"RebalanceExecutor: {exec_result.error} "
+                                f"({exec_result.attempts} attempts, "
+                                f"type={exec_result.route_type})"
+                            ),
+                        }
+                        if rebalance_id:
+                            self.database.update_rebalance_result(
+                                rebalance_id, 'failed',
+                                error_message=exec_result.error,
+                            )
                 except Exception as e:
-                    self.plugin.log(
-                        f"RebalanceExecutor error: {e} — falling back to sling",
-                        level='debug'
-                    )
-
-            # Sling fallback: if executor didn't handle it
-            if res is None:
-                res = self.job_manager.start_job(candidate, rebalance_id)
+                    res = {"success": False, "error": str(e)}
+                    if rebalance_id:
+                        self.database.update_rebalance_result(
+                            rebalance_id, 'failed', error_message=str(e),
+                        )
+            else:
+                # No executor available — cannot rebalance
+                res = {"success": False, "error": "no_rebalance_executor"}
 
             if res.get("success"):
                 self._set_last_decision_summary(
                     action="rebalance",
-                    reason="async_job_started",
+                    reason="rebalance_completed",
                     dominant_input=candidate.reason_code,
                     safety_block=False,
                     budget_blocked=False,
                 )
                 job_started = True
-                if self.hive_router:
-                    self.hive_router.reserve_for_job(
-                        candidate.to_channel.replace(":", "x"),
-                        candidate.amount_msat,
-                        direction=candidate.direction,
-                    )
-                # Clean up pending entry - job is now tracked by JobManager
                 with self._pending_lock:
                     self._pending.pop(candidate.to_channel, None)
-                # Update DB status to pending_async
-                self.database.update_rebalance_result(rebalance_id, 'pending_async')
                 result.update({
                     "success": True,
-                    "message": "Async job started",
+                    "message": res.get("message", "Rebalance completed"),
                     "rebalance_id": rebalance_id
                 })
                 self.plugin.log(
-                    f"Rebalance job queued: {candidate.to_channel} "
-                    f"(job #{self.job_manager.active_job_count})"
+                    f"Rebalance completed: {candidate.to_channel} — "
+                    f"{res.get('message', '')}"
                 )
             else:
-                error = res.get("error", "Failed to start job")
+                error = res.get("error", "Rebalance failed")
                 self._set_last_decision_summary(
                     action="suppressed",
                     reason="start_job_failed",

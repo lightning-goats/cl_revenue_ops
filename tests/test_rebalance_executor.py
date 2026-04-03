@@ -66,7 +66,7 @@ class TestLayerSelection:
         executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
         layers = executor._get_layers("fleet")
         assert "auto.localchans" in layers
-        assert "auto.sourcefree" in layers
+        assert "auto.sourcefree" not in layers  # NEVER for circular rebalancing
         assert "hive-fleet" in layers
         assert "hive-reputation" in layers
         assert "revenue-local" in layers
@@ -90,7 +90,7 @@ class TestLayerSelection:
         plugin.rpc.call.side_effect = Exception("askrene unavailable")
         executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
         layers = executor._get_layers("fleet")
-        assert layers == ["auto.localchans", "auto.sourcefree"]
+        assert layers == ["auto.localchans"]
 
 
 class TestRouteConversion:

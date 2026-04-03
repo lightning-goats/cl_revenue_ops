@@ -227,7 +227,10 @@ class HiveRouter:
         try:
             # Build layer list from what actually exists — avoids errors
             # when cl-hive hasn't created optional layers yet
-            layers = ["auto.localchans", "auto.sourcefree"]
+            # NOTE: auto.sourcefree must NOT be used for circular rebalancing.
+            # It makes our outgoing channels appear free in getroutes, but
+            # sendpay requires real fees — causing WIRE_FEE_INSUFFICIENT.
+            layers = ["auto.localchans"]
             try:
                 existing = self.plugin.rpc.call("askrene-listlayers", {})
                 existing_names = {l.get("layer") for l in existing.get("layers", [])}

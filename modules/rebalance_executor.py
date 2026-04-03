@@ -112,8 +112,16 @@ class RebalanceExecutor:
     # ------------------------------------------------------------------
 
     def _get_layers(self, route_type: str) -> List[str]:
-        """Build layer list based on route type."""
-        layers = ["auto.localchans", "auto.sourcefree"]
+        """Build layer list based on route type.
+
+        NOTE: Do NOT include auto.sourcefree for circular rebalancing.
+        auto.sourcefree makes our outgoing channels appear zero-fee in
+        getroutes, but sendpay sends real HTLCs where the actual fee
+        is required.  Using auto.sourcefree causes WIRE_FEE_INSUFFICIENT
+        errors because the amounts in the sendpay route are too low.
+        auto.localchans is safe — it provides capacity info, not fee overrides.
+        """
+        layers = ["auto.localchans"]
         try:
             existing = self.plugin.rpc.call("askrene-listlayers", {})
             for l in existing.get("layers", []):
