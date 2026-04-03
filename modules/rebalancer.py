@@ -132,7 +132,7 @@ class RebalanceCandidate:
     source_candidate_peer_ids: List[str] = field(default_factory=list)
 
     # Hive route discovery: if askrene found a cheap fleet route, store hop count
-    # so start_job can tighten sling's maxhops for better route matching.
+    # for RebalanceExecutor fleet-aware routing.
     hive_route_hops: int = 0
 
     # Backwards compatibility property

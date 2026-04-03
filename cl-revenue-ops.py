@@ -573,7 +573,7 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-hot-channel-protection-enabled',
     default='true',
-    description='Enable aggressive Sling protection for fast-draining high-profit channels (default: true)'
+    description='Enable aggressive rebalance protection for fast-draining high-profit channels (default: true)'
 )
 
 plugin.add_option(
@@ -615,7 +615,7 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-hot-channel-protection-max-rebalance-fee-ppm',
     default='2000',
-    description='Hard max routing fee ppm for protected hot-channel Sling rebalances (default: 2000)',
+    description='Hard max routing fee ppm for protected hot-channel rebalances (default: 2000)',
     opt_type='int'
 )
 

@@ -236,7 +236,7 @@ class Config:
     flow_interval: int = 3600      # 1 hour
     fee_interval: int = 1800       # 30 minutes (matches option default)
     rebalance_interval: int = 900  # 15 minutes
-    # Hot-channel protection (Sling aggressiveness for fast-draining, high-profit channels)
+    # Hot-channel protection (aggressiveness for fast-draining, high-profit channels)
     hot_channel_protection_enabled: bool = True
     hot_channel_protection_override_peers: str = ''  # CSV fallback; DB override table preferred
     hot_channel_protection_min_velocity: float = 0.20
