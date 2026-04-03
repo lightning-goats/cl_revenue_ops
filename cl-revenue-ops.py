@@ -1516,11 +1516,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hive_router = HiveRouter(safe_plugin, hive_hints)
         plugin.log("HiveRouter initialized - fleet route discovery enabled")
 
+    # Shared RPC cache: deduplicates expensive RPCs (listpeerchannels, listfunds, etc.)
+    # across modules within a 30-second window.  Reduces RPC load from ~15 to ~3 per cycle.
+    from modules.rpc_cache import RpcCache
+    rpc_cache = RpcCache(safe_plugin, ttl=30)
+
     if rebalancer is not None and hive_router is not None:
         rebalancer.hive_router = hive_router
 
-    if hive_router is not None and profitability_analyzer is not None:
-        hive_router.profitability_analyzer = profitability_analyzer
+    if hive_router is not None:
+        hive_router.rpc_cache = rpc_cache
+        if profitability_analyzer is not None:
+            hive_router.profitability_analyzer = profitability_analyzer
 
     # RebalanceExecutor: native getroutes+sendpay rebalance engine
     from modules.rebalance_executor import RebalanceExecutor
@@ -1532,6 +1539,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     if rebalancer is not None:
         rebalancer.rebalance_executor = rebalance_executor
+        rebalancer.rpc_cache = rpc_cache
     plugin.log("RebalanceExecutor initialized - native rebalance engine enabled")
 
     # Set up periodic background tasks using threading

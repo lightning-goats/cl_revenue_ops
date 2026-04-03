@@ -1974,6 +1974,7 @@ class EVRebalancer:
         self.hive_hints = None
         self._hive_router = None  # HiveRouter for fleet route discovery
         self.rebalance_executor = None  # RebalanceExecutor (native getroutes+sendpay)
+        self.rpc_cache = None  # Shared RPC cache (injected by main plugin)
 
     @property
     def hive_router(self):
@@ -2358,6 +2359,9 @@ class EVRebalancer:
                 self.hive_router.refresh_layer()
                 self.hive_router.refresh_fleet_balances()
                 self.hive_router.clear_route_cache()
+            # Invalidate RPC cache at cycle start for fresh data
+            if self.rpc_cache:
+                self.rpc_cache.invalidate()
             
             # Hoist peer connection status call - do it once instead of per-candidate
             peer_status = self._get_peer_connection_status()
@@ -4097,9 +4101,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         for attempt in range(1, max_attempts + 1):
             channels: Dict[str, Dict[str, Any]] = {}
             try:
-                listfunds = self.plugin.rpc.listfunds()
-                # Use listpeerchannels instead of deprecated listpeers (CLN 23.08+)
-                listpeerchannels = self.plugin.rpc.listpeerchannels()
+                listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
+                listpeerchannels = self.rpc_cache.listpeerchannels() if self.rpc_cache else self.plugin.rpc.listpeerchannels()
 
                 # Build peer info map from listpeerchannels
                 peer_info = {}

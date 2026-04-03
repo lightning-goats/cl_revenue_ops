@@ -49,11 +49,18 @@ class HiveRouter:
         self._our_id: Optional[str] = None
         self._last_refresh: float = 0
         self.profitability_analyzer = None  # Injected by main plugin
+        self.rpc_cache = None  # Injected by main plugin — shared RPC result cache
         # Fleet member channel balances from gossip (refreshed each cycle)
         self._fleet_balances: Dict[str, Dict] = {}  # peer_id -> {capacity_sats, available_sats, topology}
         # Route cache: avoid redundant getroutes calls within a cycle
         self._route_cache: Dict[str, Optional[Any]] = {}  # peer_id -> HiveRoute or None
         self._route_cache_ts: float = 0
+
+    def _listpeerchannels(self) -> Dict:
+        """Use cached listpeerchannels when available."""
+        if self.rpc_cache:
+            return self.rpc_cache.listpeerchannels()
+        return self.plugin.rpc.listpeerchannels()
 
     def _get_our_id(self) -> Optional[str]:
         if self._our_id:
@@ -107,7 +114,7 @@ class HiveRouter:
     def _cache_member_ids(self) -> None:
         """Populate _member_ids from hive_hints."""
         try:
-            channels = self.plugin.rpc.listpeerchannels()
+            channels = self._listpeerchannels()
             member_ids: Set[str] = set()
             for ch in channels.get("channels", []):
                 if ch.get("state") != "CHANNELD_NORMAL":
@@ -141,7 +148,7 @@ class HiveRouter:
             if not our_id:
                 return False
 
-            channels = self.plugin.rpc.listpeerchannels()
+            channels = self._listpeerchannels()
             member_ids: Set[str] = set()
             updated = 0
 
@@ -461,7 +468,7 @@ class HiveRouter:
             # Find our channel to this fleet member for source_scid
             source_scid = ""
             try:
-                channels = self.plugin.rpc.listpeerchannels()
+                channels = self._listpeerchannels()
                 for ch in channels.get("channels", []):
                     if (ch.get("peer_id") == mid
                             and ch.get("state") == "CHANNELD_NORMAL"):
@@ -548,7 +555,7 @@ class HiveRouter:
 
             self.plugin.rpc.call("askrene-create-layer", {"layer": self.LOCAL_LAYER})
 
-            channels = self.plugin.rpc.listpeerchannels()
+            channels = self._listpeerchannels()
             biased = 0
 
             for ch in channels.get("channels", []):
