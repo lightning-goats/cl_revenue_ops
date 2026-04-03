@@ -225,64 +225,96 @@ class RebalanceExecutor:
         except Exception as e:
             return RebalanceResult(success=False, error=f"invoice_error: {e}")
 
-        # xpay with askrene layers for circular rebalancing.
-        # Production logs confirmed xpay DOES handle self-payment correctly
-        # (invoices resolved, preimages returned).  xpay response returns
-        # payment_preimage (not "status": "complete"), so we check for that.
-        layers = self._get_layers(route_type)
-        layers.append("auto.sourcefree")
-
-        # Generous maxfee for fleet routes (actual cost near-zero)
-        maxfee = job.max_fee_msat
-        if route_type == "fleet":
-            maxfee = max(job.max_fee_msat, job.amount_msat // 200)
+        # Circular rebalancing via getroute + sendpay.
+        # xpay/pay resolve self-invoices LOCALLY without sending HTLCs through
+        # the network — no liquidity actually moves.  Only sendpay with an
+        # explicit non-empty route forces HTLCs through intermediate nodes.
+        #
+        # Pattern: getroute(fromid=dest_peer, id=our_id) finds path BACK to us.
+        # We prepend our outgoing channel as the first hop to complete the circle.
 
         last_error = ""
-        job.state = JobState.SENDING
+        job.state = JobState.ROUTING
 
         try:
-            self._log(
-                f"Job {job.job_id}: xpay {job.amount_msat}msat "
-                f"maxfee={maxfee} layers={len(layers)}"
+            # Find route from dest_peer back to us
+            route_result = self.plugin.rpc.getroute(
+                id=our_id,
+                amount_msat=job.amount_msat,
+                riskfactor=1,
+                fromid=job.peer_id,
+                maxhops=6,
+                fuzzpercent=0,
             )
+            route = route_result.get("route", [])
+            if not route:
+                last_error = "no_route_back"
+                self._log(f"Job {job.job_id}: no route from {job.peer_id[:12]}... back to us")
+            else:
+                # Prepend our outgoing channel as first hop
+                first_hop_scid = candidate.to_channel.replace(":", "x")
+                first_hop_amount = route[0].get("amount_msat", job.amount_msat)
+                first_hop_delay = route[0].get("delay", 18) + 6
 
-            pay_result = self.plugin.rpc.call("xpay", {
-                "invstring": bolt11,
-                "maxfee": maxfee,
-                "layers": layers,
-                "retry_for": self.SENDPAY_TIMEOUT,
-            })
+                full_route = [{
+                    "id": job.peer_id,
+                    "channel": first_hop_scid,
+                    "amount_msat": first_hop_amount,
+                    "delay": first_hop_delay,
+                }] + route
 
-            # xpay returns payment_preimage on success (NOT "status": "complete")
-            preimage = pay_result.get("payment_preimage", "")
-            if preimage:
-                actual_sent = pay_result.get("amount_sent_msat", job.amount_msat)
-                actual_fee = max(0, actual_sent - job.amount_msat)
-                fee_ppm = (actual_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
-
-                result = RebalanceResult(
-                    success=True,
-                    fee_msat=actual_fee,
-                    fee_ppm=fee_ppm,
-                    hops=0,
-                    route_type=route_type,
-                    attempts=1,
-                    parts=pay_result.get("successful_parts", 1),
-                )
-                job.state = JobState.COMPLETE
-                job.result = result
+                total_fee = max(0, first_hop_amount - job.amount_msat)
+                fee_ppm = (total_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
 
                 self._log(
-                    f"Job {job.job_id} SUCCESS: {candidate.to_channel} "
-                    f"fee={actual_fee}msat ({fee_ppm}ppm) "
-                    f"parts={result.parts}",
+                    f"Job {job.job_id}: sendpay circular "
+                    f"{len(full_route)} hops, {fee_ppm}ppm"
                 )
-                return result
-            else:
-                last_error = f"xpay_no_preimage: {pay_result}"
+
+                job.state = JobState.SENDING
+                self.plugin.rpc.sendpay(
+                    route=full_route,
+                    payment_hash=job.payment_hash,
+                    amount_msat=job.amount_msat,
+                    bolt11=bolt11,
+                    payment_secret=inv.get("payment_secret", ""),
+                )
+
+                job.state = JobState.WAITING
+                pay_result = self.plugin.rpc.waitsendpay(
+                    payment_hash=job.payment_hash,
+                    timeout=self.SENDPAY_TIMEOUT,
+                )
+
+                status = pay_result.get("status", "")
+                if status == "complete":
+                    actual_sent = pay_result.get("amount_sent_msat", first_hop_amount)
+                    actual_fee = max(0, actual_sent - job.amount_msat)
+                    actual_ppm = (actual_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
+
+                    result = RebalanceResult(
+                        success=True,
+                        fee_msat=actual_fee,
+                        fee_ppm=actual_ppm,
+                        hops=len(full_route),
+                        route_type=route_type,
+                        attempts=1,
+                        parts=1,
+                    )
+                    job.state = JobState.COMPLETE
+                    job.result = result
+
+                    self._log(
+                        f"Job {job.job_id} SUCCESS: {candidate.to_channel} "
+                        f"fee={actual_fee}msat ({actual_ppm}ppm) "
+                        f"{len(full_route)} hops",
+                    )
+                    return result
+                else:
+                    last_error = f"waitsendpay_status={status}"
 
         except Exception as e:
-            last_error = f"xpay_error: {e}"
+            last_error = f"sendpay_error: {e}"
 
         job.attempts.append({
             "attempt": 1,

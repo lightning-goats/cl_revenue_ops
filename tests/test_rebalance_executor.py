@@ -125,8 +125,7 @@ class TestRouteTypeSelection:
         def call_side_effect(method, params=None):
             if method == "askrene-listlayers":
                 return {"layers": []}
-            if method == "xpay":
-                raise Exception("self-payment not supported")
+            return {}
             return {}
 
         plugin.rpc.call.side_effect = call_side_effect
@@ -148,8 +147,7 @@ class TestRouteTypeSelection:
         def call_side_effect(method, params=None):
             if method == "askrene-listlayers":
                 return {"layers": []}
-            if method == "xpay":
-                raise Exception("no route")
+            return {}
             return {}
 
         plugin.rpc.call.side_effect = call_side_effect
@@ -168,20 +166,14 @@ class TestExecuteSuccess:
             "payment_hash": "hash123", "payment_secret": "secret123",
             "bolt11": "lnbc5u1..."
         }
-        def rpc_side_effect(method, params=None):
-            if method == "askrene-listlayers":
-                return {"layers": []}
-            if method == "xpay":
-                return {
-                    "payment_preimage": "abc123def456",
-                    "amount_msat": 500000000,
-                    "amount_sent_msat": 500050000,
-                    "successful_parts": 1,
-                    "failed_parts": 0,
-                }
-            return {}
-
-        plugin.rpc.call.side_effect = rpc_side_effect
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {"id": "our_id", "channel": "300x1x0", "amount_msat": 500000000, "delay": 18}
+            ]
+        }
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete", "amount_sent_msat": 500050000
+        }
 
         executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
         candidate = MockCandidate(hive_route_hops=0)
@@ -205,8 +197,7 @@ class TestExecuteFailure:
         def rpc_side_effect(method, params=None):
             if method == "askrene-listlayers":
                 return {"layers": []}
-            if method == "xpay":
-                raise Exception("no route found")
+            return {}
             return {}
 
         plugin.rpc.call.side_effect = rpc_side_effect
@@ -226,8 +217,7 @@ class TestExecuteFailure:
         def call_side_effect(method, params=None):
             if method == "askrene-listlayers":
                 return {"layers": []}
-            if method == "xpay":
-                raise Exception("no route")
+            return {}
             return {}
 
         plugin.rpc.call.side_effect = call_side_effect
