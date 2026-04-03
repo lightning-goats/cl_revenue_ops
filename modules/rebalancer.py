@@ -3063,7 +3063,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # Use the primary source's opportunity cost for spread calculation
         weighted_opp_cost = primary_opp_cost
         spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
-        
+
+        self.plugin.log(
+            f"SPREAD DEBUG [{dest_channel[:12]}...]: spread={spread_ppm}ppm "
+            f"(out={outbound_fee_ppm} - in={inbound_fee_ppm} - opp={weighted_opp_cost}) "
+            f"primary_source={primary_source_id[:12]}... "
+            f"is_hive={primary_source_info.get('peer_id', '') in (self.hive_router.get_hive_members() if self.hive_router else set())}",
+            level='info'
+        )
+
         # Require non-negative spread to avoid consistent leakage.
         if spread_ppm < 0:
             return None
