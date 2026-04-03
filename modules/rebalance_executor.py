@@ -114,12 +114,11 @@ class RebalanceExecutor:
     def _get_layers(self, route_type: str) -> List[str]:
         """Build layer list based on route type.
 
-        NOTE: Do NOT include auto.sourcefree for circular rebalancing.
-        auto.sourcefree makes our outgoing channels appear zero-fee in
-        getroutes, but sendpay sends real HTLCs where the actual fee
-        is required.  Using auto.sourcefree causes WIRE_FEE_INSUFFICIENT
-        errors because the amounts in the sendpay route are too low.
-        auto.localchans is safe — it provides capacity info, not fee overrides.
+        NOTE: Do NOT include auto.sourcefree — it makes our outgoing
+        channels appear zero-fee, causing WIRE_FEE_INSUFFICIENT when
+        sendpay sends real HTLCs.  auto.localchans provides capacity
+        without fee overrides.  hive-fleet layer correctly sets fleet
+        member channels to 0 fee (which is the REAL fee they charge us).
         """
         layers = ["auto.localchans"]
         try:
@@ -233,12 +232,22 @@ class RebalanceExecutor:
             # Find route
             # SAFETY: getroutes with unknown layer crashes askrene (CLN bug).
             # Retry with only auto.localchans if layers cause an error.
+            # For fleet rebalances, use a more generous fee cap for route
+            # discovery.  The EV analysis caps budget to expected_income which
+            # can be very small (6 sats).  But getroutes needs enough headroom
+            # to find ANY route.  Fleet routes should be near-zero cost, so
+            # the actual fee paid will be much less than the cap.
+            discovery_maxfee = job.max_fee_msat
+            if route_type == "fleet":
+                # Allow up to 0.5% of amount for fleet route discovery
+                discovery_maxfee = max(job.max_fee_msat, job.amount_msat // 200)
+
             getroutes_params = {
                 "source": our_id,
                 "destination": job.peer_id,
                 "amount_msat": job.amount_msat,
                 "layers": layers,
-                "maxfee_msat": job.max_fee_msat,
+                "maxfee_msat": discovery_maxfee,
                 "final_cltv": 18,
                 "maxparts": max_parts,
             }
