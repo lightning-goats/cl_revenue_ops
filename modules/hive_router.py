@@ -67,6 +67,51 @@ class HiveRouter:
     # ------------------------------------------------------------------
 
     def refresh_layer(self) -> bool:
+        """Check for cl-hive managed layers, fall back to self-creation.
+
+        If cl-hive is running, it manages hive-fleet and hive-reputation
+        layers.  We detect them via askrene-listlayers and skip our own
+        layer creation.  If absent, we create hive-fleet ourselves
+        (standalone mode).
+
+        Returns:
+            True if hive-fleet layer is available (managed or self-created).
+        """
+        if not self.hive_hints or not self.plugin:
+            return False
+
+        # Try to detect cl-hive managed layers first
+        try:
+            result = self.plugin.rpc.call("askrene-listlayers", {})
+            layer_names = {l.get("layer") for l in result.get("layers", [])}
+            if self.LAYER_NAME in layer_names:
+                # cl-hive is managing the layer — just cache member IDs
+                self._cache_member_ids()
+                self.available = True
+                self._last_refresh = time.time()
+                return True
+        except Exception:
+            pass
+
+        # cl-hive not managing layers — create our own (standalone mode)
+        return self._create_standalone_layer()
+
+    def _cache_member_ids(self) -> None:
+        """Populate _member_ids from hive_hints."""
+        try:
+            channels = self.plugin.rpc.listpeerchannels()
+            member_ids: Set[str] = set()
+            for ch in channels.get("channels", []):
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                peer_id = ch.get("peer_id", "")
+                if peer_id and self.hive_hints.is_hive_member(peer_id):
+                    member_ids.add(peer_id)
+            self._member_ids = member_ids
+        except Exception:
+            pass
+
+    def _create_standalone_layer(self) -> bool:
         """Recreate the hive-fleet askrene layer with zero-fee fleet channels.
 
         Also applies positive node bias (+5) on fleet members to gently
@@ -75,9 +120,6 @@ class HiveRouter:
         Returns:
             True if layer was created successfully.
         """
-        if not self.hive_hints or not self.plugin:
-            return False
-
         try:
             # Remove stale layer
             try:

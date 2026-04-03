@@ -138,3 +138,50 @@ class TestHiveRouterTopologyScore:
         router = HiveRouter(MagicMock(), MockHiveHints())
         router._member_ids = set()
         assert router.score_channel_for_hive("any", "out") == 1.0
+
+
+class TestHiveRouterLayerDetection:
+    def test_detects_cl_hive_managed_layer(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {
+            "layers": [
+                {"layer": "hive-fleet", "persistent": False},
+                {"layer": "hive-reputation", "persistent": False},
+            ]
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"state": "CHANNELD_NORMAL", "peer_id": "fleet_a", "short_channel_id": "100x1x0"},
+            ]
+        }
+
+        hints = MockHiveHints(members=["fleet_a"])
+        router = HiveRouter(plugin, hints)
+        result = router.refresh_layer()
+
+        assert result is True
+        assert router.available is True
+        assert router.is_hive_member("fleet_a") is True
+
+    def test_falls_back_to_standalone_when_no_cl_hive(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"state": "CHANNELD_NORMAL", "peer_id": "fleet_a", "short_channel_id": "100x1x0"},
+            ]
+        }
+
+        def side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": []}
+            return {}
+
+        plugin.rpc.call.side_effect = side_effect
+
+        hints = MockHiveHints(members=["fleet_a"])
+        router = HiveRouter(plugin, hints)
+        result = router.refresh_layer()
+
+        assert result is True
+        assert router.available is True
