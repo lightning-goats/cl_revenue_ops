@@ -306,7 +306,7 @@ class Config:
     high_liquidity_threshold: float = 0.7 # Above 70% = high outbound
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
     futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
-    inbound_fee_estimate_ppm: int = 200  # Network routing cost estimate in PPM
+    inbound_fee_estimate_ppm: int = 50  # Route cost buffer added on top of last-hop fee (PPM)
     
     # Rebalancer plugin selection
     rebalancer_plugin: str = 'sling'  # Only sling is supported
