@@ -4177,21 +4177,182 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         return {}
 
-    # NOTE: xpay circular self-payment was attempted here but CLN does not
-    # support paying your own invoices (xpay short-circuits when source ==
-    # destination).  Sling handles circular rebalancing via explicit sendpay
-    # with a constructed circular path.  If CLN gains xpay circular support
-    # in a future version, this is where to add it.  The askrene layers
-    # still benefit sling indirectly via the route discovery + source
-    # promotion + maxhops tightening in _analyze_rebalance_ev().
+    def _execute_fleet_rebalance(
+        self, candidate: RebalanceCandidate, rebalance_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        """Execute a circular rebalance using getroutes + sendpay.
+
+        For fleet rebalances, sling can't use askrene layers so it finds
+        expensive non-fleet routes.  Instead, we:
+        1. Use getroutes (with all fleet layers) to find the 0-fee path
+        2. Convert the getroutes path to sendpay route format
+        3. Execute the circular payment via sendpay (which CAN self-pay)
+        4. Wait for completion via waitsendpay
+
+        Returns:
+            Dict with success/error, or None to fall back to sling.
+        """
+        if not self.hive_router or not self.hive_router.available:
+            return None
+
+        try:
+            our_id = self.plugin.rpc.getinfo().get("id")
+            if not our_id:
+                return None
+
+            amount_msat = candidate.amount_msat
+            max_fee_msat = candidate.max_budget_msat
+
+            # Find route through fleet layers
+            layers = ["auto.localchans", "auto.sourcefree"]
+            try:
+                existing = self.plugin.rpc.call("askrene-listlayers", {})
+                for l in existing.get("layers", []):
+                    name = l.get("layer", "")
+                    if name.startswith("hive-") or name.startswith("revenue-"):
+                        layers.append(name)
+            except Exception:
+                pass
+
+            # Find circular route: us → fleet peer → dest peer → us
+            # getroutes finds path from us to the dest peer
+            dest_peer_id = candidate.to_peer_id
+            route_result = self.plugin.rpc.call("getroutes", {
+                "source": our_id,
+                "destination": dest_peer_id,
+                "amount_msat": amount_msat,
+                "layers": layers,
+                "maxfee_msat": max_fee_msat,
+                "final_cltv": 18,
+            })
+
+            routes = route_result.get("routes", [])
+            if not routes:
+                self.plugin.log(
+                    f"FLEET REBALANCE: No routes found to {dest_peer_id[:12]}...",
+                    level='debug'
+                )
+                return None
+
+            route = routes[0]
+            path = route.get("path", [])
+            if not path:
+                return None
+
+            # Calculate actual fee
+            first_hop_amount = path[0].get("amount_msat", amount_msat)
+            dest_amount = route.get("amount_msat", amount_msat)
+            total_fee_msat = max(0, first_hop_amount - dest_amount)
+            fee_ppm = (total_fee_msat * 1_000_000) // dest_amount if dest_amount > 0 else 0
+
+            if total_fee_msat > max_fee_msat:
+                self.plugin.log(
+                    f"FLEET REBALANCE: Route too expensive ({fee_ppm} ppm, "
+                    f"budget {max_fee_msat}msat)",
+                    level='debug'
+                )
+                return None
+
+            # Create self-invoice for the payment hash
+            import secrets as _secrets
+            label = f"fleet-rebal-{_secrets.token_hex(8)}"
+            inv = self.plugin.rpc.invoice(
+                amount_msat=amount_msat,
+                label=label,
+                description="fleet rebalance",
+                expiry=120,
+            )
+            payment_hash = inv.get("payment_hash")
+            payment_secret = inv.get("payment_secret")
+            if not payment_hash or not payment_secret:
+                return None
+
+            # Convert getroutes path to sendpay route format.
+            # getroutes: [{short_channel_id_dir, next_node_id, amount_msat, delay}, ...]
+            # sendpay:   [{channel, id, amount_msat, delay}, ...]
+            # The last hop must deliver to us (circular), so we append ourselves.
+            sendpay_route = []
+            for hop in path:
+                scid_dir = hop.get("short_channel_id_dir", "")
+                scid = scid_dir.split("/")[0] if "/" in scid_dir else scid_dir
+                sendpay_route.append({
+                    "channel": scid,
+                    "id": hop.get("next_node_id", ""),
+                    "amount_msat": hop.get("amount_msat", 0),
+                    "delay": hop.get("delay", 0),
+                })
+
+            # Add final hop back to ourselves
+            # The dest peer forwards to us via our channel to them
+            dest_channel = candidate.to_channel.replace(":", "x")
+            sendpay_route.append({
+                "channel": dest_channel,
+                "id": our_id,
+                "amount_msat": amount_msat,
+                "delay": 18,
+            })
+
+            self.plugin.log(
+                f"FLEET REBALANCE: Executing circular route via sendpay "
+                f"({len(sendpay_route)} hops, {fee_ppm} ppm, amount={amount_msat}msat)",
+                level='info'
+            )
+
+            # Execute circular payment
+            self.plugin.rpc.call("sendpay", {
+                "route": sendpay_route,
+                "payment_hash": payment_hash,
+                "payment_secret": payment_secret,
+                "amount_msat": amount_msat,
+            })
+
+            # Wait for result
+            pay_result = self.plugin.rpc.call("waitsendpay", {
+                "payment_hash": payment_hash,
+                "timeout": 60,
+            })
+
+            status = pay_result.get("status", "")
+            if status == "complete":
+                actual_fee = pay_result.get("amount_sent_msat", amount_msat) - amount_msat
+                actual_ppm = (actual_fee * 1_000_000) // amount_msat if amount_msat > 0 else 0
+                self.plugin.log(
+                    f"FLEET REBALANCE SUCCESS: {candidate.to_channel} "
+                    f"fee={actual_fee}msat ({actual_ppm}ppm)",
+                    level='info'
+                )
+                if rebalance_id:
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'completed',
+                        fee_paid_sats=actual_fee // 1000,
+                    )
+                return {"success": True, "message": f"fleet rebalance completed ({actual_ppm}ppm)"}
+            else:
+                self.plugin.log(
+                    f"FLEET REBALANCE FAILED: {candidate.to_channel} status={status}",
+                    level='warn'
+                )
+                # Clean up unpaid invoice
+                try:
+                    self.plugin.rpc.delinvoice(label, "unpaid")
+                except Exception:
+                    pass
+                return None  # Fall through to sling
+
+        except Exception as e:
+            self.plugin.log(
+                f"FLEET REBALANCE ERROR: {e} — falling back to sling",
+                level='debug'
+            )
+            return None
 
     def execute_rebalance(self, candidate: RebalanceCandidate, enforce_budget: bool = True, **kwargs) -> Dict[str, Any]:
         """
         Execute a rebalance for the given candidate.
 
-        Uses the async JobManager to spawn sling background jobs.
-        Askrene fleet layers benefit rebalancing indirectly via route
-        discovery, source promotion, and maxhops tightening.
+        Fleet rebalances (hive_route_hops > 0) use getroutes + sendpay
+        for layer-aware circular routing through fleet peers.
+        Non-fleet rebalances use sling background jobs.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         with self._pending_lock:
@@ -4358,11 +4519,18 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         self._pending.pop(candidate.to_channel, None)
                     return result
 
-            # Async execution via JobManager (sling background jobs).
-            # Fleet layers benefit sling indirectly: route discovery promotes
-            # hive source channels and tightens maxhops so sling finds the
-            # same short fleet path.
-            res = self.job_manager.start_job(candidate, rebalance_id)
+            # Fleet rebalances: use getroutes + sendpay (layer-aware circular
+            # routing through fleet peers at near-zero cost).
+            # Non-fleet rebalances: use sling background jobs.
+            if candidate.hive_route_hops > 0:
+                fleet_result = self._execute_fleet_rebalance(candidate, rebalance_id)
+                if fleet_result is not None:
+                    res = fleet_result
+                else:
+                    # Fleet route failed — fall back to sling
+                    res = self.job_manager.start_job(candidate, rebalance_id)
+            else:
+                res = self.job_manager.start_job(candidate, rebalance_id)
 
             if res.get("success"):
                 self._set_last_decision_summary(
