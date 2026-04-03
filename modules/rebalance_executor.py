@@ -231,20 +231,28 @@ class RebalanceExecutor:
             job.state = JobState.ROUTING
 
             # Find route
+            # SAFETY: getroutes with unknown layer crashes askrene (CLN bug).
+            # Retry with only auto.localchans if layers cause an error.
+            getroutes_params = {
+                "source": our_id,
+                "destination": job.peer_id,
+                "amount_msat": job.amount_msat,
+                "layers": layers,
+                "maxfee_msat": job.max_fee_msat,
+                "final_cltv": 18,
+                "maxparts": max_parts,
+            }
             try:
-                route_result = self.plugin.rpc.call("getroutes", {
-                    "source": our_id,
-                    "destination": job.peer_id,
-                    "amount_msat": job.amount_msat,
-                    "layers": layers,
-                    "maxfee_msat": job.max_fee_msat,
-                    "final_cltv": 18,
-                    "maxparts": max_parts,
-                })
-            except Exception as e:
-                last_error = f"getroutes_error: {e}"
-                self._log(f"Job {job.job_id}: getroutes failed: {e}", level="debug")
-                break  # No routes = no point retrying
+                route_result = self.plugin.rpc.call("getroutes", getroutes_params)
+            except Exception:
+                # Layer may be stale — retry with only auto layers
+                try:
+                    getroutes_params["layers"] = ["auto.localchans"]
+                    route_result = self.plugin.rpc.call("getroutes", getroutes_params)
+                except Exception as e:
+                    last_error = f"getroutes_error: {e}"
+                    self._log(f"Job {job.job_id}: getroutes failed: {e}", level="debug")
+                    break
 
             routes = route_result.get("routes", [])
             if not routes:

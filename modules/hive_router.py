@@ -242,14 +242,23 @@ class HiveRouter:
                 # If listlayers fails, just use auto layers
                 pass
 
-            result = self.plugin.rpc.call("getroutes", {
+            # SAFETY: getroutes with an unknown layer CRASHES askrene (CLN bug).
+            # Retry with only auto layers if the first attempt fails due to a
+            # layer being removed between our listlayers check and the getroutes call.
+            getroutes_params = {
                 "source": our_id,
                 "destination": dest_peer_id,
                 "amount_msat": amount_msat,
                 "layers": layers,
                 "maxfee_msat": max_fee_msat,
                 "final_cltv": 18,
-            })
+            }
+            try:
+                result = self.plugin.rpc.call("getroutes", getroutes_params)
+            except Exception:
+                # Layer may have been removed — retry with only auto layers
+                getroutes_params["layers"] = ["auto.localchans", "auto.sourcefree"]
+                result = self.plugin.rpc.call("getroutes", getroutes_params)
 
             routes = result.get("routes", [])
             if not routes:
