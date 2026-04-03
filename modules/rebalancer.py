@@ -2972,13 +2972,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         dest_peer_id = dest_info.get("peer_id", "")
 
-        self.plugin.log(
-            f"EV DEBUG [{dest_channel[:12]}...]: outbound_fee={outbound_fee_ppm}ppm "
-            f"(broadcast={broadcast_fee_ppm}, dts={dts_fee_ppm}), "
-            f"inbound_fee={inbound_fee_ppm}ppm, amount={rebalance_amount}",
-            level='info'
-        )
-
         # HIVE ROUTE DISCOVERY: Try askrene to find cheap routes through fleet
         # before falling back to generic source selection.
         hive_route = None
@@ -3015,10 +3008,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                                     max_through = self.hive_router.max_rebalance_through_member(source_peer)
                                     if 0 < max_through < rebalance_amount:
                                         self.plugin.log(
-                                            f"FLEET SIZING: Capping rebalance from {rebalance_amount} to "
-                                            f"{max_through} sats (fleet peer {source_peer[:12]}... "
-                                            f"capacity limit)",
-                                            level='info'
+                                            f"Fleet sizing: capped to {max_through} sats "
+                                            f"(peer {source_peer[:12]}... limit)",
+                                            level='debug'
                                         )
                                         rebalance_amount = max_through
                                         amount_msat = rebalance_amount * 1000
@@ -3063,14 +3055,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # Use the primary source's opportunity cost for spread calculation
         weighted_opp_cost = primary_opp_cost
         spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
-
-        self.plugin.log(
-            f"SPREAD DEBUG [{dest_channel[:12]}...]: spread={spread_ppm}ppm "
-            f"(out={outbound_fee_ppm} - in={inbound_fee_ppm} - opp={weighted_opp_cost}) "
-            f"primary_source={primary_source_id[:12]}... "
-            f"is_hive={primary_source_info.get('peer_id', '') in (self.hive_router.get_hive_members() if self.hive_router else set())}",
-            level='info'
-        )
 
         # Require non-negative spread to avoid consistent leakage.
         if spread_ppm < 0:
@@ -3316,11 +3300,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # Check Profit against Dynamic Threshold
         if expected_profit < profit_threshold:
             self.plugin.log(
-                f"REBALANCE SKIPPED [{dest_channel[:12]}...]: "
-                f"profit={expected_profit} < threshold={profit_threshold} "
-                f"(income={expected_income}, fee={expected_fee_sats}, "
-                f"source_loss={expected_source_loss}, util={expected_utilization:.2f})",
-                level='info'
+                f"Rebalance skipped [{dest_channel[:12]}...]: "
+                f"profit={expected_profit} < threshold={profit_threshold}",
+                level='debug'
             )
             return None
 
