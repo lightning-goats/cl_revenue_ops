@@ -405,9 +405,23 @@ class JobManager:
 
         # Convert SCIDs to sling format (x-separated, e.g., 930866x2599x2)
         to_scid = self._to_sling_scid(candidate.to_channel)
-        
-        # Convert all source candidates to sling format
-        source_scids_sling = [self._to_sling_scid(scid) for scid in candidate.source_candidates]
+
+        # Convert all source candidates to sling format.
+        # When a fleet route was discovered (hive_route_hops > 0), restrict
+        # sling to ONLY the fleet source channel.  Sling doesn't use askrene
+        # layers, so passing all 37 candidates lets it find expensive non-fleet
+        # routes.  By passing only the fleet channel, sling is forced to route
+        # through the fleet peer at near-zero cost.
+        if candidate.hive_route_hops > 0 and candidate.source_candidates:
+            # Fleet route: use only the primary (fleet) source
+            source_scids_sling = [self._to_sling_scid(candidate.source_candidates[0])]
+            self.plugin.log(
+                f"FLEET SLING: Restricting to fleet source {source_scids_sling[0]} "
+                f"({candidate.hive_route_hops}-hop fleet route)",
+                level='info'
+            )
+        else:
+            source_scids_sling = [self._to_sling_scid(scid) for scid in candidate.source_candidates]
         
         # Get initial balance for progress tracking
         initial_balance = self._get_channel_local_balance(candidate.to_channel)
