@@ -74,9 +74,10 @@ class TestHiveRouterDiscover:
         plugin.rpc.call.return_value = {
             "probability_ppm": 850000,
             "routes": [{
+                "amount_msat": 500000,
                 "path": [
-                    {"short_channel_id": "100x1x0", "amount_msat": 501000},
-                    {"short_channel_id": "200x1x0", "amount_msat": 500000},
+                    {"short_channel_id_dir": "100x1x0/1", "amount_msat": 501000},
+                    {"short_channel_id_dir": "200x1x0/0", "amount_msat": 500000},
                 ]
             }]
         }

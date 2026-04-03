@@ -195,10 +195,18 @@ class HiveRouter:
             if not path:
                 return None
 
+            # getroutes path uses "short_channel_id_dir" (e.g. "100x1x0/1"),
+            # not "short_channel_id".  The first hop's amount_msat is what
+            # enters the route; the route-level amount_msat is what arrives
+            # at the destination.  Fee = first_hop - destination_amount.
             first_hop_amount = path[0].get("amount_msat", amount_msat)
-            total_fee_msat = first_hop_amount - amount_msat
-            fee_ppm = (total_fee_msat * 1_000_000) // amount_msat if amount_msat > 0 else 0
-            source_scid = path[0].get("short_channel_id", "")
+            dest_amount = route.get("amount_msat", amount_msat)
+            total_fee_msat = max(0, first_hop_amount - dest_amount)
+            fee_ppm = (total_fee_msat * 1_000_000) // dest_amount if dest_amount > 0 else 0
+
+            # Extract source channel from short_channel_id_dir ("100x1x0/1" → "100x1x0")
+            scid_dir = path[0].get("short_channel_id_dir", "")
+            source_scid = scid_dir.split("/")[0] if "/" in scid_dir else scid_dir
             probability = result.get("probability_ppm", 0)
 
             self._log(
