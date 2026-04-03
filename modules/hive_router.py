@@ -49,6 +49,8 @@ class HiveRouter:
         self._our_id: Optional[str] = None
         self._last_refresh: float = 0
         self.profitability_analyzer = None  # Injected by main plugin
+        # Fleet member channel balances from gossip (refreshed each cycle)
+        self._fleet_balances: Dict[str, Dict] = {}  # peer_id -> {capacity_sats, available_sats, topology}
 
     def _get_our_id(self) -> Optional[str]:
         if self._our_id:
@@ -287,6 +289,148 @@ class HiveRouter:
     def is_hive_member(self, peer_id: str) -> bool:
         """Check if peer is a fleet member (uses cached set)."""
         return peer_id in self._member_ids
+
+    # ------------------------------------------------------------------
+    # Fleet Balance Awareness
+    # ------------------------------------------------------------------
+
+    def refresh_fleet_balances(self) -> None:
+        """Query cl-hive for fleet member channel balances.
+
+        Caches per-member capacity, available liquidity, and topology
+        so the rebalancer can size fleet rebalances without overloading
+        intermediary members.
+        """
+        if not self.plugin:
+            return
+        try:
+            result = self.plugin.rpc.call("hive-fleet-balances")
+            if isinstance(result, dict) and "members" in result:
+                balances = {}
+                for m in result.get("members", []):
+                    pid = m.get("peer_id", "")
+                    if pid:
+                        balances[pid] = {
+                            "capacity_sats": int(m.get("capacity_sats", 0)),
+                            "available_sats": int(m.get("available_sats", 0)),
+                            "topology": m.get("topology", []),
+                        }
+                self._fleet_balances = balances
+                self._log(f"Refreshed fleet balances ({len(balances)} members)")
+        except Exception as e:
+            self._log(f"Fleet balance refresh failed: {e}")
+
+    def get_fleet_member_balance(self, peer_id: str) -> Optional[Dict]:
+        """Get cached balance state for a fleet member.
+
+        Returns:
+            Dict with capacity_sats, available_sats, topology — or None.
+        """
+        return self._fleet_balances.get(peer_id)
+
+    def max_rebalance_through_member(self, member_peer_id: str) -> int:
+        """Calculate max rebalance amount that won't overload a fleet peer.
+
+        Returns the smaller of:
+        - 25% of the member's channel capacity (prevent heavy skew)
+        - The member's excess liquidity (available above 40% of capacity)
+
+        Returns:
+            Max sats to route through this member, or 0 if unknown.
+        """
+        bal = self._fleet_balances.get(member_peer_id)
+        if not bal:
+            return 0
+
+        capacity = bal.get("capacity_sats", 0)
+        available = bal.get("available_sats", 0)
+        if capacity <= 0:
+            return 0
+
+        # Don't use more than 25% of their capacity in a single rebalance
+        cap_limit = capacity // 4
+
+        # Don't drain their available below 40% (healthy balance floor)
+        healthy_floor = int(capacity * 0.4)
+        excess = max(0, available - healthy_floor)
+
+        return min(cap_limit, excess)
+
+    def fleet_member_can_route(self, member_peer_id: str, dest_peer_id: str) -> bool:
+        """Check if a fleet member has a channel to the destination peer.
+
+        Uses the member's topology from gossip state.
+        """
+        bal = self._fleet_balances.get(member_peer_id)
+        if not bal:
+            return False
+        return dest_peer_id in bal.get("topology", [])
+
+    def suggest_fleet_rebalance_chunks(
+        self,
+        dest_peer_id: str,
+        total_amount_sats: int,
+        max_chunk_sats: int = 500_000,
+    ) -> List[Dict]:
+        """Suggest multiple small rebalance chunks through fleet members.
+
+        For fleet rebalancing (free routing), prefers multiple small jobs
+        through different fleet peers rather than one large job that would
+        skew a single peer's balance.
+
+        Args:
+            dest_peer_id: External peer we're rebalancing toward
+            total_amount_sats: Total amount to rebalance
+            max_chunk_sats: Maximum per-chunk size
+
+        Returns:
+            List of {member_peer_id, amount_sats, source_scid} dicts,
+            sorted by amount (largest first).
+        """
+        chunks = []
+        remaining = total_amount_sats
+
+        # Find fleet members that can reach the destination
+        candidates = []
+        for mid in self._member_ids:
+            if not self.fleet_member_can_route(mid, dest_peer_id):
+                continue
+            max_amt = self.max_rebalance_through_member(mid)
+            if max_amt <= 0:
+                continue
+            candidates.append((mid, max_amt))
+
+        # Sort by capacity (largest first) for best utilization
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        for mid, max_amt in candidates:
+            if remaining <= 0:
+                break
+            chunk = min(remaining, max_amt, max_chunk_sats)
+            if chunk < 10_000:  # Minimum chunk 10k sats
+                continue
+
+            # Find our channel to this fleet member for source_scid
+            source_scid = ""
+            try:
+                channels = self.plugin.rpc.listpeerchannels()
+                for ch in channels.get("channels", []):
+                    if (ch.get("peer_id") == mid
+                            and ch.get("state") == "CHANNELD_NORMAL"):
+                        source_scid = ch.get("short_channel_id", "")
+                        break
+            except Exception:
+                pass
+
+            chunks.append({
+                "member_peer_id": mid,
+                "amount_sats": chunk,
+                "source_scid": source_scid,
+                "max_available": max_amt,
+            })
+            remaining -= chunk
+
+        return chunks
 
     # ------------------------------------------------------------------
     # Topology Scoring

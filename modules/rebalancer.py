@@ -2341,9 +2341,10 @@ class EVRebalancer:
             # Note: _peer_inbound_fees cache is now populated by _get_channels_with_balances()
             # This provides actual peer fees from listpeerchannels.updates.remote
 
-            # Refresh askrene hive-fleet layer for route discovery (best effort)
+            # Refresh askrene hive-fleet layer and fleet balances for route discovery
             if self.hive_router:
                 self.hive_router.refresh_layer()
+                self.hive_router.refresh_fleet_balances()
             
             # Hoist peer connection status call - do it once instead of per-candidate
             peer_status = self._get_peer_connection_status()
@@ -2972,6 +2973,33 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     f"for {dest_peer_id[:12]}... ({hive_route.get('hops', '?')} hops)",
                     level='info'
                 )
+
+                # Fleet-aware sizing: cap amount to what the intermediary
+                # fleet peer can handle without overloading their channels.
+                # Since fleet routing is essentially free, prefer smaller
+                # well-sized chunks over aggressive draining.
+                source_scid = hive_route.get("source_scid", "")
+                if source_scid and self.hive_router:
+                    try:
+                        # Find which fleet peer this source channel connects to
+                        for ch in self.plugin.rpc.listpeerchannels().get("channels", []):
+                            if (ch.get("short_channel_id", "") == source_scid
+                                    and ch.get("state") == "CHANNELD_NORMAL"):
+                                source_peer = ch.get("peer_id", "")
+                                if source_peer and self.hive_router.is_hive_member(source_peer):
+                                    max_through = self.hive_router.max_rebalance_through_member(source_peer)
+                                    if 0 < max_through < rebalance_amount:
+                                        self.plugin.log(
+                                            f"FLEET SIZING: Capping rebalance from {rebalance_amount} to "
+                                            f"{max_through} sats (fleet peer {source_peer[:12]}... "
+                                            f"capacity limit)",
+                                            level='info'
+                                        )
+                                        rebalance_amount = max_through
+                                        amount_msat = rebalance_amount * 1000
+                                break
+                    except Exception:
+                        pass
 
         # Get ALL profitable source candidates (sorted by score, best first)
         source_candidates = self._select_source_candidates(
