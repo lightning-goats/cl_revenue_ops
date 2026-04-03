@@ -2357,6 +2357,7 @@ class EVRebalancer:
             if self.hive_router:
                 self.hive_router.refresh_layer()
                 self.hive_router.refresh_fleet_balances()
+                self.hive_router.clear_route_cache()
             
             # Hoist peer connection status call - do it once instead of per-candidate
             peer_status = self._get_peer_connection_status()

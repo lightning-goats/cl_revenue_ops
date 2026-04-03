@@ -51,6 +51,9 @@ class HiveRouter:
         self.profitability_analyzer = None  # Injected by main plugin
         # Fleet member channel balances from gossip (refreshed each cycle)
         self._fleet_balances: Dict[str, Dict] = {}  # peer_id -> {capacity_sats, available_sats, topology}
+        # Route cache: avoid redundant getroutes calls within a cycle
+        self._route_cache: Dict[str, Optional[Any]] = {}  # peer_id -> HiveRoute or None
+        self._route_cache_ts: float = 0
 
     def _get_our_id(self) -> Optional[str]:
         if self._our_id:
@@ -217,6 +220,16 @@ class HiveRouter:
         if not self.available or not self.plugin:
             return None
 
+        # Cache routes for 60s to avoid redundant getroutes calls.
+        # _estimate_inbound_fee and _analyze_rebalance_ev both call
+        # discover_route for the same peer within one cycle.
+        now = time.time()
+        if now - self._route_cache_ts > 60:
+            self._route_cache.clear()
+            self._route_cache_ts = now
+        if dest_peer_id in self._route_cache:
+            return self._route_cache[dest_peer_id]
+
         our_id = self._get_our_id()
         if not our_id:
             return None
@@ -290,21 +303,29 @@ class HiveRouter:
                 level="info",
             )
 
-            return HiveRoute(
+            hr = HiveRoute(
                 fee_ppm=fee_ppm,
                 hops=len(path),
                 source_scid=source_scid,
                 path=path,
                 probability_ppm=probability,
             )
+            self._route_cache[dest_peer_id] = hr
+            return hr
 
         except Exception as e:
             self._log(f"Route discovery to {dest_peer_id[:12]}... failed: {e}")
+            self._route_cache[dest_peer_id] = None
             return None
 
     # ------------------------------------------------------------------
     # Membership Helpers
     # ------------------------------------------------------------------
+
+    def clear_route_cache(self) -> None:
+        """Clear route cache at the start of a new rebalance cycle."""
+        self._route_cache.clear()
+        self._route_cache_ts = time.time()
 
     def get_hive_members(self) -> Set[str]:
         """Return cached set of fleet member pubkeys."""
