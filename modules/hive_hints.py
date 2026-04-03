@@ -195,6 +195,22 @@ class HiveHintAdapter:
         bias = max(-MAX_REBALANCE_BIAS, min(MAX_REBALANCE_BIAS, bias))
         return 1.0 + bias
 
+    def get_centrality(self, peer_id: str) -> float:
+        """Return external centrality for peer (0.0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("external_centrality")
+        if isinstance(val, (int, float)):
+            return max(0.0, min(1.0, float(val)))
+        return 0.0
+
+    def get_reputation_score(self, peer_id: str) -> int:
+        """Return fleet-aggregated reputation score (50 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("reputation_score")
+        if isinstance(val, (int, float)):
+            return max(0, min(100, int(val)))
+        return 50
+
     # ------------------------------------------------------------------
     # Channel-open hints
     # ------------------------------------------------------------------
