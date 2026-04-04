@@ -14,6 +14,7 @@ from modules.rebalance_executor import (
 @dataclass
 class MockCandidate:
     source_candidates: List[str] = field(default_factory=lambda: ["100x1x0"])
+    primary_source_peer_id: str = "source_peer_abc"
     to_channel: str = "200x1x0"
     to_peer_id: str = "dest_peer_abc"
     amount_sats: int = 500000
