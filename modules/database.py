@@ -3930,10 +3930,52 @@ class Database:
             avg_cost_ppm, and avg_amount_sats.
             Returns None if no rebalance history for this channel.
         """
+        return self._get_rebalance_success_rate_for_where(
+            "to_channel = ?",
+            (channel_id,),
+            window_days=window_days,
+        )
+
+    def get_source_rebalance_success_rate(
+        self, channel_id: str, window_days: int = 30
+    ) -> Optional[Dict[str, Any]]:
+        """Get source-channel rebalance success rate from rebalance_history."""
+        return self._get_rebalance_success_rate_for_where(
+            "from_channel = ?",
+            (channel_id,),
+            window_days=window_days,
+        )
+
+    def get_peer_rebalance_success_rate(
+        self, peer_id: str, window_days: int = 30
+    ) -> Optional[Dict[str, Any]]:
+        """Get destination-peer rebalance success rate aggregated across its channels."""
+        conn = self._get_connection()
+        peer_channels = conn.execute("""
+            SELECT channel_id FROM channel_states WHERE peer_id = ?
+        """, (peer_id,)).fetchall()
+        if not peer_channels:
+            return None
+        channel_ids = [row["channel_id"] for row in peer_channels]
+        placeholders = ",".join("?" * len(channel_ids))
+        return self._get_rebalance_success_rate_for_where(
+            f"to_channel IN ({placeholders})",
+            tuple(channel_ids),
+            window_days=window_days,
+        )
+
+    def _get_rebalance_success_rate_for_where(
+        self,
+        where_sql: str,
+        where_params: tuple,
+        *,
+        window_days: int = 30,
+    ) -> Optional[Dict[str, Any]]:
+        """Shared aggregate helper for rebalance success-rate queries."""
         conn = self._get_connection()
         cutoff = int(time.time()) - (window_days * 86400)
 
-        row = conn.execute("""
+        row = conn.execute(f"""
             SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successes,
@@ -3943,8 +3985,8 @@ class Database:
                     ELSE NULL END) as avg_cost_ppm,
                 AVG(CASE WHEN status = 'success' THEN amount_sats ELSE NULL END) as avg_amount
             FROM rebalance_history
-            WHERE to_channel = ? AND timestamp >= ?
-        """, (channel_id, cutoff)).fetchone()
+            WHERE {where_sql} AND timestamp >= ?
+        """, (*where_params, cutoff)).fetchone()
 
         if not row or row['total'] == 0:
             return None
