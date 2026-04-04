@@ -589,12 +589,19 @@ class RebalanceExecutor:
         # SAFETY: never auto.sourcefree in circular routes (lesson 502)
         layers = [l for l in layers if l != "auto.sourcefree"]
 
+        # Fleet maxfee: without auto.sourcefree, askrene includes our own
+        # outgoing channel fee in the route cost.  For circular payments we
+        # don't actually pay that fee (we're the sender), so the real cost
+        # is lower than askrene estimates.  Use a generous 1% cap (matching
+        # HiveRouter discovery) to avoid "excessive cost" rejections.
+        fleet_maxfee = max(job.max_fee_msat, required_amount_msat // 100)
+
         params = {
             "source": our_id,
             "destination": candidate.to_peer_id,
             "amount_msat": required_amount_msat,
             "layers": layers,
-            "maxfee_msat": job.max_fee_msat,
+            "maxfee_msat": fleet_maxfee,
             "final_cltv": required_cltv,
             "maxparts": 1,
         }
@@ -704,6 +711,15 @@ class RebalanceExecutor:
 
                 total_fee = max(0, full_route[0].get("amount_msat", job.amount_msat) - job.amount_msat)
                 fee_ppm = (total_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
+
+                # Budget gate: fleet routes use generous maxfee for discovery
+                # (because askrene inflates cost without auto.sourcefree), but
+                # we still enforce the real budget before committing sats.
+                if total_fee > job.max_fee_msat:
+                    raise ValueError(
+                        f"route_over_budget: {fee_ppm}ppm ({total_fee}msat) "
+                        f"exceeds budget {job.max_fee_msat}msat"
+                    )
 
                 self._log(
                     f"Job {job.job_id}: sendpay circular "
