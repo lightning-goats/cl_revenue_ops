@@ -8,7 +8,7 @@ This module only triggers rebalances when the math shows positive expected profi
 
 Architecture Pattern: "Strategist and Executor"
 - STRATEGIST (EVRebalancer): Calculates EV, determines IF and HOW MUCH to rebalance
-- EXECUTOR (RebalanceExecutor): Actually executes payments via native getroutes+sendpay
+- EXECUTOR (RebalanceExecutor): Executes native safe single-path circular payments
 
 Async Job Queue
 - Decouples decision-making from execution
@@ -209,7 +209,7 @@ class JobManager:
     DEPRECATED: Sling-based background rebalancing job manager.
 
     JobManager is no longer called from the active rebalance path.
-    RebalanceExecutor (native getroutes+sendpay) replaced it as the primary
+    RebalanceExecutor replaced it as the primary
     execution engine. This class is retained because diagnostic RPCs may still
     reference it for active job counts. Do not add new sling dependencies here.
     """
@@ -1916,7 +1916,7 @@ class EVRebalancer:
 
     This class acts as the "Strategist" - it calculates EV and determines
     IF and HOW MUCH to rebalance. The actual execution is delegated to
-    RebalanceExecutor (native getroutes+sendpay).
+    RebalanceExecutor.
 
     Thread Safety (I-13, I-14, S-9):
     The rebalance cycle runs single-threaded on a timer. Candidate evaluation,
@@ -1973,7 +1973,7 @@ class EVRebalancer:
         # Hive hints adapter (injected by main plugin; None = disabled)
         self.hive_hints = None
         self._hive_router = None  # HiveRouter for fleet route discovery
-        self.rebalance_executor = None  # RebalanceExecutor (native getroutes+sendpay)
+        self.rebalance_executor = None  # RebalanceExecutor (safe explicit-route executor)
         self.rpc_cache = None  # Shared RPC cache (injected by main plugin)
 
     @property
@@ -2160,6 +2160,70 @@ class EVRebalancer:
         if last_attempted_ppm >= ev_max_fee_ppm:
             return ev_max_fee_ppm
         return min(int(last_attempted_ppm * 1.5), ev_max_fee_ppm)
+
+    @staticmethod
+    def _normalize_rebalance_success_signal(
+        data: Optional[Dict[str, Any]],
+        *,
+        min_samples: int = 3,
+    ) -> Optional[Dict[str, float]]:
+        """Normalize rebalance success-rate history into a bounded weighted signal."""
+        if not data:
+            return None
+        total = int(data.get("total", 0) or 0)
+        if total < min_samples:
+            return None
+        rate = max(0.10, min(0.95, float(data.get("success_rate", 0.0) or 0.0)))
+        confidence = max(0.0, min(1.0, total / 10.0))
+        return {"rate": rate, "confidence": confidence, "total": total}
+
+    def _estimate_rebalance_success_probability(
+        self,
+        *,
+        dest_peer_id: str,
+        dest_channel: str,
+        source_channel: str,
+    ) -> float:
+        """Blend forwarding reputation with rebalance-specific history."""
+        signals: List[tuple[float, float]] = []
+
+        try:
+            reputation = self.database.get_peer_reputation(dest_peer_id)
+            rep_score = float(reputation.get("score", 0.5) or 0.5)
+        except Exception:
+            rep_score = 0.5
+        signals.append((max(0.10, min(0.95, rep_score)), 0.20))
+
+        signal_sources = [
+            (
+                getattr(self.database, "get_peer_rebalance_success_rate", lambda *_a, **_k: None)(
+                    dest_peer_id, 30
+                ),
+                0.30,
+            ),
+            (
+                self.database.get_channel_rebalance_success_rate(dest_channel, 30),
+                0.30,
+            ),
+            (
+                getattr(self.database, "get_source_rebalance_success_rate", lambda *_a, **_k: None)(
+                    source_channel, 30
+                ),
+                0.20,
+            ),
+        ]
+
+        for raw_signal, base_weight in signal_sources:
+            signal = self._normalize_rebalance_success_signal(raw_signal)
+            if signal is None:
+                continue
+            signals.append((signal["rate"], base_weight * signal["confidence"]))
+
+        total_weight = sum(weight for _, weight in signals)
+        if total_weight <= 0:
+            return 0.5
+        probability = sum(rate * weight for rate, weight in signals) / total_weight
+        return max(0.10, min(0.95, probability))
 
     def _parse_msat(self, v: Any) -> int:
         """Delegate to shared parse_msat in utils.py."""
@@ -3068,6 +3132,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         max_budget_msat = max(1000, raw_budget_msat)
         # Use ceiling sats for conservative accounting.
         max_budget_sats = (max_budget_msat + 999) // 1000
+        route_success_prob = self._estimate_rebalance_success_probability(
+            dest_peer_id=dest_peer_id,
+            dest_channel=dest_channel,
+            source_channel=primary_source_id,
+        )
         
         # MAJOR-13 DOCUMENTATION: Modified Kelly Criterion for Per-Trade Sizing
         #
@@ -3088,8 +3157,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # total routing capital. For daily budget management, see reserve_budget().
 
         if self.config.enable_kelly:
-            reputation = self.database.get_peer_reputation(dest_info.get("peer_id", ""))
-            historical_p = reputation.get('score', 0.5)  # Historical success probability
+            historical_p = route_success_prob
 
             # EV v2.0: Blend AskRene real-time liquidity belief with historical reputation.
             # AskRene tracks maximum believed capacity per channel direction from
@@ -3231,13 +3299,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         expected_income = int((rebalance_amount * expected_utilization * outbound_fee_ppm) // 1_000_000)
 
-        # Source reliability: discount income by probability the rebalance succeeds.
-        # Uses primary source's failure history — high failure count = lower success prob.
+        # Discount expected income by the probability that the rebalance itself succeeds.
+        # This blends forwarding reputation, rebalance-specific history, and short-lived
+        # source failures so unreliable routes stop looking artificially profitable.
         source_fail_count = self.job_manager.get_source_failure_count(primary_source_id)
         if source_fail_count > 0:
             # Exponential decay: 0 fails=100%, 1 fail=80%, 2 fails=64%, 4 fails=41%
-            source_success_prob = max(0.1, 0.8 ** source_fail_count)
-            expected_income = int(expected_income * source_success_prob)
+            route_success_prob *= max(0.1, 0.8 ** source_fail_count)
+            route_success_prob = max(0.1, min(0.95, route_success_prob))
+        expected_income = int(expected_income * route_success_prob)
 
         # Corridor ownership is a bounded, confidence-weighted utilization prior.
         expected_income = int(
@@ -4044,6 +4114,22 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             if normalized in route_pair_ins:
                 score += 40
 
+            # Persistent source-channel reliability from rebalance history.
+            # This complements the in-memory recent-failure penalty below.
+            try:
+                source_signal = self._normalize_rebalance_success_signal(
+                    getattr(self.database, "get_source_rebalance_success_rate", lambda *_a, **_k: None)(
+                        cid, 30
+                    )
+                )
+                if source_signal is not None:
+                    reliability_delta = int(
+                        round((source_signal["rate"] - 0.5) * 160 * source_signal["confidence"])
+                    )
+                    score += reliability_delta
+            except Exception:
+                pass
+
             # RELIABILITY PENALTY: Penalize sources with recent failures
             fails = self.job_manager.get_source_failure_count(cid)
             if fails > 0:
@@ -4196,8 +4282,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         """
         Execute a rebalance for the given candidate.
 
-        Uses RebalanceExecutor (native getroutes+sendpay) for all rebalances.
-        Fleet routes use hive-* layers, network routes use revenue-* layers.
+        Uses RebalanceExecutor for all live rebalances.
+        Fleet intelligence still influences planning, but execution uses the
+        safe explicit-route path for both fleet-planned and network-planned jobs.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         with self._pending_lock:
@@ -4364,8 +4451,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         self._pending.pop(candidate.to_channel, None)
                     return result
 
-            # RebalanceExecutor: native getroutes+sendpay for ALL rebalances.
-            # Fleet routes use hive-* layers (0-fee fleet paths).
+            # RebalanceExecutor: safe explicit-route execution for all rebalances.
+            # Fleet planning still uses hive intelligence before execution.
             # Network routes use revenue-* layers (best available paths).
             if self.rebalance_executor:
                 try:

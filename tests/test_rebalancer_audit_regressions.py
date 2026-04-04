@@ -618,6 +618,161 @@ class TestB2WeeklyBudgetExtCosts:
 
 
 # ============================================================================
+# 7. Rebalance-specific reliability should leverage rebalance history
+# ============================================================================
+
+
+class TestRebalanceReliabilityIntegration:
+    """Rebalance routing should prefer rebalance-specific success signals."""
+
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            dry_run=True,
+            enable_proportional_budget=False,
+            enable_kelly=False,
+            enable_velocity_gate=False,
+            rebalance_min_amount=50_000,
+            rebalance_max_amount=5_000_000,
+            rebalance_min_profit=0,
+            rebalance_min_profit_ppm=0,
+            rebalance_cooldown_hours=24,
+            flow_window_days=7,
+            hot_channel_protection_enabled=False,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r._profitability_analyzer = None
+        return r
+
+    def test_source_selection_prefers_persistently_successful_source(self, mock_plugin, mock_database):
+        """Persistent source-channel success should break ties before transient retries do."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        bad_peer_id = "02" + "c" * 64
+        good_peer_id = "02" + "d" * 64
+        sources = [
+            ("111x1x0", {"peer_id": bad_peer_id, "capacity": 5_000_000, "spendable_sats": 4_000_000, "fee_ppm": 50}, 0.9),
+            ("111x2x0", {"peer_id": good_peer_id, "capacity": 5_000_000, "spendable_sats": 4_000_000, "fee_ppm": 50}, 0.9),
+        ]
+
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_source_rebalance_success_rate.side_effect = lambda cid, window_days=30: {
+            "111x1x0": {"total": 12, "successes": 2, "failures": 10, "success_rate": 2 / 12},
+            "111x2x0": {"total": 12, "successes": 10, "failures": 2, "success_rate": 10 / 12},
+        }.get(cid)
+
+        selected = r._select_source_candidates(
+            sources=sources,
+            amount_needed=50_000,
+            dest_channel="222x333x0",
+            dest_outbound_fee_ppm=1200,
+            dest_inbound_fee_ppm=100,
+            peer_status={
+                bad_peer_id: {"connected": True},
+                good_peer_id: {"connected": True},
+            },
+        )
+
+        assert selected, "Expected at least one source candidate"
+        assert selected[0][0] == "111x2x0", (
+            "Persistent rebalance success should prefer 111x2x0 over 111x1x0 "
+            "when other source attributes are equal."
+        )
+
+    def test_ev_profit_is_discounted_by_rebalance_success_history(self, mock_plugin, mock_database):
+        """Identical generic peer reputation should still diverge on rebalance-specific history."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        dest_channel = "222x333x0"
+        dest_peer_id = "02" + "b" * 64
+        source_scid = "333x444x0"
+        source_peer_id = "02" + "c" * 64
+
+        dest_info = {
+            "peer_id": dest_peer_id,
+            "capacity": 10_000_000,
+            "spendable_sats": 500_000,
+            "fee_ppm": 5000,
+        }
+        source_info = {
+            "peer_id": source_peer_id,
+            "capacity": 10_000_000,
+            "spendable_sats": 4_000_000,
+            "fee_ppm": 25,
+        }
+        sources = [(source_scid, source_info, 0.8)]
+
+        mock_database.get_channel_state.return_value = {
+            "state": "balanced",
+            "sats_in": 10_000,
+            "sats_out": 10_000,
+        }
+        mock_database.get_fee_strategy_state.return_value = {"last_broadcast_fee_ppm": 5000}
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_failure_count.return_value = (0, None)
+        mock_database.get_failure_metadata.return_value = {"last_attempted_ppm": 0}
+        mock_database.get_kalman_state.return_value = None
+        mock_database.get_historical_inbound_fee_ppm.return_value = None
+        mock_database.get_peer_closed_channel_profit_summary.return_value = None
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        mock_database.get_peer_reputation.return_value = {
+            "successes": 0,
+            "failures": 0,
+            "score": 0.5,
+        }
+
+        r._estimate_inbound_fee = MagicMock(return_value=10)
+        r._get_channel_age_days = MagicMock(return_value=30)
+        r._select_source_candidates = MagicMock(return_value=[
+            (source_scid, source_info, 1.0, 50),
+        ])
+
+        mock_database.get_peer_rebalance_success_rate.return_value = {
+            "total": 10, "successes": 9, "failures": 1, "success_rate": 0.9,
+        }
+        mock_database.get_channel_rebalance_success_rate.return_value = {
+            "total": 10, "successes": 9, "failures": 1, "success_rate": 0.9,
+            "avg_cost_ppm": 10, "avg_amount_sats": 50_000,
+        }
+        mock_database.get_source_rebalance_success_rate.return_value = {
+            "total": 10, "successes": 9, "failures": 1, "success_rate": 0.9,
+        }
+        high = r._analyze_rebalance_ev(
+            dest_channel=dest_channel,
+            dest_info=dest_info,
+            dest_ratio=0.05,
+            sources=sources,
+        )
+
+        mock_database.get_peer_rebalance_success_rate.return_value = {
+            "total": 10, "successes": 1, "failures": 9, "success_rate": 0.1,
+        }
+        mock_database.get_channel_rebalance_success_rate.return_value = {
+            "total": 10, "successes": 1, "failures": 9, "success_rate": 0.1,
+            "avg_cost_ppm": 10, "avg_amount_sats": 50_000,
+        }
+        mock_database.get_source_rebalance_success_rate.return_value = {
+            "total": 10, "successes": 1, "failures": 9, "success_rate": 0.1,
+        }
+        low = r._analyze_rebalance_ev(
+            dest_channel=dest_channel,
+            dest_info=dest_info,
+            dest_ratio=0.05,
+            sources=sources,
+        )
+
+        assert high is not None
+        assert low is not None
+        assert high.expected_profit_sats > low.expected_profit_sats, (
+            "Rebalance-specific success history should affect EV independently "
+            "of generic forwarding reputation."
+        )
+
+
+# ============================================================================
 # 7. B3: Push EV uses wrong peer for fee estimation
 # ============================================================================
 

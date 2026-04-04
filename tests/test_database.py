@@ -117,6 +117,68 @@ class TestChannelRebalanceSuccessRate:
         assert result is None
 
 
+class TestPeerAndSourceRebalanceSuccessRate:
+    """Real SQLite tests for peer/source rebalance success aggregation."""
+
+    def _make_db(self, tmp_path):
+        db_path = os.path.join(tmp_path, "test_peer_source_sr.db")
+        plugin = MagicMock()
+        db = Database(db_path, plugin)
+        db.initialize()
+        return db
+
+    def test_peer_and_source_success_rates_use_existing_rebalance_history(self, tmp_path):
+        """Peer and source success rates should aggregate existing rebalance_history rows."""
+        db = self._make_db(tmp_path)
+        conn = db._get_connection()
+        now = int(time.time())
+        peer_id = "02" + "b" * 64
+
+        # Two destination channels for the same peer
+        conn.execute(
+            "INSERT INTO channel_states "
+            "(channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("111x1x0", peer_id, "balanced", 0.5, 0, 0, 1_000_000, now),
+        )
+        conn.execute(
+            "INSERT INTO channel_states "
+            "(channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("111x2x0", peer_id, "balanced", 0.5, 0, 0, 1_000_000, now),
+        )
+
+        rows = [
+            ("src-good", "111x1x0", 50_000, 100, 10, 50, "success", "normal", now - 3600),
+            ("src-good", "111x2x0", 50_000, 100, 10, 50, "success", "normal", now - 7200),
+            ("src-good", "111x2x0", 50_000, 100, None, 50, "failed", "normal", now - 10_800),
+            ("src-bad", "111x1x0", 50_000, 100, None, 50, "failed", "normal", now - 14_400),
+        ]
+        for row in rows:
+            conn.execute(
+                "INSERT INTO rebalance_history "
+                "(from_channel, to_channel, amount_sats, max_fee_sats, actual_fee_sats, "
+                "expected_profit_sats, status, rebalance_type, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+        conn.commit()
+
+        peer_result = db.get_peer_rebalance_success_rate(peer_id, 30)
+        assert peer_result is not None
+        assert peer_result["total"] == 4
+        assert peer_result["successes"] == 2
+        assert peer_result["failures"] == 2
+        assert abs(peer_result["success_rate"] - 0.5) < 0.01
+
+        source_result = db.get_source_rebalance_success_rate("src-good", 30)
+        assert source_result is not None
+        assert source_result["total"] == 3
+        assert source_result["successes"] == 2
+        assert source_result["failures"] == 1
+        assert abs(source_result["success_rate"] - (2 / 3)) < 0.01
+
+
 # =============================================================================
 # Audit Round 8 – Turn 3 Regression Tests
 # =============================================================================
