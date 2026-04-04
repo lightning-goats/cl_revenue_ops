@@ -341,6 +341,20 @@ class HiveHintAdapter:
         return results
 
     # ------------------------------------------------------------------
+    # Closure recommendations
+    # ------------------------------------------------------------------
+
+    def is_closure_recommended(self, peer_id: str) -> bool:
+        """Return True if cl-hive reputation layer recommends closing this peer."""
+        hint = self._get_peer_hint(peer_id)
+        return bool(hint.get("closure_recommended", False))
+
+    def get_closure_reason(self, peer_id: str) -> str:
+        """Return closure reason string, or '' if no recommendation."""
+        hint = self._get_peer_hint(peer_id)
+        return str(hint.get("closure_reason", ""))
+
+    # ------------------------------------------------------------------
     # Fleet fee prior
     # ------------------------------------------------------------------
 

@@ -1009,7 +1009,7 @@ class TestEnrichedLosers:
             "scid", "peer_id", "reason", "roi", "marginal_roi",
             "classification", "capacity", "estimated_closure_cost_sats",
             "rebal_difficulty", "opener", "action",
-            "is_hard_bleeder", "uptime_pct", "regime_change",
+            "is_hard_bleeder", "hive_closure_flagged", "uptime_pct", "regime_change",
         }
         assert set(losers[0].keys()) == expected_keys
 
