@@ -626,6 +626,37 @@ class RebalanceExecutor:
             our_id,
             job.amount_msat,
         )
+
+        # Strip our outgoing channel fee from the first hop.
+        # Without auto.sourcefree, getroutes includes our channel's fee in
+        # path[0].amount_msat.  For circular self-payments the first hop from
+        # us is free (we're the sender, not a forwarder).  If we don't strip
+        # it, the first peer keeps the excess as unearned profit and the
+        # budget gate rejects the route as over-budget.
+        if len(full_route) >= 2:
+            first_scid = full_route[0].get("channel", "")
+            our_fee_base = 0
+            our_fee_ppm = 0
+            try:
+                for ch in (self.plugin.rpc.listpeerchannels()
+                           .get("channels", [])):
+                    if ch.get("short_channel_id") == first_scid:
+                        local = ch.get("updates", {}).get("local", {})
+                        our_fee_ppm = int(local.get(
+                            "fee_proportional_millionths", 0) or 0)
+                        our_fee_base = int(local.get(
+                            "fee_base_msat", 0) or 0)
+                        break
+            except Exception:
+                pass
+            if our_fee_ppm > 0 or our_fee_base > 0:
+                fwd_amount = full_route[1].get("amount_msat", 0)
+                our_fee = our_fee_base + (fwd_amount * our_fee_ppm) // 1_000_000
+                full_route[0]["amount_msat"] = max(
+                    full_route[1]["amount_msat"],
+                    full_route[0]["amount_msat"] - our_fee,
+                )
+
         inform_path = list(path)
         final_direction = 1 if candidate.to_peer_id > our_id else 0
         inform_path.append({
