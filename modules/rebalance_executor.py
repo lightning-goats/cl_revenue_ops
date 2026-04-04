@@ -239,9 +239,9 @@ class RebalanceExecutor:
         try:
             # Find route from dest_peer back to us
             route_result = self.plugin.rpc.getroute(
-                id=our_id,
-                amount_msat=job.amount_msat,
-                riskfactor=1,
+                our_id,
+                job.amount_msat,
+                1,
                 fromid=job.peer_id,
                 maxhops=6,
                 fuzzpercent=0,
