@@ -3003,10 +3003,19 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     "source_scid": hr.source_scid,
                 }
             if hive_route and hive_route.get("fee_ppm", 9999) <= inbound_fee_ppm:
-                # Hive route is cheaper than estimated inbound — use its fee
-                inbound_fee_ppm = hive_route["fee_ppm"]
+                # Hive route forward cost is cheap, but HiveRouter uses
+                # auto.sourcefree which hides our channel fee AND the return
+                # hop fee.  The executor strips our channel fee at sendpay
+                # time, but the return hop (dest_peer → us) costs dest_peer's
+                # published fee regardless of fleet status.  Add it back so
+                # the EV budget is sized for reality, not the askrene fiction.
+                return_hop_ppm = self._get_last_hop_fee(dest_peer_id) or 0
+                fleet_fee_ppm = hive_route["fee_ppm"] + return_hop_ppm
+                if fleet_fee_ppm < inbound_fee_ppm:
+                    inbound_fee_ppm = fleet_fee_ppm
                 self.plugin.log(
-                    f"HIVE ROUTE: Using askrene-discovered fee {inbound_fee_ppm} ppm "
+                    f"HIVE ROUTE: Using askrene-discovered fee {hive_route['fee_ppm']} ppm "
+                    f"+ return hop {return_hop_ppm} ppm = {fleet_fee_ppm} ppm "
                     f"for {dest_peer_id[:12]}... ({hive_route.get('hops', '?')} hops)",
                     level='info'
                 )
