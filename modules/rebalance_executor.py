@@ -628,41 +628,21 @@ class RebalanceExecutor:
         )
 
         # Strip our outgoing channel fee from the first hop.
-        # Without auto.sourcefree, getroutes includes our channel's fee in
-        # path[0].amount_msat.  For circular self-payments the first hop from
-        # us is free (we're the sender, not a forwarder).  If we don't strip
-        # it, the first peer keeps the excess as unearned profit and the
-        # budget gate rejects the route as over-budget.
+        # Without auto.sourcefree, getroutes inflates path[0].amount by our
+        # channel fee.  For circular self-payments we're the sender (free
+        # first hop).  Fleet intermediaries charge 0 (hive-fleet layer), so
+        # the correct first-hop amount is simply required_amount_msat.
+        # No RPC needed — avoids the listpeerchannels timeout that blocked
+        # the previous approach.
         if len(full_route) >= 2:
-            first_scid = full_route[0].get("channel", "")
-            first_peer = full_route[0].get("id", "")
-            our_fee_base = 0
-            our_fee_ppm = 0
-            try:
-                # Query only the first hop peer (not all channels)
-                peer_chans = self.plugin.rpc.listpeerchannels(first_peer)
-                for ch in peer_chans.get("channels", []):
-                    if ch.get("short_channel_id") == first_scid:
-                        local = ch.get("updates", {}).get("local", {})
-                        our_fee_ppm = int(local.get(
-                            "fee_proportional_millionths", 0) or 0)
-                        our_fee_base = int(local.get(
-                            "fee_base_msat", 0) or 0)
-                        break
-            except Exception:
-                pass
-            if our_fee_ppm > 0 or our_fee_base > 0:
-                fwd_amount = int(full_route[1].get("amount_msat", 0) or 0)
-                our_fee = our_fee_base + (fwd_amount * our_fee_ppm) // 1_000_000
-                adjusted = full_route[0]["amount_msat"] - our_fee
-                full_route[0]["amount_msat"] = max(
-                    int(full_route[1]["amount_msat"]),
-                    adjusted,
-                )
+            inflated = int(full_route[0].get("amount_msat", 0) or 0)
+            if inflated > required_amount_msat:
+                full_route[0]["amount_msat"] = required_amount_msat
                 self._log(
-                    f"Fleet first-hop fee strip: {our_fee_ppm}ppm + "
-                    f"{our_fee_base}base = {our_fee}msat removed",
-                    level="debug",
+                    f"Fleet first-hop fee strip: {inflated} -> "
+                    f"{required_amount_msat} "
+                    f"(removed {inflated - required_amount_msat}msat "
+                    f"phantom channel fee)",
                 )
 
         inform_path = list(path)
