@@ -566,16 +566,19 @@ class RebalanceExecutor:
         our_id: str,
     ) -> tuple[List[Dict], List[Dict]]:
         """Build a circular route using getroutes for fleet rebalances."""
+        required_amount_msat, required_cltv = self._get_return_hop_policy(
+            candidate, job.amount_msat, our_id,
+        )
         layers = self._get_layers(job.route_type)
         if "auto.no_mpp_support" not in layers:
             layers.append("auto.no_mpp_support")
         params = {
             "source": our_id,
             "destination": candidate.to_peer_id,
-            "amount_msat": job.amount_msat,
+            "amount_msat": required_amount_msat,
             "layers": layers,
             "maxfee_msat": job.max_fee_msat,
-            "final_cltv": 18,
+            "final_cltv": required_cltv,
             "maxparts": 1,
         }
         try:
@@ -612,9 +615,9 @@ class RebalanceExecutor:
     def _execute_single(self, job: RebalanceJob, candidate) -> RebalanceResult:
         """Execute a rebalance job.
 
-        Uses sendpay with explicit routes. Both network and fleet-planned
-        rebalances currently execute through getroute-based explicit routes.
-        Retry behavior uses explicit excludes on subsequent attempts.
+        Uses sendpay with explicit routes.  Fleet rebalances use getroutes
+        (askrene layers) for zero-fee fleet paths.  Network rebalances use
+        getroute with explicit excludes and retry.
         """
         our_id = self._get_our_id()
         if not our_id:
@@ -638,13 +641,10 @@ class RebalanceExecutor:
         except Exception as e:
             return RebalanceResult(success=False, error=f"invoice_error: {e}")
 
-        # Circular rebalancing via getroute + sendpay.
+        # Circular rebalancing via sendpay with explicit routes.
         # xpay/pay resolve self-invoices LOCALLY without sending HTLCs through
         # the network — no liquidity actually moves.  Only sendpay with an
         # explicit non-empty route forces HTLCs through intermediate nodes.
-        #
-        # Pattern: getroute(fromid=dest_peer, id=our_id) finds path BACK to us.
-        # We prepend our outgoing channel as the first hop to complete the circle.
 
         last_error = ""
         job.state = JobState.ROUTING
@@ -654,9 +654,19 @@ class RebalanceExecutor:
             inform_path: List[Dict] = []
             attempt_reserved = False
             try:
-                full_route, inform_path = self._compute_network_route(
-                    job, candidate, our_id, excludes
-                )
+                if route_type == "fleet" and attempt == 1:
+                    try:
+                        full_route, inform_path = self._compute_fleet_route(
+                            job, candidate, our_id,
+                        )
+                    except Exception:
+                        full_route, inform_path = self._compute_network_route(
+                            job, candidate, our_id, excludes
+                        )
+                else:
+                    full_route, inform_path = self._compute_network_route(
+                        job, candidate, our_id, excludes
+                    )
                 constraint_excludes = self._route_constraint_excludes(
                     full_route, candidate, our_id, job.amount_msat
                 )
@@ -755,7 +765,7 @@ class RebalanceExecutor:
                     is_node_error = bool(failcode & 0x2000)
                     if erring_index == 0 or (erring_index == 1 and is_node_error):
                         should_retry = False
-                    elif full_route and erring_index == len(full_route) + 1:
+                    elif full_route and erring_index == len(full_route):
                         should_retry = False
                     else:
                         previous_excludes = list(excludes)

@@ -311,73 +311,67 @@ class TestExecuteSuccess:
         assert sendpay_route[-1]["channel"] == "200x1x0"
         assert sendpay_route[-1]["amount_msat"] == 500_000_000
 
-    def test_fleet_execution_does_not_use_getroutes_for_sendpay(self):
+    def test_fleet_execution_uses_getroutes_with_return_hop_fees(self):
+        """Fleet routes use getroutes (askrene layers) with proper return hop fee accounting."""
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
         plugin.rpc.invoice.return_value = {
             "payment_hash": "hash123", "payment_secret": "secret123",
             "bolt11": "lnbc5u1..."
         }
-        plugin.rpc.listpeerchannels.return_value = {
-            "channels": [
-                {
-                    "short_channel_id": "100x1x0",
-                    "updates": {
-                        "local": {
-                            "fee_base_msat": 0,
-                            "fee_proportional_millionths": 10,
-                            "cltv_expiry_delta": 6,
+
+        def listpeerchannels_side_effect(peer_id=None):
+            if peer_id == "dest_peer_abc":
+                return {
+                    "channels": [
+                        {
+                            "short_channel_id": "200x1x0",
+                            "updates": {
+                                "remote": {
+                                    "fee_base_msat": 1000,
+                                    "fee_proportional_millionths": 100,
+                                    "cltv_expiry_delta": 12,
+                                },
+                            },
                         },
-                        "remote": {
-                            "fee_base_msat": 0,
-                            "fee_proportional_millionths": 0,
-                            "cltv_expiry_delta": 6,
-                        },
-                    },
-                },
-                {
-                    "short_channel_id": "200x1x0",
-                    "updates": {
-                        "remote": {
-                            "fee_base_msat": 0,
-                            "fee_proportional_millionths": 10,
-                            "cltv_expiry_delta": 6,
-                        },
-                    },
-                },
-            ]
-        }
-        plugin.rpc.listchannels.return_value = {
-            "channels": [
-                {
-                    "short_channel_id": "300x1x0",
-                    "direction": 0,
-                    "base_fee_millisatoshi": 1000,
-                    "fee_per_millionth": 10,
-                    "delay": 18,
+                    ]
                 }
-            ]
-        }
-        plugin.rpc.getroute.return_value = {
-            "route": [
-                {
-                    "id": "dest_peer_abc",
-                    "channel": "300x1x0",
-                    "direction": 0,
-                    "amount_msat": 500_005_000,
-                    "delay": 24,
-                },
-            ]
-        }
+            return {"channels": []}
+
+        plugin.rpc.listpeerchannels.side_effect = listpeerchannels_side_effect
         plugin.rpc.waitsendpay.return_value = {
-            "status": "complete", "amount_sent_msat": 500_011_000
+            "status": "complete", "amount_sent_msat": 500_051_000
         }
 
         def call_side_effect(method, params=None):
             if method == "askrene-listlayers":
                 return {"layers": [{"layer": "hive-fleet"}, {"layer": "revenue-local"}]}
             if method == "getroutes":
-                raise AssertionError("direct getroutes execution path should not be used")
+                # Verify getroutes receives return hop fee-adjusted amount and CLTV
+                assert params["amount_msat"] == 500_051_000  # 500M + 1000 base + (500M * 100 / 1M)
+                assert params["final_cltv"] == 30  # 18 + 12 cltv_delta
+                assert params["maxparts"] == 1
+                assert "auto.no_mpp_support" in params["layers"]
+                return {
+                    "routes": [{
+                        "amount_msat": 500_051_000,
+                        "path": [
+                            {
+                                "short_channel_id_dir": "100x1x0/1",
+                                "next_node_id": "fleet_mid",
+                                "amount_msat": 500_051_000,
+                                "delay": 42,
+                            },
+                            {
+                                "short_channel_id_dir": "300x1x0/0",
+                                "next_node_id": "dest_peer_abc",
+                                "amount_msat": 500_051_000,
+                                "delay": 30,
+                            },
+                        ],
+                    }],
+                    "probability_ppm": 999999,
+                }
             if method == "askrene-inform-channel":
                 return {}
             return {}
@@ -390,23 +384,21 @@ class TestExecuteSuccess:
         result = executor.execute(candidate)
 
         assert result.success is True
-        plugin.rpc.getroute.assert_called_once_with(
-            "dest_peer_abc",
-            500_005_000,
-            riskfactor=0,
-            cltv=24,
-            fromid="source_peer_abc",
-            maxhops=6,
-            fuzzpercent=0,
-        )
+        assert result.route_type == "fleet"
+        # getroute should NOT be called for fleet routes
+        plugin.rpc.getroute.assert_not_called()
+        # getroutes should be called via plugin.rpc.call
+        getroutes_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c[0][0] == "getroutes"
+        ]
+        assert len(getroutes_calls) == 1
         sendpay_route = plugin.rpc.sendpay.call_args.kwargs["route"]
-        assert sendpay_route[-1] == {
-            "channel": "200x1x0",
-            "id": "our_id",
-            "amount_msat": 500_000_000,
-            "delay": 18,
-            "style": "tlv",
-        }
+        # Final hop: dest_peer -> us via dest_channel
+        assert sendpay_route[-1]["id"] == "our_id"
+        assert sendpay_route[-1]["channel"] == "200x1x0"
+        assert sendpay_route[-1]["amount_msat"] == 500_000_000
+        assert sendpay_route[-1]["delay"] == 18
 
 
 class TestExecuteFailure:
@@ -604,6 +596,7 @@ class TestExecuteFailure:
         assert any(c[0][1]["inform"] == "succeeded" for c in inform_calls)
 
     def test_fleet_retries_on_fee_insufficient_with_exclude(self):
+        """Fleet attempt 1 uses getroutes, retry falls back to getroute + excludes."""
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
         plugin.rpc.invoice.return_value = {
@@ -612,13 +605,6 @@ class TestExecuteFailure:
         }
         plugin.rpc.listchannels.return_value = {
             "channels": [
-                {
-                    "short_channel_id": "300x1x0",
-                    "direction": 1,
-                    "base_fee_millisatoshi": 1000,
-                    "fee_per_millionth": 10,
-                    "delay": 18,
-                },
                 {
                     "short_channel_id": "301x1x0",
                     "direction": 0,
@@ -642,39 +628,51 @@ class TestExecuteFailure:
                 }
             ]
         }
-        plugin.rpc.getroute.side_effect = [
-            {
-                "route": [
-                    {
-                        "id": "dest_peer_abc",
-                        "channel": "300x1x0",
-                        "direction": 1,
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": [{"layer": "hive-fleet"}]}
+            if method == "getroutes":
+                return {
+                    "routes": [{
                         "amount_msat": 500_000_000,
-                        "delay": 24,
-                    },
-                ]
-            },
-            {
-                "route": [
-                    {
-                        "id": "dest_peer_abc",
-                        "channel": "301x1x0",
-                        "direction": 0,
-                        "amount_msat": 500_000_000,
-                        "delay": 24,
-                    },
-                ]
-            },
-        ]
+                        "path": [
+                            {
+                                "short_channel_id_dir": "300x1x0/1",
+                                "next_node_id": "dest_peer_abc",
+                                "amount_msat": 500_000_000,
+                                "delay": 24,
+                            },
+                        ],
+                    }],
+                }
+            if method == "askrene-inform-channel":
+                return {}
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
+
+        # Retry (attempt 2) falls back to getroute + excludes
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {
+                    "id": "dest_peer_abc",
+                    "channel": "301x1x0",
+                    "direction": 0,
+                    "amount_msat": 500_000_000,
+                    "delay": 24,
+                },
+            ]
+        }
         plugin.rpc.waitsendpay.side_effect = [
             FakeRpcError(error={
                 "code": 204,
                 "message": "failed: WIRE_FEE_INSUFFICIENT",
                 "data": {
-                    "erring_index": 2,
-                    "erring_channel": "941153x2443x0",
+                    "erring_index": 1,
+                    "erring_channel": "300x1x0",
                     "erring_direction": 1,
-                    "erring_node": "03a93b87bf9f052b8e862d51ebbac4ce5e97b5f4137563cd5128548d7f5978dda9",
+                    "erring_node": "dest_peer_abc",
                     "failcode": 4108,
                     "failcodename": "WIRE_FEE_INSUFFICIENT",
                 },
@@ -691,8 +689,9 @@ class TestExecuteFailure:
         assert result.success is True
         assert result.route_type == "fleet"
         assert result.attempts == 2
-        assert plugin.rpc.getroute.call_count == 2
-        assert plugin.rpc.getroute.call_args_list[1].kwargs["exclude"] == ["941153x2443x0/1"]
+        # Attempt 1 used getroutes (fleet), attempt 2 used getroute (network fallback)
+        assert plugin.rpc.getroute.call_count == 1
+        assert plugin.rpc.getroute.call_args.kwargs["exclude"] == ["300x1x0/1"]
 
     def test_runtime_memory_excludes_banned_channel(self):
         plugin = MagicMock()
