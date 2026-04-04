@@ -203,18 +203,11 @@ class TestExecuteSuccess:
         plugin.rpc.getroute.return_value = {
             "route": [
                 {
-                    "id": "mid_node",
-                    "channel": "200x1x0",
+                    "id": "dest_peer_abc",
+                    "channel": "300x1x0",
                     "direction": 1,
                     "amount_msat": 500_000_000,
-                    "delay": 18,
-                },
-                {
-                    "id": "our_id",
-                    "channel": "300x1x0",
-                    "direction": 0,
-                    "amount_msat": 499_982_000,
-                    "delay": 6,
+                    "delay": 24,
                 },
             ]
         }
@@ -229,13 +222,23 @@ class TestExecuteSuccess:
                             "cltv_expiry_delta": 6,
                         },
                     },
+                },
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
                 }
             ]
         }
         plugin.rpc.listchannels.return_value = {
             "channels": [
                 {
-                    "short_channel_id": "200x1x0",
+                    "short_channel_id": "300x1x0",
                     "direction": 1,
                     "base_fee_millisatoshi": 1000,
                     "fee_per_millionth": 34,
@@ -253,47 +256,90 @@ class TestExecuteSuccess:
         result = executor.execute(candidate)
 
         assert result.success is True
+        plugin.rpc.getroute.assert_called_once_with(
+            "dest_peer_abc",
+            500_000_000,
+            24,
+            fromid="source_peer_abc",
+            maxhops=6,
+            fuzzpercent=0,
+        )
         sendpay_route = plugin.rpc.sendpay.call_args.kwargs["route"]
         assert sendpay_route[0]["channel"] == "100x1x0"
         assert sendpay_route[0]["amount_msat"] == 500_018_000
-        assert sendpay_route[0]["delay"] == 52
+        assert sendpay_route[0]["delay"] == 58
+        assert sendpay_route[-1]["channel"] == "200x1x0"
+        assert sendpay_route[-1]["amount_msat"] == 500_000_000
 
-    def test_fleet_route_uses_getroutes_execution_path(self):
+    def test_fleet_execution_does_not_use_getroutes_for_sendpay(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
         plugin.rpc.invoice.return_value = {
             "payment_hash": "hash123", "payment_secret": "secret123",
             "bolt11": "lnbc5u1..."
         }
-        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "100x1x0",
+                    "updates": {
+                        "local": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 10,
+                            "cltv_expiry_delta": 6,
+                        },
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                },
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 10,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                },
+            ]
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "300x1x0",
+                    "direction": 0,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                }
+            ]
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {
+                    "id": "dest_peer_abc",
+                    "channel": "300x1x0",
+                    "direction": 0,
+                    "amount_msat": 500_005_000,
+                    "delay": 24,
+                },
+            ]
+        }
         plugin.rpc.waitsendpay.return_value = {
-            "status": "complete", "amount_sent_msat": 500_000_000
+            "status": "complete", "amount_sent_msat": 500_011_000
         }
 
         def call_side_effect(method, params=None):
             if method == "askrene-listlayers":
                 return {"layers": [{"layer": "hive-fleet"}, {"layer": "revenue-local"}]}
             if method == "getroutes":
-                return {
-                    "routes": [{
-                        "amount_msat": 500_000_000,
-                        "path": [
-                            {
-                                "short_channel_id_dir": "100x1x0/1",
-                                "next_node_id": "fleet_mid",
-                                "amount_msat": 500_000_000,
-                                "delay": 24,
-                            },
-                            {
-                                "short_channel_id_dir": "300x1x0/0",
-                                "next_node_id": "dest_peer_abc",
-                                "amount_msat": 500_000_000,
-                                "delay": 18,
-                            },
-                        ],
-                    }],
-                    "probability_ppm": 999999,
-                }
+                raise AssertionError("direct getroutes execution path should not be used")
+            if method == "askrene-inform-channel":
+                return {}
             return {}
 
         plugin.rpc.call.side_effect = call_side_effect
@@ -304,18 +350,78 @@ class TestExecuteSuccess:
         result = executor.execute(candidate)
 
         assert result.success is True
-        plugin.rpc.getroute.assert_not_called()
-        plugin.rpc.call.assert_any_call("getroutes", {
-            "source": "our_id",
-            "destination": "dest_peer_abc",
+        plugin.rpc.getroute.assert_called_once_with(
+            "dest_peer_abc",
+            500_005_000,
+            24,
+            fromid="source_peer_abc",
+            maxhops=6,
+            fuzzpercent=0,
+        )
+        sendpay_route = plugin.rpc.sendpay.call_args.kwargs["route"]
+        assert sendpay_route[-1] == {
+            "channel": "200x1x0",
+            "id": "our_id",
             "amount_msat": 500_000_000,
-            "layers": ["auto.localchans", "hive-fleet", "revenue-local"],
-            "maxfee_msat": 100_000,
-            "final_cltv": 18,
-        })
+            "delay": 18,
+            "style": "tlv",
+        }
 
 
 class TestExecuteFailure:
+    def test_rejects_malformed_route_before_sendpay(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "100x1x0",
+                    "updates": {"local": {"cltv_expiry_delta": 6}},
+                },
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {"remote": {"cltv_expiry_delta": 6}},
+                },
+            ]
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "300x1x0",
+                    "direction": 0,
+                    "base_fee_millisatoshi": 0,
+                    "fee_per_millionth": 0,
+                    "delay": 18,
+                }
+            ]
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {
+                    "id": "dest_peer_abc",
+                    "channel": "300x1x0",
+                    "direction": 0,
+                    "amount_msat": 400_000_000,
+                    "delay": 24,
+                },
+            ]
+        }
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete",
+            "amount_sent_msat": 400_000_000,
+        }
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        result = executor.execute(MockCandidate(hive_route_hops=0))
+
+        assert result.success is False
+        assert result.error == "sendpay_error: increasing_route_amount"
+        plugin.rpc.sendpay.assert_not_called()
+
     def test_no_routes(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
@@ -367,49 +473,55 @@ class TestExecuteFailure:
         plugin.rpc.listchannels.return_value = {
             "channels": [
                 {
-                    "short_channel_id": "200x1x0",
+                    "short_channel_id": "300x1x0",
                     "direction": 1,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                },
+                {
+                    "short_channel_id": "301x1x0",
+                    "direction": 0,
                     "base_fee_millisatoshi": 1000,
                     "fee_per_millionth": 10,
                     "delay": 18,
                 }
             ]
         }
-        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
         plugin.rpc.getroute.side_effect = [
             {
                 "route": [
                     {
-                        "id": "mid_a",
-                        "channel": "200x1x0",
+                        "id": "dest_peer_abc",
+                        "channel": "300x1x0",
                         "direction": 1,
                         "amount_msat": 500_000_000,
                         "delay": 24,
-                    },
-                    {
-                        "id": "our_id",
-                        "channel": "300x1x0",
-                        "direction": 0,
-                        "amount_msat": 499_990_000,
-                        "delay": 6,
                     },
                 ]
             },
             {
                 "route": [
                     {
-                        "id": "mid_b",
-                        "channel": "201x1x0",
+                        "id": "dest_peer_abc",
+                        "channel": "301x1x0",
                         "direction": 0,
                         "amount_msat": 500_000_000,
                         "delay": 24,
-                    },
-                    {
-                        "id": "our_id",
-                        "channel": "300x1x0",
-                        "direction": 0,
-                        "amount_msat": 499_990_000,
-                        "delay": 6,
                     },
                 ]
             },

@@ -170,6 +170,73 @@ class RebalanceExecutor:
         })
         return route
 
+    def _get_return_hop_policy(
+        self,
+        candidate,
+        amount_msat: int,
+        our_id: str,
+    ) -> tuple[int, int]:
+        """Amount and CLTV the destination peer needs to forward back to us."""
+        scid = candidate.to_channel.replace(":", "x")
+        base_msat = 0
+        fee_ppm = 0
+        cltv_delta = 6
+
+        try:
+            chans = self.plugin.rpc.listpeerchannels(candidate.to_peer_id)
+            for ch in chans.get("channels", []):
+                if ch.get("short_channel_id") != scid:
+                    continue
+                remote = ch.get("updates", {}).get("remote", {})
+                fee_ppm_val = remote.get("fee_proportional_millionths")
+                if fee_ppm_val is not None:
+                    fee_ppm = int(fee_ppm_val or 0)
+                fee_base_val = remote.get("fee_base_msat")
+                if fee_base_val is not None:
+                    base_msat = int(fee_base_val or 0)
+                cltv_val = remote.get("cltv_expiry_delta")
+                if cltv_val is not None:
+                    cltv_delta = int(cltv_val or 6)
+                break
+        except Exception:
+            pass
+
+        if fee_ppm == 0 and base_msat == 0:
+            try:
+                chans = self.plugin.rpc.listchannels(source=candidate.to_peer_id)
+                for ch in chans.get("channels", []):
+                    if ch.get("destination") != our_id:
+                        continue
+                    if ch.get("short_channel_id") != scid:
+                        continue
+                    fee_ppm = int(ch.get("fee_per_millionth", 0) or 0)
+                    base_msat = int(ch.get("base_fee_millisatoshi", 0) or 0)
+                    cltv_delta = int(ch.get("delay", 6) or 6)
+                    break
+            except Exception:
+                pass
+
+        required_amount_msat = amount_msat + base_msat + (amount_msat * fee_ppm) // 1_000_000
+        required_cltv = 18 + cltv_delta
+        return required_amount_msat, required_cltv
+
+    def _validate_sendpay_route(self, route: List[Dict], final_amount_msat: int) -> None:
+        """Reject malformed routes before they can crash lightningd."""
+        if not route:
+            raise ValueError("empty_route")
+
+        previous_amount = None
+        for hop in route:
+            amount = int(hop.get("amount_msat", 0) or 0)
+            if amount <= 0:
+                raise ValueError("non_positive_route_amount")
+            if previous_amount is not None and amount > previous_amount:
+                raise ValueError("increasing_route_amount")
+            previous_amount = amount
+
+        if int(route[0].get("amount_msat", 0) or 0) < int(final_amount_msat):
+            raise ValueError("insufficient_first_hop_amount")
+
     # ------------------------------------------------------------------
     # Learning
     # ------------------------------------------------------------------
@@ -240,12 +307,18 @@ class RebalanceExecutor:
         candidate,
         our_id: str,
         excludes: List[str],
-    ) -> List[Dict]:
-        """Build a circular route using getroute for network rebalances."""
+    ) -> tuple[List[Dict], List[Dict]]:
+        """Build a safe explicit circular route using getroute."""
         source_scid = candidate.source_candidates[0] if candidate.source_candidates else ""
         source_peer = candidate.primary_source_peer_id
         if not source_scid or not source_peer:
             raise ValueError("no_source_channel")
+
+        required_amount_msat, required_cltv = self._get_return_hop_policy(
+            candidate,
+            job.amount_msat,
+            our_id,
+        )
 
         getroute_kwargs = {
             "fromid": source_peer,
@@ -256,9 +329,9 @@ class RebalanceExecutor:
             getroute_kwargs["exclude"] = excludes
 
         route_result = self.plugin.rpc.getroute(
-            our_id,
-            job.amount_msat,
-            1,
+            candidate.to_peer_id,
+            required_amount_msat,
+            required_cltv,
             **getroute_kwargs,
         )
         route = route_result.get("route", [])
@@ -322,14 +395,28 @@ class RebalanceExecutor:
         first_hop_delay = route[0].get("delay", 18) + source_cltv_delta
         first_hop_direction = 1 if our_id > source_peer else 0
 
-        return [{
+        first_hop = {
             "id": source_peer,
             "channel": first_hop_scid,
             "direction": first_hop_direction,
             "amount_msat": first_hop_amount,
             "delay": first_hop_delay,
             "style": "tlv",
-        }] + route
+        }
+        final_hop = {
+            "id": our_id,
+            "channel": candidate.to_channel.replace(":", "x"),
+            "amount_msat": job.amount_msat,
+            "delay": 18,
+            "style": "tlv",
+        }
+        full_route = [first_hop] + route + [final_hop]
+        final_direction = 1 if candidate.to_peer_id > our_id else 0
+        inform_path = self._path_for_inform([first_hop] + route)
+        inform_path.append({
+            "short_channel_id_dir": f"{candidate.to_channel.replace(':', 'x')}/{final_direction}",
+        })
+        return full_route, inform_path
 
     def _compute_fleet_route(
         self,
@@ -380,8 +467,9 @@ class RebalanceExecutor:
     def _execute_single(self, job: RebalanceJob, candidate) -> RebalanceResult:
         """Execute a rebalance job.
 
-        Uses sendpay with explicit routes. Network rebalances use getroute and
-        explicit excludes on retry. Fleet rebalances use layer-aware getroutes.
+        Uses sendpay with explicit routes. Both network and fleet-planned
+        rebalances currently execute through getroute-based explicit routes.
+        Retry behavior uses explicit excludes on subsequent attempts.
         """
         our_id = self._get_our_id()
         if not our_id:
@@ -420,11 +508,10 @@ class RebalanceExecutor:
             full_route: List[Dict] = []
             inform_path: List[Dict] = []
             try:
-                if route_type == "fleet":
-                    full_route, inform_path = self._compute_fleet_route(job, candidate, our_id)
-                else:
-                    full_route = self._compute_network_route(job, candidate, our_id, excludes)
-                    inform_path = self._path_for_inform(full_route)
+                full_route, inform_path = self._compute_network_route(
+                    job, candidate, our_id, excludes
+                )
+                self._validate_sendpay_route(full_route, job.amount_msat)
 
                 total_fee = max(0, full_route[0].get("amount_msat", job.amount_msat) - job.amount_msat)
                 fee_ppm = (total_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
