@@ -3641,13 +3641,17 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         Returns:
             Estimated inbound fee in PPM
         """
-        # Priority 0: Hive fleet members have direct channels with 0 fee
+        # Priority 0: Hive fleet members — forward hops are free but the
+        # return hop (dest_peer → us) still costs dest_peer's published fee.
+        # Use the last-hop fee as the floor: fleet route cost ≈ return hop fee.
         if self.hive_hints and peer_id and self.hive_hints.is_hive_member(peer_id):
+            return_hop_fee = self._get_last_hop_fee(peer_id, amount_msat) or 0
             self.plugin.log(
-                f"INBOUND FEE EST [{peer_id[:12]}...]: Hive fleet member, 0 PPM",
+                f"INBOUND FEE EST [{peer_id[:12]}...]: Hive fleet member, "
+                f"return hop fee {return_hop_fee} PPM",
                 level='debug'
             )
-            return 0
+            return return_hop_fee
 
         # =====================================================================
         # Historical-First Fee Estimation
