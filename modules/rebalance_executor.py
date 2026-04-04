@@ -267,22 +267,35 @@ class RebalanceExecutor:
                     last_error = "no_route_back"
                     self._log(f"Job {job.job_id}: no route from {source_peer[:12]}... back to us")
             else:
-                # Prepend our SOURCE channel as first hop
+                # Prepend our SOURCE channel as first hop.
+                # getroute(fromid=source_peer) treats source_peer as origin,
+                # so route[0].amount_msat is what source_peer FORWARDS.
+                # We need to SEND source_peer enough to cover:
+                #   route[0].amount_msat + source_peer's forwarding fee
                 first_hop_scid = source_scid.replace(":", "x")
-                first_hop_amount = route[0].get("amount_msat", job.amount_msat)
+                forward_amount = route[0].get("amount_msat", job.amount_msat)
 
-                # Get our channel's actual cltv_expiry_delta from gossip
-                our_cltv_delta = 6  # Conservative default
+                # Get source peer's fee + our cltv delta from channel gossip
+                source_fee_ppm = 0
+                source_base_msat = 0
+                our_cltv_delta = 6
                 try:
                     chans = self.plugin.rpc.listpeerchannels(source_peer)
                     for ch in chans.get("channels", []):
                         if ch.get("short_channel_id") == first_hop_scid:
                             updates = ch.get("updates", {})
                             local = updates.get("local", {})
+                            remote = updates.get("remote", {})
                             our_cltv_delta = int(local.get("cltv_expiry_delta", 6) or 6)
+                            # Source peer's forwarding fee (what they charge to forward)
+                            source_fee_ppm = int(remote.get("fee_proportional_millionths", 0) or 0)
+                            source_base_msat = int(remote.get("fee_base_msat", 0) or 0)
                             break
                 except Exception:
                     pass
+                # First hop amount = what source_peer forwards + their fee
+                source_fee_msat = source_base_msat + (forward_amount * source_fee_ppm) // 1_000_000
+                first_hop_amount = forward_amount + source_fee_msat
                 first_hop_delay = route[0].get("delay", 18) + our_cltv_delta
 
                 full_route = [{
