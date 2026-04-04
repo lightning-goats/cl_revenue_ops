@@ -259,7 +259,11 @@ class RebalanceExecutor:
                 first_hop_scid = candidate.to_channel.replace(":", "x")
                 forward_amount = route[0].get("amount_msat", job.amount_msat)
 
-                # Get dest peer's fee for this channel from gossip
+                # Get BOTH our outgoing fee AND dest peer's forwarding fee.
+                # Our node rejects the HTLC if the first hop amount doesn't
+                # cover our own channel fee (WIRE_FEE_INSUFFICIENT from 0th node).
+                our_fee_ppm = 0
+                our_base_msat = 0
                 dest_fee_ppm = 0
                 dest_base_msat = 0
                 try:
@@ -267,16 +271,20 @@ class RebalanceExecutor:
                     for ch in chans.get("channels", []):
                         if ch.get("short_channel_id") == first_hop_scid:
                             updates = ch.get("updates", {})
+                            local = updates.get("local", {})
                             remote = updates.get("remote", {})
+                            our_fee_ppm = int(local.get("fee_proportional_millionths", 0) or 0)
+                            our_base_msat = int(local.get("fee_base_msat", 0) or 0)
                             dest_fee_ppm = int(remote.get("fee_proportional_millionths", 0) or 0)
                             dest_base_msat = int(remote.get("fee_base_msat", 0) or 0)
                             break
                 except Exception:
                     pass
 
-                # Amount we send = what they forward + their fee
+                # Amount we send = what they forward + their fee + our outgoing fee
                 dest_fee_msat = dest_base_msat + (forward_amount * dest_fee_ppm) // 1_000_000
-                first_hop_amount = forward_amount + dest_fee_msat
+                our_fee_msat = our_base_msat + (forward_amount * our_fee_ppm) // 1_000_000
+                first_hop_amount = forward_amount + dest_fee_msat + our_fee_msat
                 first_hop_delay = route[0].get("delay", 18) + 6
 
                 full_route = [{
@@ -305,8 +313,8 @@ class RebalanceExecutor:
 
                 job.state = JobState.WAITING
                 pay_result = self.plugin.rpc.waitsendpay(
-                    payment_hash=job.payment_hash,
-                    timeout=self.SENDPAY_TIMEOUT,
+                    job.payment_hash,
+                    self.SENDPAY_TIMEOUT,
                 )
 
                 status = pay_result.get("status", "")
