@@ -186,7 +186,7 @@ class TestExecuteSuccess:
         assert result.attempts == 1
         assert result.route_type == "network"
 
-    def test_first_hop_uses_local_source_channel_fee_policy(self):
+    def test_first_hop_uses_first_return_hop_policy(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
         plugin.rpc.invoice.return_value = {
@@ -196,11 +196,19 @@ class TestExecuteSuccess:
         plugin.rpc.getroute.return_value = {
             "route": [
                 {
-                    "id": "our_id",
+                    "id": "mid_node",
                     "channel": "200x1x0",
+                    "direction": 1,
                     "amount_msat": 500_000_000,
                     "delay": 18,
-                }
+                },
+                {
+                    "id": "our_id",
+                    "channel": "300x1x0",
+                    "direction": 0,
+                    "amount_msat": 499_982_000,
+                    "delay": 6,
+                },
             ]
         }
         plugin.rpc.listpeerchannels.return_value = {
@@ -210,19 +218,26 @@ class TestExecuteSuccess:
                     "updates": {
                         "local": {
                             "fee_base_msat": 0,
-                            "fee_proportional_millionths": 34,
-                            "cltv_expiry_delta": 18,
-                        },
-                        "remote": {
-                            "fee_base_msat": 0,
-                            "fee_proportional_millionths": 0,
+                            "fee_proportional_millionths": 1,
+                            "cltv_expiry_delta": 6,
                         },
                     },
                 }
             ]
         }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "direction": 1,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 34,
+                    "delay": 34,
+                }
+            ]
+        }
         plugin.rpc.waitsendpay.return_value = {
-            "status": "complete", "amount_sent_msat": 500_017_000
+            "status": "complete", "amount_sent_msat": 500_018_000
         }
 
         executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
@@ -233,7 +248,8 @@ class TestExecuteSuccess:
         assert result.success is True
         sendpay_route = plugin.rpc.sendpay.call_args.kwargs["route"]
         assert sendpay_route[0]["channel"] == "100x1x0"
-        assert sendpay_route[0]["amount_msat"] == 500_017_000
+        assert sendpay_route[0]["amount_msat"] == 500_018_000
+        assert sendpay_route[0]["delay"] == 52
 
 
 class TestExecuteFailure:

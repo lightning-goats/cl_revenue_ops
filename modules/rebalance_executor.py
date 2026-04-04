@@ -275,36 +275,62 @@ class RebalanceExecutor:
                 first_hop_scid = source_scid.replace(":", "x")
                 forward_amount = route[0].get("amount_msat", job.amount_msat)
 
-                # Price the prepended first hop from our local source-channel
-                # policy. sendpay validates the first directed edge against
-                # that fee schedule, so using the remote policy underpays the
-                # route and triggers WIRE_FEE_INSUFFICIENT at hop 0.
+                # Price the prepended hop from the source peer's FIRST outgoing
+                # hop in the returned route. route[0].amount_msat/delay are
+                # what that next node expects; to pay the source peer itself we
+                # must add the policy for route[0].channel/direction.
                 source_fee_ppm = 0
                 source_base_msat = 0
-                our_cltv_delta = 6
+                source_cltv_delta = 6
                 try:
-                    chans = self.plugin.rpc.listpeerchannels(source_peer)
+                    forward_hop = route[0]
+                    forward_scid = forward_hop.get("channel", "")
+                    forward_dir = forward_hop.get("direction")
+                    chans = self.plugin.rpc.listchannels(forward_scid)
                     for ch in chans.get("channels", []):
-                        if ch.get("short_channel_id") == first_hop_scid:
-                            updates = ch.get("updates", {})
-                            local = updates.get("local", {})
-                            our_cltv_delta = int(local.get("cltv_expiry_delta", 6) or 6)
-                            fee_ppm_val = local.get("fee_proportional_millionths")
-                            if fee_ppm_val is None:
-                                fee_ppm_val = ch.get("fee_proportional_millionths", 0)
-                            fee_base_val = local.get("fee_base_msat")
-                            if fee_base_val is None:
-                                fee_base_val = ch.get("fee_base_msat", 0)
-                            source_fee_ppm = int(fee_ppm_val or 0)
-                            source_base_msat = int(fee_base_val or 0)
-                            break
+                        if ch.get("short_channel_id") != forward_scid:
+                            continue
+                        if forward_dir is not None and ch.get("direction") != forward_dir:
+                            continue
+                        fee_ppm_val = ch.get("fee_per_millionth")
+                        if fee_ppm_val is None:
+                            fee_ppm_val = ch.get("fee_proportional_millionths", 0)
+                        fee_base_val = ch.get("base_fee_millisatoshi")
+                        if fee_base_val is None:
+                            fee_base_val = ch.get("fee_base_msat", 0)
+                        delay_val = ch.get("delay")
+                        if delay_val is None:
+                            delay_val = ch.get("cltv_expiry_delta", 6)
+                        source_cltv_delta = int(delay_val or 6)
+                        source_fee_ppm = int(fee_ppm_val or 0)
+                        source_base_msat = int(fee_base_val or 0)
+                        break
                 except Exception:
                     pass
+                if source_fee_ppm == 0 and source_base_msat == 0:
+                    try:
+                        chans = self.plugin.rpc.listpeerchannels(source_peer)
+                        for ch in chans.get("channels", []):
+                            if ch.get("short_channel_id") == first_hop_scid:
+                                updates = ch.get("updates", {})
+                                local = updates.get("local", {})
+                                source_cltv_delta = int(local.get("cltv_expiry_delta", 6) or 6)
+                                fee_ppm_val = local.get("fee_proportional_millionths")
+                                if fee_ppm_val is None:
+                                    fee_ppm_val = ch.get("fee_proportional_millionths", 0)
+                                fee_base_val = local.get("fee_base_msat")
+                                if fee_base_val is None:
+                                    fee_base_val = ch.get("fee_base_msat", 0)
+                                source_fee_ppm = int(fee_ppm_val or 0)
+                                source_base_msat = int(fee_base_val or 0)
+                                break
+                    except Exception:
+                        pass
                 # First hop amount = what the next hop must receive plus our
-                # fee for forwarding over the source channel.
+                # source peer's forwarding fee on its first outgoing hop.
                 source_fee_msat = source_base_msat + (forward_amount * source_fee_ppm) // 1_000_000
                 first_hop_amount = forward_amount + source_fee_msat
-                first_hop_delay = route[0].get("delay", 18) + our_cltv_delta
+                first_hop_delay = route[0].get("delay", 18) + source_cltv_delta
 
                 full_route = [{
                     "id": source_peer,
