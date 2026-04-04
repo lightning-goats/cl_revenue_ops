@@ -565,13 +565,30 @@ class RebalanceExecutor:
         candidate,
         our_id: str,
     ) -> tuple[List[Dict], List[Dict]]:
-        """Build a circular route using getroutes for fleet rebalances."""
+        """Build a circular route using getroutes for fleet rebalances.
+
+        SAFETY: askrene has known crash vectors (see hexmem lessons 502/504).
+        - Never include auto.sourcefree (WIRE_FEE_INSUFFICIENT → crash)
+        - Validate all params before calling getroutes (0 amounts → crash)
+        - Try/except with auto-only fallback (unknown layer TOCTOU → crash)
+        """
         required_amount_msat, required_cltv = self._get_return_hop_policy(
             candidate, job.amount_msat, our_id,
         )
+
+        # Pre-validate: askrene can crash on degenerate inputs
+        if required_amount_msat <= 0 or job.max_fee_msat <= 0:
+            raise ValueError("fleet_invalid_amount")
+        if our_id == candidate.to_peer_id:
+            raise ValueError("fleet_self_route")
+
         layers = self._get_layers(job.route_type)
         if "auto.no_mpp_support" not in layers:
             layers.append("auto.no_mpp_support")
+
+        # SAFETY: never auto.sourcefree in circular routes (lesson 502)
+        layers = [l for l in layers if l != "auto.sourcefree"]
+
         params = {
             "source": our_id,
             "destination": candidate.to_peer_id,
@@ -581,6 +598,8 @@ class RebalanceExecutor:
             "final_cltv": required_cltv,
             "maxparts": 1,
         }
+        # SAFETY: TOCTOU race on layer names can crash askrene (lesson 504).
+        # Catch and retry with auto-only layers.
         try:
             result = self.plugin.rpc.call("getroutes", params)
         except Exception:
