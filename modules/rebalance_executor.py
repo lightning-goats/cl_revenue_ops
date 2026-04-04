@@ -270,7 +270,20 @@ class RebalanceExecutor:
                 # Prepend our SOURCE channel as first hop
                 first_hop_scid = source_scid.replace(":", "x")
                 first_hop_amount = route[0].get("amount_msat", job.amount_msat)
-                first_hop_delay = route[0].get("delay", 18) + 6
+
+                # Get our channel's actual cltv_expiry_delta from gossip
+                our_cltv_delta = 6  # Conservative default
+                try:
+                    chans = self.plugin.rpc.listpeerchannels(source_peer)
+                    for ch in chans.get("channels", []):
+                        if ch.get("short_channel_id") == first_hop_scid:
+                            updates = ch.get("updates", {})
+                            local = updates.get("local", {})
+                            our_cltv_delta = int(local.get("cltv_expiry_delta", 6) or 6)
+                            break
+                except Exception:
+                    pass
+                first_hop_delay = route[0].get("delay", 18) + our_cltv_delta
 
                 full_route = [{
                     "id": source_peer,
