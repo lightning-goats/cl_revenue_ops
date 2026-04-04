@@ -55,19 +55,18 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.3.0: Native Rebalance Executor + Fleet Routing Hardening
+#   - Native getroute+sendpay executor replaces sling for all rebalances
+#   - Fleet routing via getroutes with askrene layers (hive-fleet, revenue-*)
+#   - Askrene crash vector hardening (auto.sourcefree, TOCTOU layer race)
+#   - Return hop fee accounting in fleet EV (no more askrene-fiction budgets)
+#   - Rebalance routing memory (transient bans + constraints across retries)
+#   - Fleet-first with network fallback retry strategy
+#   - Thread-safe RebalanceRoutingMemory for concurrent executor workers
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
-#   - Replaces EMA with Kalman filter for optimal state estimation
-#   - Faster regime change detection via innovation monitoring
-#   - Adaptive process noise based on flow volatility
-#   - Confidence-weighted measurement noise
-#   - Velocity tracking built into state vector
-#   - Persistent filter state across restarts
 # v2.0.0: DTS+PID Fee Controller
-#   - DTS (Dynamic Thompson Sampling) for Bayesian fee exploration
-#   - PID control loop for smooth convergence
-#   - Contextual posteriors (balance, time, corridor role)
-PLUGIN_VERSION = "2.2.4"
+PLUGIN_VERSION = "2.3.0"
 
 
 # =============================================================================
