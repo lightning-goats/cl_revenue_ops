@@ -1105,15 +1105,6 @@ class JobManager:
         # H-4: Ensure reservation_id is str to match DB column type
         self.database.mark_budget_spent(str(job.rebalance_id), fee_sats)
 
-        # Release askrene reservation before stopping
-        if self.hive_router:
-            job_ref = self._active_jobs.get(job.scid_normalized)
-            if job_ref and hasattr(job_ref, 'candidate') and job_ref.candidate:
-                self.hive_router.unreserve_for_job(
-                    job_ref.scid, job_ref.candidate.amount_msat,
-                    direction=getattr(job_ref.candidate, 'direction', 'pull'),
-                )
-
         # Stop the job
         self.stop_job(job.scid_normalized, reason="success")
 
@@ -1162,15 +1153,6 @@ class JobManager:
             self.database.mark_budget_spent(str(job.rebalance_id), partial_fee_sats)
         else:
             self.database.release_budget_reservation(str(job.rebalance_id))
-
-        # Release askrene reservation before stopping
-        if self.hive_router:
-            job_ref = self._active_jobs.get(job.scid_normalized)
-            if job_ref and hasattr(job_ref, 'candidate') and job_ref.candidate:
-                self.hive_router.unreserve_for_job(
-                    job_ref.scid, job_ref.candidate.amount_msat,
-                    direction=getattr(job_ref.candidate, 'direction', 'pull'),
-                )
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="failure")
@@ -1223,15 +1205,6 @@ class JobManager:
         # L-17: Budget was actually spent (overspent), mark as spent not released
         # H-4: Ensure reservation_id is str to match DB column type
         self.database.mark_budget_spent(str(job.rebalance_id), actual_cost_sats)
-
-        # Release askrene reservation before stopping
-        if self.hive_router:
-            job_ref = self._active_jobs.get(job.scid_normalized)
-            if job_ref and hasattr(job_ref, 'candidate') and job_ref.candidate:
-                self.hive_router.unreserve_for_job(
-                    job_ref.scid, job_ref.candidate.amount_msat,
-                    direction=getattr(job_ref.candidate, 'direction', 'pull'),
-                )
 
         # Stop the job
         self.stop_job(job.scid_normalized, reason="exceeded_budget")
@@ -1303,15 +1276,6 @@ class JobManager:
         else:
             self.database.release_budget_reservation(str(job.rebalance_id))
 
-        # Release askrene reservation before stopping
-        if self.hive_router:
-            job_ref = self._active_jobs.get(job.scid_normalized)
-            if job_ref and hasattr(job_ref, 'candidate') and job_ref.candidate:
-                self.hive_router.unreserve_for_job(
-                    job_ref.scid, job_ref.candidate.amount_msat,
-                    direction=getattr(job_ref.candidate, 'direction', 'pull'),
-                )
-
         # Stop the job
         self.stop_job(job.scid_normalized, reason="timeout")
     
@@ -1321,15 +1285,6 @@ class JobManager:
         with self._jobs_lock:
             jobs_snapshot = [(k, v) for k, v in self._active_jobs.items() if isinstance(v, ActiveJob)]
         for scid, job in jobs_snapshot:
-            # Release askrene reservation before stopping
-            if self.hive_router and hasattr(job, 'candidate') and job.candidate:
-                try:
-                    self.hive_router.unreserve_for_job(
-                        job.scid, job.candidate.amount_msat,
-                        direction=getattr(job.candidate, 'direction', 'pull'),
-                    )
-                except Exception:
-                    pass
             # I-10 FIX: Stop the job FIRST, then release budget. Releasing before
             # stop means if sling-stop fails, the budget is freed but the job
             # continues spending. By stopping first, we at least attempt to halt

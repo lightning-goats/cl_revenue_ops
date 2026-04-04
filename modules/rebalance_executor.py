@@ -244,23 +244,72 @@ class RebalanceExecutor:
     # Learning
     # ------------------------------------------------------------------
 
+    def _inform_channel(self, scid_dir: str, amount_msat: int, inform: str) -> None:
+        """Send a single valid askrene channel update."""
+        if not scid_dir or amount_msat <= 0:
+            return
+        if inform not in {"constrained", "unconstrained", "succeeded"}:
+            raise ValueError(f"invalid askrene inform value: {inform}")
+        try:
+            self.plugin.rpc.call("askrene-inform-channel", {
+                "layer": "revenue-local",
+                "short_channel_id_dir": scid_dir,
+                "amount_msat": amount_msat,
+                "inform": inform,
+            })
+        except Exception:
+            pass
+
     def _inform_result(self, path: List[Dict], amount_msat: int,
                        succeeded: bool) -> None:
-        """Teach askrene about route success/failure."""
-        inform = "succeeded" if succeeded else "failed"
+        """Teach askrene about a successful route using per-hop amounts."""
+        if not succeeded:
+            raise ValueError("use _inform_failure() for failed routes")
         for hop in path:
             scid_dir = hop.get("short_channel_id_dir", "")
-            if not scid_dir:
-                continue
-            try:
-                self.plugin.rpc.call("askrene-inform-channel", {
-                    "layer": "revenue-local",
-                    "short_channel_id_dir": scid_dir,
-                    "amount_msat": amount_msat,
-                    "inform": inform,
-                })
-            except Exception:
-                pass
+            hop_amount = int(hop.get("amount_msat", amount_msat) or amount_msat)
+            self._inform_channel(scid_dir, hop_amount, "succeeded")
+
+    def _inform_failure(self, path: List[Dict], failure: Dict[str, Any]) -> None:
+        """Teach askrene about a routed failure using valid semantics.
+
+        Prefix hops that definitely forwarded are marked unconstrained.
+        The failing hop is marked constrained. Downstream hops are unknown.
+        """
+        if not path or failure.get("code") != 204:
+            return
+
+        erring_channel = failure.get("erring_channel")
+        erring_direction = failure.get("erring_direction")
+        fail_scid_dir = None
+        if erring_channel and erring_direction is not None:
+            fail_scid_dir = f"{erring_channel}/{erring_direction}"
+
+        fail_index = None
+        if fail_scid_dir:
+            for idx, hop in enumerate(path):
+                if hop.get("short_channel_id_dir") == fail_scid_dir:
+                    fail_index = idx
+                    break
+
+        if fail_index is None:
+            erring_index = int(failure.get("erring_index") or 0)
+            if erring_index <= 0 or erring_index > len(path):
+                return
+            fail_index = erring_index - 1
+            fail_scid_dir = path[fail_index].get("short_channel_id_dir", "")
+
+        if not fail_scid_dir:
+            return
+
+        for hop in path[:fail_index]:
+            scid_dir = hop.get("short_channel_id_dir", "")
+            hop_amount = int(hop.get("amount_msat", 0) or 0)
+            self._inform_channel(scid_dir, hop_amount, "unconstrained")
+
+        failed_hop = path[fail_index]
+        failed_amount = int(failed_hop.get("amount_msat", 0) or 0)
+        self._inform_channel(fail_scid_dir, failed_amount, "constrained")
 
     def _path_for_inform(self, hops: List[Dict]) -> List[Dict]:
         """Normalize hop data to askrene-inform-channel format."""
@@ -273,7 +322,10 @@ class RebalanceExecutor:
                 if channel and direction is not None:
                     scid_dir = f"{channel}/{direction}"
             if scid_dir:
-                path.append({"short_channel_id_dir": scid_dir})
+                path.append({
+                    "short_channel_id_dir": scid_dir,
+                    "amount_msat": int(hop.get("amount_msat", 0) or 0),
+                })
         return path
 
     def _cleanup_failed_payment(self, payment_hash: str) -> None:
@@ -335,7 +387,8 @@ class RebalanceExecutor:
         route_result = self.plugin.rpc.getroute(
             candidate.to_peer_id,
             required_amount_msat,
-            required_cltv,
+            riskfactor=0,
+            cltv=required_cltv,
             **getroute_kwargs,
         )
         route = route_result.get("route", [])
@@ -419,6 +472,7 @@ class RebalanceExecutor:
         inform_path = self._path_for_inform([first_hop] + route)
         inform_path.append({
             "short_channel_id_dir": f"{candidate.to_channel.replace(':', 'x')}/{final_direction}",
+            "amount_msat": job.amount_msat,
         })
         return full_route, inform_path
 
@@ -509,6 +563,8 @@ class RebalanceExecutor:
     ) -> tuple[List[Dict], List[Dict]]:
         """Build a circular route using getroutes for fleet rebalances."""
         layers = self._get_layers(job.route_type)
+        if "auto.no_mpp_support" not in layers:
+            layers.append("auto.no_mpp_support")
         params = {
             "source": our_id,
             "destination": candidate.to_peer_id,
@@ -516,11 +572,12 @@ class RebalanceExecutor:
             "layers": layers,
             "maxfee_msat": job.max_fee_msat,
             "final_cltv": 18,
+            "maxparts": 1,
         }
         try:
             result = self.plugin.rpc.call("getroutes", params)
         except Exception:
-            params["layers"] = ["auto.localchans"]
+            params["layers"] = ["auto.localchans", "auto.no_mpp_support"]
             result = self.plugin.rpc.call("getroutes", params)
 
         routes = result.get("routes", [])
@@ -540,6 +597,7 @@ class RebalanceExecutor:
         final_direction = 1 if candidate.to_peer_id > our_id else 0
         inform_path.append({
             "short_channel_id_dir": f"{candidate.to_channel.replace(':', 'x')}/{final_direction}",
+            "amount_msat": job.amount_msat,
         })
         return full_route, inform_path
 
@@ -590,6 +648,7 @@ class RebalanceExecutor:
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             full_route: List[Dict] = []
             inform_path: List[Dict] = []
+            attempt_reserved = False
             try:
                 full_route, inform_path = self._compute_network_route(
                     job, candidate, our_id, excludes
@@ -603,6 +662,12 @@ class RebalanceExecutor:
                         continue
                     raise ValueError("constrained_route")
                 self._validate_sendpay_route(full_route, job.amount_msat)
+
+                if self.hive_router and inform_path:
+                    try:
+                        attempt_reserved = bool(self.hive_router.reserve_path(inform_path))
+                    except Exception:
+                        attempt_reserved = False
 
                 total_fee = max(0, full_route[0].get("amount_msat", job.amount_msat) - job.amount_msat)
                 fee_ppm = (total_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
@@ -630,6 +695,11 @@ class RebalanceExecutor:
                 if status != "complete":
                     raise RuntimeError(f"waitsendpay_status={status}")
 
+                if attempt_reserved and self.hive_router:
+                    try:
+                        self.hive_router.unreserve_path(inform_path)
+                    except Exception:
+                        pass
                 self._inform_result(inform_path, job.amount_msat, succeeded=True)
 
                 actual_sent = pay_result.get("amount_sent_msat", full_route[0].get("amount_msat", job.amount_msat))
@@ -658,9 +728,14 @@ class RebalanceExecutor:
             except Exception as e:
                 failure = self._parse_failure(e)
                 last_error = f"sendpay_error: {e}"
+                if attempt_reserved and self.hive_router:
+                    try:
+                        self.hive_router.unreserve_path(inform_path)
+                    except Exception:
+                        pass
                 self._learn_from_failure(full_route, failure, e)
                 if inform_path:
-                    self._inform_result(inform_path, job.amount_msat, succeeded=False)
+                    self._inform_failure(inform_path, failure)
                 self._cleanup_failed_payment(job.payment_hash)
                 job.attempts.append({
                     "attempt": attempt,
@@ -764,28 +839,9 @@ class RebalanceExecutor:
                 return RebalanceResult(success=False, error="job_already_active")
             self._jobs[normalized] = job
 
-        if self.hive_router:
-            try:
-                self.hive_router.reserve_for_job(
-                    candidate.to_channel,
-                    amount_msat,
-                    direction=getattr(candidate, "direction", "pull"),
-                )
-            except Exception:
-                pass
-
         try:
             result = self._execute_single(job, candidate)
         finally:
-            if self.hive_router:
-                try:
-                    self.hive_router.unreserve_for_job(
-                        candidate.to_channel,
-                        amount_msat,
-                        direction=getattr(candidate, "direction", "pull"),
-                    )
-                except Exception:
-                    pass
             with self._lock:
                 self._jobs.pop(normalized, None)
 
@@ -810,16 +866,6 @@ class RebalanceExecutor:
                 return ""
             self._jobs[normalized] = job
 
-        if self.hive_router:
-            try:
-                self.hive_router.reserve_for_job(
-                    candidate.to_channel,
-                    candidate.amount_msat,
-                    direction=getattr(candidate, "direction", "pull"),
-                )
-            except Exception:
-                pass
-
         def _run():
             try:
                 result = self._execute_single(job, candidate)
@@ -827,15 +873,6 @@ class RebalanceExecutor:
                     callback(result)
                 return result
             finally:
-                if self.hive_router:
-                    try:
-                        self.hive_router.unreserve_for_job(
-                            candidate.to_channel,
-                            candidate.amount_msat,
-                            direction=getattr(candidate, "direction", "pull"),
-                        )
-                    except Exception:
-                        pass
                 with self._lock:
                     self._jobs.pop(normalized, None)
                     self._futures.pop(normalized, None)

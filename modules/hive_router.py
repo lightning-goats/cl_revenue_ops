@@ -76,6 +76,25 @@ class HiveRouter:
         if self.plugin:
             self.plugin.log(f"[HiveRouter] {msg}", level=level)
 
+    def _existing_layers(self) -> Set[str]:
+        """Return currently available askrene layer names."""
+        if not self.plugin:
+            return set()
+        try:
+            result = self.plugin.rpc.call("askrene-listlayers", {})
+        except Exception:
+            return set()
+        return {layer.get("layer") for layer in result.get("layers", []) if layer.get("layer")}
+
+    def _recreate_layer(self, layer: str) -> None:
+        """Create or recreate an askrene layer without noisy missing-layer RPCs."""
+        if not self.plugin:
+            return
+        existing = self._existing_layers()
+        if layer in existing:
+            self.plugin.rpc.call("askrene-remove-layer", {"layer": layer})
+        self.plugin.rpc.call("askrene-create-layer", {"layer": layer})
+
     # ------------------------------------------------------------------
     # Layer Management
     # ------------------------------------------------------------------
@@ -136,13 +155,7 @@ class HiveRouter:
             True if layer was created successfully.
         """
         try:
-            # Remove stale layer
-            try:
-                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.LAYER_NAME})
-            except Exception:
-                pass
-
-            self.plugin.rpc.call("askrene-create-layer", {"layer": self.LAYER_NAME})
+            self._recreate_layer(self.LAYER_NAME)
 
             our_id = self._get_our_id()
             if not our_id:
@@ -250,7 +263,7 @@ class HiveRouter:
             # fee ESTIMATION (EV analysis, inbound cost), not sendpay execution.
             # The executor's _get_layers() correctly excludes auto.sourcefree
             # for the actual sendpay route construction.
-            layers = ["auto.localchans", "auto.sourcefree"]
+            layers = ["auto.localchans", "auto.sourcefree", "auto.no_mpp_support"]
             try:
                 existing = self.plugin.rpc.call("askrene-listlayers", {})
                 existing_names = {l.get("layer") for l in existing.get("layers", [])}
@@ -272,12 +285,13 @@ class HiveRouter:
                 "layers": layers,
                 "maxfee_msat": max_fee_msat,
                 "final_cltv": 18,
+                "maxparts": 1,
             }
             try:
                 result = self.plugin.rpc.call("getroutes", getroutes_params)
             except Exception:
                 # Layer may have been removed — retry with only auto layers
-                getroutes_params["layers"] = ["auto.localchans", "auto.sourcefree"]
+                getroutes_params["layers"] = ["auto.localchans", "auto.sourcefree", "auto.no_mpp_support"]
                 result = self.plugin.rpc.call("getroutes", getroutes_params)
 
             routes = result.get("routes", [])
@@ -518,6 +532,20 @@ class HiveRouter:
     # revenue-local layer (profitability biases + job reservations)
     # ------------------------------------------------------------------
 
+    def _normalize_path(self, path: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Trim a route/inform path to askrene reserve-compatible fields."""
+        normalized: List[Dict[str, Any]] = []
+        for hop in path or []:
+            scid_dir = str(hop.get("short_channel_id_dir") or "").strip()
+            amount_msat = int(hop.get("amount_msat", 0) or 0)
+            if not scid_dir or amount_msat <= 0:
+                continue
+            normalized.append({
+                "short_channel_id_dir": scid_dir,
+                "amount_msat": amount_msat,
+            })
+        return normalized
+
     PROFITABILITY_BIAS = {
         "profitable": 3,
         "break_even": 0,
@@ -536,12 +564,7 @@ class HiveRouter:
             return False
 
         try:
-            try:
-                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.LOCAL_LAYER})
-            except Exception:
-                pass
-
-            self.plugin.rpc.call("askrene-create-layer", {"layer": self.LOCAL_LAYER})
+            self._recreate_layer(self.LOCAL_LAYER)
 
             channels = self._listpeerchannels()
             biased = 0
@@ -585,34 +608,62 @@ class HiveRouter:
             self._log(f"Local layer refresh failed: {e}")
             return False
 
-    def reserve_for_job(self, scid: str, amount_msat: int, direction: str = "pull") -> bool:
-        """Reserve capacity on a channel for an in-flight rebalance job.
+    def _coerce_graph_direction(self, direction: Any) -> Optional[int]:
+        """Accept only explicit askrene graph directions.
 
-        Args:
-            scid: Channel SCID
-            amount_msat: Amount being rebalanced
-            direction: "pull" (liquidity into channel, dir=1) or "push" (out, dir=0)
+        Older callers used rebalance intent strings like "pull"/"push", but
+        those do not map reliably to askrene's short_channel_id_dir semantics.
         """
+        if direction in (0, 1):
+            return int(direction)
+        if isinstance(direction, str) and direction in {"0", "1"}:
+            return int(direction)
+        return None
+
+    def reserve_for_job(self, scid: str, amount_msat: int, direction: Any = None) -> bool:
+        """Reserve a single exact channel direction for compatibility callers."""
         if not self.plugin:
             return False
-        askrene_dir = 1 if direction == "pull" else 0
+        askrene_dir = self._coerce_graph_direction(direction)
+        if askrene_dir is None:
+            return False
+        return self.reserve_path([
+            {"short_channel_id_dir": f"{scid}/{askrene_dir}", "amount_msat": amount_msat}
+        ])
+
+    def unreserve_for_job(self, scid: str, amount_msat: int, direction: Any = None) -> bool:
+        """Release a single exact channel direction for compatibility callers."""
+        if not self.plugin:
+            return False
+        askrene_dir = self._coerce_graph_direction(direction)
+        if askrene_dir is None:
+            return False
+        return self.unreserve_path([
+            {"short_channel_id_dir": f"{scid}/{askrene_dir}", "amount_msat": amount_msat}
+        ])
+
+    def reserve_path(self, path: List[Dict[str, Any]]) -> bool:
+        """Reserve an exact attempted path using askrene semantics."""
+        if not self.plugin:
+            return False
+        normalized = self._normalize_path(path)
+        if not normalized:
+            return False
         try:
-            self.plugin.rpc.call("askrene-reserve", {
-                "path": [{"short_channel_id_dir": f"{scid}/{askrene_dir}", "amount_msat": amount_msat}]
-            })
+            self.plugin.rpc.call("askrene-reserve", {"path": normalized})
             return True
         except Exception:
             return False
 
-    def unreserve_for_job(self, scid: str, amount_msat: int, direction: str = "pull") -> bool:
-        """Release reserved capacity after a rebalance job completes."""
+    def unreserve_path(self, path: List[Dict[str, Any]]) -> bool:
+        """Release an exact attempted path after completion."""
         if not self.plugin:
             return False
-        askrene_dir = 1 if direction == "pull" else 0
+        normalized = self._normalize_path(path)
+        if not normalized:
+            return False
         try:
-            self.plugin.rpc.call("askrene-unreserve", {
-                "path": [{"short_channel_id_dir": f"{scid}/{askrene_dir}", "amount_msat": amount_msat}]
-            })
+            self.plugin.rpc.call("askrene-unreserve", {"path": normalized})
             return True
         except Exception:
             return False

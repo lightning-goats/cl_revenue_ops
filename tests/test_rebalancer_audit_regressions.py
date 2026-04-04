@@ -1013,6 +1013,32 @@ class TestB4StopAllJobsBudget:
             f"its budget released. But release_budget_reservation was called with: {released_ids}"
         )
 
+    def test_stop_all_jobs_does_not_issue_legacy_unreserve(self, mock_plugin, mock_database):
+        """Shutdown should not send stale one-hop askrene unreserve calls.
+
+        The native executor now reserves exact attempted paths per attempt.
+        The old rebalancer-wide unreserve_for_job cleanup is semantically wrong
+        and may target the wrong channel direction.
+        """
+        from modules.config import Config
+        from modules.rebalancer import JobManager, JobStatus
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+        jm.hive_router = MagicMock()
+
+        job_running = _active_job(scid="333x444x0", rebalance_id=200)
+        job_running.status = JobStatus.RUNNING
+
+        with jm._jobs_lock:
+            jm._active_jobs["333x444x0"] = job_running
+
+        mock_plugin.rpc.call.return_value = {}
+
+        jm.stop_all_jobs(reason="shutdown")
+
+        jm.hive_router.unreserve_for_job.assert_not_called()
+
 
 # ============================================================================
 # 9. B5: _handle_job_success total_spent_sats used as fee
@@ -1229,6 +1255,60 @@ class TestB7PartialFeeSpendOnFailure:
 
         mock_database.mark_budget_spent.assert_called_once_with("44", 8)
         mock_database.release_budget_reservation.assert_not_called()
+
+
+class TestLegacyAskreneCleanupRemoved:
+    """Legacy one-hop askrene cleanup should no longer fire from JobManager."""
+
+    def _make_job_manager(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import JobManager
+
+        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        jm = JobManager(mock_plugin, cfg, mock_database)
+        jm.hive_router = MagicMock()
+        jm.stop_job = MagicMock(return_value=True)
+        return jm
+
+    def test_handle_job_success_does_not_issue_legacy_unreserve(self, mock_plugin, mock_database):
+        jm = self._make_job_manager(mock_plugin, mock_database)
+
+        job = _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=45)
+        jm._active_jobs[job.scid_normalized] = job
+
+        stats = {
+            "successes_in_time_window": {
+                "total_amount_sats": 50000,
+                "total_spent_sats": 50010,
+            }
+        }
+
+        jm._handle_job_success(job, 50000, stats)
+
+        jm.hive_router.unreserve_for_job.assert_not_called()
+
+    def test_handle_job_failure_does_not_issue_legacy_unreserve(self, mock_plugin, mock_database):
+        jm = self._make_job_manager(mock_plugin, mock_database)
+
+        job = _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=46)
+        jm._active_jobs[job.scid_normalized] = job
+
+        stats = {"last_error": "WIRE_TEMPORARY_CHANNEL_FAILURE"}
+
+        jm._handle_job_failure(job, stats)
+
+        jm.hive_router.unreserve_for_job.assert_not_called()
+
+    def test_handle_job_timeout_does_not_issue_legacy_unreserve(self, mock_plugin, mock_database):
+        jm = self._make_job_manager(mock_plugin, mock_database)
+
+        job = _active_job(scid="222x333x0", amount_sats=50000, rebalance_id=47)
+        jm._active_jobs[job.scid_normalized] = job
+        jm._get_channel_local_balance = MagicMock(return_value=job.initial_local_sats)
+
+        jm._handle_job_timeout(job)
+
+        jm.hive_router.unreserve_for_job.assert_not_called()
 
 
 # ============================================================================

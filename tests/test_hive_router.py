@@ -66,6 +66,30 @@ class TestHiveRouterRefresh:
         assert result is False
         assert router.available is False
 
+    def test_refresh_skips_remove_when_layer_missing(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"state": "CHANNELD_NORMAL", "peer_id": "fleet_a", "short_channel_id": "100x1x0"},
+            ]
+        }
+
+        def rpc_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": []}
+            return {}
+
+        plugin.rpc.call.side_effect = rpc_side_effect
+
+        router = HiveRouter(plugin, MockHiveHints(["fleet_a"]))
+        result = router.refresh_layer()
+
+        assert result is True
+        methods = [c[0][0] for c in plugin.rpc.call.call_args_list]
+        assert "askrene-create-layer" in methods
+        assert "askrene-remove-layer" not in methods
+
 
 class TestHiveRouterDiscover:
     def test_discover_returns_route(self):
@@ -92,6 +116,45 @@ class TestHiveRouterDiscover:
         assert route.hops == 2
         assert route.fee_ppm == 2000  # (501000-500000)*1e6/500000 = 2000
         assert route.probability_ppm == 850000
+
+    def test_discover_requests_single_path_solution(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+
+        def rpc_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": [{"layer": "hive-fleet"}, {"layer": "revenue-local"}]}
+            if method == "getroutes":
+                return {
+                    "probability_ppm": 900000,
+                    "routes": [{
+                        "amount_msat": 500000,
+                        "path": [
+                            {"short_channel_id_dir": "100x1x0/1", "amount_msat": 500100},
+                        ],
+                    }],
+                }
+            return {}
+
+        plugin.rpc.call.side_effect = rpc_side_effect
+
+        router = HiveRouter(plugin, MockHiveHints())
+        router.available = True
+        router._our_id = "our_id"
+
+        route = router.discover_route("dest_peer", 500)
+
+        assert route is not None
+        getroutes_call = [
+            c for c in plugin.rpc.call.call_args_list
+            if c[0][0] == "getroutes"
+        ][0]
+        params = getroutes_call[0][1]
+        assert "auto.localchans" in params["layers"]
+        assert "auto.sourcefree" in params["layers"]
+        assert "auto.no_mpp_support" in params["layers"]
+        assert params["maxparts"] == 1
+        assert params["final_cltv"] == 18
 
     def test_discover_returns_none_when_unavailable(self):
         router = HiveRouter(MagicMock(), MockHiveHints())
@@ -289,62 +352,115 @@ class TestLocalLayer:
         ]
         assert len(bias_calls) == 0
 
+    def test_refresh_local_layer_skips_remove_when_layer_missing(self):
+        plugin = MagicMock()
+        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+
+        def rpc_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": []}
+            return {}
+
+        plugin.rpc.call.side_effect = rpc_side_effect
+
+        router = HiveRouter(plugin, MockHiveHints())
+        router.profitability_analyzer = MagicMock()
+
+        result = router.refresh_local_layer()
+
+        assert result is True
+        methods = [c[0][0] for c in plugin.rpc.call.call_args_list]
+        assert "askrene-create-layer" in methods
+        assert "askrene-remove-layer" not in methods
+
 
 class TestReservations:
-    def test_reserve_pull_uses_direction_1(self):
+    def test_reserve_path_normalizes_to_exact_hops(self):
         plugin = MagicMock()
         plugin.rpc.call.return_value = {}
 
         router = HiveRouter(plugin, MockHiveHints())
-        result = router.reserve_for_job("100x1x0", 500_000, direction="pull")
+        result = router.reserve_path([
+            {"short_channel_id_dir": "100x1x0/1", "amount_msat": 500_000, "ignored": True},
+            {"short_channel_id_dir": "200x1x0/0", "amount_msat": 400_000},
+        ])
+
+        assert result is True
+        plugin.rpc.call.assert_called_once_with("askrene-reserve", {
+            "path": [
+                {"short_channel_id_dir": "100x1x0/1", "amount_msat": 500_000},
+                {"short_channel_id_dir": "200x1x0/0", "amount_msat": 400_000},
+            ]
+        })
+
+    def test_unreserve_path_normalizes_to_exact_hops(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.unreserve_path([
+            {"short_channel_id_dir": "100x1x0/1", "amount_msat": 500_000, "ignored": True},
+            {"short_channel_id_dir": "200x1x0/0", "amount_msat": 400_000},
+        ])
+
+        assert result is True
+        plugin.rpc.call.assert_called_once_with("askrene-unreserve", {
+            "path": [
+                {"short_channel_id_dir": "100x1x0/1", "amount_msat": 500_000},
+                {"short_channel_id_dir": "200x1x0/0", "amount_msat": 400_000},
+            ]
+        })
+
+    def test_reserve_uses_explicit_graph_direction(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.reserve_for_job("100x1x0", 500_000, direction=1)
 
         assert result is True
         plugin.rpc.call.assert_called_once_with("askrene-reserve", {
             "path": [{"short_channel_id_dir": "100x1x0/1", "amount_msat": 500_000}]
         })
 
-    def test_reserve_push_uses_direction_0(self):
+    def test_unreserve_uses_explicit_graph_direction(self):
         plugin = MagicMock()
         plugin.rpc.call.return_value = {}
 
         router = HiveRouter(plugin, MockHiveHints())
-        result = router.reserve_for_job("100x1x0", 300_000, direction="push")
-
-        assert result is True
-        plugin.rpc.call.assert_called_once_with("askrene-reserve", {
-            "path": [{"short_channel_id_dir": "100x1x0/0", "amount_msat": 300_000}]
-        })
-
-    def test_unreserve_pull_uses_direction_1(self):
-        plugin = MagicMock()
-        plugin.rpc.call.return_value = {}
-
-        router = HiveRouter(plugin, MockHiveHints())
-        result = router.unreserve_for_job("200x1x0", 100_000, direction="pull")
-
-        assert result is True
-        plugin.rpc.call.assert_called_once_with("askrene-unreserve", {
-            "path": [{"short_channel_id_dir": "200x1x0/1", "amount_msat": 100_000}]
-        })
-
-    def test_unreserve_push_uses_direction_0(self):
-        plugin = MagicMock()
-        plugin.rpc.call.return_value = {}
-
-        router = HiveRouter(plugin, MockHiveHints())
-        result = router.unreserve_for_job("200x1x0", 200_000, direction="push")
+        result = router.unreserve_for_job("200x1x0", 200_000, direction=0)
 
         assert result is True
         plugin.rpc.call.assert_called_once_with("askrene-unreserve", {
             "path": [{"short_channel_id_dir": "200x1x0/0", "amount_msat": 200_000}]
         })
 
+    def test_reserve_rejects_ambiguous_pull_push_direction(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.reserve_for_job("200x1x0", 100_000, direction="pull")
+
+        assert result is False
+        plugin.rpc.call.assert_not_called()
+
+    def test_unreserve_rejects_ambiguous_pull_push_direction(self):
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        router = HiveRouter(plugin, MockHiveHints())
+        result = router.unreserve_for_job("200x1x0", 100_000, direction="push")
+
+        assert result is False
+        plugin.rpc.call.assert_not_called()
+
     def test_reserve_returns_false_on_error(self):
         plugin = MagicMock()
         plugin.rpc.call.side_effect = Exception("askrene error")
 
         router = HiveRouter(plugin, MockHiveHints())
-        result = router.reserve_for_job("100x1x0", 500_000, direction="pull")
+        result = router.reserve_for_job("100x1x0", 500_000, direction=1)
 
         assert result is False
 
@@ -353,6 +469,6 @@ class TestReservations:
         plugin.rpc.call.side_effect = Exception("askrene error")
 
         router = HiveRouter(plugin, MockHiveHints())
-        result = router.unreserve_for_job("100x1x0", 500_000, direction="pull")
+        result = router.unreserve_for_job("100x1x0", 500_000, direction=1)
 
         assert result is False

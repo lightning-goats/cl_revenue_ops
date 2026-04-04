@@ -193,6 +193,45 @@ class TestExecuteSuccess:
         assert result.attempts == 1
         assert result.route_type == "network"
 
+    def test_getroute_uses_named_riskfactor_and_cltv(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {"id": "dest_peer_abc", "channel": "300x1x0", "direction": 1, "amount_msat": 500000000, "delay": 24}
+            ]
+        }
+        plugin.rpc.listchannels.return_value = {"channels": []}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete", "amount_sent_msat": 500000000
+        }
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        result = executor.execute(MockCandidate(hive_route_hops=0))
+
+        assert result.success is True
+        assert plugin.rpc.getroute.call_args.kwargs["riskfactor"] == 0
+        assert plugin.rpc.getroute.call_args.kwargs["cltv"] == 24
+        assert plugin.rpc.getroute.call_args.kwargs["fromid"] == "source_peer_abc"
+
     def test_first_hop_uses_first_return_hop_policy(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
@@ -259,7 +298,8 @@ class TestExecuteSuccess:
         plugin.rpc.getroute.assert_called_once_with(
             "dest_peer_abc",
             500_000_000,
-            24,
+            riskfactor=0,
+            cltv=24,
             fromid="source_peer_abc",
             maxhops=6,
             fuzzpercent=0,
@@ -353,7 +393,8 @@ class TestExecuteSuccess:
         plugin.rpc.getroute.assert_called_once_with(
             "dest_peer_abc",
             500_005_000,
-            24,
+            riskfactor=0,
+            cltv=24,
             fromid="source_peer_abc",
             maxhops=6,
             fuzzpercent=0,
@@ -558,7 +599,8 @@ class TestExecuteFailure:
             c for c in plugin.rpc.call.call_args_list
             if c[0][0] == "askrene-inform-channel"
         ]
-        assert any(c[0][1]["inform"] == "failed" for c in inform_calls)
+        assert not any(c[0][1]["inform"] == "failed" for c in inform_calls)
+        assert any(c[0][1]["inform"] == "constrained" for c in inform_calls)
         assert any(c[0][1]["inform"] == "succeeded" for c in inform_calls)
 
     def test_runtime_memory_excludes_banned_channel(self):
@@ -861,8 +903,140 @@ class TestExecuteFailure:
         result = executor.execute(candidate)
 
         assert result.success is True
-        hive_router.reserve_for_job.assert_called_once_with("200x1x0", 500000000, direction="pull")
-        hive_router.unreserve_for_job.assert_called_once_with("200x1x0", 500000000, direction="pull")
+        hive_router.reserve_path.assert_called_once()
+        hive_router.unreserve_path.assert_called_once()
+        reserved_path = hive_router.reserve_path.call_args.args[0]
+        unreserved_path = hive_router.unreserve_path.call_args.args[0]
+        assert reserved_path == unreserved_path
+        assert reserved_path == [
+            {"short_channel_id_dir": "100x1x0/0", "amount_msat": 500000000},
+            {"short_channel_id_dir": "300x1x0/0", "amount_msat": 500000000},
+            {"short_channel_id_dir": "200x1x0/0", "amount_msat": 500000000},
+        ]
+
+    def test_unreserves_attempt_path_before_success_inform(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "bbbb"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {"id": "cccc", "channel": "300x1x0", "direction": 0, "amount_msat": 500000000, "delay": 24}
+            ]
+        }
+        plugin.rpc.listchannels.return_value = {"channels": []}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete", "amount_sent_msat": 500000000
+        }
+        events = []
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-inform-channel":
+                events.append(f"inform:{params['inform']}")
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
+        hive_router = MagicMock()
+        hive_router.reserve_path.side_effect = lambda path: events.append("reserve") or True
+        hive_router.unreserve_path.side_effect = lambda path: events.append("unreserve") or True
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock(), hive_router=hive_router)
+        candidate = MockCandidate(
+            hive_route_hops=0,
+            primary_source_peer_id="aaaa",
+            to_peer_id="cccc",
+        )
+
+        result = executor.execute(candidate)
+
+        assert result.success is True
+        assert events[0] == "reserve"
+        assert events[1] == "unreserve"
+        assert all(event.startswith("inform:") for event in events[2:])
+
+    def test_unreserves_attempt_path_before_failure_inform(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "bbbb"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {"id": "cccc", "channel": "300x1x0", "direction": 0, "amount_msat": 500000000, "delay": 24}
+            ]
+        }
+        plugin.rpc.listchannels.return_value = {"channels": []}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.waitsendpay.side_effect = FakeRpcError(error={
+            "code": 204,
+            "message": "failed: WIRE_TEMPORARY_CHANNEL_FAILURE",
+            "data": {
+                "erring_index": 2,
+                "erring_channel": "300x1x0",
+                "erring_direction": 0,
+                "erring_node": "cccc",
+                "failcode": 4103,
+                "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+            },
+        })
+        events = []
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-inform-channel":
+                events.append(f"inform:{params['inform']}")
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
+        hive_router = MagicMock()
+        hive_router.reserve_path.side_effect = lambda path: events.append("reserve") or True
+        hive_router.unreserve_path.side_effect = lambda path: events.append("unreserve") or True
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock(), hive_router=hive_router)
+        executor.MAX_ATTEMPTS = 1
+        candidate = MockCandidate(
+            hive_route_hops=0,
+            primary_source_peer_id="aaaa",
+            to_peer_id="cccc",
+        )
+
+        result = executor.execute(candidate)
+
+        assert result.success is False
+        assert events[0] == "reserve"
+        assert events[1] == "unreserve"
+        assert all(event.startswith("inform:") for event in events[2:])
+        assert "inform:unconstrained" in events
+        assert "inform:constrained" in events
 
 
 class TestCancelAndShutdown:
@@ -888,7 +1062,7 @@ class TestInformChannel:
 
         path = [
             {"short_channel_id_dir": "100x1x0/1", "next_node_id": "a",
-             "amount_msat": 500000, "delay": 24},
+             "amount_msat": 501000, "delay": 24},
         ]
         executor._inform_result(path, 500000, succeeded=True)
 
@@ -898,19 +1072,35 @@ class TestInformChannel:
         ]
         assert len(inform_calls) == 1
         assert inform_calls[0][0][1]["inform"] == "succeeded"
+        assert inform_calls[0][0][1]["amount_msat"] == 501000
 
-    def test_informs_on_failure(self):
+    def test_informs_on_failure_with_valid_askrene_semantics(self):
         plugin = MagicMock()
         plugin.rpc.call.return_value = {}
         executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
 
-        path = [{"short_channel_id_dir": "100x1x0/1", "next_node_id": "a",
-                 "amount_msat": 500000, "delay": 24}]
-        executor._inform_result(path, 500000, succeeded=False)
+        path = [
+            {"short_channel_id_dir": "100x1x0/0", "amount_msat": 501000},
+            {"short_channel_id_dir": "200x1x0/1", "amount_msat": 500000},
+            {"short_channel_id_dir": "300x1x0/0", "amount_msat": 500000},
+        ]
+        failure = {
+            "code": 204,
+            "erring_channel": "200x1x0",
+            "erring_direction": 1,
+            "erring_index": 2,
+        }
+        executor._inform_failure(path, failure)
 
         inform_calls = [
             c for c in plugin.rpc.call.call_args_list
             if c[0][0] == "askrene-inform-channel"
         ]
-        assert len(inform_calls) == 1
-        assert inform_calls[0][0][1]["inform"] == "failed"
+        assert [c[0][1]["inform"] for c in inform_calls] == [
+            "unconstrained",
+            "constrained",
+        ]
+        assert inform_calls[0][0][1]["short_channel_id_dir"] == "100x1x0/0"
+        assert inform_calls[0][0][1]["amount_msat"] == 501000
+        assert inform_calls[1][0][1]["short_channel_id_dir"] == "200x1x0/1"
+        assert inform_calls[1][0][1]["amount_msat"] == 500000
