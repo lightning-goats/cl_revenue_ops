@@ -192,6 +192,187 @@ class RebalanceExecutor:
             except Exception:
                 pass
 
+    def _path_for_inform(self, hops: List[Dict]) -> List[Dict]:
+        """Normalize hop data to askrene-inform-channel format."""
+        path = []
+        for hop in hops:
+            scid_dir = hop.get("short_channel_id_dir", "")
+            if not scid_dir:
+                channel = hop.get("channel", "")
+                direction = hop.get("direction")
+                if channel and direction is not None:
+                    scid_dir = f"{channel}/{direction}"
+            if scid_dir:
+                path.append({"short_channel_id_dir": scid_dir})
+        return path
+
+    def _cleanup_failed_payment(self, payment_hash: str) -> None:
+        """Delete a failed sendpay attempt so the hash can be retried."""
+        if not payment_hash:
+            return
+        try:
+            self.plugin.rpc.delpay(payment_hash, "failed")
+        except Exception:
+            pass
+
+    def _parse_failure(self, exc: Exception) -> Dict[str, Any]:
+        """Extract routing failure details from an RPC exception."""
+        error = getattr(exc, "error", None)
+        if not isinstance(error, dict):
+            return {}
+        data = error.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+        return {
+            "code": error.get("code"),
+            "message": error.get("message", ""),
+            "erring_index": data.get("erring_index"),
+            "erring_channel": data.get("erring_channel"),
+            "erring_direction": data.get("erring_direction"),
+            "erring_node": data.get("erring_node"),
+            "failcode": data.get("failcode", 0) or 0,
+            "failcodename": data.get("failcodename", ""),
+        }
+
+    def _compute_network_route(
+        self,
+        job: RebalanceJob,
+        candidate,
+        our_id: str,
+        excludes: List[str],
+    ) -> List[Dict]:
+        """Build a circular route using getroute for network rebalances."""
+        source_scid = candidate.source_candidates[0] if candidate.source_candidates else ""
+        source_peer = candidate.primary_source_peer_id
+        if not source_scid or not source_peer:
+            raise ValueError("no_source_channel")
+
+        getroute_kwargs = {
+            "fromid": source_peer,
+            "maxhops": 6,
+            "fuzzpercent": 0,
+        }
+        if excludes:
+            getroute_kwargs["exclude"] = excludes
+
+        route_result = self.plugin.rpc.getroute(
+            our_id,
+            job.amount_msat,
+            1,
+            **getroute_kwargs,
+        )
+        route = route_result.get("route", [])
+        if not route:
+            raise ValueError("no_route_back")
+
+        first_hop_scid = source_scid.replace(":", "x")
+        forward_amount = route[0].get("amount_msat", job.amount_msat)
+
+        source_fee_ppm = 0
+        source_base_msat = 0
+        source_cltv_delta = 6
+        try:
+            forward_hop = route[0]
+            forward_scid = forward_hop.get("channel", "")
+            forward_dir = forward_hop.get("direction")
+            chans = self.plugin.rpc.listchannels(forward_scid)
+            for ch in chans.get("channels", []):
+                if ch.get("short_channel_id") != forward_scid:
+                    continue
+                if forward_dir is not None and ch.get("direction") != forward_dir:
+                    continue
+                fee_ppm_val = ch.get("fee_per_millionth")
+                if fee_ppm_val is None:
+                    fee_ppm_val = ch.get("fee_proportional_millionths", 0)
+                fee_base_val = ch.get("base_fee_millisatoshi")
+                if fee_base_val is None:
+                    fee_base_val = ch.get("fee_base_msat", 0)
+                delay_val = ch.get("delay")
+                if delay_val is None:
+                    delay_val = ch.get("cltv_expiry_delta", 6)
+                source_cltv_delta = int(delay_val or 6)
+                source_fee_ppm = int(fee_ppm_val or 0)
+                source_base_msat = int(fee_base_val or 0)
+                break
+        except Exception:
+            pass
+
+        if source_fee_ppm == 0 and source_base_msat == 0:
+            try:
+                chans = self.plugin.rpc.listpeerchannels(source_peer)
+                for ch in chans.get("channels", []):
+                    if ch.get("short_channel_id") == first_hop_scid:
+                        updates = ch.get("updates", {})
+                        local = updates.get("local", {})
+                        source_cltv_delta = int(local.get("cltv_expiry_delta", 6) or 6)
+                        fee_ppm_val = local.get("fee_proportional_millionths")
+                        if fee_ppm_val is None:
+                            fee_ppm_val = ch.get("fee_proportional_millionths", 0)
+                        fee_base_val = local.get("fee_base_msat")
+                        if fee_base_val is None:
+                            fee_base_val = ch.get("fee_base_msat", 0)
+                        source_fee_ppm = int(fee_ppm_val or 0)
+                        source_base_msat = int(fee_base_val or 0)
+                        break
+            except Exception:
+                pass
+
+        source_fee_msat = source_base_msat + (forward_amount * source_fee_ppm) // 1_000_000
+        first_hop_amount = forward_amount + source_fee_msat
+        first_hop_delay = route[0].get("delay", 18) + source_cltv_delta
+        first_hop_direction = 1 if our_id > source_peer else 0
+
+        return [{
+            "id": source_peer,
+            "channel": first_hop_scid,
+            "direction": first_hop_direction,
+            "amount_msat": first_hop_amount,
+            "delay": first_hop_delay,
+            "style": "tlv",
+        }] + route
+
+    def _compute_fleet_route(
+        self,
+        job: RebalanceJob,
+        candidate,
+        our_id: str,
+    ) -> tuple[List[Dict], List[Dict]]:
+        """Build a circular route using getroutes for fleet rebalances."""
+        layers = self._get_layers(job.route_type)
+        params = {
+            "source": our_id,
+            "destination": candidate.to_peer_id,
+            "amount_msat": job.amount_msat,
+            "layers": layers,
+            "maxfee_msat": job.max_fee_msat,
+            "final_cltv": 18,
+        }
+        try:
+            result = self.plugin.rpc.call("getroutes", params)
+        except Exception:
+            params["layers"] = ["auto.localchans"]
+            result = self.plugin.rpc.call("getroutes", params)
+
+        routes = result.get("routes", [])
+        if not routes:
+            raise ValueError("no_fleet_route")
+        path = routes[0].get("path", [])
+        if not path:
+            raise ValueError("no_fleet_route")
+
+        full_route = self._getroutes_to_sendpay(
+            path,
+            candidate.to_channel,
+            our_id,
+            job.amount_msat,
+        )
+        inform_path = list(path)
+        final_direction = 1 if candidate.to_peer_id > our_id else 0
+        inform_path.append({
+            "short_channel_id_dir": f"{candidate.to_channel.replace(':', 'x')}/{final_direction}",
+        })
+        return full_route, inform_path
+
     # ------------------------------------------------------------------
     # Core Execution
     # ------------------------------------------------------------------
@@ -199,9 +380,8 @@ class RebalanceExecutor:
     def _execute_single(self, job: RebalanceJob, candidate) -> RebalanceResult:
         """Execute a rebalance job.
 
-        Uses CLN's native 'pay' with exclude lists to force routing
-        through the desired channel.  This avoids manual route construction
-        and fee calculation issues that caused WIRE_FEE_INSUFFICIENT.
+        Uses sendpay with explicit routes. Network rebalances use getroute and
+        explicit excludes on retry. Fleet rebalances use layer-aware getroutes.
         """
         our_id = self._get_our_id()
         if not our_id:
@@ -235,111 +415,18 @@ class RebalanceExecutor:
 
         last_error = ""
         job.state = JobState.ROUTING
+        excludes: List[str] = []
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            full_route: List[Dict] = []
+            inform_path: List[Dict] = []
+            try:
+                if route_type == "fleet":
+                    full_route, inform_path = self._compute_fleet_route(job, candidate, our_id)
+                else:
+                    full_route = self._compute_network_route(job, candidate, our_id, excludes)
+                    inform_path = self._path_for_inform(full_route)
 
-        try:
-            # Circular route: Us →[source_chan]→ SourcePeer →...→ Us
-            #
-            # getroute(id=our_id, fromid=source_peer) finds the path from
-            # the source peer back to us.  We prepend our SOURCE channel
-            # (where we have outbound liquidity) as the first hop.
-            # The last hop of getroute's result arrives back at us via
-            # the depleted channel — completing the circle.
-            #
-            # The PRIMARY source is the best-scored source channel from
-            # the EV analysis (candidate.source_candidates[0]).
-            source_scid = candidate.source_candidates[0] if candidate.source_candidates else ""
-            source_peer = candidate.primary_source_peer_id
-            if not source_scid or not source_peer:
-                last_error = "no_source_channel"
-                self._log(f"Job {job.job_id}: no source channel for circular route")
-            else:
-                route_result = self.plugin.rpc.getroute(
-                    our_id,
-                    job.amount_msat,
-                    1,
-                    fromid=source_peer,
-                    maxhops=6,
-                    fuzzpercent=0,
-                )
-                route = route_result.get("route", [])
-            if not source_scid or not route:
-                if not last_error:
-                    last_error = "no_route_back"
-                    self._log(f"Job {job.job_id}: no route from {source_peer[:12]}... back to us")
-            else:
-                # Prepend our SOURCE channel as first hop.
-                # getroute(fromid=source_peer) treats source_peer as origin,
-                # so route[0].amount_msat is what source_peer FORWARDS.
-                # We need to SEND source_peer enough to cover:
-                #   route[0].amount_msat + source_peer's forwarding fee
-                first_hop_scid = source_scid.replace(":", "x")
-                forward_amount = route[0].get("amount_msat", job.amount_msat)
-
-                # Price the prepended hop from the source peer's FIRST outgoing
-                # hop in the returned route. route[0].amount_msat/delay are
-                # what that next node expects; to pay the source peer itself we
-                # must add the policy for route[0].channel/direction.
-                source_fee_ppm = 0
-                source_base_msat = 0
-                source_cltv_delta = 6
-                try:
-                    forward_hop = route[0]
-                    forward_scid = forward_hop.get("channel", "")
-                    forward_dir = forward_hop.get("direction")
-                    chans = self.plugin.rpc.listchannels(forward_scid)
-                    for ch in chans.get("channels", []):
-                        if ch.get("short_channel_id") != forward_scid:
-                            continue
-                        if forward_dir is not None and ch.get("direction") != forward_dir:
-                            continue
-                        fee_ppm_val = ch.get("fee_per_millionth")
-                        if fee_ppm_val is None:
-                            fee_ppm_val = ch.get("fee_proportional_millionths", 0)
-                        fee_base_val = ch.get("base_fee_millisatoshi")
-                        if fee_base_val is None:
-                            fee_base_val = ch.get("fee_base_msat", 0)
-                        delay_val = ch.get("delay")
-                        if delay_val is None:
-                            delay_val = ch.get("cltv_expiry_delta", 6)
-                        source_cltv_delta = int(delay_val or 6)
-                        source_fee_ppm = int(fee_ppm_val or 0)
-                        source_base_msat = int(fee_base_val or 0)
-                        break
-                except Exception:
-                    pass
-                if source_fee_ppm == 0 and source_base_msat == 0:
-                    try:
-                        chans = self.plugin.rpc.listpeerchannels(source_peer)
-                        for ch in chans.get("channels", []):
-                            if ch.get("short_channel_id") == first_hop_scid:
-                                updates = ch.get("updates", {})
-                                local = updates.get("local", {})
-                                source_cltv_delta = int(local.get("cltv_expiry_delta", 6) or 6)
-                                fee_ppm_val = local.get("fee_proportional_millionths")
-                                if fee_ppm_val is None:
-                                    fee_ppm_val = ch.get("fee_proportional_millionths", 0)
-                                fee_base_val = local.get("fee_base_msat")
-                                if fee_base_val is None:
-                                    fee_base_val = ch.get("fee_base_msat", 0)
-                                source_fee_ppm = int(fee_ppm_val or 0)
-                                source_base_msat = int(fee_base_val or 0)
-                                break
-                    except Exception:
-                        pass
-                # First hop amount = what the next hop must receive plus our
-                # source peer's forwarding fee on its first outgoing hop.
-                source_fee_msat = source_base_msat + (forward_amount * source_fee_ppm) // 1_000_000
-                first_hop_amount = forward_amount + source_fee_msat
-                first_hop_delay = route[0].get("delay", 18) + source_cltv_delta
-
-                full_route = [{
-                    "id": source_peer,
-                    "channel": first_hop_scid,
-                    "amount_msat": first_hop_amount,
-                    "delay": first_hop_delay,
-                }] + route
-
-                total_fee = max(0, first_hop_amount - job.amount_msat)
+                total_fee = max(0, full_route[0].get("amount_msat", job.amount_msat) - job.amount_msat)
                 fee_ppm = (total_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
 
                 self._log(
@@ -361,43 +448,73 @@ class RebalanceExecutor:
                     job.payment_hash,
                     self.SENDPAY_TIMEOUT,
                 )
-
                 status = pay_result.get("status", "")
-                if status == "complete":
-                    actual_sent = pay_result.get("amount_sent_msat", first_hop_amount)
-                    actual_fee = max(0, actual_sent - job.amount_msat)
-                    actual_ppm = (actual_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
+                if status != "complete":
+                    raise RuntimeError(f"waitsendpay_status={status}")
 
-                    result = RebalanceResult(
-                        success=True,
-                        fee_msat=actual_fee,
-                        fee_ppm=actual_ppm,
-                        hops=len(full_route),
-                        route_type=route_type,
-                        attempts=1,
-                        parts=1,
-                    )
-                    job.state = JobState.COMPLETE
-                    job.result = result
+                self._inform_result(inform_path, job.amount_msat, succeeded=True)
 
-                    self._log(
-                        f"Job {job.job_id} SUCCESS: {candidate.to_channel} "
-                        f"fee={actual_fee}msat ({actual_ppm}ppm) "
-                        f"{len(full_route)} hops",
-                    )
-                    return result
-                else:
-                    last_error = f"waitsendpay_status={status}"
+                actual_sent = pay_result.get("amount_sent_msat", full_route[0].get("amount_msat", job.amount_msat))
+                actual_fee = max(0, actual_sent - job.amount_msat)
+                actual_ppm = (actual_fee * 1_000_000) // job.amount_msat if job.amount_msat > 0 else 0
 
-        except Exception as e:
-            last_error = f"sendpay_error: {e}"
+                result = RebalanceResult(
+                    success=True,
+                    fee_msat=actual_fee,
+                    fee_ppm=actual_ppm,
+                    hops=len(full_route),
+                    route_type=route_type,
+                    attempts=attempt,
+                    parts=1,
+                )
+                job.state = JobState.COMPLETE
+                job.result = result
 
-        job.attempts.append({
-            "attempt": 1,
-            "error": last_error,
-            "timestamp": int(time.time()),
-        })
-        self._log(f"Job {job.job_id} failed: {last_error}", level="info")
+                self._log(
+                    f"Job {job.job_id} SUCCESS: {candidate.to_channel} "
+                    f"fee={actual_fee}msat ({actual_ppm}ppm) "
+                    f"{len(full_route)} hops",
+                )
+                return result
+
+            except Exception as e:
+                failure = self._parse_failure(e)
+                last_error = f"sendpay_error: {e}"
+                if inform_path:
+                    self._inform_result(inform_path, job.amount_msat, succeeded=False)
+                self._cleanup_failed_payment(job.payment_hash)
+                job.attempts.append({
+                    "attempt": attempt,
+                    "error": last_error,
+                    "timestamp": int(time.time()),
+                })
+                self._log(f"Job {job.job_id} failed attempt {attempt}: {last_error}", level="info")
+
+                should_retry = False
+                if attempt < self.MAX_ATTEMPTS and failure.get("code") == 204:
+                    erring_index = failure.get("erring_index")
+                    failcode = int(failure.get("failcode", 0) or 0)
+                    is_node_error = bool(failcode & 0x2000)
+                    if erring_index == 0 or (erring_index == 1 and is_node_error):
+                        should_retry = False
+                    elif full_route and erring_index == len(full_route) + 1:
+                        should_retry = False
+                    elif route_type == "network":
+                        if is_node_error and failure.get("erring_node"):
+                            excludes.append(str(failure["erring_node"]))
+                            should_retry = True
+                        elif failure.get("erring_channel") and failure.get("erring_direction") is not None:
+                            excludes.append(
+                                f"{failure['erring_channel']}/{failure['erring_direction']}"
+                            )
+                            should_retry = True
+                    else:
+                        should_retry = True
+
+                if should_retry:
+                    job.state = JobState.ROUTING
+                    continue
+                break
 
         # All attempts exhausted
         job.state = JobState.FAILED
@@ -468,9 +585,28 @@ class RebalanceExecutor:
                 return RebalanceResult(success=False, error="job_already_active")
             self._jobs[normalized] = job
 
+        if self.hive_router:
+            try:
+                self.hive_router.reserve_for_job(
+                    candidate.to_channel,
+                    amount_msat,
+                    direction=getattr(candidate, "direction", "pull"),
+                )
+            except Exception:
+                pass
+
         try:
             result = self._execute_single(job, candidate)
         finally:
+            if self.hive_router:
+                try:
+                    self.hive_router.unreserve_for_job(
+                        candidate.to_channel,
+                        amount_msat,
+                        direction=getattr(candidate, "direction", "pull"),
+                    )
+                except Exception:
+                    pass
             with self._lock:
                 self._jobs.pop(normalized, None)
 
@@ -495,6 +631,16 @@ class RebalanceExecutor:
                 return ""
             self._jobs[normalized] = job
 
+        if self.hive_router:
+            try:
+                self.hive_router.reserve_for_job(
+                    candidate.to_channel,
+                    candidate.amount_msat,
+                    direction=getattr(candidate, "direction", "pull"),
+                )
+            except Exception:
+                pass
+
         def _run():
             try:
                 result = self._execute_single(job, candidate)
@@ -502,6 +648,15 @@ class RebalanceExecutor:
                     callback(result)
                 return result
             finally:
+                if self.hive_router:
+                    try:
+                        self.hive_router.unreserve_for_job(
+                            candidate.to_channel,
+                            candidate.amount_msat,
+                            direction=getattr(candidate, "direction", "pull"),
+                        )
+                    except Exception:
+                        pass
                 with self._lock:
                     self._jobs.pop(normalized, None)
                     self._futures.pop(normalized, None)

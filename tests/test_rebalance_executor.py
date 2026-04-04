@@ -11,6 +11,13 @@ from modules.rebalance_executor import (
 )
 
 
+class FakeRpcError(Exception):
+    def __init__(self, command="waitsendpay", error=None):
+        self.command = command
+        self.error = error or {}
+        super().__init__(f"{command}: {self.error}")
+
+
 @dataclass
 class MockCandidate:
     source_candidates: List[str] = field(default_factory=lambda: ["100x1x0"])
@@ -251,6 +258,62 @@ class TestExecuteSuccess:
         assert sendpay_route[0]["amount_msat"] == 500_018_000
         assert sendpay_route[0]["delay"] == 52
 
+    def test_fleet_route_uses_getroutes_execution_path(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete", "amount_sent_msat": 500_000_000
+        }
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": [{"layer": "hive-fleet"}, {"layer": "revenue-local"}]}
+            if method == "getroutes":
+                return {
+                    "routes": [{
+                        "amount_msat": 500_000_000,
+                        "path": [
+                            {
+                                "short_channel_id_dir": "100x1x0/1",
+                                "next_node_id": "fleet_mid",
+                                "amount_msat": 500_000_000,
+                                "delay": 24,
+                            },
+                            {
+                                "short_channel_id_dir": "300x1x0/0",
+                                "next_node_id": "dest_peer_abc",
+                                "amount_msat": 500_000_000,
+                                "delay": 18,
+                            },
+                        ],
+                    }],
+                    "probability_ppm": 999999,
+                }
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        candidate = MockCandidate(hive_route_hops=2)
+
+        result = executor.execute(candidate)
+
+        assert result.success is True
+        plugin.rpc.getroute.assert_not_called()
+        plugin.rpc.call.assert_any_call("getroutes", {
+            "source": "our_id",
+            "destination": "dest_peer_abc",
+            "amount_msat": 500_000_000,
+            "layers": ["auto.localchans", "hive-fleet", "revenue-local"],
+            "maxfee_msat": 100_000,
+            "final_cltv": 18,
+        })
+
 
 class TestExecuteFailure:
     def test_no_routes(self):
@@ -293,6 +356,126 @@ class TestExecuteFailure:
 
         # delinvoice should be called for cleanup
         plugin.rpc.delinvoice.assert_called_once()
+
+    def test_retries_on_route_failure_with_exclude(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "direction": 1,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                }
+            ]
+        }
+        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        plugin.rpc.getroute.side_effect = [
+            {
+                "route": [
+                    {
+                        "id": "mid_a",
+                        "channel": "200x1x0",
+                        "direction": 1,
+                        "amount_msat": 500_000_000,
+                        "delay": 24,
+                    },
+                    {
+                        "id": "our_id",
+                        "channel": "300x1x0",
+                        "direction": 0,
+                        "amount_msat": 499_990_000,
+                        "delay": 6,
+                    },
+                ]
+            },
+            {
+                "route": [
+                    {
+                        "id": "mid_b",
+                        "channel": "201x1x0",
+                        "direction": 0,
+                        "amount_msat": 500_000_000,
+                        "delay": 24,
+                    },
+                    {
+                        "id": "our_id",
+                        "channel": "300x1x0",
+                        "direction": 0,
+                        "amount_msat": 499_990_000,
+                        "delay": 6,
+                    },
+                ]
+            },
+        ]
+        plugin.rpc.waitsendpay.side_effect = [
+            FakeRpcError(error={
+                "code": 204,
+                "message": "failed: WIRE_TEMPORARY_CHANNEL_FAILURE",
+                "data": {
+                    "erring_index": 2,
+                    "erring_channel": "940851x30x0",
+                    "erring_direction": 0,
+                    "erring_node": "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266",
+                    "failcode": 4103,
+                    "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+                },
+            }),
+            {
+                "status": "complete",
+                "amount_sent_msat": 500_006_000,
+            },
+        ]
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        result = executor.execute(MockCandidate())
+
+        assert result.success is True
+        assert result.attempts == 2
+        assert plugin.rpc.getroute.call_count == 2
+        assert plugin.rpc.getroute.call_args_list[1].kwargs["exclude"] == ["940851x30x0/0"]
+        plugin.rpc.delpay.assert_called_once_with("hash123", "failed")
+
+        inform_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c[0][0] == "askrene-inform-channel"
+        ]
+        assert any(c[0][1]["inform"] == "failed" for c in inform_calls)
+        assert any(c[0][1]["inform"] == "succeeded" for c in inform_calls)
+
+    def test_execute_reserves_and_unreserves_capacity(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {"id": "our_id", "channel": "300x1x0", "direction": 0, "amount_msat": 500000000, "delay": 18}
+            ]
+        }
+        plugin.rpc.listchannels.return_value = {"channels": []}
+        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete", "amount_sent_msat": 500000000
+        }
+        hive_router = MagicMock()
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock(), hive_router=hive_router)
+        candidate = MockCandidate(hive_route_hops=0)
+
+        result = executor.execute(candidate)
+
+        assert result.success is True
+        hive_router.reserve_for_job.assert_called_once_with("200x1x0", 500000000, direction="pull")
+        hive_router.unreserve_for_job.assert_called_once_with("200x1x0", 500000000, direction="pull")
 
 
 class TestCancelAndShutdown:
