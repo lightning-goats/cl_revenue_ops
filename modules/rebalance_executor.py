@@ -511,8 +511,12 @@ class RebalanceExecutor:
 
         if erring_channel and erring_direction is not None:
             scid_dir = f"{erring_channel}/{erring_direction}"
-            if failcodename == "WIRE_TEMPORARY_CHANNEL_FAILURE":
+            if failcodename in {
+                "WIRE_TEMPORARY_CHANNEL_FAILURE",
+                "WIRE_FEE_INSUFFICIENT",
+            }:
                 self._routing_memory.ban_channel(scid_dir, ttl_seconds=self.CHANNEL_BAN_TTL)
+            if failcodename == "WIRE_TEMPORARY_CHANNEL_FAILURE":
                 amount_idx = min(max(erring_index - 1, 0), len(full_route) - 1)
                 constrained_amount = max(
                     0,
@@ -753,17 +757,17 @@ class RebalanceExecutor:
                         should_retry = False
                     elif full_route and erring_index == len(full_route) + 1:
                         should_retry = False
-                    elif route_type == "network":
-                        if is_node_error and failure.get("erring_node"):
-                            excludes.append(str(failure["erring_node"]))
-                            should_retry = True
-                        elif failure.get("erring_channel") and failure.get("erring_direction") is not None:
-                            excludes.append(
-                                f"{failure['erring_channel']}/{failure['erring_direction']}"
-                            )
-                            should_retry = True
                     else:
-                        should_retry = True
+                        previous_excludes = list(excludes)
+                        if is_node_error and failure.get("erring_node"):
+                            excludes = list(dict.fromkeys(
+                                excludes + [str(failure["erring_node"])]
+                            ))
+                        elif failure.get("erring_channel") and failure.get("erring_direction") is not None:
+                            excludes = list(dict.fromkeys(excludes + [
+                                f"{failure['erring_channel']}/{failure['erring_direction']}"
+                            ]))
+                        should_retry = excludes != previous_excludes
 
                 if should_retry:
                     job.state = JobState.ROUTING

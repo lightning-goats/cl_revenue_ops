@@ -603,6 +603,97 @@ class TestExecuteFailure:
         assert any(c[0][1]["inform"] == "constrained" for c in inform_calls)
         assert any(c[0][1]["inform"] == "succeeded" for c in inform_calls)
 
+    def test_fleet_retries_on_fee_insufficient_with_exclude(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "300x1x0",
+                    "direction": 1,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                },
+                {
+                    "short_channel_id": "301x1x0",
+                    "direction": 0,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                },
+            ]
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.getroute.side_effect = [
+            {
+                "route": [
+                    {
+                        "id": "dest_peer_abc",
+                        "channel": "300x1x0",
+                        "direction": 1,
+                        "amount_msat": 500_000_000,
+                        "delay": 24,
+                    },
+                ]
+            },
+            {
+                "route": [
+                    {
+                        "id": "dest_peer_abc",
+                        "channel": "301x1x0",
+                        "direction": 0,
+                        "amount_msat": 500_000_000,
+                        "delay": 24,
+                    },
+                ]
+            },
+        ]
+        plugin.rpc.waitsendpay.side_effect = [
+            FakeRpcError(error={
+                "code": 204,
+                "message": "failed: WIRE_FEE_INSUFFICIENT",
+                "data": {
+                    "erring_index": 2,
+                    "erring_channel": "941153x2443x0",
+                    "erring_direction": 1,
+                    "erring_node": "03a93b87bf9f052b8e862d51ebbac4ce5e97b5f4137563cd5128548d7f5978dda9",
+                    "failcode": 4108,
+                    "failcodename": "WIRE_FEE_INSUFFICIENT",
+                },
+            }),
+            {
+                "status": "complete",
+                "amount_sent_msat": 500_006_000,
+            },
+        ]
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        result = executor.execute(MockCandidate(hive_route_hops=2))
+
+        assert result.success is True
+        assert result.route_type == "fleet"
+        assert result.attempts == 2
+        assert plugin.rpc.getroute.call_count == 2
+        assert plugin.rpc.getroute.call_args_list[1].kwargs["exclude"] == ["941153x2443x0/1"]
+
     def test_runtime_memory_excludes_banned_channel(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
@@ -823,6 +914,68 @@ class TestExecuteFailure:
 
         assert result.success is True
         assert "940851x30x0/0" in executor._routing_memory.current_excludes()
+
+    def test_fee_insufficient_learns_ban(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "300x1x0",
+                    "direction": 1,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                }
+            ]
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {
+                    "id": "dest_peer_abc",
+                    "channel": "300x1x0",
+                    "direction": 1,
+                    "amount_msat": 500_000_000,
+                    "delay": 24,
+                },
+            ]
+        }
+        plugin.rpc.waitsendpay.side_effect = FakeRpcError(error={
+            "code": 204,
+            "message": "failed: WIRE_FEE_INSUFFICIENT",
+            "data": {
+                "erring_index": 2,
+                "erring_channel": "941153x2443x0",
+                "erring_direction": 1,
+                "failcode": 4108,
+                "failcodename": "WIRE_FEE_INSUFFICIENT",
+            },
+        })
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        executor.MAX_ATTEMPTS = 1
+        result = executor.execute(MockCandidate(hive_route_hops=0))
+
+        assert result.success is False
+        assert "941153x2443x0/1" in executor._routing_memory.current_excludes()
 
     def test_immediate_sendpay_failure_bans_first_hop(self):
         plugin = MagicMock()
