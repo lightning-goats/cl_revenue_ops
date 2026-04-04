@@ -237,58 +237,43 @@ class RebalanceExecutor:
         job.state = JobState.ROUTING
 
         try:
-            # Find route from dest_peer back to us
-            route_result = self.plugin.rpc.getroute(
-                our_id,
-                job.amount_msat,
-                1,
-                fromid=job.peer_id,
-                maxhops=6,
-                fuzzpercent=0,
-            )
-            route = route_result.get("route", [])
-            if not route:
-                last_error = "no_route_back"
-                self._log(f"Job {job.job_id}: no route from {job.peer_id[:12]}... back to us")
+            # Circular route: Us →[source_chan]→ SourcePeer →...→ Us
+            #
+            # getroute(id=our_id, fromid=source_peer) finds the path from
+            # the source peer back to us.  We prepend our SOURCE channel
+            # (where we have outbound liquidity) as the first hop.
+            # The last hop of getroute's result arrives back at us via
+            # the depleted channel — completing the circle.
+            #
+            # The PRIMARY source is the best-scored source channel from
+            # the EV analysis (candidate.source_candidates[0]).
+            source_scid = candidate.source_candidates[0] if candidate.source_candidates else ""
+            source_peer = candidate.primary_source_peer_id
+            if not source_scid or not source_peer:
+                last_error = "no_source_channel"
+                self._log(f"Job {job.job_id}: no source channel for circular route")
             else:
-                # Prepend our outgoing channel as first hop.
-                # getroute(fromid=dest_peer) returns amounts from dest_peer's
-                # perspective.  We need to send dest_peer enough to cover:
-                # - route[0].amount_msat (what dest_peer forwards to next hop)
-                # - dest_peer's own forwarding fee (from gossip)
-                first_hop_scid = candidate.to_channel.replace(":", "x")
-                forward_amount = route[0].get("amount_msat", job.amount_msat)
-
-                # Get BOTH our outgoing fee AND dest peer's forwarding fee.
-                # Our node rejects the HTLC if the first hop amount doesn't
-                # cover our own channel fee (WIRE_FEE_INSUFFICIENT from 0th node).
-                our_fee_ppm = 0
-                our_base_msat = 0
-                dest_fee_ppm = 0
-                dest_base_msat = 0
-                try:
-                    chans = self.plugin.rpc.listpeerchannels(id=job.peer_id)
-                    for ch in chans.get("channels", []):
-                        if ch.get("short_channel_id") == first_hop_scid:
-                            updates = ch.get("updates", {})
-                            local = updates.get("local", {})
-                            remote = updates.get("remote", {})
-                            our_fee_ppm = int(local.get("fee_proportional_millionths", 0) or 0)
-                            our_base_msat = int(local.get("fee_base_msat", 0) or 0)
-                            dest_fee_ppm = int(remote.get("fee_proportional_millionths", 0) or 0)
-                            dest_base_msat = int(remote.get("fee_base_msat", 0) or 0)
-                            break
-                except Exception:
-                    pass
-
-                # Amount we send = what they forward + their fee + our outgoing fee
-                dest_fee_msat = dest_base_msat + (forward_amount * dest_fee_ppm) // 1_000_000
-                our_fee_msat = our_base_msat + (forward_amount * our_fee_ppm) // 1_000_000
-                first_hop_amount = forward_amount + dest_fee_msat + our_fee_msat
+                route_result = self.plugin.rpc.getroute(
+                    our_id,
+                    job.amount_msat,
+                    1,
+                    fromid=source_peer,
+                    maxhops=6,
+                    fuzzpercent=0,
+                )
+                route = route_result.get("route", [])
+            if not source_scid or not route:
+                if not last_error:
+                    last_error = "no_route_back"
+                    self._log(f"Job {job.job_id}: no route from {source_peer[:12]}... back to us")
+            else:
+                # Prepend our SOURCE channel as first hop
+                first_hop_scid = source_scid.replace(":", "x")
+                first_hop_amount = route[0].get("amount_msat", job.amount_msat)
                 first_hop_delay = route[0].get("delay", 18) + 6
 
                 full_route = [{
-                    "id": job.peer_id,
+                    "id": source_peer,
                     "channel": first_hop_scid,
                     "amount_msat": first_hop_amount,
                     "delay": first_hop_delay,
