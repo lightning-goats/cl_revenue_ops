@@ -186,6 +186,55 @@ class TestExecuteSuccess:
         assert result.attempts == 1
         assert result.route_type == "network"
 
+    def test_first_hop_uses_local_source_channel_fee_policy(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {
+                    "id": "our_id",
+                    "channel": "200x1x0",
+                    "amount_msat": 500_000_000,
+                    "delay": 18,
+                }
+            ]
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "100x1x0",
+                    "updates": {
+                        "local": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 34,
+                            "cltv_expiry_delta": 18,
+                        },
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete", "amount_sent_msat": 500_017_000
+        }
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        candidate = MockCandidate(hive_route_hops=0)
+
+        result = executor.execute(candidate)
+
+        assert result.success is True
+        sendpay_route = plugin.rpc.sendpay.call_args.kwargs["route"]
+        assert sendpay_route[0]["channel"] == "100x1x0"
+        assert sendpay_route[0]["amount_msat"] == 500_017_000
+
 
 class TestExecuteFailure:
     def test_no_routes(self):

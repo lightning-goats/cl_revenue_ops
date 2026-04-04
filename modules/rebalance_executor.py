@@ -275,7 +275,10 @@ class RebalanceExecutor:
                 first_hop_scid = source_scid.replace(":", "x")
                 forward_amount = route[0].get("amount_msat", job.amount_msat)
 
-                # Get source peer's fee + our cltv delta from channel gossip
+                # Price the prepended first hop from our local source-channel
+                # policy. sendpay validates the first directed edge against
+                # that fee schedule, so using the remote policy underpays the
+                # route and triggers WIRE_FEE_INSUFFICIENT at hop 0.
                 source_fee_ppm = 0
                 source_base_msat = 0
                 our_cltv_delta = 6
@@ -285,15 +288,20 @@ class RebalanceExecutor:
                         if ch.get("short_channel_id") == first_hop_scid:
                             updates = ch.get("updates", {})
                             local = updates.get("local", {})
-                            remote = updates.get("remote", {})
                             our_cltv_delta = int(local.get("cltv_expiry_delta", 6) or 6)
-                            # Source peer's forwarding fee (what they charge to forward)
-                            source_fee_ppm = int(remote.get("fee_proportional_millionths", 0) or 0)
-                            source_base_msat = int(remote.get("fee_base_msat", 0) or 0)
+                            fee_ppm_val = local.get("fee_proportional_millionths")
+                            if fee_ppm_val is None:
+                                fee_ppm_val = ch.get("fee_proportional_millionths", 0)
+                            fee_base_val = local.get("fee_base_msat")
+                            if fee_base_val is None:
+                                fee_base_val = ch.get("fee_base_msat", 0)
+                            source_fee_ppm = int(fee_ppm_val or 0)
+                            source_base_msat = int(fee_base_val or 0)
                             break
                 except Exception:
                     pass
-                # First hop amount = what source_peer forwards + their fee
+                # First hop amount = what the next hop must receive plus our
+                # fee for forwarding over the source channel.
                 source_fee_msat = source_base_msat + (forward_amount * source_fee_ppm) // 1_000_000
                 first_hop_amount = forward_amount + source_fee_msat
                 first_hop_delay = route[0].get("delay", 18) + our_cltv_delta
