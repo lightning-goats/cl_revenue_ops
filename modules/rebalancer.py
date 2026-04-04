@@ -8,7 +8,7 @@ This module only triggers rebalances when the math shows positive expected profi
 
 Architecture Pattern: "Strategist and Executor"
 - STRATEGIST (EVRebalancer): Calculates EV, determines IF and HOW MUCH to rebalance
-- EXECUTOR (RebalanceExecutor): Actually executes payments via native getroutes+sendpay
+- EXECUTOR (RebalanceExecutor): Executes native safe single-path circular payments
 
 Async Job Queue
 - Decouples decision-making from execution
@@ -209,7 +209,7 @@ class JobManager:
     DEPRECATED: Sling-based background rebalancing job manager.
 
     JobManager is no longer called from the active rebalance path.
-    RebalanceExecutor (native getroutes+sendpay) replaced it as the primary
+    RebalanceExecutor replaced it as the primary
     execution engine. This class is retained because diagnostic RPCs may still
     reference it for active job counts. Do not add new sling dependencies here.
     """
@@ -1916,7 +1916,7 @@ class EVRebalancer:
 
     This class acts as the "Strategist" - it calculates EV and determines
     IF and HOW MUCH to rebalance. The actual execution is delegated to
-    RebalanceExecutor (native getroutes+sendpay).
+    RebalanceExecutor.
 
     Thread Safety (I-13, I-14, S-9):
     The rebalance cycle runs single-threaded on a timer. Candidate evaluation,
@@ -1973,7 +1973,7 @@ class EVRebalancer:
         # Hive hints adapter (injected by main plugin; None = disabled)
         self.hive_hints = None
         self._hive_router = None  # HiveRouter for fleet route discovery
-        self.rebalance_executor = None  # RebalanceExecutor (native getroutes+sendpay)
+        self.rebalance_executor = None  # RebalanceExecutor (safe explicit-route executor)
         self.rpc_cache = None  # Shared RPC cache (injected by main plugin)
 
     @property
@@ -4196,8 +4196,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         """
         Execute a rebalance for the given candidate.
 
-        Uses RebalanceExecutor (native getroutes+sendpay) for all rebalances.
-        Fleet routes use hive-* layers, network routes use revenue-* layers.
+        Uses RebalanceExecutor for all live rebalances.
+        Fleet intelligence still influences planning, but execution uses the
+        safe explicit-route path for both fleet-planned and network-planned jobs.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         with self._pending_lock:
@@ -4364,8 +4365,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         self._pending.pop(candidate.to_channel, None)
                     return result
 
-            # RebalanceExecutor: native getroutes+sendpay for ALL rebalances.
-            # Fleet routes use hive-* layers (0-fee fleet paths).
+            # RebalanceExecutor: safe explicit-route execution for all rebalances.
+            # Fleet planning still uses hive intelligence before execution.
             # Network routes use revenue-* layers (best available paths).
             if self.rebalance_executor:
                 try:

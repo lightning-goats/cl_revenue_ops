@@ -561,6 +561,281 @@ class TestExecuteFailure:
         assert any(c[0][1]["inform"] == "failed" for c in inform_calls)
         assert any(c[0][1]["inform"] == "succeeded" for c in inform_calls)
 
+    def test_runtime_memory_excludes_banned_channel(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "300x1x0",
+                    "direction": 1,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                }
+            ]
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {
+                    "id": "dest_peer_abc",
+                    "channel": "300x1x0",
+                    "direction": 1,
+                    "amount_msat": 500_000_000,
+                    "delay": 24,
+                },
+            ]
+        }
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete",
+            "amount_sent_msat": 500_006_000,
+        }
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        executor._routing_memory.ban_channel("940851x30x0/0", ttl_seconds=300)
+
+        result = executor.execute(MockCandidate(hive_route_hops=0))
+
+        assert result.success is True
+        assert plugin.rpc.getroute.call_args.kwargs["exclude"] == ["940851x30x0/0"]
+
+    def test_constraint_excludes_oversized_route_before_sendpay(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "300x1x0",
+                    "direction": 1,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                },
+                {
+                    "short_channel_id": "301x1x0",
+                    "direction": 0,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                },
+            ]
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.getroute.side_effect = [
+            {
+                "route": [
+                    {
+                        "id": "dest_peer_abc",
+                        "channel": "300x1x0",
+                        "direction": 1,
+                        "amount_msat": 500_000_000,
+                        "delay": 24,
+                    },
+                ]
+            },
+            {
+                "route": [
+                    {
+                        "id": "dest_peer_abc",
+                        "channel": "301x1x0",
+                        "direction": 0,
+                        "amount_msat": 500_000_000,
+                        "delay": 24,
+                    },
+                ]
+            },
+        ]
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete",
+            "amount_sent_msat": 500_006_000,
+        }
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        executor._routing_memory.constrain_channel("300x1x0/1", 400_000_000, ttl_seconds=300)
+
+        result = executor.execute(MockCandidate(hive_route_hops=0))
+
+        assert result.success is True
+        assert plugin.rpc.getroute.call_count == 2
+        assert plugin.rpc.getroute.call_args_list[1].kwargs["exclude"] == ["300x1x0/1"]
+        plugin.rpc.sendpay.assert_called_once()
+
+    def test_temp_channel_failure_learns_ban(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "300x1x0",
+                    "direction": 1,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                },
+                {
+                    "short_channel_id": "301x1x0",
+                    "direction": 0,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                }
+            ]
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.getroute.side_effect = [
+            {
+                "route": [
+                    {
+                        "id": "dest_peer_abc",
+                        "channel": "300x1x0",
+                        "direction": 1,
+                        "amount_msat": 500_000_000,
+                        "delay": 24,
+                    },
+                ]
+            },
+            {
+                "route": [
+                    {
+                        "id": "dest_peer_abc",
+                        "channel": "301x1x0",
+                        "direction": 0,
+                        "amount_msat": 500_000_000,
+                        "delay": 24,
+                    },
+                ]
+            },
+        ]
+        plugin.rpc.waitsendpay.side_effect = [
+            FakeRpcError(error={
+                "code": 204,
+                "message": "failed: WIRE_TEMPORARY_CHANNEL_FAILURE",
+                "data": {
+                    "erring_index": 2,
+                    "erring_channel": "940851x30x0",
+                    "erring_direction": 0,
+                    "failcode": 4103,
+                    "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+                },
+            }),
+            {
+                "status": "complete",
+                "amount_sent_msat": 500_006_000,
+            },
+        ]
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        result = executor.execute(MockCandidate(hive_route_hops=0))
+
+        assert result.success is True
+        assert "940851x30x0/0" in executor._routing_memory.current_excludes()
+
+    def test_immediate_sendpay_failure_bans_first_hop(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "300x1x0",
+                    "direction": 1,
+                    "base_fee_millisatoshi": 1000,
+                    "fee_per_millionth": 10,
+                    "delay": 18,
+                }
+            ]
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {
+                    "id": "dest_peer_abc",
+                    "channel": "300x1x0",
+                    "direction": 1,
+                    "amount_msat": 500_000_000,
+                    "delay": 24,
+                },
+            ]
+        }
+        plugin.rpc.sendpay.side_effect = FakeRpcError(
+            command="sendpay",
+            error={"code": 205, "message": "failed: PAY_TRY_OTHER_ROUTE"},
+        )
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        result = executor.execute(MockCandidate(hive_route_hops=0))
+
+        assert result.success is False
+        assert "100x1x0/0" in executor._routing_memory.current_excludes()
+
     def test_execute_reserves_and_unreserves_capacity(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
