@@ -635,11 +635,13 @@ class RebalanceExecutor:
         # budget gate rejects the route as over-budget.
         if len(full_route) >= 2:
             first_scid = full_route[0].get("channel", "")
+            first_peer = full_route[0].get("id", "")
             our_fee_base = 0
             our_fee_ppm = 0
             try:
-                for ch in (self.plugin.rpc.listpeerchannels()
-                           .get("channels", [])):
+                # Query only the first hop peer (not all channels)
+                peer_chans = self.plugin.rpc.listpeerchannels(first_peer)
+                for ch in peer_chans.get("channels", []):
                     if ch.get("short_channel_id") == first_scid:
                         local = ch.get("updates", {}).get("local", {})
                         our_fee_ppm = int(local.get(
@@ -650,11 +652,17 @@ class RebalanceExecutor:
             except Exception:
                 pass
             if our_fee_ppm > 0 or our_fee_base > 0:
-                fwd_amount = full_route[1].get("amount_msat", 0)
+                fwd_amount = int(full_route[1].get("amount_msat", 0) or 0)
                 our_fee = our_fee_base + (fwd_amount * our_fee_ppm) // 1_000_000
+                adjusted = full_route[0]["amount_msat"] - our_fee
                 full_route[0]["amount_msat"] = max(
-                    full_route[1]["amount_msat"],
-                    full_route[0]["amount_msat"] - our_fee,
+                    int(full_route[1]["amount_msat"]),
+                    adjusted,
+                )
+                self._log(
+                    f"Fleet first-hop fee strip: {our_fee_ppm}ppm + "
+                    f"{our_fee_base}base = {our_fee}msat removed",
+                    level="debug",
                 )
 
         inform_path = list(path)
