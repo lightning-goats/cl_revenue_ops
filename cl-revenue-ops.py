@@ -657,13 +657,15 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-boltz-daily-budget-sats',
     default='3000',
-    description='Daily Boltz swap fee budget used by revenue-boltz loop methods (default: 3000)'
+    description='Daily Boltz swap fee budget used by revenue-boltz loop methods (default: 3000)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='revenue-ops-boltz-enforce-budget',
     default='true',
-    description='If true, reject Boltz swaps when estimated fee exceeds remaining daily budget (default: true)'
+    description='If true, reject Boltz swaps when estimated fee exceeds remaining daily budget (default: true)',
+    dynamic=True
 )
 
 plugin.add_option(
