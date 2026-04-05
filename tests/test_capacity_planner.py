@@ -1440,60 +1440,38 @@ class TestPeerDiscovery:
 class TestGraphDiscoveryAndScoring:
     """Tests for graph centrality discovery and composite candidate scoring."""
 
-    def _make_nodes(self, count, channel_count=10, total_capacity=50_000_000,
-                    start_id=0, id_prefix="02"):
+    def _make_nodes(self, count, start_id=0, id_prefix="02"):
         """Helper to generate mock listnodes output."""
         nodes = []
         for i in range(count):
             nid = f"{id_prefix}{str(start_id + i).zfill(64)}"
-            nodes.append({
-                "nodeid": nid,
-                "alias": f"node_{i}",
-                "channel_count": channel_count,
-                "total_capacity": total_capacity,
-            })
+            nodes.append({"nodeid": nid, "alias": f"node_{i}"})
         return nodes
 
-    def test_discover_from_graph_requires_800_nodes(self):
-        """Graph discovery requires 800+ known nodes."""
-        plugin = MagicMock()
-        plugin.rpc.listnodes.return_value = {
-            "nodes": self._make_nodes(100)
-        }
-
-        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
-        planner._init_cycle_cache()
-        result = planner._discover_from_graph(set())
-        assert result == []
-        # Verify it logged the insufficient nodes message
-        plugin.log.assert_called()
+    def _populate_cache(self, planner, node_id, channel_count, cap_msat_each=5_000_000_000):
+        """Populate _cycle_channels_source for a node."""
+        planner._cycle_channels_source[node_id] = [
+            {"destination": f"p{i}", "amount_msat": cap_msat_each, "active": True}
+            for i in range(channel_count)
+        ]
 
     def test_discover_from_graph_scores_by_centrality(self):
         """Nodes scored by channel_count * sqrt(capacity)."""
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_node"}
 
-        # Create nodes with different channel counts and capacities
-        nodes = [
-            {"nodeid": "node_high", "channel_count": 50, "total_capacity": 100_000_000},
-            {"nodeid": "node_medium", "channel_count": 20, "total_capacity": 50_000_000},
-            {"nodeid": "node_low", "channel_count": 10, "total_capacity": 10_000_000},
-        ]
-        # Pad with 800+ filler nodes (channel_count < 5 so they get filtered)
-        nodes.extend(self._make_nodes(800, channel_count=1))
-
-        plugin.rpc.listnodes.return_value = {"nodes": nodes}
-
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
-        planner._init_cycle_cache()
+        # Populate node registry and channel cache directly
+        for nid in ("node_high", "node_medium", "node_low"):
+            planner._cycle_nodes_by_id[nid] = {"nodeid": nid, "alias": nid}
+        self._populate_cache(planner, "node_high", 50, cap_msat_each=2_000_000_000)
+        self._populate_cache(planner, "node_medium", 20, cap_msat_each=2_500_000_000)
+        self._populate_cache(planner, "node_low", 10, cap_msat_each=1_000_000_000)
+
         result = planner._discover_from_graph(set())
 
         assert len(result) == 3
-        # Highest score should come first
         assert result[0]["peer_id"] == "node_high"
-        assert result[1]["peer_id"] == "node_medium"
-        assert result[2]["peer_id"] == "node_low"
-        # Verify scores are decreasing
         assert result[0]["score"] > result[1]["score"] > result[2]["score"]
 
     def test_discover_from_graph_excludes_existing_peers(self):
@@ -1501,16 +1479,12 @@ class TestGraphDiscoveryAndScoring:
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_node"}
 
-        nodes = [
-            {"nodeid": "existing_peer", "channel_count": 100, "total_capacity": 500_000_000},
-            {"nodeid": "new_peer", "channel_count": 20, "total_capacity": 50_000_000},
-        ]
-        nodes.extend(self._make_nodes(800, channel_count=1))
-
-        plugin.rpc.listnodes.return_value = {"nodes": nodes}
-
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
-        planner._init_cycle_cache()
+        for nid in ("existing_peer", "new_peer"):
+            planner._cycle_nodes_by_id[nid] = {"nodeid": nid, "alias": nid}
+        self._populate_cache(planner, "existing_peer", 20)
+        self._populate_cache(planner, "new_peer", 20)
+
         result = planner._discover_from_graph({"existing_peer"})
 
         peer_ids = {c["peer_id"] for c in result}
@@ -1522,16 +1496,12 @@ class TestGraphDiscoveryAndScoring:
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_node"}
 
-        nodes = [
-            {"nodeid": "our_node", "channel_count": 100, "total_capacity": 500_000_000},
-            {"nodeid": "other_node", "channel_count": 20, "total_capacity": 50_000_000},
-        ]
-        nodes.extend(self._make_nodes(800, channel_count=1))
-
-        plugin.rpc.listnodes.return_value = {"nodes": nodes}
-
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
-        planner._init_cycle_cache()
+        for nid in ("our_node", "other_node"):
+            planner._cycle_nodes_by_id[nid] = {"nodeid": nid, "alias": nid}
+        self._populate_cache(planner, "our_node", 20)
+        self._populate_cache(planner, "other_node", 20)
+
         result = planner._discover_from_graph(set())
 
         peer_ids = {c["peer_id"] for c in result}
@@ -1539,21 +1509,17 @@ class TestGraphDiscoveryAndScoring:
         assert "other_node" in peer_ids
 
     def test_discover_from_graph_skips_poorly_connected(self):
-        """Nodes with < 5 channels are excluded."""
+        """Nodes with < 5 active channels are excluded."""
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_node"}
 
-        nodes = [
-            {"nodeid": "well_connected", "channel_count": 10, "total_capacity": 50_000_000},
-            {"nodeid": "poorly_connected", "channel_count": 3, "total_capacity": 50_000_000},
-            {"nodeid": "zero_channels", "channel_count": 0, "total_capacity": 50_000_000},
-        ]
-        nodes.extend(self._make_nodes(800, channel_count=1))
-
-        plugin.rpc.listnodes.return_value = {"nodes": nodes}
-
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
-        planner._init_cycle_cache()
+        for nid in ("well_connected", "poorly_connected", "zero_channels"):
+            planner._cycle_nodes_by_id[nid] = {"nodeid": nid, "alias": nid}
+        self._populate_cache(planner, "well_connected", 10)
+        self._populate_cache(planner, "poorly_connected", 3)
+        self._populate_cache(planner, "zero_channels", 0)
+
         result = planner._discover_from_graph(set())
 
         peer_ids = {c["peer_id"] for c in result}
@@ -1566,77 +1532,61 @@ class TestGraphDiscoveryAndScoring:
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_node"}
 
-        # 20 well-connected nodes + 800 filler
-        nodes = self._make_nodes(20, channel_count=10, total_capacity=50_000_000,
-                                 id_prefix="03")
-        nodes.extend(self._make_nodes(800, channel_count=1))
-
-        plugin.rpc.listnodes.return_value = {"nodes": nodes}
-
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
-        planner._init_cycle_cache()
-        result = planner._discover_from_graph(set())
+        for i in range(20):
+            nid = f"03{str(i).zfill(64)}"
+            planner._cycle_nodes_by_id[nid] = {"nodeid": nid, "alias": f"hub{i}"}
+            self._populate_cache(planner, nid, 10)
 
+        result = planner._discover_from_graph(set())
         assert len(result) <= 10
 
-    def test_discover_from_graph_handles_listnodes_error(self):
-        """listnodes RPC failure returns empty list."""
-        plugin = MagicMock()
-        plugin.rpc.listnodes.side_effect = Exception("RPC timeout")
-
-        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
-        result = planner._discover_from_graph(set())
-        assert result == []
-
     def test_discover_from_graph_handles_getinfo_error(self):
-        """getinfo failure after listnodes returns empty list."""
+        """getinfo failure returns empty list."""
         plugin = MagicMock()
-        plugin.rpc.listnodes.return_value = {"nodes": self._make_nodes(900)}
         plugin.rpc.getinfo.side_effect = Exception("RPC timeout")
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner._cycle_nodes_by_id["some_node"] = {"nodeid": "some_node"}
+        self._populate_cache(planner, "some_node", 10)
+
         result = planner._discover_from_graph(set())
         assert result == []
 
     def test_discover_from_graph_handles_msat_capacity(self):
-        """Total capacity in msat string format is converted correctly."""
+        """Channel amount_msat values are converted to sats correctly."""
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_node"}
 
-        nodes = [
-            {"nodeid": "msat_node", "channel_count": 10,
-             "total_capacity": "50000000000msat"},  # 50M msat = 50k sat
-        ]
-        nodes.extend(self._make_nodes(800, channel_count=1))
-
-        plugin.rpc.listnodes.return_value = {"nodes": nodes}
-
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
-        planner._init_cycle_cache()
+        planner._cycle_nodes_by_id["msat_node"] = {"nodeid": "msat_node", "alias": "msat_node"}
+        # 10 channels each 5_000_000_000 msat = 5_000_000 sats each
+        planner._cycle_channels_source["msat_node"] = [
+            {"destination": f"p{i}", "amount_msat": "5000000000msat", "active": True}
+            for i in range(10)
+        ]
+
         result = planner._discover_from_graph(set())
 
         assert len(result) == 1
-        assert result[0]["total_capacity"] == 50_000_000  # Converted from msat
+        assert result[0]["total_capacity"] == 50_000_000  # 10 * 5_000_000 sats
 
     def test_discover_from_graph_missing_fields_graceful(self):
-        """Nodes without channel_count or total_capacity are handled gracefully."""
+        """Nodes with no cached channels are excluded; cached nodes with enough channels pass."""
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_node"}
-
-        nodes = [
-            {"nodeid": "no_fields_node"},  # No channel_count, no total_capacity
-            {"nodeid": "has_channels", "channel_count": 10},  # No total_capacity
-        ]
-        nodes.extend(self._make_nodes(800, channel_count=1))
-
-        plugin.rpc.listnodes.return_value = {"nodes": nodes}
+        # Exhaust fallback budget so only cache is used
+        plugin.rpc.listchannels.return_value = {"channels": []}
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
-        planner._init_cycle_cache()
+        # no_fields_node: in registry but no channel cache — gets budget fallback (empty) → excluded
+        planner._cycle_nodes_by_id["no_fields_node"] = {"nodeid": "no_fields_node"}
+        # has_channels: 10 cached active channels → included
+        planner._cycle_nodes_by_id["has_channels"] = {"nodeid": "has_channels"}
+        self._populate_cache(planner, "has_channels", 10)
+
         result = planner._discover_from_graph(set())
 
-        # no_fields_node has channel_count=0 default, so excluded
-        # has_channels has channel_count=10 but total_capacity=0
         peer_ids = {c["peer_id"] for c in result}
         assert "no_fields_node" not in peer_ids
         assert "has_channels" in peer_ids
@@ -1834,16 +1784,7 @@ class TestGraphDiscoveryAndScoring:
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_node"}
         plugin.rpc.listchannels.return_value = {"channels": []}
-
-        # Set up listnodes with 800+ nodes and one well-connected candidate
-        nodes = [
-            {"nodeid": "graph_peer", "channel_count": 20, "total_capacity": 100_000_000},
-        ]
-        filler = [
-            {"nodeid": f"filler_{i}", "channel_count": 1, "total_capacity": 100}
-            for i in range(800)
-        ]
-        plugin.rpc.listnodes.return_value = {"nodes": nodes + filler}
+        plugin.rpc.listnodes.return_value = {"nodes": []}
 
         prof_analyzer = MagicMock()
         prof_analyzer.database.get_peer_reputation.return_value = None
@@ -1855,6 +1796,13 @@ class TestGraphDiscoveryAndScoring:
 
         planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
         planner._init_cycle_cache()
+
+        # Inject a well-connected graph candidate directly into the cycle cache
+        planner._cycle_nodes_by_id["graph_peer"] = {"nodeid": "graph_peer", "alias": "GraphPeer"}
+        planner._cycle_channels_source["graph_peer"] = [
+            {"destination": f"p{i}", "amount_msat": 5_000_000_000, "active": True}
+            for i in range(20)
+        ]
 
         # No winners, empty profitability/flow
         candidates = planner._discover_peers([], {}, {})

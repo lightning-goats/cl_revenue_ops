@@ -915,58 +915,56 @@ class CapacityPlanner:
         return candidates[:10]  # Max 10 total from this strategy
 
     def _discover_from_graph(self, existing_peer_ids: set) -> List[Dict]:
-        """Strategy 3: Network centrality scoring via listnodes."""
-        nodes = list(self._cycle_nodes_by_id.values())
-        if not nodes:
-            return []
+        """Strategy 3: Network centrality scoring from cached channel data.
 
-        if len(nodes) < 800:
-            self.plugin.log(
-                f"Insufficient graph knowledge ({len(nodes)} nodes, need 800+)",
-                level='debug',
-            )
-            return []
-
-        # Get our own node ID
+        Uses channel data already cached by neighbor/route-pair lookups
+        (in _cycle_channels_source) with a 20-lookup RPC budget fallback
+        for uncached nodes in the gossip store.
+        """
         try:
             our_node_id = self.plugin.rpc.getinfo().get("id")
         except Exception:
             return []
 
         scored = []
-        for node in nodes:
-            node_id = node.get("nodeid")
-            if not node_id or node_id == our_node_id or node_id in existing_peer_ids:
+        lookup_budget = 20
+
+        for node_id, node_info in self._cycle_nodes_by_id.items():
+            if node_id == our_node_id or node_id in existing_peer_ids:
                 continue
 
-            # Channel count from the node's channel_count field if available
-            channel_count = node.get("channel_count", 0)
+            # Get channel data: prefer cache, fallback to RPC with budget
+            if node_id in self._cycle_channels_source:
+                channels = self._cycle_channels_source[node_id]
+            elif lookup_budget > 0:
+                channels = self._get_cached_channels(node_id, "source")
+                lookup_budget -= 1
+            else:
+                continue
+
+            active_channels = [ch for ch in channels if ch.get("active", False)]
+            channel_count = len(active_channels)
             if channel_count < 5:
-                continue  # Skip poorly connected nodes
+                continue
 
-            # Total capacity (if available)
-            total_capacity = node.get("total_capacity", 0)
-            if isinstance(total_capacity, str):
-                total_capacity = (
-                    int(total_capacity.replace("msat", "")) // 1000
-                    if "msat" in total_capacity
-                    else int(total_capacity)
-                )
+            total_capacity_msat = sum(
+                int(str(ch.get("amount_msat", 0)).replace("msat", ""))
+                for ch in active_channels
+            )
+            total_capacity_sats = total_capacity_msat // 1000
 
-            # Compute centrality score = channel_count * sqrt(capacity_btc)
-            capacity_btc = total_capacity / 100_000_000 if total_capacity > 0 else 0.001
+            capacity_btc = total_capacity_sats / 100_000_000 if total_capacity_sats > 0 else 0.001
             score = channel_count * math.sqrt(capacity_btc)
 
             scored.append({
                 "peer_id": node_id,
                 "source": "graph",
                 "score": score,
-                "reason": f"Graph centrality: {channel_count} channels, {total_capacity} sat capacity",
+                "reason": f"Graph centrality: {channel_count} channels, {total_capacity_sats:,} sat",
                 "channel_count": channel_count,
-                "total_capacity": total_capacity,
+                "total_capacity": total_capacity_sats,
             })
 
-        # Sort by score descending, take top 10
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:10]
 
