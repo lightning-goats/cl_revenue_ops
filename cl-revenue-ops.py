@@ -795,7 +795,8 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-planner-execute-closes',
     default='false',
-    description='Allow the capacity planner to execute close RPCs (default: false)'
+    description='Allow the capacity planner to execute close RPCs (default: false)',
+    dynamic=True
 )
 plugin.add_option(
     name='revenue-ops-hive-hints-enabled',
@@ -4154,6 +4155,9 @@ def on_setconfig(plugin: Plugin, **kwargs):
                 plugin.log(f"Dynamic config: daily_budget_sats = {boltz_manager.cfg.daily_budget_sats}")
             except ValueError:
                 pass
+    if config and config_name == "revenue-ops-planner-execute-closes":
+        config.planner_execute_closes = val_str.lower() in ("true", "1", "yes")
+        plugin.log(f"Dynamic config: planner_execute_closes = {config.planner_execute_closes}")
 
 
 @plugin.subscribe("forward_event")
