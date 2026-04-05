@@ -148,6 +148,7 @@ class GaussianThompsonState:
     DECAY_HOURS = 168.0             # 7-day half-life for observation decay
     MIN_OBSERVATIONS = 5            # Minimum before trusting posterior
     MIN_STD = 10                    # Never let uncertainty go below 10 ppm
+    ZERO_REVENUE_WEIGHT_FACTOR = 0.15  # Zero-revenue observations get 15% of time-weight
     SECONDARY_EXPLORE_BOOST = 1.25  # Slightly wider prior for secondary contexts
 
     # Prior parameters
@@ -443,8 +444,15 @@ class GaussianThompsonState:
         # Weight based on revenue (higher revenue = more confidence)
         # and observation duration (longer = more confidence)
         # MA-8: Use log scale to avoid saturation at 100 sats/hr on high-volume nodes
-        weight = min(1.0, hours / 6.0) * min(1.0, math.log1p(revenue_rate) / math.log1p(1000))
-        weight = max(0.01, weight)  # Minimum weight
+        if revenue_rate <= 0:
+            # Zero revenue: silence is weak evidence that this fee isn't working.
+            # 15% of time-weight — enough to drift the posterior, but positive
+            # observations always dominate. See dts-stagnant-decay-design.md.
+            weight = min(1.0, hours / 6.0) * self.ZERO_REVENUE_WEIGHT_FACTOR
+        else:
+            # Positive revenue: original formula (log-scaled revenue * time)
+            weight = min(1.0, hours / 6.0) * min(1.0, math.log1p(revenue_rate) / math.log1p(1000))
+            weight = max(0.01, weight)  # Minimum weight for positive observations
 
         # Add observation with time bucket (5-tuple)
         self.observations.append((fee, revenue_rate, weight, now, time_bucket))
