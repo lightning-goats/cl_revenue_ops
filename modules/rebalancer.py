@@ -243,6 +243,8 @@ class JobManager:
         # Source reliability tracking
         self.source_failure_counts: Dict[str, float] = {}
         self._source_failures_lock = threading.Lock()
+
+        self.rpc_cache = None  # Shared RPC cache (injected after construction)
         self.last_decay_time = time.time()
 
         # Periodic exclusion sync tracking
@@ -351,7 +353,7 @@ class JobManager:
         is not reported). Returns 0 for channels in closing/non-normal states.
         """
         try:
-            listfunds = self.plugin.rpc.listfunds()
+            listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
             normalized = self._normalize_scid(channel_id)
 
             for channel in listfunds.get("channels", []):
@@ -839,7 +841,7 @@ class JobManager:
         """
         balances: Dict[str, int] = {}
         try:
-            listfunds = self.plugin.rpc.listfunds()
+            listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
             for channel in listfunds.get("channels", []):
                 scid = channel.get("short_channel_id", "")
                 if not scid:
@@ -2253,7 +2255,7 @@ class EVRebalancer:
                 return 0
 
             # Get current block height
-            getinfo = self.plugin.rpc.getinfo()
+            getinfo = self.rpc_cache.getinfo() if self.rpc_cache else self.plugin.rpc.getinfo()
             current_height = getinfo.get("blockheight", 0)
 
             if current_height <= 0 or block_height <= 0:
@@ -4783,7 +4785,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         try:
             # --- Reserve check (needs listfunds RPC) ---
             try:
-                listfunds = self.plugin.rpc.listfunds()
+                listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
                 onchain_sats = 0
                 for output in listfunds.get("outputs", []):
                     if output.get("status") == "confirmed":

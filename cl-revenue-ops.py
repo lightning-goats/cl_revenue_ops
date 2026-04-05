@@ -1539,6 +1539,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if rebalancer is not None:
         rebalancer.rebalance_executor = rebalance_executor
         rebalancer.rpc_cache = rpc_cache
+        rebalancer.job_manager.rpc_cache = rpc_cache
     plugin.log("RebalanceExecutor initialized - native rebalance engine enabled")
 
     if fee_controller is not None:
