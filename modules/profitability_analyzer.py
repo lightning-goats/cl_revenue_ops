@@ -1683,7 +1683,8 @@ class ChannelProfitabilityAnalyzer:
             if open_cost is not None and capacity_sats > 0:
                 open_cost = self._sanity_check_open_cost(
                     channel_id, peer_id, funding_txid, open_cost, capacity_sats,
-                    open_timestamp=open_timestamp
+                    open_timestamp=open_timestamp,
+                    bkpr_cache=bkpr_cache
                 )
             
             # Query bookkeeper if not found
@@ -1744,7 +1745,8 @@ class ChannelProfitabilityAnalyzer:
     def _sanity_check_open_cost(self, channel_id: str, peer_id: str,
                                  funding_txid: str, open_cost: int,
                                  capacity_sats: int,
-                                 open_timestamp: Optional[int] = None) -> int:
+                                 open_timestamp: Optional[int] = None,
+                                 bkpr_cache: Optional['BookkeeperCache'] = None) -> int:
         """
         Sanity check and self-heal invalid open_cost values.
         
@@ -1780,7 +1782,7 @@ class ChannelProfitabilityAnalyzer:
         # Step 1: Force re-query from bookkeeper
         corrected_cost = None
         if funding_txid:
-            corrected_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
+            corrected_cost = self._lookup_open_cost(funding_txid, capacity_sats, bkpr_cache)
         
         # Step 2: Validate the re-queried value using centralized helper
         if corrected_cost is not None and not self._is_valid_fee_amount(corrected_cost, capacity_sats, funding_txid):
