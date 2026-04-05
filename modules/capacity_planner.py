@@ -21,6 +21,15 @@ _LOSER_SEVERITY = {
     "STAGNANT": 1,
 }
 
+# Strategy weights for score normalization (higher = more trusted signal)
+STRATEGY_WEIGHTS = {
+    "winner": 1.0,
+    "hive": 0.9,
+    "route_pair": 0.85,
+    "graph": 0.8,
+    "neighbor": 0.7,
+}
+
 
 class CapacityPlanner:
     """
@@ -1203,6 +1212,62 @@ class CapacityPlanner:
         except Exception:
             pass
 
+    def _normalize_candidate_scores(self, candidates: List[Dict]) -> List[Dict]:
+        """Normalize candidate scores within each strategy to 0-1, then apply strategy weights."""
+        by_source: Dict[str, List[Dict]] = {}
+        for c in candidates:
+            by_source.setdefault(c["source"], []).append(c)
+
+        for source, group in by_source.items():
+            max_score = max((c["score"] for c in group), default=0)
+            weight = STRATEGY_WEIGHTS.get(source, 1.0)
+            for c in group:
+                if max_score > 0:
+                    c["score"] = (c["score"] / max_score) * weight
+                else:
+                    c["score"] = 0.0
+
+        return candidates
+
+    def _apply_pool_quotas(self, candidates: List[Dict], max_pool: int = 32) -> List[Dict]:
+        """Apply reserved slot quotas per strategy, then fill remaining slots by score."""
+        RESERVED = {"hive": 4, "graph": 4, "route_pair": 4}
+        reserved_total = sum(RESERVED.values())
+        open_slots = max_pool - reserved_total
+
+        by_source: Dict[str, List[Dict]] = {}
+        for c in candidates:
+            by_source.setdefault(c["source"], []).append(c)
+
+        for group in by_source.values():
+            group.sort(key=lambda c: c["score"], reverse=True)
+
+        result = []
+        used_ids = set()
+        unfilled_slots = 0
+
+        for source, quota in RESERVED.items():
+            group = by_source.get(source, [])
+            filled = 0
+            for c in group:
+                if filled >= quota:
+                    break
+                if c["peer_id"] not in used_ids:
+                    result.append(c)
+                    used_ids.add(c["peer_id"])
+                    filled += 1
+            unfilled_slots += quota - filled
+
+        open_slots += unfilled_slots
+        all_remaining = [c for c in candidates if c["peer_id"] not in used_ids]
+        all_remaining.sort(key=lambda c: c["score"], reverse=True)
+        for c in all_remaining[:open_slots]:
+            if c["peer_id"] not in used_ids:
+                result.append(c)
+                used_ids.add(c["peer_id"])
+
+        return result
+
     def _check_fee_gate(self, cfg) -> tuple:
         """Check on-chain fee rate is acceptable. Returns (ok, reason)."""
         try:
@@ -1324,6 +1389,9 @@ class CapacityPlanner:
         # Strategy 5: route-pair analysis (neighbors of peers on profitable routes)
         candidates.extend(self._discover_from_route_pairs(all_profitability))
 
+        # Normalize scores within each strategy before dedup
+        candidates = self._normalize_candidate_scores(candidates)
+
         # Deduplicate by peer_id, keeping highest score
         seen = {}
         for c in candidates:
@@ -1335,6 +1403,9 @@ class CapacityPlanner:
         # Enrich scores with reputation, uptime, profit history
         for c in merged:
             c["score"] = self._score_candidate(c["peer_id"], c["score"])
+
+        # Apply pool slot quotas to ensure strategy diversity
+        merged = self._apply_pool_quotas(merged)
 
         # Persist to candidate pool
         self._update_candidate_pool(merged)

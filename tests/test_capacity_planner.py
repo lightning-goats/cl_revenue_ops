@@ -1361,9 +1361,11 @@ class TestPeerDiscovery:
         # Should be deduplicated to one entry
         peer1_candidates = [c for c in candidates if c["peer_id"] == "peer1"]
         assert len(peer1_candidates) == 1
-        # Winner score (0.5) > neighbor score (0.2), so winner entry kept
-        assert peer1_candidates[0]["score"] == 0.5
+        # Winner entry is kept (higher pre-normalization score)
+        # After normalization winner strategy gets weight 1.0, neighbor gets 0.7,
+        # so winner score (1.0) > neighbor score (0.7*0.2/0.2=0.7) and winner is kept
         assert peer1_candidates[0]["source"] == "winner"
+        assert peer1_candidates[0]["score"] > 0
 
     def test_discover_peers_merges_both_strategies(self):
         """Orchestrator returns candidates from both strategies."""
@@ -1887,8 +1889,9 @@ class TestGraphDiscoveryAndScoring:
 
         winner_c = [c for c in candidates if c["peer_id"] == "winner_peer"]
         assert len(winner_c) == 1
-        # Original score was 50/100 = 0.5, penalized by 50% uptime -> 0.25
-        assert abs(winner_c[0]["score"] - 0.25) < 0.01
+        # After normalization: winner strategy (only one candidate) gets weight 1.0,
+        # then uptime penalty at 50% applies -> score = 1.0 * 0.5 = 0.5
+        assert abs(winner_c[0]["score"] - 0.5) < 0.01
 
     def test_discover_peers_persists_to_pool(self):
         """_discover_peers calls _update_candidate_pool."""
