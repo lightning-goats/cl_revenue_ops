@@ -486,6 +486,9 @@ class ChannelProfitabilityAnalyzer:
             # Get all channels
             channels = self._get_all_channels()
 
+            # Batch fetch bookkeeper data with a single RPC call
+            bkpr_cache = BookkeeperCache(self.plugin.rpc)
+
             # Batch fetch all revenue data with a single RPC call
             all_revenue_data = self._get_all_revenue_data()
 
@@ -493,7 +496,9 @@ class ChannelProfitabilityAnalyzer:
                 # Pass precalculated revenue to avoid per-channel RPC calls
                 precalculated_revenue = all_revenue_data.get(channel_id)
                 profitability = self.analyze_channel(
-                    channel_id, channel_info, precalculated_revenue=precalculated_revenue
+                    channel_id, channel_info,
+                    precalculated_revenue=precalculated_revenue,
+                    bkpr_cache=bkpr_cache
                 )
                 if profitability:
                     results[channel_id] = profitability
@@ -525,9 +530,10 @@ class ChannelProfitabilityAnalyzer:
 
         return results
     
-    def analyze_channel(self, channel_id: str, 
+    def analyze_channel(self, channel_id: str,
                        channel_info: Optional[Dict] = None,
-                       precalculated_revenue: Optional[ChannelRevenue] = None) -> Optional[ChannelProfitability]:
+                       precalculated_revenue: Optional[ChannelRevenue] = None,
+                       bkpr_cache: Optional['BookkeeperCache'] = None) -> Optional[ChannelProfitability]:
         """
         Analyze profitability for a single channel.
         
@@ -558,7 +564,8 @@ class ChannelProfitabilityAnalyzer:
             # Pass opener to correctly handle remote vs local channel costs
             costs = self._get_channel_costs(
                 channel_id, peer_id, funding_txid, capacity, opener,
-                open_timestamp=open_timestamp
+                open_timestamp=open_timestamp,
+                bkpr_cache=bkpr_cache
             )
             
             # Get revenue from routing history

@@ -272,3 +272,69 @@ class TestRebalanceCostsDbOnly:
         assert costs.rebalance_cost_sats == 1500
         for call_args in analyzer.plugin.rpc.call.call_args_list:
             assert "bkpr-listaccountevents" not in str(call_args)
+
+
+# ============================================================
+# Task 5: analyze_all_channels creates one BookkeeperCache
+# ============================================================
+
+class TestAnalyzeAllChannelsBatchFetch:
+    """analyze_all_channels creates one BookkeeperCache for all channels."""
+
+    def test_single_bkpr_call_for_all_channels(self):
+        """Analyzing 3 channels makes exactly 1 bkpr-listincome call."""
+        analyzer = _make_analyzer()
+
+        # Set up 3 channels
+        analyzer.plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "state": "CHANNELD_NORMAL",
+                    "short_channel_id": f"{900000 + i}x1x0",
+                    "total_msat": "2000000000msat",
+                    "funding_txid": f"txid_{i}",
+                    "peer_id": f"peer_{i}",
+                    "opener": "local"
+                }
+                for i in range(3)
+            ]
+        }
+
+        # Set up bkpr-listincome response
+        from unittest.mock import call
+        analyzer.plugin.rpc.call.return_value = {
+            "income_events": [
+                {
+                    "account": f"reversed_{i}",
+                    "tag": "onchain_fee",
+                    "credit_msat": f"{(i + 1) * 100000}msat",
+                    "debit_msat": "0msat",
+                    "currency": "bc",
+                    "timestamp": 1700000000,
+                    "txid": f"txid_{i}"
+                }
+                for i in range(3)
+            ]
+        }
+
+        # DB returns nothing cached
+        analyzer.database.get_channel_open_cost.return_value = None
+        analyzer.database.get_channel_rebalance_costs.return_value = 0
+        analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
+        }
+        analyzer.database.get_total_routing_revenue.return_value = 0
+        analyzer.database.get_channel_routing_revenue.return_value = (0, 0, 0)
+        analyzer.database.get_last_routing_time.return_value = None
+        analyzer.database.get_channel_full_pnl.return_value = None
+        analyzer.database.get_channel_sourced_revenue.return_value = (0, 0, 0)
+
+        analyzer.analyze_all_channels(force=True)
+
+        # Only ONE bkpr-listincome call, not 3+ bkpr-listaccountevents calls
+        bkpr_calls = [
+            c for c in analyzer.plugin.rpc.call.call_args_list
+            if "bkpr" in str(c)
+        ]
+        assert len(bkpr_calls) == 1
+        assert bkpr_calls[0] == call("bkpr-listincome", {"consolidate_fees": True})
