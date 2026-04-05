@@ -57,6 +57,10 @@ class CapacityPlanner:
         # Demand-flow classifier state (populated per cycle)
         self._demand_flow_profiles: Dict[str, Any] = {}
         self._demand_flow_sink_adjacent: set = set()
+        # Capital recycling state
+        self._last_preferred_loop_out_scid: str | None = None
+        self._last_preferred_loop_out_reason: str = ""
+        self._pending_recycle: dict | None = None
         # Per-cycle gossip cache (cleared at start of each execute_cycle)
         self._cycle_nodes_by_id: Dict[str, dict] = {}
         self._cycle_channels_dest: Dict[str, list] = {}
@@ -72,6 +76,8 @@ class CapacityPlanner:
             "funding_deficit_sats": self._last_funding_deficit_sats,
             "best_candidate": dict(self._last_best_candidate) if self._last_best_candidate else None,
             "cycle_ts": self._last_cycle_ts,
+            "preferred_loop_out_scid": self._last_preferred_loop_out_scid,
+            "preferred_loop_out_reason": self._last_preferred_loop_out_reason,
         }
 
     def get_status(self) -> Dict[str, Any]:
@@ -1142,6 +1148,78 @@ class CapacityPlanner:
         except Exception as e:
             self.plugin.log(f"Demand-flow discovery failed: {e}", level='info')
             return []
+
+    def _is_recycle_eligible(
+        self, loser: Dict, protected_peers: set, route_pair_scids: set
+    ) -> tuple:
+        """Check if a channel is eligible for capital recycling.
+
+        Returns (eligible: bool, reason: str)
+        """
+        scid = loser.get("scid", "")
+        peer_id = loser.get("peer_id", "")
+
+        # Age gate: >60 days
+        try:
+            open_block = int(scid.split("x")[0])
+            info = self.plugin.rpc.getinfo()
+            current_block = info.get("blockheight", 0)
+            age_days = (current_block - open_block) * 10 / 1440
+            if age_days < 60:
+                return False, f"Channel age {age_days:.0f}d < 60d minimum"
+        except Exception:
+            return False, "Cannot determine channel age"
+
+        # Marginal ROI must be negative
+        if loser.get("marginal_roi", 0) >= 0:
+            return False, f"Marginal ROI {loser.get('marginal_roi', 0):.1f}% >= 0"
+
+        # Hive member protection
+        if self.hive_hints is not None:
+            try:
+                if self.hive_hints.is_hive_member(peer_id):
+                    return False, "Hive member protected"
+            except Exception:
+                pass
+
+        # Policy protection
+        if peer_id in protected_peers:
+            return False, "Policy-protected peer"
+
+        # Route pair protection
+        if scid in route_pair_scids:
+            return False, "On revenue route pair"
+
+        return True, "Eligible for recycling"
+
+    def _calculate_recycle_ev(
+        self, loser: Dict, candidate: Dict, cfg
+    ) -> float:
+        """Calculate EV of closing loser and opening to candidate.
+
+        Returns recycle_ev in sats.
+        """
+        capacity = loser.get("capacity", 0)
+
+        # Candidate EV
+        candidate_ev = self._calculate_open_ev(candidate["peer_id"], capacity, cfg)
+
+        # Residual value: credit the loser for its remaining earnings (90-day horizon)
+        marginal_30d = loser.get("marginal_profit_30d_sats", 0)
+        residual_value = marginal_30d * 3
+
+        # On-chain costs
+        try:
+            feerates = self.plugin.rpc.feerates(style="perkb")
+            sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
+            close_cost = int(sat_per_vb * 200)
+            open_cost = int(sat_per_vb * 140)
+        except Exception:
+            close_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+            open_cost = ChainCostDefaults.CHANNEL_OPEN_COST_SATS
+
+        recycle_ev = candidate_ev - residual_value - close_cost - open_cost
+        return recycle_ev
 
     def _score_candidate(self, peer_id: str, base_score: float) -> float:
         """Enrich candidate score with reputation, uptime, and profit history."""
