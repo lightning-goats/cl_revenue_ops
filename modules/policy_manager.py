@@ -975,6 +975,8 @@ class PolicyManager:
 
                 net_pnl = bleeder.get('net_pnl_sats', 0)
                 forward_count = bleeder.get('forward_count', 0)
+                sourced_forward_count = bleeder.get('sourced_forward_count', 0)
+                total_activity = forward_count + sourced_forward_count
                 rebalance_cost = bleeder.get('rebalance_cost_sats', 0)
 
                 # Query success rate trend: compare recent (7d) vs historical (30d)
@@ -994,7 +996,7 @@ class PolicyManager:
                         self.plugin.log(f"Bleeder trend query failed for {channel_id[:12]}...: {e}", level='debug')
 
                 # Determine suggestion type
-                if forward_count == ZOMBIE_FORWARD_THRESHOLD and net_pnl < 0:
+                if total_activity == ZOMBIE_FORWARD_THRESHOLD and net_pnl < 0:
                     # Zombie: No activity but costs money
                     suggestions.append({
                         'peer_id': peer_id,

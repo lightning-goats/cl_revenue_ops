@@ -472,3 +472,98 @@ class TestClassificationTotalForwardCount:
         assert classification == ProfitabilityClass.BREAK_EVEN, (
             f"Hive member with 50 forwards should be BREAK_EVEN, got {classification.value}"
         )
+
+
+class TestPolicyManagerZombieCheck:
+    """Policy manager ZOMBIE check uses total activity."""
+
+    def test_inbound_gateway_not_flagged_as_zombie(self):
+        """Channel with 0 exit forwards but 50 sourced forwards is not ZOMBIE."""
+        import threading
+        from modules.policy_manager import PolicyManager
+
+        mock_plugin = MagicMock()
+        mock_db = MagicMock()
+        mock_db.get_channel_rebalance_success_rate.return_value = None
+
+        pm = PolicyManager.__new__(PolicyManager)
+        pm.plugin = mock_plugin
+        pm.database = mock_db
+        pm._policies = {}
+        pm._cache = {}
+        pm._cache_valid = True  # Prevent _load_cache from hitting DB
+        pm._cache_lock = threading.Lock()
+        pm._change_timestamps = {}
+        pm.hive_hints = None
+
+        mock_pa = MagicMock()
+        mock_pa.identify_bleeders.return_value = [{
+            'channel_id': '100x1x0',
+            'peer_id': '02' + 'a' * 64,
+            'capacity_sats': 2_000_000,
+            'direct_revenue_sats': 0,
+            'sourced_fee_contribution_sats': 120,
+            'sourced_volume_sats': 50_000,
+            'total_contribution_sats': 120,
+            'rebalance_cost_sats': 200,
+            'net_pnl_sats': -80,
+            'direct_forward_count': 0,
+            'sourced_forward_count': 50,
+            'total_forward_count': 50,
+            'loss_per_forward': 2,
+            'revenue_sats': 0,
+            'forward_count': 0,
+        }]
+
+        suggestions = pm.get_policy_suggestions(profitability_analyzer=mock_pa)
+
+        zombie_suggestions = [s for s in suggestions if s.get('action') == 'consider_close']
+        assert len(zombie_suggestions) == 0, (
+            f"Inbound gateway with 50 sourced forwards should not be flagged as zombie. "
+            f"Got: {zombie_suggestions}"
+        )
+
+
+class TestBleederIdentification:
+    """Bleeder identification includes sourced metrics."""
+
+    def test_identify_bleeders_includes_sourced_forward_count(self):
+        """identify_bleeders output includes sourced_forward_count."""
+        try:
+            from modules.profitability_analyzer import ChannelProfitabilityAnalyzer as ProfitabilityAnalyzer
+        except ImportError:
+            from modules.profitability_analyzer import ProfitabilityAnalyzer
+
+        mock_plugin = MagicMock()
+        mock_db = MagicMock()
+
+        mock_db.get_channel_full_pnl.return_value = {
+            'direct_revenue_msat': 0,
+            'direct_revenue_sats': 0,
+            'direct_forward_count': 0,
+            'sourced_volume_msat': 50_000_000,
+            'sourced_volume_sats': 50_000,
+            'sourced_fee_contribution_msat': 120_000,
+            'sourced_fee_contribution_sats': 120,
+            'sourced_forward_count': 50,
+            'total_contribution_msat': 120_000,
+            'total_contribution_sats': 120,
+            'rebalance_cost_sats': 200,
+            'net_pnl_msat': -80_000,
+            'net_pnl_sats': -80,
+            'revenue_sats': 0,
+            'forward_count': 0,
+        }
+
+        analyzer = ProfitabilityAnalyzer.__new__(ProfitabilityAnalyzer)
+        analyzer.plugin = mock_plugin
+        analyzer.database = mock_db
+        analyzer._get_all_channels = lambda: {
+            "100x1x0": {"peer_id": "02" + "a" * 64, "capacity": 2_000_000}
+        }
+
+        bleeders = analyzer.identify_bleeders(window_days=30)
+        assert len(bleeders) == 1
+        b = bleeders[0]
+        assert b['sourced_forward_count'] == 50
+        assert b['total_forward_count'] == 50

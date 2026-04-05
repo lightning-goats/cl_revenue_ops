@@ -1313,8 +1313,8 @@ class ChannelProfitabilityAnalyzer:
 
                     # Check for bleeder condition: net < 0 AND has activity
                     # Now uses total_contribution which includes sourced fee value
-                    net_pnl = pnl.get('net_pnl_sats', 0)
-                    if net_pnl < 0 and total_activity > 0:
+                    net_pnl_sats = pnl.get('net_pnl_sats', pnl.get('net_pnl_msat', 0) // 1000)
+                    if net_pnl_sats < 0 and total_activity > 0:
                         bleeders.append({
                             'channel_id': channel_id,
                             'peer_id': info.get('peer_id', ''),
@@ -1327,11 +1327,11 @@ class ChannelProfitabilityAnalyzer:
                             # Combined metrics
                             'total_contribution_sats': pnl.get('total_contribution_sats', 0),
                             'rebalance_cost_sats': pnl.get('rebalance_cost_sats', 0),
-                            'net_pnl_sats': net_pnl,
+                            'net_pnl_sats': net_pnl_sats,
                             'direct_forward_count': pnl.get('direct_forward_count', 0),
                             'sourced_forward_count': pnl.get('sourced_forward_count', 0),
                             'total_forward_count': total_activity,
-                            'loss_per_forward': round(abs(net_pnl) / max(total_activity, 1)),
+                            'loss_per_forward': round(abs(net_pnl_sats) / max(total_activity, 1)),
                             # Legacy fields for backward compatibility
                             'revenue_sats': pnl.get('direct_revenue_sats', 0),
                             'forward_count': pnl.get('direct_forward_count', 0)
@@ -1395,9 +1395,9 @@ class ChannelProfitabilityAnalyzer:
 
                     # Extract metrics
                     rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
-                    revenue_30d = pnl_30d.get('total_contribution_sats', 0)
-                    net_profit_30d = pnl_30d.get('net_pnl_sats', 0)
-                    net_profit_7d = pnl_7d.get('net_pnl_sats', 0)
+                    revenue_30d = pnl_30d.get('total_contribution_sats', pnl_30d.get('total_contribution_msat', 0) // 1000)
+                    net_profit_30d = pnl_30d.get('net_pnl_sats', pnl_30d.get('net_pnl_msat', 0) // 1000)
+                    net_profit_7d = pnl_7d.get('net_pnl_sats', pnl_7d.get('net_pnl_msat', 0) // 1000)
 
                     # Adjust for success rate — effective cost accounts for failed attempts
                     success_data = self.database.get_channel_rebalance_success_rate(channel_id, window_days)
