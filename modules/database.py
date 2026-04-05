@@ -1107,6 +1107,24 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_status ON planner_actions(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_peer ON planner_actions(peer_id)")
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS planner_recycle_ops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                close_scid TEXT NOT NULL,
+                close_peer_id TEXT NOT NULL,
+                open_peer_id TEXT NOT NULL,
+                open_amount_sats INTEGER NOT NULL,
+                recycle_ev_sats INTEGER NOT NULL,
+                funding_source TEXT NOT NULL DEFAULT 'close',
+                status TEXT NOT NULL DEFAULT 'pending_close',
+                cycles_waited INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                close_action_id INTEGER,
+                open_action_id INTEGER
+            )
+        """)
+
         self.plugin.log("Database initialized successfully")
     
 
@@ -5481,6 +5499,67 @@ class Database:
         ).fetchone()
         return row['avg_fee'] if row and row['avg_fee'] else 1.0
     
+    def create_recycle_op(self, close_scid: str, close_peer_id: str,
+                          open_peer_id: str, open_amount_sats: int,
+                          recycle_ev_sats: int, funding_source: str = "close") -> int:
+        """Create a new recycle operation. Returns the operation ID."""
+        conn = self._get_connection()
+        cursor = conn.execute(
+            """INSERT INTO planner_recycle_ops
+               (close_scid, close_peer_id, open_peer_id, open_amount_sats,
+                recycle_ev_sats, funding_source, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending_close', ?)""",
+            (close_scid, close_peer_id, open_peer_id, open_amount_sats,
+             recycle_ev_sats, funding_source, int(time.time())),
+        )
+        return cursor.lastrowid
+
+    def get_pending_recycle_op(self) -> dict | None:
+        """Get the active (non-terminal) recycle operation, if any."""
+        conn = self._get_connection()
+        row = conn.execute(
+            """SELECT * FROM planner_recycle_ops
+               WHERE status IN ('pending_close', 'pending_open')
+               ORDER BY created_at DESC LIMIT 1"""
+        ).fetchone()
+        if row:
+            return dict(row)
+        return None
+
+    def update_recycle_op(self, op_id: int, status: str = None,
+                          close_action_id: int = None,
+                          open_action_id: int = None):
+        """Update a recycle operation's status and action IDs."""
+        conn = self._get_connection()
+        updates = []
+        params = []
+        if status:
+            updates.append("status = ?")
+            params.append(status)
+            if status in ("completed", "failed", "expired"):
+                updates.append("completed_at = ?")
+                params.append(int(time.time()))
+        if close_action_id is not None:
+            updates.append("close_action_id = ?")
+            params.append(close_action_id)
+        if open_action_id is not None:
+            updates.append("open_action_id = ?")
+            params.append(open_action_id)
+        if updates:
+            params.append(op_id)
+            conn.execute(
+                f"UPDATE planner_recycle_ops SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+
+    def increment_recycle_cycles_waited(self, op_id: int):
+        """Increment the cycles_waited counter for a recycle operation."""
+        conn = self._get_connection()
+        conn.execute(
+            "UPDATE planner_recycle_ops SET cycles_waited = cycles_waited + 1 WHERE id = ?",
+            (op_id,),
+        )
+
     def close(self):
         """Close the thread-local database connection (if any).
 
