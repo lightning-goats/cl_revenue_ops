@@ -2589,6 +2589,28 @@ def planner_candidate_sources(plugin: Plugin):
     return capacity_planner.get_candidate_sources()
 
 
+@plugin.method("revenue-hive-hints-status")
+def revenue_hive_hints_status(plugin: Plugin):
+    """Show HiveHintAdapter status: freshness, snapshot age, hint count, and signal coverage."""
+    if hive_hints is None:
+        return {"error": "Hive hints not enabled"}
+    status = hive_hints.get_status()
+    # Add signal coverage stats
+    if hive_hints._snapshot and isinstance(hive_hints._snapshot.get("hints"), dict):
+        hints = hive_hints._snapshot["hints"]
+        has_traffic = sum(1 for h in hints.values() if h.get("traffic_confidence", 0) > 0)
+        has_quality = sum(1 for h in hints.values() if h.get("peer_quality_score") is not None)
+        has_corridor = sum(1 for h in hints.values() if h.get("corridor_role", "none") != "none")
+        has_open_hint = sum(1 for h in hints.values() if isinstance(h.get("channel_open_hint"), dict))
+        status["signal_coverage"] = {
+            "traffic_confidence_gt_0": has_traffic,
+            "peer_quality_score": has_quality,
+            "corridor_role_non_none": has_corridor,
+            "channel_open_hint": has_open_hint,
+        }
+    return status
+
+
 @plugin.method("revenue-planner-candidates")
 def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
     """List scored peer candidates for channel opens."""
