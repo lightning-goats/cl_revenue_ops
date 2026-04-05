@@ -942,11 +942,12 @@ class GaussianThompsonState:
     MIN_PRECISION = 0.000025
 
     def apply_dts_discount(self, gamma: float = 0.95) -> None:
-        """Apply Discounted Thompson Sampling decay to posterior precision.
+        """Apply Discounted Thompson Sampling decay to both posteriors.
 
-        Widens the posterior by reducing precision, making the model
-        "5% less certain" per cycle. Replaces HistoricalResponseCurve
-        regime detection.
+        Widens the Gaussian posterior by reducing precision and decays
+        the polynomial posterior precision matrix, making the model
+        "less certain" per cycle. Without the polynomial decay, old
+        observations retain full influence indefinitely.
 
         The controller typically uses gamma=0.98 for active channels and
         gamma=0.992 for sparse/quiet channels. Lower gamma values remain
@@ -961,6 +962,14 @@ class GaussianThompsonState:
         precision *= gamma
         precision = max(precision, self.MIN_PRECISION)
         self.posterior_std = math.sqrt(1.0 / precision)
+
+        # Polynomial posterior discount — decay precision matrix so old
+        # observations lose influence. Without this, the polynomial
+        # posterior accumulates confidence indefinitely.
+        if self.posterior_precision is not None:
+            for i in range(3):
+                for j in range(3):
+                    self.posterior_precision[i][j] *= gamma
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state to dict for database storage."""

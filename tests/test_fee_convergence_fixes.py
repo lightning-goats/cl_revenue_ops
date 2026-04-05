@@ -68,3 +68,58 @@ class TestSleepExemption:
         floor_ppm = 15
         zero_rev_exploring = (current_revenue_rate <= 0 and current_fee_ppm > floor_ppm)
         assert zero_rev_exploring is False
+
+
+class TestPolynomialPosteriorDiscount:
+    """DTS discount applies to polynomial posterior precision, not just Gaussian."""
+
+    def test_discount_scales_polynomial_precision(self):
+        """apply_dts_discount scales posterior_precision matrix by gamma."""
+        ts = GaussianThompsonState()
+        ts.posterior_precision = [
+            [100.0, 10.0, 1.0],
+            [10.0, 50.0, 5.0],
+            [1.0, 5.0, 25.0],
+        ]
+        ts.posterior_std = 50.0
+
+        ts.apply_dts_discount(gamma=0.98)
+
+        assert abs(ts.posterior_precision[0][0] - 98.0) < 0.01
+        assert abs(ts.posterior_precision[1][1] - 49.0) < 0.01
+        assert abs(ts.posterior_precision[2][2] - 24.5) < 0.01
+        assert abs(ts.posterior_precision[0][1] - 9.8) < 0.01
+
+    def test_discount_no_crash_when_precision_is_none(self):
+        """apply_dts_discount handles None posterior_precision gracefully."""
+        ts = GaussianThompsonState()
+        ts.posterior_precision = None
+        ts.posterior_std = 50.0
+
+        ts.apply_dts_discount(gamma=0.98)
+        assert ts.posterior_std > 50.0  # Gaussian still widened
+
+    def test_polynomial_precision_decays_over_100_cycles(self):
+        """After 100 cycles at gamma=0.98, precision is ~13% of original."""
+        ts = GaussianThompsonState()
+        ts.posterior_precision = [
+            [100.0, 0.0, 0.0],
+            [0.0, 100.0, 0.0],
+            [0.0, 0.0, 100.0],
+        ]
+
+        for _ in range(100):
+            ts.apply_dts_discount(gamma=0.98)
+
+        expected = 100.0 * (0.98 ** 100)
+        assert abs(ts.posterior_precision[0][0] - expected) < 0.5
+
+    def test_gaussian_discount_still_applies(self):
+        """Gaussian posterior_std is still widened (existing behavior)."""
+        ts = GaussianThompsonState()
+        ts.posterior_precision = None
+        original_std = 50.0
+        ts.posterior_std = original_std
+
+        ts.apply_dts_discount(gamma=0.98)
+        assert ts.posterior_std > original_std
