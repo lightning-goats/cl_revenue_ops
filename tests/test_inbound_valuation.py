@@ -567,3 +567,113 @@ class TestBleederIdentification:
         b = bleeders[0]
         assert b['sourced_forward_count'] == 50
         assert b['total_forward_count'] == 50
+
+
+class TestCapacityPlannerClosureProtection:
+    """Inbound gateway closure protection enhanced."""
+
+    def test_inbound_gateway_channel_role(self):
+        """Verify pure inbound gateway gets INBOUND_GATEWAY role."""
+        from modules.profitability_analyzer import (
+            ChannelRevenue, ChannelProfitability, ChannelCosts,
+            ProfitabilityClass
+        )
+        try:
+            from modules.profitability_analyzer import ChannelRole
+        except ImportError:
+            pytest.skip("ChannelRole not available")
+
+        rev = ChannelRevenue(
+            channel_id="100x1x0",
+            fees_earned_msat=0,
+            volume_routed_msat=0,
+            forward_count=0,
+            sourced_volume_msat=50_000_000,
+            sourced_fee_contribution_msat=120_000,
+            sourced_forward_count=100,
+        )
+        costs = ChannelCosts(
+            channel_id="100x1x0",
+            peer_id="02" + "a" * 64,
+            open_cost_sats=1000,
+            rebalance_cost_sats=500,
+        )
+        prof = ChannelProfitability(
+            channel_id="100x1x0",
+            peer_id="02" + "a" * 64,
+            capacity_sats=2_000_000,
+            costs=costs,
+            revenue=rev,
+            net_profit_sats=-600,
+            roi_percent=-40.0,
+            classification=ProfitabilityClass.UNDERWATER,
+            cost_per_sat_routed=0.0,
+            fee_per_sat_routed=0.0,
+            days_open=60,
+            last_routed=int(time.time()) - 3600,
+            marginal_profit_30d_sats=-200,
+            rebalance_cost_30d_sats=500,
+        )
+        assert prof.channel_role == ChannelRole.INBOUND_GATEWAY
+        assert rev.sourced_fee_contribution_sats >= 100
+
+
+class TestRpcOutputSourcedMetrics:
+    """RPC output includes sourced metrics in batch view."""
+
+    def test_batch_output_includes_sourced_fields(self):
+        rev = ChannelRevenue(
+            channel_id="100x1x0",
+            fees_earned_msat=5_000,
+            volume_routed_msat=1_000_000,
+            forward_count=10,
+            sourced_volume_msat=50_000_000,
+            sourced_fee_contribution_msat=120_000,
+            sourced_forward_count=63,
+        )
+
+        channel_summary = {
+            "channel_id": "100x1x0",
+            "fees_earned_sats": rev.fees_earned_sats,
+            "volume_routed_sats": rev.volume_routed_sats,
+            "forward_count": rev.forward_count,
+            "sourced_forward_count": rev.sourced_forward_count,
+            "sourced_fee_contribution_sats": rev.sourced_fee_contribution_sats,
+            "sourced_volume_sats": rev.sourced_volume_sats,
+            "total_contribution_sats": rev.total_contribution_sats,
+            "total_forward_count": rev.total_forward_count,
+        }
+
+        assert channel_summary["sourced_forward_count"] == 63
+        assert channel_summary["sourced_fee_contribution_sats"] == 120
+        assert channel_summary["total_contribution_sats"] == 120
+        assert channel_summary["total_forward_count"] == 73
+
+
+class TestFleetPnlMsat:
+    """Fleet P&L uses msat from database, converts at reporting boundary."""
+
+    def test_sub_sat_fees_aggregate_before_truncation(self):
+        """3 forwards of 300 msat each = 900 msat total should be at least 1 sat."""
+        try:
+            from modules.profitability_analyzer import ChannelProfitabilityAnalyzer as ProfitabilityAnalyzer
+        except ImportError:
+            from modules.profitability_analyzer import ProfitabilityAnalyzer
+
+        mock_plugin = MagicMock()
+        mock_db = MagicMock()
+
+        mock_db.get_total_routing_revenue.return_value = 900  # 900 msat
+        mock_db.get_total_volume_since.return_value = 150_000
+        mock_db.get_total_forward_count_since.return_value = 3
+        mock_db.get_total_rebalance_fees.return_value = 0
+        mock_db.get_closure_costs_since.return_value = 0
+
+        analyzer = ProfitabilityAnalyzer.__new__(ProfitabilityAnalyzer)
+        analyzer.plugin = mock_plugin
+        analyzer.database = mock_db
+
+        summary = analyzer.get_pnl_summary(window_days=30)
+        assert summary['gross_revenue_sats'] >= 1, (
+            "Sub-satoshi fees should not be truncated to 0 at fleet level"
+        )

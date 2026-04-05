@@ -2875,8 +2875,12 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                     "flow_profile": flow_profile,
                     "forward_count": outbound_count,
                     "sourced_forward_count": inbound_count,
+                    "total_forward_count": result.revenue.total_forward_count,
                     "fees_earned_sats": result.revenue.fees_earned_sats,
                     "volume_routed_sats": result.revenue.volume_routed_sats,
+                    "sourced_fee_contribution_sats": result.revenue.sourced_fee_contribution_sats,
+                    "sourced_volume_sats": result.revenue.sourced_volume_sats,
+                    "total_contribution_sats": result.revenue.total_contribution_sats,
                 }
                 summary[result.classification.value].append(channel_summary)
                 flow_profiles[flow_profile].append(ch_id)

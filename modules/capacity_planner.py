@@ -630,9 +630,18 @@ class CapacityPlanner:
             except Exception:
                 pass
 
-            # If inbound gateway, require much worse marginal ROI before closure
-            if is_inbound_gateway and prof.marginal_roi_percent > -50.0:
-                continue  # Protect inbound gateways
+            # Protect inbound gateways — they source traffic for the fleet
+            if is_inbound_gateway and prof.marginal_roi_percent > -30.0:
+                continue  # Protect inbound gateways (tighter threshold)
+
+            # Protect channels that source significant fee contribution
+            # regardless of their own ROI — they enable other channels' revenue.
+            # Uses all-time sourced contribution from ChannelRevenue (not 30d window)
+            # because channels with a history of sourcing are worth protecting even
+            # if recent volume is lower. Avoids modifying ChannelProfitability dataclass.
+            sourced_fee_sats = getattr(prof.revenue, 'sourced_fee_contribution_sats', 0)
+            if sourced_fee_sats > 100 and prof.marginal_roi_percent > -50.0:
+                continue  # Protect significant inbound sources
 
             # Route-pair protection: channels on proven revenue routes have network value
             # beyond their individual ROI.  Closing one kills the paired channel's revenue.

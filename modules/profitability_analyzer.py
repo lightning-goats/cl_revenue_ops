@@ -1236,8 +1236,9 @@ class ChannelProfitabilityAnalyzer:
 
         since_timestamp = int(time.time()) - (window_days * 86400)
 
-        # Get revenue (routing fees earned)
-        gross_revenue_sats = self.database.get_total_routing_revenue(since_timestamp)
+        # Get revenue (routing fees earned) — DB returns msat, convert at boundary
+        gross_revenue_msat = self.database.get_total_routing_revenue(since_timestamp)
+        gross_revenue_sats = max(1, gross_revenue_msat // 1000) if gross_revenue_msat > 0 else 0
 
         # Get volume and forward count for dashboard metrics
         volume_sats = self.database.get_total_volume_since(since_timestamp)
