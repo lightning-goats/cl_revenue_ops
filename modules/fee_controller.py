@@ -1673,6 +1673,10 @@ class FeeController:
 
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
+        try:
+            self._our_node_id: str = self.plugin.rpc.getinfo().get("id", "")
+        except Exception:
+            self._our_node_id = ""
 
         self._last_decision_summary: Dict[str, Any] = {
             "action": "hold",
@@ -1816,6 +1820,32 @@ class FeeController:
         except Exception:
             return None
 
+    def _get_our_id(self) -> str:
+        """Return our node ID, cached forever (never changes at runtime)."""
+        if not self._our_node_id:
+            self._our_node_id = self.plugin.rpc.getinfo().get("id", "")
+        return self._our_node_id
+
+    def _get_peer_inbound_channels(self, peer_id: str) -> list:
+        """Get channels pointing at peer_id, cached for 30 minutes.
+
+        Uses the same cache dict as _get_neighbor_fee_median but with
+        a different key prefix. Returns [] on RPC failure.
+        """
+        cache_key = f"gossip_channels_{peer_id}"
+        cached = self._neighbor_fee_cache.get(cache_key)
+        if cached and (time.time() - cached["ts"]) < 1800:
+            return cached["value"]
+
+        try:
+            channels = self.plugin.rpc.listchannels(destination=peer_id)
+            result = channels.get("channels", [])
+        except Exception:
+            result = []
+
+        self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
+        return result
+
     def _get_neighbor_fee_median(self, peer_id: str) -> int | None:
         """Get median fee charged by other nodes to the same peer.
 
@@ -1853,12 +1883,12 @@ class FeeController:
 
         try:
             now = time.time()
-            our_id = self.plugin.rpc.getinfo().get("id", "")
-            channels = self.plugin.rpc.listchannels(destination=peer_id)
+            our_id = self._get_our_id()
+            peer_channels = self._get_peer_inbound_channels(peer_id)
 
             # Collect fee + weight pairs (weight = capacity * recency)
             weighted_fees = []
-            for ch in channels.get("channels", []):
+            for ch in peer_channels:
                 if ch.get("source") == our_id:
                     continue
                 if not ch.get("active", False):
@@ -1893,7 +1923,7 @@ class FeeController:
         except Exception:
             return None
 
-    def _get_competitive_undercut_pct(self, peer_id: str, channel_id: str) -> float:
+    def _get_competitive_undercut_pct(self, peer_id: str, channel_id: str, neighbor_median: int | None = None) -> float:
         """Calculate intelligent undercut percentage based on competitive position.
 
         Considers our channel capacity vs competitors:
@@ -1907,9 +1937,8 @@ class FeeController:
         Returns 0.0 if insufficient data.
         """
         try:
-            our_id = self.plugin.rpc.getinfo().get("id", "")
-            channels = self.plugin.rpc.listchannels(destination=peer_id)
-            all_channels = channels.get("channels", [])
+            our_id = self._get_our_id()
+            all_channels = self._get_peer_inbound_channels(peer_id)
 
             # Find our capacity and competitor capacities
             our_capacity = 0
@@ -1937,7 +1966,8 @@ class FeeController:
             base_undercut = 0.05 + (our_rank_pct * 0.10)
 
             # Corridor value adjustment
-            neighbor_median = self._get_neighbor_fee_median(peer_id)
+            if neighbor_median is None:
+                neighbor_median = self._get_neighbor_fee_median(peer_id)
             if neighbor_median is not None:
                 if neighbor_median > 300:
                     base_undercut += 0.05  # High-fee corridor, undercut more aggressively
@@ -3916,7 +3946,7 @@ class FeeController:
             # High-fee corridors get more aggressive undercut. Low-fee corridors
             # get less (margins are thin).
             if neighbor_median is not None:
-                undercut_pct = self._get_competitive_undercut_pct(peer_id, channel_id)
+                undercut_pct = self._get_competitive_undercut_pct(peer_id, channel_id, neighbor_median)
                 undercut_target = int(neighbor_median * (1.0 - undercut_pct))
                 undercut_target = max(floor_ppm, undercut_target)  # Never below floor
 
