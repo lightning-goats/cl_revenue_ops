@@ -1956,15 +1956,53 @@ def run_fee_adjustment():
                 mode="create-or-replace",
             )
 
+            # Push fee bounds for cl-hive fee intelligence
+            try:
+                cfg_snap = config.snapshot() if config else None
+                if cfg_snap:
+                    safe_plugin.rpc.datastore(
+                        key=["revenue", "fee-bounds"],
+                        string=_json.dumps({
+                            "timestamp": int(time.time()),
+                            "min_fee_ppm": cfg_snap.min_fee_ppm,
+                            "max_fee_ppm": cfg_snap.max_fee_ppm,
+                            "mid_fee_ppm": (cfg_snap.min_fee_ppm + cfg_snap.max_fee_ppm) // 2,
+                        }),
+                        mode="create-or-replace",
+                    )
+            except Exception:
+                plugin.log("Datastore push failed for fee-bounds", level="debug")
+
             # NOTE: revenue-profitability is too large for datastore (47 channels
             # of detailed data).  The Bridge's get_profitability() call is
             # infrequent and can stay as cross-plugin RPC fallback.
         except Exception:
             pass  # Datastore push is best-effort
 
+        # Push dashboard snapshot (cheap, idempotent, runs each fee cycle)
+        _push_dashboard_to_datastore()
+
     except Exception as e:
         plugin.log(f"Fee adjustment failed: {e}", level='error')
         raise
+
+
+def _push_dashboard_to_datastore() -> None:
+    """Push 30-day dashboard snapshot to datastore for cl-hive."""
+    global safe_plugin, profitability_analyzer, database
+    if safe_plugin is None or profitability_analyzer is None or database is None:
+        return
+    try:
+        dashboard = revenue_dashboard(plugin, window_days=30)
+        if isinstance(dashboard, dict) and "error" not in dashboard:
+            dashboard["timestamp"] = int(time.time())
+            safe_plugin.rpc.datastore(
+                key=["revenue", "dashboard"],
+                string=json.dumps(dashboard),
+                mode="create-or-replace",
+            )
+    except Exception:
+        plugin.log("Datastore push failed for dashboard", level="debug")
 
 
 def run_rebalance_check():
