@@ -1071,16 +1071,20 @@ class CapacityPlanner:
     def _discover_from_hive(self) -> List[Dict]:
         """Strategy 4: Propose peers where cl_hive recommends channel opening."""
         if self.hive_hints is None:
+            self.plugin.log("Hive discovery: hive_hints not injected, skipping", level='debug')
             return []
         try:
             open_candidates = self.hive_hints.get_open_candidates()
-        except Exception:
+        except Exception as e:
+            self.plugin.log(f"Hive discovery: get_open_candidates() failed: {e}", level='info')
+            return []
+        if not open_candidates:
+            self.plugin.log("Hive discovery: get_open_candidates() returned empty", level='debug')
             return []
         candidates = []
         for peer_id, hint in open_candidates:
             confidence = hint.get("topology_confidence", 0.0)
             reason_str = hint.get("reason", "hive_topology")
-            bucket = hint.get("suggested_size_bucket")
             candidates.append({
                 "peer_id": peer_id,
                 "source": "hive",
@@ -1088,6 +1092,7 @@ class CapacityPlanner:
                 "reason": f"Hive: {reason_str}",
                 "hive_open_hint": hint,
             })
+        self.plugin.log(f"Hive discovery: produced {len(candidates)} candidates", level='debug')
         return candidates
 
     def _score_candidate(self, peer_id: str, base_score: float) -> float:
@@ -1265,6 +1270,30 @@ class CapacityPlanner:
                 used_ids.add(c["peer_id"])
 
         return result
+
+    def get_candidate_sources(self) -> Dict[str, Any]:
+        """Return strategy distribution of the current candidate pool."""
+        db = self.profitability.database if self.profitability else None
+        if not db:
+            return {"error": "no database"}
+        try:
+            candidates = db.get_planner_candidates(min_score=-999.0, limit=100)
+        except Exception as e:
+            return {"error": str(e)}
+
+        by_source: Dict[str, int] = {}
+        for c in candidates:
+            src = c.get("source", "unknown")
+            by_source[src] = by_source.get(src, 0) + 1
+
+        return {
+            "total": len(candidates),
+            "by_source": by_source,
+            "candidates": [
+                {"peer_id": c["peer_id"], "score": round(c["score"], 4), "source": c["source"]}
+                for c in sorted(candidates, key=lambda x: x["score"], reverse=True)
+            ],
+        }
 
     def _check_fee_gate(self, cfg) -> tuple:
         """Check on-chain fee rate is acceptable. Returns (ok, reason)."""
