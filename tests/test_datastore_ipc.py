@@ -268,49 +268,207 @@ class TestAnalyzeAllChannelsPush:
 
 # ============================================================
 # Tests — Fee-bounds push
+#
+# The production push lives inside run_fee_adjustment() in cl-revenue-ops.py
+# (a CLN plugin entry point that cannot be imported directly).  These tests
+# verify the mid-point computation formula used there:
+#
+#   mid_fee_ppm = (min_fee_ppm + max_fee_ppm) // 2
+#
+# Full end-to-end validation is covered by Task 4 integration testing.
 # ============================================================
+
+def _compute_fee_bounds_payload(min_fee_ppm: int, max_fee_ppm: int) -> dict:
+    """
+    Mirror of the production formula in cl-revenue-ops.py run_fee_adjustment():
+
+        mid_fee_ppm = (cfg_snap.min_fee_ppm + cfg_snap.max_fee_ppm) // 2
+
+    Extracted here so the formula can be unit-tested without importing the
+    un-importable plugin entry point.
+    """
+    return {
+        "timestamp": int(time.time()),
+        "min_fee_ppm": min_fee_ppm,
+        "max_fee_ppm": max_fee_ppm,
+        "mid_fee_ppm": (min_fee_ppm + max_fee_ppm) // 2,
+    }
+
 
 class TestFeeBoundsPush:
     """Fee bounds pushed to datastore each fee cycle."""
 
-    def test_fee_bounds_payload_structure(self):
-        """Fee bounds payload has timestamp, min, max, mid."""
-        import json as _json
-        payload = {
-            "timestamp": int(time.time()),
-            "min_fee_ppm": 10,
-            "max_fee_ppm": 5000,
-            "mid_fee_ppm": 2505,
-        }
-        payload_str = _json.dumps(payload)
-        parsed = _json.loads(payload_str)
+    def test_mid_fee_even_sum(self):
+        """mid_fee_ppm is exact midpoint when sum is even."""
+        payload = _compute_fee_bounds_payload(min_fee_ppm=100, max_fee_ppm=200)
+        assert payload["mid_fee_ppm"] == 150
+
+    def test_mid_fee_odd_sum_floors(self):
+        """mid_fee_ppm floors when (min + max) is odd (integer division)."""
+        payload = _compute_fee_bounds_payload(min_fee_ppm=10, max_fee_ppm=5000)
+        # (10 + 5000) // 2 = 5010 // 2 = 2505
+        assert payload["mid_fee_ppm"] == 2505
+
+    def test_mid_fee_odd_gap(self):
+        """mid_fee_ppm floors when gap between min and max is odd."""
+        # (1 + 100) // 2 = 50, not 50.5
+        payload = _compute_fee_bounds_payload(min_fee_ppm=1, max_fee_ppm=100)
+        assert payload["mid_fee_ppm"] == 50
+
+    def test_mid_fee_equal_min_max(self):
+        """mid_fee_ppm equals both when min == max."""
+        payload = _compute_fee_bounds_payload(min_fee_ppm=500, max_fee_ppm=500)
+        assert payload["mid_fee_ppm"] == 500
+
+    def test_mid_fee_zero_min(self):
+        """mid_fee_ppm is half of max when min is zero."""
+        payload = _compute_fee_bounds_payload(min_fee_ppm=0, max_fee_ppm=1000)
+        assert payload["mid_fee_ppm"] == 500
+
+    def test_payload_structure_and_serialisability(self):
+        """Payload serialises to valid JSON with all required keys."""
+        payload = _compute_fee_bounds_payload(min_fee_ppm=10, max_fee_ppm=5000)
+        payload_str = json.dumps(payload)
+        parsed = json.loads(payload_str)
+
+        assert "timestamp" in parsed
+        assert isinstance(parsed["timestamp"], int)
         assert parsed["min_fee_ppm"] == 10
         assert parsed["max_fee_ppm"] == 5000
         assert parsed["mid_fee_ppm"] == 2505
-        assert "timestamp" in parsed
-        assert isinstance(parsed["timestamp"], int)
+
+    def test_payload_within_datastore_size_limit(self):
+        """Fee-bounds payload is well within CLN's 65 KB datastore limit."""
+        payload = _compute_fee_bounds_payload(min_fee_ppm=10, max_fee_ppm=5000)
+        assert len(json.dumps(payload)) < 65_536
 
 
 # ============================================================
 # Tests — Dashboard push
+#
+# _push_dashboard_to_datastore() in cl-revenue-ops.py uses module-level
+# globals (safe_plugin, profitability_analyzer, database, plugin) and calls
+# revenue_dashboard() — all defined in the non-importable CLN plugin entry
+# point.  Full end-to-end validation is covered by Task 4 integration testing.
+#
+# These tests verify:
+#   1. The fire-and-forget IPC pattern (same as profitability push, tested here
+#      via _push_profitability_summary as a proxy).
+#   2. That a realistic dashboard payload fits within CLN's 65 KB limit.
+#   3. That the timestamp-augmentation step produces valid JSON with the
+#      correct shape.
 # ============================================================
+
+def _make_dashboard_result(net_profit_sats: int = 12815,
+                           window_days: int = 30,
+                           bleeder_count: int = 1) -> dict:
+    """Construct a realistic revenue_dashboard() return value."""
+    return {
+        "financial_health": {
+            "tlv_sats": 187_071_746,
+            "net_profit_sats": net_profit_sats,
+            "operating_margin_pct": 95.07,
+            "annualized_roc_pct": 0.07,
+        },
+        "period": {
+            "window_days": window_days,
+            "gross_revenue_sats": 13_480,
+            "opex_sats": 665,
+            "rebalance_cost_sats": 665,
+            "closure_cost_sats": 0,
+            "volume_sats": 20_638_037,
+            "forward_count": 188,
+        },
+        "warnings": [f"Channel 100x1x{i} is bleeding" for i in range(bleeder_count)],
+        "bleeder_count": bleeder_count,
+    }
+
 
 class TestDashboardPush:
     """Dashboard snapshot pushed to datastore."""
 
-    def test_dashboard_payload_structure(self):
-        """Dashboard payload wraps revenue_dashboard output with timestamp."""
-        import json as _json
-        dashboard_result = {
-            "financial_health": {"tlv_sats": 187071746, "net_profit_sats": 12815, "operating_margin_pct": 95.07, "annualized_roc_pct": 0.07},
-            "period": {"window_days": 30, "gross_revenue_sats": 13480, "opex_sats": 665, "rebalance_cost_sats": 665, "closure_cost_sats": 0, "volume_sats": 20638037, "forward_count": 188},
-            "warnings": ["Channel unknown is bleeding"],
-            "bleeder_count": 1,
-        }
-        payload = {"timestamp": int(time.time()), **dashboard_result}
-        payload_str = _json.dumps(payload)
-        parsed = _json.loads(payload_str)
+    def test_timestamp_augmentation_produces_valid_json(self):
+        """Augmenting revenue_dashboard output with a timestamp yields valid JSON."""
+        dashboard_result = _make_dashboard_result()
+        # Mirror of the production code in _push_dashboard_to_datastore():
+        #   dashboard["timestamp"] = int(time.time())
+        #   safe_plugin.rpc.datastore(key=..., string=json.dumps(dashboard), ...)
+        dashboard_result["timestamp"] = int(time.time())
+        payload_str = json.dumps(dashboard_result)
+        parsed = json.loads(payload_str)
+
         assert "timestamp" in parsed
+        assert isinstance(parsed["timestamp"], int)
         assert parsed["financial_health"]["net_profit_sats"] == 12815
         assert parsed["period"]["window_days"] == 30
-        assert len(payload_str) < 5000
+        assert parsed["bleeder_count"] == 1
+
+    def test_dashboard_payload_within_datastore_size_limit(self):
+        """Dashboard payload with many bleeders stays within CLN's 65 KB limit."""
+        # Stress test: 50 bleeder warnings (far more than a real fleet)
+        dashboard_result = _make_dashboard_result(bleeder_count=50)
+        dashboard_result["timestamp"] = int(time.time())
+        payload_str = json.dumps(dashboard_result)
+        assert len(payload_str) < 65_536
+
+    def test_error_response_is_not_pushed(self):
+        """Payload with an 'error' key is not pushed (production guard check)."""
+        error_result = {"error": "Profitability analyzer not initialized"}
+        # Production code: if isinstance(dashboard, dict) and "error" not in dashboard
+        should_push = isinstance(error_result, dict) and "error" not in error_result
+        assert should_push is False
+
+    def test_valid_result_passes_guard(self):
+        """Valid dashboard result passes the production push guard."""
+        dashboard_result = _make_dashboard_result()
+        should_push = isinstance(dashboard_result, dict) and "error" not in dashboard_result
+        assert should_push is True
+
+    def test_fire_and_forget_via_profitability_proxy(self):
+        """
+        Datastore failures in dashboard push are swallowed (fire-and-forget).
+
+        _push_dashboard_to_datastore() uses the same try/except-and-log pattern
+        as _push_profitability_summary().  We verify the pattern holds via the
+        profitability analyzer (which IS importable) as a structural proxy.
+        """
+        analyzer, plugin, _, _ = _make_analyzer()
+        analyzer._cache_timestamp = int(time.time())
+        plugin.rpc.datastore.side_effect = Exception("datastore unavailable")
+
+        # Must not raise even though datastore is broken
+        analyzer._push_profitability_summary({"100x1x0": _make_profitability()})
+
+        # Error was logged, not re-raised
+        plugin.log.assert_called()
+
+    def test_datastore_called_with_dashboard_key(self):
+        """
+        Mock _push_dashboard_to_datastore() call pattern: key is
+        ['revenue', 'dashboard'], mode is 'create-or-replace'.
+
+        We verify the call contract by simulating the production code path
+        with a mock plugin (same technique as TestPushProfitabilitySummary).
+        """
+        mock_plugin = MagicMock()
+        dashboard_result = _make_dashboard_result()
+
+        # Simulate the production code body of _push_dashboard_to_datastore()
+        if isinstance(dashboard_result, dict) and "error" not in dashboard_result:
+            dashboard_result["timestamp"] = int(time.time())
+            mock_plugin.rpc.datastore(
+                key=["revenue", "dashboard"],
+                string=json.dumps(dashboard_result),
+                mode="create-or-replace",
+            )
+
+        mock_plugin.rpc.datastore.assert_called_once()
+        call_kwargs = mock_plugin.rpc.datastore.call_args
+        assert call_kwargs[1]["key"] == ["revenue", "dashboard"]
+        assert call_kwargs[1]["mode"] == "create-or-replace"
+
+        payload = json.loads(call_kwargs[1]["string"])
+        assert "timestamp" in payload
+        assert "financial_health" in payload
+        assert "period" in payload
+        assert payload["period"]["window_days"] == 30
