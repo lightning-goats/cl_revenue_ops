@@ -293,9 +293,9 @@ class BoltzCliManager:
     def _build_first_hop_excludes(self, preferred_peer_id: str, preferred_channel_id: Optional[str] = None) -> Tuple[List[str], List[str]]:
         """Build CLN `pay` exclude list to force the first hop via preferred peer.
 
-        We exclude all other directly connected peers (node-id excludes). If there are multiple channels
-        to the preferred peer and a preferred channel is specified, exclude the alternate channels by SCID
-        in both directions (best effort; CLN accepts scid/direction excludes).
+        Excludes direct channels (SCID/direction) to all non-preferred peers.
+        Using channel-level excludes (not node-level) so these peers can still
+        appear as intermediate hops on multi-hop routes to the destination.
         """
         warnings: List[str] = []
         try:
@@ -305,7 +305,6 @@ class BoltzCliManager:
         channels = result.get("channels", []) if isinstance(result, dict) else []
 
         exclude: List[str] = []
-        seen_peers = set()
         preferred_scid = (str(preferred_channel_id).replace(':', 'x') if preferred_channel_id else None)
         alt_same_peer: List[str] = []
 
@@ -316,13 +315,16 @@ class BoltzCliManager:
             if not peer:
                 continue
             scid = str(ch.get("short_channel_id") or "").replace(':', 'x')
+            if not scid:
+                continue
             if peer == preferred_peer_id:
-                if preferred_scid and scid and scid != preferred_scid:
+                if preferred_scid and scid != preferred_scid:
                     alt_same_peer.append(scid)
                 continue
-            if peer not in seen_peers:
-                exclude.append(peer)
-                seen_peers.add(peer)
+            # Exclude the direct channel, not the node ��� the node can still
+            # appear as an intermediate hop on routes to the destination.
+            exclude.append(f"{scid}/0")
+            exclude.append(f"{scid}/1")
 
         if alt_same_peer:
             for scid in alt_same_peer:
