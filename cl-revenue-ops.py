@@ -2581,6 +2581,14 @@ def revenue_planner_status(plugin: Plugin) -> Dict[str, Any]:
     return capacity_planner.get_status()
 
 
+@plugin.method("revenue-planner-candidate-sources")
+def planner_candidate_sources(plugin: Plugin):
+    """Show strategy distribution of the current candidate pool."""
+    if capacity_planner is None:
+        return {"error": "Capacity planner not initialized"}
+    return capacity_planner.get_candidate_sources()
+
+
 @plugin.method("revenue-planner-candidates")
 def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
     """List scored peer candidates for channel opens."""
