@@ -1010,6 +1010,7 @@ class TestEnrichedLosers:
             "classification", "capacity", "estimated_closure_cost_sats",
             "rebal_difficulty", "opener", "action",
             "is_hard_bleeder", "hive_closure_flagged", "uptime_pct", "regime_change",
+            "is_fire_sale", "marginal_profit_30d_sats",
         }
         assert set(losers[0].keys()) == expected_keys
 
