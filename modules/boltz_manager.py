@@ -639,17 +639,9 @@ class BoltzCliManager:
         The boltz_daily_budget_sats config is only used as a last-resort
         fallback if the unified provider is not registered.
         """
-        # Read live budget from plugin options (dynamic=True) so setconfig works at runtime
-        live_budget = self.cfg.daily_budget_sats
-        try:
-            opt = self.plugin.options.get('revenue-ops-boltz-daily-budget-sats')
-            if isinstance(opt, str):
-                live_budget = int(opt)
-        except Exception:
-            pass
         provider = getattr(self, "global_budget_limit_provider", None)
         if not callable(provider):
-            return {"budget_sats": max(0, int(live_budget)), "source": "boltz_cfg"}
+            return {"budget_sats": max(0, int(self.cfg.daily_budget_sats)), "source": "boltz_cfg"}
         try:
             data = provider()
             if isinstance(data, dict):
@@ -669,7 +661,7 @@ class BoltzCliManager:
                 return {"budget_sats": max(0, self._parse_int(data, 0)), "source": "unified_scalar"}
         except Exception as e:
             self.plugin.log(f"BOLTZ: unified budget provider failed: {e}", level="warn")
-        return {"budget_sats": max(0, int(live_budget)), "source": "boltz_cfg_fallback"}
+        return {"budget_sats": max(0, int(self.cfg.daily_budget_sats)), "source": "boltz_cfg_fallback"}
 
     def get_boltz_cost_components(self, window_hours: int = 24) -> Dict[str, Any]:
         """Boltz-only spend component summary (no external costs, no unified budget math)."""
@@ -1069,15 +1061,7 @@ class BoltzCliManager:
         budget = self.get_budget_status()
         allowed = True
         reason = None
-        # Read live from plugin options (dynamic=True) so setconfig works at runtime
-        enforce = self.cfg.enforce_budget
-        try:
-            opt = self.plugin.options.get('revenue-ops-boltz-enforce-budget')
-            if isinstance(opt, str):
-                enforce = opt.lower() == 'true'
-        except Exception:
-            pass
-        if enforce and fee_sats > budget.get("remaining_24h_sats_estimate", 0):
+        if self.cfg.enforce_budget and fee_sats > budget.get("remaining_24h_sats_estimate", 0):
             allowed = False
             reason = (
                 f"Estimated swap fee {fee_sats} sats exceeds remaining Boltz daily budget "

@@ -4139,6 +4139,23 @@ def _parse_msat(msat_val: Any) -> int:
     return parse_msat(msat_val)
 
 
+@plugin.subscribe("setconfig")
+def on_setconfig(plugin: Plugin, **kwargs):
+    """Handle dynamic option changes at runtime (no plugin restart needed)."""
+    config_name = kwargs.get("config")
+    val_str = kwargs.get("val_str", "")
+    if boltz_manager and boltz_manager.cfg:
+        if config_name == "revenue-ops-boltz-enforce-budget":
+            boltz_manager.cfg.enforce_budget = val_str.lower() == "true"
+            plugin.log(f"Dynamic config: enforce_budget = {boltz_manager.cfg.enforce_budget}")
+        elif config_name == "revenue-ops-boltz-daily-budget-sats":
+            try:
+                boltz_manager.cfg.daily_budget_sats = int(val_str)
+                plugin.log(f"Dynamic config: daily_budget_sats = {boltz_manager.cfg.daily_budget_sats}")
+            except ValueError:
+                pass
+
+
 @plugin.subscribe("forward_event")
 def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     """
