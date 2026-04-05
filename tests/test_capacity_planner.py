@@ -1460,6 +1460,7 @@ class TestGraphDiscoveryAndScoring:
         }
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner._init_cycle_cache()
         result = planner._discover_from_graph(set())
         assert result == []
         # Verify it logged the insufficient nodes message
@@ -1482,6 +1483,7 @@ class TestGraphDiscoveryAndScoring:
         plugin.rpc.listnodes.return_value = {"nodes": nodes}
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner._init_cycle_cache()
         result = planner._discover_from_graph(set())
 
         assert len(result) == 3
@@ -1506,6 +1508,7 @@ class TestGraphDiscoveryAndScoring:
         plugin.rpc.listnodes.return_value = {"nodes": nodes}
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner._init_cycle_cache()
         result = planner._discover_from_graph({"existing_peer"})
 
         peer_ids = {c["peer_id"] for c in result}
@@ -1526,6 +1529,7 @@ class TestGraphDiscoveryAndScoring:
         plugin.rpc.listnodes.return_value = {"nodes": nodes}
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner._init_cycle_cache()
         result = planner._discover_from_graph(set())
 
         peer_ids = {c["peer_id"] for c in result}
@@ -1547,6 +1551,7 @@ class TestGraphDiscoveryAndScoring:
         plugin.rpc.listnodes.return_value = {"nodes": nodes}
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner._init_cycle_cache()
         result = planner._discover_from_graph(set())
 
         peer_ids = {c["peer_id"] for c in result}
@@ -1567,6 +1572,7 @@ class TestGraphDiscoveryAndScoring:
         plugin.rpc.listnodes.return_value = {"nodes": nodes}
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner._init_cycle_cache()
         result = planner._discover_from_graph(set())
 
         assert len(result) <= 10
@@ -1604,6 +1610,7 @@ class TestGraphDiscoveryAndScoring:
         plugin.rpc.listnodes.return_value = {"nodes": nodes}
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner._init_cycle_cache()
         result = planner._discover_from_graph(set())
 
         assert len(result) == 1
@@ -1623,6 +1630,7 @@ class TestGraphDiscoveryAndScoring:
         plugin.rpc.listnodes.return_value = {"nodes": nodes}
 
         planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner._init_cycle_cache()
         result = planner._discover_from_graph(set())
 
         # no_fields_node has channel_count=0 default, so excluded
@@ -1844,6 +1852,7 @@ class TestGraphDiscoveryAndScoring:
         prof_analyzer.database.get_planner_candidates.return_value = []
 
         planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+        planner._init_cycle_cache()
 
         # No winners, empty profitability/flow
         candidates = planner._discover_peers([], {}, {})

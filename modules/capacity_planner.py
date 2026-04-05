@@ -43,6 +43,10 @@ class CapacityPlanner:
         self._last_funding_deficit_sats: int = 0    # On-chain shortfall for next open
         self._last_best_candidate: dict = {}        # Top candidate that needs funding
         self._last_cycle_ts: int = 0
+        # Per-cycle gossip cache (cleared at start of each execute_cycle)
+        self._cycle_nodes_by_id: Dict[str, dict] = {}
+        self._cycle_channels_dest: Dict[str, list] = {}
+        self._cycle_channels_source: Dict[str, list] = {}
 
     def get_boltz_coordination(self) -> Dict[str, Any]:
         """Return signals for Boltz planner coordination.
@@ -115,6 +119,45 @@ class CapacityPlanner:
             return False
         return getattr(cfg, "planner_max_closes_per_cycle", 1) > 0
 
+    def _init_cycle_cache(self):
+        """Fetch listnodes once and index by ID. Clear per-peer caches."""
+        self._cycle_channels_dest.clear()
+        self._cycle_channels_source.clear()
+        self._cycle_nodes_by_id.clear()
+        try:
+            nodes = self.plugin.rpc.listnodes().get("nodes", [])
+            self._cycle_nodes_by_id = {n["nodeid"]: n for n in nodes if "nodeid" in n}
+        except Exception:
+            pass
+
+    def _get_cached_channels(self, peer_id: str, direction: str = "destination") -> list:
+        """Get listchannels result, cached for this cycle."""
+        cache = self._cycle_channels_dest if direction == "destination" else self._cycle_channels_source
+        if peer_id in cache:
+            return cache[peer_id]
+        try:
+            if direction == "destination":
+                result = self.plugin.rpc.listchannels(destination=peer_id).get("channels", [])
+            else:
+                result = self.plugin.rpc.listchannels(source=peer_id).get("channels", [])
+        except Exception:
+            result = []
+        cache[peer_id] = result
+        return result
+
+    def _get_cached_node(self, peer_id: str) -> dict | None:
+        """Get node info, preferring preloaded dict, falling back to RPC."""
+        if peer_id in self._cycle_nodes_by_id:
+            return self._cycle_nodes_by_id[peer_id]
+        try:
+            nodes = self.plugin.rpc.listnodes(id=peer_id).get("nodes", [])
+            if nodes:
+                self._cycle_nodes_by_id[peer_id] = nodes[0]
+                return nodes[0]
+        except Exception:
+            pass
+        return None
+
     def execute_cycle(self, cfg=None) -> Dict[str, Any]:
         """Main timer-driven cycle. Evaluates and executes open/close decisions."""
         if cfg is None:
@@ -122,6 +165,8 @@ class CapacityPlanner:
 
         if not cfg.planner_enabled:
             return {"skipped": True, "reason": "planner disabled"}
+
+        self._init_cycle_cache()
 
         summary = {
             "opens": [],
@@ -765,7 +810,7 @@ class CapacityPlanner:
                 continue
 
             try:
-                channels = self.plugin.rpc.listchannels(source=patron_peer_id)
+                channels = {"channels": self._get_cached_channels(patron_peer_id, "source")}
                 patron_roi = getattr(patron, 'marginal_roi_percent', 0)
                 # Score neighbors by capacity and fee competitiveness, not random order
                 scored_neighbors = []
@@ -812,9 +857,8 @@ class CapacityPlanner:
 
     def _discover_from_graph(self, existing_peer_ids: set) -> List[Dict]:
         """Strategy 3: Network centrality scoring via listnodes."""
-        try:
-            nodes = self.plugin.rpc.listnodes().get("nodes", [])
-        except Exception:
+        nodes = list(self._cycle_nodes_by_id.values())
+        if not nodes:
             return []
 
         if len(nodes) < 800:
@@ -929,7 +973,7 @@ class CapacityPlanner:
         ]
         for route_peer in ranked_route_peers:
             try:
-                channels = self.plugin.rpc.listchannels(source=route_peer)
+                channels = {"channels": self._get_cached_channels(route_peer, "source")}
                 for ch in channels.get("channels", []):
                     dest = ch.get("destination")
                     if not dest or dest == our_node_id or dest in existing_peers:
@@ -1022,10 +1066,9 @@ class CapacityPlanner:
 
         # Prefer clearnet peers (more reliable, lower latency)
         try:
-            node_info = self.plugin.rpc.listnodes(id=peer_id)
-            nodes = node_info.get("nodes", [])
-            if nodes:
-                addresses = nodes[0].get("addresses", [])
+            node = self._get_cached_node(peer_id)
+            if node:
+                addresses = node.get("addresses", [])
                 has_clearnet = any(
                     a.get("type") in ("ipv4", "ipv6")
                     for a in addresses
@@ -1064,10 +1107,10 @@ class CapacityPlanner:
         # serve high-value payment traffic (bigger HTLCs). Opening a channel
         # to them captures more of the payment size distribution.
         try:
-            peer_channels = self.plugin.rpc.listchannels(destination=peer_id)
+            peer_channels = self._get_cached_channels(peer_id, "destination")
             capacities = [
                 ch.get("satoshis", 0)
-                for ch in peer_channels.get("channels", [])
+                for ch in peer_channels
                 if ch.get("active", False) and ch.get("satoshis", 0) > 0
             ]
             if capacities:
@@ -1276,10 +1319,10 @@ class CapacityPlanner:
         peer_id = candidate.get("peer_id")
         if peer_id:
             try:
-                peer_channels = self.plugin.rpc.listchannels(destination=peer_id)
+                peer_channels = self._get_cached_channels(peer_id, "destination")
                 capacities = [
                     ch.get("satoshis", 0)
-                    for ch in peer_channels.get("channels", [])
+                    for ch in peer_channels
                     if ch.get("active", False) and ch.get("satoshis", 0) > 0
                 ]
                 if capacities:
