@@ -2486,6 +2486,8 @@ def _make_open_planner():
     plugin.rpc.feerates.return_value = {"perkb": {"opening": 2000}}  # 2 sat/vB
     # Default: generic RPC dispatch succeeds
     plugin.rpc.call.return_value = {"channel_id": "123x1x0"}
+    # Default: listnodes returns empty so _get_cached_node returns None (no dual-fund)
+    plugin.rpc.listnodes.return_value = {"nodes": []}
 
     planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
     return planner, db
