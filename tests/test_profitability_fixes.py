@@ -379,8 +379,7 @@ class TestOpenTimestampPassthrough:
         }
 
         # Bookkeeper returns a cost
-        with patch.object(analyzer, '_get_rebalance_costs_from_bookkeeper', return_value=0), \
-             patch.object(analyzer, '_get_open_cost_from_bookkeeper', return_value=150):
+        with patch.object(analyzer, '_get_open_cost_from_bookkeeper', return_value=150):
             analyzer._get_channel_costs(
                 "100x1x0", "peer1", "abc123", 2_000_000,
                 opener="local", open_timestamp=old_ts
@@ -413,11 +412,10 @@ class TestOpenTimestampPassthrough:
             "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
         }
 
-        with patch.object(analyzer, '_get_rebalance_costs_from_bookkeeper', return_value=0):
-            analyzer._get_channel_costs(
-                "200x2x0", "peer2", "def456", 3_000_000,
-                opener="remote", open_timestamp=old_ts
-            )
+        analyzer._get_channel_costs(
+            "200x2x0", "peer2", "def456", 3_000_000,
+            opener="remote", open_timestamp=old_ts
+        )
 
         call_args = analyzer.database.record_channel_open_cost.call_args
         assert call_args is not None, "Self-heal did not call record_channel_open_cost"
@@ -442,8 +440,7 @@ class TestOpenTimestampPassthrough:
             "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
         }
 
-        with patch.object(analyzer, '_get_rebalance_costs_from_bookkeeper', return_value=0), \
-             patch.object(analyzer, '_get_open_cost_from_bookkeeper', return_value=300):
+        with patch.object(analyzer, '_get_open_cost_from_bookkeeper', return_value=300):
             analyzer._get_channel_costs(
                 "300x3x0", "peer3", "ghi789", 2_000_000,
                 opener="local", open_timestamp=old_ts
