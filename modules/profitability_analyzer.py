@@ -29,6 +29,85 @@ from pyln.client import Plugin, RpcError
 from .utils import parse_msat as _shared_parse_msat
 
 
+class BookkeeperCache:
+    """
+    Batch-fetches bkpr-listincome(consolidate_fees=true) once and indexes
+    results for O(1) lookups by txid.
+
+    Replaces N per-channel bkpr-listaccountevents calls with 1 bulk call.
+    """
+
+    def __init__(self, rpc):
+        """Fetch and index all income events.
+
+        Args:
+            rpc: An object with .call(method, params) — either plugin.rpc
+                 or ThreadSafeRpcProxy.
+        """
+        self._onchain_fees: dict = {}      # txid → net_fee_sats
+        self._wallet_fees: dict = {}       # txid → net_fee_sats (wallet perspective)
+        self._fetch_ok = False
+
+        try:
+            result = rpc.call("bkpr-listincome", {"consolidate_fees": True})
+            events = result.get("income_events", [])
+            self._index_onchain_fees(events)
+            self._fetch_ok = True
+        except Exception:
+            # Bookkeeper unavailable — all lookups return None
+            pass
+
+    def _index_onchain_fees(self, events: list) -> None:
+        """Build txid indexes from onchain_fee events."""
+        account_fees: dict = {}
+        for ev in events:
+            if ev.get("tag") != "onchain_fee":
+                continue
+            txid = ev.get("txid")
+            if not txid:
+                continue
+            account = ev.get("account", "")
+            credit = _shared_parse_msat(ev.get("credit_msat", 0))
+            debit = _shared_parse_msat(ev.get("debit_msat", 0))
+
+            key = (account, txid)
+            if key in account_fees:
+                account_fees[key]["credit"] += credit
+                account_fees[key]["debit"] += debit
+            else:
+                account_fees[key] = {"credit": credit, "debit": debit}
+
+        for (account, txid), totals in account_fees.items():
+            if account == "wallet":
+                net_msat = totals["debit"] - totals["credit"]
+                if net_msat > 0:
+                    self._wallet_fees[txid] = net_msat // 1000
+            else:
+                net_msat = totals["credit"] - totals["debit"]
+                if txid not in self._onchain_fees and net_msat > 0:
+                    self._onchain_fees[txid] = net_msat // 1000
+
+    def get_open_cost_by_txid(self, funding_txid: str) -> int | None:
+        """Look up the on-chain fee for a funding transaction.
+
+        Tries channel-account perspective first, then wallet fallback.
+
+        Returns:
+            Fee in sats, or None if not found.
+        """
+        if not self._fetch_ok:
+            return None
+        fee = self._onchain_fees.get(funding_txid)
+        if fee is not None:
+            return fee
+        return self._wallet_fees.get(funding_txid)
+
+    @property
+    def available(self) -> bool:
+        """Whether the bookkeeper fetch succeeded."""
+        return self._fetch_ok
+
+
 class ProfitabilityClass(Enum):
     """Channel profitability classification."""
     PROFITABLE = "profitable"      # ROI > 10%
