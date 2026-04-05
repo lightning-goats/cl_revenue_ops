@@ -320,6 +320,8 @@ class CapacityPlanner:
         # Reset funding coordination before evaluating opens
         self._last_funding_deficit_sats = 0
         self._last_best_candidate = {}
+        self._last_preferred_loop_out_scid = None
+        self._last_preferred_loop_out_reason = ""
         if fee_ok and portfolio_state != "blocked":
             candidates = self._discover_peers(winners, all_profitability, all_flow)
 
@@ -408,6 +410,23 @@ class CapacityPlanner:
 
         # 6. Update candidate pool
         self._update_candidate_pool(candidates if fee_ok else [])
+
+        # 8. Evaluate recycling opportunities (works even when blocked)
+        if candidates and losers:
+            recycle_plan = self._evaluate_recycle_opportunities(losers, candidates, cfg)
+            if recycle_plan:
+                summary["recycle_opportunity"] = {
+                    "close_scid": recycle_plan["loser"]["scid"],
+                    "close_peer": recycle_plan["loser"]["peer_id"][:16],
+                    "open_peer": recycle_plan["candidate"]["peer_id"][:16],
+                    "recycle_ev": round(recycle_plan["recycle_ev"]),
+                }
+                self.plugin.log(
+                    f"Recycle opportunity: close {recycle_plan['loser']['scid']} → "
+                    f"open {recycle_plan['candidate']['peer_id'][:16]}... "
+                    f"(EV={recycle_plan['recycle_ev']:.0f} sats)",
+                    level='info',
+                )
 
         summary["portfolio_state"] = portfolio_state
         summary["timestamp"] = int(time.time())
@@ -1221,6 +1240,80 @@ class CapacityPlanner:
         recycle_ev = candidate_ev - residual_value - close_cost - open_cost
         return recycle_ev
 
+    RECYCLE_MIN_EV_SATS = 5000
+
+    def _evaluate_recycle_opportunities(
+        self, losers: List[Dict], candidates: List[Dict], cfg
+    ) -> Dict[str, Any] | None:
+        """Find the best recycle opportunity: close a loser, open to a candidate.
+
+        Returns a recycle plan dict or None if no viable opportunity exists.
+        """
+        if not losers or not candidates:
+            return None
+
+        db = self.profitability.database if self.profitability else None
+        if not db:
+            return None
+
+        # Build protection sets
+        protected_peers = set()
+        if self.policy_manager:
+            try:
+                for peer_id, policy in self.policy_manager.get_all_policies().items():
+                    tags = getattr(policy, 'tags', []) or []
+                    if "protect" in tags or "no_close" in tags:
+                        protected_peers.add(peer_id)
+            except Exception:
+                pass
+
+        route_pair_scids = set()
+        try:
+            pairs = db.get_top_route_pairs(days=30, min_forwards=3, limit=10)
+            for p in pairs:
+                for key in ("in_channel", "out_channel"):
+                    ch = str(p.get(key, "")).replace(":", "x")
+                    if ch:
+                        route_pair_scids.add(ch)
+        except Exception:
+            pass
+
+        # Find eligible losers
+        eligible_losers = []
+        for loser in losers:
+            ok, reason = self._is_recycle_eligible(loser, protected_peers, route_pair_scids)
+            if ok:
+                eligible_losers.append(loser)
+
+        if not eligible_losers:
+            return None
+
+        # Sort candidates by score (best first)
+        sorted_candidates = sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)
+
+        # Find best recycle pair
+        best_ev = 0
+        best_pair = None
+        for candidate in sorted_candidates[:5]:
+            for loser in eligible_losers:
+                ev = self._calculate_recycle_ev(loser, candidate, cfg)
+                if ev > self.RECYCLE_MIN_EV_SATS and ev > best_ev:
+                    best_ev = ev
+                    best_pair = {
+                        "loser": loser,
+                        "candidate": candidate,
+                        "recycle_ev": ev,
+                    }
+
+        if best_pair:
+            self._last_preferred_loop_out_scid = best_pair["loser"]["scid"]
+            self._last_preferred_loop_out_reason = (
+                f"Recycle target: EV={best_pair['recycle_ev']:.0f} sats, "
+                f"candidate={best_pair['candidate']['peer_id'][:12]}..."
+            )
+
+        return best_pair
+
     def _score_candidate(self, peer_id: str, base_score: float) -> float:
         """Enrich candidate score with reputation, uptime, and profit history."""
         score = base_score
@@ -1747,11 +1840,13 @@ class CapacityPlanner:
                 pass
         return 0
 
-    def _rpc_fundchannel(self, peer_id: str, amount_sats: int) -> Dict[str, Any]:
-        return self.plugin.rpc.call(
-            "fundchannel",
-            {"id": peer_id, "amount": amount_sats, "announce": True},
-        )
+    def _rpc_fundchannel(self, peer_id: str, amount_sats: int,
+                         request_amt: int = None, compact_lease: str = None) -> Dict[str, Any]:
+        params = {"id": peer_id, "amount": amount_sats, "announce": True}
+        if request_amt and compact_lease:
+            params["request_amt"] = request_amt
+            params["compact_lease"] = compact_lease
+        return self.plugin.rpc.call("fundchannel", params)
 
     def _execute_open(self, peer_id: str, amount_sats: int, cfg, reason: str) -> Dict:
         """Execute a channel open via fundchannel RPC.
@@ -1826,8 +1921,22 @@ class CapacityPlanner:
                 }
 
         try:
+            # Detect dual-fund opportunity
+            request_amt = None
+            compact_lease = None
+            node_info = self._get_cached_node(peer_id)
+            if node_info and node_info.get("option_will_fund"):
+                owf = node_info["option_will_fund"]
+                compact_lease = owf.get("compact_lease")
+                if compact_lease:
+                    request_amt = amount_sats
+                    self.plugin.log(
+                        f"Dual-fund available for {peer_id[:16]}..., requesting {request_amt} sats",
+                        level='info',
+                    )
+
             # fundchannel auto-connects if CLN knows the peer address (from gossip).
-            result = self._rpc_fundchannel(peer_id, amount_sats)
+            result = self._rpc_fundchannel(peer_id, amount_sats, request_amt, compact_lease)
 
             channel_id = result.get("channel_id") or result.get("channelid")
 
