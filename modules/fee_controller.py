@@ -1545,7 +1545,7 @@ class FeeController:
     """
     
     # Observation window parameters
-    MIN_OBSERVATION_HOURS = 0.5  # Minimum hours between fee changes for valid signal
+    MIN_OBSERVATION_HOURS = 0.25  # Minimum hours between fee changes for valid signal
     VOLATILITY_THRESHOLD = 0.50  # 50% change in revenue rate triggers volatility reset
     MIN_FORWARDS_FOR_SIGNAL = 3  # Forwards threshold for dynamic window
 
@@ -1558,7 +1558,7 @@ class FeeController:
     DTS_SPARSE_DISCOUNT_GAMMA = 0.992
     NORMAL_TARGET_BLEND_RATIO = 0.35
     WAKE_TARGET_BLEND_RATIO = 0.15
-    SPARSE_TARGET_BLEND_RATIO = 0.10
+    SPARSE_TARGET_BLEND_RATIO = 0.20
     NORMAL_CYCLE_MAX_DELTA_RATIO = 0.50
     NORMAL_CYCLE_MIN_DELTA_PPM = 100
     WAKE_CYCLE_MAX_DELTA_RATIO = 0.20

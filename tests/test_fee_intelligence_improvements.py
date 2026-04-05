@@ -171,7 +171,7 @@ class TestConfidenceScaledBlend:
     def test_sparse_data_not_boosted(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
         ratio = fc._get_target_blend_ratio(False, True, posterior_std=10.0)
-        assert ratio == 0.10  # Sparse rate, no confidence boost
+        assert ratio == 0.20  # Sparse rate, no confidence boost
 
 
 class TestNeighborFeeAwareness:

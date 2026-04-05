@@ -1519,7 +1519,7 @@ class TestDTSPIDStabilityCaps:
     def test_sparse_data_channel_moves_more_conservatively(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         cfg.min_fee_ppm = 75
-        cfg.max_fee_ppm = 2500
+        cfg.max_fee_ppm = 700  # Keep target close enough to avoid delta-cap masking blend diff
         sparse_channel_id = "123x461x0"
         dense_channel_id = "123x462x0"
         sparse_peer_id = "02" + "2" * 64
