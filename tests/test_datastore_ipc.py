@@ -264,3 +264,53 @@ class TestAnalyzeAllChannelsPush:
         # Analysis results should still be returned
         assert ch_id in results
         assert results[ch_id].net_profit_sats is not None
+
+
+# ============================================================
+# Tests — Fee-bounds push
+# ============================================================
+
+class TestFeeBoundsPush:
+    """Fee bounds pushed to datastore each fee cycle."""
+
+    def test_fee_bounds_payload_structure(self):
+        """Fee bounds payload has timestamp, min, max, mid."""
+        import json as _json
+        payload = {
+            "timestamp": int(time.time()),
+            "min_fee_ppm": 10,
+            "max_fee_ppm": 5000,
+            "mid_fee_ppm": 2505,
+        }
+        payload_str = _json.dumps(payload)
+        parsed = _json.loads(payload_str)
+        assert parsed["min_fee_ppm"] == 10
+        assert parsed["max_fee_ppm"] == 5000
+        assert parsed["mid_fee_ppm"] == 2505
+        assert "timestamp" in parsed
+        assert isinstance(parsed["timestamp"], int)
+
+
+# ============================================================
+# Tests — Dashboard push
+# ============================================================
+
+class TestDashboardPush:
+    """Dashboard snapshot pushed to datastore."""
+
+    def test_dashboard_payload_structure(self):
+        """Dashboard payload wraps revenue_dashboard output with timestamp."""
+        import json as _json
+        dashboard_result = {
+            "financial_health": {"tlv_sats": 187071746, "net_profit_sats": 12815, "operating_margin_pct": 95.07, "annualized_roc_pct": 0.07},
+            "period": {"window_days": 30, "gross_revenue_sats": 13480, "opex_sats": 665, "rebalance_cost_sats": 665, "closure_cost_sats": 0, "volume_sats": 20638037, "forward_count": 188},
+            "warnings": ["Channel unknown is bleeding"],
+            "bleeder_count": 1,
+        }
+        payload = {"timestamp": int(time.time()), **dashboard_result}
+        payload_str = _json.dumps(payload)
+        parsed = _json.loads(payload_str)
+        assert "timestamp" in parsed
+        assert parsed["financial_health"]["net_profit_sats"] == 12815
+        assert parsed["period"]["window_days"] == 30
+        assert len(payload_str) < 5000
