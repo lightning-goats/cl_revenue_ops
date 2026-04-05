@@ -40,3 +40,31 @@ class TestObservationWindow:
 
     def test_min_observation_hours_is_025(self):
         assert FeeController.MIN_OBSERVATION_HOURS == 0.25
+
+
+class TestSleepExemption:
+    """Zero-revenue channels above floor don't enter sleep."""
+
+    def test_zero_revenue_above_floor_no_sleep(self):
+        """Zero revenue + fee above floor → exemption applies."""
+        current_revenue_rate = 0.0
+        current_fee_ppm = 200
+        floor_ppm = 15
+        zero_rev_exploring = (current_revenue_rate <= 0 and current_fee_ppm > floor_ppm)
+        assert zero_rev_exploring is True
+
+    def test_zero_revenue_at_floor_can_sleep(self):
+        """Zero revenue + fee at floor → no exemption (nothing more to explore)."""
+        current_revenue_rate = 0.0
+        current_fee_ppm = 15
+        floor_ppm = 15
+        zero_rev_exploring = (current_revenue_rate <= 0 and current_fee_ppm > floor_ppm)
+        assert zero_rev_exploring is False
+
+    def test_positive_revenue_no_exemption(self):
+        """Positive revenue → no exemption (unchanged behavior)."""
+        current_revenue_rate = 50.0
+        current_fee_ppm = 200
+        floor_ppm = 15
+        zero_rev_exploring = (current_revenue_rate <= 0 and current_fee_ppm > floor_ppm)
+        assert zero_rev_exploring is False

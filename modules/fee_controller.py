@@ -3739,7 +3739,9 @@ class FeeController:
             # Check for sleep mode entry
             if ts_state.last_update > 0 and rate_change_ratio < self.STABILITY_THRESHOLD:
                 ts_state.stable_cycles += 1
-                if ts_state.stable_cycles >= self.STABLE_CYCLES_REQUIRED:
+                # Don't sleep if zero revenue and fee above floor — channel needs to keep exploring
+                zero_rev_exploring = (current_revenue_rate <= 0 and current_fee_ppm > floor_ppm)
+                if ts_state.stable_cycles >= self.STABLE_CYCLES_REQUIRED and not zero_rev_exploring:
                     sleep_duration_seconds = cfg.fee_interval * self.SLEEP_CYCLES
                     ts_state.is_sleeping = True
                     ts_state.sleep_until = now + sleep_duration_seconds
