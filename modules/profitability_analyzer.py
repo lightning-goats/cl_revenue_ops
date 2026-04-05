@@ -1570,92 +1570,41 @@ class ChannelProfitabilityAnalyzer:
     def _get_channel_open_timestamp(self, channel_id: str, funding_txid: str) -> int:
         """
         Get the timestamp when a channel was opened.
-        
-        Methods (in priority order):
-        1. Bookkeeper channel_open event - has exact timestamp
-        2. Estimate from SCID block height - approximate but reliable
-        3. Fallback to 30 days ago
-        
+
+        Uses SCID block height to estimate open time. This is accurate to ~10
+        minutes, which is sufficient for days_open / ROI calculations.
+
+        Fallback: 30 days ago if SCID is unparseable.
+
         Args:
             channel_id: Short channel ID (e.g., "902205x123x0")
-            funding_txid: Funding transaction ID
-            
+            funding_txid: Funding transaction ID (unused, kept for API compat)
+
         Returns:
             Unix timestamp of channel open
         """
-        # Method 1: Query bookkeeper for channel_open event
-        if funding_txid:
-            bkpr_timestamp = self._get_open_timestamp_from_bookkeeper(funding_txid)
-            if bkpr_timestamp:
-                return bkpr_timestamp
-        
-        # Method 2: Estimate from SCID block height
-        # SCID format is "blockheight x txindex x output"
         if channel_id and 'x' in channel_id:
             try:
                 block_height = int(channel_id.split('x')[0])
-                # Estimate: ~10 minutes per block, blocks since genesis
-                # Bitcoin mainnet started ~Jan 3, 2009
-                # Block 0 = 1231006505
                 genesis_timestamp = 1231006505
-                seconds_per_block = 600  # 10 minutes average
+                seconds_per_block = 600
                 estimated_timestamp = genesis_timestamp + (block_height * seconds_per_block)
-                
-                # Sanity check - should be in the past
+
                 now = int(time.time())
                 if estimated_timestamp < now:
                     return estimated_timestamp
-                    
+
             except (ValueError, IndexError):
                 pass
-        
-        # Method 3: Fallback to 30 days ago
+
         return int(time.time()) - (86400 * 30)
-    
-    def _get_open_timestamp_from_bookkeeper(self, funding_txid: str) -> Optional[int]:
-        """
-        Get channel open timestamp from bookkeeper.
-        
-        Bookkeeper records channel_open events with the exact timestamp.
-        
-        Args:
-            funding_txid: The funding transaction ID
-            
-        Returns:
-            Unix timestamp, or None if not found
-        """
-        try:
-            # Bookkeeper account names use reversed txid bytes
-            reversed_txid = self._reverse_txid(funding_txid)
-            
-            # Query bookkeeper for this account's events
-            result = self.plugin.rpc.call(
-                "bkpr-listaccountevents",
-                {"account": reversed_txid}
-            )
-            
-            events = result.get("events", [])
-            
-            # Look for channel_open event
-            for event in events:
-                if (event.get("type") == "chain" and 
-                    event.get("tag") == "channel_open"):
-                    timestamp = event.get("timestamp")
-                    if timestamp:
-                        return int(timestamp)
-                        
-        except Exception as e:
-            self.plugin.log(
-                f"Error getting open timestamp from bookkeeper: {e}",
-                level='debug'
-            )
-        
-        return None
-    
+
+
     def _get_channel_costs(self, channel_id: str, peer_id: str,
                           funding_txid: str, capacity_sats: int = 0,
                           opener: str = "local",
-                          open_timestamp: Optional[int] = None) -> ChannelCosts:
+                          open_timestamp: Optional[int] = None,
+                          bkpr_cache: Optional['BookkeeperCache'] = None) -> ChannelCosts:
         """
         Get costs for a channel from bookkeeper and database.
 
@@ -1673,12 +1622,8 @@ class ChannelProfitabilityAnalyzer:
             opener: Who opened the channel ('local' or 'remote')
             open_timestamp: Actual channel open time (for correct budget windowing)
         """
-        # Get rebalance costs - combine database records with bookkeeper data
-        db_rebalance_costs = self.database.get_channel_rebalance_costs(channel_id)
-        bkpr_rebalance_costs = self._get_rebalance_costs_from_bookkeeper(channel_id, funding_txid)
-        
-        # Use the higher value (bookkeeper may have more complete history)
-        rebalance_costs = max(db_rebalance_costs, bkpr_rebalance_costs)
+        # Rebalance costs from database (records all rebalance attempts)
+        rebalance_costs = self.database.get_channel_rebalance_costs(channel_id)
         
         # Determine open cost
         open_cost = None
@@ -1713,7 +1658,7 @@ class ChannelProfitabilityAnalyzer:
                         f"({db_open_cost} sats). Attempting re-query with summation logic...",
                         level='debug'
                     )
-                    requeried_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
+                    requeried_cost = self._lookup_open_cost(funding_txid, capacity_sats, bkpr_cache)
                     
                     if requeried_cost is not None:
                         self.plugin.log(
@@ -1736,7 +1681,7 @@ class ChannelProfitabilityAnalyzer:
             
             # Query bookkeeper if not found
             if open_cost is None and funding_txid:
-                open_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
+                open_cost = self._lookup_open_cost(funding_txid, capacity_sats, bkpr_cache)
                 if open_cost is not None:
                     self.database.record_channel_open_cost(
                         channel_id, peer_id, open_cost, capacity_sats,
@@ -2005,12 +1950,39 @@ class ChannelProfitabilityAnalyzer:
             )
         
         return None
-    
-    def _is_valid_fee_amount(self, fee_sats: int, capacity_sats: int, 
+
+    def _lookup_open_cost(self, funding_txid: str, capacity_sats: int = 0,
+                          bkpr_cache: Optional['BookkeeperCache'] = None) -> Optional[int]:
+        """Look up open cost from cache, falling back to legacy per-channel RPC.
+
+        Args:
+            funding_txid: The funding transaction ID
+            capacity_sats: Channel capacity for validation
+            bkpr_cache: Batch bookkeeper cache (preferred)
+
+        Returns:
+            Fee in sats, or None if not found
+        """
+        fee = None
+
+        # Prefer batch cache
+        if bkpr_cache is not None and bkpr_cache.available:
+            fee = bkpr_cache.get_open_cost_by_txid(funding_txid)
+        else:
+            # Legacy fallback: per-channel RPC (only if no cache provided)
+            fee = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
+
+        # Validate
+        if fee is not None and not self._is_valid_fee_amount(fee, capacity_sats, funding_txid):
+            return None
+
+        return fee
+
+    def _is_valid_fee_amount(self, fee_sats: int, capacity_sats: int,
                              funding_txid: str) -> bool:
         """
         Validate that a fee amount is actually a mining fee, not an invalid value.
-        
+
         This is a final failsafe to catch cases where the funding principal
         (channel capacity) is incorrectly returned instead of the actual
         on-chain mining fee.
@@ -2067,70 +2039,6 @@ class ChannelProfitabilityAnalyzer:
             return False
         
         return True
-    
-    def _get_rebalance_costs_from_bookkeeper(self, channel_id: str, funding_txid: Optional[str] = None) -> int:
-        """
-        Query bookkeeper for rebalance costs (self-payment rebalance fees).
-        
-        Rebalance self-payments show up in bookkeeper as:
-        - 'invoice' events on the destination channel (we paid ourselves)
-        - The fees_msat field shows what we paid in routing fees
-        
-        We look for invoice events where we paid to ourselves
-        by checking if there's a matching credit on another of our channels.
-        
-        Args:
-            channel_id: The channel to get rebalance costs for
-            funding_txid: The funding transaction ID (optional, will look up if not provided)
-            
-        Returns:
-            Total rebalance costs in sats
-        """
-        total_fees_sats = 0
-        
-        try:
-            # Use provided funding_txid or look it up
-            if not funding_txid:
-                channels = self._get_all_channels()
-                if channel_id not in channels:
-                    return 0
-                funding_txid = channels[channel_id].get("funding_txid", "")
-            
-            if not funding_txid:
-                return 0
-            
-            reversed_txid = self._reverse_txid(funding_txid)
-            
-            # Query bookkeeper for this channel's events
-            result = self.plugin.rpc.call(
-                "bkpr-listaccountevents",
-                {"account": reversed_txid}
-            )
-            
-            events = result.get("events", [])
-            
-            # Look for invoice events with fees (payments we made)
-            for event in events:
-                if event.get("type") == "channel" and event.get("tag") == "invoice":
-                    # Debit on invoice = we paid out (could be rebalance)
-                    fees_msat = self._parse_msat(event.get("fees_msat", 0))
-                    if fees_msat > 0:
-                        # This is a fee we paid - likely a rebalance self-payment
-                        total_fees_sats += fees_msat // 1000
-            
-            if total_fees_sats > 0:
-                self.plugin.log(
-                    f"Found {total_fees_sats} sats in rebalance costs from bookkeeper for {channel_id}",
-                    level='debug'
-                )
-                        
-        except Exception as e:
-            self.plugin.log(
-                f"Error getting rebalance costs from bookkeeper for {channel_id}: {e}",
-                level='debug'
-            )
-        
-        return total_fees_sats
     
     def _reverse_txid(self, txid: str) -> str:
         """

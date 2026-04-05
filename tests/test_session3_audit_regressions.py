@@ -291,7 +291,6 @@ class TestEffectiveCostFallback:
         analyzer._lock = threading.Lock()
         analyzer.config = MagicMock()
         analyzer.config.estimated_open_cost_sats = 5000
-        analyzer._get_rebalance_costs_from_bookkeeper = MagicMock(return_value=0)
         return analyzer
 
     def test_fallback_does_not_inflate_costs(self):

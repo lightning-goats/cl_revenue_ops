@@ -13,6 +13,7 @@ Verifies:
 
 import os
 import sys
+import time
 import pytest
 from unittest.mock import MagicMock
 
@@ -25,7 +26,7 @@ sys.modules['pyln.client'] = mock_pyln
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.profitability_analyzer import BookkeeperCache
+from modules.profitability_analyzer import BookkeeperCache, ChannelProfitabilityAnalyzer
 
 
 # ============================================================
@@ -160,3 +161,114 @@ class TestBookkeeperCache:
 
         assert cache.available is True
         assert cache.get_open_cost_by_txid(txid) is None
+
+
+# ============================================================
+# Helpers for analyzer tests
+# ============================================================
+
+def _make_analyzer():
+    """Build analyzer with mocked dependencies."""
+    plugin = MagicMock()
+    config = MagicMock()
+    config.estimated_open_cost_sats = 2000
+    config.rpc_timeout_seconds = 15
+    database = MagicMock()
+    analyzer = ChannelProfitabilityAnalyzer(plugin, config, database)
+    return analyzer
+
+
+# ============================================================
+# Task 2: Open cost from cache
+# ============================================================
+
+class TestOpenCostFromCache:
+    def test_open_cost_from_cache_skips_rpc(self):
+        """When bkpr_cache has the fee, no per-channel RPC is made."""
+        analyzer = _make_analyzer()
+        analyzer.database.get_channel_open_cost.return_value = None
+        analyzer.database.get_channel_rebalance_costs.return_value = 0
+        analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
+        }
+
+        cache = MagicMock()
+        cache.available = True
+        cache.get_open_cost_by_txid.return_value = 350
+
+        costs = analyzer._get_channel_costs(
+            "100x1x0", "peer1", "funding_tx_1", 2_000_000,
+            opener="local", open_timestamp=1700000000,
+            bkpr_cache=cache
+        )
+
+        assert costs.open_cost_sats == 350
+        analyzer.plugin.rpc.call.assert_not_called()
+
+    def test_open_cost_falls_back_to_config_when_cache_empty(self):
+        """When cache has no data for this txid, uses config fallback."""
+        analyzer = _make_analyzer()
+        analyzer.database.get_channel_open_cost.return_value = None
+        analyzer.database.get_channel_rebalance_costs.return_value = 0
+        analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
+        }
+
+        cache = MagicMock()
+        cache.available = True
+        cache.get_open_cost_by_txid.return_value = None
+
+        costs = analyzer._get_channel_costs(
+            "100x1x0", "peer1", "funding_tx_1", 2_000_000,
+            opener="local", open_timestamp=1700000000,
+            bkpr_cache=cache
+        )
+
+        assert costs.open_cost_sats == 2000  # config.estimated_open_cost_sats
+
+
+# ============================================================
+# Task 3: Open timestamp without bookkeeper RPC
+# ============================================================
+
+class TestOpenTimestampNoBkprRpc:
+    def test_scid_block_height_estimate(self):
+        """Timestamp is derived from SCID block height without any RPC."""
+        analyzer = _make_analyzer()
+        ts = analyzer._get_channel_open_timestamp("900000x123x0", "sometxid")
+        expected = 1231006505 + (900000 * 600)
+        assert ts == expected
+        analyzer.plugin.rpc.call.assert_not_called()
+
+    def test_fallback_when_scid_unparseable(self):
+        """Bad SCID format falls back to 30 days ago."""
+        analyzer = _make_analyzer()
+        ts = analyzer._get_channel_open_timestamp("badformat", "sometxid")
+        now = int(time.time())
+        thirty_days_ago = now - (86400 * 30)
+        assert abs(ts - thirty_days_ago) < 5
+
+
+# ============================================================
+# Task 4: Rebalance costs from DB only
+# ============================================================
+
+class TestRebalanceCostsDbOnly:
+    def test_rebalance_cost_from_db_no_bkpr_rpc(self):
+        """_get_channel_costs uses DB rebalance cost without bookkeeper call."""
+        analyzer = _make_analyzer()
+        analyzer.database.get_channel_open_cost.return_value = 300
+        analyzer.database.get_channel_rebalance_costs.return_value = 1500
+        analyzer.database.get_channel_rebalance_success_rate.return_value = {
+            "success_rate": 1.0, "total": 0, "avg_cost_ppm": 0, "avg_amount_sats": 0
+        }
+
+        costs = analyzer._get_channel_costs(
+            "100x1x0", "peer1", "funding_tx_1", 2_000_000,
+            opener="local", open_timestamp=1700000000,
+            bkpr_cache=MagicMock(available=True, get_open_cost_by_txid=MagicMock(return_value=None))
+        )
+
+        assert costs.rebalance_cost_sats == 1500
+        for call_args in analyzer.plugin.rpc.call.call_args_list:
+            assert "bkpr-listaccountevents" not in str(call_args)
