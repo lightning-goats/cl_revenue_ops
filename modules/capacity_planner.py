@@ -158,6 +158,43 @@ class CapacityPlanner:
             pass
         return None
 
+    def _check_portfolio_balance_gate(self, channels: list) -> str:
+        """Check aggregate fleet liquidity balance. Returns state string.
+
+        States:
+            healthy     (< 70% local)  — all opens permitted
+            watch       (70-85% local) — opens permitted, log warning
+            constrained (85-95% local) — only dual-funded or sink-targeting opens
+            blocked     (>= 95% local) — no new outbound opens
+        """
+        total_local = 0
+        total_capacity = 0
+        for ch in channels:
+            if ch.get("state") != "CHANNELD_NORMAL":
+                continue
+            to_us = ch.get("to_us_msat", 0)
+            total = ch.get("total_msat", 0)
+            if isinstance(to_us, str):
+                to_us = int(to_us.replace("msat", "")) if "msat" in to_us else int(to_us)
+            if isinstance(total, str):
+                total = int(total.replace("msat", "")) if "msat" in total else int(total)
+            total_local += to_us
+            total_capacity += total
+
+        if total_capacity == 0:
+            return "healthy"
+
+        local_pct = (total_local / total_capacity) * 100
+
+        if local_pct >= 95:
+            return "blocked"
+        elif local_pct >= 85:
+            return "constrained"
+        elif local_pct >= 70:
+            return "watch"
+        else:
+            return "healthy"
+
     def execute_cycle(self, cfg=None) -> Dict[str, Any]:
         """Main timer-driven cycle. Evaluates and executes open/close decisions."""
         if cfg is None:
@@ -246,12 +283,24 @@ class CapacityPlanner:
             })
             closes_this_cycle += 1
 
-        # 5. Discover and open channels (up to max_opens_per_cycle)
+        # 5. Check portfolio balance before opening
+        portfolio_state = "healthy"
+        try:
+            peer_channels = self.plugin.rpc.listpeerchannels().get("channels", [])
+            portfolio_state = self._check_portfolio_balance_gate(peer_channels)
+            if portfolio_state == "watch":
+                self.plugin.log(f"Portfolio balance governor: {portfolio_state} — opens permitted with warning", level='info')
+            elif portfolio_state in ("constrained", "blocked"):
+                self.plugin.log(f"Portfolio balance governor: {portfolio_state} — restricting opens", level='info')
+        except Exception as e:
+            self.plugin.log(f"Portfolio balance check failed: {e}", level='debug')
+
+        # 6. Discover and open channels (up to max_opens_per_cycle)
         candidates = []
         # Reset funding coordination before evaluating opens
         self._last_funding_deficit_sats = 0
         self._last_best_candidate = {}
-        if fee_ok:
+        if fee_ok and portfolio_state != "blocked":
             candidates = self._discover_peers(winners, all_profitability, all_flow)
 
             # Get available funds for sizing
@@ -329,6 +378,7 @@ class CapacityPlanner:
         # 6. Update candidate pool
         self._update_candidate_pool(candidates if fee_ok else [])
 
+        summary["portfolio_state"] = portfolio_state
         summary["timestamp"] = int(time.time())
         return summary
 
