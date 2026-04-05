@@ -519,6 +519,9 @@ class ChannelProfitabilityAnalyzer:
                 f"cache_age={age_label}]"
             )
 
+            # Push summary to datastore for cross-plugin access
+            self._push_profitability_summary(results)
+
         except Exception as e:
             self.plugin.log(f"Error in profitability analysis: {e}", level='error')
             # On error, restore old timestamp so next call retries
@@ -529,7 +532,40 @@ class ChannelProfitabilityAnalyzer:
             self._analysis_lock.release()
 
         return results
-    
+
+    def _push_profitability_summary(self, results: Dict[str, 'ChannelProfitability']) -> None:
+        """Push compressed profitability summary to CLN datastore.
+
+        Enables cl-hive to read profitability data without cross-plugin RPC.
+        Fire-and-forget -- failures are logged but don't affect analysis.
+        """
+        import json as _json
+
+        channels = {}
+        for ch_id, p in results.items():
+            channels[ch_id] = {
+                "class": p.classification.value,
+                "net_profit_sats": p.net_profit_sats,
+                "roi_pct": round(p.roi_percent, 2),
+                "days_open": p.days_open,
+                "role": p.channel_role.value,
+                "fee_multiplier": round(self.get_fee_multiplier(ch_id), 2),
+            }
+
+        payload = {
+            "timestamp": int(time.time()),
+            "channels": channels,
+        }
+
+        try:
+            self.plugin.rpc.datastore(
+                key=["revenue", "profitability-summary"],
+                string=_json.dumps(payload),
+                mode="create-or-replace",
+            )
+        except Exception:
+            self.plugin.log("Datastore push failed for profitability-summary", level="debug")
+
     def analyze_channel(self, channel_id: str,
                        channel_info: Optional[Dict] = None,
                        precalculated_revenue: Optional[ChannelRevenue] = None,
