@@ -159,30 +159,75 @@ class ChannelCosts:
 @dataclass
 class ChannelRevenue:
     """
-    Revenue tracking for a channel.
+    Revenue tracking for a channel — msat-native.
+
+    All monetary values stored in millisatoshis for lossless accounting.
+    Satoshi values exposed via properties with ceiling semantics for fees
+    (any non-zero msat fee → at least 1 sat) to prevent sub-sat truncation.
 
     Attributes:
         channel_id: Channel short ID
-        fees_earned_sats: Total routing fees earned (as exit channel)
-        volume_routed_sats: Total sats forwarded through channel (as exit)
+        fees_earned_msat: Total routing fees earned as exit channel (msat)
+        volume_routed_msat: Total sats forwarded through channel as exit (msat)
         forward_count: Number of successful forwards (as exit)
-        sourced_volume_sats: Volume that entered through this channel (as entry)
-        sourced_fee_contribution_sats: Fees earned on exits for forwards sourced here
+        sourced_volume_msat: Volume that entered through this channel (msat)
+        sourced_fee_contribution_msat: Fees earned on exits for forwards sourced here (msat)
         sourced_forward_count: Number of forwards where this was entry channel
     """
     channel_id: str
-    fees_earned_sats: int
-    volume_routed_sats: int
+    fees_earned_msat: int
+    volume_routed_msat: int
     forward_count: int
     # Inbound contribution metrics (channel as entry point)
-    sourced_volume_sats: int = 0
-    sourced_fee_contribution_sats: int = 0
+    sourced_volume_msat: int = 0
+    sourced_fee_contribution_msat: int = 0
     sourced_forward_count: int = 0
+
+    # --- Satoshi properties (reporting boundary) ---
+
+    @property
+    def fees_earned_sats(self) -> int:
+        """Fees earned in sats. Non-zero msat rounds up to at least 1 sat."""
+        if self.fees_earned_msat <= 0:
+            return 0
+        return max(1, self.fees_earned_msat // 1000)
+
+    @property
+    def volume_routed_sats(self) -> int:
+        """Volume routed in sats (truncated, no ceiling needed for volume)."""
+        return self.volume_routed_msat // 1000
+
+    @property
+    def sourced_fee_contribution_sats(self) -> int:
+        """Sourced fee contribution in sats. Non-zero msat rounds up to at least 1 sat."""
+        if self.sourced_fee_contribution_msat <= 0:
+            return 0
+        return max(1, self.sourced_fee_contribution_msat // 1000)
+
+    @property
+    def sourced_volume_sats(self) -> int:
+        """Sourced volume in sats (truncated)."""
+        return self.sourced_volume_msat // 1000
+
+    # --- Valuation properties ---
+
+    @property
+    def total_contribution_msat(self) -> int:
+        """Channel's valuation contribution in msat — max of earned vs sourced.
+
+        Uses max() not average: credit the channel for its most valuable role.
+        This is for classification/protection decisions, NOT fleet revenue reporting.
+        Fleet revenue = sum of fees_earned across exit channels (no double-counting).
+        """
+        return max(self.fees_earned_msat, self.sourced_fee_contribution_msat)
 
     @property
     def total_contribution_sats(self) -> int:
-        """Total value: 50% of direct fees + 50% of fees enabled by sourcing."""
-        return (self.fees_earned_sats + self.sourced_fee_contribution_sats) // 2
+        """Channel's valuation contribution in sats (ceiling for non-zero)."""
+        msat = self.total_contribution_msat
+        if msat <= 0:
+            return 0
+        return max(1, msat // 1000)
 
     @property
     def total_forward_count(self) -> int:
