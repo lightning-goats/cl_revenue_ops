@@ -4370,9 +4370,13 @@ def _on_channel_state_changed_impl(plugin: Plugin, **kwargs):
     funding_txid = None
     closing_txid = None
 
+    # Bookkeeper accounts use the hex channel_id, not the SCID.
+    # The event's 'channel_id' field is the hex format bookkeeper expects.
+    bkpr_account = event.get('channel_id') or channel_id
+
     try:
         # Try to get on-chain fee data from bookkeeper
-        closure_data = _get_closure_costs_from_bookkeeper(channel_id)
+        closure_data = _get_closure_costs_from_bookkeeper(bkpr_account)
         if closure_data:
             closure_fee_sats = closure_data.get('closure_fee_sats', 0)
             htlc_sweep_fee_sats = closure_data.get('htlc_sweep_fee_sats', 0)
@@ -4494,7 +4498,7 @@ def _handle_channel_open(channel_id: str, peer_id: Optional[str],
         plugin.log(f"Error handling channel open {channel_id}: {e}", level='debug')
 
 
-def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, Any]]:
+def _get_closure_costs_from_bookkeeper(bkpr_account: str) -> Optional[Dict[str, Any]]:
     """
     Query bookkeeper for on-chain fees related to channel closure.
 
@@ -4502,7 +4506,7 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
     avoiding raw event scanning.
 
     Args:
-        channel_id: The channel short ID
+        bkpr_account: Bookkeeper account identifier (hex channel_id, not SCID)
 
     Returns:
         Dict with closure_fee_sats, htlc_sweep_fee_sats, funding_txid, closing_txid
@@ -4514,14 +4518,14 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
         return None
 
     try:
-        result = safe_plugin.rpc.call("bkpr-inspect", {"account": channel_id})
+        result = safe_plugin.rpc.call("bkpr-inspect", {"account": bkpr_account})
 
         if not result or "txs" not in result:
             return None
 
         txs = result.get("txs", [])
         if not isinstance(txs, list):
-            plugin.log(f"Security: Invalid txs structure from bkpr-inspect for {channel_id}", level='warn')
+            plugin.log(f"Security: Invalid txs structure from bkpr-inspect for {bkpr_account}", level='warn')
             return None
 
         closure_fee_sats = 0
@@ -4571,7 +4575,7 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
         }
 
     except Exception as e:
-        plugin.log(f"Bookkeeper query failed for {channel_id}: {e}", level='debug')
+        plugin.log(f"Bookkeeper query failed for {bkpr_account}: {e}", level='debug')
         return None
 
 
