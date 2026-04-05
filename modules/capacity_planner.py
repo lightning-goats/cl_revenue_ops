@@ -309,6 +309,10 @@ class CapacityPlanner:
         # Reset funding coordination before evaluating opens
         self._last_funding_deficit_sats = 0
         self._last_best_candidate = {}
+        # NOTE: "constrained" state (85-95% local) will filter candidates to
+        # dual-funded or sink-targeting only once Phase 2 (demand-flow classifier)
+        # provides is_sink_adjacent and has_liquidity_ads signals. Until then,
+        # constrained behaves like watch (logs warning, permits opens).
         if fee_ok and portfolio_state != "blocked":
             candidates = self._discover_peers(winners, all_profitability, all_flow)
 
