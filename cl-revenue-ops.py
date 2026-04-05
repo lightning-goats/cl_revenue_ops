@@ -4498,7 +4498,8 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
     """
     Query bookkeeper for on-chain fees related to channel closure.
 
-    Uses bkpr-listaccountevents to find onchain_fee events for the channel.
+    Uses bkpr-inspect to get fees_paid_msat per transaction directly,
+    avoiding raw event scanning.
 
     Args:
         channel_id: The channel short ID
@@ -4513,11 +4514,14 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
         return None
 
     try:
-        # Query bookkeeper for account events
-        # The account name for a channel is typically the channel_id
-        events = safe_plugin.rpc.call("bkpr-listaccountevents", {"account": channel_id})
+        result = safe_plugin.rpc.call("bkpr-inspect", {"account": channel_id})
 
-        if not events or 'events' not in events:
+        if not result or "txs" not in result:
+            return None
+
+        txs = result.get("txs", [])
+        if not isinstance(txs, list):
+            plugin.log(f"Security: Invalid txs structure from bkpr-inspect for {channel_id}", level='warn')
             return None
 
         closure_fee_sats = 0
@@ -4525,49 +4529,39 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
         funding_txid = None
         closing_txid = None
 
-        # Security: Validate events structure
-        event_list = events.get('events', [])
-        if not isinstance(event_list, list):
-            plugin.log(f"Security: Invalid events structure from bookkeeper for {channel_id}", level='warn')
-            return None
-
-        for event in event_list:
-            # Security: Type check each event is a dict
-            if not isinstance(event, dict):
+        for tx in txs:
+            if not isinstance(tx, dict):
                 continue
 
-            event_type = event.get('type', '')
-            tag = event.get('tag', '')
+            txid = tx.get("txid")
+            fees_msat = parse_msat(tx.get("fees_paid_msat", 0))
+            fee_sats = min(fees_msat // 1000, 50000)  # Bounds check
 
-            # Track funding transaction
-            if tag == 'channel_open':
-                funding_txid = event.get('txid')
+            outputs = tx.get("outputs", [])
+            if not isinstance(outputs, list):
+                continue
 
-            # Track closing transaction and fees
-            if tag in ('channel_close', 'mutual_close', 'unilateral_close'):
-                closing_txid = event.get('txid')
+            tags = {o.get("output_tag", "") for o in outputs if isinstance(o, dict)}
+            spend_tags = {o.get("spend_tag", "") for o in outputs if isinstance(o, dict)}
+            all_tags = tags | spend_tags
 
-            # Accumulate on-chain fees
-            if event_type == 'onchain_fee':
-                # Security: Type check fee values before arithmetic
-                credit_msat = event.get('credit_msat', 0)
-                debit_msat = event.get('debit_msat', 0)
+            if "channel_open" in all_tags:
+                funding_txid = txid
 
-                # Parse msat values safely (handles Millisatoshi objects, strings, ints)
-                credit_msat = parse_msat(credit_msat)
-                debit_msat = parse_msat(debit_msat)
+            is_close = any(
+                t for t in all_tags
+                if t in ("channel_close", "mutual_close", "unilateral_close")
+            )
+            is_sweep = any(
+                t for t in all_tags
+                if "htlc" in t.lower() or "sweep" in t.lower()
+            )
 
-                fee_msat = max(abs(credit_msat), abs(debit_msat))
-                fee_sats = fee_msat // 1000
-
-                # Security: Bounds check (max 50,000 sats per fee event)
-                fee_sats = min(fee_sats, 50000)
-
-                # Categorize the fee
-                if 'htlc' in tag.lower() or 'sweep' in tag.lower():
-                    htlc_sweep_fee_sats += fee_sats
-                else:
-                    closure_fee_sats += fee_sats
+            if is_sweep:
+                htlc_sweep_fee_sats += fee_sats
+            elif is_close:
+                closing_txid = txid
+                closure_fee_sats += fee_sats
 
         return {
             'closure_fee_sats': closure_fee_sats,
@@ -4577,7 +4571,6 @@ def _get_closure_costs_from_bookkeeper(channel_id: str) -> Optional[Dict[str, An
         }
 
     except Exception as e:
-        # Bookkeeper might not be available or channel not found
         plugin.log(f"Bookkeeper query failed for {channel_id}: {e}", level='debug')
         return None
 
