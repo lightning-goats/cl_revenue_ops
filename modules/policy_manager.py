@@ -1124,7 +1124,6 @@ class PolicyManager:
                             fee_ppm_target=0,
                             rebalance_mode=RebalanceMode.ENABLED.value,
                             tags=["corridor_owner", "auto_fleet"],
-                            reason="Auto: fleet member (0-fee)",
                         )
                         applied += 1
                 elif corridor_role == "owner":
@@ -1135,7 +1134,6 @@ class PolicyManager:
                             strategy=FeeStrategy.DYNAMIC.value,
                             rebalance_mode=RebalanceMode.ENABLED.value,
                             tags=["corridor_owner", "auto_corridor"],
-                            reason=f"Auto: corridor owner (role={corridor_role})",
                         )
                         applied += 1
 
