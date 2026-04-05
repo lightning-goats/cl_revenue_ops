@@ -48,11 +48,11 @@ def _make_revenue(fees=2000, sourced_fees=0, volume=1_000_000, sourced_volume=0,
                   forwards=100, sourced_forwards=0):
     return ChannelRevenue(
         channel_id="111x222x0",
-        fees_earned_sats=fees,
-        volume_routed_sats=volume,
+        fees_earned_msat=fees * 1000,
+        volume_routed_msat=volume * 1000,
         forward_count=forwards,
-        sourced_volume_sats=sourced_volume,
-        sourced_fee_contribution_sats=sourced_fees,
+        sourced_volume_msat=sourced_volume * 1000,
+        sourced_fee_contribution_msat=sourced_fees * 1000,
         sourced_forward_count=sourced_forwards,
     )
 
@@ -98,39 +98,50 @@ def _make_analyzer():
 # Fix 1: 50/50 Revenue Attribution
 # ============================================================
 
-class TestFiftyFiftySplit:
-    """Verify that total_contribution_sats applies 50/50 split."""
+class TestMaxValuation:
+    """Verify that total_contribution_sats uses max(earned, sourced)."""
 
     def test_direct_only(self):
-        """Direct-only channel: contribution = fees / 2."""
+        """Direct-only channel: contribution = fees."""
         rev = _make_revenue(fees=1000, sourced_fees=0)
-        assert rev.total_contribution_sats == 500
+        assert rev.total_contribution_sats == 1000
 
     def test_sourced_only(self):
-        """Source-only channel: contribution = sourced / 2."""
+        """Source-only channel: contribution = sourced."""
         rev = _make_revenue(fees=0, sourced_fees=800)
-        assert rev.total_contribution_sats == 400
-
-    def test_both_directions(self):
-        """Channel with fees in both directions gets (a+b)//2."""
-        rev = _make_revenue(fees=1000, sourced_fees=600)
-        # (1000 + 600) // 2 = 800
         assert rev.total_contribution_sats == 800
 
-    def test_no_phantom_wealth(self):
-        """Two channels that share the same 10-sat forward can't claim 20 sats total."""
+    def test_both_directions_exit_dominant(self):
+        """Exit-dominant channel: contribution = max(fees, sourced) = fees."""
+        rev = _make_revenue(fees=1000, sourced_fees=600)
+        assert rev.total_contribution_sats == 1000
+
+    def test_both_directions_inbound_dominant(self):
+        """Inbound-dominant channel: contribution = max(fees, sourced) = sourced."""
+        rev = _make_revenue(fees=600, sourced_fees=1000)
+        assert rev.total_contribution_sats == 1000
+
+    def test_no_double_counting(self):
+        """Each channel credited for its most valuable role, not combined."""
         # Channel A earns 10 sats as exit, Channel B sources it
         exit_rev = _make_revenue(fees=10, sourced_fees=0)
         source_rev = _make_revenue(fees=0, sourced_fees=10)
-        total = exit_rev.total_contribution_sats + source_rev.total_contribution_sats
-        # 5 + 5 = 10, not 20
-        assert total == 10
+        # max(10,0)=10 + max(0,10)=10 = 20; each channel fully credited for role
+        assert exit_rev.total_contribution_sats == 10
+        assert source_rev.total_contribution_sats == 10
 
-    def test_odd_rounding(self):
-        """Integer division truncates, not rounds."""
-        rev = _make_revenue(fees=7, sourced_fees=0)
-        # 7 // 2 = 3
-        assert rev.total_contribution_sats == 3
+    def test_odd_msat_ceiling(self):
+        """Sub-sat non-zero contribution rounds up to 1."""
+        rev = _make_revenue(fees=0, sourced_fees=0)
+        # fees=0 sourced_fees=0, make a channel with 7 msat fee
+        rev2 = ChannelRevenue(
+            channel_id="111x222x0",
+            fees_earned_msat=7,
+            volume_routed_msat=1_000_000_000,
+            forward_count=100,
+        )
+        # 7 msat > 0, max(1, 7//1000) = max(1, 0) = 1
+        assert rev2.total_contribution_sats == 1
 
 
 # ============================================================

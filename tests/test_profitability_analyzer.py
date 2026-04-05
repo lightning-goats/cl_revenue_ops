@@ -37,10 +37,10 @@ def _make_profitability(
     )
     revenue = ChannelRevenue(
         channel_id="111x222x0",
-        fees_earned_sats=fees_earned_sats,
-        volume_routed_sats=1_000_000,
+        fees_earned_msat=fees_earned_sats * 1000,
+        volume_routed_msat=1_000_000 * 1000,
         forward_count=100,
-        sourced_fee_contribution_sats=sourced_fee_contribution_sats,
+        sourced_fee_contribution_msat=sourced_fee_contribution_sats * 1000,
     )
     return ChannelProfitability(
         channel_id="111x222x0",

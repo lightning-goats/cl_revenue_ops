@@ -71,11 +71,11 @@ def _setup_integration_mocks(analyzer, plugin, config, database, ch_id="100x1x0"
     # Database methods used by _get_channel_costs
     database.get_all_channels_revenue_totals.return_value = {
         ch_id: {
-            "fees_earned_sats": 6000,
-            "volume_routed_sats": 1_000_000,
+            "fees_earned_msat": 6_000_000,
+            "volume_routed_msat": 1_000_000_000,
             "forward_count": 50,
-            "sourced_volume_sats": 800_000,
-            "sourced_fee_contribution_sats": 4000,
+            "sourced_volume_msat": 800_000_000,
+            "sourced_fee_contribution_msat": 4_000_000,
             "sourced_forward_count": 30,
         }
     }
@@ -110,11 +110,11 @@ def _make_profitability(channel_id="100x1x0", peer_id="02abc",
     )
     revenue = ChannelRevenue(
         channel_id=channel_id,
-        fees_earned_sats=6000,
-        volume_routed_sats=1_000_000,
+        fees_earned_msat=6_000_000,
+        volume_routed_msat=1_000_000_000,
         forward_count=forward_count,
-        sourced_volume_sats=800_000,
-        sourced_fee_contribution_sats=4000,
+        sourced_volume_msat=800_000_000,
+        sourced_fee_contribution_msat=4_000_000,
         sourced_forward_count=sourced_forward_count,
     )
     return ChannelProfitability(

@@ -40,10 +40,10 @@ def _insert_forward(conn, *, in_channel, out_channel, in_msat, out_msat, fee_msa
 # Fix #17: get_channel_full_pnl applies 50/50 split to prevent double-counting
 # =========================================================================
 
-class TestFullPnl5050Split:
-    """get_channel_full_pnl must apply 50/50 split to match Revenue dataclass."""
+class TestFullPnlMaxValuation:
+    """get_channel_full_pnl uses max(direct, sourced) for total_contribution."""
 
-    def test_total_contribution_is_halved(self, db):
+    def test_total_contribution_uses_max(self, db):
         now = int(time.time())
         conn = db._get_connection()
         # Exit-side: 10000 msat fee => 10 sats
@@ -56,11 +56,11 @@ class TestFullPnl5050Split:
         full = db.get_channel_full_pnl("A", window_days=30)
         assert full["direct_revenue_sats"] == 10
         assert full["sourced_fee_contribution_sats"] == 6
-        # 50/50 split: (10 + 6) // 2 = 8
-        assert full["total_contribution_sats"] == 8
+        # max(10000, 6000) = 10000 msat => 10 sats
+        assert full["total_contribution_sats"] == 10
 
     def test_zero_sourced_contribution(self, db):
-        """Channel with no inbound traffic: total = (direct + 0) // 2."""
+        """Channel with no inbound traffic: total = max(direct, 0) = direct."""
         now = int(time.time())
         conn = db._get_connection()
         _insert_forward(conn, in_channel="B", out_channel="A",
@@ -69,8 +69,8 @@ class TestFullPnl5050Split:
         full = db.get_channel_full_pnl("A", window_days=30)
         assert full["direct_revenue_sats"] == 5
         assert full["sourced_fee_contribution_sats"] == 0
-        # 50/50 split: (5 + 0) // 2 = 2
-        assert full["total_contribution_sats"] == 2
+        # max(5000, 0) = 5000 msat => 5 sats
+        assert full["total_contribution_sats"] == 5
 
 
 # =========================================================================
@@ -106,8 +106,8 @@ class TestBoundaryDayExclusion:
     def test_get_channel_revenue_totals_no_double_count(self, db):
         self._setup_boundary_scenario(db)
         totals = db.get_channel_revenue_totals("A")
-        # Should be 2 sats (2000 msat), NOT 4 sats (doubled)
-        assert totals["fees_earned_sats"] == 2
+        # Should be 2000 msat (not 4000 msat doubled)
+        assert totals["fees_earned_msat"] == 2000
         assert totals["forward_count"] == 1
 
     def test_get_lifetime_stats_no_double_count(self, db):
@@ -137,8 +137,8 @@ class TestBoundaryDayExclusion:
                         ts=today_start + 100)
 
         totals = db.get_channel_revenue_totals("A")
-        # Yesterday rollup (3 sats) + today raw (1 sat) = 4 sats
-        assert totals["fees_earned_sats"] == 4
+        # Yesterday rollup (3000 msat) + today raw (1000 msat) = 4000 msat
+        assert totals["fees_earned_msat"] == 4000
         assert totals["forward_count"] == 3
 
 

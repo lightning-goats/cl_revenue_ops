@@ -2175,11 +2175,11 @@ class ChannelProfitabilityAnalyzer:
         for channel_id, data in totals.items():
             result_map[channel_id] = ChannelRevenue(
                 channel_id=channel_id,
-                fees_earned_sats=int(data.get("fees_earned_sats", 0) or 0),
-                volume_routed_sats=int(data.get("volume_routed_sats", 0) or 0),
+                fees_earned_msat=int(data.get("fees_earned_msat", 0) or 0),
+                volume_routed_msat=int(data.get("volume_routed_msat", 0) or 0),
                 forward_count=int(data.get("forward_count", 0) or 0),
-                sourced_volume_sats=int(data.get("sourced_volume_sats", 0) or 0),
-                sourced_fee_contribution_sats=int(data.get("sourced_fee_contribution_sats", 0) or 0),
+                sourced_volume_msat=int(data.get("sourced_volume_msat", 0) or 0),
+                sourced_fee_contribution_msat=int(data.get("sourced_fee_contribution_msat", 0) or 0),
                 sourced_forward_count=int(data.get("sourced_forward_count", 0) or 0),
             )
 
@@ -2203,11 +2203,11 @@ class ChannelProfitabilityAnalyzer:
 
         return ChannelRevenue(
             channel_id=channel_id,
-            fees_earned_sats=int(totals.get("fees_earned_sats", 0) or 0),
-            volume_routed_sats=int(totals.get("volume_routed_sats", 0) or 0),
+            fees_earned_msat=int(totals.get("fees_earned_msat", 0) or 0),
+            volume_routed_msat=int(totals.get("volume_routed_msat", 0) or 0),
             forward_count=int(totals.get("forward_count", 0) or 0),
-            sourced_volume_sats=int(totals.get("sourced_volume_sats", 0) or 0),
-            sourced_fee_contribution_sats=int(totals.get("sourced_fee_contribution_sats", 0) or 0),
+            sourced_volume_msat=int(totals.get("sourced_volume_msat", 0) or 0),
+            sourced_fee_contribution_msat=int(totals.get("sourced_fee_contribution_msat", 0) or 0),
             sourced_forward_count=int(totals.get("sourced_forward_count", 0) or 0),
         )
     

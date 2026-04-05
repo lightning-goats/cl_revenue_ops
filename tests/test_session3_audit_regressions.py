@@ -190,8 +190,8 @@ def _make_profitability(classification, roi_percent, marginal_roi,
         ),
         revenue=ChannelRevenue(
             channel_id="100x1x0",
-            fees_earned_sats=2000,
-            volume_routed_sats=500_000,
+            fees_earned_msat=2_000_000,
+            volume_routed_msat=500_000_000,
             forward_count=50,
         ),
         net_profit_sats=int(roi_percent * 60),  # arbitrary

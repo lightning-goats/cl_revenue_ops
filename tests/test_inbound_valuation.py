@@ -312,3 +312,55 @@ class TestDatabaseMsatReturns:
         since = now - 86400
         total = db.get_total_routing_revenue(since)
         assert total == 900  # 3 * 300 = 900 msat (not 0 from truncation)
+
+
+class TestRevenueDataConstruction:
+    """Revenue data constructors use msat fields from database."""
+
+    def test_get_all_revenue_data_builds_msat_channel_revenue(self):
+        from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
+
+        mock_plugin = MagicMock()
+        mock_db = MagicMock()
+        mock_db.get_all_channels_revenue_totals.return_value = {
+            "200x1x0": {
+                "fees_earned_msat": 5500,
+                "volume_routed_msat": 1_000_000,
+                "forward_count": 10,
+                "sourced_volume_msat": 0,
+                "sourced_fee_contribution_msat": 0,
+                "sourced_forward_count": 0,
+            }
+        }
+
+        analyzer = ChannelProfitabilityAnalyzer.__new__(ChannelProfitabilityAnalyzer)
+        analyzer.plugin = mock_plugin
+        analyzer.database = mock_db
+
+        result = analyzer._get_all_revenue_data()
+        rev = result["200x1x0"]
+        assert rev.fees_earned_msat == 5500
+        assert rev.fees_earned_sats == 5
+        assert rev.volume_routed_msat == 1_000_000
+
+    def test_get_channel_revenue_builds_msat_channel_revenue(self):
+        from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
+
+        mock_plugin = MagicMock()
+        mock_db = MagicMock()
+        mock_db.get_channel_revenue_totals.return_value = {
+            "fees_earned_msat": 500,
+            "volume_routed_msat": 50_000,
+            "forward_count": 1,
+            "sourced_volume_msat": 0,
+            "sourced_fee_contribution_msat": 0,
+            "sourced_forward_count": 0,
+        }
+
+        analyzer = ChannelProfitabilityAnalyzer.__new__(ChannelProfitabilityAnalyzer)
+        analyzer.plugin = mock_plugin
+        analyzer.database = mock_db
+
+        rev = analyzer._get_channel_revenue("200x1x0")
+        assert rev.fees_earned_msat == 500
+        assert rev.fees_earned_sats == 1  # sub-sat ceiling

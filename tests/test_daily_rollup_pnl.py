@@ -57,18 +57,18 @@ def test_windowed_pnl_includes_pruned_daily_rollups(db):
 
     # Channel direct PnL window should include rolled-up + recent
     pnl = db.get_channel_pnl("A", window_days=30)
-    assert pnl["revenue_sats"] == 8  # (1000 + 2000 + 5000) msat => 8 sats
+    assert pnl["revenue_msat"] == 8000  # (1000 + 2000 + 5000) msat
     assert pnl["forward_count"] == 3
 
     inbound = db.get_channel_inbound_contribution("A", window_days=30)
-    assert inbound["sourced_fee_contribution_sats"] == 10  # (4000 + 6000) msat => 10 sats
-    assert inbound["sourced_volume_sats"] == 11000  # (10_000_000 + 1_000_000) msat => 11_000 sats
+    assert inbound["sourced_fee_contribution_msat"] == 10000  # (4000 + 6000) msat
+    assert inbound["sourced_volume_msat"] == 11_000_000  # (10_000_000 + 1_000_000) msat
     assert inbound["sourced_forward_count"] == 2
 
     full = db.get_channel_full_pnl("A", window_days=30)
     assert full["direct_revenue_sats"] == 8
     assert full["sourced_fee_contribution_sats"] == 10
-    assert full["total_contribution_sats"] == 9  # (8 + 10) // 2 = 9 (50/50 split)
+    assert full["total_contribution_msat"] == 10000  # max(8000, 10000) msat
 
 
 def test_total_routing_revenue_includes_daily_rollups(db):
@@ -82,7 +82,7 @@ def test_total_routing_revenue_includes_daily_rollups(db):
     db.cleanup_old_data(days_to_keep=8)
 
     since = now - (30 * 86400)
-    assert db.get_total_routing_revenue(since) == 5  # (1000 + 4000) msat => 5 sats
+    assert db.get_total_routing_revenue(since) == 5000  # (1000 + 4000) msat
 
 
 def test_last_forward_time_any_direction(db):
