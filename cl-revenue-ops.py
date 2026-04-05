@@ -1694,6 +1694,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
             if enabled:
                 try:
+                    _refresh_dynamic_config()
                     result = _run_boltz_auto_cycle_once(trigger='scheduler')
                     _boltz_auto_cycle_mark_state(last_result=result)
                     summary = ''
@@ -1748,6 +1749,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
         while not shutdown_event.is_set():
             try:
+                _refresh_dynamic_config()
                 plugin.log("Running scheduled capacity planner cycle...")
                 result = capacity_planner.execute_cycle()
                 if result.get("skipped"):
@@ -4170,24 +4172,47 @@ def _parse_msat(msat_val: Any) -> int:
     return parse_msat(msat_val)
 
 
-@plugin.subscribe("setconfig")
-def on_setconfig(plugin: Plugin, **kwargs):
-    """Handle dynamic option changes at runtime (no plugin restart needed)."""
-    config_name = kwargs.get("config")
-    val_str = kwargs.get("val_str", "")
+def _refresh_dynamic_config():
+    """Read dynamic option values from CLN and update in-memory objects.
+
+    Called at the top of each boltz/planner cycle. CLN stores setconfig
+    values persistently but pyln-client's plugin.options dict is only
+    populated at init. This function bridges the gap.
+    """
+    try:
+        all_configs = plugin.rpc.listconfigs()
+        configs = all_configs.get("configs", {})
+    except Exception:
+        return
+
     if boltz_manager and boltz_manager.cfg:
-        if config_name == "revenue-ops-boltz-enforce-budget":
-            boltz_manager.cfg.enforce_budget = val_str.lower() == "true"
-            plugin.log(f"Dynamic config: enforce_budget = {boltz_manager.cfg.enforce_budget}")
-        elif config_name == "revenue-ops-boltz-daily-budget-sats":
+        eb = configs.get("revenue-ops-boltz-enforce-budget", {})
+        val = eb.get("value_str", "")
+        if val:
+            new_val = val.lower() in ("true", "1", "yes")
+            if new_val != boltz_manager.cfg.enforce_budget:
+                boltz_manager.cfg.enforce_budget = new_val
+                plugin.log(f"Dynamic config refresh: enforce_budget = {new_val}")
+
+        db_cfg = configs.get("revenue-ops-boltz-daily-budget-sats", {})
+        val = db_cfg.get("value_str", "")
+        if val:
             try:
-                boltz_manager.cfg.daily_budget_sats = int(val_str)
-                plugin.log(f"Dynamic config: daily_budget_sats = {boltz_manager.cfg.daily_budget_sats}")
+                new_val = int(val)
+                if new_val != boltz_manager.cfg.daily_budget_sats:
+                    boltz_manager.cfg.daily_budget_sats = new_val
+                    plugin.log(f"Dynamic config refresh: daily_budget_sats = {new_val}")
             except ValueError:
                 pass
-    if config and config_name == "revenue-ops-planner-execute-closes":
-        config.planner_execute_closes = val_str.lower() in ("true", "1", "yes")
-        plugin.log(f"Dynamic config: planner_execute_closes = {config.planner_execute_closes}")
+
+    if config:
+        ec = configs.get("revenue-ops-planner-execute-closes", {})
+        val = ec.get("value_str", "")
+        if val:
+            new_val = val.lower() in ("true", "1", "yes")
+            if new_val != config.planner_execute_closes:
+                config.planner_execute_closes = new_val
+                plugin.log(f"Dynamic config refresh: planner_execute_closes = {new_val}")
 
 
 @plugin.subscribe("forward_event")
