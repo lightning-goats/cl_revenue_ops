@@ -2010,7 +2010,7 @@ class Database:
             since_timestamp: Unix timestamp to start summing from
             
         Returns:
-            Total routing fees earned in sats (0 if none)
+            Total routing fees earned in msat (0 if none)
         """
         conn = self._get_connection()
         since_day = (int(since_timestamp) // 86400) * 86400
@@ -2035,8 +2035,8 @@ class Database:
                 ) AS total_fees_msat
         """, (since_timestamp, since_day, today_start)).fetchone()
 
-        # Convert msat to sats
-        return int((row['total_fees_msat'] or 0) // 1000) if row else 0
+        # Return msat — conversion to sats happens at reporting boundary
+        return int(row['total_fees_msat'] or 0) if row else 0
 
     # =========================================================================
     # Financial Snapshots for P&L Dashboard
@@ -2201,16 +2201,17 @@ class Database:
             WHERE channel_id = ? AND timestamp >= ?
         """, (channel_id, since)).fetchone()
 
-        revenue_sats = (rev_row['revenue_msat'] // 1000) if rev_row else 0
+        revenue_msat = int(rev_row['revenue_msat'] or 0) if rev_row else 0
         cost_sats = cost_row['cost_sats'] if cost_row else 0
+        cost_msat = cost_sats * 1000
         forward_count = rev_row['forward_count'] if rev_row else 0
 
         return {
             'channel_id': channel_id,
             'window_days': window_days,
-            'revenue_sats': revenue_sats,
+            'revenue_msat': revenue_msat,
             'rebalance_cost_sats': cost_sats,
-            'net_pnl_sats': revenue_sats - cost_sats,
+            'net_pnl_msat': revenue_msat - cost_msat,
             'forward_count': forward_count
         }
 
@@ -2283,15 +2284,15 @@ class Database:
             channel_id, since_day, today_start,
         )).fetchone()
 
-        sourced_volume_sats = (inbound_row['sourced_volume_msat'] // 1000) if inbound_row else 0
-        sourced_fee_sats = (inbound_row['sourced_fee_msat'] // 1000) if inbound_row else 0
+        sourced_volume_msat = int(inbound_row['sourced_volume_msat'] or 0) if inbound_row else 0
+        sourced_fee_msat = int(inbound_row['sourced_fee_msat'] or 0) if inbound_row else 0
         sourced_forward_count = inbound_row['sourced_forward_count'] if inbound_row else 0
 
         return {
             'channel_id': channel_id,
             'window_days': window_days,
-            'sourced_volume_sats': sourced_volume_sats,
-            'sourced_fee_contribution_sats': sourced_fee_sats,
+            'sourced_volume_msat': sourced_volume_msat,
+            'sourced_fee_contribution_msat': sourced_fee_msat,
             'sourced_forward_count': sourced_forward_count
         }
 
@@ -2314,31 +2315,41 @@ class Database:
         Returns:
             Dict with complete P&L including contribution metrics
         """
-        # Get direct P&L (exit channel fees)
+        # Get direct P&L (exit channel fees) — msat native
         direct_pnl = self.get_channel_pnl(channel_id, window_days)
 
-        # Get inbound contribution
+        # Get inbound contribution — msat native
         inbound = self.get_channel_inbound_contribution(channel_id, window_days)
 
-        # FIX: Apply the 50/50 split here to prevent double-counting in the dictionary return
-        total_contribution = (direct_pnl['revenue_sats'] + inbound['sourced_fee_contribution_sats']) // 2
+        # Valuation: max(earned, sourced) — credit channel for its most valuable role
+        revenue_msat = direct_pnl['revenue_msat']
+        sourced_fee_msat = inbound['sourced_fee_contribution_msat']
+        total_contribution_msat = max(revenue_msat, sourced_fee_msat)
+        rebalance_cost_sats = direct_pnl['rebalance_cost_sats']
+        rebalance_cost_msat = rebalance_cost_sats * 1000
 
         return {
             'channel_id': channel_id,
             'window_days': window_days,
-            # Direct metrics (as exit channel)
-            'direct_revenue_sats': direct_pnl['revenue_sats'],
+            # Direct metrics (as exit channel) — msat native
+            'direct_revenue_msat': revenue_msat,
             'direct_forward_count': direct_pnl['forward_count'],
-            # Inbound contribution metrics (as entry channel)
-            'sourced_volume_sats': inbound['sourced_volume_sats'],
-            'sourced_fee_contribution_sats': inbound['sourced_fee_contribution_sats'],
+            # Inbound contribution metrics (as entry channel) — msat native
+            'sourced_volume_msat': inbound['sourced_volume_msat'],
+            'sourced_fee_contribution_msat': sourced_fee_msat,
             'sourced_forward_count': inbound['sourced_forward_count'],
-            # Combined metrics
-            'total_contribution_sats': total_contribution,
-            'rebalance_cost_sats': direct_pnl['rebalance_cost_sats'],
-            'net_pnl_sats': total_contribution - direct_pnl['rebalance_cost_sats'],
+            # Combined metrics — msat native
+            'total_contribution_msat': total_contribution_msat,
+            'rebalance_cost_sats': rebalance_cost_sats,
+            'net_pnl_msat': total_contribution_msat - rebalance_cost_msat,
+            # Sats conversions for reporting (ceiling for fees)
+            'direct_revenue_sats': max(1, revenue_msat // 1000) if revenue_msat > 0 else 0,
+            'total_contribution_sats': max(1, total_contribution_msat // 1000) if total_contribution_msat > 0 else 0,
+            'net_pnl_sats': (total_contribution_msat - rebalance_cost_msat) // 1000,
+            'sourced_fee_contribution_sats': max(1, sourced_fee_msat // 1000) if sourced_fee_msat > 0 else 0,
+            'sourced_volume_sats': inbound['sourced_volume_msat'] // 1000,
             # Legacy fields for backward compatibility
-            'revenue_sats': direct_pnl['revenue_sats'],
+            'revenue_sats': max(1, revenue_msat // 1000) if revenue_msat > 0 else 0,
             'forward_count': direct_pnl['forward_count']
         }
 
@@ -2464,11 +2475,11 @@ class Database:
               channel_id, channel_id, today_start)).fetchone()
 
         return {
-            "fees_earned_sats": int((exit_row["fee_msat"] or 0) // 1000) if exit_row else 0,
-            "volume_routed_sats": int((exit_row["out_msat"] or 0) // 1000) if exit_row else 0,
+            "fees_earned_msat": int(exit_row["fee_msat"] or 0) if exit_row else 0,
+            "volume_routed_msat": int(exit_row["out_msat"] or 0) if exit_row else 0,
             "forward_count": int(exit_row["forward_count"] or 0) if exit_row else 0,
-            "sourced_volume_sats": int((inbound_row["in_msat"] or 0) // 1000) if inbound_row else 0,
-            "sourced_fee_contribution_sats": int((inbound_row["fee_msat"] or 0) // 1000) if inbound_row else 0,
+            "sourced_volume_msat": int(inbound_row["in_msat"] or 0) if inbound_row else 0,
+            "sourced_fee_contribution_msat": int(inbound_row["fee_msat"] or 0) if inbound_row else 0,
             "sourced_forward_count": int(inbound_row["forward_count"] or 0) if inbound_row else 0,
         }
 
@@ -2519,11 +2530,11 @@ class Database:
             if not cid:
                 continue
             revenue[cid] = {
-                "fees_earned_sats": int((r["fee_msat"] or 0) // 1000),
-                "volume_routed_sats": int((r["out_msat"] or 0) // 1000),
+                "fees_earned_msat": int(r["fee_msat"] or 0),
+                "volume_routed_msat": int(r["out_msat"] or 0),
                 "forward_count": int(r["forward_count"] or 0),
-                "sourced_volume_sats": 0,
-                "sourced_fee_contribution_sats": 0,
+                "sourced_volume_msat": 0,
+                "sourced_fee_contribution_msat": 0,
                 "sourced_forward_count": 0,
             }
 
@@ -2558,15 +2569,15 @@ class Database:
                 continue
             if cid not in revenue:
                 revenue[cid] = {
-                    "fees_earned_sats": 0,
-                    "volume_routed_sats": 0,
+                    "fees_earned_msat": 0,
+                    "volume_routed_msat": 0,
                     "forward_count": 0,
-                    "sourced_volume_sats": 0,
-                    "sourced_fee_contribution_sats": 0,
+                    "sourced_volume_msat": 0,
+                    "sourced_fee_contribution_msat": 0,
                     "sourced_forward_count": 0,
                 }
-            revenue[cid]["sourced_volume_sats"] = int((r["in_msat"] or 0) // 1000)
-            revenue[cid]["sourced_fee_contribution_sats"] = int((r["fee_msat"] or 0) // 1000)
+            revenue[cid]["sourced_volume_msat"] = int(r["in_msat"] or 0)
+            revenue[cid]["sourced_fee_contribution_msat"] = int(r["fee_msat"] or 0)
             revenue[cid]["sourced_forward_count"] = int(r["forward_count"] or 0)
 
         return revenue

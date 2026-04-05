@@ -138,3 +138,177 @@ class TestTotalContributionMax:
             sourced_forward_count=50,
         )
         assert rev.total_forward_count == 60
+
+
+import sqlite3
+import time
+
+
+def _create_test_db():
+    """Create an in-memory DB with the forwards schema and test data."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE forwards (
+            in_channel TEXT,
+            out_channel TEXT,
+            in_msat INTEGER,
+            out_msat INTEGER,
+            fee_msat INTEGER,
+            timestamp INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE daily_forwarding_stats (
+            channel_id TEXT,
+            date INTEGER,
+            forward_count INTEGER,
+            total_fee_msat INTEGER,
+            total_out_msat INTEGER,
+            total_in_msat INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE daily_forwarding_stats_inbound (
+            channel_id TEXT,
+            date INTEGER,
+            forward_count INTEGER,
+            total_fee_msat INTEGER,
+            total_in_msat INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE rebalance_costs (
+            channel_id TEXT,
+            cost_sats INTEGER,
+            timestamp INTEGER
+        )
+    """)
+    return conn
+
+
+class TestDatabaseMsatReturns:
+    """Database methods return msat values without truncation."""
+
+    def test_get_all_channels_revenue_totals_returns_msat_keys(self):
+        conn = _create_test_db()
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO forwards VALUES (?, ?, ?, ?, ?, ?)",
+            ("100x1x0", "200x1x0", 50000, 49500, 500, now)
+        )
+        conn.commit()
+
+        from modules.database import Database
+        db = Database.__new__(Database)
+        db.plugin = MagicMock()
+        db._get_connection = lambda: conn
+
+        totals = db.get_all_channels_revenue_totals()
+
+        exit_data = totals["200x1x0"]
+        assert "fees_earned_msat" in exit_data
+        assert exit_data["fees_earned_msat"] == 500
+        assert "volume_routed_msat" in exit_data
+        assert exit_data["volume_routed_msat"] == 49500
+
+        entry_data = totals["100x1x0"]
+        assert "sourced_fee_contribution_msat" in entry_data
+        assert entry_data["sourced_fee_contribution_msat"] == 500
+        assert "sourced_volume_msat" in entry_data
+        assert entry_data["sourced_volume_msat"] == 50000
+
+    def test_get_channel_revenue_totals_returns_msat_keys(self):
+        conn = _create_test_db()
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO forwards VALUES (?, ?, ?, ?, ?, ?)",
+            ("100x1x0", "200x1x0", 50000, 49500, 500, now)
+        )
+        conn.commit()
+
+        from modules.database import Database
+        db = Database.__new__(Database)
+        db.plugin = MagicMock()
+        db._get_connection = lambda: conn
+
+        totals = db.get_channel_revenue_totals("200x1x0")
+        assert "fees_earned_msat" in totals
+        assert totals["fees_earned_msat"] == 500
+
+    def test_get_channel_pnl_returns_msat(self):
+        conn = _create_test_db()
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO forwards VALUES (?, ?, ?, ?, ?, ?)",
+            ("100x1x0", "200x1x0", 50000, 49500, 500, now)
+        )
+        conn.commit()
+
+        from modules.database import Database
+        db = Database.__new__(Database)
+        db.plugin = MagicMock()
+        db._get_connection = lambda: conn
+
+        pnl = db.get_channel_pnl("200x1x0", window_days=30)
+        assert "revenue_msat" in pnl
+        assert pnl["revenue_msat"] == 500
+
+    def test_get_channel_inbound_contribution_returns_msat(self):
+        conn = _create_test_db()
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO forwards VALUES (?, ?, ?, ?, ?, ?)",
+            ("100x1x0", "200x1x0", 50000, 49500, 500, now)
+        )
+        conn.commit()
+
+        from modules.database import Database
+        db = Database.__new__(Database)
+        db.plugin = MagicMock()
+        db._get_connection = lambda: conn
+
+        inbound = db.get_channel_inbound_contribution("100x1x0", window_days=30)
+        assert "sourced_fee_contribution_msat" in inbound
+        assert inbound["sourced_fee_contribution_msat"] == 500
+        assert "sourced_volume_msat" in inbound
+        assert inbound["sourced_volume_msat"] == 50000
+
+    def test_get_channel_full_pnl_returns_msat(self):
+        conn = _create_test_db()
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO forwards VALUES (?, ?, ?, ?, ?, ?)",
+            ("100x1x0", "200x1x0", 50000, 49500, 500, now)
+        )
+        conn.commit()
+
+        from modules.database import Database
+        db = Database.__new__(Database)
+        db.plugin = MagicMock()
+        db._get_connection = lambda: conn
+
+        pnl = db.get_channel_full_pnl("200x1x0", window_days=30)
+        assert "direct_revenue_msat" in pnl
+        assert pnl["direct_revenue_msat"] == 500
+        assert "total_contribution_msat" in pnl
+        assert "net_pnl_msat" in pnl
+
+    def test_get_total_routing_revenue_returns_msat(self):
+        conn = _create_test_db()
+        now = int(time.time())
+        for _ in range(3):
+            conn.execute(
+                "INSERT INTO forwards VALUES (?, ?, ?, ?, ?, ?)",
+                ("100x1x0", "200x1x0", 50000, 49700, 300, now)
+            )
+        conn.commit()
+
+        from modules.database import Database
+        db = Database.__new__(Database)
+        db.plugin = MagicMock()
+        db._get_connection = lambda: conn
+
+        since = now - 86400
+        total = db.get_total_routing_revenue(since)
+        assert total == 900  # 3 * 300 = 900 msat (not 0 from truncation)
