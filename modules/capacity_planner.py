@@ -11,6 +11,7 @@ import time
 from typing import Dict, List, Any
 from pyln.client import Plugin
 from .config import ChainCostDefaults
+from .demand_flow import DemandFlowClassifier
 
 
 # Loser severity ranking for sorting (higher = worse)
@@ -24,6 +25,7 @@ _LOSER_SEVERITY = {
 # Strategy weights for score normalization (higher = more trusted signal)
 STRATEGY_WEIGHTS = {
     "winner": 1.0,
+    "demand_flow": 1.0,
     "hive": 0.9,
     "route_pair": 0.85,
     "graph": 0.8,
@@ -52,6 +54,9 @@ class CapacityPlanner:
         self._last_funding_deficit_sats: int = 0    # On-chain shortfall for next open
         self._last_best_candidate: dict = {}        # Top candidate that needs funding
         self._last_cycle_ts: int = 0
+        # Demand-flow classifier state (populated per cycle)
+        self._demand_flow_profiles: Dict[str, Any] = {}
+        self._demand_flow_sink_adjacent: set = set()
         # Per-cycle gossip cache (cleared at start of each execute_cycle)
         self._cycle_nodes_by_id: Dict[str, dict] = {}
         self._cycle_channels_dest: Dict[str, list] = {}
@@ -309,10 +314,6 @@ class CapacityPlanner:
         # Reset funding coordination before evaluating opens
         self._last_funding_deficit_sats = 0
         self._last_best_candidate = {}
-        # NOTE: "constrained" state (85-95% local) will filter candidates to
-        # dual-funded or sink-targeting only once Phase 2 (demand-flow classifier)
-        # provides is_sink_adjacent and has_liquidity_ads signals. Until then,
-        # constrained behaves like watch (logs warning, permits opens).
         if fee_ok and portfolio_state != "blocked":
             candidates = self._discover_peers(winners, all_profitability, all_flow)
 
@@ -360,6 +361,17 @@ class CapacityPlanner:
                         f"Negative EV ({ev:.0f}) for {peer_id[:16]}..."
                     )
                     continue
+
+                # Constrained portfolio: only allow sink-adjacent or dual-fund candidates
+                if portfolio_state == "constrained":
+                    is_sink_adj = peer_id in self._demand_flow_sink_adjacent
+                    node_info = self._get_cached_node(peer_id)
+                    has_lads = bool(node_info and node_info.get("option_will_fund"))
+                    if not is_sink_adj and not has_lads:
+                        summary["skipped_reasons"].append(
+                            f"Constrained: {peer_id[:16]}... not sink-adjacent or dual-fund"
+                        )
+                        continue
 
                 # Check safety guards
                 guards_ok, guards_reason = self._check_safety_guards(
@@ -1099,6 +1111,38 @@ class CapacityPlanner:
         self.plugin.log(f"Hive discovery: produced {len(candidates)} candidates", level='debug')
         return candidates
 
+    def _discover_from_demand_flow(self, all_flow, existing_peers: set) -> List[Dict]:
+        """Strategy 6: Find candidates adjacent to our sink peers."""
+        try:
+            classifier = DemandFlowClassifier()
+
+            # Classify all current peers from flow data
+            self._demand_flow_profiles = classifier.classify_peers(all_flow)
+
+            # Find sink peers
+            sink_profiles = {
+                pid: profile for pid, profile in self._demand_flow_profiles.items()
+                if profile.role == "sink"
+            }
+            if not sink_profiles:
+                return []
+
+            # Get channels for each sink peer (from cache)
+            sink_channels = {}
+            for pid in sink_profiles:
+                sink_channels[pid] = self._get_cached_channels(pid, "source")
+
+            # Track which candidates are sink-adjacent for scoring
+            candidates = classifier.find_sink_adjacent_candidates(
+                sink_profiles, sink_channels, existing_peers
+            )
+            self._demand_flow_sink_adjacent = {c["peer_id"] for c in candidates}
+
+            return candidates
+        except Exception as e:
+            self.plugin.log(f"Demand-flow discovery failed: {e}", level='info')
+            return []
+
     def _score_candidate(self, peer_id: str, base_score: float) -> float:
         """Enrich candidate score with reputation, uptime, and profit history."""
         score = base_score
@@ -1187,6 +1231,18 @@ class CapacityPlanner:
                     score *= 1.1  # 10% boost
         except Exception:
             pass
+
+        # Demand-flow boost: sink-adjacent candidates get a scoring bonus
+        if peer_id in self._demand_flow_sink_adjacent:
+            score *= 1.4  # 40% boost for sink-adjacent
+        elif peer_id in self._demand_flow_profiles:
+            profile = self._demand_flow_profiles[peer_id]
+            if profile.role == "sink":
+                score *= 1.3
+            elif profile.role == "source":
+                score *= 1.2
+            elif profile.role == "unknown":
+                score *= 0.9
 
         return score
 
@@ -1419,6 +1475,9 @@ class CapacityPlanner:
 
         # Strategy 5: route-pair analysis (neighbors of peers on profitable routes)
         candidates.extend(self._discover_from_route_pairs(all_profitability))
+
+        # Strategy 6: demand-flow (sink-adjacent candidates)
+        candidates.extend(self._discover_from_demand_flow(all_flow, existing_peers))
 
         # Normalize scores within each strategy before dedup
         candidates = self._normalize_candidate_scores(candidates)
