@@ -693,16 +693,17 @@ class ChannelProfitabilityAnalyzer:
 
             # 30-day trailing P&L for marginal ROI
             pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days=30)
-            contribution_30d = pnl_30d.get('total_contribution_sats', 0)
+            contribution_30d_msat = pnl_30d.get('total_contribution_msat', 0)
             rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
-            marginal_profit_30d = contribution_30d - rebalance_cost_30d
+            rebalance_cost_30d_msat = rebalance_cost_30d * 1000
+            marginal_profit_30d = (contribution_30d_msat - rebalance_cost_30d_msat) // 1000
 
             # Classify
             classification = self._classify_channel(
                 roi, net_profit, last_routed, days_open,
                 channel_id=channel_id,
                 peer_id=peer_id,
-                forward_count=revenue.forward_count,
+                forward_count=revenue.total_forward_count,
             )
 
             profitability = ChannelProfitability(

@@ -364,3 +364,111 @@ class TestRevenueDataConstruction:
         rev = analyzer._get_channel_revenue("200x1x0")
         assert rev.fees_earned_msat == 500
         assert rev.fees_earned_sats == 1  # sub-sat ceiling
+
+
+class TestClassificationTotalForwardCount:
+    """Classification sees total (exit + sourced) forward count."""
+
+    def test_inbound_gateway_not_stagnant(self):
+        """Channel with 0 exit forwards but 100 sourced forwards is not STAGNANT."""
+        from modules.profitability_analyzer import (
+            ChannelProfitabilityAnalyzer as ProfitabilityAnalyzer, ProfitabilityClass, ChannelCosts
+        )
+
+        mock_plugin = MagicMock()
+        mock_db = MagicMock()
+
+        # Channel with 0 exit but 100 sourced forwards
+        mock_db.get_channel_revenue_totals.return_value = {
+            "fees_earned_msat": 0,
+            "volume_routed_msat": 0,
+            "forward_count": 0,
+            "sourced_volume_msat": 50_000_000,
+            "sourced_fee_contribution_msat": 120_000,
+            "sourced_forward_count": 100,
+        }
+        mock_db.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 120_000,
+            'total_contribution_sats': 120,
+            'rebalance_cost_sats': 50,
+            'net_pnl_msat': 70_000,
+            'net_pnl_sats': 70,
+            'direct_revenue_msat': 0,
+            'direct_revenue_sats': 0,
+            'direct_forward_count': 0,
+            'sourced_fee_contribution_msat': 120_000,
+            'sourced_fee_contribution_sats': 120,
+            'sourced_volume_msat': 50_000_000,
+            'sourced_volume_sats': 50_000,
+            'sourced_forward_count': 100,
+            'revenue_sats': 0,
+            'forward_count': 0,
+        }
+        mock_db.get_last_forward_time_any_direction.return_value = int(time.time()) - 3600
+        mock_db.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0, "last_success_time": None
+        }
+
+        analyzer = ProfitabilityAnalyzer.__new__(ProfitabilityAnalyzer)
+        analyzer.plugin = mock_plugin
+        analyzer.database = mock_db
+        analyzer.hive_hints = None
+        analyzer._profitability_cache = {}
+        analyzer._cache_timestamp = 0
+        analyzer._cache_ttl = 300
+        analyzer._bleeder_cache = None
+        analyzer._bleeder_cache_time = 0
+
+        peer_id = "02" + "b" * 64
+        analyzer._get_channel_costs = lambda *args, **kwargs: ChannelCosts(
+            channel_id="100x1x0", peer_id=peer_id,
+            open_cost_sats=500, rebalance_cost_sats=50
+        )
+
+        channel_info = {
+            "peer_id": peer_id,
+            "capacity": 2_000_000,
+            "funding_txid": "abc123",
+            "opener": "local",
+            "open_timestamp": int(time.time()) - 86400 * 30,
+        }
+
+        result = analyzer.analyze_channel("100x1x0", channel_info=channel_info)
+        assert result is not None
+        # Must NOT be STAGNANT or ZOMBIE — it has 100 sourced forwards
+        assert result.classification not in (
+            ProfitabilityClass.STAGNANT_CANDIDATE,
+            ProfitabilityClass.ZOMBIE,
+        ), f"Got {result.classification.value} — inbound gateway with 100 sourced forwards should not be stagnant/zombie"
+
+    def test_fleet_member_protection_with_sourced_forwards(self):
+        """Hive member with sourced forwards is protected from UNDERWATER."""
+        from modules.profitability_analyzer import ChannelProfitabilityAnalyzer as ProfitabilityAnalyzer, ProfitabilityClass
+
+        mock_plugin = MagicMock()
+        analyzer = ProfitabilityAnalyzer.__new__(ProfitabilityAnalyzer)
+        analyzer.plugin = mock_plugin
+        analyzer.database = MagicMock()
+        analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0, "last_success_time": None
+        }
+
+        mock_hints = MagicMock()
+        mock_hints.is_hive_member.return_value = True
+        mock_hints.get_centrality.return_value = 0.001
+        mock_hints.get_corridor_role.return_value = None
+        analyzer.hive_hints = mock_hints
+
+        peer_id = "02" + "c" * 64
+        # Underwater ROI but has sourced forwards (total_forward_count=50 passed as forward_count)
+        classification = analyzer._classify_channel(
+            roi=-0.5, net_profit=-500,
+            last_routed=int(time.time()) - 3600,
+            days_open=30,
+            channel_id="100x1x0",
+            peer_id=peer_id,
+            forward_count=50,
+        )
+        assert classification == ProfitabilityClass.BREAK_EVEN, (
+            f"Hive member with 50 forwards should be BREAK_EVEN, got {classification.value}"
+        )
