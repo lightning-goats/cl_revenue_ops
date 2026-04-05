@@ -633,6 +633,8 @@ class CapacityPlanner:
                     "hive_closure_flagged": hive_closure_flagged,
                     "uptime_pct": round(uptime_pct, 1) if isinstance(uptime_pct, (int, float)) else None,
                     "regime_change": regime_change,
+                    "is_fire_sale": is_fire_sale,
+                    "marginal_profit_30d_sats": prof.marginal_profit_30d_sats,
                 })
 
         return losers
@@ -640,13 +642,38 @@ class CapacityPlanner:
     def _generate_recommendations(self, winners: List[Dict], losers: List[Dict]) -> List[str]:
         """
         Create actionable recommendations pairing winners and losers.
+
+        Non-fire-sale, non-hard-bleeder CLOSE losers are demoted to DEFIBRILLATE
+        if redeployment EV is negative (capital better off staying).
         """
         recommendations = []
 
         # Sort winners by ROI (descending)
         sorted_winners = sorted(winners, key=lambda x: x['roi'], reverse=True)
 
-        # Separate closeable losers from defibrillation candidates
+        # EV-based demotion: check each CLOSE loser
+        for loser in losers:
+            if loser.get("action") != "CLOSE":
+                continue
+            # Fire sale and hard bleeders bypass EV check
+            if loser.get("is_fire_sale", False) or loser.get("is_hard_bleeder", False):
+                continue
+            # Compute redeployment EV
+            try:
+                ev, best_peer, winner_ev = self._calculate_redeployment_ev(
+                    loser, sorted_winners, self.config
+                )
+                loser["redeployment_ev"] = round(ev, 0)
+                loser["best_winner_peer"] = best_peer
+                loser["winner_ev"] = round(winner_ev, 0)
+
+                if ev <= 0:
+                    loser["action"] = "DEFIBRILLATE"
+                    loser["reason"] = f"{loser['reason']} (NO PROFITABLE REDEPLOYMENT)"
+            except Exception:
+                pass  # On error, keep original action
+
+        # Re-separate after demotion
         defibrillate = [l for l in losers if l.get("action") == "DEFIBRILLATE"]
         closeable = [l for l in losers if l.get("action") == "CLOSE"]
 
@@ -664,9 +691,13 @@ class CapacityPlanner:
                 loser = sorted_closeable[closeable_idx]
                 closeable_idx += 1
 
+                ev_note = ""
+                if "redeployment_ev" in loser:
+                    ev_note = f" EV: {loser['redeployment_ev']:.0f} sats."
+
                 recommendations.append(
                     f"REDEPLOYMENT: Close channel {loser['scid']} ({loser['reason']}) "
-                    f"and redeploy funds to {winner['scid']} (ROI: {winner['roi']:.1f}%)."
+                    f"and redeploy funds to {winner['scid']} (ROI: {winner['roi']:.1f}%).{ev_note}"
                 )
             else:
                 recommendations.append(
@@ -681,7 +712,7 @@ class CapacityPlanner:
                 f"No winner available for pairing — consider closing to free capital."
             )
 
-        # Defibrillation alerts are always separate — they don't consume winner slots
+        # Defibrillation alerts
         for loser in defibrillate:
             recommendations.append(
                 f"DEFIBRILLATE: {loser['scid']} ({loser['reason']}, {loser['roi']:.1f}% ROI). "
@@ -1327,6 +1358,38 @@ class CapacityPlanner:
 
         ev = expected_revenue - on_chain_cost - expected_rebal_cost
         return ev
+
+    def _calculate_redeployment_ev(
+        self, loser: Dict[str, Any], winners: List[Dict[str, Any]], cfg
+    ) -> tuple:
+        """Compute the EV of closing a loser and redeploying capital to the best winner.
+
+        Returns:
+            (redeployment_ev, best_winner_peer_id, winner_ev)
+            redeployment_ev = winner_ev - loser_ongoing_cost - closure_cost
+            If no winners, returns (negative_ev, None, 0)
+        """
+        closure_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+        loser_capacity = loser.get("capacity", 0)
+
+        # Ongoing cost: projected 6-month loss (0 if channel is profitable)
+        marginal_30d = loser.get("marginal_profit_30d_sats", 0)
+        ongoing_cost = max(0, -marginal_30d * 6)
+
+        # Find the best winner by EV
+        best_ev = 0
+        best_peer = None
+        for winner in winners:
+            try:
+                ev = self._calculate_open_ev(winner["peer_id"], loser_capacity, cfg)
+                if ev > best_ev:
+                    best_ev = ev
+                    best_peer = winner["peer_id"]
+            except Exception:
+                continue
+
+        redeployment_ev = best_ev - ongoing_cost - closure_cost
+        return (redeployment_ev, best_peer, best_ev)
 
     def _estimate_open_cost(self) -> int:
         """Estimate the on-chain cost of opening a channel."""
