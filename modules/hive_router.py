@@ -63,14 +63,19 @@ class HiveRouter:
         """Use cached listpeerchannels when available."""
         if self.rpc_cache:
             return self.rpc_cache.listpeerchannels()
+        if self.data_service:
+            return self.data_service.get_peer_channels()
         return self.plugin.rpc.listpeerchannels()
 
     def _get_our_id(self) -> Optional[str]:
         if self._our_id:
             return self._our_id
         try:
-            info = self.plugin.rpc.getinfo()
-            self._our_id = info.get("id")
+            if self.data_service:
+                self._our_id = self.data_service.get_node_id()
+            else:
+                info = self.plugin.rpc.getinfo()
+                self._our_id = info.get("id")
         except Exception:
             pass
         return self._our_id
@@ -84,7 +89,7 @@ class HiveRouter:
         if not self.plugin:
             return set()
         try:
-            result = self.plugin.rpc.call("askrene-listlayers", {})
+            result = self.data_service.get_askrene_layers() if self.data_service else self.plugin.rpc.call("askrene-listlayers", {})
         except Exception:
             return set()
         return {layer.get("layer") for layer in result.get("layers", []) if layer.get("layer")}
@@ -95,8 +100,14 @@ class HiveRouter:
             return
         existing = self._existing_layers()
         if layer in existing:
-            self.plugin.rpc.call("askrene-remove-layer", {"layer": layer})
-        self.plugin.rpc.call("askrene-create-layer", {"layer": layer})
+            if self.data_service:
+                self.data_service.askrene_remove_layer(layer)
+            else:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": layer})
+        if self.data_service:
+            self.data_service.askrene_create_layer(layer)
+        else:
+            self.plugin.rpc.call("askrene-create-layer", {"layer": layer})
 
     # ------------------------------------------------------------------
     # Layer Management
@@ -118,7 +129,7 @@ class HiveRouter:
 
         # Try to detect cl-hive managed layers first
         try:
-            result = self.plugin.rpc.call("askrene-listlayers", {})
+            result = self.data_service.get_askrene_layers() if self.data_service else self.plugin.rpc.call("askrene-listlayers", {})
             layer_names = {l.get("layer") for l in result.get("layers", [])}
             if self.LAYER_NAME in layer_names:
                 # cl-hive is managing the layer — just cache member IDs
@@ -182,13 +193,22 @@ class HiveRouter:
 
                 for direction in (0, 1):
                     try:
-                        self.plugin.rpc.call("askrene-update-channel", {
-                            "layer": self.LAYER_NAME,
-                            "short_channel_id_dir": f"{scid}/{direction}",
-                            "fee_base_msat": 0,
-                            "fee_proportional_millionths": 0,
-                            "cltv_expiry_delta": 6,
-                        })
+                        if self.data_service:
+                            self.data_service.askrene_update_channel(
+                                layer=self.LAYER_NAME,
+                                short_channel_id_dir=f"{scid}/{direction}",
+                                fee_base_msat=0,
+                                fee_proportional_millionths=0,
+                                cltv_expiry_delta=6,
+                            )
+                        else:
+                            self.plugin.rpc.call("askrene-update-channel", {
+                                "layer": self.LAYER_NAME,
+                                "short_channel_id_dir": f"{scid}/{direction}",
+                                "fee_base_msat": 0,
+                                "fee_proportional_millionths": 0,
+                                "cltv_expiry_delta": 6,
+                            })
                         updated += 1
                     except Exception:
                         pass
@@ -197,13 +217,22 @@ class HiveRouter:
             for mid in member_ids:
                 for direction in ("in", "out"):
                     try:
-                        self.plugin.rpc.call("askrene-bias-node", {
-                            "layer": self.LAYER_NAME,
-                            "node": mid,
-                            "direction": direction,
-                            "bias": 5,
-                            "description": "hive fleet preference",
-                        })
+                        if self.data_service:
+                            self.data_service.askrene_bias_node(
+                                layer=self.LAYER_NAME,
+                                node=mid,
+                                direction=direction,
+                                bias=5,
+                                description="hive fleet preference",
+                            )
+                        else:
+                            self.plugin.rpc.call("askrene-bias-node", {
+                                "layer": self.LAYER_NAME,
+                                "node": mid,
+                                "direction": direction,
+                                "bias": 5,
+                                "description": "hive fleet preference",
+                            })
                     except Exception:
                         pass
 
@@ -268,7 +297,7 @@ class HiveRouter:
             # for the actual sendpay route construction.
             layers = ["auto.localchans", "auto.sourcefree", "auto.no_mpp_support"]
             try:
-                existing = self.plugin.rpc.call("askrene-listlayers", {})
+                existing = self.data_service.get_askrene_layers() if self.data_service else self.plugin.rpc.call("askrene-listlayers", {})
                 existing_names = {l.get("layer") for l in existing.get("layers", [])}
                 for candidate in [self.LAYER_NAME, "hive-reputation",
                                   "hive-corridors", "hive-traffic", self.LOCAL_LAYER]:
@@ -291,11 +320,11 @@ class HiveRouter:
                 "maxparts": 1,
             }
             try:
-                result = self.plugin.rpc.call("getroutes", getroutes_params)
+                result = self.data_service.get_routes(**getroutes_params) if self.data_service else self.plugin.rpc.call("getroutes", getroutes_params)
             except Exception:
                 # Layer may have been removed — retry with only auto layers
                 getroutes_params["layers"] = ["auto.localchans", "auto.sourcefree", "auto.no_mpp_support"]
-                result = self.plugin.rpc.call("getroutes", getroutes_params)
+                result = self.data_service.get_routes(**getroutes_params) if self.data_service else self.plugin.rpc.call("getroutes", getroutes_params)
 
             routes = result.get("routes", [])
             if not routes:
@@ -593,12 +622,20 @@ class HiveRouter:
 
                 for direction in (0, 1):
                     try:
-                        self.plugin.rpc.call("askrene-bias-channel", {
-                            "layer": self.LOCAL_LAYER,
-                            "short_channel_id_dir": f"{scid}/{direction}",
-                            "bias": bias,
-                            "description": f"profitability={classification}",
-                        })
+                        if self.data_service:
+                            self.data_service.askrene_bias_channel(
+                                layer=self.LOCAL_LAYER,
+                                short_channel_id_dir=f"{scid}/{direction}",
+                                bias=bias,
+                                description=f"profitability={classification}",
+                            )
+                        else:
+                            self.plugin.rpc.call("askrene-bias-channel", {
+                                "layer": self.LOCAL_LAYER,
+                                "short_channel_id_dir": f"{scid}/{direction}",
+                                "bias": bias,
+                                "description": f"profitability={classification}",
+                            })
                         biased += 1
                     except Exception:
                         pass
@@ -653,7 +690,10 @@ class HiveRouter:
         if not normalized:
             return False
         try:
-            self.plugin.rpc.call("askrene-reserve", {"path": normalized})
+            if self.data_service:
+                self.data_service.askrene_reserve(path=normalized)
+            else:
+                self.plugin.rpc.call("askrene-reserve", {"path": normalized})
             return True
         except Exception:
             return False
@@ -666,7 +706,10 @@ class HiveRouter:
         if not normalized:
             return False
         try:
-            self.plugin.rpc.call("askrene-unreserve", {"path": normalized})
+            if self.data_service:
+                self.data_service.askrene_unreserve(path=normalized)
+            else:
+                self.plugin.rpc.call("askrene-unreserve", {"path": normalized})
             return True
         except Exception:
             return False
