@@ -24,10 +24,6 @@ def _make_rebalancer(capex_engine=None):
     mock_plugin.rpc = MagicMock()
     mock_db = MagicMock()
     mock_config = MagicMock()
-    mock_config.rebalance_reinvestment_rate = 0.50
-    mock_config.rebalance_bootstrap_bps = 10
-    mock_config.rebalance_bootstrap_max_sats = 200
-    mock_config.rebalance_grace_days = 14
     mock_config.rebalance_max_amount = 5_000_000
     mock_config.rebalance_min_amount = 50_000
     mock_config.snapshot.return_value = mock_config
@@ -293,29 +289,8 @@ class TestCapexFallbackWithEngine:
         assert c.max_fee_ppm <= 250  # Bootstrap ceiling
 
 
-class TestCapexConfig:
-    """Capex rebalancer config fields still exist (used by legacy code until Phase 6)."""
-
-    def test_reinvestment_rate_default(self):
-        assert Config().rebalance_reinvestment_rate == 0.50
-
-    def test_bootstrap_bps_default(self):
-        assert Config().rebalance_bootstrap_bps == 10
-
-    def test_bootstrap_max_sats_default(self):
-        assert Config().rebalance_bootstrap_max_sats == 200
-
-    def test_grace_days_default(self):
-        assert Config().rebalance_grace_days == 14
-
-
-class TestDeprecationCompat:
-    """Deprecated config fields still exist for backward compat."""
-
-    def test_enable_proportional_budget_still_exists(self):
-        cfg = Config()
-        assert hasattr(cfg, 'enable_proportional_budget')
-        assert hasattr(cfg, 'proportional_budget_pct')
+class TestDefaultBudgetPreserved:
+    """Basic config fields still exist."""
 
     def test_default_daily_budget_preserved(self):
         cfg = Config()

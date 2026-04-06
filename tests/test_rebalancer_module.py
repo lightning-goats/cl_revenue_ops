@@ -52,7 +52,7 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        cfg = Config(dry_run=True)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         r.job_manager.start_job = MagicMock(return_value={"success": True})
 
@@ -71,7 +71,7 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         r.job_manager.start_job = MagicMock(return_value={"success": False, "error": "boom"})
 
@@ -120,7 +120,7 @@ class TestManualRebalanceBudgetBypass:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         r._check_capital_controls = MagicMock(return_value=True)
         r._estimate_inbound_fee = MagicMock(return_value=0)
@@ -278,7 +278,7 @@ class TestJobMonitorPrefersSlingStats:
         from modules.config import Config
         from modules.rebalancer import JobManager, ActiveJob, JobStatus
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         target_scid = "123x456x0"
@@ -808,7 +808,7 @@ class TestPushCandidateDetection:
     def _setup_rebalancer(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         return r
 
@@ -882,7 +882,7 @@ class TestExecuteOnceDiagnostic:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         channel_id = "111x222x0"
@@ -909,7 +909,7 @@ class TestExecuteOnceDiagnostic:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         channel_id = "111x222x0"
@@ -937,7 +937,7 @@ class TestExecuteOnceManual:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         from_ch = "111x222x0"
@@ -963,7 +963,7 @@ class TestExecuteOnceManual:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         from_ch = "111x222x0"
@@ -1262,7 +1262,7 @@ class TestAuditTurn2ManualRebalanceZeroFee:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        cfg = Config(dry_run=True)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         r._check_capital_controls = MagicMock(return_value=True)
         mock_database.record_rebalance = MagicMock(return_value=123)
@@ -1293,7 +1293,6 @@ class TestAuditTurn2HotChannelBudgetFilter:
 
         cfg = Config(
             daily_budget_sats=100,
-            enable_proportional_budget=False,
             hot_channel_protection_enabled=True,
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -1315,7 +1314,6 @@ class TestAuditTurn2HotChannelBudgetFilter:
 
         cfg = Config(
             daily_budget_sats=100,
-            enable_proportional_budget=False,
             hot_channel_protection_enabled=False,
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -1335,7 +1333,6 @@ class TestAuditTurn2HotChannelBudgetFilter:
 
         cfg = Config(
             daily_budget_sats=1000,
-            enable_proportional_budget=False,
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
@@ -1496,7 +1493,7 @@ class TestLastDecisionSummary:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         mock_database.record_rebalance = MagicMock(return_value=456)
         mock_database.update_rebalance_result = MagicMock()

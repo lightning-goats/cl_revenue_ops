@@ -105,7 +105,7 @@ class TestSentinelCleanup:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         # Insert a None sentinel (simulates stuck start_job)
@@ -150,7 +150,7 @@ class TestSentinelCleanup:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         with jm._jobs_lock:
@@ -176,7 +176,7 @@ class TestChannelCloseDetection:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         job = _active_job(scid="222x333x0", initial_local_sats=100_000)
@@ -202,7 +202,7 @@ class TestChannelCloseDetection:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         mock_plugin.rpc.listfunds.return_value = {
@@ -253,7 +253,7 @@ class TestStopJobReAddOnFailure:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
 
         # Patch RpcError in the module so the inner `except RpcError` only
         # catches the narrow subclass, not TimeoutError.
@@ -289,7 +289,7 @@ class TestStopJobReAddOnFailure:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         job = _active_job(scid="222x333x0")
@@ -312,7 +312,7 @@ class TestStopJobReAddOnFailure:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
 
         # Patch RpcError in the module so only our narrow subclass is caught.
         original_rpc_error = _mod.RpcError
@@ -354,7 +354,7 @@ class TestHotChannelProfitBudgetFloor:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        cfg = Config(dry_run=True)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         return r
 
@@ -406,7 +406,7 @@ class TestHotChannelProfitBudgetFloor:
         from modules.rebalancer import EVRebalancer
 
         # Config defaults have hot_channel_protection_enabled=True
-        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        cfg = Config(dry_run=True)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         # Build a mock snapshot with the required attributes
@@ -464,7 +464,6 @@ class TestB1MaxFeePpmRederive:
 
         cfg = Config(
             dry_run=True,
-            enable_proportional_budget=False,
             enable_kelly=False,
             enable_velocity_gate=False,
             rebalance_min_amount=50_000,
@@ -574,7 +573,6 @@ class TestB2WeeklyBudgetExtCosts:
 
         cfg = Config(
             dry_run=True,
-            enable_proportional_budget=False,
             daily_budget_sats=100_000,       # High daily budget so daily gate does NOT block
             weekly_budget_sats=1000,          # Low weekly budget — this is the gate we test
             min_wallet_reserve=0,             # Disable reserve check
@@ -631,7 +629,6 @@ class TestRebalanceReliabilityIntegration:
 
         cfg = Config(
             dry_run=True,
-            enable_proportional_budget=False,
             enable_kelly=False,
             enable_velocity_gate=False,
             rebalance_min_amount=50_000,
@@ -789,7 +786,6 @@ class TestB3PushEvWrongPeer:
 
         cfg = Config(
             dry_run=True,
-            enable_proportional_budget=False,
             enable_kelly=False,
             rebalance_min_amount=10_000,
             rebalance_max_amount=5_000_000,
@@ -898,7 +894,7 @@ class TestB4StopAllJobsBudget:
         from modules.config import Config
         from modules.rebalancer import JobManager, JobStatus
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         # Job 1: SUCCESS — budget already handled by monitor_jobs
@@ -940,7 +936,7 @@ class TestB4StopAllJobsBudget:
         from modules.config import Config
         from modules.rebalancer import JobManager, JobStatus
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         job_failed = _active_job(scid="111x222x0", rebalance_id=300)
@@ -966,7 +962,7 @@ class TestB4StopAllJobsBudget:
         from modules.config import Config
         from modules.rebalancer import JobManager, JobStatus
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         job_timeout = _active_job(scid="111x222x0", rebalance_id=400)
@@ -992,7 +988,7 @@ class TestB4StopAllJobsBudget:
         from modules.config import Config
         from modules.rebalancer import JobManager, JobStatus
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         job_pending = _active_job(scid="111x222x0", rebalance_id=500)
@@ -1023,7 +1019,7 @@ class TestB4StopAllJobsBudget:
         from modules.config import Config
         from modules.rebalancer import JobManager, JobStatus
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
         jm.hive_router = MagicMock()
 
@@ -1055,7 +1051,7 @@ class TestB5TotalSpentSatsAsFee:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
         return jm
 
@@ -1130,7 +1126,7 @@ class TestB6ProfitReconciliationInflated:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         return JobManager(mock_plugin, cfg, mock_database)
 
     def test_legacy_candidate_profit_not_inflated(self, mock_plugin, mock_database):
@@ -1200,7 +1196,7 @@ class TestB7PartialFeeSpendOnFailure:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         return JobManager(mock_plugin, cfg, mock_database)
 
     def test_failure_with_partial_fee_calls_mark_budget_spent(self, mock_plugin, mock_database):
@@ -1264,7 +1260,7 @@ class TestLegacyAskreneCleanupRemoved:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
         jm.hive_router = MagicMock()
         jm.stop_job = MagicMock(return_value=True)
@@ -1324,7 +1320,7 @@ class TestTimestampedSentinels:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         # Insert a *fresh* timestamp sentinel (just now)
@@ -1351,7 +1347,7 @@ class TestTimestampedSentinels:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         # Insert a *stale* timestamp sentinel (10 minutes old)
@@ -1387,7 +1383,7 @@ class TestPeerExclusionRemoval:
         from modules.config import Config
         from modules.rebalancer import JobManager
 
-        cfg = Config(dry_run=False, enable_proportional_budget=False)
+        cfg = Config(dry_run=False)
         jm = JobManager(mock_plugin, cfg, mock_database)
 
         # Two peers currently excluded in sling
@@ -1453,7 +1449,6 @@ class TestB10PushEvKellyGuard:
 
         cfg = Config(
             dry_run=True,
-            enable_proportional_budget=False,
             enable_kelly=enable_kelly,
             kelly_fraction=kelly_fraction,
             rebalance_min_amount=10_000,
@@ -1560,7 +1555,6 @@ class TestB11DiagnosticRebalanceExceptionSuccess:
 
         cfg = Config(
             dry_run=True,
-            enable_proportional_budget=False,
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         return r

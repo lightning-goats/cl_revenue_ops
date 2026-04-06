@@ -47,7 +47,7 @@ class TestRebalancerDryRun:
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
-        cfg = Config(dry_run=dry_run, enable_proportional_budget=False)
+        cfg = Config(dry_run=dry_run)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         r.job_manager.start_job = MagicMock(return_value={"success": True})
         mock_database.record_rebalance = MagicMock(return_value=123)

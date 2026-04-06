@@ -262,12 +262,8 @@ def test_revenue_config_allows_public_resets():
 def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
     mod = load_plugin_module()
     mod.config = SimpleNamespace(
-        total_cost_budget_window_hours=24,
         reservation_timeout_hours=4,
-        total_cost_budget_mode="fixed",
         daily_budget_sats=2000,
-        total_cost_budget_profit_pct=0.30,
-        total_cost_budget_profit_pct_cap=0.75,
     )
     mod.database = MagicMock()
     mod.database.get_spend_ledger_summary.return_value = {

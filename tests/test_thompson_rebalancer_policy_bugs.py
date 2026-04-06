@@ -454,7 +454,7 @@ class TestPushEVTurnoverChannelId:
         from modules.rebalancer import EVRebalancer
 
         plugin = MagicMock()
-        cfg = Config(dry_run=True, enable_proportional_budget=False)
+        cfg = Config(dry_run=True)
         database = MagicMock()
         database.get_channel_state.return_value = {
             "sats_in": 500_000,
