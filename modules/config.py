@@ -41,10 +41,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'max_fee_ppm': int,
     'daily_budget_sats': int,
     'weekly_budget_sats': int,
-    'total_cost_budget_mode': str,
-    'total_cost_budget_profit_pct': float,
-    'total_cost_budget_profit_pct_cap': float,
-    'total_cost_budget_window_hours': int,
     'hot_channel_protection_enabled': bool,
     'hot_channel_protection_override_peers': str,
     'hot_channel_protection_min_velocity': float,
@@ -70,8 +66,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'htlc_congestion_threshold': float,
     'enable_reputation': bool,
     'enable_kelly': bool,
-    'enable_proportional_budget': bool,
-    'proportional_budget_pct': float,
     'kelly_fraction': float,
     'reputation_decay': float,
     'max_concurrent_jobs': int,
@@ -130,11 +124,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Hive Hints
     'hive_hints_enabled': bool,
     'hive_hints_ttl_seconds': int,
-    # Capex-Aware Rebalancer
-    'rebalance_reinvestment_rate': float,
-    'rebalance_bootstrap_bps': int,
-    'rebalance_bootstrap_max_sats': int,
-    'rebalance_grace_days': int,
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': float,
     'capex_bootstrap_bps': int,
@@ -155,9 +144,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'max_fee_ppm': (1, 100000),
     'daily_budget_sats': (0, 10000000),
     'weekly_budget_sats': (0, 70_000_000),
-    'total_cost_budget_profit_pct': (0.0, 1.0),
-    'total_cost_budget_profit_pct_cap': (0.0, 1.0),
-    'total_cost_budget_window_hours': (1, 168),
     'boltz_auto_cycle_interval_minutes': (1, 1440),
     'boltz_auto_cycle_max_actions': (1, 10),
     'boltz_auto_cycle_startup_delay_seconds': (0, 3600),
@@ -166,7 +152,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'high_liquidity_threshold': (0.0, 1.0),
     'htlc_congestion_threshold': (0.0, 1.0),
     'reputation_decay': (0.0, 1.0),
-    'proportional_budget_pct': (0.0, 1.0),
     'kelly_fraction': (0.0, 1.0),
     'vegas_decay_rate': (0.0, 1.0),
     'rebalance_min_profit_ppm': (0, 100000),
@@ -225,11 +210,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_peer_uptime_pct': (0.0, 100.0),
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
     'hive_hints_ttl_seconds': (60, 7200),
-    # Capex-Aware Rebalancer
-    'rebalance_reinvestment_rate': (0.0, 1.0),
-    'rebalance_bootstrap_bps': (0, 100),
-    'rebalance_bootstrap_max_sats': (0, 10000),
-    'rebalance_grace_days': (0, 90),
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': (0.0, 1.0),
     'capex_bootstrap_bps': (0, 100),
@@ -243,7 +223,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 # Valid values for string enum fields
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
     'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
-    'total_cost_budget_mode': ('fixed', 'profit_pct'),
 }
 
 
@@ -315,22 +294,7 @@ class Config:
     # Global Capital Controls
     daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period (fixed floor)
     weekly_budget_sats: int = 35000        # Max rebalancing fees per 7-day window (hard ceiling)
-    total_cost_budget_mode: str = 'fixed'  # 'fixed' or 'profit_pct' (global liquidity spend gate)
-    total_cost_budget_profit_pct: float = 0.30  # Percent of net profit allocated to spend budget when mode=profit_pct
-    total_cost_budget_profit_pct_cap: float = 0.75  # Hard cap for pct input (operator guard)
-    total_cost_budget_window_hours: int = 24  # Window for profit-based budget calculation
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
-
-    # Revenue-Proportional Budget
-    enable_proportional_budget: bool = True   # Scale daily budget based on revenue (Issue #22)
-    proportional_budget_pct: float = 0.30     # Budget = max(daily_budget_sats, revenue_24h * pct)
-                                               # Default 30% of 24h revenue
-
-    # Capex-Aware Rebalancer
-    rebalance_reinvestment_rate: float = 0.50   # Fraction of channel contribution for rebalance budget
-    rebalance_bootstrap_bps: int = 10           # Bootstrap budget: basis points of capacity per 30d
-    rebalance_bootstrap_max_sats: int = 200     # Max bootstrap budget per channel per 30d
-    rebalance_grace_days: int = 14              # Days before bootstrap activates for new channels
 
     # RPC Hardening
     rpc_timeout_seconds: int = 15
@@ -694,15 +658,7 @@ class ConfigSnapshot:
     
     # Global Capital Controls
     daily_budget_sats: int
-    total_cost_budget_mode: str
-    total_cost_budget_profit_pct: float
-    total_cost_budget_profit_pct_cap: float
-    total_cost_budget_window_hours: int
     min_wallet_reserve: int
-
-    # Revenue-Proportional Budget
-    enable_proportional_budget: bool
-    proportional_budget_pct: float
 
     # HTLC Congestion threshold
     htlc_congestion_threshold: float
@@ -774,11 +730,6 @@ class ConfigSnapshot:
     # Hive Hints
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0
-    # Capex-Aware Rebalancer
-    rebalance_reinvestment_rate: float = 0.50
-    rebalance_bootstrap_bps: int = 10
-    rebalance_bootstrap_max_sats: int = 200
-    rebalance_grace_days: int = 14
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50
     capex_bootstrap_bps: int = 10

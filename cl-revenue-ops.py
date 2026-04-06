@@ -449,7 +449,7 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-daily-budget-sats',
     default='5000',
-    description='Max rebalancing fees to spend in 24 hours - acts as floor when proportional budget enabled (default: 5000)'
+    description='Max rebalancing fees to spend in 24 hours (default: 5000)'
 )
 
 plugin.add_option(
@@ -459,45 +459,9 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-total-cost-budget-mode',
-    default='fixed',
-    description="Unified spend gate mode for all liquidity costs: 'fixed' or 'profit_pct' (default: fixed)"
-)
-
-plugin.add_option(
-    name='revenue-ops-total-cost-budget-profit-pct',
-    default='0.30',
-    description='When total-cost budget mode=profit_pct, use this fraction of net profit as spend budget (default: 0.30)'
-)
-
-plugin.add_option(
-    name='revenue-ops-total-cost-budget-profit-pct-cap',
-    default='0.75',
-    description='Safety cap for total-cost profit percentage (default: 0.75 = 75%)'
-)
-
-plugin.add_option(
-    name='revenue-ops-total-cost-budget-window-hours',
-    default='24',
-    description='Window for unified spend budget accounting and profit-based budget calculation (default: 24h)'
-)
-
-plugin.add_option(
     name='revenue-ops-min-wallet-reserve',
     default='1000000',
     description='Minimum total funds (on-chain + off-chain) to keep in reserve (default: 1,000,000)'
-)
-
-plugin.add_option(
-    name='revenue-ops-proportional-budget',
-    default='true',
-    description='If true, scale daily budget based on 24h revenue (default: true)'
-)
-
-plugin.add_option(
-    name='revenue-ops-proportional-budget-pct',
-    default='0.30',
-    description='Percentage of 24h revenue to use as budget when proportional budget enabled (default: 0.30 = 30%)'
 )
 
 plugin.add_option(
@@ -1218,13 +1182,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
         weekly_budget_sats=_safe_int('revenue-ops-weekly-budget-sats'),
-        total_cost_budget_mode=options.get('revenue-ops-total-cost-budget-mode', 'fixed').lower(),
-        total_cost_budget_profit_pct=_safe_float_opt('revenue-ops-total-cost-budget-profit-pct', '0.30'),
-        total_cost_budget_profit_pct_cap=_safe_float_opt('revenue-ops-total-cost-budget-profit-pct-cap', '0.75'),
-        total_cost_budget_window_hours=_safe_int_opt('revenue-ops-total-cost-budget-window-hours', '24'),
         min_wallet_reserve=_safe_int('revenue-ops-min-wallet-reserve'),
-        enable_proportional_budget=options['revenue-ops-proportional-budget'].lower() == 'true',
-        proportional_budget_pct=_safe_float('revenue-ops-proportional-budget-pct'),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
         htlc_congestion_threshold=_safe_float('revenue-ops-htlc-congestion-threshold'),
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
@@ -2221,9 +2179,7 @@ def revenue_rebalance_debug(
             "daily_budget_sats": daily_budget,
             "budget_mode": total_budget.get("mode", "fixed"),
             "budget_window_hours": total_budget.get("window_hours", 24),
-            "budget_floor_sats": total_budget.get("daily_budget_floor_sats", cfg.daily_budget_sats),
-            "profit_based_budget_sats": total_budget.get("profit_based_budget_sats"),
-            "profit_pct_effective": total_budget.get("profit_pct_effective"),
+            "budget_floor_sats": total_budget.get("daily_budget_sats", cfg.daily_budget_sats),
             "daily_spent_sats": daily_spent,
             "daily_reserved_sats": daily_reserved,
             "boltz_spent_sats": boltz_spent,
@@ -5251,11 +5207,6 @@ def _boltz_liquidity_cost_components(window_hours: int = 24) -> Dict[str, Any]:
         }
 
 
-def _normalize_total_cost_budget_mode(mode: Optional[str]) -> str:
-    m = str(mode or "fixed").strip().lower()
-    return "profit_pct" if m in ("profit", "profit_pct", "profit-percent", "percentage") else "fixed"
-
-
 _CANONICAL_TOTAL_COST_LEDGER_CATEGORIES = frozenset({"channel_open", "channel_close"})
 
 
@@ -5290,7 +5241,7 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
         return {"error": "Plugin not initialized"}
 
     cfg = config.snapshot() if hasattr(config, "snapshot") else config
-    wh = int(window_hours or getattr(cfg, "total_cost_budget_window_hours", 24) or 24)
+    wh = int(window_hours or 24)
     wh = max(1, min(168, wh))
     now = int(time.time())
     since = now - (wh * 3600)
@@ -5332,19 +5283,9 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     actual_total = sum(max(0, int(v or 0)) for v in actual_by_category.values())
     reserved_total = sum(max(0, int(v or 0)) for v in reserved_by_category.values())
 
-    mode = _normalize_total_cost_budget_mode(getattr(cfg, "total_cost_budget_mode", "fixed"))
-    fixed_floor = max(0, int(getattr(cfg, "daily_budget_sats", 0) or 0))
-    pct_cfg = float(getattr(cfg, "total_cost_budget_profit_pct", 0.30) or 0.30)
-    pct_cap = float(getattr(cfg, "total_cost_budget_profit_pct_cap", 0.75) or 0.75)
-    pct_effective = max(0.0, min(pct_cfg, pct_cap, 1.0))
+    daily_budget_sats = max(0, int(getattr(cfg, "daily_budget_sats", 0) or 0))
+    effective_budget_sats = daily_budget_sats
     net_profit_sats = int(revenue_sats - actual_total)
-    profit_based_budget_sats = int(max(0, net_profit_sats) * pct_effective)
-
-    if mode == "profit_pct":
-        # Keep the fixed budget as a floor for resilience/recovery.
-        effective_budget_sats = max(fixed_floor, profit_based_budget_sats)
-    else:
-        effective_budget_sats = fixed_floor
 
     remaining_sats = max(0, int(effective_budget_sats) - actual_total - reserved_total)
 
@@ -5352,12 +5293,8 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
         "source": "total_cost_budget",
         "window_hours": wh,
         "since_timestamp": since,
-        "mode": mode,
-        "daily_budget_floor_sats": fixed_floor,
-        "profit_pct_requested": pct_cfg,
-        "profit_pct_cap": pct_cap,
-        "profit_pct_effective": pct_effective,
-        "profit_based_budget_sats": profit_based_budget_sats,
+        "mode": "fixed",
+        "daily_budget_sats": daily_budget_sats,
         "effective_budget_sats": int(effective_budget_sats),
         "revenue_sats": revenue_sats,
         "actual_spent_sats": actual_total,
