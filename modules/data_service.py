@@ -374,6 +374,51 @@ class DataService:
         """Release a reserved route in askrene."""
         return self._plugin.rpc.call("askrene-unreserve", {"path": path})
 
+    # ------------------------------------------------------------------
+    # Datastore tier — standardized IPC writes
+    # ------------------------------------------------------------------
+
+    _DATASTORE_MAX_BYTES = 60000  # Safety margin under 65KB CLN limit
+
+    def datastore_push(self, key: List[str], payload: dict) -> bool:
+        """Push JSON payload to CLN datastore with standard envelope.
+
+        Automatically adds timestamp if not present. Validates payload is dict,
+        not an error response, and under size limit. Fire-and-forget: logs
+        failures, never raises.
+
+        Returns True on success, False on failure.
+        """
+        if not isinstance(payload, dict):
+            return False
+        if "error" in payload:
+            return False
+        if "timestamp" not in payload:
+            payload = {**payload, "timestamp": int(time.time())}
+        encoded = json.dumps(payload)
+        if len(encoded.encode("utf-8")) > self._DATASTORE_MAX_BYTES:
+            try:
+                self._plugin.log(
+                    f"Datastore payload too large for {key}: "
+                    f"{len(encoded.encode('utf-8'))} bytes",
+                    level="warn",
+                )
+            except Exception:
+                pass
+            return False
+        try:
+            self._plugin.rpc.datastore(key=key, string=encoded,
+                                        mode="create-or-replace")
+            return True
+        except Exception:
+            try:
+                self._plugin.log(
+                    f"Datastore push failed for {key}", level="debug"
+                )
+            except Exception:
+                pass
+            return False
+
     # --- Datastore (raw passthrough for reads) ---
 
     def list_datastore(self, key: List[str]) -> Dict:

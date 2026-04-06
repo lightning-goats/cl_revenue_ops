@@ -1,5 +1,6 @@
 """Tests for DataService — unified RPC cache with tiered TTLs."""
 
+import json
 import os
 import sys
 import time
@@ -517,3 +518,74 @@ class TestAskrenePassthrough:
         ds = DataService(plugin)
         ds.askrene_unreserve(path=[{"short_channel_id_dir": "100x1x0/0"}])
         plugin.rpc.call.assert_called_once()
+
+
+class TestDatastorePush:
+    """Standardized datastore write helper."""
+
+    def test_push_adds_timestamp(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.datastore.return_value = {}
+        ds = DataService(plugin)
+        ds.datastore_push(["revenue", "test"], {"data": 1})
+        call_args = plugin.rpc.datastore.call_args
+        payload = json.loads(call_args[1]["string"])
+        assert "timestamp" in payload
+        assert isinstance(payload["timestamp"], int)
+        assert payload["data"] == 1
+
+    def test_push_preserves_existing_timestamp(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.datastore.return_value = {}
+        ds = DataService(plugin)
+        ds.datastore_push(["revenue", "test"], {"data": 1, "timestamp": 12345})
+        call_args = plugin.rpc.datastore.call_args
+        payload = json.loads(call_args[1]["string"])
+        assert payload["timestamp"] == 12345
+
+    def test_push_uses_create_or_replace(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.datastore.return_value = {}
+        ds = DataService(plugin)
+        ds.datastore_push(["revenue", "test"], {"data": 1})
+        call_args = plugin.rpc.datastore.call_args
+        assert call_args[1]["mode"] == "create-or-replace"
+
+    def test_push_returns_true_on_success(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.datastore.return_value = {}
+        ds = DataService(plugin)
+        assert ds.datastore_push(["revenue", "test"], {"data": 1}) is True
+
+    def test_push_returns_false_on_failure(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.datastore.side_effect = Exception("RPC error")
+        ds = DataService(plugin)
+        assert ds.datastore_push(["revenue", "test"], {"data": 1}) is False
+
+    def test_push_rejects_oversized_payload(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        ds = DataService(plugin)
+        huge = {"data": "x" * 70000}
+        assert ds.datastore_push(["revenue", "test"], huge) is False
+        plugin.rpc.datastore.assert_not_called()
+
+    def test_push_rejects_non_dict(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        ds = DataService(plugin)
+        assert ds.datastore_push(["revenue", "test"], "not a dict") is False
+        plugin.rpc.datastore.assert_not_called()
+
+    def test_push_rejects_error_payload(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        ds = DataService(plugin)
+        assert ds.datastore_push(["revenue", "test"], {"error": "something broke"}) is False
+        plugin.rpc.datastore.assert_not_called()
