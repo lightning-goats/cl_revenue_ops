@@ -86,12 +86,13 @@ class DataService:
 
     def _ensure_getinfo(self) -> Dict:
         """Fetch and forever-cache getinfo result."""
-        cached = self._get_forever("getinfo")
-        if cached is not None:
-            return cached
-        result = self._plugin.rpc.getinfo()
-        self._set_forever("getinfo", result)
-        return result
+        with self._forever_lock:
+            cached = self._forever.get("getinfo")
+            if cached is not None:
+                return cached
+            result = self._plugin.rpc.getinfo()
+            self._forever["getinfo"] = result
+            return result
 
     def get_node_id(self) -> str:
         """Our node's public key. Cached forever."""
@@ -107,9 +108,10 @@ class DataService:
 
     def get_configs(self) -> Dict:
         """Node configuration. Cached forever."""
-        cached = self._get_forever("listconfigs")
-        if cached is not None:
-            return cached
-        result = self._plugin.rpc.listconfigs()
-        self._set_forever("listconfigs", result)
-        return result
+        with self._forever_lock:
+            cached = self._forever.get("listconfigs")
+            if cached is not None:
+                return cached
+            result = self._plugin.rpc.listconfigs()
+            self._forever["listconfigs"] = result
+            return result
