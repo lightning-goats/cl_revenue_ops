@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
-from .utils import normalize_scid
+from .utils import normalize_scid, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
 
 # Size bucket labels matching fee_controller.SIZE_BUCKET_LABELS
@@ -2203,7 +2203,7 @@ class Database:
 
         revenue_msat = int(rev_row['revenue_msat'] or 0) if rev_row else 0
         cost_sats = cost_row['cost_sats'] if cost_row else 0
-        cost_msat = cost_sats * 1000
+        cost_msat = sats_to_base(cost_sats)
         forward_count = rev_row['forward_count'] if rev_row else 0
 
         return {
@@ -2326,7 +2326,7 @@ class Database:
         sourced_fee_msat = inbound['sourced_fee_contribution_msat']
         total_contribution_msat = max(revenue_msat, sourced_fee_msat)
         rebalance_cost_sats = direct_pnl['rebalance_cost_sats']
-        rebalance_cost_msat = rebalance_cost_sats * 1000
+        rebalance_cost_msat = sats_to_base(rebalance_cost_sats)
 
         return {
             'channel_id': channel_id,
@@ -2343,13 +2343,13 @@ class Database:
             'rebalance_cost_sats': rebalance_cost_sats,
             'net_pnl_msat': total_contribution_msat - rebalance_cost_msat,
             # Sats conversions for reporting (ceiling for fees)
-            'direct_revenue_sats': max(1, revenue_msat // 1000) if revenue_msat > 0 else 0,
-            'total_contribution_sats': max(1, total_contribution_msat // 1000) if total_contribution_msat > 0 else 0,
-            'net_pnl_sats': (total_contribution_msat - rebalance_cost_msat) // 1000,
-            'sourced_fee_contribution_sats': max(1, sourced_fee_msat // 1000) if sourced_fee_msat > 0 else 0,
-            'sourced_volume_sats': inbound['sourced_volume_msat'] // 1000,
+            'direct_revenue_sats': base_to_sats_ceil(revenue_msat),
+            'total_contribution_sats': base_to_sats_ceil(total_contribution_msat),
+            'net_pnl_sats': base_to_sats_floor(total_contribution_msat - rebalance_cost_msat),
+            'sourced_fee_contribution_sats': base_to_sats_ceil(sourced_fee_msat),
+            'sourced_volume_sats': base_to_sats_floor(inbound['sourced_volume_msat']),
             # Legacy fields for backward compatibility
-            'revenue_sats': max(1, revenue_msat // 1000) if revenue_msat > 0 else 0,
+            'revenue_sats': base_to_sats_ceil(revenue_msat),
             'forward_count': direct_pnl['forward_count']
         }
 
@@ -3476,8 +3476,8 @@ class Database:
             if cid not in flow_data:
                 flow_data[cid] = [init_bucket() for _ in range(window_days)]
             bucket = flow_data[cid][age_days]
-            bucket["in"] += int(row["in_msat"] or 0) // 1000
-            bucket["out"] += int(row["out_msat"] or 0) // 1000
+            bucket["in"] += base_to_sats_floor(int(row["in_msat"] or 0))
+            bucket["out"] += base_to_sats_floor(int(row["out_msat"] or 0))
             bucket["count"] += int(row["count"] or 0)
             last_ts = int(row["last_ts"] or 0)
             if last_ts > bucket["last_ts"]:
@@ -3663,7 +3663,7 @@ class Database:
         """, (channel_id, timestamp)).fetchone()
 
         # Convert msat to sats
-        return (row['total_out_msat'] // 1000) if row else 0
+        return base_to_sats_floor(row['total_out_msat']) if row else 0
 
     def get_forward_count_since(self, channel_id: str, timestamp: int) -> int:
         """
@@ -3767,7 +3767,7 @@ class Database:
         """, (channel_id, timestamp)).fetchone()
         
         # Convert msat to sats
-        return int(row['weighted_out_msat'] // 1000) if row else 0
+        return base_to_sats_floor(int(row['weighted_out_msat'])) if row else 0
     
     def get_daily_volume(self, days: int = 7) -> int:
         """Get total routing volume over the past N days."""
@@ -3780,7 +3780,7 @@ class Database:
             WHERE timestamp >= ?
         """, (since,)).fetchone()
         
-        return row['total_volume_msat'] // 1000 if row else 0
+        return base_to_sats_floor(row['total_volume_msat']) if row else 0
 
     def get_total_volume_since(self, since_timestamp: int) -> int:
         """Get total routing volume since a timestamp (in sats)."""
@@ -3792,7 +3792,7 @@ class Database:
             WHERE timestamp >= ?
         """, (since_timestamp,)).fetchone()
 
-        return row['total_volume_msat'] // 1000 if row else 0
+        return base_to_sats_floor(row['total_volume_msat']) if row else 0
 
     def get_top_route_pairs(self, days: int = 30, min_forwards: int = 3, limit: int = 20) -> List[Dict[str, Any]]:
         """Return top revenue-generating (in_channel, out_channel) pairs.
@@ -5087,7 +5087,7 @@ class Database:
                 self.plugin.log(f"incremental_vacuum failed (non-fatal): {e}", level='warn')
 
             self.plugin.log(
-                f"Preserved {pruned_revenue // 1000} sats revenue from {pruned_count} forwards before pruning"
+                f"Preserved {base_to_sats_floor(pruned_revenue)} sats revenue from {pruned_count} forwards before pruning"
             )
 
             self.plugin.log(
