@@ -130,6 +130,11 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Hive Hints
     'hive_hints_enabled': bool,
     'hive_hints_ttl_seconds': int,
+    # Capex-Aware Rebalancer
+    'rebalance_reinvestment_rate': float,
+    'rebalance_bootstrap_bps': int,
+    'rebalance_bootstrap_max_sats': int,
+    'rebalance_grace_days': int,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -212,6 +217,11 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_peer_uptime_pct': (0.0, 100.0),
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
     'hive_hints_ttl_seconds': (60, 7200),
+    # Capex-Aware Rebalancer
+    'rebalance_reinvestment_rate': (0.0, 1.0),
+    'rebalance_bootstrap_bps': (0, 100),
+    'rebalance_bootstrap_max_sats': (0, 10000),
+    'rebalance_grace_days': (0, 90),
 }
 
 # Valid values for string enum fields
@@ -299,7 +309,13 @@ class Config:
     enable_proportional_budget: bool = True   # Scale daily budget based on revenue (Issue #22)
     proportional_budget_pct: float = 0.30     # Budget = max(daily_budget_sats, revenue_24h * pct)
                                                # Default 30% of 24h revenue
-    
+
+    # Capex-Aware Rebalancer
+    rebalance_reinvestment_rate: float = 0.50   # Fraction of channel contribution for rebalance budget
+    rebalance_bootstrap_bps: int = 10           # Bootstrap budget: basis points of capacity per 30d
+    rebalance_bootstrap_max_sats: int = 200     # Max bootstrap budget per channel per 30d
+    rebalance_grace_days: int = 14              # Days before bootstrap activates for new channels
+
     # RPC Hardening
     rpc_timeout_seconds: int = 15
     rpc_circuit_breaker_seconds: int = 60
@@ -661,7 +677,7 @@ class ConfigSnapshot:
     # Revenue-Proportional Budget
     enable_proportional_budget: bool
     proportional_budget_pct: float
-    
+
     # HTLC Congestion threshold
     htlc_congestion_threshold: float
     
@@ -732,6 +748,11 @@ class ConfigSnapshot:
     # Hive Hints
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0
+    # Capex-Aware Rebalancer
+    rebalance_reinvestment_rate: float = 0.50
+    rebalance_bootstrap_bps: int = 10
+    rebalance_bootstrap_max_sats: int = 200
+    rebalance_grace_days: int = 14
     # Version tracking
     version: int = 0
     
