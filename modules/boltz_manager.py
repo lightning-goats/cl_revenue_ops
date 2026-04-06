@@ -58,6 +58,40 @@ class BoltzCliManager:
         self.global_budget_limit_provider = None
         # Capability cache: some CLN+boltzd combinations reject reverse-swap chanIds.
         self._reverse_chanids_supported: Optional[bool] = None
+        self._capex_engine = None
+
+    def set_capex_engine(self, engine):
+        """Inject the unified capex budget engine."""
+        self._capex_engine = engine
+
+    def check_tactical_budget(self, estimated_fee_sats: int, channel_id=None) -> dict:
+        """Check if the capex tactical budget allows a swap.
+
+        Pure treasury swaps (channel_id=None) are gated by tactical budget.
+        Channel-targeted swaps bypass the tactical gate (they use channel budget).
+        Without an engine, the gate is not applied (backward compat).
+
+        Returns:
+            {"allowed": bool, "reason": str or None}
+        """
+        if not self._capex_engine:
+            return {"allowed": True, "reason": None}
+
+        # Channel-targeted swaps bypass tactical gate
+        if channel_id is not None:
+            return {"allowed": True, "reason": None}
+
+        # Pure treasury: check tactical budget
+        tactical = self._capex_engine.get_tactical_budget()
+        if estimated_fee_sats > tactical:
+            return {
+                "allowed": False,
+                "reason": (
+                    f"Tactical budget: estimated fee {estimated_fee_sats} sats "
+                    f"exceeds tactical budget {tactical} sats"
+                ),
+            }
+        return {"allowed": True, "reason": None}
 
     @property
     def enabled(self) -> bool:
@@ -1136,6 +1170,18 @@ class BoltzCliManager:
                     "budget": budget_check["budget"],
                 }
 
+            # Tactical budget gate for pure treasury swaps
+            tactical_check = self.check_tactical_budget(
+                estimated_fee_sats=budget_check.get("estimated_fee_sats", 0),
+                channel_id=channel_id,
+            )
+            if not tactical_check["allowed"]:
+                return {
+                    "status": "rejected",
+                    "reason": tactical_check["reason"],
+                    "budget": budget_check.get("budget"),
+                }
+
             warnings: List[str] = []
             if channel_id or peer_id:
                 warnings.append(
@@ -1187,6 +1233,18 @@ class BoltzCliManager:
                 "error": budget_check["reason"],
                 "quote": quote,
                 "budget": budget_check["budget"],
+            }
+
+        # Tactical budget gate for pure treasury swaps
+        tactical_check = self.check_tactical_budget(
+            estimated_fee_sats=budget_check.get("estimated_fee_sats", 0),
+            channel_id=channel_id,
+        )
+        if not tactical_check["allowed"]:
+            return {
+                "status": "rejected",
+                "reason": tactical_check["reason"],
+                "budget": budget_check.get("budget"),
             }
 
         target_channel_id = (str(channel_id).replace(':', 'x') if channel_id else None)
