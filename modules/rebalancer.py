@@ -32,7 +32,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ConfigSnapshot
 from .database import Database
 from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
-from .utils import parse_msat as _shared_parse_msat
+from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -368,7 +368,7 @@ class JobManager:
                         return 0
                     # M-22: Use _parse_msat for consistent Millisatoshi handling
                     our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
-                    return our_amount_msat // 1000
+                    return base_to_sats_floor(our_amount_msat)
         except Exception as e:
             self.plugin.log(f"Error getting channel balance: {e}", level='debug')
         return 0
@@ -446,7 +446,7 @@ class JobManager:
         # of full_amount / chunk_size, allowing sling to overpay on routes.
         if chunk_size > 0 and candidate.amount_sats > 0:
             chunk_budget_msat = (candidate.max_budget_msat * chunk_size) // candidate.amount_sats
-            budget_ppm = (chunk_budget_msat * 1_000_000) // (chunk_size * 1000) if chunk_size > 0 else 0
+            budget_ppm = (chunk_budget_msat * 1_000_000) // sats_to_base(chunk_size) if chunk_size > 0 else 0
         else:
             budget_ppm = 0
         maxppm = int(max(1, min(candidate.max_fee_ppm, budget_ppm))) if budget_ppm > 0 else 0
@@ -783,7 +783,7 @@ class JobManager:
             fee_msat = self._parse_msat(job_stats.get("fee_total_msat"))
             if not fee_msat:
                 fee_sats = self._parse_sats(job_stats.get("fee_total_sats"))
-                fee_msat = fee_sats * 1000 if fee_sats else 0
+                fee_msat = sats_to_base(fee_sats) if fee_sats else 0
 
             if fee_msat and job.candidate and fee_msat > job.candidate.max_budget_msat:
                 self._handle_job_budget_exceeded(job, fee_msat, job_stats)
@@ -856,7 +856,7 @@ class JobManager:
                     continue
                 # M-22b: Use _parse_msat for consistent Millisatoshi handling
                 our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
-                balances[self._normalize_scid(scid)] = our_amount_msat // 1000
+                balances[self._normalize_scid(scid)] = base_to_sats_floor(our_amount_msat)
         except Exception as e:
             self.plugin.log(f"Error preloading channel balances: {e}", level='debug')
         return balances
@@ -904,7 +904,7 @@ class JobManager:
             if k in stats:
                 msat = self._parse_msat(stats[k])
                 if msat > 0:
-                    return msat // 1000
+                    return base_to_sats_floor(msat)
 
         for k in ("success_total_sats", "successful_total_sats"):
             if k in stats:
@@ -1047,7 +1047,7 @@ class JobManager:
         fee_sats = self._parse_sats(stats.get("fee_total_sats"))
         if not fee_sats:
             fee_msat = self._parse_msat(stats.get("fee_total_msat"))
-            fee_sats = fee_msat // 1000 if fee_msat else 0
+            fee_sats = base_to_sats_floor(fee_msat) if fee_msat else 0
         if not fee_sats:
             # B5 FIX: total_spent_sats includes principal + fee.
             # Derive fee as total_spent - amount_transferred.
@@ -1149,7 +1149,7 @@ class JobManager:
         partial_fee_sats = 0
         fee_msat = self._parse_msat(stats.get("fee_total_msat"))
         if fee_msat:
-            partial_fee_sats = fee_msat // 1000
+            partial_fee_sats = base_to_sats_floor(fee_msat)
         if not partial_fee_sats:
             partial_fee_sats = self._parse_sats(stats.get("fee_total_sats"))
 
@@ -1179,7 +1179,7 @@ class JobManager:
         self.database.update_rebalance_result(
             job.rebalance_id,
             'failed',
-            actual_fee_sats=(fee_msat + 999) // 1000,
+            actual_fee_sats=base_to_sats_ceil(fee_msat),
             error_message=f"exceeded_budget: {msg}"
         )
         self.database.increment_failure_count(job.scid_normalized)
@@ -1193,7 +1193,7 @@ class JobManager:
         # Record actual rebalance cost even on budget failure.
         # Compute actual amount transferred from balance delta (not 0)
         # to avoid distorting cost-per-sat metrics.
-        actual_cost_sats = (fee_msat + 999) // 1000
+        actual_cost_sats = base_to_sats_ceil(fee_msat)
         current_balance = self._get_channel_local_balance(job.scid_normalized)
         raw_delta = current_balance - job.initial_local_sats
         amount_transferred = max(0, -raw_delta if job.direction == "push" else raw_delta)
@@ -1235,7 +1235,7 @@ class JobManager:
             if fee_sats == 0:
                 # H-1c: Use _parse_msat to handle string "Nmsat" values
                 fee_msat = self._parse_msat(stats.get("fee_total_msat"))
-                fee_sats = fee_msat // 1000 if fee_msat else 0
+                fee_sats = base_to_sats_floor(fee_msat) if fee_msat else 0
             if fee_sats == 0 and amount_transferred > 0:
                 # Conservative estimate: half of max fee
                 fee_sats = (amount_transferred * job.max_fee_ppm) // 2_000_000
@@ -1495,7 +1495,7 @@ class JobManager:
                     fee_sats = self._parse_sats(st.get("fee_total_sats"))
                     if not fee_sats:
                         fee_msat = self._parse_msat(st.get("fee_total_msat"))
-                        fee_sats = fee_msat // 1000 if fee_msat else 0
+                        fee_sats = base_to_sats_floor(fee_msat) if fee_msat else 0
                     # Fallback: weighted avg fee ppm
                     if fee_sats == 0:
                         w_feeppm = st.get("w_feeppm")
@@ -1524,7 +1524,7 @@ class JobManager:
                             fee_sats = self._parse_sats(st.get("fee_total_sats"))
                             if not fee_sats:
                                 fee_msat = self._parse_msat(st.get("fee_total_msat"))
-                                fee_sats = fee_msat // 1000 if fee_msat else 0
+                                fee_sats = base_to_sats_floor(fee_msat) if fee_msat else 0
                             if fee_sats == 0:
                                 w_feeppm = st.get("w_feeppm")
                                 if w_feeppm is not None and amount > 0:
@@ -1599,7 +1599,7 @@ class JobManager:
             best_msat = v if best_msat is None else min(best_msat, v)
         if best_msat is None:
             return None
-        return max(0, best_msat // 1000)
+        return max(0, base_to_sats_floor(best_msat))
 
     def sync_peer_exclusions(self, policy_manager=None) -> int:
         """
@@ -3001,7 +3001,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         except Exception:
             pass  # AskRene is optional
 
-        amount_msat = rebalance_amount * 1000
+        amount_msat = sats_to_base(rebalance_amount)
 
         # FEE FOR EV: Use the LOWER of broadcast fee and DTS posterior mean.
         # Broadcast fee = what the network actually sees (conservative baseline).
@@ -3084,7 +3084,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                                             level='debug'
                                         )
                                         rebalance_amount = max_through
-                                        amount_msat = rebalance_amount * 1000
+                                        amount_msat = sats_to_base(rebalance_amount)
                                 break
                     except Exception:
                         pass
@@ -3138,7 +3138,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # and ensures execution can enforce a non-zero fee cap.
         max_budget_msat = max(1000, raw_budget_msat)
         # Use ceiling sats for conservative accounting.
-        max_budget_sats = (max_budget_msat + 999) // 1000
+        max_budget_sats = base_to_sats_ceil(max_budget_msat)
         route_success_prob = self._estimate_rebalance_success_probability(
             dest_peer_id=dest_peer_id,
             dest_channel=dest_channel,
@@ -3193,7 +3193,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 return None  # Negative EV, reject
             # MA-5: Ensure at least 1 sat budget when Kelly fraction is positive but small
             max_budget_sats = max(1, int(max_budget_sats * kelly_safe))
-            max_budget_msat = max_budget_sats * 1000
+            max_budget_msat = sats_to_base(max_budget_sats)
 
         # HOT CHANNEL PROTECTION: budget override tied to channel profitability.
         hot_budget_override_sats = 0
@@ -3212,7 +3212,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     level='info'
                 )
                 max_budget_sats = per_trade_hot_cap
-                max_budget_msat = max_budget_sats * 1000
+                max_budget_msat = sats_to_base(max_budget_sats)
             hot_budget_override_sats = max(0, hot_channel_profit_budget_sats)
 
         if amount_msat > 0:
@@ -3245,7 +3245,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     capped_budget_msat = max(1, (amount_msat * max_fee_ppm) // 1_000_000)
                     if capped_budget_msat < max_budget_msat:
                         max_budget_msat = capped_budget_msat
-                        max_budget_sats = max(1, (max_budget_msat + 999) // 1000)
+                        max_budget_sats = max(1, base_to_sats_ceil(max_budget_msat))
             
         if max_fee_ppm <= 0:
             return None
@@ -3341,7 +3341,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # utilization < 1.0 means we won't earn the full spread before next rebalance.
         if expected_income > 0:
             max_budget_sats = min(max_budget_sats, max(1, expected_income))
-            max_budget_msat = max_budget_sats * 1000
+            max_budget_msat = sats_to_base(max_budget_sats)
             # B1 FIX: Re-derive max_fee_ppm from the capped budget.
             # Without this, the stale pre-cap max_fee_ppm is recorded as
             # attempted_ppm on failure, poisoning fee escalation feedback.
@@ -3485,7 +3485,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # Per-rebalance fee ceiling
             ppm_cap_sats = (amount_needed * tier_ppm) // 1_000_000
             max_fee_sats = min(budget_sats, max(1, ppm_cap_sats))
-            max_fee_msat = max_fee_sats * 1000
+            max_fee_msat = sats_to_base(max_fee_sats)
             max_fee_ppm = min(tier_ppm, (max_fee_sats * 1_000_000) // max(1, amount_needed))
 
             # Find source channels
@@ -3518,7 +3518,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 primary_source_peer_id=primary_source_info.get("peer_id", ""),
                 to_peer_id=dest_peer_id,
                 amount_sats=amount_needed,
-                amount_msat=amount_needed * 1000,
+                amount_msat=sats_to_base(amount_needed),
                 outbound_fee_ppm=outbound_fee_ppm,
                 inbound_fee_ppm=0,
                 source_fee_ppm=source_fee_ppm,
@@ -3789,14 +3789,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             primary_source_peer_id=resolved_peer_ids[0] if resolved_peer_ids else "",
             to_peer_id=src_peer_id,
             amount_sats=amount,
-            amount_msat=amount * 1000,
+            amount_msat=sats_to_base(amount),
             outbound_fee_ppm=src_fee,
             inbound_fee_ppm=inbound_fee,
             source_fee_ppm=0,
             weighted_opp_cost_ppm=0,
             spread_ppm=spread,
             max_budget_sats=max_budget,
-            max_budget_msat=max_budget * 1000,
+            max_budget_msat=sats_to_base(max_budget),
             max_fee_ppm=max_fee_ppm,
             expected_profit_sats=expected_profit,
             liquidity_ratio=src_ratio,
@@ -3917,7 +3917,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # All fleet intelligence (corridors, traffic, reputation, profitability)
         # is encoded in askrene layers — a single getroutes call captures it all.
         if self.hive_router and self.hive_router.available:
-            route = self.hive_router.discover_route(peer_id, amount_msat // 1000)
+            route = self.hive_router.discover_route(peer_id, base_to_sats_floor(amount_msat))
             if route and route.fee_ppm >= 0:
                 estimate = route.fee_ppm
                 # Ensure estimate respects failure floor
@@ -4382,8 +4382,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
                     info = peer_info.get(scid, {})
                     channels[scid] = {
-                        "capacity": amount_msat // 1000,
-                        "spendable_sats": our_amount_msat // 1000,
+                        "capacity": base_to_sats_floor(amount_msat),
+                        "spendable_sats": base_to_sats_floor(our_amount_msat),
                         "peer_id": info.get("peer_id", channel.get("peer_id", "")),
                         "fee_ppm": info.get("fee_ppm", 0),
                         "base_fee_msat": info.get("base_fee_msat", 0),
@@ -4612,7 +4612,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         if rebalance_id:
                             self.database.update_rebalance_result(
                                 rebalance_id, 'completed',
-                                actual_fee_sats=exec_result.fee_msat // 1000,
+                                actual_fee_sats=base_to_sats_floor(exec_result.fee_msat),
                             )
                     else:
                         res = {
@@ -4764,7 +4764,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 primary_source_peer_id=best_source_info.get('peer_id', ''),
                 to_peer_id=dest_info.get('peer_id', ''),
                 amount_sats=shock_amount,
-                amount_msat=shock_amount * 1000,
+                amount_msat=sats_to_base(shock_amount),
                 outbound_fee_ppm=0,
                 inbound_fee_ppm=inbound_fee,
                 source_fee_ppm=best_source_info.get('fee_ppm', 0),
@@ -4882,14 +4882,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             primary_source_peer_id=f_info.get("peer_id", ""),
             to_peer_id=t_info.get("peer_id", ""),
             amount_sats=amount_sats,
-            amount_msat=amount_sats * 1000,
+            amount_msat=sats_to_base(amount_sats),
             outbound_fee_ppm=fee_ppm,
             inbound_fee_ppm=est_in,
             source_fee_ppm=src_ppm,
             weighted_opp_cost_ppm=0,
             spread_ppm=fee_ppm - est_in - src_ppm,
             max_budget_sats=max_fee_sats,
-            max_budget_msat=max_fee_sats * 1000,
+            max_budget_msat=sats_to_base(max_fee_sats),
             max_fee_ppm=max_fee_ppm,
             expected_profit_sats=0,
             liquidity_ratio=0.5,
@@ -4964,14 +4964,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     if output.get("status") == "confirmed":
                         amount_msat = output.get("amount_msat", 0)
                         amount_msat = self._parse_msat(amount_msat)
-                        onchain_sats += amount_msat // 1000
+                        onchain_sats += base_to_sats_floor(amount_msat)
 
                 channel_spendable_sats = 0
                 for channel in listfunds.get("channels", []):
                     if channel.get("state") != "CHANNELD_NORMAL":
                         continue
                     our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
-                    spendable = our_amount_msat // 1000
+                    spendable = base_to_sats_floor(our_amount_msat)
                     if spendable > 0:
                         channel_spendable_sats += spendable
 
