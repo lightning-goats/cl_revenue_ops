@@ -4335,7 +4335,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 # Calculate effective budget (same logic as _check_capital_controls)
                 effective_budget = cfg.daily_budget_sats
                 if cfg.enable_proportional_budget:
-                    revenue_24h = self.database.get_total_routing_revenue(since_24h)
+                    revenue_24h_msat = self.database.get_total_routing_revenue(since_24h)
+                    revenue_24h = revenue_24h_msat // 1000
                     proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
                     effective_budget = max(cfg.daily_budget_sats, proportional_budget)
                 # Only override with global provider if one is configured;
@@ -4368,7 +4369,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 # Compute effective weekly budget for atomic reservation
                 _effective_weekly = cfg.weekly_budget_sats
                 if cfg.enable_proportional_budget:
-                    _weekly_rev = self.database.get_total_routing_revenue(now - 7 * 86400)
+                    _weekly_rev_msat = self.database.get_total_routing_revenue(now - 7 * 86400)
+                    _weekly_rev = _weekly_rev_msat // 1000
                     _prop_weekly = int(_weekly_rev * cfg.proportional_budget_pct)
                     _effective_weekly = max(cfg.weekly_budget_sats, _prop_weekly)
 
@@ -4830,7 +4832,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             if cfg.enable_proportional_budget:
                 # E4 FIX: Use configurable budget window, matching execute_rebalance (line 3760)
                 # instead of hardcoded 86400 which ignores total_cost_budget_window_hours.
-                revenue_window = self.database.get_total_routing_revenue(now - (budget_window_hours * 3600))
+                revenue_window_msat = self.database.get_total_routing_revenue(now - (budget_window_hours * 3600))
+                revenue_window = revenue_window_msat // 1000
                 proportional_budget = int(revenue_window * cfg.proportional_budget_pct)
                 effective_budget = max(cfg.daily_budget_sats, proportional_budget)
 
@@ -4872,7 +4875,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             effective_weekly = cfg.weekly_budget_sats
 
             if cfg.enable_proportional_budget:
-                weekly_revenue = self.database.get_total_routing_revenue(now - 7 * 86400)
+                weekly_revenue_msat = self.database.get_total_routing_revenue(now - 7 * 86400)
+                weekly_revenue = weekly_revenue_msat // 1000
                 proportional_weekly = int(weekly_revenue * cfg.proportional_budget_pct)
                 effective_weekly = max(cfg.weekly_budget_sats, proportional_weekly)
                 self.plugin.log(

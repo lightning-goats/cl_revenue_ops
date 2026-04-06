@@ -389,4 +389,4 @@ def test_readme_describes_boltz_treasury_first_boundary():
 
     assert "standing on-chain reserve" in readme
     assert "treasury mode first" in readme
-    assert "does not replace channel rebalancing" in readme
+    assert "balance cycle" in readme

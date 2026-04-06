@@ -1,10 +1,10 @@
 # cl-revenue-ops
 
-`cl-revenue-ops` is the local execution layer for routing profit and liquidity management on Core Lightning. It watches channel economics, adjusts fees, and executes rebalancing through Sling while keeping the normal operator surface intentionally small.
+`cl-revenue-ops` is the local execution layer for routing profit and liquidity management on Core Lightning. It watches channel economics, adjusts fees, and executes rebalancing while keeping the normal operator surface intentionally small.
 
 ## What Operators Need To Know
 
-- This is the executor. It owns local fee execution, local rebalance execution, and Sling integration.
+- This is the executor. It owns local fee execution and rebalance execution.
 - The normal runtime controls are `paused`, `daily_budget_sats`, `min_fee_ppm`, and `max_fee_ppm`.
 - The primary operator surfaces are `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug`.
 - The normal workflow is decision explainability first, knob tuning second.
@@ -12,13 +12,6 @@
 - `revenue-policy list|get|find|changes` are diagnostic surfaces. Write actions such as `set` and `delete` remain internal or debug workflows, not the normal operator path.
 - Planner closes are recommendation-only by default.
 - To allow live close RPCs, set `revenue-ops-planner-execute-closes=true` and `revenue-ops-planner-max-closes-per-cycle` to a positive value.
-
-## Boltz Automation
-
-- The in-plugin Boltz auto-cycle is treasury mode first when confirmed on-chain funds are below the configured reserve target.
-- It maintains a standing on-chain reserve for reserve maintenance, and that reserve maintenance is independent of pending planner opens.
-- When the reserve is healthy, it falls back to the existing balance cycle.
-- Boltz automation does not replace channel rebalancing; Sling still handles channel-to-channel liquidity movement.
 
 ## Profitability Analysis
 
@@ -48,14 +41,11 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 - The in-plugin Boltz auto-cycle is treasury mode first when confirmed on-chain funds are below the configured reserve target.
 - It maintains a standing on-chain reserve for reserve maintenance, and that reserve maintenance is independent of pending planner opens.
 - When the reserve is healthy, it falls back to the existing balance cycle.
-- Boltz automation does not replace channel rebalancing; Sling still handles channel-to-channel liquidity movement.
 
 ## Architecture
 
 ```text
 cl-revenue-ops (local execution layer)
-    ↓
-Sling (required rebalance engine)
     ↓
 Core Lightning
 ```
@@ -66,7 +56,6 @@ Core Lightning
 
 - Core Lightning `v23.05+`
 - Python `3.10+`
-- Sling plugin: required and owned by `cl-revenue-ops`
 - bookkeeper plugin: recommended for cleaner P&L and cost accounting
 
 ### Start The Plugin

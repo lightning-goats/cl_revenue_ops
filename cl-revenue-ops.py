@@ -4732,7 +4732,7 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
 
         # Get channel P&L from current data
         pnl = database.get_channel_pnl(channel_id, window_days=3650)  # 10 years = all time
-        total_revenue_sats = pnl.get('revenue_sats', 0)
+        total_revenue_sats = pnl.get('revenue_msat', 0) // 1000
         total_rebalance_cost_sats = pnl.get('rebalance_cost_sats', 0)
         forward_count = pnl.get('forward_count', 0)
 
@@ -5230,7 +5230,8 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
         "spent_24h_sats": 0, "reserved_24h_sats": 0, "spent_by_category": {}, "reserved_by_category": {}
     }
     generic_ledger = _normalize_generic_ledger_for_total_cost_budget(generic_ledger)
-    revenue_sats = int(database.get_total_routing_revenue(since)) if database else 0
+    revenue_msat = int(database.get_total_routing_revenue(since)) if database else 0
+    revenue_sats = revenue_msat // 1000
     open_cost_sats = int(database.get_opening_costs_since(since)) if database else 0
     closure_cost_sats = int(database.get_closure_costs_since(since)) if database else 0
 
