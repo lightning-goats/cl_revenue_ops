@@ -1521,6 +1521,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database=database,
         hive_router=hive_router,
     )
+    rebalance_executor.data_service = data_service
     if rebalancer is not None:
         rebalancer.rebalance_executor = rebalance_executor
         rebalancer.rpc_cache = rpc_cache

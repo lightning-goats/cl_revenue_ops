@@ -90,6 +90,7 @@ class RebalanceExecutor:
         self.config = config
         self.database = database
         self.hive_router = hive_router
+        self.data_service = None
         self._routing_memory = RebalanceRoutingMemory()
         self._our_id: Optional[str] = None
         self._pool = ThreadPoolExecutor(max_workers=self.MAX_CONCURRENT,
@@ -106,7 +107,10 @@ class RebalanceExecutor:
         if self._our_id:
             return self._our_id
         try:
-            self._our_id = self.plugin.rpc.getinfo().get("id")
+            if self.data_service:
+                self._our_id = self.data_service.get_node_id()
+            else:
+                self._our_id = self.plugin.rpc.getinfo().get("id")
         except Exception:
             pass
         return self._our_id
@@ -126,7 +130,10 @@ class RebalanceExecutor:
         """
         layers = ["auto.localchans"]
         try:
-            existing = self.plugin.rpc.call("askrene-listlayers", {})
+            if self.data_service:
+                existing = self.data_service.get_askrene_layers()
+            else:
+                existing = self.plugin.rpc.call("askrene-listlayers", {})
             for l in existing.get("layers", []):
                 name = l.get("layer", "")
                 if route_type == "fleet":
@@ -187,7 +194,10 @@ class RebalanceExecutor:
         cltv_delta = 6
 
         try:
-            chans = self.plugin.rpc.listpeerchannels(candidate.to_peer_id)
+            if self.data_service:
+                chans = self.data_service.get_peer_channels(peer_id=candidate.to_peer_id)
+            else:
+                chans = self.plugin.rpc.listpeerchannels(candidate.to_peer_id)
             for ch in chans.get("channels", []):
                 if ch.get("short_channel_id") != scid:
                     continue
@@ -207,7 +217,10 @@ class RebalanceExecutor:
 
         if fee_ppm == 0 and base_msat == 0:
             try:
-                chans = self.plugin.rpc.listchannels(source=candidate.to_peer_id)
+                if self.data_service:
+                    chans = self.data_service.get_channels(source=candidate.to_peer_id)
+                else:
+                    chans = self.plugin.rpc.listchannels(source=candidate.to_peer_id)
                 for ch in chans.get("channels", []):
                     if ch.get("destination") != our_id:
                         continue
@@ -252,12 +265,20 @@ class RebalanceExecutor:
         if inform not in {"constrained", "unconstrained", "succeeded"}:
             raise ValueError(f"invalid askrene inform value: {inform}")
         try:
-            self.plugin.rpc.call("askrene-inform-channel", {
-                "layer": "revenue-local",
-                "short_channel_id_dir": scid_dir,
-                "amount_msat": amount_msat,
-                "inform": inform,
-            })
+            if self.data_service:
+                self.data_service.askrene_inform_channel(
+                    layer="revenue-local",
+                    short_channel_id_dir=scid_dir,
+                    amount_msat=amount_msat,
+                    inform=inform,
+                )
+            else:
+                self.plugin.rpc.call("askrene-inform-channel", {
+                    "layer": "revenue-local",
+                    "short_channel_id_dir": scid_dir,
+                    "amount_msat": amount_msat,
+                    "inform": inform,
+                })
         except Exception:
             pass
 
@@ -334,7 +355,10 @@ class RebalanceExecutor:
         if not payment_hash:
             return
         try:
-            self.plugin.rpc.delpay(payment_hash, "failed")
+            if self.data_service:
+                self.data_service.delete_pay(payment_hash, "failed")
+            else:
+                self.plugin.rpc.delpay(payment_hash, "failed")
         except Exception:
             pass
 
@@ -385,13 +409,22 @@ class RebalanceExecutor:
         if merged_excludes:
             getroute_kwargs["exclude"] = merged_excludes
 
-        route_result = self.plugin.rpc.getroute(
-            candidate.to_peer_id,
-            required_amount_msat,
-            riskfactor=0,
-            cltv=required_cltv,
-            **getroute_kwargs,
-        )
+        if self.data_service:
+            route_result = self.data_service.get_route(
+                candidate.to_peer_id,
+                required_amount_msat,
+                riskfactor=0,
+                cltv=required_cltv,
+                **getroute_kwargs,
+            )
+        else:
+            route_result = self.plugin.rpc.getroute(
+                candidate.to_peer_id,
+                required_amount_msat,
+                riskfactor=0,
+                cltv=required_cltv,
+                **getroute_kwargs,
+            )
         route = route_result.get("route", [])
         if not route:
             raise ValueError("no_route_back")
@@ -406,7 +439,10 @@ class RebalanceExecutor:
             forward_hop = route[0]
             forward_scid = forward_hop.get("channel", "")
             forward_dir = forward_hop.get("direction")
-            chans = self.plugin.rpc.listchannels(forward_scid)
+            if self.data_service:
+                chans = self.data_service.get_channels(short_channel_id=forward_scid)
+            else:
+                chans = self.plugin.rpc.listchannels(forward_scid)
             for ch in chans.get("channels", []):
                 if ch.get("short_channel_id") != forward_scid:
                     continue
@@ -430,7 +466,10 @@ class RebalanceExecutor:
 
         if source_fee_ppm == 0 and source_base_msat == 0:
             try:
-                chans = self.plugin.rpc.listpeerchannels(source_peer)
+                if self.data_service:
+                    chans = self.data_service.get_peer_channels(peer_id=source_peer)
+                else:
+                    chans = self.plugin.rpc.listpeerchannels(source_peer)
                 for ch in chans.get("channels", []):
                     if ch.get("short_channel_id") == first_hop_scid:
                         updates = ch.get("updates", {})
@@ -609,10 +648,16 @@ class RebalanceExecutor:
         # SAFETY: TOCTOU race on layer names can crash askrene (lesson 504).
         # Catch and retry with auto-only layers.
         try:
-            result = self.plugin.rpc.call("getroutes", params)
+            if self.data_service:
+                result = self.data_service.get_routes(**params)
+            else:
+                result = self.plugin.rpc.call("getroutes", params)
         except Exception:
             params["layers"] = ["auto.localchans", "auto.no_mpp_support"]
-            result = self.plugin.rpc.call("getroutes", params)
+            if self.data_service:
+                result = self.data_service.get_routes(**params)
+            else:
+                result = self.plugin.rpc.call("getroutes", params)
 
         routes = result.get("routes", [])
         if not routes:
@@ -674,12 +719,20 @@ class RebalanceExecutor:
         # Create self-invoice
         try:
             job.label = f"rebal-{secrets.token_hex(8)}"
-            inv = self.plugin.rpc.invoice(
-                amount_msat=job.amount_msat,
-                label=job.label,
-                description=f"{route_type} rebalance",
-                expiry=self.INVOICE_EXPIRY,
-            )
+            if self.data_service:
+                inv = self.data_service.create_invoice(
+                    amount_msat=job.amount_msat,
+                    label=job.label,
+                    description=f"{route_type} rebalance",
+                    expiry=self.INVOICE_EXPIRY,
+                )
+            else:
+                inv = self.plugin.rpc.invoice(
+                    amount_msat=job.amount_msat,
+                    label=job.label,
+                    description=f"{route_type} rebalance",
+                    expiry=self.INVOICE_EXPIRY,
+                )
             job.payment_hash = inv.get("payment_hash", "")
             bolt11 = inv.get("bolt11", "")
             if not job.payment_hash or not bolt11:
@@ -747,19 +800,34 @@ class RebalanceExecutor:
                 )
 
                 job.state = JobState.SENDING
-                self.plugin.rpc.sendpay(
-                    route=full_route,
-                    payment_hash=job.payment_hash,
-                    amount_msat=job.amount_msat,
-                    bolt11=bolt11,
-                    payment_secret=inv.get("payment_secret", ""),
-                )
+                if self.data_service:
+                    self.data_service.send_pay(
+                        route=full_route,
+                        payment_hash=job.payment_hash,
+                        amount_msat=job.amount_msat,
+                        bolt11=bolt11,
+                        payment_secret=inv.get("payment_secret", ""),
+                    )
+                else:
+                    self.plugin.rpc.sendpay(
+                        route=full_route,
+                        payment_hash=job.payment_hash,
+                        amount_msat=job.amount_msat,
+                        bolt11=bolt11,
+                        payment_secret=inv.get("payment_secret", ""),
+                    )
 
                 job.state = JobState.WAITING
-                pay_result = self.plugin.rpc.waitsendpay(
-                    job.payment_hash,
-                    self.SENDPAY_TIMEOUT,
-                )
+                if self.data_service:
+                    pay_result = self.data_service.wait_send_pay(
+                        job.payment_hash,
+                        self.SENDPAY_TIMEOUT,
+                    )
+                else:
+                    pay_result = self.plugin.rpc.waitsendpay(
+                        job.payment_hash,
+                        self.SENDPAY_TIMEOUT,
+                    )
                 status = pay_result.get("status", "")
                 if status != "complete":
                     raise RuntimeError(f"waitsendpay_status={status}")
@@ -844,7 +912,10 @@ class RebalanceExecutor:
 
         # Clean up unpaid invoice
         try:
-            self.plugin.rpc.delinvoice(job.label, "unpaid")
+            if self.data_service:
+                self.data_service.delete_invoice(job.label, "unpaid")
+            else:
+                self.plugin.rpc.delinvoice(job.label, "unpaid")
         except Exception:
             pass
 
@@ -876,7 +947,10 @@ class RebalanceExecutor:
             try:
                 source_scid = candidate.source_candidates[0] if candidate.source_candidates else ""
                 if source_scid:
-                    channels = self.plugin.rpc.listpeerchannels()
+                    if self.data_service:
+                        channels = self.data_service.get_peer_channels()
+                    else:
+                        channels = self.plugin.rpc.listpeerchannels()
                     for ch in channels.get("channels", []):
                         if (ch.get("short_channel_id") == source_scid
                                 and ch.get("state") == "CHANNELD_NORMAL"):
