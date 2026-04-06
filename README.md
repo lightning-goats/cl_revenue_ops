@@ -20,6 +20,36 @@
 - When the reserve is healthy, it falls back to the existing balance cycle.
 - Boltz automation does not replace channel rebalancing; Sling still handles channel-to-channel liquidity movement.
 
+## Profitability Analysis
+
+The profitability analyzer tracks channel economics using **millisatoshi-native accounting** — all revenue values are stored in msat internally and converted to sats only at reporting boundaries. This ensures sub-satoshi fees are never silently truncated to zero.
+
+Key concepts:
+- **Channel valuation** uses `max(exit_fees, sourced_fees)` — channels are credited for their most valuable role (routing exit traffic *or* sourcing inbound traffic).
+- **Fleet revenue** sums exit fees only across all channels — no double-counting of inbound sourcing.
+- **Inbound gateways** (channels that primarily source traffic for the fleet) receive enhanced protection from closure and are never misclassified as stagnant or zombie based on exit-side metrics alone.
+- **Classification** uses total forward count (exit + sourced) for ZOMBIE, STAGNANT, and fleet member protection decisions.
+
+Use `revenue-profitability` to see per-channel analysis including sourced metrics, flow profiles, and total contribution.
+
+## Channel Opening Intelligence
+
+The capacity planner uses a multi-strategy candidate pipeline with portfolio-aware governance:
+
+- **Portfolio balance governor** — hard gate at >95% local blocks outbound opens, constrained at 85-95% allows only sink-adjacent or dual-fund
+- **Multi-strategy discovery** — winner (proven revenue), demand-flow (gossip heuristics), hive (fleet intelligence), route-pair, graph, and neighbor strategies
+- **Score normalization** — within-strategy 0-1 normalization with configurable weights; pool slot quotas prevent strategy monoculture
+- **Demand-flow classifier** — classifies peers as source/sink/router using FlowMetrics aggregation and gossip heuristics (exchange, LSP, sink keyword matching)
+- **Capital recycling** — evaluates underperformers for close-and-reopen when recycle EV exceeds threshold; coordinates with Boltz for on-chain fund management
+- **Dual-fund support** — uses `fundchannel request_amt` when peers advertise `option_will_fund`
+
+## Boltz Automation
+
+- The in-plugin Boltz auto-cycle is treasury mode first when confirmed on-chain funds are below the configured reserve target.
+- It maintains a standing on-chain reserve for reserve maintenance, and that reserve maintenance is independent of pending planner opens.
+- When the reserve is healthy, it falls back to the existing balance cycle.
+- Boltz automation does not replace channel rebalancing; Sling still handles channel-to-channel liquidity movement.
+
 ## Architecture
 
 ```text
@@ -81,8 +111,11 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-rebalance-debug` | Why a rebalance was selected, skipped, or blocked |
 | `revenue-config get` | Inspect current runtime controls |
 | `revenue-config set <key> <value>` | Change one of the supported runtime controls |
+| `revenue-profitability [channel_id]` | Per-channel profitability with sourced metrics and flow profiles |
 | `revenue-analyze` | Trigger immediate analysis |
 | `revenue-wake-all` | Wake the background loops immediately |
+| `revenue-hive-hints-status` | Diagnostic: hive hints coverage and freshness |
+| `revenue-planner-candidate-sources` | Diagnostic: candidate pipeline strategy breakdown |
 
 ## More Detail
 
