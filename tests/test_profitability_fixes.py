@@ -201,6 +201,7 @@ class TestMarginalRoi30d:
 
         # 30d P&L: 800 contribution, 300 rebalance cost
         analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 800_000,
             'total_contribution_sats': 800,
             'rebalance_cost_sats': 300,
         }
@@ -296,6 +297,7 @@ class TestRoiSortingAndVolume:
         ))
         analyzer._get_last_routing_time = MagicMock(return_value=int(time.time()) - 3600)
         analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 50_000,
             'total_contribution_sats': 50,
             'rebalance_cost_sats': 0,
         }
@@ -325,6 +327,7 @@ class TestRoiSortingAndVolume:
         ))
         analyzer._get_last_routing_time = MagicMock(return_value=None)
         analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 0,
             'total_contribution_sats': 0,
             'rebalance_cost_sats': 0,
         }
@@ -355,6 +358,7 @@ class TestRoiSortingAndVolume:
         analyzer._get_channel_revenue = MagicMock(return_value=rev)
         analyzer._get_last_routing_time = MagicMock(return_value=int(time.time()) - 3600)
         analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 750_000,
             'total_contribution_sats': 750,
             'rebalance_cost_sats': 100,
         }
@@ -531,6 +535,7 @@ class TestCapacityDivisionGuards:
         ))
         analyzer._get_last_routing_time = MagicMock(return_value=int(time.time()) - 3600)
         analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 50_000,
             'total_contribution_sats': 50,
             'rebalance_cost_sats': 0,
         }
@@ -558,6 +563,7 @@ class TestCapacityDivisionGuards:
         ))
         analyzer._get_last_routing_time = MagicMock(return_value=None)
         analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 0,
             'total_contribution_sats': 0,
             'rebalance_cost_sats': 0,
         }

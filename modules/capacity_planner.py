@@ -631,7 +631,7 @@ class CapacityPlanner:
                 pass
 
             # Protect inbound gateways — they source traffic for the fleet
-            if is_inbound_gateway and prof.marginal_roi_percent > -30.0:
+            if is_inbound_gateway and prof.marginal_roi_percent >= -30.0:
                 continue  # Protect inbound gateways (tighter threshold)
 
             # Protect channels that source significant fee contribution
@@ -640,6 +640,10 @@ class CapacityPlanner:
             # because channels with a history of sourcing are worth protecting even
             # if recent volume is lower. Avoids modifying ChannelProfitability dataclass.
             sourced_fee_sats = getattr(prof.revenue, 'sourced_fee_contribution_sats', 0)
+            try:
+                sourced_fee_sats = int(sourced_fee_sats)
+            except (TypeError, ValueError):
+                sourced_fee_sats = 0
             if sourced_fee_sats > 100 and prof.marginal_roi_percent > -50.0:
                 continue  # Protect significant inbound sources
 

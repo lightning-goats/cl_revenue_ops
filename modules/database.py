@@ -2394,7 +2394,7 @@ class Database:
         - Rolled-up daily_forwarding_stats (exit-side)
         - Rolled-up daily_forwarding_stats_inbound (entry-side)
 
-        Returns a dict with values in sats and counts as integers.
+        Returns a dict with values in msat and counts as integers.
         """
         conn = self._get_connection()
 
@@ -2489,8 +2489,8 @@ class Database:
 
         Returns:
             Dict[channel_id] -> dict with:
-              fees_earned_sats, volume_routed_sats, forward_count,
-              sourced_volume_sats, sourced_fee_contribution_sats, sourced_forward_count
+              fees_earned_msat, volume_routed_msat, forward_count,
+              sourced_volume_msat, sourced_fee_contribution_msat, sourced_forward_count
         """
         conn = self._get_connection()
 
