@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import MagicMock
 
-from modules.rebalancer import EVRebalancer, JobManager
+from modules.rebalancer import EVRebalancer
 
 
 @pytest.fixture
@@ -91,38 +91,5 @@ class TestChannelAgeDaysUsesCache:
         mock_plugin.rpc.getinfo.assert_called()
 
 
-class TestJobManagerUsesCache:
-    """JobManager listfunds calls use rpc_cache when available."""
-
-    def test_get_channel_local_balance_uses_cache(self, mock_plugin, mock_config, mock_database, mock_rpc_cache):
-        jm = JobManager(mock_plugin, mock_config, mock_database)
-        jm.rpc_cache = mock_rpc_cache
-
-        balance = jm._get_channel_local_balance("800000x1x0")
-        mock_rpc_cache.listfunds.assert_called()
-        mock_plugin.rpc.listfunds.assert_not_called()
-        assert balance == 500_000
-
-    def test_get_local_balances_map_uses_cache(self, mock_plugin, mock_config, mock_database, mock_rpc_cache):
-        jm = JobManager(mock_plugin, mock_config, mock_database)
-        jm.rpc_cache = mock_rpc_cache
-
-        balances = jm._get_local_balances_map()
-        mock_rpc_cache.listfunds.assert_called()
-        mock_plugin.rpc.listfunds.assert_not_called()
-        assert "800000x1x0" in balances
-
-    def test_falls_back_without_cache(self, mock_plugin, mock_config, mock_database):
-        jm = JobManager(mock_plugin, mock_config, mock_database)
-        jm.rpc_cache = None
-        mock_plugin.rpc.listfunds.return_value = {
-            "outputs": [],
-            "channels": [
-                {"short_channel_id": "800000x1x0", "our_amount_msat": 500_000_000,
-                 "state": "CHANNELD_NORMAL"},
-            ]
-        }
-
-        balance = jm._get_channel_local_balance("800000x1x0")
-        mock_plugin.rpc.listfunds.assert_called()
-        assert balance == 500_000
+# TestJobManagerUsesCache removed -- _get_channel_local_balance and
+# _get_local_balances_map deleted with sling code.

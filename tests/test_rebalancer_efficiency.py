@@ -89,40 +89,7 @@ class TestFailureMetadataPersistence:
         assert meta["last_attempted_ppm"] == 0
 
 
-# =============================================================================
-# Task 3: Classify sling failure messages
-# =============================================================================
-
-class TestFailureClassification:
-    """Verify sling error messages are classified correctly."""
-
-    def test_no_route_classified(self):
-        from modules.rebalancer import JobManager
-        assert JobManager._classify_sling_error("no route found") == "no_route"
-
-    def test_no_route_variant(self):
-        from modules.rebalancer import JobManager
-        assert JobManager._classify_sling_error("WIRE_UNKNOWN_NEXT_PEER") == "no_route"
-
-    def test_timeout_classified(self):
-        from modules.rebalancer import JobManager
-        assert JobManager._classify_sling_error("timeout waiting for response") == "timeout"
-
-    def test_budget_exceeded_classified(self):
-        from modules.rebalancer import JobManager
-        assert JobManager._classify_sling_error("exceeded fee budget") == "budget_exceeded"
-
-    def test_route_over_budget_classified(self):
-        from modules.rebalancer import JobManager
-        assert JobManager._classify_sling_error("route_over_budget: fee 1500 > budget 1000") == "budget_exceeded"
-
-    def test_unknown_error_is_other(self):
-        from modules.rebalancer import JobManager
-        assert JobManager._classify_sling_error("something weird happened") == "other"
-
-    def test_empty_error_is_other(self):
-        from modules.rebalancer import JobManager
-        assert JobManager._classify_sling_error("") == "other"
+# TestFailureClassification removed -- _classify_sling_error deleted with sling code.
 
 
 # =============================================================================
@@ -240,41 +207,7 @@ class TestFasterNoRouteFutility:
         assert EVRebalancer._should_skip_futility(0, "") is False
 
 
-# =============================================================================
-# Task 6: Adaptive chunk sizing on fee escalation
-# =============================================================================
-
-class TestAdaptiveChunkSizing:
-    """Verify chunk size scales inversely with fee escalation."""
-
-    def test_no_escalation_uses_base_chunk(self):
-        from modules.rebalancer import JobManager
-        result = JobManager._scale_chunk_for_escalation(
-            base_chunk=500000, base_ppm=50, actual_ppm=50, min_amount=50000
-        )
-        assert result == 500000
-
-    def test_escalation_reduces_chunk(self):
-        from modules.rebalancer import JobManager
-        result = JobManager._scale_chunk_for_escalation(
-            base_chunk=500000, base_ppm=50, actual_ppm=150, min_amount=50000
-        )
-        # 500000 * (50/150) = 166666
-        assert result == 166666
-
-    def test_chunk_never_below_min_amount(self):
-        from modules.rebalancer import JobManager
-        result = JobManager._scale_chunk_for_escalation(
-            base_chunk=500000, base_ppm=10, actual_ppm=5000, min_amount=50000
-        )
-        assert result == 50000
-
-    def test_zero_base_ppm_uses_base_chunk(self):
-        from modules.rebalancer import JobManager
-        result = JobManager._scale_chunk_for_escalation(
-            base_chunk=500000, base_ppm=0, actual_ppm=100, min_amount=50000
-        )
-        assert result == 500000
+# TestAdaptiveChunkSizing removed -- _scale_chunk_for_escalation deleted with sling code.
 
 
 class TestFleetFeeCapRestoration:

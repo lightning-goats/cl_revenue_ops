@@ -49,13 +49,12 @@ class TestRebalancerDryRun:
 
         cfg = Config(dry_run=dry_run)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
-        r.job_manager.start_job = MagicMock(return_value={"success": True})
         mock_database.record_rebalance = MagicMock(return_value=123)
         mock_database.update_rebalance_result = MagicMock()
         return r
 
-    def test_dry_run_does_not_start_sling_job(self, mock_plugin, mock_database):
-        """In dry_run mode, execute_rebalance should record but not start a sling job."""
+    def test_dry_run_does_not_execute_rebalance(self, mock_plugin, mock_database):
+        """In dry_run mode, execute_rebalance should record but not execute."""
         r = self._make_rebalancer(mock_plugin, mock_database, dry_run=True)
 
         cand = _candidate()

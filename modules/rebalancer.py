@@ -14,9 +14,9 @@ Async Job Queue
 - Decouples decision-making from execution
 - Allows concurrent rebalancing attempts
 
-Note: JobManager (sling-based) is retained as deprecated legacy code.
-      It is no longer called from the active rebalance path but diagnostic
-      RPCs may still reference it for active job counts.
+Note: JobManager has been stripped of all sling-based code and retains only
+      source-failure tracking, AskRene constraint caching, and stub APIs
+      referenced by diagnostic RPCs.
 """
 
 import math
@@ -184,122 +184,105 @@ class RebalanceCandidate:
         }
 
 
-@dataclass
-class ActiveJob:
-    """Tracks an active sling background job."""
-    scid: str                      # Target channel SCID (colon format for sling)
-    scid_normalized: str           # Original SCID format (for our tracking)
-    source_candidates: List[str]   # List of source channel SCIDs (colon format)
-    start_time: int                # Unix timestamp when job started
-    candidate: RebalanceCandidate  # Original candidate data
-    rebalance_id: int              # Database record ID
-    target_amount_sats: int        # Total amount we want to rebalance
-    initial_local_sats: int        # Local balance when job started
-    max_fee_ppm: int               # Max fee rate for this job
-    status: JobStatus = JobStatus.PENDING
-    direction: str = "pull"
 
-    # Backwards compatibility property
-    @property
-    def from_scid(self) -> str:
-        """Returns the primary (best) source SCID for backwards compatibility."""
-        return self.source_candidates[0] if self.source_candidates else ""
+# ActiveJob dataclass removed — sling-based rebalancing deleted.
+# All rebalancing is handled by RebalanceExecutor.
+
+
 
 
 class JobManager:
     """
-    DEPRECATED: Sling-based background rebalancing job manager.
+    Stripped-down job manager — sling-based rebalancing removed.
 
-    JobManager is no longer called from the active rebalance path.
-    RebalanceExecutor replaced it as the primary
-    execution engine. This class is retained because diagnostic RPCs may still
-    reference it for active job counts. Do not add new sling dependencies here.
+    All rebalancing is handled by RebalanceExecutor. This class retains:
+    - Source failure tracking (used by EVRebalancer for failure-informed routing)
+    - AskRene constraint cache (used by EVRebalancer for liquidity-aware sizing)
+    - Stub properties referenced by diagnostic RPCs and cl-revenue-ops.py
     """
-
-    # Default timeout: 2 hours (configurable)
-    DEFAULT_JOB_TIMEOUT_SECONDS = 7200
 
     def __init__(self, plugin: Plugin, config: Config, database: Database):
         self.plugin = plugin
         self.config = config
         self.database = database
 
-        # Active jobs indexed by target channel SCID (normalized format)
-        self._active_jobs: Dict[str, ActiveJob] = {}
-        self._jobs_lock = threading.Lock()
-
-        # Configurable settings (legacy sling options; kept for backward compat with orphan cleanup)
-        self.job_timeout_seconds = self.DEFAULT_JOB_TIMEOUT_SECONDS
-        self.max_concurrent_jobs = getattr(config, 'max_concurrent_jobs', 5)
-
-        # Chunk size (legacy; kept for diagnostics)
-        self.chunk_size_sats = 500000
-
-        # AskRene integration (read-only): use constraints for preflight sizing + intelligence.
-        self._askrene_cache_ts = 0
-        self._askrene_cache: Dict[str, int] = {}  # short_channel_id_dir -> maximum_msat
-        self._askrene_lock = threading.Lock()  # TS-5: Protect cache access
-        self.askrene_layer = getattr(config, 'askrene_layer', 'xpay')
-        self.askrene_max_age_sec = getattr(config, 'askrene_max_age_sec', 900)
-
-        # Source reliability tracking
+        # Source reliability tracking (used by EVRebalancer for failure-informed routing)
         self.source_failure_counts: Dict[str, float] = {}
         self._source_failures_lock = threading.Lock()
 
-        self.rpc_cache = None  # Shared RPC cache (injected after construction)
-        self.data_service = None  # Unified data service (injected after construction)
-        self.last_decay_time = time.time()
-
-        # Periodic exclusion sync tracking
-        self._last_exclusion_sync: float = 0
-        self._policy_manager_ref = None
+        # AskRene integration (read-only): used by EVRebalancer for preflight sizing.
+        self._askrene_cache_ts = 0
+        self._askrene_cache: Dict[str, int] = {}  # short_channel_id_dir -> maximum_msat
+        self._askrene_lock = threading.Lock()
+        self.askrene_layer = getattr(config, 'askrene_layer', 'xpay')
+        self.askrene_max_age_sec = getattr(config, 'askrene_max_age_sec', 900)
 
         # HiveRouter for askrene job reservations (injected by EVRebalancer)
         self.hive_router = None
 
-    @staticmethod
-    def _classify_sling_error(error_msg: str) -> str:
-        """Classify a sling error message for failure-informed routing."""
-        msg = error_msg.lower()
-        if any(s in msg for s in ("no route", "unknown_next_peer", "no path", "no channels")):
-            return "no_route"
-        if any(s in msg for s in ("timeout", "timed out", "deadline")):
-            return "timeout"
-        if any(s in msg for s in ("exceeded", "budget", "overpaid")):
-            return "budget_exceeded"
-        return "other"
+    # ---- SCID helpers (used by EVRebalancer for AskRene lookups) ----
 
     @staticmethod
-    def _scale_chunk_for_escalation(base_chunk: int, base_ppm: int, actual_ppm: int, min_amount: int) -> int:
-        """
-        Scale chunk size inversely with fee escalation to keep per-attempt cost constant.
+    def _normalize_scid(scid: str) -> str:
+        """Normalize SCID to consistent format (with 'x' separators)."""
+        return scid.replace(':', 'x')
 
-        If we're paying 3x the base fee rate, use 1/3 the chunk size.
-        """
-        if base_ppm <= 0 or actual_ppm <= base_ppm:
-            return base_chunk
-        scaled = int(base_chunk * base_ppm / actual_ppm)
-        return max(min_amount, scaled)
+    def _parse_msat(self, v: Any) -> int:
+        """Delegate to shared parse_msat in utils.py."""
+        return _shared_parse_msat(v)
+
+    # ---- Stubs for callers that still reference sling-era APIs ----
+
+    @property
+    def active_job_count(self) -> int:
+        """Legacy stub -- sling removed. Always 0."""
+        return 0
+
+    @property
+    def active_channels(self) -> list:
+        """Legacy stub -- sling removed. Always empty."""
+        return []
+
+    def has_active_job(self, channel_id: str) -> bool:
+        """Legacy stub -- sling removed. Always False."""
+        return False
+
+    def slots_available(self) -> int:
+        """Legacy stub -- sling removed. Always 999 (unlimited)."""
+        return 999
 
     def get_active_rebalancing_peers(self) -> List[str]:
-        """Get deduplicated peer IDs from all active jobs (source + dest peers)."""
-        peers = set()
-        with self._jobs_lock:
-            for job in self._active_jobs.values():
-                if job is not None and job.candidate:
-                    peers.add(job.candidate.to_peer_id)
-                    peers.add(job.candidate.primary_source_peer_id)
-        return list(peers)
+        """Legacy stub -- sling removed. Always empty."""
+        return []
+
+    def get_all_jobs_status(self) -> List[Dict[str, Any]]:
+        """Legacy stub -- sling removed. Always empty."""
+        return []
+
+    def stop_job(self, channel_id: str, reason: str = "manual") -> bool:
+        """Legacy stub -- sling removed. Always False (no jobs to stop)."""
+        return False
+
+    def stop_all_jobs(self, reason: str = "shutdown") -> int:
+        """Legacy stub -- sling removed. Always 0 (no jobs stopped)."""
+        return 0
+
+    def execute_once(self, scid: str, direction: str, amount: int,
+                     maxppm: int, onceamount: int, candidates: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Legacy stub -- sling removed. Returns failure."""
+        return {"success": False, "error": "sling execute_once removed; use RebalanceExecutor"}
+
+    # ---- Source failure tracking (still used by EVRebalancer) ----
 
     def prune_stale_source_failures(self, active_channel_ids: set) -> int:
         """
         Remove in-memory failure counts for channels that no longer exist.
-        
+
         This prevents memory bloat from closed channels over time.
-        
+
         Args:
             active_channel_ids: Set of currently active channel IDs
-            
+
         Returns:
             Number of stale entries pruned
         """
@@ -317,1206 +300,13 @@ class JobManager:
             )
 
         return pruned
-    
-    @property
-    def active_job_count(self) -> int:
-        """Returns the number of currently active jobs."""
-        with self._jobs_lock:
-            return len(self._active_jobs)
 
-    @property
-    def active_channels(self) -> List[str]:
-        """Returns list of channel SCIDs with active jobs."""
-        with self._jobs_lock:
-            return list(self._active_jobs.keys())
+    def get_source_failure_count(self, channel_id: str) -> float:
+        """Get the recent failure count for a source channel."""
+        with self._source_failures_lock:
+            return self.source_failure_counts.get(channel_id, 0.0)
 
-    def has_active_job(self, channel_id: str) -> bool:
-        """Check if a channel has an active rebalance job."""
-        normalized = self._normalize_scid(channel_id)
-        with self._jobs_lock:
-            return normalized in self._active_jobs
-
-    def slots_available(self) -> int:
-        """Returns number of available job slots."""
-        with self._jobs_lock:
-            return max(0, self.max_concurrent_jobs - len(self._active_jobs))
-    
-    def _normalize_scid(self, scid: str) -> str:
-        """Normalize SCID to consistent format (with 'x' separators)."""
-        return scid.replace(':', 'x')
-    
-    def _to_sling_scid(self, scid: str) -> str:
-        """Normalize SCID to sling's expected 'x' separator format."""
-        return self._normalize_scid(scid)
-    
-    def _get_channel_local_balance(self, channel_id: str) -> int:
-        """Get current local balance of a channel in sats.
-
-        Only returns balance for channels in CHANNELD_NORMAL state (or if state
-        is not reported). Returns 0 for channels in closing/non-normal states.
-        """
-        try:
-            listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
-            normalized = self._normalize_scid(channel_id)
-
-            for channel in listfunds.get("channels", []):
-                scid = channel.get("short_channel_id", "")
-                if self._normalize_scid(scid) == normalized:
-                    # I-8 FIX: Filter out non-normal channels to prevent false
-                    # positive success detection during channel closure
-                    ch_state = channel.get("state")
-                    if ch_state and ch_state != "CHANNELD_NORMAL":
-                        return 0
-                    # M-22: Use _parse_msat for consistent Millisatoshi handling
-                    our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
-                    return base_to_sats_floor(our_amount_msat)
-        except Exception as e:
-            self.plugin.log(f"Error getting channel balance: {e}", level='debug')
-        return 0
-
-    # NOTE: _get_channel_age_days removed - duplicate of EVRebalancer method and was never called
-
-    def start_job(self, candidate: RebalanceCandidate, rebalance_id: int) -> Dict[str, Any]:
-        """
-        Start a new sling-job for the given candidate with multi-source support.
-        
-        sling-job creates a persistent background worker that will keep
-        attempting to rebalance until stopped or target is reached.
-        Passes ALL profitable source candidates to Sling so it can handle
-        pathfinding failover automatically.
-        
-        Args:
-            candidate: The rebalance candidate with all parameters
-            rebalance_id: Database record ID for this rebalance attempt
-            
-        Returns:
-            Dict with 'success' bool and 'message' or 'error'
-        """
-        normalized_scid = self._normalize_scid(candidate.to_channel)
-
-        # H-1: Atomic check-and-reserve under lock to prevent TOCTOU race
-        with self._jobs_lock:
-            if normalized_scid in self._active_jobs:
-                return {"success": False, "error": "Job already exists for this channel"}
-            if len(self._active_jobs) >= self.max_concurrent_jobs:
-                return {"success": False, "error": "No job slots available"}
-            # Reserve slot with sentinel timestamp immediately
-            self._active_jobs[normalized_scid] = time.time()
-
-        # Convert SCIDs to sling format (x-separated, e.g., 930866x2599x2)
-        to_scid = self._to_sling_scid(candidate.to_channel)
-
-        # Convert all source candidates to sling format.
-        # When a fleet route was discovered (hive_route_hops > 0), restrict
-        # sling to ONLY the fleet source channel.  Sling doesn't use askrene
-        # layers, so passing all 37 candidates lets it find expensive non-fleet
-        # routes.  By passing only the fleet channel, sling is forced to route
-        # through the fleet peer at near-zero cost.
-        if candidate.hive_route_hops > 0 and candidate.source_candidates:
-            # Fleet route: use only the primary (fleet) source
-            source_scids_sling = [self._to_sling_scid(candidate.source_candidates[0])]
-            self.plugin.log(
-                f"FLEET SLING: Restricting to fleet source {source_scids_sling[0]} "
-                f"({candidate.hive_route_hops}-hop fleet route)",
-                level='info'
-            )
-        else:
-            source_scids_sling = [self._to_sling_scid(scid) for scid in candidate.source_candidates]
-        
-        # Get initial balance for progress tracking
-        initial_balance = self._get_channel_local_balance(candidate.to_channel)
-        
-        # Calculate chunk size (amount per rebalance attempt)
-        chunk_size = min(candidate.amount_sats, self.chunk_size_sats)
-
-        # Adaptive chunk sizing: reduce chunk when fee has been escalated
-        # to keep per-attempt fee risk constant.
-        ev_base_ppm = getattr(candidate, 'ev_base_fee_ppm', 0)
-        if ev_base_ppm > 0 and candidate.max_fee_ppm > ev_base_ppm:
-            chunk_size = self._scale_chunk_for_escalation(
-                base_chunk=chunk_size,
-                base_ppm=ev_base_ppm,
-                actual_ppm=candidate.max_fee_ppm,
-                min_amount=getattr(self.config, 'rebalance_min_amount', 50000),
-            )
-
-        # I-4 FIX: Scale budget proportionally to chunk size. The EV analysis computed
-        # max_budget_sats for the full candidate.amount_sats. If we chunk into smaller
-        # pieces, the per-chunk budget must be proportionally smaller to maintain the
-        # same effective PPM cap. Without this, the PPM cap is inflated by the ratio
-        # of full_amount / chunk_size, allowing sling to overpay on routes.
-        if chunk_size > 0 and candidate.amount_sats > 0:
-            chunk_budget_msat = (candidate.max_budget_msat * chunk_size) // candidate.amount_sats
-            budget_ppm = (chunk_budget_msat * 1_000_000) // sats_to_base(chunk_size) if chunk_size > 0 else 0
-        else:
-            budget_ppm = 0
-        maxppm = int(max(1, min(candidate.max_fee_ppm, budget_ppm))) if budget_ppm > 0 else 0
-        if maxppm <= 0:
-            return {"success": False, "error": "Budget too small to allow any routing fee (maxppm=0)"}
-        
-        try:
-            primary_source = source_scids_sling[0] if source_scids_sling else "none"
-
-            # =================================================================
-            # PHASE 6: Flow-Aware Target Selection
-            # =================================================================
-            # Different channel types want different balance targets:
-            # - SINK channels: Want more inbound capacity (lower target)
-            # - SOURCE channels: Want more outbound capacity (higher target)
-            # - BALANCED: Neutral 50/50
-            # =================================================================
-            flow_state = candidate.dest_flow_state
-            direction = candidate.direction
-
-            # DEPRECATED: sling-specific target/balance logic (legacy, not active)
-            _sling_target_source = 0.65
-            _sling_target_sink = 0.40
-            _sling_target_balanced = 0.50
-            _sling_deplete_pct_sink = 0.10
-            _sling_deplete_pct_source = 0.35
-            _sling_deplete_pct_balanced = 0.20
-            _sling_max_hops = 5
-            _sling_parallel_jobs = 2
-            _sling_outppm_fallback = 500
-
-            if direction == "push":
-                if flow_state == "source":
-                    target = 1.0 - _sling_target_source
-                elif flow_state == "sink":
-                    target = 1.0 - _sling_target_sink
-                else:
-                    target = 1.0 - _sling_target_balanced
-            else:
-                if flow_state == "sink":
-                    target = _sling_target_sink
-                elif flow_state == "source":
-                    target = _sling_target_source
-                else:
-                    target = _sling_target_balanced
-
-            self.plugin.log(
-                f"Starting sling-job (legacy): {to_scid} {'<-' if direction == 'pull' else '->'} "
-                f"[{len(source_scids_sling)} candidates], "
-                f"primary={primary_source}, dir={direction}, amount={chunk_size}, "
-                f"maxppm={maxppm}, maxhops={_sling_max_hops}, "
-                f"target={target} (flow={flow_state}), budget_sats={candidate.max_budget_sats}"
-            )
-
-            maxhops = _sling_max_hops
-            if candidate.hive_route_hops > 0:
-                maxhops = min(maxhops, candidate.hive_route_hops + 1)
-                self.plugin.log(
-                    f"HIVE ROUTE: Tightening maxhops to {maxhops} "
-                    f"(askrene found {candidate.hive_route_hops}-hop route)",
-                    level='debug'
-                )
-
-            job_params = {
-                "scid": to_scid,
-                "direction": direction,
-                "amount": chunk_size,
-                "maxppm": maxppm,
-                "maxhops": maxhops,
-                "target": target,
-                "paralleljobs": _sling_parallel_jobs,
-            }
-
-            if flow_state == "sink":
-                deplete_pct = _sling_deplete_pct_sink
-            elif flow_state == "source":
-                deplete_pct = _sling_deplete_pct_source
-            else:
-                deplete_pct = _sling_deplete_pct_balanced
-
-            job_params["depleteuptopercent"] = deplete_pct
-
-            try:
-                primary_source_scid = candidate.source_candidates[0] if candidate.source_candidates else None
-                source_state = self.database.get_channel_state(primary_source_scid) if primary_source_scid else None
-                if source_state and source_state.get("capacity", 0) > 0:
-                    source_cap = source_state["capacity"]
-                    source_bal = self._get_channel_local_balance(primary_source_scid)
-                    source_flow = source_state.get("state", "balanced")
-                    if source_flow == "source":
-                        source_target_ratio = _sling_target_source
-                    elif source_flow == "sink":
-                        source_target_ratio = _sling_target_sink
-                    else:
-                        source_target_ratio = _sling_target_balanced
-                    source_target_sats = int(source_cap * source_target_ratio)
-                    actual_excess = max(0, source_bal - source_target_sats)
-                    job_params["depleteuptoamount"] = max(100_000, actual_excess)
-                else:
-                    job_params["depleteuptoamount"] = max(100_000, chunk_size * 2)
-            except Exception:
-                job_params["depleteuptoamount"] = max(100_000, chunk_size * 2)
-
-            if source_scids_sling:
-                job_params["candidates"] = source_scids_sling
-
-            if _sling_outppm_fallback > 0:
-                if not source_scids_sling:
-                    job_params["outppm"] = _sling_outppm_fallback
-                    self.plugin.log(
-                        f"No candidates for {to_scid}, using outppm={_sling_outppm_fallback} fallback",
-                        level='info'
-                    )
-                else:
-                    job_params["outppm"] = _sling_outppm_fallback
-
-            self.plugin.rpc.call("sling-job", job_params)
-            
-            # Start the job (sling-job only creates it, sling-go starts it)
-            try:
-                self.plugin.rpc.call("sling-go", {"scid": to_scid})
-            except RpcError as e:
-                # sling-go might fail if job auto-started, that's OK
-                if "already running" not in str(e).lower():
-                    self.plugin.log(f"sling-go warning: {e}", level='debug')
-            
-            # Track the job with all source candidates (replace sentinel with real job)
-            job = ActiveJob(
-                scid=to_scid,
-                scid_normalized=normalized_scid,
-                source_candidates=source_scids_sling,
-                start_time=int(time.time()),
-                candidate=candidate,
-                rebalance_id=rebalance_id,
-                target_amount_sats=candidate.amount_sats,
-                initial_local_sats=initial_balance,
-                max_fee_ppm=maxppm,  # Use enforced budget-derived maxppm
-                status=JobStatus.RUNNING,
-                direction=direction,
-            )
-            with self._jobs_lock:
-                self._active_jobs[normalized_scid] = job
-
-            self.plugin.log(
-                f"Sling job started for {to_scid}, tracking as {normalized_scid} "
-                f"with {len(source_scids_sling)} source candidates"
-            )
-
-            return {
-                "success": True,
-                "message": f"Job started for {to_scid} with {len(source_scids_sling)} source candidates"
-            }
-            
-        except RpcError as e:
-            # H-1: Remove sentinel on failure
-            with self._jobs_lock:
-                self._active_jobs.pop(normalized_scid, None)
-            error_msg = str(e)
-            self.plugin.log(f"Failed to start sling-job: {error_msg}", level='warn')
-            return {"success": False, "error": f"Sling RPC error: {error_msg}"}
-        except Exception as e:
-            # H-1: Remove sentinel on failure
-            with self._jobs_lock:
-                self._active_jobs.pop(normalized_scid, None)
-            self.plugin.log(f"Error starting sling-job: {e}", level='error')
-            return {"success": False, "error": str(e)}
-    
-    def stop_job(self, channel_id: str, reason: str = "manual") -> bool:
-        """
-        Stop and delete a sling job.
-
-        Args:
-            channel_id: Channel SCID (any format)
-            reason: Why the job is being stopped (for logging)
-
-        Returns:
-            True if job was stopped, False if not found or error
-        """
-        normalized = self._normalize_scid(channel_id)
-
-        # L-3: Atomic pop under lock first, then do RPC calls with the removed job
-        with self._jobs_lock:
-            job = self._active_jobs.pop(normalized, None)
-
-        if not job or job is None:  # None = sentinel from start_job
-            return False
-
-        sling_stopped = False
-        try:
-            # First stop the job gracefully
-            try:
-                self.plugin.rpc.call("sling-stop", {"scid": job.scid})
-                sling_stopped = True
-            except RpcError:
-                sling_stopped = True  # RpcError means sling responded (job may already be stopped)
-
-            # Then delete it to prevent restart
-            try:
-                self.plugin.rpc.call("sling-deletejob", {
-                    "job": job.scid,
-                    "delete_stats": False  # Keep stats for analysis
-                })
-            except RpcError as e:
-                self.plugin.log(f"sling-deletejob warning: {e}", level='debug')
-
-            self.plugin.log(f"Stopped sling job {job.scid} (reason: {reason})")
-
-        except Exception as e:
-            self.plugin.log(f"Error stopping job {job.scid}: {e}", level='warn')
-            # C-3 FIX: If sling is unreachable (timeout, connection error), the job
-            # may still be running and spending fees. Re-add to _active_jobs so
-            # monitor_jobs continues tracking it. RpcError is fine (sling responded),
-            # but other exceptions (timeout, connection) mean we couldn't confirm the stop.
-            if not sling_stopped:
-                with self._jobs_lock:
-                    if normalized not in self._active_jobs:
-                        self._active_jobs[normalized] = job
-                        self.plugin.log(
-                            f"Re-added job {job.scid} to tracking (sling unreachable, "
-                            f"job may still be running)",
-                            level='warn'
-                        )
-                return False
-
-        return True
-    
-    def monitor_jobs(self) -> Dict[str, Any]:
-        """
-        Monitor all active jobs and handle completed/failed/timed-out ones.
-        
-        This should be called periodically (e.g., every rebalance interval).
-        
-        Returns:
-            Summary dict with counts of various outcomes
-        """
-        summary = {
-            "checked": 0,
-            "completed": 0,
-            "failed": 0,
-            "timed_out": 0,
-            "still_running": 0
-        }
-        
-        # Get current time
-        now = int(time.time())
-        
-        # Periodic decay of failure counts (every hour)
-        if now - self.last_decay_time > 3600:
-            with self._source_failures_lock:
-                for scid in list(self.source_failure_counts.keys()):
-                    self.source_failure_counts[scid] *= 0.5
-                    if self.source_failure_counts[scid] < 0.1:
-                        del self.source_failure_counts[scid]
-            self.last_decay_time = now
-
-        # Periodic exclusion sync (every 30 minutes)
-        if now - self._last_exclusion_sync > 1800:
-            try:
-                self.sync_peer_exclusions(self._policy_manager_ref)
-                self.sync_channel_exclusions()
-            except Exception as e:
-                self.plugin.log(f"Periodic exclusion sync error: {e}", level='debug')
-            self._last_exclusion_sync = now
-
-        # M-1: Snapshot active jobs under lock for thread-safe iteration
-        # C-2 FIX: Also clean up stale sentinel entries (None values) from stuck start_job calls.
-        # If a sling RPC hangs during start_job, the sentinel blocks the slot indefinitely.
-        sentinel_timeout = 300  # 5 minutes
-        now_sentinel = time.time()
-        with self._jobs_lock:
-            stale_sentinels = [
-                k for k, v in self._active_jobs.items()
-                if not isinstance(v, ActiveJob) and (
-                    v is None or  # Legacy None sentinels (always stale)
-                    (isinstance(v, (int, float)) and now_sentinel - v > sentinel_timeout)
-                )
-            ]
-            for k in stale_sentinels:
-                del self._active_jobs[k]
-                self.plugin.log(
-                    f"Cleaned up stale sentinel for {k} (stuck start_job?)",
-                    level='info'
-                )
-            jobs_snapshot = {k: v for k, v in self._active_jobs.items() if isinstance(v, ActiveJob)}
-
-        if not jobs_snapshot:
-            return summary
-
-        # Get sling stats for all jobs (using snapshot)
-        sling_stats = self._get_sling_stats(jobs_snapshot)
-
-        # Hoist listfunds to avoid N+1 RPC calls (per-job balance checks).
-        local_balances = self._get_local_balances_map()
-
-        for normalized_scid, job in jobs_snapshot.items():
-            if not job:
-                continue
-                
-            summary["checked"] += 1
-            
-            # Check timeout first
-            elapsed = now - job.start_time
-            if elapsed > self.job_timeout_seconds:
-                self._handle_job_timeout(job)
-                summary["timed_out"] += 1
-                continue
-            
-            # Check current channel balance for progress
-            current_balance = local_balances.get(job.scid_normalized)
-
-            # C-4 FIX: Detect channel closure (not in CHANNELD_NORMAL state).
-            # _get_local_balances_map only includes CHANNELD_NORMAL channels,
-            # so a missing key means the channel is closing/closed.
-            if current_balance is None:
-                self.plugin.log(
-                    f"Job {job.scid}: channel no longer in CHANNELD_NORMAL state, "
-                    f"terminating job immediately",
-                    level='info'
-                )
-                self._handle_job_failure(job, {})
-                summary["failed"] += 1
-                continue
-
-            # For pull: positive delta = liquidity gained (success)
-            # For push: negative delta = liquidity drained (success), so flip sign
-            raw_delta = current_balance - job.initial_local_sats
-            balance_delta = -raw_delta if job.direction == "push" else raw_delta
-            
-            # Get job-specific stats from sling
-            job_stats = sling_stats.get(job.scid, {})
-
-            # ZERO-TOLERANCE: Abort if the job is spending at/above its msat budget.
-            # H-1: Use _parse_msat/_parse_sats to handle string "Nmsat" values
-            fee_msat = self._parse_msat(job_stats.get("fee_total_msat"))
-            if not fee_msat:
-                fee_sats = self._parse_sats(job_stats.get("fee_total_sats"))
-                fee_msat = sats_to_base(fee_sats) if fee_sats else 0
-
-            if fee_msat and job.candidate and fee_msat > job.candidate.max_budget_msat:
-                self._handle_job_budget_exceeded(job, fee_msat, job_stats)
-                summary["failed"] += 1
-                continue
-            
-            # Check for success:
-            # - Prefer sling stats when they provide explicit success signals (less fragile than balance deltas,
-            #   which can be masked by concurrent forwarding).
-            # - Fallback to positive balance delta if stats don't expose success.
-            stats_success_amount = self._extract_success_amount_sats(job_stats)
-            stats_success_count = self._extract_success_count(job_stats)
-            if stats_success_amount is not None and stats_success_amount > 0:
-                amount_transferred = max(balance_delta, stats_success_amount)
-                self._handle_job_success(job, amount_transferred, job_stats)
-                summary["completed"] += 1
-                continue
-            if stats_success_count > 0:
-                amount_transferred = balance_delta
-                if amount_transferred <= 0:
-                    # We know at least one payment succeeded, but local balance may not reflect it due to
-                    # concurrent routing. Use the job's intended chunk as a conservative proxy.
-                    amount_transferred = max(1, min(int(job.target_amount_sats or 0), self.chunk_size_sats))
-                self._handle_job_success(job, amount_transferred, job_stats)
-                summary["completed"] += 1
-                continue
-            if balance_delta > 0:
-                self._handle_job_success(job, balance_delta, job_stats)
-                summary["completed"] += 1
-                continue
-            
-            # Check for sling-reported errors
-            if self._check_job_error(job, job_stats):
-                self._handle_job_failure(job, job_stats)
-                summary["failed"] += 1
-                continue
-            
-            # Job still running
-            summary["still_running"] += 1
-            failure_count = self._extract_failure_count(job_stats)
-            fee_ppm = self._extract_fee_ppm(job_stats)
-            self.plugin.log(
-                f"Job {job.scid} running: {elapsed}s elapsed, "
-                f"transferred={balance_delta} sats, failures={failure_count}"
-                + (f", avg_ppm={fee_ppm}" if fee_ppm else ""),
-                level='debug'
-            )
-        
-        return summary
-
-    def _get_local_balances_map(self) -> Dict[str, int]:
-        """Return a map of normalized scid -> local balance sats (single listfunds call).
-
-        Only includes channels in CHANNELD_NORMAL state. Channels that are closing
-        or in other non-normal states are excluded so that monitor_jobs can detect
-        channel closures (missing key = channel no longer normal).
-        """
-        balances: Dict[str, int] = {}
-        try:
-            listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
-            for channel in listfunds.get("channels", []):
-                scid = channel.get("short_channel_id", "")
-                if not scid:
-                    continue
-                # C-4 FIX: Exclude channels in known non-normal states.
-                # This allows monitor_jobs to detect channel closures via missing keys.
-                # If state is absent (old CLN or test mock), include the channel.
-                ch_state = channel.get("state")
-                if ch_state and ch_state != "CHANNELD_NORMAL":
-                    continue
-                # M-22b: Use _parse_msat for consistent Millisatoshi handling
-                our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
-                balances[self._normalize_scid(scid)] = base_to_sats_floor(our_amount_msat)
-        except Exception as e:
-            self.plugin.log(f"Error preloading channel balances: {e}", level='debug')
-        return balances
-
-    def _parse_msat(self, v: Any) -> int:
-        """L-18: Delegate to shared parse_msat in utils.py."""
-        return _shared_parse_msat(v)
-
-    def _parse_sats(self, v: Any) -> int:
-        if v is None:
-            return 0
-        if isinstance(v, str):
-            s = v.strip().lower()
-            if s.endswith("sat"):
-                s = s[:-3]
-            try:
-                return int(s)
-            except Exception:
-                return 0
-        try:
-            return int(v)
-        except Exception:
-            return 0
-
-    def _extract_success_amount_sats(self, stats: Dict[str, Any]) -> Optional[int]:
-        """
-        Extract how much has been successfully transferred from sling stats.
-
-        Preferred source: per-scid ``successes_in_time_window.total_amount_sats``
-        (returned by ``sling-stats scid=X json=true``).  Falls back to legacy
-        flat keys for older sling versions or bulk-query results.
-        """
-        if not stats:
-            return None
-
-        # Per-scid detailed stats (from per-job query)
-        successes = stats.get("successes_in_time_window")
-        if isinstance(successes, dict):
-            sats = self._parse_sats(successes.get("total_amount_sats"))
-            if sats > 0:
-                return sats
-
-        # Fallback: bulk query fields (legacy/version compat)
-        for k in ("success_total_msat", "successful_total_msat"):
-            if k in stats:
-                msat = self._parse_msat(stats[k])
-                if msat > 0:
-                    return base_to_sats_floor(msat)
-
-        for k in ("success_total_sats", "successful_total_sats"):
-            if k in stats:
-                sats = self._parse_sats(stats[k])
-                if sats > 0:
-                    return sats
-
-        return None
-
-    def _extract_success_count(self, stats: Dict[str, Any]) -> int:
-        """Extract successful rebalance count from sling stats."""
-        if not stats:
-            return 0
-
-        # Per-scid detailed stats
-        successes = stats.get("successes_in_time_window")
-        if isinstance(successes, dict):
-            n = self._parse_sats(successes.get("total_rebalances"))
-            if n > 0:
-                return n
-
-        # Fallback
-        for k in ("success_count", "successful_payments"):
-            if k in stats:
-                n = self._parse_sats(stats[k])
-                if n > 0:
-                    return n
-
-        return 0
-
-    def _extract_failure_count(self, stats: Dict[str, Any]) -> int:
-        """Extract failure count from sling per-scid stats."""
-        if not stats:
-            return 0
-
-        failures = stats.get("failures_in_time_window")
-        if isinstance(failures, dict):
-            n = self._parse_sats(failures.get("total_rebalances"))
-            if n > 0:
-                return n
-
-        # Fallback
-        for k in ("consecutive_failures", "failure_count"):
-            if k in stats:
-                n = self._parse_sats(stats[k])
-                if n > 0:
-                    return n
-
-        return 0
-
-    def _extract_fee_ppm(self, stats: Dict[str, Any]) -> Optional[int]:
-        """Extract weighted average fee PPM from sling per-scid stats."""
-        if not stats:
-            return None
-
-        successes = stats.get("successes_in_time_window")
-        if isinstance(successes, dict):
-            ppm = self._parse_sats(successes.get("feeppm_weighted_avg"))
-            if ppm > 0:
-                return ppm
-
-        return None
-
-    def _get_sling_stats(self, jobs_snapshot: Optional[Dict[str, 'ActiveJob']] = None) -> Dict[str, Dict[str, Any]]:
-        """Query sling-stats for all active jobs, returning dict keyed by SCID.
-
-        Preferred approach: per-job ``sling-stats scid=<scid> json=true``
-        which returns a known schema with ``successes_in_time_window`` /
-        ``failures_in_time_window`` nested dicts.  Falls back to the bulk
-        ``sling-stats json=true`` call if per-scid queries fail.
-
-        Args:
-            jobs_snapshot: Optional pre-taken snapshot of active jobs. If None,
-                          takes a snapshot under lock.
-        """
-        stats: Dict[str, Dict[str, Any]] = {}
-
-        # M-1: Use provided snapshot or take one under lock
-        if jobs_snapshot is None:
-            with self._jobs_lock:
-                jobs_snapshot = {k: v for k, v in self._active_jobs.items() if isinstance(v, ActiveJob)}
-
-        # Per-job detailed stats (preferred — returns known schema)
-        for normalized_scid, job in jobs_snapshot.items():
-            try:
-                result = self.plugin.rpc.call("sling-stats", {
-                    "scid": job.scid,
-                    "json": True
-                })
-                if isinstance(result, dict):
-                    stats[job.scid] = result
-            except Exception:
-                pass  # Fall through to bulk query
-
-        # Bulk fallback if per-job queries failed
-        if not stats:
-            try:
-                result = self.plugin.rpc.call("sling-stats", {"json": True})
-                if isinstance(result, dict):
-                    if "jobs" in result:
-                        for job_data in result["jobs"]:
-                            scid = job_data.get("scid", "")
-                            if scid:
-                                stats[scid] = job_data
-                    else:
-                        stats = result
-                elif isinstance(result, list):
-                    for job_data in result:
-                        scid = job_data.get("scid", "")
-                        if scid:
-                            stats[scid] = job_data
-            except Exception as e:
-                self.plugin.log(f"sling-stats error: {e}", level='debug')
-
-        return stats
-    
-    def _check_job_error(self, job: ActiveJob, stats: Dict[str, Any]) -> bool:
-        """Check if sling reports an error state for this job."""
-        # Check for explicit error status
-        # Handle case where status might be a list (sling plugin inconsistency)
-        status = stats.get("status", "")
-        if isinstance(status, list):
-            status = status[0] if status else ""
-        status = str(status).lower()
-        if status in ("error", "failed", "stopped"):
-            return True
-        
-        # Check for high consecutive failure count
-        consecutive_failures = self._parse_sats(stats.get("consecutive_failures", 0))
-        if consecutive_failures >= 10:
-            return True
-        
-        return False
-    
-    def _handle_job_success(self, job: ActiveJob, amount_transferred: int, 
-                            stats: Dict[str, Any]) -> None:
-        """Handle a successfully completed job."""
-        # Calculate actual fee paid (from sling stats if available)
-        # H-1b: Use _parse_sats/_parse_msat to handle string "Nmsat" values
-        fee_sats = self._parse_sats(stats.get("fee_total_sats"))
-        if not fee_sats:
-            fee_msat = self._parse_msat(stats.get("fee_total_msat"))
-            fee_sats = base_to_sats_floor(fee_msat) if fee_msat else 0
-        if not fee_sats:
-            # B5 FIX: total_spent_sats includes principal + fee.
-            # Derive fee as total_spent - amount_transferred.
-            successes = stats.get("successes_in_time_window")
-            if isinstance(successes, dict):
-                total_spent = self._parse_sats(successes.get("total_spent_sats"))
-                if total_spent and total_spent > amount_transferred:
-                    fee_sats = total_spent - amount_transferred
-        
-        # Estimate fee from amount if sling doesn't report it
-        if fee_sats == 0 and amount_transferred > 0:
-            # Conservative estimate: half of max_fee_ppm (actual is usually well below max)
-            fee_sats = (amount_transferred * job.max_fee_ppm) // 2_000_000
-        
-        # Calculate actual profit
-        # expected_profit was computed as: income - expected_fee - source_loss
-        # Actual profit replaces expected_fee with the real fee paid.
-        # B6 FIX: When expected_fee_sats==0 (legacy candidates), use fee_sats
-        # to avoid inflation from max_budget_sats fallback.
-        expected_profit = job.candidate.expected_profit_sats
-        assumed_fee = job.candidate.expected_fee_sats or fee_sats
-        actual_profit = expected_profit + (assumed_fee - fee_sats)
-        
-        self.plugin.log(
-            f"Rebalance SUCCESS: {job.scid} filled with {amount_transferred} sats. "
-            f"Fee: {fee_sats} sats, Profit: {actual_profit} sats"
-        )
-        
-        # Update database
-        self.database.update_rebalance_result(
-            job.rebalance_id, 
-            'success', 
-            fee_sats, 
-            actual_profit
-        )
-        self.database.reset_failure_count(job.scid_normalized)
-        
-        # Record cost in rebalance_costs for lifetime accounting (revenue-history)
-        # Uses rebalance_id as part of idempotency: each job has a unique rebalance_id,
-        # and _handle_job_success is only called once per job lifecycle.
-        if fee_sats > 0:
-            self.database.record_rebalance_cost(
-                channel_id=job.scid_normalized,
-                peer_id=job.candidate.to_peer_id,
-                cost_sats=fee_sats,
-                amount_sats=amount_transferred,
-                timestamp=int(time.time())
-            )
-        
-        # RELIABILITY: Reset failure count for the source channel since it delivered
-        if job.candidate and job.candidate.source_candidates:
-            primary_source = job.candidate.source_candidates[0]
-            with self._source_failures_lock:
-                if primary_source in self.source_failure_counts:
-                    # Significant reduction (rewarding success)
-                    self.source_failure_counts[primary_source] = 0.0
-
-        # Mark budget reservation as spent (CRITICAL-01 fix)
-        # H-4: Ensure reservation_id is str to match DB column type
-        self.database.mark_budget_spent(str(job.rebalance_id), fee_sats)
-
-        # Stop the job
-        self.stop_job(job.scid_normalized, reason="success")
-
-    def _handle_job_failure(self, job: ActiveJob, stats: Dict[str, Any]) -> None:
-        """Handle a failed job."""
-        error_msg = stats.get("last_error", "Unknown error from sling")
-        # sling is the only supported backend; hide legacy wording if it appears
-        if isinstance(error_msg, str) and "method: circular" in error_msg:
-            error_msg = error_msg.replace("method: circular", "method: sling")
-        
-        self.plugin.log(
-            f"Rebalance FAILED: {job.scid} - {error_msg}",
-            level='warn'
-        )
-        
-        # Update database
-        self.database.update_rebalance_result(
-            job.rebalance_id,
-            'failed',
-            error_message=error_msg
-        )
-        error_type = self._classify_sling_error(error_msg)
-        self.database.increment_failure_count(
-            job.scid_normalized,
-            attempted_ppm=job.max_fee_ppm,
-            attempted_amount=job.candidate.amount_sats if job.candidate else 0,
-            error_type=error_type,
-        )
-
-        # Track source failure for reliability scoring
-        if job.candidate and job.candidate.source_candidates:
-            # Penalize the primary source
-            primary_source = job.candidate.source_candidates[0]
-            with self._source_failures_lock:
-                self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
-
-        # B7 FIX: Check for partial fee spend before releasing budget.
-        partial_fee_sats = 0
-        fee_msat = self._parse_msat(stats.get("fee_total_msat"))
-        if fee_msat:
-            partial_fee_sats = base_to_sats_floor(fee_msat)
-        if not partial_fee_sats:
-            partial_fee_sats = self._parse_sats(stats.get("fee_total_sats"))
-
-        if partial_fee_sats > 0:
-            self.database.mark_budget_spent(str(job.rebalance_id), partial_fee_sats)
-        else:
-            self.database.release_budget_reservation(str(job.rebalance_id))
-
-        # Stop the job
-        self.stop_job(job.scid_normalized, reason="failure")
-
-    def _handle_job_budget_exceeded(self, job: ActiveJob, fee_msat: int,
-                                    stats: Dict[str, Any]) -> None:
-        """Handle a job that exceeded its configured sats budget."""
-        error_msg = stats.get("last_error", "")
-        budget_msat = job.candidate.max_budget_msat if job.candidate else 0
-        msg = f"Exceeded msat budget: fee_msat={fee_msat} > budget_msat={budget_msat}"
-        if error_msg:
-            msg = f"{msg}; last_error={error_msg}"
-
-        self.plugin.log(
-            f"Rebalance FAILED (budget): {job.scid} - {msg}",
-            level='warn'
-        )
-
-        # Update database (treat as failure with explicit error message)
-        self.database.update_rebalance_result(
-            job.rebalance_id,
-            'failed',
-            actual_fee_sats=base_to_sats_ceil(fee_msat),
-            error_message=f"exceeded_budget: {msg}"
-        )
-        self.database.increment_failure_count(job.scid_normalized)
-
-        # Penalize primary source reliability (it led us into an overspend scenario)
-        if job.candidate and job.candidate.source_candidates:
-            primary_source = job.candidate.source_candidates[0]
-            with self._source_failures_lock:
-                self.source_failure_counts[primary_source] = self.source_failure_counts.get(primary_source, 0.0) + 1.0
-
-        # Record actual rebalance cost even on budget failure.
-        # Compute actual amount transferred from balance delta (not 0)
-        # to avoid distorting cost-per-sat metrics.
-        actual_cost_sats = base_to_sats_ceil(fee_msat)
-        current_balance = self._get_channel_local_balance(job.scid_normalized)
-        raw_delta = current_balance - job.initial_local_sats
-        amount_transferred = max(0, -raw_delta if job.direction == "push" else raw_delta)
-        if actual_cost_sats > 0 and job.candidate:
-            try:
-                dest_peer_id = job.candidate.to_peer_id
-                self.database.record_rebalance_cost(
-                    job.scid_normalized, dest_peer_id,
-                    actual_cost_sats, amount_transferred)
-            except Exception as e:
-                self.plugin.log(f"Failed to record rebalance cost: {e}", level='debug')
-
-        # L-17: Budget was actually spent (overspent), mark as spent not released
-        # H-4: Ensure reservation_id is str to match DB column type
-        self.database.mark_budget_spent(str(job.rebalance_id), actual_cost_sats)
-
-        # Stop the job
-        self.stop_job(job.scid_normalized, reason="exceeded_budget")
-
-    def _handle_job_timeout(self, job: ActiveJob) -> None:
-        """Handle a timed-out job."""
-        elapsed_hours = (int(time.time()) - job.start_time) / 3600
-
-        # Check if any progress was made
-        # For push: negative delta = liquidity drained (success), so flip sign
-        current_balance = self._get_channel_local_balance(job.scid_normalized)
-        raw_delta = current_balance - job.initial_local_sats
-        amount_transferred = -raw_delta if job.direction == "push" else raw_delta
-        fee_sats = 0  # MA-9: Initialize before branching so it's always defined
-
-        if amount_transferred > 0:
-            # Partial success - try to get actual fee from sling stats
-            job_stats = self._get_sling_stats()
-            stats = job_stats.get(job.scid, {})
-            fee_sats = 0
-            successes = stats.get("successes_in_time_window")
-            if isinstance(successes, dict):
-                fee_sats = self._parse_sats(successes.get("total_spent_sats"))
-            if fee_sats == 0:
-                # H-1c: Use _parse_msat to handle string "Nmsat" values
-                fee_msat = self._parse_msat(stats.get("fee_total_msat"))
-                fee_sats = base_to_sats_floor(fee_msat) if fee_msat else 0
-            if fee_sats == 0 and amount_transferred > 0:
-                # Conservative estimate: half of max fee
-                fee_sats = (amount_transferred * job.max_fee_ppm) // 2_000_000
-
-            self.plugin.log(
-                f"Rebalance TIMEOUT (partial): {job.scid} after {elapsed_hours:.1f}h. "
-                f"Transferred {amount_transferred} sats, fee ~{fee_sats} sats."
-            )
-            self.database.update_rebalance_result(
-                job.rebalance_id,
-                'partial',
-                actual_fee_sats=fee_sats,
-                actual_profit_sats=0
-            )
-            # E3 FIX: Record cost in rebalance_costs for lifetime accounting,
-            # matching _handle_job_success (line 1001) and _handle_job_budget_exceeded (line 1100).
-            # Without this, partial timeout fees are lost from budget tracking.
-            if fee_sats > 0:
-                self.database.record_rebalance_cost(
-                    channel_id=job.scid_normalized,
-                    peer_id=job.candidate.to_peer_id,
-                    cost_sats=fee_sats,
-                    amount_sats=amount_transferred,
-                    timestamp=int(time.time())
-                )
-        else:
-            self.plugin.log(
-                f"Rebalance TIMEOUT: {job.scid} after {elapsed_hours:.1f}h with no progress",
-                level='warn'
-            )
-            self.database.update_rebalance_result(
-                job.rebalance_id,
-                'timeout',
-                error_message=f"Timeout after {elapsed_hours:.1f} hours"
-            )
-            self.database.increment_failure_count(job.scid_normalized)
-
-        # M-15: Partial success spent real fees; only release if no progress
-        # H-4: Ensure reservation_id is str to match DB column type
-        if amount_transferred > 0:
-            self.database.mark_budget_spent(str(job.rebalance_id), fee_sats)
-        else:
-            self.database.release_budget_reservation(str(job.rebalance_id))
-
-        # Stop the job
-        self.stop_job(job.scid_normalized, reason="timeout")
-    
-    def stop_all_jobs(self, reason: str = "shutdown") -> int:
-        """Stop all active jobs and release their budget reservations. Returns count of jobs stopped."""
-        count = 0
-        with self._jobs_lock:
-            jobs_snapshot = [(k, v) for k, v in self._active_jobs.items() if isinstance(v, ActiveJob)]
-        for scid, job in jobs_snapshot:
-            # I-10 FIX: Stop the job FIRST, then release budget. Releasing before
-            # stop means if sling-stop fails, the budget is freed but the job
-            # continues spending. By stopping first, we at least attempt to halt
-            # the spend before releasing the reservation.
-            if self.stop_job(scid, reason=reason):
-                count += 1
-            # B4 FIX: Only release budget for jobs still in PENDING/RUNNING status.
-            # Jobs in SUCCESS/FAILED/TIMEOUT already had their budget handled by
-            # monitor_jobs (via mark_budget_spent or release_budget_reservation).
-            if job.status in (JobStatus.PENDING, JobStatus.RUNNING):
-                try:
-                    self.database.release_budget_reservation(str(job.rebalance_id))
-                except Exception as e:
-                    self.plugin.log(f"Failed to release budget reservation during stop_all: {e}", level='debug')
-        return count
-    
-    def cleanup_orphans(self) -> int:
-        """
-        Clean up orphan sling jobs on startup.
-        
-        If the plugin crashes or restarts, sling jobs continue running in the
-        background. This method queries sling for all active jobs and terminates
-        them to prevent "Phantom Spending" where old logic fights new logic.
-        
-        Called during plugin init() to ensure clean state.
-        
-        Returns:
-            Number of orphan jobs terminated
-        """
-        try:
-            # Get list of all sling jobs (sling-jobsettings returns dict keyed by SCID)
-            result = self.plugin.rpc.call("sling-jobsettings", {})
-            jobs = result if isinstance(result, dict) else {}
-
-            if not jobs:
-                self.plugin.log("Startup Hygiene: No orphan sling jobs found", level='debug')
-                return 0
-
-            orphan_count = 0
-            for scid in jobs:
-                if not scid:
-                    continue
-                
-                try:
-                    # Delete the orphan job
-                    # BUG FIX: Use "job" key to match stop_job() method
-                    self.plugin.rpc.call("sling-deletejob", {"job": scid})
-                    orphan_count += 1
-                    self.plugin.log(f"Startup Hygiene: Terminated orphan job for {scid}", level='debug')
-                except RpcError as e:
-                    self.plugin.log(f"Failed to delete orphan job {scid}: {e}", level='warn')
-            
-            if orphan_count > 0:
-                self.plugin.log(
-                    f"Startup Hygiene: Terminated {orphan_count} orphan sling jobs",
-                    level='info'
-                )
-
-            # M-14: Mark orphaned pending/pending_async DB records as failed.
-            # Records older than job timeout that are still pending are from crashed jobs.
-            try:
-                orphaned_ids = self.database.cleanup_orphaned_rebalances(self.job_timeout_seconds)
-                orphaned_db = len(orphaned_ids)
-
-                # Release budget reservations for orphaned jobs (outside transaction —
-                # release_budget_reservation manages its own transactions)
-                released_count = 0
-                for rid in orphaned_ids:
-                    try:
-                        self.database.release_budget_reservation(str(rid))
-                        released_count += 1
-                    except Exception:
-                        pass
-
-                if orphaned_db > 0:
-                    self.plugin.log(
-                        f"Startup Hygiene: Marked {orphaned_db} orphaned DB rebalance records as failed, "
-                        f"released {released_count} budget reservations",
-                        level='info'
-                    )
-            except Exception as e:
-                self.plugin.log(f"Startup Hygiene: DB orphan cleanup error: {e}", level='debug')
-
-            return orphan_count
-
-        except RpcError as e:
-            # sling-jobsettings might not be available or no jobs exist
-            self.plugin.log(f"Startup Hygiene: Could not query sling jobs: {e}", level='debug')
-            return 0
-        except Exception as e:
-            self.plugin.log(f"Startup Hygiene: Unexpected error: {e}", level='warn')
-            return 0
-
-    def execute_once(self, scid: str, direction: str, amount: int,
-                     maxppm: int, onceamount: Optional[int] = None,
-                     candidates: Optional[List[str]] = None,
-                     outppm: Optional[int] = None,
-                     maxhops: Optional[int] = None,
-                     depleteuptopercent: Optional[float] = None,
-                     depleteuptoamount: Optional[int] = None,
-                     paralleljobs: Optional[int] = None) -> Dict[str, Any]:
-        """
-        One-shot rebalance via sling-once.  Blocks until complete.
-
-        Unlike sling-job, no persistent job is created — nothing to
-        track, monitor, or delete afterward.
-
-        Used for: Defibrillator shocks, manual rebalances.
-
-        sling-once params: scid, direction, amount, maxppm, onceamount
-        (must be multiple of amount).  Target is forbidden for sling-once.
-        """
-        sling_scid = self._to_sling_scid(scid)
-        if onceamount is None:
-            onceamount = amount
-        # Ensure multiple of amount
-        if amount > 0 and onceamount % amount != 0:
-            onceamount = ((onceamount // amount) + 1) * amount
-
-        params: Dict[str, Any] = {
-            "scid": sling_scid,
-            "direction": direction,
-            "amount": amount,
-            "maxppm": maxppm,
-            "onceamount": onceamount,
-        }
-        if candidates:
-            params["candidates"] = [self._to_sling_scid(c) for c in candidates]
-        if outppm and outppm > 0:
-            params["outppm"] = outppm
-
-        # Apply defaults for params not explicitly provided (legacy sling defaults)
-        if maxhops is None:
-            maxhops = 5  # legacy sling default
-        params["maxhops"] = maxhops
-
-        if depleteuptopercent is not None:
-            params["depleteuptopercent"] = depleteuptopercent
-
-        if depleteuptoamount is not None:
-            params["depleteuptoamount"] = depleteuptoamount
-
-        if paralleljobs is None:
-            paralleljobs = 2  # legacy sling default
-        if paralleljobs > 1:
-            params["paralleljobs"] = paralleljobs
-
-        self.plugin.log(
-            f"sling-once: {sling_scid} dir={direction} amt={amount} "
-            f"maxppm={maxppm} total={onceamount}",
-            level='info'
-        )
-
-        # AskRene preflight sizing: if AskRene says the channel/direction has a lower maximum,
-        # shrink the attempt so we fail less and learn faster.
-        try:
-            max_sats = self._askrene_max_sats_for_scid_dir(sling_scid)
-            if max_sats is not None and max_sats > 0 and amount > max_sats:
-                self.plugin.log(
-                    f"AskRene preflight: capping sling-once amount {amount} -> {max_sats} sats for {sling_scid}",
-                    level='info'
-                )
-                amount = max_sats
-                params["amount"] = amount
-                params["onceamount"] = amount
-        except Exception as e:
-            # Never block execution on AskRene parsing issues
-            self.plugin.log(f"AskRene preflight failed (ignored): {e}", level='debug')
-
-        try:
-            result = self.plugin.rpc.call("sling-once", params)
-
-            # Try to derive actual fees from sling stats (best-effort)
-            fee_sats = 0
-            try:
-                st = self.plugin.rpc.call("sling-stats", {"scid": sling_scid, "json": True})
-                # sling-stats may return a dict or a list of dicts
-                if isinstance(st, list) and st:
-                    st = st[0]
-                if isinstance(st, dict):
-                    # Preferred: explicit totals (use safe parsers for sling string values)
-                    fee_sats = self._parse_sats(st.get("fee_total_sats"))
-                    if not fee_sats:
-                        fee_msat = self._parse_msat(st.get("fee_total_msat"))
-                        fee_sats = base_to_sats_floor(fee_msat) if fee_msat else 0
-                    # Fallback: weighted avg fee ppm
-                    if fee_sats == 0:
-                        w_feeppm = st.get("w_feeppm")
-                        if w_feeppm is not None and amount > 0:
-                            fee_sats = int((amount * self._parse_sats(w_feeppm) + 999_999) // 1_000_000)
-            except Exception:
-                pass
-
-            return {"success": True, "message": "sling-once completed", "raw": result, "actual_fee_sats": fee_sats}
-        except RpcError as e:
-            err = str(e)
-            # Auto-heal: stale job locks. If sling says a job is already running for this scid,
-            # clear job registry and retry once.
-            if "already a job for that scid running" in err.lower():
-                try:
-                    self.plugin.log(f"Sling job lock detected for {sling_scid}. Clearing that job and retrying once.", level='warn')
-                    self.plugin.rpc.call("sling-deletejob", {"job": sling_scid})
-                    result = self.plugin.rpc.call("sling-once", params)
-                    # best-effort fee calc on retry as well
-                    fee_sats = 0
-                    try:
-                        st = self.plugin.rpc.call("sling-stats", {"scid": sling_scid, "json": True})
-                        if isinstance(st, list) and st:
-                            st = st[0]
-                        if isinstance(st, dict):
-                            fee_sats = self._parse_sats(st.get("fee_total_sats"))
-                            if not fee_sats:
-                                fee_msat = self._parse_msat(st.get("fee_total_msat"))
-                                fee_sats = base_to_sats_floor(fee_msat) if fee_msat else 0
-                            if fee_sats == 0:
-                                w_feeppm = st.get("w_feeppm")
-                                if w_feeppm is not None and amount > 0:
-                                    fee_sats = int((amount * self._parse_sats(w_feeppm) + 999_999) // 1_000_000)
-                    except Exception:
-                        pass
-                    return {"success": True, "message": "sling-once completed (after deletejob)", "raw": result, "actual_fee_sats": fee_sats}
-                except Exception as e2:
-                    return {"success": False, "error": f"sling-once RPC error (job lock retry failed): {e2}"}
-
-            return {"success": False, "error": f"sling-once RPC error: {e}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    # ---- AskRene constraint cache (still used by EVRebalancer) ----
 
     def _askrene_refresh_cache(self) -> None:
         """Refresh AskRene constraints cache (best-effort).
@@ -1525,7 +315,6 @@ class JobManager:
         Uses a time-based cache to avoid hammering RPC.
         """
         now = int(time.time())
-        # TS-5: Protect cache access with lock
         with self._askrene_lock:
             if self._askrene_cache_ts and (now - self._askrene_cache_ts) < 30:
                 return
@@ -1540,7 +329,6 @@ class JobManager:
                     scid_dir = c.get("short_channel_id_dir")
                     try:
                         ts = int(c.get("timestamp") or 0)
-                        # FIX: Use class method, 'parse_msat' is not defined in global scope
                         max_msat = self._parse_msat(c.get("maximum_msat", 0))
                     except (TypeError, ValueError):
                         continue  # Skip malformed entry, keep rest of cache
@@ -1556,22 +344,21 @@ class JobManager:
                 self._askrene_cache = cache
                 self._askrene_cache_ts = now
         except Exception:
-            # Silent: AskRene is optional; sling will still function.
+            # Silent: AskRene is optional.
             return
 
-    def _askrene_max_sats_for_scid_dir(self, sling_scid: str) -> Optional[int]:
+    def _askrene_max_sats_for_scid_dir(self, scid: str) -> Optional[int]:
         """Return the tightest AskRene constraint (in sats) for a given scid (either dir).
 
         We don't always know the correct /0 vs /1 mapping for pull/push here,
         so we take the minimum across both directions when present.
         """
         self._askrene_refresh_cache()
-        # TS-5: Read cache under lock
         with self._askrene_lock:
             cache_snapshot = dict(self._askrene_cache)
         best_msat = None
         for suffix in ("/0", "/1"):
-            key = f"{sling_scid}{suffix}"
+            key = f"{scid}{suffix}"
             v = cache_snapshot.get(key)
             if v is None:
                 continue
@@ -1580,272 +367,6 @@ class JobManager:
             return None
         return max(0, base_to_sats_floor(best_msat))
 
-    def sync_peer_exclusions(self, policy_manager=None) -> int:
-        """
-        Sync peer exclusions with sling's global exclusion list.
-
-        PHASE 6: Global Exclusion Sync
-        When peers are disabled for rebalancing in our policy system,
-        tell sling to globally exclude them. This prevents sling from
-        considering them as sources or routing through them.
-
-        Args:
-            policy_manager: Optional PolicyManager to get disabled peers
-
-        Returns:
-            Number of peers added to sling exclusion list
-        """
-        excluded_count = 0
-
-        try:
-            # Get current sling exclusions
-            try:
-                result = self.plugin.rpc.call("sling-except-peer", ["list"])
-                current_exclusions = set(result) if isinstance(result, list) else set(result.get("peers", []))
-            except (RpcError, KeyError):
-                current_exclusions = set()
-
-            # Collect peers that should be excluded
-            peers_to_exclude = set()
-
-            # From policy manager (disabled rebalance mode)
-            if policy_manager:
-                self._policy_manager_ref = policy_manager
-                try:
-                    from .policy_manager import RebalanceMode
-                    for policy in policy_manager.get_all_policies():
-                        if policy.rebalance_mode == RebalanceMode.DISABLED:
-                            peers_to_exclude.add(policy.peer_id)
-                except Exception as e:
-                    self.plugin.log(f"Could not get policies for exclusion sync: {e}", level='debug')
-
-            # Add new exclusions to sling
-            for peer_id in peers_to_exclude:
-                if peer_id not in current_exclusions:
-                    try:
-                        self.plugin.rpc.call("sling-except-peer", ["add", peer_id])
-                        excluded_count += 1
-                        self.plugin.log(
-                            f"Sling Exclusion: Added {peer_id[:16]}... to global exclusion list",
-                            level='debug'
-                        )
-                    except RpcError as e:
-                        self.plugin.log(f"Failed to add peer exclusion: {e}", level='warn')
-
-            # B9 FIX: Remove stale exclusions for re-enabled peers
-            for peer_id in current_exclusions:
-                if peer_id not in peers_to_exclude:
-                    try:
-                        self.plugin.rpc.call("sling-except-peer", ["remove", peer_id])
-                        self.plugin.log(
-                            f"Sling Exclusion: Removed {peer_id[:16]}... (peer re-enabled)",
-                            level='debug'
-                        )
-                    except RpcError as e:
-                        self.plugin.log(f"Failed to remove peer exclusion: {e}", level='warn')
-
-            if excluded_count > 0:
-                self.plugin.log(
-                    f"Sling Exclusion Sync: Added {excluded_count} peers to global exclusion list",
-                    level='info'
-                )
-
-        except Exception as e:
-            self.plugin.log(f"Peer exclusion sync error: {e}", level='warn')
-
-        return excluded_count
-
-    def add_peer_exclusion(self, peer_id: str) -> bool:
-        """
-        Add a single peer to sling's global exclusion list.
-
-        Called when a peer is dynamically disabled for rebalancing.
-
-        Args:
-            peer_id: The peer node ID to exclude
-
-        Returns:
-            True if successfully added, False otherwise
-        """
-        try:
-            self.plugin.rpc.call("sling-except-peer", ["add", peer_id])
-            self.plugin.log(
-                f"Sling Exclusion: Added {peer_id[:16]}... to exclusion list",
-                level='info'
-            )
-            return True
-        except RpcError as e:
-            self.plugin.log(f"Failed to add sling peer exclusion: {e}", level='warn')
-            return False
-
-    def remove_peer_exclusion(self, peer_id: str) -> bool:
-        """
-        Remove a peer from sling's global exclusion list.
-
-        Called when a peer is re-enabled for rebalancing.
-
-        Args:
-            peer_id: The peer node ID to un-exclude
-
-        Returns:
-            True if successfully removed, False otherwise
-        """
-        try:
-            self.plugin.rpc.call("sling-except-peer", ["remove", peer_id])
-            self.plugin.log(
-                f"Sling Exclusion: Removed {peer_id[:16]}... from exclusion list",
-                level='info'
-            )
-            return True
-        except RpcError as e:
-            self.plugin.log(f"Failed to remove sling peer exclusion: {e}", level='warn')
-            return False
-
-    def sync_channel_exclusions(self) -> int:
-        """
-        Sync channel exclusions with sling's channel exclusion list.
-
-        Excludes channels with high failure counts from sling routing.
-        Removes stale exclusions for channels whose failure counts have decayed.
-
-        Returns:
-            Number of exclusion changes made
-        """
-        changes = 0
-
-        try:
-            # Get current sling channel exclusions
-            try:
-                result = self.plugin.rpc.call("sling-except-chan", ["list"])
-                current_exclusions = set(result) if isinstance(result, list) else set(result.get("channels", []))
-            except (RpcError, KeyError):
-                current_exclusions = set()
-
-            # Channels that should be excluded (high failure count)
-            channels_to_exclude = set()
-            channels_to_remove = set()
-            with self._source_failures_lock:
-                for scid, count in self.source_failure_counts.items():
-                    if count >= 5.0:
-                        channels_to_exclude.add(self._to_sling_scid(scid))
-
-                # Channels to un-exclude (failure count decayed)
-                for scid in current_exclusions:
-                    normalized = self._normalize_scid(scid)
-                    count = self.source_failure_counts.get(normalized, 0)
-                    if count < 2.0:
-                        channels_to_remove.add(scid)
-
-            # Add new exclusions
-            for scid in channels_to_exclude:
-                if scid not in current_exclusions:
-                    if self.add_channel_exclusion(scid):
-                        changes += 1
-
-            # Remove stale exclusions
-            for scid in channels_to_remove:
-                if self.remove_channel_exclusion(scid):
-                    changes += 1
-
-            if changes > 0:
-                self.plugin.log(
-                    f"Sling Channel Exclusion Sync: {changes} changes",
-                    level='info'
-                )
-
-        except Exception as e:
-            self.plugin.log(f"Channel exclusion sync error: {e}", level='warn')
-
-        return changes
-
-    def add_channel_exclusion(self, scid: str) -> bool:
-        """
-        Add a single channel to sling's channel exclusion list.
-
-        Args:
-            scid: The short channel ID to exclude
-
-        Returns:
-            True if successfully added, False otherwise
-        """
-        try:
-            sling_scid = self._to_sling_scid(scid)
-            self.plugin.rpc.call("sling-except-chan", ["add", sling_scid])
-            self.plugin.log(
-                f"Sling Channel Exclusion: Added {sling_scid} to exclusion list",
-                level='debug'
-            )
-            return True
-        except RpcError as e:
-            self.plugin.log(f"Failed to add sling channel exclusion: {e}", level='warn')
-            return False
-
-    def remove_channel_exclusion(self, scid: str) -> bool:
-        """
-        Remove a channel from sling's channel exclusion list.
-
-        Args:
-            scid: The short channel ID to un-exclude
-
-        Returns:
-            True if successfully removed, False otherwise
-        """
-        try:
-            sling_scid = self._to_sling_scid(scid)
-            self.plugin.rpc.call("sling-except-chan", ["remove", sling_scid])
-            self.plugin.log(
-                f"Sling Channel Exclusion: Removed {sling_scid} from exclusion list",
-                level='debug'
-            )
-            return True
-        except RpcError as e:
-            self.plugin.log(f"Failed to remove sling channel exclusion: {e}", level='warn')
-            return False
-
-    def get_job_status(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        """Get status info for a specific job."""
-        normalized = self._normalize_scid(channel_id)
-        # TS-4: Protect _active_jobs read with _jobs_lock
-        with self._jobs_lock:
-            job = self._active_jobs.get(normalized)
-        
-        if not job:
-            return None
-        
-        elapsed = int(time.time()) - job.start_time
-        current_balance = self._get_channel_local_balance(normalized)
-        raw_delta = current_balance - job.initial_local_sats
-        # For push: negative delta = liquidity drained (success), so flip sign
-        transferred = -raw_delta if job.direction == "push" else raw_delta
-
-        return {
-            "scid": job.scid,
-            "source_candidates": job.source_candidates,
-            "from_scid": job.from_scid,  # Primary source for backwards compat
-            "num_sources": len(job.source_candidates),
-            "status": job.status.value,
-            "elapsed_seconds": elapsed,
-            "target_amount_sats": job.target_amount_sats,
-            "transferred_sats": transferred,
-            "progress_pct": round(transferred / job.target_amount_sats * 100, 1) if job.target_amount_sats > 0 else 0,
-            "max_fee_ppm": job.max_fee_ppm
-        }
-    
-    def get_all_jobs_status(self) -> List[Dict[str, Any]]:
-        """Get status info for all active jobs."""
-        result = []
-        with self._jobs_lock:
-            scids = list(self._active_jobs.keys())
-        for scid in scids:
-            status = self.get_job_status(scid)
-            if status:
-                result.append(status)
-        return result
-
-    def get_source_failure_count(self, channel_id: str) -> float:
-        """Get the recent failure count for a source channel."""
-        with self._source_failures_lock:
-            return self.source_failure_counts.get(channel_id, 0.0)
 
 
 class EVRebalancer:
@@ -2309,18 +830,7 @@ class EVRebalancer:
             self.plugin.log(f"Cleaned {cleaned} stale budget reservations before rebalance cycle")
 
         try:
-            # First, monitor existing jobs and clean up finished ones
-            if self.job_manager.active_job_count > 0:
-                monitor_result = self.job_manager.monitor_jobs()
-                self.plugin.log(
-                    f"Job monitor: {monitor_result['checked']} checked, "
-                    f"{monitor_result['completed']} completed, "
-                    f"{monitor_result['failed']} failed, "
-                    f"{monitor_result['timed_out']} timed out, "
-                    f"{monitor_result['still_running']} running"
-                )
-            
-            # Check if we have slots available
+            # Slot check (legacy sling monitoring removed; stubs always allow)
             available_slots = self.job_manager.slots_available()
             if available_slots <= 0:
                 self._set_last_decision_summary(
@@ -2331,8 +841,7 @@ class EVRebalancer:
                     budget_blocked=False,
                 )
                 self.plugin.log(
-                    f"No rebalance slots available ({self.job_manager.active_job_count}/"
-                    f"{self.job_manager.max_concurrent_jobs} jobs active)"
+                    f"No rebalance slots available ({self.job_manager.active_job_count} jobs active)"
                 )
                 self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
@@ -2969,8 +1478,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         # AskRene constraint: don't exceed 75% of max believed routable amount.
         # This improves success rates by staying within CLN's liquidity beliefs.
         try:
-            dest_sling_scid = self.job_manager._to_sling_scid(dest_channel)
-            askrene_max = self.job_manager._askrene_max_sats_for_scid_dir(dest_sling_scid)
+            dest_norm_scid = self.job_manager._normalize_scid(dest_channel)
+            askrene_max = self.job_manager._askrene_max_sats_for_scid_dir(dest_norm_scid)
             if askrene_max is not None and askrene_max > 0:
                 askrene_cap = int(askrene_max * 0.75)
                 if askrene_cap < rebalance_amount and askrene_cap >= self.config.rebalance_min_amount:
@@ -3154,8 +1663,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # want to route Y, probability drops as Y approaches X.
             p = historical_p
             try:
-                dest_sling_scid = self.job_manager._to_sling_scid(dest_channel)
-                askrene_max_sats = self.job_manager._askrene_max_sats_for_scid_dir(dest_sling_scid)
+                dest_norm_scid = self.job_manager._normalize_scid(dest_channel)
+                askrene_max_sats = self.job_manager._askrene_max_sats_for_scid_dir(dest_norm_scid)
                 if askrene_max_sats is not None and askrene_max_sats > 0:
                     # Clamp ratio to 0.99 so probability never goes negative
                     capacity_ratio = min(0.99, rebalance_amount / askrene_max_sats)

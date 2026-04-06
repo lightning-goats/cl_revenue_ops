@@ -2,7 +2,6 @@
 Tests for DTS posterior, Rebalancer, and Policy Engine bug fixes.
 
 Covers:
-1. Rebalancer: fee_paid_sats → actual_fee_sats kwarg fix (P0 crash)
 2. DTS: Double revenue_weight removed from update_contextual
 3. DTS: Double revenue_factor removed from _recompute_posterior
 4. DTS: Legacy migration includes time_bucket (5-tuple)
@@ -10,6 +9,8 @@ Covers:
 6. Policy: set_policies_batch validates fee_ppm, tags, multiplier bounds
 7. Config: _apply_override enforces range validation
 8. Rebalancer: _estimate_push_ev passes channel SCID (not peer_id) to turnover calc
+
+Note: Fix 1 (fee_paid_sats kwarg) test removed -- _handle_job_timeout deleted with sling code.
 """
 
 import pytest
@@ -24,92 +25,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-# =============================================================================
-# Fix 1: Rebalancer fee_paid_sats → actual_fee_sats
-# =============================================================================
-
-class TestRebalancerTimeoutKwarg:
-    """
-    Bug: _handle_job_timeout used `fee_paid_sats=0` but update_rebalance_result
-    expects `actual_fee_sats`. This caused a TypeError crash.
-    """
-
-    def test_partial_timeout_uses_correct_kwarg(self):
-        """_handle_job_timeout should use actual_fee_sats, not fee_paid_sats."""
-        from modules.rebalancer import JobManager
-
-        plugin = MagicMock()
-        config = MagicMock()
-        config.sling_timeout_minutes = 30
-        database = MagicMock()
-        database.update_rebalance_result = MagicMock()
-
-        jm = JobManager(plugin, config, database)
-
-        # Create a mock job
-        job = MagicMock()
-        job.rebalance_id = 42
-        job.scid = "100x1x0"
-        job.scid_normalized = "100x1x0"
-        job.start_time = int(time.time()) - 7200  # 2 hours ago
-        job.initial_local_sats = 500000
-
-        # Mock _get_channel_local_balance to simulate partial transfer
-        jm._get_channel_local_balance = MagicMock(return_value=510000)
-        jm.stop_job = MagicMock(return_value=True)
-        jm._report_outcome = MagicMock()
-        # E3 FIX: Mock _get_sling_stats and _parse_msat to return proper values
-        # so fee_sats stays an int (prevents MagicMock propagation through arithmetic)
-        jm._get_sling_stats = MagicMock(return_value={})
-        jm._parse_msat = MagicMock(return_value=0)
-        job.max_fee_ppm = 1000
-        job.direction = "pull"
-        job.candidate = MagicMock()
-        job.candidate.to_peer_id = "a" * 66
-
-        # This should NOT raise TypeError
-        jm._handle_job_timeout(job)
-
-        # Verify it was called with actual_fee_sats (not fee_paid_sats)
-        call_args = database.update_rebalance_result.call_args
-        assert 'actual_fee_sats' in call_args.kwargs
-        assert 'fee_paid_sats' not in call_args.kwargs
-
-        # Verify record_rebalance_cost was called for partial success with fee > 0
-        # (fee is conservative estimate: (10000 * 1000) // 2000000 = 5 sats)
-        database.record_rebalance_cost.assert_called_once()
-        rc_kwargs = database.record_rebalance_cost.call_args
-        assert rc_kwargs.kwargs.get('cost_sats', rc_kwargs[1].get('cost_sats', 0)) > 0 if rc_kwargs.kwargs else True
-
-    def test_full_timeout_does_not_crash(self):
-        """_handle_job_timeout with no transfer should not crash either."""
-        from modules.rebalancer import JobManager
-
-        plugin = MagicMock()
-        config = MagicMock()
-        config.sling_timeout_minutes = 30
-        database = MagicMock()
-
-        jm = JobManager(plugin, config, database)
-
-        job = MagicMock()
-        job.rebalance_id = 43
-        job.scid = "100x1x0"
-        job.scid_normalized = "100x1x0"
-        job.start_time = int(time.time()) - 7200
-        job.initial_local_sats = 500000
-
-        # No transfer
-        jm._get_channel_local_balance = MagicMock(return_value=500000)
-        jm.stop_job = MagicMock(return_value=True)
-        jm._report_outcome = MagicMock()
-
-        # Should not raise
-        jm._handle_job_timeout(job)
-
-        # Full timeout should use 'timeout' status with error_message
-        call_args = database.update_rebalance_result.call_args
-        assert call_args.args[1] == 'timeout'
+# TestRebalancerTimeoutKwarg removed -- _handle_job_timeout deleted with sling code.
 
 
 # =============================================================================
