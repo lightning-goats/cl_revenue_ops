@@ -673,23 +673,28 @@ class RebalanceExecutor:
             job.amount_msat,
         )
 
-        # Strip our outgoing channel fee from the first hop.
-        # Without auto.sourcefree, getroutes inflates path[0].amount by our
-        # channel fee.  For circular self-payments we're the sender (free
-        # first hop).  Fleet intermediaries charge 0 (hive-fleet layer), so
-        # the correct first-hop amount is simply required_amount_msat.
-        # No RPC needed — avoids the listpeerchannels timeout that blocked
-        # the previous approach.
+        # Strip our outgoing channel fee from the route.
+        # Without auto.sourcefree, getroutes inflates the path by our channel
+        # fee.  For circular self-payments we're the sender (free first hop).
+        # Fleet intermediaries charge 0 (hive-fleet layer), so intermediate
+        # hops may also be inflated.  Cascade the correction: ensure amounts
+        # are monotonically non-increasing after stripping the phantom fee.
         if len(full_route) >= 2:
             inflated = int(full_route[0].get("amount_msat", 0) or 0)
             if inflated > required_amount_msat:
-                full_route[0]["amount_msat"] = required_amount_msat
                 self._log(
                     f"Fleet first-hop fee strip: {inflated} -> "
                     f"{required_amount_msat} "
                     f"(removed {inflated - required_amount_msat}msat "
                     f"phantom channel fee)",
                 )
+                full_route[0]["amount_msat"] = required_amount_msat
+                # Cascade: ensure each subsequent hop <= previous hop
+                for i in range(1, len(full_route)):
+                    prev = int(full_route[i - 1].get("amount_msat", 0) or 0)
+                    curr = int(full_route[i].get("amount_msat", 0) or 0)
+                    if curr > prev:
+                        full_route[i]["amount_msat"] = prev
 
         inform_path = list(path)
         final_direction = 1 if candidate.to_peer_id > our_id else 0

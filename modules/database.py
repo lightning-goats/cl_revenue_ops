@@ -1877,10 +1877,12 @@ class Database:
         conn = self._get_connection()
         
         conn.execute("""
-            UPDATE rebalance_history 
-            SET status = ?, actual_fee_sats = ?, actual_profit_sats = ?, error_message = ?
+            UPDATE rebalance_history
+            SET status = ?, actual_fee_sats = ?, actual_profit_sats = ?,
+                error_message = ?, timestamp = ?
             WHERE id = ?
-        """, (status, actual_fee_sats, actual_profit_sats, error_message, rebalance_id))
+        """, (status, actual_fee_sats, actual_profit_sats, error_message,
+              int(time.time()), rebalance_id))
     
     def get_recent_rebalances(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent rebalance attempts."""

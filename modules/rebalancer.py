@@ -1024,14 +1024,22 @@ class EVRebalancer:
                     if not hr:
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
-                    # Hive route found — use capex budget directly
+                    # Hive route found — check cooldown before proceeding
+                    last_rebalance = self.database.get_last_rebalance_time(dest_id)
+                    if last_rebalance:
+                        cd_hours = float(getattr(cfg, 'rebalance_cooldown_hours', 1.0))
+                        cooldown = int(cd_hours * 3600)
+                        if cooldown > 0 and int(time.time()) - last_rebalance < cooldown:
+                            non_hive_depleted.append((dest_id, dest_info, dest_ratio))
+                            continue
+                    # Use capex budget directly
                     ch_budget = self._capex_engine.get_channel_budget(dest_id)
                     if ch_budget.tier == "blocked" or ch_budget.budget_sats <= 0:
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
                     # Build capex candidate with hive route
                     capacity = dest_info.get("capacity", 0)
-                    spendable = dest_info.get("spendable", 0)
+                    spendable = dest_info.get("spendable_sats", 0)
                     headroom = capacity - spendable
                     amount_needed = min(int(capacity * 0.5) - spendable, cfg.rebalance_max_amount)
                     amount_needed = max(cfg.rebalance_min_amount, min(amount_needed, headroom))
@@ -2067,7 +2075,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
             # Determine rebalance amount
             capacity = dest_info.get("capacity", 0)
-            spendable = dest_info.get("spendable", 0)
+            spendable = dest_info.get("spendable_sats", 0)
             headroom = capacity - spendable
             if headroom <= 0:
                 continue
