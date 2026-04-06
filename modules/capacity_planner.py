@@ -12,6 +12,7 @@ from typing import Dict, List, Any
 from pyln.client import Plugin
 from .config import ChainCostDefaults
 from .demand_flow import DemandFlowClassifier
+from .utils import parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
 
 # Loser severity ranking for sorting (higher = worse)
@@ -192,12 +193,8 @@ class CapacityPlanner:
         for ch in channels:
             if ch.get("state") != "CHANNELD_NORMAL":
                 continue
-            to_us = ch.get("to_us_msat", 0)
-            total = ch.get("total_msat", 0)
-            if isinstance(to_us, str):
-                to_us = int(to_us.replace("msat", "")) if "msat" in to_us else int(to_us)
-            if isinstance(total, str):
-                total = int(total.replace("msat", "")) if "msat" in total else int(total)
+            to_us = parse_msat(ch.get("to_us_msat", 0))
+            total = parse_msat(ch.get("total_msat", 0))
             total_local += to_us
             total_capacity += total
 
@@ -337,7 +334,7 @@ class CapacityPlanner:
             try:
                 funds = self.plugin.rpc.listfunds()
                 confirmed = sum(
-                    o.get("amount_msat", 0) // 1000
+                    base_to_sats_floor(parse_msat(o.get("amount_msat", 0)))
                     for o in funds.get("outputs", [])
                     if o.get("status") == "confirmed"
                 )
@@ -954,13 +951,7 @@ class CapacityPlanner:
                     dest = ch.get("destination")
                     if not dest or dest == our_node_id or dest in existing_peers:
                         continue
-                    cap = ch.get("amount_msat", 0)
-                    if isinstance(cap, str):
-                        cap = int(cap.replace("msat", "")) // 1000 if "msat" in cap else int(cap)
-                    elif isinstance(cap, (int, float)):
-                        cap = int(cap) // 1000
-                    else:
-                        cap = 0
+                    cap = base_to_sats_floor(parse_msat(ch.get("amount_msat", 0)))
                     fee_ppm = ch.get("fee_per_millionth", 0) or 0
                     # Skip expensive or tiny channels (only filter when data is available)
                     if fee_ppm > 1500:
@@ -1017,11 +1008,10 @@ class CapacityPlanner:
             if channel_count < 5:
                 continue
 
-            total_capacity_msat = sum(
-                int(str(ch.get("amount_msat", 0)).replace("msat", ""))
+            total_capacity_sats = sum(
+                base_to_sats_floor(parse_msat(ch.get("amount_msat", 0)))
                 for ch in active_channels
             )
-            total_capacity_sats = total_capacity_msat // 1000
 
             capacity_btc = total_capacity_sats / 100_000_000 if total_capacity_sats > 0 else 0.001
             score = channel_count * math.sqrt(capacity_btc)
@@ -1082,7 +1072,7 @@ class CapacityPlanner:
         for row in rows:
             in_ch = str(row['in_channel']).replace(':', 'x')
             out_ch = str(row['out_channel']).replace(':', 'x')
-            total_fee_sats = int(row['total_fee_msat']) // 1000
+            total_fee_sats = base_to_sats_ceil(parse_msat(row['total_fee_msat']))
 
             in_peer = channel_to_peer.get(in_ch)
             out_peer = channel_to_peer.get(out_ch)
@@ -1106,11 +1096,7 @@ class CapacityPlanner:
                     if not dest or dest == our_node_id or dest in existing_peers:
                         continue
                     # Score based on fee capacity of the route
-                    capacity = ch.get("amount_msat", 0)
-                    if isinstance(capacity, str):
-                        capacity = int(capacity.replace("msat", "")) // 1000 if "msat" in capacity else int(capacity)
-                    else:
-                        capacity = int(capacity) // 1000
+                    capacity = base_to_sats_floor(parse_msat(ch.get("amount_msat", 0)))
                     fee_ppm = ch.get("fee_per_millionth", 0)
                     # Prefer neighbors with reasonable fees and decent capacity
                     if fee_ppm > 1000 or capacity < 500000:
@@ -1572,11 +1558,10 @@ class CapacityPlanner:
         try:
             funds = self.plugin.rpc.listfunds()
             confirmed = sum(
-                o.get("amount_msat", 0) // 1000
+                base_to_sats_floor(parse_msat(o.get("amount_msat", 0)))
                 for o in funds.get("outputs", [])
                 if o.get("status") == "confirmed"
             )
-            # Handle msat values that might be strings
             min_reserve = getattr(cfg, 'min_wallet_reserve', 500000)
             available = confirmed - min_reserve
             if available < required_sats:
@@ -2006,7 +1991,7 @@ class CapacityPlanner:
                 try:
                     funds = self.plugin.rpc.listfunds()
                     onchain = sum(
-                        o.get("amount_msat", 0) // 1000
+                        base_to_sats_floor(parse_msat(o.get("amount_msat", 0)))
                         for o in funds.get("outputs", [])
                         if o.get("status") == "confirmed"
                     )
