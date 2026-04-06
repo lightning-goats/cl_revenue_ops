@@ -5030,17 +5030,10 @@ class FeeController:
         """
         try:
             # Check if we have open timestamp in database
-            cost_record = self.database.get_channel_open_cost(channel_id)
-            if cost_record:
-                # The database stores the open timestamp
-                conn = self.database._get_connection()
-                row = conn.execute(
-                    "SELECT opened_at FROM channel_costs WHERE channel_id = ?",
-                    (channel_id,)
-                ).fetchone()
-                if row and row["opened_at"]:
-                    age_seconds = int(time.time()) - row["opened_at"]
-                    return max(0, age_seconds // 86400)
+            cost_record = self.database.get_channel_cost(channel_id)
+            if cost_record and cost_record.get("opened_at"):
+                age_seconds = int(time.time()) - cost_record["opened_at"]
+                return max(0, age_seconds // 86400)
 
             # Fallback: Try to get from channel_info if it has open timestamp
             open_timestamp = channel_info.get("open_timestamp", 0)

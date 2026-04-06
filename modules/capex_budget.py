@@ -402,42 +402,8 @@ class CapexBudgetEngine:
             return 0
 
     def _get_total_capex_by_channel(self, window_days: int = 30) -> Dict[str, int]:
-        """Get total capex per channel from rebalance_costs + spend_events.
-
-        Sums both tables to get the complete picture of what's been spent
-        per channel across all expense types.
-        """
-        since = int(time.time()) - (window_days * 86400)
-        result: Dict[str, int] = {}
-
+        """Get total capex per channel from rebalance_costs + spend_events."""
         try:
-            conn = self._database._get_connection()
-
-            # Rebalance costs (canonical table for rebalancing spend)
-            rows = conn.execute("""
-                SELECT channel_id, COALESCE(SUM(cost_sats), 0) as total
-                FROM rebalance_costs
-                WHERE timestamp >= ?
-                GROUP BY channel_id
-            """, (since,)).fetchall()
-            for r in rows:
-                cid = r["channel_id"]
-                if cid:
-                    result[cid] = result.get(cid, 0) + int(r["total"] or 0)
-
-            # Spend events (opens, boltz, closures, etc.)
-            rows = conn.execute("""
-                SELECT channel_id, COALESCE(SUM(amount_sats), 0) as total
-                FROM spend_events
-                WHERE timestamp >= ? AND channel_id IS NOT NULL
-                GROUP BY channel_id
-            """, (since,)).fetchall()
-            for r in rows:
-                cid = r["channel_id"]
-                if cid:
-                    result[cid] = result.get(cid, 0) + int(r["total"] or 0)
-
+            return self._database.get_total_capex_by_channel(window_days)
         except Exception:
-            pass
-
-        return result
+            return {}

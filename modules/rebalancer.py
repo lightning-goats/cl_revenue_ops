@@ -1351,30 +1351,8 @@ class JobManager:
             # M-14: Mark orphaned pending/pending_async DB records as failed.
             # Records older than job timeout that are still pending are from crashed jobs.
             try:
-                cutoff = int(time.time()) - self.job_timeout_seconds
-                conn = self.database._get_connection()
-                # I-7 FIX: Wrap orphan cleanup in transaction for atomicity
-                conn.execute("BEGIN IMMEDIATE")
-                try:
-                    # First, get the IDs of orphaned records so we can release their budget reservations
-                    orphaned_rows = conn.execute("""
-                        SELECT id FROM rebalance_history
-                        WHERE status IN ('pending', 'pending_async')
-                          AND timestamp < ?
-                    """, (cutoff,)).fetchall()
-                    orphaned_ids = [row['id'] for row in orphaned_rows]
-
-                    cursor = conn.execute("""
-                        UPDATE rebalance_history
-                        SET status = 'failed', error_message = 'orphaned_on_restart'
-                        WHERE status IN ('pending', 'pending_async')
-                          AND timestamp < ?
-                    """, (cutoff,))
-                    orphaned_db = cursor.rowcount
-                    conn.execute("COMMIT")
-                except Exception:
-                    conn.execute("ROLLBACK")
-                    raise
+                orphaned_ids = self.database.cleanup_orphaned_rebalances(self.job_timeout_seconds)
+                orphaned_db = len(orphaned_ids)
 
                 # Release budget reservations for orphaned jobs (outside transaction —
                 # release_budget_reservation manages its own transactions)
