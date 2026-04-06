@@ -3375,6 +3375,79 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             hive_route_hops=hive_route.get("hops", 0) if hive_route else 0,
         )
 
+    def _calculate_channel_capex_budget(
+        self,
+        channel_id: str,
+        total_contribution_30d_sats: int,
+        rebalance_cost_30d_sats: int,
+        total_forward_count_30d: int,
+        capacity_sats: int,
+        days_open: int,
+        classification: str,
+        bleeder_status: str,
+        marginal_roi: float,
+        success_rate: Optional[float],
+    ) -> Tuple[int, str, int]:
+        """Calculate per-channel capex rebalance budget.
+
+        Returns:
+            (budget_sats, tier, tier_ppm) where:
+            - budget_sats: remaining 30d budget for this channel
+            - tier: "proven", "active", "bootstrap", or "blocked"
+            - tier_ppm: max PPM ceiling for individual rebalance attempts
+        """
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        # --- Blocked channels: budget = 0 ---
+        if classification == "zombie":
+            return (0, "blocked", 0)
+        if bleeder_status == "hard":
+            return (0, "blocked", 0)
+        if days_open < cfg.rebalance_grace_days and total_contribution_30d_sats == 0:
+            return (0, "blocked", 0)
+        if marginal_roi < 0 and total_contribution_30d_sats == 0:
+            return (0, "blocked", 0)
+
+        # --- Success rate discount ---
+        if success_rate is not None:
+            discount = max(0.1, success_rate)
+        else:
+            discount = 1.0  # No history — no penalty
+
+        # --- Proven budget: reinvestment_rate * contribution - already spent ---
+        reinvestment = cfg.rebalance_reinvestment_rate
+        proven_budget = max(0, int(total_contribution_30d_sats * reinvestment) - rebalance_cost_30d_sats)
+
+        # --- Bootstrap budget: basis points of capacity, capped ---
+        bootstrap_budget = min(
+            int(capacity_sats * cfg.rebalance_bootstrap_bps / 10000),
+            cfg.rebalance_bootstrap_max_sats,
+        )
+
+        # --- Determine tier and PPM ceiling ---
+        if total_contribution_30d_sats > 100:
+            tier = "proven"
+            tier_ppm = 2000
+        elif total_forward_count_30d > 5:
+            tier = "active"
+            tier_ppm = 500
+        elif days_open >= cfg.rebalance_grace_days:
+            tier = "bootstrap"
+            tier_ppm = 250
+        else:
+            tier = "blocked"
+            tier_ppm = 0
+            return (0, tier, tier_ppm)
+
+        # --- Pick budget: proven earners use only reinvestment; others get bootstrap floor ---
+        if tier == "proven":
+            raw_budget = proven_budget
+        else:
+            raw_budget = max(proven_budget, bootstrap_budget)
+
+        budget = int(raw_budget * discount)
+        return (budget, tier, tier_ppm)
+
     def _calculate_turnover_rate(self, channel_id: str, capacity: int) -> float:
         if capacity <= 0: 
             return 0.0
