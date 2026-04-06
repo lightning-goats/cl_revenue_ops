@@ -22,28 +22,61 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+# Sub-satoshi unit constant. Change when Lightning switches to microsatoshis.
+MSAT_PER_SAT = 1000
+
 
 @dataclass
 class ChannelCapexBudget:
     """Per-channel capex budget computed by the engine."""
     channel_id: str
-    budget_sats: int = 0           # Remaining 30d budget
+    budget_msat: int = 0           # Remaining 30d budget (millisatoshis)
     tier: str = "blocked"          # proven / active / bootstrap / blocked
     tier_ppm: int = 0              # Max PPM per rebalance attempt
     priority_class: str = "growth" # defensive / preservation / operational / growth
     hive_multiplier: float = 1.0   # 1.0 / 1.5 / 2.0
+
+    @property
+    def budget_sats(self) -> int:
+        """Budget in sats, ceiling-rounded. Zero msat yields zero sats (no false floor)."""
+        return -(-self.budget_msat // MSAT_PER_SAT)
 
 
 @dataclass
 class CapexAllocations:
     """Complete budget allocation snapshot for one cycle."""
     priority_class: str = "growth"
-    global_envelope_sats: int = 0
+    global_envelope_msat: int = 0
     channel_budgets: Dict[str, ChannelCapexBudget] = field(default_factory=dict)
-    fleet_exploration_budget_sats: int = 0
-    tactical_budget_sats: int = 0
-    allocated_by_priority: Dict[str, int] = field(default_factory=dict)
-    total_fleet_contribution_sats: int = 0
+    fleet_exploration_budget_msat: int = 0
+    tactical_budget_msat: int = 0
+    allocated_by_priority_msat: Dict[str, int] = field(default_factory=dict)
+    total_fleet_contribution_msat: int = 0
+
+    @property
+    def global_envelope_sats(self) -> int:
+        """Global envelope in sats, ceiling-rounded."""
+        return -(-self.global_envelope_msat // MSAT_PER_SAT)
+
+    @property
+    def fleet_exploration_budget_sats(self) -> int:
+        """Fleet exploration budget in sats, ceiling-rounded."""
+        return -(-self.fleet_exploration_budget_msat // MSAT_PER_SAT)
+
+    @property
+    def tactical_budget_sats(self) -> int:
+        """Tactical budget in sats, ceiling-rounded."""
+        return -(-self.tactical_budget_msat // MSAT_PER_SAT)
+
+    @property
+    def total_fleet_contribution_sats(self) -> int:
+        """Total fleet contribution in sats, ceiling-rounded."""
+        return -(-self.total_fleet_contribution_msat // MSAT_PER_SAT)
+
+    @property
+    def allocated_by_priority_sats(self) -> Dict[str, int]:
+        """Allocated by priority in sats, ceiling-rounded."""
+        return {k: -(-v // MSAT_PER_SAT) for k, v in self.allocated_by_priority_msat.items()}
 
 
 class CapexBudgetEngine:
@@ -81,19 +114,19 @@ class CapexBudgetEngine:
         except Exception:
             pass
 
-        # Get total capex per channel (rebalance_costs + spend_events)
+        # Get total capex per channel (rebalance_costs + spend_events) — in sats
         capex_by_channel = self._get_total_capex_by_channel(window_days=30)
 
-        # Compute per-channel budgets
+        # Compute per-channel budgets (all arithmetic in msat)
         channel_budgets: Dict[str, ChannelCapexBudget] = {}
-        total_fleet_contribution = 0
+        total_fleet_contribution_msat = 0
         has_hard_bleeders = False
         has_depleted_earners = False
 
         for ch_id, prof in all_prof.items():
-            contribution = prof.revenue.total_contribution_sats
-            total_fleet_contribution += prof.revenue.fees_earned_sats  # Fleet revenue = exit only
-            total_capex = capex_by_channel.get(ch_id, 0)
+            contribution_msat = prof.revenue.total_contribution_msat
+            total_fleet_contribution_msat += prof.revenue.fees_earned_msat  # Fleet revenue = exit only
+            total_capex_msat = capex_by_channel.get(ch_id, 0) * MSAT_PER_SAT
 
             # Bleeder status
             bleeder_status = "none"
@@ -107,7 +140,7 @@ class CapexBudgetEngine:
                 pass
 
             # Depleted earner detection
-            if contribution > 100:
+            if contribution_msat > 100 * MSAT_PER_SAT:
                 classification = prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification)
                 if classification in ("underwater", "stagnant_candidate"):
                     has_depleted_earners = True
@@ -115,7 +148,7 @@ class CapexBudgetEngine:
             budget = self._compute_channel_budget(
                 ch_id=ch_id,
                 prof=prof,
-                total_capex_30d=total_capex,
+                total_capex_30d_msat=total_capex_msat,
                 bleeder_status=bleeder_status,
                 cfg=cfg,
             )
@@ -128,59 +161,59 @@ class CapexBudgetEngine:
             reserve_deficit=self._get_reserve_deficit(cfg),
         )
 
-        # Compute fleet exploration and tactical budgets
-        exploration = int(total_fleet_contribution * cfg.capex_exploration_rate)
-        reserve_deficit = self._get_reserve_deficit(cfg)
-        tactical = min(reserve_deficit, int(total_fleet_contribution * cfg.capex_tactical_rate))
-        tactical = max(0, tactical)
+        # Compute fleet exploration and tactical budgets (msat)
+        exploration_msat = int(total_fleet_contribution_msat * cfg.capex_exploration_rate)
+        reserve_deficit_msat = self._get_reserve_deficit(cfg) * MSAT_PER_SAT
+        tactical_msat = min(reserve_deficit_msat, int(total_fleet_contribution_msat * cfg.capex_tactical_rate))
+        tactical_msat = max(0, tactical_msat)
 
-        # Global envelope enforcement
-        total_channel_budgets = sum(b.budget_sats for b in channel_budgets.values())
-        raw_total = total_channel_budgets + exploration + tactical
+        # Global envelope enforcement (msat)
+        total_channel_budgets_msat = sum(b.budget_msat for b in channel_budgets.values())
+        raw_total_msat = total_channel_budgets_msat + exploration_msat + tactical_msat
 
         if cfg.capex_global_envelope_sats > 0:
-            envelope = cfg.capex_global_envelope_sats
+            envelope_msat = cfg.capex_global_envelope_sats * MSAT_PER_SAT
         else:
-            envelope = raw_total
+            envelope_msat = raw_total_msat
 
         # Emergency overrides
         if cfg.daily_budget_sats > 0:
-            daily_30d = cfg.daily_budget_sats * 30
-            envelope = min(envelope, daily_30d)
+            daily_30d_msat = cfg.daily_budget_sats * 30 * MSAT_PER_SAT
+            envelope_msat = min(envelope_msat, daily_30d_msat)
         if cfg.weekly_budget_sats > 0:
-            weekly_30d = int(cfg.weekly_budget_sats * (30 / 7))
-            envelope = min(envelope, weekly_30d)
+            weekly_30d_msat = int(cfg.weekly_budget_sats * MSAT_PER_SAT * (30 / 7))
+            envelope_msat = min(envelope_msat, weekly_30d_msat)
 
         # Scale down if over envelope
-        if raw_total > envelope and raw_total > 0:
-            scale = envelope / raw_total
-            exploration = int(exploration * scale)
-            tactical = int(tactical * scale)
+        if raw_total_msat > envelope_msat and raw_total_msat > 0:
+            scale = envelope_msat / raw_total_msat
+            exploration_msat = int(exploration_msat * scale)
+            tactical_msat = int(tactical_msat * scale)
             for b in channel_budgets.values():
-                b.budget_sats = int(b.budget_sats * scale)
+                b.budget_msat = int(b.budget_msat * scale)
 
-        # Priority allocation tracking
-        defensive_total = sum(
-            b.budget_sats for b in channel_budgets.values()
+        # Priority allocation tracking (msat)
+        defensive_total_msat = sum(
+            b.budget_msat for b in channel_budgets.values()
             if b.priority_class == "defensive"
         )
-        preservation_total = sum(
-            b.budget_sats for b in channel_budgets.values()
+        preservation_total_msat = sum(
+            b.budget_msat for b in channel_budgets.values()
             if b.priority_class == "preservation"
         )
 
         alloc = CapexAllocations(
             priority_class=priority_class,
-            global_envelope_sats=envelope,
+            global_envelope_msat=envelope_msat,
             channel_budgets=channel_budgets,
-            fleet_exploration_budget_sats=exploration,
-            tactical_budget_sats=tactical,
-            total_fleet_contribution_sats=total_fleet_contribution,
-            allocated_by_priority={
-                "defensive": defensive_total,
-                "preservation": preservation_total,
-                "operational": tactical,
-                "growth": exploration,
+            fleet_exploration_budget_msat=exploration_msat,
+            tactical_budget_msat=tactical_msat,
+            total_fleet_contribution_msat=total_fleet_contribution_msat,
+            allocated_by_priority_msat={
+                "defensive": defensive_total_msat,
+                "preservation": preservation_total_msat,
+                "operational": tactical_msat,
+                "growth": exploration_msat,
             },
         )
         self._last_allocations = alloc
@@ -193,13 +226,13 @@ class CapexBudgetEngine:
         return ChannelCapexBudget(channel_id=channel_id)
 
     def get_fleet_exploration_budget(self) -> int:
-        """Remaining fleet exploration budget for opens and recycling."""
+        """Remaining fleet exploration budget in sats (ceiling)."""
         if self._last_allocations:
             return self._last_allocations.fleet_exploration_budget_sats
         return 0
 
     def get_tactical_budget(self) -> int:
-        """Remaining tactical budget for Boltz treasury."""
+        """Remaining tactical budget in sats (ceiling)."""
         if self._last_allocations:
             return self._last_allocations.tactical_budget_sats
         return 0
@@ -215,8 +248,11 @@ class CapexBudgetEngine:
     ) -> Dict[str, int]:
         """Split a Boltz cost between channel and tactical budgets.
 
+        Operates in sats (consumer-facing boundary method).
+        Callers provide cost in sats; returns split in sats.
+
         Returns:
-            {"channel": amount, "tactical": amount}
+            {"channel": amount_sats, "tactical": amount_sats}
         """
         if channel_id is None:
             # Pure treasury swap — all tactical
@@ -232,13 +268,13 @@ class CapexBudgetEngine:
         self,
         ch_id: str,
         prof,
-        total_capex_30d: int,
+        total_capex_30d_msat: int,
         bleeder_status: str,
         cfg,
     ) -> ChannelCapexBudget:
-        """Compute budget for a single channel."""
+        """Compute budget for a single channel (all arithmetic in msat)."""
         classification = prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification)
-        contribution = prof.revenue.total_contribution_sats
+        contribution_msat = prof.revenue.total_contribution_msat
         total_fwd = prof.revenue.total_forward_count
         days_open = prof.days_open
         marginal_roi = getattr(prof, 'marginal_roi', 0.0)
@@ -267,11 +303,11 @@ class CapexBudgetEngine:
                 channel_id=ch_id, tier="blocked", priority_class="defensive",
                 hive_multiplier=hive_mult,
             )
-        if days_open < cfg.capex_grace_days and contribution == 0:
+        if days_open < cfg.capex_grace_days and contribution_msat == 0:
             return ChannelCapexBudget(
                 channel_id=ch_id, tier="blocked", hive_multiplier=hive_mult,
             )
-        if marginal_roi < 0 and contribution == 0:
+        if marginal_roi < 0 and contribution_msat == 0:
             return ChannelCapexBudget(
                 channel_id=ch_id, tier="blocked", priority_class="defensive",
                 hive_multiplier=hive_mult,
@@ -288,47 +324,47 @@ class CapexBudgetEngine:
         else:
             discount = 1.0
 
-        # Proven budget: contribution x rate - total capex spent
+        # Proven budget (msat): contribution x rate - total capex spent
         reinvestment = cfg.capex_reinvestment_rate
-        proven_budget = max(0, int(contribution * reinvestment) - total_capex_30d)
+        proven_budget_msat = max(0, int(contribution_msat * reinvestment) - total_capex_30d_msat)
 
-        # Bootstrap budget: basis points of capacity
-        capacity = getattr(prof, 'capacity_sats', 0) or 0
-        bootstrap_budget = min(
-            int(capacity * cfg.capex_bootstrap_bps / 10000),
-            cfg.capex_bootstrap_max_sats,
+        # Bootstrap budget (msat): basis points of capacity
+        capacity_msat = (getattr(prof, 'capacity_sats', 0) or 0) * MSAT_PER_SAT
+        bootstrap_budget_msat = min(
+            int(capacity_msat * cfg.capex_bootstrap_bps / 10000),
+            cfg.capex_bootstrap_max_sats * MSAT_PER_SAT,
         )
 
         # Tier classification
-        if contribution > 100:
+        if contribution_msat > 100 * MSAT_PER_SAT:
             tier = "proven"
             tier_ppm = 2000
             priority = "preservation"
-            raw_budget = proven_budget
+            raw_budget_msat = proven_budget_msat
         elif total_fwd > 5:
             tier = "active"
             tier_ppm = 500
             priority = "preservation"
             # Active: pick higher of proven (already capex-adjusted) or bootstrap - capex
-            if proven_budget > 0:
-                raw_budget = max(proven_budget, max(0, bootstrap_budget - total_capex_30d))
+            if proven_budget_msat > 0:
+                raw_budget_msat = max(proven_budget_msat, max(0, bootstrap_budget_msat - total_capex_30d_msat))
             else:
-                raw_budget = max(0, bootstrap_budget - total_capex_30d)
+                raw_budget_msat = max(0, bootstrap_budget_msat - total_capex_30d_msat)
         elif days_open >= cfg.capex_grace_days:
             tier = "bootstrap"
             tier_ppm = 250
             priority = "growth"
-            raw_budget = max(0, bootstrap_budget - total_capex_30d)
+            raw_budget_msat = max(0, bootstrap_budget_msat - total_capex_30d_msat)
         else:
             return ChannelCapexBudget(
                 channel_id=ch_id, tier="blocked", hive_multiplier=hive_mult,
             )
 
-        budget = int(raw_budget * discount * hive_mult)
+        budget_msat = int(raw_budget_msat * discount * hive_mult)
 
         return ChannelCapexBudget(
             channel_id=ch_id,
-            budget_sats=budget,
+            budget_msat=budget_msat,
             tier=tier,
             tier_ppm=tier_ppm,
             priority_class=priority,

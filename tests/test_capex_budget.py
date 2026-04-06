@@ -55,6 +55,7 @@ from modules.capex_budget import (
     CapexBudgetEngine,
     ChannelCapexBudget,
     CapexAllocations,
+    MSAT_PER_SAT,
 )
 
 
@@ -133,11 +134,11 @@ class TestEngineConstruction:
 def _make_mock_profitability(
     channel_id="100x1x0",
     peer_id="02" + "a" * 64,
-    contribution_sats=0,
-    fees_earned_sats=0,
+    contribution_msat=0,
+    fees_earned_msat=0,
     total_forward_count=0,
     days_open=60,
-    capacity_sats=5_000_000,
+    capacity_sats=5_000_000,      # Channel capacity stays in sats
     classification="break_even",
     marginal_roi=0.0,
 ):
@@ -145,8 +146,8 @@ def _make_mock_profitability(
     prof = MagicMock()
     prof.channel_id = channel_id
     prof.peer_id = peer_id
-    prof.revenue.total_contribution_sats = contribution_sats
-    prof.revenue.fees_earned_sats = fees_earned_sats
+    prof.revenue.total_contribution_msat = contribution_msat
+    prof.revenue.fees_earned_msat = fees_earned_msat
     prof.revenue.total_forward_count = total_forward_count
     prof.days_open = days_open
     prof.capacity_sats = capacity_sats
@@ -163,8 +164,8 @@ class TestPerChannelBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=1000,
-                    fees_earned_sats=800,
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
                     total_forward_count=50,
                 ),
             },
@@ -172,7 +173,7 @@ class TestPerChannelBudget:
         )
         alloc = engine.compute_allocations()
         b = alloc.channel_budgets["100x1x0"]
-        # (1000 * 0.50 - 200) * 1.0 discount * 1.0 hive = 300
+        # (1_000_000 * 0.50 - 200_000) * 1.0 discount * 1.0 hive = 300_000 msat = 300 sats
         assert b.budget_sats == 300
         assert b.tier == "proven"
         assert b.tier_ppm == 2000
@@ -183,8 +184,8 @@ class TestPerChannelBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=400,
-                    fees_earned_sats=300,
+                    contribution_msat=400_000,
+                    fees_earned_msat=300_000,
                     total_forward_count=50,
                 ),
             },
@@ -196,12 +197,12 @@ class TestPerChannelBudget:
         assert b.tier == "proven"
 
     def test_active_router(self):
-        """Channel with >5 forwards but <=100 contribution."""
+        """Channel with >5 forwards but <=100 sats contribution."""
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=50,
-                    fees_earned_sats=30,
+                    contribution_msat=50_000,
+                    fees_earned_msat=30_000,
                     total_forward_count=10,
                 ),
             },
@@ -217,7 +218,7 @@ class TestPerChannelBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=0,
+                    contribution_msat=0,
                     total_forward_count=0,
                     days_open=20,
                     classification="stagnant_candidate",
@@ -228,7 +229,7 @@ class TestPerChannelBudget:
         b = alloc.channel_budgets["100x1x0"]
         assert b.tier == "bootstrap"
         assert b.tier_ppm == 250
-        # min(5_000_000 * 10/10000, 200) = min(5000, 200) = 200
+        # min(5_000_000_000 * 10/10000, 200_000) = min(5_000_000, 200_000) = 200_000 msat = 200 sats
         assert b.budget_sats == 200
         assert b.priority_class == "growth"
 
@@ -237,7 +238,7 @@ class TestPerChannelBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=0,
+                    contribution_msat=0,
                     total_forward_count=0,
                     days_open=20,
                     classification="stagnant_candidate",
@@ -247,14 +248,14 @@ class TestPerChannelBudget:
         )
         alloc = engine.compute_allocations()
         b = alloc.channel_budgets["100x1x0"]
-        assert b.budget_sats == 50  # 200 - 150
+        assert b.budget_sats == 50  # 200_000 - 150_000 msat = 50_000 msat = 50 sats
 
     def test_young_channel_blocked(self):
         """Channel younger than grace period with 0 contribution."""
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=0,
+                    contribution_msat=0,
                     days_open=10,
                 ),
             },
@@ -283,7 +284,7 @@ class TestPerChannelBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=500,
+                    contribution_msat=500_000,
                     total_forward_count=20,
                 ),
             },
@@ -301,8 +302,8 @@ class TestPerChannelBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=1000,
-                    fees_earned_sats=800,
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
                     total_forward_count=50,
                 ),
             },
@@ -310,7 +311,7 @@ class TestPerChannelBudget:
         )
         alloc = engine.compute_allocations()
         b = alloc.channel_budgets["100x1x0"]
-        # (1000 * 0.50) * 1.0 discount * 1.5 hive = 750
+        # (1_000_000 * 0.50) * 1.0 discount * 1.5 hive = 750_000 msat = 750 sats
         assert b.budget_sats == 750
         assert b.hive_multiplier == 1.5
 
@@ -321,8 +322,8 @@ class TestPerChannelBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=1000,
-                    fees_earned_sats=800,
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
                     total_forward_count=50,
                 ),
             },
@@ -330,7 +331,7 @@ class TestPerChannelBudget:
         )
         alloc = engine.compute_allocations()
         b = alloc.channel_budgets["100x1x0"]
-        # (1000 * 0.50) * 1.0 discount * 2.0 hive = 1000
+        # (1_000_000 * 0.50) * 1.0 discount * 2.0 hive = 1_000_000 msat = 1000 sats
         assert b.budget_sats == 1000
         assert b.hive_multiplier == 2.0
 
@@ -338,8 +339,8 @@ class TestPerChannelBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=1000,
-                    fees_earned_sats=800,
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
                     total_forward_count=50,
                 ),
             },
@@ -358,21 +359,21 @@ class TestFleetExplorationBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=500,
-                    fees_earned_sats=500,
+                    contribution_msat=500_000,
+                    fees_earned_msat=500_000,
                     total_forward_count=50,
                 ),
                 "200x1x0": _make_mock_profitability(
-                    contribution_sats=300,
-                    fees_earned_sats=300,
+                    contribution_msat=300_000,
+                    fees_earned_msat=300_000,
                     total_forward_count=30,
                     channel_id="200x1x0",
                 ),
             },
         )
         alloc = engine.compute_allocations()
-        # Fleet revenue = 500 + 300 = 800 (exit fees only)
-        # Exploration = 800 * 0.10 = 80
+        # Fleet revenue = 500_000 + 300_000 = 800_000 msat (exit fees only)
+        # Exploration = 800_000 * 0.10 = 80_000 msat = 80 sats
         assert alloc.fleet_exploration_budget_sats == 80
 
     def test_zero_revenue_zero_exploration(self):
@@ -389,34 +390,34 @@ class TestTacticalBudget:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=10000,
-                    fees_earned_sats=10000,
+                    contribution_msat=10_000_000,
+                    fees_earned_msat=10_000_000,
                     total_forward_count=100,
                 ),
             },
             reserve_deficit=500,
         )
         alloc = engine.compute_allocations()
-        # fleet_contrib = 10000, tactical_rate = 0.15 -> 1500
-        # deficit = 500
-        # min(500, 1500) = 500
+        # fleet_contrib = 10_000_000 msat, tactical_rate = 0.15 -> 1_500_000 msat
+        # deficit = 500 sats = 500_000 msat
+        # min(500_000, 1_500_000) = 500_000 msat = 500 sats
         assert alloc.tactical_budget_sats == 500
 
     def test_tactical_capped_at_rate(self):
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=1000,
-                    fees_earned_sats=1000,
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=1_000_000,
                     total_forward_count=100,
                 ),
             },
             reserve_deficit=500_000,  # Large deficit
         )
         alloc = engine.compute_allocations()
-        # fleet_contrib = 1000, tactical_rate = 0.15 -> 150
-        # deficit = 500000
-        # min(500000, 150) = 150
+        # fleet_contrib = 1_000_000 msat, tactical_rate = 0.15 -> 150_000 msat
+        # deficit = 500_000 sats = 500_000_000 msat
+        # min(500_000_000, 150_000) = 150_000 msat = 150 sats
         assert alloc.tactical_budget_sats == 150
 
     def test_no_deficit_no_tactical(self):
@@ -432,7 +433,7 @@ class TestPriorityClass:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=500,
+                    contribution_msat=500_000,
                     total_forward_count=20,
                 ),
             },
@@ -445,8 +446,8 @@ class TestPriorityClass:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=500,
-                    fees_earned_sats=500,
+                    contribution_msat=500_000,
+                    fees_earned_msat=500_000,
                     total_forward_count=50,
                 ),
             },
@@ -488,36 +489,56 @@ class TestGlobalEnvelope:
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=10000,
-                    fees_earned_sats=10000,
+                    contribution_msat=10_000_000,
+                    fees_earned_msat=10_000_000,
                     total_forward_count=100,
                 ),
             },
             config_overrides={"capex_global_envelope_sats": 100},
         )
         alloc = engine.compute_allocations()
-        total = (
-            sum(b.budget_sats for b in alloc.channel_budgets.values())
-            + alloc.fleet_exploration_budget_sats
-            + alloc.tactical_budget_sats
+        # msat total is the true invariant (ceiling per-component can overshoot)
+        total_msat = (
+            sum(b.budget_msat for b in alloc.channel_budgets.values())
+            + alloc.fleet_exploration_budget_msat
+            + alloc.tactical_budget_msat
         )
-        assert total <= 100
+        assert total_msat <= 100 * MSAT_PER_SAT
 
     def test_daily_budget_emergency_override(self):
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
-                    contribution_sats=100000,
-                    fees_earned_sats=100000,
+                    contribution_msat=100_000_000,
+                    fees_earned_msat=100_000_000,
                     total_forward_count=500,
                 ),
             },
             config_overrides={"daily_budget_sats": 100},  # 100/day = 3000/30d
         )
         alloc = engine.compute_allocations()
-        total = (
-            sum(b.budget_sats for b in alloc.channel_budgets.values())
-            + alloc.fleet_exploration_budget_sats
-            + alloc.tactical_budget_sats
+        total_msat = (
+            sum(b.budget_msat for b in alloc.channel_budgets.values())
+            + alloc.fleet_exploration_budget_msat
+            + alloc.tactical_budget_msat
         )
-        assert total <= 3000
+        assert total_msat <= 3000 * MSAT_PER_SAT
+
+
+class TestMsatPrecision:
+    """Verify msat-native computation preserves sub-sat precision."""
+
+    def test_sub_satoshi_budget_rounds_up(self):
+        """Non-multiple-of-1000 msat rounds up to next sat."""
+        b = ChannelCapexBudget(channel_id="x", budget_msat=1)
+        assert b.budget_sats == 1  # 1 msat → 1 sat (ceiling)
+        b2 = ChannelCapexBudget(channel_id="x", budget_msat=999)
+        assert b2.budget_sats == 1  # 999 msat → 1 sat (ceiling)
+        b3 = ChannelCapexBudget(channel_id="x", budget_msat=1001)
+        assert b3.budget_sats == 2  # 1001 msat → 2 sats (ceiling)
+        b4 = ChannelCapexBudget(channel_id="x", budget_msat=0)
+        assert b4.budget_sats == 0  # 0 msat → 0 sats (no false floor)
+
+    def test_msat_constant_exported(self):
+        """MSAT_PER_SAT constant is available for consumers."""
+        assert MSAT_PER_SAT == 1000
