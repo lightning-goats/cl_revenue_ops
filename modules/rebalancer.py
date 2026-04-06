@@ -2158,16 +2158,43 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             max_fee_ppm = min(tier_ppm, (max_fee_sats * 1_000_000) // max(1, amount_needed))
 
             # Hive route discovery: try fleet paths before generic source selection.
-            # Fleet routes are near-zero cost, making even tiny budgets viable.
             outbound_fee_ppm = dest_info.get("fee_ppm", 0)
             dest_peer_id = dest_info.get("peer_id", "")
             hive_route_hops = 0
             hive_source_scid = None
+            dest_is_member = False
 
             if self.hive_router and self.hive_router.available and dest_peer_id:
+                dest_is_member = self.hive_router.is_hive_member(dest_peer_id)
                 try:
                     hr = self.hive_router.discover_route(dest_peer_id, amount_needed)
                     if hr:
+                        # Non-member destinations: check return-hop viability
+                        if not dest_is_member:
+                            return_ppm = int(dest_info.get("peer_inbound_fee_ppm") or 0)
+                            return_base_msat = int(dest_info.get("peer_inbound_base_msat") or 0)
+                            return_fee_msat = return_base_msat + (sats_to_base(amount_needed) * return_ppm) // 1_000_000
+                            return_fee_sats = base_to_sats_ceil(return_fee_msat)
+                            if return_fee_sats >= budget_sats:
+                                # Try scaling down amount
+                                if return_ppm > 0:
+                                    max_amt_msat = ((budget_sats * 1000 - return_base_msat) * 1_000_000) // return_ppm
+                                    amount_needed = max(0, base_to_sats_floor(max_amt_msat))
+                                else:
+                                    amount_needed = 0
+                                if amount_needed < cfg.rebalance_min_amount:
+                                    self.plugin.log(
+                                        f"CAPEX_FALLBACK SKIP: {dest_id[:12]}... return hop {return_ppm} ppm "
+                                        f"({return_fee_sats} sats) exceeds budget {budget_sats} sats",
+                                        level='info',
+                                    )
+                                    skipped_no_budget += 1
+                                    continue
+                                # Recalculate fee ceiling with reduced amount
+                                ppm_cap_sats = (amount_needed * tier_ppm) // 1_000_000
+                                max_fee_sats = min(budget_sats, max(1, ppm_cap_sats))
+                                max_fee_msat = sats_to_base(max_fee_sats)
+                                max_fee_ppm = min(tier_ppm, (max_fee_sats * 1_000_000) // max(1, amount_needed))
                         hive_route_hops = hr.hops
                         hive_source_scid = hr.source_scid
                         self.plugin.log(
@@ -2239,6 +2266,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 reason_code=RebalanceReasonCode.CAPEX_FALLBACK.value,
                 bleeder_status="none",
                 hive_route_hops=hive_route_hops,
+                dest_is_hive_member=dest_is_member,
                 source_candidate_peer_ids=[
                     s[1].get("peer_id", "") for s in source_result
                 ],
