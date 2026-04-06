@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple
 from pyln.client import Plugin, RpcError
+from .utils import parse_msat, base_to_sats_floor
 
 try:
     import numpy as np
@@ -1163,21 +1164,21 @@ class FlowAnalyzer:
 
             # Calculate capacity - may be null in some CLN versions
             # Always fetch spendable/receivable first for balance calculation
-            spendable_msat = int(channel.get("spendable_msat", 0) or 0)
-            receivable_msat = int(channel.get("receivable_msat", 0) or 0)
+            spendable_msat = parse_msat(channel.get("spendable_msat", 0) or 0)
+            receivable_msat = parse_msat(channel.get("receivable_msat", 0) or 0)
 
             capacity_msat = channel.get("capacity_msat")
             if capacity_msat is None or capacity_msat == 0:
                 # Calculate from spendable + receivable (approximate)
-                capacity = (spendable_msat + receivable_msat) // 1000
+                capacity = base_to_sats_floor(spendable_msat + receivable_msat)
             else:
-                capacity = int(capacity_msat) // 1000
+                capacity = base_to_sats_floor(parse_msat(capacity_msat))
 
             if capacity == 0:
                 capacity = int(channel.get("capacity", 0))
 
             # CLN's spendable_msat already accounts for pending HTLCs and channel reserve.
-            our_balance = spendable_msat // 1000
+            our_balance = base_to_sats_floor(spendable_msat)
 
             # Get daily buckets for this channel
             channel_daily = flow_data_daily.get(channel_id, [])
@@ -1351,19 +1352,19 @@ class FlowAnalyzer:
 
         # Calculate capacity
         capacity_msat = channel.get("capacity_msat")
-        spendable_msat = int(channel.get("spendable_msat", 0) or 0)
-        receivable_msat = int(channel.get("receivable_msat", 0) or 0)
+        spendable_msat = parse_msat(channel.get("spendable_msat", 0) or 0)
+        receivable_msat = parse_msat(channel.get("receivable_msat", 0) or 0)
 
         if capacity_msat is None or capacity_msat == 0:
-            capacity = (spendable_msat + receivable_msat) // 1000
+            capacity = base_to_sats_floor(spendable_msat + receivable_msat)
         else:
-            capacity = int(capacity_msat) // 1000
+            capacity = base_to_sats_floor(parse_msat(capacity_msat))
 
         if capacity == 0:
             capacity = int(channel.get("capacity", 0))
 
         # CLN's spendable_msat already accounts for pending HTLCs and channel reserve.
-        our_balance = spendable_msat // 1000
+        our_balance = base_to_sats_floor(spendable_msat)
 
         # Get daily flow data
         flow_data_daily = self._get_daily_flow_from_db(channel_id)
