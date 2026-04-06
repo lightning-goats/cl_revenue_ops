@@ -140,15 +140,10 @@ class CapacityPlanner:
         return getattr(cfg, "planner_max_closes_per_cycle", 1) > 0
 
     def _init_cycle_cache(self):
-        """Fetch listnodes once and index by ID. Clear per-peer caches."""
+        """Clear per-cycle caches. Node info is fetched lazily via _get_cached_node()."""
         self._cycle_channels_dest.clear()
         self._cycle_channels_source.clear()
         self._cycle_nodes_by_id.clear()
-        try:
-            nodes = self.plugin.rpc.listnodes().get("nodes", [])
-            self._cycle_nodes_by_id = {n["nodeid"]: n for n in nodes if "nodeid" in n}
-        except Exception:
-            pass
 
     def _get_cached_channels(self, peer_id: str, direction: str = "destination") -> list:
         """Get listchannels result, cached for this cycle."""
@@ -971,9 +966,9 @@ class CapacityPlanner:
     def _discover_from_graph(self, existing_peer_ids: set) -> List[Dict]:
         """Strategy 3: Network centrality scoring from cached channel data.
 
-        Uses channel data already cached by neighbor/route-pair lookups
-        (in _cycle_channels_source) with a 20-lookup RPC budget fallback
-        for uncached nodes in the gossip store.
+        Scores nodes whose channel data was already cached by earlier strategies
+        (neighbor, route-pair, demand-flow lookups populate _cycle_channels_source).
+        No bulk gossip fetches — only uses data already in memory.
         """
         try:
             our_node_id = self.plugin.rpc.getinfo().get("id")
@@ -981,19 +976,12 @@ class CapacityPlanner:
             return []
 
         scored = []
-        lookup_budget = 20
 
-        for node_id, node_info in self._cycle_nodes_by_id.items():
+        # Score nodes already in the channel cache (populated by earlier strategies).
+        # This avoids any additional RPC calls — graph discovery is purely opportunistic
+        # over data that was already fetched for other purposes.
+        for node_id, channels in self._cycle_channels_source.items():
             if node_id == our_node_id or node_id in existing_peer_ids:
-                continue
-
-            # Get channel data: prefer cache, fallback to RPC with budget
-            if node_id in self._cycle_channels_source:
-                channels = self._cycle_channels_source[node_id]
-            elif lookup_budget > 0:
-                channels = self._get_cached_channels(node_id, "source")
-                lookup_budget -= 1
-            else:
                 continue
 
             active_channels = [ch for ch in channels if ch.get("active", False)]

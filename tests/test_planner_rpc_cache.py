@@ -21,34 +21,32 @@ def planner(mock_plugin):
 
 
 class TestInitCycleCache:
-    """_init_cycle_cache fetches listnodes once and indexes by ID."""
+    """_init_cycle_cache clears per-cycle caches. Node info is lazy-loaded."""
 
-    def test_populates_nodes_by_id(self, planner, mock_plugin):
+    def test_lazy_node_lookup(self, planner, mock_plugin):
+        """Node info fetched on demand via _get_cached_node, not bulk-loaded."""
         mock_plugin.rpc.listnodes.return_value = {"nodes": [
-            {"nodeid": "02aaa", "alias": "Alice", "addresses": []},
             {"nodeid": "02bbb", "alias": "Bob", "addresses": [{"type": "ipv4"}]},
         ]}
         planner._init_cycle_cache()
-        assert "02aaa" in planner._cycle_nodes_by_id
+        # No bulk load — cache starts empty
+        assert planner._cycle_nodes_by_id == {}
+        # On-demand lookup populates cache
+        node = planner._get_cached_node("02bbb")
+        assert node is not None
+        assert node["alias"] == "Bob"
         assert "02bbb" in planner._cycle_nodes_by_id
-        assert planner._cycle_nodes_by_id["02bbb"]["alias"] == "Bob"
 
     def test_clears_previous_cycle(self, planner, mock_plugin):
         planner._cycle_channels_dest["old_peer"] = [{"stale": True}]
         planner._cycle_channels_source["old_peer"] = [{"stale": True}]
         planner._cycle_nodes_by_id["old_node"] = {"stale": True}
 
-        mock_plugin.rpc.listnodes.return_value = {"nodes": []}
         planner._init_cycle_cache()
 
         assert "old_peer" not in planner._cycle_channels_dest
         assert "old_peer" not in planner._cycle_channels_source
         assert "old_node" not in planner._cycle_nodes_by_id
-
-    def test_handles_rpc_error(self, planner, mock_plugin):
-        mock_plugin.rpc.listnodes.side_effect = Exception("RPC timeout")
-        planner._init_cycle_cache()
-        assert planner._cycle_nodes_by_id == {}
 
 
 class TestGetCachedChannels:
