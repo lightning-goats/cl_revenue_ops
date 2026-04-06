@@ -1987,8 +1987,28 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             max_fee_msat = sats_to_base(max_fee_sats)
             max_fee_ppm = min(tier_ppm, (max_fee_sats * 1_000_000) // max(1, amount_needed))
 
-            # Find source channels
+            # Hive route discovery: try fleet paths before generic source selection.
+            # Fleet routes are near-zero cost, making even tiny budgets viable.
             outbound_fee_ppm = dest_info.get("fee_ppm", 0)
+            dest_peer_id = dest_info.get("peer_id", "")
+            hive_route_hops = 0
+            hive_source_scid = None
+
+            if self.hive_router and self.hive_router.available and dest_peer_id:
+                try:
+                    hr = self.hive_router.discover_route(dest_peer_id, amount_needed)
+                    if hr:
+                        hive_route_hops = hr.hops
+                        hive_source_scid = hr.source_scid
+                        self.plugin.log(
+                            f"CAPEX_FALLBACK: Hive route to {dest_peer_id[:12]}...: "
+                            f"{hr.hops} hops, {hr.fee_ppm} ppm via {hr.source_scid}",
+                            level='info',
+                        )
+                except Exception:
+                    pass
+
+            # Find source channels
             source_tuples = [(s[0], s[1], s[2] if len(s) > 2 else 0.0) for s in source_channels]
             try:
                 source_result = self._select_source_candidates(
@@ -2008,8 +2028,23 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
             source_scids = [s[0] for s in source_result]
             primary_source_id, primary_source_info, _, _ = source_result[0]
-            dest_peer_id = dest_info.get("peer_id", "")
             source_fee_ppm = primary_source_info.get("fee_ppm", 0)
+
+            # If hive route found, promote its source to primary position
+            if hive_source_scid:
+                hive_scid_norm = hive_source_scid.replace(":", "x")
+                for i, (cid, info, score, opp) in enumerate(source_result):
+                    if cid.replace(":", "x") == hive_scid_norm:
+                        if i > 0:
+                            source_result.insert(0, source_result.pop(i))
+                            source_scids = [s[0] for s in source_result]
+                            self.plugin.log(
+                                f"CAPEX_FALLBACK: Promoted {cid} to primary source (fleet route)",
+                                level='info',
+                            )
+                        primary_source_id, primary_source_info, _, _ = source_result[0]
+                        source_fee_ppm = primary_source_info.get("fee_ppm", 0)
+                        break
 
             candidate = RebalanceCandidate(
                 source_candidates=source_scids,
@@ -2033,6 +2068,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 source_turnover_rate=0.0,
                 reason_code=RebalanceReasonCode.CAPEX_FALLBACK.value,
                 bleeder_status="none",
+                hive_route_hops=hive_route_hops,
                 source_candidate_peer_ids=[
                     s[1].get("peer_id", "") for s in source_result
                 ],

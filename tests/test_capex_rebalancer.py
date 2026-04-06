@@ -34,6 +34,7 @@ def _make_rebalancer(capex_engine=None):
     rebalancer.config = mock_config
     rebalancer._profitability_analyzer = MagicMock()
     rebalancer._capex_engine = capex_engine
+    rebalancer._hive_router = None
     return rebalancer
 
 
