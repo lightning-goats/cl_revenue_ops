@@ -199,6 +199,7 @@ class PolicyManager:
         self.plugin = plugin
         self.hive_hints = None  # Injected by main plugin for corridor-aware policies
         self.rpc_cache = None
+        self.data_service = None  # Unified data service (injected by main plugin)
 
         # In-memory cache with write-through pattern (v2.0)
         self._cache: Dict[str, PeerPolicy] = {}

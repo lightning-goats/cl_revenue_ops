@@ -1500,11 +1500,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     from modules.rpc_cache import RpcCache
     rpc_cache = RpcCache(safe_plugin, ttl=30)
 
+    from modules.data_service import DataService
+    data_service = DataService(safe_plugin)
+
     if rebalancer is not None and hive_router is not None:
         rebalancer.hive_router = hive_router
 
     if hive_router is not None:
         hive_router.rpc_cache = rpc_cache
+        hive_router.data_service = data_service
         if profitability_analyzer is not None:
             hive_router.profitability_analyzer = profitability_analyzer
 
@@ -1519,17 +1523,23 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if rebalancer is not None:
         rebalancer.rebalance_executor = rebalance_executor
         rebalancer.rpc_cache = rpc_cache
+        rebalancer.data_service = data_service
         rebalancer.job_manager.rpc_cache = rpc_cache
+        rebalancer.job_manager.data_service = data_service
     plugin.log("RebalanceExecutor initialized - native rebalance engine enabled")
 
     if fee_controller is not None:
         fee_controller.rpc_cache = rpc_cache
+        fee_controller.data_service = data_service
     if profitability_analyzer is not None:
         profitability_analyzer.rpc_cache = rpc_cache
+        profitability_analyzer.data_service = data_service
     if policy_manager is not None:
         policy_manager.rpc_cache = rpc_cache
+        policy_manager.data_service = data_service
     if flow_analyzer is not None:
         flow_analyzer.rpc_cache = rpc_cache
+        flow_analyzer.data_service = data_service
 
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client

@@ -15,6 +15,7 @@ from .fee_controller import FeeController
 from .rebalancer import EVRebalancer, RebalanceCandidate
 from .config import Config
 from .database import Database
+from .data_service import DataService
 from .policy_manager import PolicyManager, FeeStrategy, RebalanceMode, PeerPolicy
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     'RebalanceCandidate',
     'Config',
     'Database',
+    'DataService',
     'PolicyManager',
     'FeeStrategy',
     'RebalanceMode',

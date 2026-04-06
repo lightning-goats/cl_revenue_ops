@@ -52,6 +52,7 @@ class HiveRouter:
         self._last_refresh: float = 0
         self.profitability_analyzer = None  # Injected by main plugin
         self.rpc_cache = None  # Injected by main plugin — shared RPC result cache
+        self.data_service = None  # Unified data service (injected by main plugin)
         # Fleet member channel balances from gossip (refreshed each cycle)
         self._fleet_balances: Dict[str, Dict] = {}  # peer_id -> {capacity_sats, available_sats, topology}
         # Route cache: avoid redundant getroutes calls within a cycle
