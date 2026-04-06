@@ -3285,7 +3285,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         if rebalance_id:
                             self.database.update_rebalance_result(
                                 rebalance_id, 'completed',
-                                actual_fee_sats=base_to_sats_floor(exec_result.fee_msat),
+                                actual_fee_sats=base_to_sats_ceil(exec_result.fee_msat),
                             )
                         # Success resets failure count so channel re-enters rotation
                         self.database.reset_failure_count(dest_channel)

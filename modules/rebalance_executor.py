@@ -18,7 +18,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from modules.rebalance_memory import RebalanceRoutingMemory
-from modules.utils import base_to_sats_floor, sats_to_base
+from modules.utils import base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
 
 class JobState(Enum):
@@ -692,7 +692,7 @@ class RebalanceExecutor:
                 self._log(
                     f"Fleet first-hop fee strip: {base_to_sats_floor(inflated)} -> "
                     f"{base_to_sats_floor(required_amount_msat)} sats "
-                    f"(removed {base_to_sats_floor(inflated - required_amount_msat)} sats "
+                    f"(removed {base_to_sats_ceil(inflated - required_amount_msat)} sats "
                     f"phantom channel fee)",
                 )
                 full_route[0]["amount_msat"] = required_amount_msat
@@ -803,8 +803,8 @@ class RebalanceExecutor:
                 if total_fee > job.max_fee_msat:
                     raise ValueError(
                         f"route_over_budget: {fee_ppm}ppm "
-                        f"({base_to_sats_floor(total_fee)} sats) "
-                        f"exceeds budget {base_to_sats_floor(job.max_fee_msat)} sats"
+                        f"({base_to_sats_ceil(total_fee)} sats) "
+                        f"exceeds budget {base_to_sats_ceil(job.max_fee_msat)} sats"
                     )
 
                 self._log(
@@ -870,7 +870,7 @@ class RebalanceExecutor:
 
                 self._log(
                     f"Job {job.job_id} SUCCESS: {candidate.to_channel} "
-                    f"fee={base_to_sats_floor(actual_fee)} sats ({actual_ppm}ppm) "
+                    f"fee={base_to_sats_ceil(actual_fee)} sats ({actual_ppm}ppm) "
                     f"{len(full_route)} hops",
                 )
                 return result
