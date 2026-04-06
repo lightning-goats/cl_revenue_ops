@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
+from .utils import sats_to_base
+
 
 @dataclass
 class HiveRoute:
@@ -254,7 +256,7 @@ class HiveRouter:
         if not our_id:
             return None
 
-        amount_msat = amount_sats * 1000
+        amount_msat = sats_to_base(amount_sats)
         max_fee_msat = amount_msat // 100  # 1% discovery cap
 
         try:
