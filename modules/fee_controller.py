@@ -65,7 +65,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .policy_manager import PolicyManager, FeeStrategy, PeerPolicy
-from .utils import parse_msat
+from .utils import parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -1772,7 +1772,7 @@ class FeeController:
                 if not (1 <= fee_ppm <= 10000):
                     continue
                 # Weight by capacity — bigger channels = more credible signal
-                capacity = max(1, ch.get("satoshis", ch.get("amount_msat", 1000000) // 1000))
+                capacity = max(1, ch.get("satoshis", base_to_sats_floor(ch.get("amount_msat", 1000000))))
                 weight = capacity / 1_000_000  # Normalize to BTC
                 weighted_fees.append((fee_ppm, weight))
 
@@ -1897,7 +1897,7 @@ class FeeController:
                 if not (1 <= fee_ppm <= 10000):
                     continue
                 # Weight by capacity (bigger channels = more credible signal)
-                capacity = max(1, ch.get("satoshis", ch.get("amount_msat", 1000000) // 1000))
+                capacity = max(1, ch.get("satoshis", base_to_sats_floor(ch.get("amount_msat", 1000000))))
                 # Weight by recency (recently updated = more active)
                 last_update = ch.get("last_update", 0)
                 age_days = max(0.1, max(0, now - last_update) / 86400) if last_update > 0 else 30.0
@@ -1944,7 +1944,7 @@ class FeeController:
             our_capacity = 0
             competitor_capacities = []
             for ch in all_channels:
-                cap = ch.get("satoshis", ch.get("amount_msat", 0) // 1000)
+                cap = ch.get("satoshis", base_to_sats_floor(ch.get("amount_msat", 0)))
                 if not cap or cap <= 0:
                     continue
                 if ch.get("source") == our_id:
@@ -2077,7 +2077,7 @@ class FeeController:
         self._refresh_askrene_cache(cfg)
         with self._askrene_lock:
             cache_snapshot = dict(self._askrene_cache)
-        threshold_msat = capacity_sats * 1000 * 0.20  # 20% of capacity
+        threshold_msat = sats_to_base(capacity_sats) * 0.20  # 20% of capacity
         for suffix in ("/0", "/1"):
             key = f"{channel_id}{suffix}"
             v = cache_snapshot.get(key)
@@ -3571,7 +3571,7 @@ class FeeController:
 
         # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity") or 2_000_000
-        spendable = parse_msat(channel_info.get("spendable_msat", 0)) // 1000
+        spendable = base_to_sats_floor(parse_msat(channel_info.get("spendable_msat", 0)))
         outbound_ratio = spendable / capacity if capacity > 0 else 0.5
         
         bucket = LiquidityBuckets.get_bucket(outbound_ratio)
@@ -4055,7 +4055,7 @@ class FeeController:
         # =====================================================================
         htlcmax_msat = None
         if getattr(cfg, 'enable_dynamic_htlcmax', False):
-            capacity_msat = channel_info.get("capacity", 0) * 1000
+            capacity_msat = sats_to_base(channel_info.get("capacity", 0))
             if capacity_msat > 0:
                 if flow_state == "source":
                     target_msat = int(capacity_msat * cfg.htlcmax_source_pct)
@@ -4069,7 +4069,7 @@ class FeeController:
 
                 self.plugin.log(
                     f"DYNAMIC_HTLCMAX: {channel_id[:12]}... is {flow_state}. "
-                    f"Set limit to {htlcmax_msat // 1000:,} sats",
+                    f"Set limit to {base_to_sats_floor(htlcmax_msat):,} sats",
                     level='debug'
                 )
 
@@ -4652,7 +4652,7 @@ class FeeController:
             channel_info = {
                 'channel_id': scid,
                 'peer_id': peer_id,
-                'capacity': int(total_msat) // 1000 if total_msat else 0,
+                'capacity': base_to_sats_floor(int(total_msat)) if total_msat else 0,
                 'spendable_msat': spendable_msat,
                 'receivable_msat': receivable_msat,
                 'fee_base_msat': fee_base,
@@ -5188,7 +5188,7 @@ class FeeController:
                     channels[channel_id] = {
                         "channel_id": channel_id,
                         "peer_id": channel.get("peer_id", ""),
-                        "capacity": int(total_msat) // 1000 if total_msat else 0,
+                        "capacity": base_to_sats_floor(int(total_msat)) if total_msat else 0,
                         "spendable_msat": spendable_msat,
                         "receivable_msat": receivable_msat,
                         "fee_base_msat": fee_base,
