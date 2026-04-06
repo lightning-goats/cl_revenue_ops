@@ -5571,6 +5571,174 @@ class Database:
             (op_id,),
         )
 
+    # ------------------------------------------------------------------
+    # Policy CRUD (replaces direct SQL in policy_manager.py)
+    # ------------------------------------------------------------------
+
+    def get_all_policies(self) -> list:
+        """Get all peer policies ordered by updated_at descending."""
+        conn = self._get_connection()
+        return conn.execute(
+            "SELECT * FROM peer_policies ORDER BY updated_at DESC"
+        ).fetchall()
+
+    def get_policy(self, peer_id: str):
+        """Get a single peer policy by peer_id. Returns row or None."""
+        conn = self._get_connection()
+        return conn.execute(
+            "SELECT * FROM peer_policies WHERE peer_id = ?", (peer_id,)
+        ).fetchone()
+
+    def upsert_policy(self, peer_id: str, strategy: str, rebalance_mode: str,
+                      fee_ppm_target: int, tags: str, updated_at: int,
+                      fee_multiplier_min: float, fee_multiplier_max: float,
+                      expires_at) -> None:
+        """Insert or replace a peer policy."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT OR REPLACE INTO peer_policies
+                (peer_id, strategy, rebalance_mode, fee_ppm_target, tags,
+                 updated_at, fee_multiplier_min, fee_multiplier_max, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (peer_id, strategy, rebalance_mode, fee_ppm_target, tags,
+              updated_at, fee_multiplier_min, fee_multiplier_max, expires_at))
+
+    def delete_policy(self, peer_id: str) -> bool:
+        """Delete a peer policy. Returns True if a row was deleted."""
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "DELETE FROM peer_policies WHERE peer_id = ?", (peer_id,)
+        )
+        return cursor.rowcount > 0
+
+    def delete_expired_policies(self, now: int) -> list:
+        """Delete expired policies. Returns list of deleted peer_ids."""
+        conn = self._get_connection()
+        expired_rows = conn.execute(
+            "SELECT peer_id FROM peer_policies WHERE expires_at IS NOT NULL AND expires_at < ?",
+            (now,)
+        ).fetchall()
+        if not expired_rows:
+            return []
+        conn.execute(
+            "DELETE FROM peer_policies WHERE expires_at IS NOT NULL AND expires_at < ?",
+            (now,)
+        )
+        return [row["peer_id"] for row in expired_rows]
+
+    def upsert_policies_batch(self, rows: list) -> None:
+        """Batch insert/replace peer policies atomically.
+
+        Args:
+            rows: List of tuples (peer_id, strategy, rebalance_mode,
+                  fee_ppm_target, tags, updated_at, fee_multiplier_min,
+                  fee_multiplier_max, expires_at)
+        """
+        conn = self._get_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany("""
+                INSERT OR REPLACE INTO peer_policies
+                    (peer_id, strategy, rebalance_mode, fee_ppm_target, tags,
+                     updated_at, fee_multiplier_min, fee_multiplier_max, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def get_policy_changes_since(self, since_timestamp: int) -> list:
+        """Get policy rows updated after the given timestamp."""
+        conn = self._get_connection()
+        return conn.execute("""
+            SELECT * FROM peer_policies
+            WHERE updated_at > ?
+            ORDER BY updated_at DESC
+        """, (since_timestamp,)).fetchall()
+
+    def get_last_policy_change_timestamp(self) -> int:
+        """Get the most recent updated_at across all policies. Returns 0 if empty."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT MAX(updated_at) as max_ts FROM peer_policies"
+        ).fetchone()
+        return (row["max_ts"] or 0) if row else 0
+
+    # ------------------------------------------------------------------
+    # Capex aggregation (replaces direct SQL in capex_budget.py)
+    # ------------------------------------------------------------------
+
+    def get_total_capex_by_channel(self, window_days: int = 30) -> dict:
+        """Get total capex per channel from rebalance_costs + spend_events.
+
+        Returns dict of channel_id -> total_sats.
+        """
+        since = int(time.time()) - (window_days * 86400)
+        result = {}
+        conn = self._get_connection()
+
+        rows = conn.execute("""
+            SELECT channel_id, COALESCE(SUM(cost_sats), 0) as total
+            FROM rebalance_costs
+            WHERE timestamp >= ?
+            GROUP BY channel_id
+        """, (since,)).fetchall()
+        for r in rows:
+            cid = r["channel_id"]
+            if cid:
+                result[cid] = result.get(cid, 0) + int(r["total"] or 0)
+
+        rows = conn.execute("""
+            SELECT channel_id, COALESCE(SUM(amount_sats), 0) as total
+            FROM spend_events
+            WHERE timestamp >= ? AND channel_id IS NOT NULL
+            GROUP BY channel_id
+        """, (since,)).fetchall()
+        for r in rows:
+            cid = r["channel_id"]
+            if cid:
+                result[cid] = result.get(cid, 0) + int(r["total"] or 0)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Orphan cleanup (replaces direct SQL in rebalancer.py)
+    # ------------------------------------------------------------------
+
+    def cleanup_orphaned_rebalances(self, timeout_seconds: int = 3600) -> list:
+        """Mark stale pending rebalances as failed. Returns list of orphaned IDs.
+
+        Finds rebalance_history rows with status 'pending' or 'pending_async'
+        older than timeout_seconds and marks them failed with
+        error_message='orphaned_on_restart'.
+        """
+        cutoff = int(time.time()) - timeout_seconds
+        conn = self._get_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            orphaned_rows = conn.execute("""
+                SELECT id FROM rebalance_history
+                WHERE status IN ('pending', 'pending_async')
+                  AND timestamp < ?
+            """, (cutoff,)).fetchall()
+            orphaned_ids = [row["id"] for row in orphaned_rows]
+
+            if orphaned_ids:
+                conn.execute("""
+                    UPDATE rebalance_history
+                    SET status = 'failed', error_message = 'orphaned_on_restart'
+                    WHERE status IN ('pending', 'pending_async')
+                      AND timestamp < ?
+                """, (cutoff,))
+
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        return orphaned_ids
+
     def close(self):
         """Close the thread-local database connection (if any).
 
