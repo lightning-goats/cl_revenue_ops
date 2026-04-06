@@ -49,6 +49,7 @@ from modules.policy_manager import (
     TACTICAL_POLICY_ACTIONS,
 )
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
+from modules.capex_budget import CapexBudgetEngine
 from modules.utils import normalize_scid, parse_msat
 
 
@@ -349,6 +350,7 @@ safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrap
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 hive_hints: Optional[HiveHintAdapter] = None  # cl_hive fleet hint adapter
+capex_engine: Optional[CapexBudgetEngine] = None  # Unified capex budget engine
 hive_router = None  # HiveRouter: shared askrene fleet route discovery
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
@@ -1107,7 +1109,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager, capex_engine
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -1510,6 +1512,23 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         capacity_planner.hive_hints = hive_hints
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
         capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
+
+    # Construct unified capex budget engine (after hive_hints are available)
+    capex_engine = CapexBudgetEngine(
+        profitability_analyzer=profitability_analyzer,
+        database=database,
+        config=config,
+        hive_hints=hive_hints,
+    )
+    plugin.log("CapexBudgetEngine initialized")
+
+    # Wire capex engine to all consumers
+    if rebalancer is not None:
+        rebalancer.set_capex_engine(capex_engine)
+    if capacity_planner is not None:
+        capacity_planner.set_capex_engine(capex_engine)
+    if boltz_manager is not None:
+        boltz_manager.set_capex_engine(capex_engine)
 
     # Hive Router (shared askrene fleet route discovery)
     global hive_router
