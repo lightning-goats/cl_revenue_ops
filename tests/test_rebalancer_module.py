@@ -192,6 +192,10 @@ class TestHiveLiquidityReporting:
 
         cfg = Config(dry_run=True)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
+        # Inject mock data_service
+        mock_ds = MagicMock()
+        mock_ds.datastore_push.return_value = True
+        r.data_service = mock_ds
 
         depleted_channels = [
             ("222x333x0", {"peer_id": "02" + "d" * 64, "capacity": 2_000_000}, 0.05),
@@ -202,12 +206,10 @@ class TestHiveLiquidityReporting:
 
         r._report_hive_liquidity_state(depleted_channels, source_channels, [])
 
-        # Liquidity state is now pushed to CLN datastore, not via cross-plugin RPC
-        ds_calls = [c for c in mock_plugin.rpc.datastore.call_args_list]
-        assert len(ds_calls) >= 1
-        # Verify the datastore key is correct
-        ds_key = ds_calls[0][1].get("key", ds_calls[0][0][0] if ds_calls[0][0] else None)
-        assert ds_key == ["revenue", "liquidity-state"]
+        # Liquidity state is now pushed via data_service.datastore_push
+        mock_ds.datastore_push.assert_called_once()
+        call_args = mock_ds.datastore_push.call_args
+        assert call_args[0][0] == ["revenue", "liquidity-state"]
 
     def test_find_rebalance_candidates_reports_state_even_without_profitable_candidates(
         self, mock_plugin, mock_database
@@ -221,6 +223,10 @@ class TestHiveLiquidityReporting:
             high_liquidity_threshold=0.8,
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
+        # Inject mock data_service
+        mock_ds = MagicMock()
+        mock_ds.datastore_push.return_value = True
+        r.data_service = mock_ds
 
         source_peer = "02" + "c" * 64
         dest_peer = "02" + "d" * 64
@@ -249,9 +255,8 @@ class TestHiveLiquidityReporting:
         result = r.find_rebalance_candidates()
 
         assert result == []
-        # Liquidity state pushed to datastore
-        ds_calls = [c for c in mock_plugin.rpc.datastore.call_args_list]
-        assert len(ds_calls) >= 1
+        # Liquidity state pushed via data_service.datastore_push
+        mock_ds.datastore_push.assert_called()
 
 
 

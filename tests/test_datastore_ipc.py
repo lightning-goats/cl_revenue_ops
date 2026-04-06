@@ -38,12 +38,16 @@ from modules.profitability_analyzer import (
 # ============================================================
 
 def _make_analyzer():
-    """Build an analyzer with mocked plugin, config, and database."""
+    """Build an analyzer with mocked plugin, config, database, and data_service."""
     plugin = MagicMock()
     config = MagicMock()
     config.estimated_open_cost_sats = 1000
     database = MagicMock()
     analyzer = ChannelProfitabilityAnalyzer(plugin, config, database)
+    # Inject a mock data_service so _push_profitability_summary uses it
+    data_service = MagicMock()
+    data_service.datastore_push.return_value = True
+    analyzer.data_service = data_service
     return analyzer, plugin, config, database
 
 
@@ -151,14 +155,13 @@ class TestPushProfitabilitySummary:
 
         analyzer._push_profitability_summary(results)
 
-        plugin.rpc.datastore.assert_called_once()
-        call_kwargs = plugin.rpc.datastore.call_args
-        # Check key
-        assert call_kwargs[1]["key"] == ["revenue", "profitability-summary"]
-        assert call_kwargs[1]["mode"] == "create-or-replace"
+        analyzer.data_service.datastore_push.assert_called_once()
+        call_args = analyzer.data_service.datastore_push.call_args
+        # Check key (first positional arg)
+        assert call_args[0][0] == ["revenue", "profitability-summary"]
 
-        # Parse and validate JSON payload
-        payload = json.loads(call_kwargs[1]["string"])
+        # Validate payload dict (second positional arg)
+        payload = call_args[0][1]
         assert "timestamp" in payload
         assert isinstance(payload["timestamp"], int)
         assert ch_id in payload["channels"]
@@ -188,7 +191,7 @@ class TestPushProfitabilitySummary:
 
         analyzer._push_profitability_summary(results)
 
-        payload = json.loads(plugin.rpc.datastore.call_args[1]["string"])
+        payload = analyzer.data_service.datastore_push.call_args[0][1]
         assert len(payload["channels"]) == 2
         assert payload["channels"]["200x2x0"]["class"] == "underwater"
         assert payload["channels"]["200x2x0"]["net_profit_sats"] == -1000
@@ -200,20 +203,21 @@ class TestPushProfitabilitySummary:
 
         analyzer._push_profitability_summary({})
 
-        payload = json.loads(plugin.rpc.datastore.call_args[1]["string"])
+        payload = analyzer.data_service.datastore_push.call_args[0][1]
         assert payload["channels"] == {}
         assert "timestamp" in payload
 
     def test_failure_does_not_raise(self):
-        """Datastore RPC failure is swallowed (fire-and-forget)."""
+        """Datastore push failure is swallowed (fire-and-forget via data_service)."""
         analyzer, plugin, _, _ = _make_analyzer()
         analyzer._cache_timestamp = int(time.time())
-        plugin.rpc.datastore.side_effect = Exception("datastore unavailable")
+        # data_service.datastore_push returns False on failure — never raises
+        analyzer.data_service.datastore_push.return_value = False
 
         # Should not raise
         analyzer._push_profitability_summary({"100x1x0": _make_profitability()})
 
-        plugin.log.assert_called()
+        analyzer.data_service.datastore_push.assert_called_once()
 
     def test_roi_rounded_to_two_decimals(self):
         """roi_pct is rounded to 2 decimal places."""
@@ -222,7 +226,7 @@ class TestPushProfitabilitySummary:
         p = _make_profitability(roi_percent=33.33333)
         analyzer._push_profitability_summary({"100x1x0": p})
 
-        payload = json.loads(plugin.rpc.datastore.call_args[1]["string"])
+        payload = analyzer.data_service.datastore_push.call_args[0][1]
         assert payload["channels"]["100x1x0"]["roi_pct"] == 33.33
 
 
@@ -243,20 +247,21 @@ class TestAnalyzeAllChannelsPush:
         # Results should contain our channel
         assert ch_id in results
 
-        # Datastore should have been called
-        plugin.rpc.datastore.assert_called_once()
-        call_kwargs = plugin.rpc.datastore.call_args[1]
-        assert call_kwargs["key"] == ["revenue", "profitability-summary"]
+        # data_service.datastore_push should have been called
+        analyzer.data_service.datastore_push.assert_called_once()
+        call_args = analyzer.data_service.datastore_push.call_args
+        assert call_args[0][0] == ["revenue", "profitability-summary"]
 
-        payload = json.loads(call_kwargs["string"])
+        payload = call_args[0][1]
         assert ch_id in payload["channels"]
 
     def test_push_failure_does_not_crash_analysis(self):
-        """Analysis returns results even when datastore push raises."""
+        """Analysis returns results even when datastore push returns False."""
         analyzer, plugin, config, database = _make_analyzer()
         ch_id = "100x1x0"
         _setup_integration_mocks(analyzer, plugin, config, database, ch_id)
-        plugin.rpc.datastore.side_effect = Exception("datastore broken")
+        # data_service.datastore_push returning False simulates a failed push
+        analyzer.data_service.datastore_push.return_value = False
 
         # Should NOT raise despite datastore failure
         results = analyzer.analyze_all_channels(force=True)
@@ -428,19 +433,20 @@ class TestDashboardPush:
         """
         Datastore failures in dashboard push are swallowed (fire-and-forget).
 
-        _push_dashboard_to_datastore() uses the same try/except-and-log pattern
-        as _push_profitability_summary().  We verify the pattern holds via the
-        profitability analyzer (which IS importable) as a structural proxy.
+        _push_dashboard_to_datastore() uses the same data_service.datastore_push
+        pattern as _push_profitability_summary().  We verify the pattern holds via
+        the profitability analyzer (which IS importable) as a structural proxy.
         """
         analyzer, plugin, _, _ = _make_analyzer()
         analyzer._cache_timestamp = int(time.time())
-        plugin.rpc.datastore.side_effect = Exception("datastore unavailable")
+        # data_service.datastore_push returns False on failure — never raises
+        analyzer.data_service.datastore_push.return_value = False
 
-        # Must not raise even though datastore is broken
+        # Must not raise even though datastore push failed
         analyzer._push_profitability_summary({"100x1x0": _make_profitability()})
 
-        # Error was logged, not re-raised
-        plugin.log.assert_called()
+        # push was attempted
+        analyzer.data_service.datastore_push.assert_called_once()
 
     def test_datastore_called_with_dashboard_key(self):
         """

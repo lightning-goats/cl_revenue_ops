@@ -610,14 +610,8 @@ class ChannelProfitabilityAnalyzer:
             "channels": channels,
         }
 
-        try:
-            self.plugin.rpc.datastore(
-                key=["revenue", "profitability-summary"],
-                string=_json.dumps(payload),
-                mode="create-or-replace",
-            )
-        except Exception:
-            self.plugin.log("Datastore push failed for profitability-summary", level="debug")
+        if self.data_service:
+            self.data_service.datastore_push(["revenue", "profitability-summary"], payload)
 
     def analyze_channel(self, channel_id: str,
                        channel_info: Optional[Dict] = None,

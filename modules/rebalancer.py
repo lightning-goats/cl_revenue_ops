@@ -565,15 +565,8 @@ class EVRebalancer:
             candidates,
         )
 
-        try:
-            import json as _json
-            self.plugin.rpc.datastore(
-                key=["revenue", "liquidity-state"],
-                string=_json.dumps(payload),
-                mode="create-or-replace",
-            )
-        except Exception as e:
-            self.plugin.log(f"HIVE: liquidity state datastore write failed: {e}", level='debug')
+        if self.data_service:
+            self.data_service.datastore_push(["revenue", "liquidity-state"], payload)
 
     def _get_hive_rebalance_bias(self, peer_id: str) -> float:
         """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""

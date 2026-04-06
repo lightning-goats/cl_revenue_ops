@@ -347,6 +347,7 @@ config: Optional[Config] = None
 profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
 capacity_planner: Optional[CapacityPlanner] = None
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
+data_service = None  # Unified data service (DataService instance)
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 hive_hints: Optional[HiveHintAdapter] = None  # cl_hive fleet hint adapter
@@ -1073,7 +1074,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager, capex_engine
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager, capex_engine, data_service
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -1941,28 +1942,17 @@ def run_fee_adjustment():
                     else {}
                 ),
             }
-            safe_plugin.rpc.datastore(
-                key=["revenue", "status"],
-                string=_json.dumps(status_data),
-                mode="create-or-replace",
-            )
+            if data_service:
+                data_service.datastore_push(["revenue", "status"], status_data)
 
             # Push fee bounds for cl-hive fee intelligence
-            try:
-                cfg_snap = config.snapshot() if config else None
-                if cfg_snap:
-                    safe_plugin.rpc.datastore(
-                        key=["revenue", "fee-bounds"],
-                        string=_json.dumps({
-                            "timestamp": int(time.time()),
-                            "min_fee_ppm": cfg_snap.min_fee_ppm,
-                            "max_fee_ppm": cfg_snap.max_fee_ppm,
-                            "mid_fee_ppm": (cfg_snap.min_fee_ppm + cfg_snap.max_fee_ppm) // 2,
-                        }),
-                        mode="create-or-replace",
-                    )
-            except Exception:
-                plugin.log("Datastore push failed for fee-bounds", level="debug")
+            cfg_snap = config.snapshot() if config else None
+            if cfg_snap and data_service:
+                data_service.datastore_push(["revenue", "fee-bounds"], {
+                    "min_fee_ppm": cfg_snap.min_fee_ppm,
+                    "max_fee_ppm": cfg_snap.max_fee_ppm,
+                    "mid_fee_ppm": (cfg_snap.min_fee_ppm + cfg_snap.max_fee_ppm) // 2,
+                })
 
             # NOTE: revenue-profitability is too large for datastore (47 channels
             # of detailed data).  The Bridge's get_profitability() call is
@@ -1980,20 +1970,16 @@ def run_fee_adjustment():
 
 def _push_dashboard_to_datastore() -> None:
     """Push 30-day dashboard snapshot to datastore for cl-hive."""
-    global safe_plugin, profitability_analyzer, database
+    global safe_plugin, profitability_analyzer, database, data_service
     if safe_plugin is None or profitability_analyzer is None or database is None:
         return
     try:
         dashboard = revenue_dashboard(plugin, window_days=30)
         if isinstance(dashboard, dict) and "error" not in dashboard:
-            dashboard["timestamp"] = int(time.time())
-            safe_plugin.rpc.datastore(
-                key=["revenue", "dashboard"],
-                string=json.dumps(dashboard),
-                mode="create-or-replace",
-            )
+            if data_service:
+                data_service.datastore_push(["revenue", "dashboard"], dashboard)
     except Exception:
-        plugin.log("Datastore push failed for dashboard", level="debug")
+        pass  # datastore_push handles its own error logging
 
 
 def run_rebalance_check():
@@ -4845,13 +4831,10 @@ def revenue_capex_status(plugin, **kwargs):
             "allocated_by_priority_sats": alloc.allocated_by_priority_sats,
             "channel_count": len(channels),
         }
-        plugin.rpc.datastore(
-            key=["revenue", "capex-summary"],
-            string=_json.dumps(summary),
-            mode="create-or-replace",
-        )
+        if data_service:
+            data_service.datastore_push(["revenue", "capex-summary"], summary)
     except Exception:
-        plugin.log("Datastore push failed for capex-summary", level="debug")
+        pass  # datastore_push handles its own error logging
 
     return result
 
