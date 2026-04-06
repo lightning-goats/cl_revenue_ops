@@ -47,44 +47,126 @@ class TestPlannerEngineInjection:
 class TestExplorationBudgetGate:
     """Opens gated by fleet exploration budget."""
 
+    def _make_planner_for_cycle(self, exploration_budget=0):
+        """Create a planner wired for a minimal execute_cycle open-path test."""
+        from modules.capacity_planner import CapacityPlanner
+        mock_plugin = MagicMock()
+        mock_profitability = MagicMock()
+        mock_profitability.analyze_all_channels.return_value = {}
+        mock_flow = MagicMock()
+        mock_flow.analyze_all_channels.return_value = {}
+
+        mock_config = MagicMock()
+        mock_config.planner_enabled = True
+        mock_config.planner_dry_run = True  # Dry run — no actual opens
+        mock_config.planner_max_opens_per_cycle = 5
+        mock_config.planner_max_closes_per_cycle = 0
+        mock_config.planner_min_channel_sats = 500_000
+        mock_config.planner_max_channel_sats = 10_000_000
+        mock_config.planner_reserve_pct = 0.20
+        mock_config.rebalance_max_amount = 5_000_000
+        mock_config.rebalance_min_amount = 50_000
+        mock_config.min_wallet_reserve = 500_000
+        mock_config.snapshot.return_value = mock_config
+
+        planner = CapacityPlanner(
+            plugin=mock_plugin,
+            profitability_analyzer=mock_profitability,
+            flow_analyzer=mock_flow,
+            config=mock_config,
+        )
+
+        if exploration_budget > 0:
+            mock_engine = MagicMock(spec=CapexBudgetEngine)
+            mock_engine.get_fleet_exploration_budget.return_value = exploration_budget
+            planner.set_capex_engine(mock_engine)
+
+        # Stub methods that call RPC or do complex logic
+        planner._check_fee_gate = MagicMock(return_value=(True, "ok"))
+        planner._identify_winners = MagicMock(return_value=[])
+        planner._identify_losers = MagicMock(return_value=[])
+        planner._check_portfolio_balance_gate = MagicMock(return_value="healthy")
+        planner._update_candidate_pool = MagicMock()
+        planner._evaluate_recycle_opportunities = MagicMock(return_value=None)
+        # _estimate_open_cost returns a fixed value for test predictability
+        planner._estimate_open_cost = MagicMock(return_value=5000)
+
+        return planner
+
     def test_candidate_share_below_open_cost_skipped(self):
         """When per-candidate exploration share < open cost, open is deferred."""
-        mock_engine = MagicMock(spec=CapexBudgetEngine)
-        mock_engine.get_fleet_exploration_budget.return_value = 1000
+        planner = self._make_planner_for_cycle(exploration_budget=1000)
 
-        candidates = [
-            {"peer_id": "02" + "a" * 64, "score": 50},
-            {"peer_id": "02" + "b" * 64, "score": 50},
-        ]
-        estimated_cost = 5000
+        # Stub discovery to return 2 equal-score candidates
+        planner._discover_peers = MagicMock(return_value=[
+            {"peer_id": "02" + "a" * 64, "score": 50, "reason": "test"},
+            {"peer_id": "02" + "b" * 64, "score": 50, "reason": "test"},
+        ])
 
-        skipped = []
-        total_score = sum(c.get("score", 0) for c in candidates)
-        for c in candidates:
-            share = int(1000 * (c["score"] / total_score))
-            if share < estimated_cost:
-                skipped.append(c["peer_id"])
+        # Stub listfunds for available sats
+        planner.plugin.rpc.listfunds.return_value = {
+            "outputs": [{"amount_msat": 10_000_000_000, "status": "confirmed"}],
+            "channels": [],
+        }
+        # Stub listpeerchannels
+        planner.plugin.rpc.listpeerchannels.return_value = {"channels": []}
 
-        assert len(skipped) == 2  # Both skipped, 500 < 5000
+        summary = planner.execute_cycle()
+
+        # Each candidate gets 500 sats share, open cost is 5000 → both skipped
+        exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
+        assert len(exploration_skips) == 2
 
     def test_sufficient_budget_allows_open(self):
-        """When per-candidate share >= open cost, open proceeds."""
-        mock_engine = MagicMock(spec=CapexBudgetEngine)
-        mock_engine.get_fleet_exploration_budget.return_value = 50000
+        """When per-candidate share >= open cost, open proceeds past budget gate."""
+        planner = self._make_planner_for_cycle(exploration_budget=50000)
 
-        total_score = 100
-        share = int(50000 * (100 / total_score))
-        assert share >= 5000  # 50000 >= 5000
+        planner._discover_peers = MagicMock(return_value=[
+            {"peer_id": "02" + "a" * 64, "score": 100, "reason": "test"},
+        ])
+
+        planner.plugin.rpc.listfunds.return_value = {
+            "outputs": [{"amount_msat": 10_000_000_000, "status": "confirmed"}],
+            "channels": [],
+        }
+        planner.plugin.rpc.listpeerchannels.return_value = {"channels": []}
+
+        # Stub remaining gates that would run after budget gate
+        planner._size_channel = MagicMock(return_value=1_000_000)
+        planner._calculate_open_ev = MagicMock(return_value=100)
+        planner._check_safety_guards = MagicMock(return_value=(True, "ok"))
+        planner._execute_open = MagicMock(return_value={"status": "dry_run", "action_id": 1})
+
+        summary = planner.execute_cycle()
+
+        # No exploration budget skips — candidate passed the gate
+        exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
+        assert len(exploration_skips) == 0
 
     def test_no_engine_skips_budget_gate(self):
         """Without engine, exploration budget gate is not applied."""
-        from modules.capacity_planner import CapacityPlanner
-        planner = CapacityPlanner(
-            plugin=MagicMock(),
-            profitability_analyzer=MagicMock(),
-            flow_analyzer=MagicMock(),
-        )
-        assert planner._capex_engine is None
+        planner = self._make_planner_for_cycle(exploration_budget=0)  # No engine
+
+        planner._discover_peers = MagicMock(return_value=[
+            {"peer_id": "02" + "a" * 64, "score": 100, "reason": "test"},
+        ])
+
+        planner.plugin.rpc.listfunds.return_value = {
+            "outputs": [{"amount_msat": 10_000_000_000, "status": "confirmed"}],
+            "channels": [],
+        }
+        planner.plugin.rpc.listpeerchannels.return_value = {"channels": []}
+
+        planner._size_channel = MagicMock(return_value=1_000_000)
+        planner._calculate_open_ev = MagicMock(return_value=100)
+        planner._check_safety_guards = MagicMock(return_value=(True, "ok"))
+        planner._execute_open = MagicMock(return_value={"status": "dry_run", "action_id": 1})
+
+        summary = planner.execute_cycle()
+
+        # No exploration budget skips — gate not applied
+        exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
+        assert len(exploration_skips) == 0
 
 
 class TestCloseCostRecording:

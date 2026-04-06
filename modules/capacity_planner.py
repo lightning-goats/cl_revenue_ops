@@ -67,7 +67,7 @@ class CapacityPlanner:
         self._cycle_channels_dest: Dict[str, list] = {}
         self._cycle_channels_source: Dict[str, list] = {}
 
-    def set_capex_engine(self, engine):
+    def set_capex_engine(self, engine: 'CapexBudgetEngine'):
         """Inject the unified capex budget engine."""
         self._capex_engine = engine
 
