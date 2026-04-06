@@ -270,3 +270,164 @@ class TestChannelCapexBudget:
         )
         assert budget == 0
         assert tier == "blocked"
+
+
+from modules.rebalancer import RebalanceReasonCode
+
+
+class TestCapexFallbackPass:
+    """_capex_fallback_pass re-evaluates destinations with capex budgets."""
+
+    def test_returns_candidate_for_proven_channel(self):
+        """Proven channel gets a capex candidate when EV rejected it."""
+        r = _make_rebalancer()
+
+        # Add required config fields for sizing
+        r.config.rebalance_max_amount = 5_000_000
+        r.config.rebalance_min_amount = 50_000
+
+        # Mock profitability data
+        mock_prof = MagicMock()
+        mock_prof.revenue.total_contribution_sats = 500
+        mock_prof.revenue.total_forward_count = 30
+        mock_prof.days_open = 60
+        mock_prof.classification.value = "profitable"
+        mock_prof.marginal_roi = 0.5
+        r._profitability_analyzer.get_profitability.return_value = mock_prof
+        r._profitability_analyzer.get_bleeder_status.return_value = MagicMock(
+            classification="none"
+        )
+
+        # Mock database
+        r.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 500_000,
+            'total_contribution_sats': 500,
+            'rebalance_cost_sats': 100,
+        }
+        r.database.get_channel_rebalance_success_rate.return_value = {
+            'success_rate': 0.8, 'total': 10
+        }
+
+        # Mock source selection to return one source (real signature)
+        source_scid = "200x1x0"
+        source_info = {
+            "peer_id": "02" + "b" * 64,
+            "capacity": 5_000_000,
+            "fee_ppm": 100,
+            "spendable": 3_000_000,
+        }
+        r._select_source_candidates = MagicMock(return_value=[
+            (source_scid, source_info, 50.0, 10)
+        ])
+
+        depleted = [
+            ("100x1x0", {
+                "peer_id": "02" + "a" * 64,
+                "capacity": 5_000_000,
+                "spendable": 500_000,
+                "fee_ppm": 100,
+            }, 0.10),
+        ]
+        source_channels = [
+            (source_scid, source_info, 0.80),
+        ]
+
+        candidates = r._capex_fallback_pass(
+            depleted_channels=depleted,
+            source_channels=source_channels,
+            active_channels=set(),
+            available_slots=5,
+            cfg=r.config,
+        )
+
+        assert len(candidates) >= 1
+        c = candidates[0]
+        assert c.reason_code == "capex_fallback"
+        assert c.max_budget_sats > 0
+        assert c.max_fee_ppm <= 2000
+
+    def test_blocked_channel_skipped(self):
+        """Zombie channel gets no capex candidate."""
+        r = _make_rebalancer()
+        r.config.rebalance_max_amount = 5_000_000
+        r.config.rebalance_min_amount = 50_000
+
+        mock_prof = MagicMock()
+        mock_prof.revenue.total_contribution_sats = 0
+        mock_prof.revenue.total_forward_count = 0
+        mock_prof.days_open = 90
+        mock_prof.classification.value = "zombie"
+        mock_prof.marginal_roi = -1.0
+        r._profitability_analyzer.get_profitability.return_value = mock_prof
+        r._profitability_analyzer.get_bleeder_status.return_value = MagicMock(
+            classification="none"
+        )
+        r.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 0,
+            'total_contribution_sats': 0,
+            'rebalance_cost_sats': 0,
+        }
+        r.database.get_channel_rebalance_success_rate.return_value = None
+
+        depleted = [
+            ("100x1x0", {
+                "peer_id": "02" + "a" * 64,
+                "capacity": 5_000_000,
+                "spendable": 500_000,
+                "fee_ppm": 100,
+            }, 0.10),
+        ]
+
+        candidates = r._capex_fallback_pass(
+            depleted_channels=depleted,
+            source_channels=[],
+            active_channels=set(),
+            available_slots=5,
+            cfg=r.config,
+        )
+
+        assert len(candidates) == 0
+
+    def test_zero_budget_channel_skipped(self):
+        """Channel with exhausted budget gets no candidate."""
+        r = _make_rebalancer()
+        r.config.rebalance_max_amount = 5_000_000
+        r.config.rebalance_min_amount = 50_000
+
+        mock_prof = MagicMock()
+        mock_prof.revenue.total_contribution_sats = 200
+        mock_prof.revenue.total_forward_count = 20
+        mock_prof.days_open = 60
+        mock_prof.classification.value = "break_even"
+        mock_prof.marginal_roi = 0.0
+        r._profitability_analyzer.get_profitability.return_value = mock_prof
+        r._profitability_analyzer.get_bleeder_status.return_value = MagicMock(
+            classification="none"
+        )
+        r.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 200_000,
+            'total_contribution_sats': 200,
+            'rebalance_cost_sats': 100,  # 200*0.5 - 100 = 0
+        }
+        r.database.get_channel_rebalance_success_rate.return_value = {
+            'success_rate': 1.0, 'total': 5
+        }
+
+        depleted = [
+            ("100x1x0", {
+                "peer_id": "02" + "a" * 64,
+                "capacity": 5_000_000,
+                "spendable": 500_000,
+                "fee_ppm": 100,
+            }, 0.10),
+        ]
+
+        candidates = r._capex_fallback_pass(
+            depleted_channels=depleted,
+            source_channels=[],
+            active_channels=set(),
+            available_slots=5,
+            cfg=r.config,
+        )
+
+        assert len(candidates) == 0

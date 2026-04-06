@@ -65,6 +65,7 @@ class RebalanceReasonCode(Enum):
     """
     # Success codes (rebalance was attempted)
     EV_POSITIVE = "ev_positive"                   # Normal EV-positive rebalance
+    CAPEX_FALLBACK = "capex_fallback"             # Capex-aware fallback rebalance
 
     # Skip codes (rebalance was not attempted)
     SKIP_HARD_BLEEDER = "skip_hard_bleeder"       # Channel is a hard bleeder (rebal_cost > 2x revenue)
@@ -3447,6 +3448,176 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
         budget = int(raw_budget * discount)
         return (budget, tier, tier_ppm)
+
+    def _capex_fallback_pass(
+        self,
+        depleted_channels: list,
+        source_channels: list,
+        active_channels: set,
+        available_slots: int,
+        cfg=None,
+    ) -> list:
+        """Capex fallback: re-evaluate depleted channels with cost-ceiling budgets.
+
+        Called when the EV profit gate found 0 profitable candidates. Uses
+        per-channel budgets from _calculate_channel_capex_budget instead of
+        per-trade profit requirements.
+        """
+        if cfg is None:
+            cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+
+        candidates = []
+        evaluated = 0
+        skipped_blocked = 0
+        skipped_no_budget = 0
+        skipped_no_sources = 0
+
+        for dest_id, dest_info, dest_ratio in depleted_channels:
+            if dest_id in active_channels:
+                continue
+            if len(candidates) >= available_slots:
+                break
+
+            evaluated += 1
+
+            # Get profitability data for budget calculation
+            prof = None
+            if self._profitability_analyzer:
+                try:
+                    prof = self._profitability_analyzer.get_profitability(dest_id)
+                except Exception:
+                    pass
+
+            if prof is None:
+                skipped_blocked += 1
+                continue
+
+            # Get 30d P&L for contribution and cost data
+            try:
+                pnl = self.database.get_channel_full_pnl(dest_id, window_days=30)
+            except Exception:
+                skipped_blocked += 1
+                continue
+
+            contribution_sats = pnl.get('total_contribution_sats',
+                                        pnl.get('total_contribution_msat', 0) // 1000)
+            rebalance_cost = pnl.get('rebalance_cost_sats', 0)
+
+            # Get success rate
+            sr_data = self.database.get_channel_rebalance_success_rate(dest_id, 30)
+            success_rate = sr_data['success_rate'] if sr_data and sr_data.get('total', 0) >= 3 else None
+
+            # Get bleeder status
+            bleeder_status = "none"
+            try:
+                bleeder = self._profitability_analyzer.get_bleeder_status(dest_id)
+                if bleeder:
+                    bleeder_status = bleeder.classification
+            except Exception:
+                pass
+
+            # Calculate capex budget
+            budget, tier, tier_ppm = self._calculate_channel_capex_budget(
+                channel_id=dest_id,
+                total_contribution_30d_sats=contribution_sats,
+                rebalance_cost_30d_sats=rebalance_cost,
+                total_forward_count_30d=prof.revenue.total_forward_count,
+                capacity_sats=dest_info.get("capacity", 0),
+                days_open=prof.days_open,
+                classification=prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
+                bleeder_status=bleeder_status,
+                marginal_roi=getattr(prof, 'marginal_roi', 0.0),
+                success_rate=success_rate,
+            )
+
+            if budget <= 0:
+                if tier == "blocked":
+                    skipped_blocked += 1
+                else:
+                    skipped_no_budget += 1
+                continue
+
+            # Determine rebalance amount
+            capacity = dest_info.get("capacity", 0)
+            spendable = dest_info.get("spendable", 0)
+            headroom = capacity - spendable
+            if headroom <= 0:
+                continue
+
+            amount_needed = min(
+                int(capacity * 0.5) - spendable,  # Target 50% outbound
+                cfg.rebalance_max_amount,
+            )
+            amount_needed = max(cfg.rebalance_min_amount, amount_needed)
+            amount_needed = min(amount_needed, headroom)
+            if amount_needed < cfg.rebalance_min_amount:
+                continue
+
+            # Per-rebalance fee ceiling
+            ppm_cap_sats = (amount_needed * tier_ppm) // 1_000_000
+            max_fee_sats = min(budget, max(1, ppm_cap_sats))
+            max_fee_msat = max_fee_sats * 1000
+            max_fee_ppm = min(tier_ppm, (max_fee_sats * 1_000_000) // max(1, amount_needed))
+
+            # Find source channels — call with actual signature
+            outbound_fee_ppm = dest_info.get("fee_ppm", 0)
+            source_tuples = [(s[0], s[1], s[2] if len(s) > 2 else 0.0) for s in source_channels]
+            try:
+                source_result = self._select_source_candidates(
+                    sources=source_tuples,
+                    amount_needed=amount_needed,
+                    dest_channel=dest_id,
+                    dest_outbound_fee_ppm=outbound_fee_ppm,
+                    dest_inbound_fee_ppm=0,
+                )
+            except Exception:
+                source_result = []
+
+            if not source_result:
+                skipped_no_sources += 1
+                continue
+
+            source_scids = [s[0] for s in source_result]
+            primary_source_id, primary_source_info, _, _ = source_result[0]
+            dest_peer_id = dest_info.get("peer_id", "")
+            source_fee_ppm = primary_source_info.get("fee_ppm", 0)
+
+            candidate = RebalanceCandidate(
+                source_candidates=source_scids,
+                to_channel=dest_id,
+                primary_source_peer_id=primary_source_info.get("peer_id", ""),
+                to_peer_id=dest_peer_id,
+                amount_sats=amount_needed,
+                amount_msat=amount_needed * 1000,
+                outbound_fee_ppm=outbound_fee_ppm,
+                inbound_fee_ppm=0,
+                source_fee_ppm=source_fee_ppm,
+                weighted_opp_cost_ppm=0,
+                spread_ppm=0,
+                max_budget_sats=max_fee_sats,
+                max_budget_msat=max_fee_msat,
+                max_fee_ppm=max_fee_ppm,
+                expected_profit_sats=0,
+                liquidity_ratio=dest_ratio,
+                dest_flow_state="unknown",
+                dest_turnover_rate=0.0,
+                source_turnover_rate=0.0,
+                reason_code=RebalanceReasonCode.CAPEX_FALLBACK.value,
+                bleeder_status=bleeder_status,
+                source_candidate_peer_ids=[
+                    s[1].get("peer_id", "") for s in source_result
+                ],
+            )
+            candidates.append(candidate)
+
+        self.plugin.log(
+            f"CAPEX_FALLBACK: evaluated={evaluated}, selected={len(candidates)}, "
+            f"blocked={skipped_blocked}, no_budget={skipped_no_budget}, "
+            f"no_sources={skipped_no_sources}",
+            level='info'
+        )
+
+        return candidates
 
     def _calculate_turnover_rate(self, channel_id: str, capacity: int) -> float:
         if capacity <= 0: 
