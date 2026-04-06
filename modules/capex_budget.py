@@ -26,6 +26,13 @@ from typing import Dict, Optional
 MSAT_PER_SAT = 1000
 
 
+def _classify(obj) -> str:
+    """Extract classification string from enum or string."""
+    if hasattr(obj, 'value'):
+        return str(obj.value)
+    return str(obj).rsplit('.', 1)[-1].lower()
+
+
 @dataclass
 class ChannelCapexBudget:
     """Per-channel capex budget computed by the engine."""
@@ -141,7 +148,7 @@ class CapexBudgetEngine:
 
             # Depleted earner detection
             if contribution_msat > 100 * MSAT_PER_SAT:
-                classification = prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification)
+                classification = _classify(prof.classification)
                 if classification in ("underwater", "stagnant_candidate"):
                     has_depleted_earners = True
 
@@ -273,7 +280,7 @@ class CapexBudgetEngine:
         cfg,
     ) -> ChannelCapexBudget:
         """Compute budget for a single channel (all arithmetic in msat)."""
-        classification = prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification)
+        classification = _classify(prof.classification)
         contribution_msat = prof.revenue.total_contribution_msat
         total_fwd = prof.revenue.total_forward_count
         days_open = prof.days_open
