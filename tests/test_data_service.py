@@ -238,3 +238,65 @@ class TestMediumTier:
         ds._cache["listfunds"]["ts"] -= 60
         ds.get_funds()
         assert plugin.rpc.listfunds.call_count == 2
+
+
+class TestLongTier:
+    """5-minute TTL: listnodes, askrene-listlayers, feerates."""
+
+    def test_get_node_info(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listnodes.return_value = {
+            "nodes": [{"nodeid": "abc", "alias": "PeerNode"}]
+        }
+        ds = DataService(plugin)
+        result = ds.get_node_info("abc")
+        assert result == {"nodes": [{"nodeid": "abc", "alias": "PeerNode"}]}
+        ds.get_node_info("abc")
+        plugin.rpc.listnodes.assert_called_once()
+
+    def test_get_node_info_different_ids_separate_cache(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listnodes.return_value = {"nodes": []}
+        ds = DataService(plugin)
+        ds.get_node_info("abc")
+        ds.get_node_info("def")
+        assert plugin.rpc.listnodes.call_count == 2
+
+    def test_get_askrene_layers(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"layers": [{"layer": "auto.localchans"}]}
+        ds = DataService(plugin)
+        result = ds.get_askrene_layers()
+        assert "layers" in result
+        ds.get_askrene_layers()
+        plugin.rpc.call.assert_called_once()
+
+    def test_get_feerates(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.feerates.return_value = {
+            "perkb": {"opening": 1000, "mutual_close": 500}
+        }
+        ds = DataService(plugin)
+        result = ds.get_feerates()
+        assert "perkb" in result
+        ds.get_feerates()
+        plugin.rpc.feerates.assert_called_once()
+
+    def test_long_tier_uses_5min_ttl(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.feerates.return_value = {"perkb": {}}
+        ds = DataService(plugin)
+        ds.get_feerates()
+        # Still fresh at 4 minutes
+        ds._cache["feerates:perkb"]["ts"] -= 240
+        ds.get_feerates()
+        plugin.rpc.feerates.assert_called_once()
+        # Stale at 6 minutes
+        ds._cache["feerates:perkb"]["ts"] -= 120
+        ds.get_feerates()
+        assert plugin.rpc.feerates.call_count == 2

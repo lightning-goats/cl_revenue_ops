@@ -204,3 +204,37 @@ class DataService:
         height = result.get("blockheight", 0)
         self._set_cached(key, height)
         return height
+
+    # ------------------------------------------------------------------
+    # Long tier — 5 minute TTL
+    # ------------------------------------------------------------------
+
+    def get_node_info(self, node_id: str) -> Dict:
+        """Node metadata from gossip. Cached 5min per node_id."""
+        key = f"listnodes:{node_id}"
+        cached = self._get_cached(key, TTL_LONG)
+        if cached is not None:
+            return cached
+        result = self._plugin.rpc.listnodes(id=node_id)
+        self._set_cached(key, result)
+        return result
+
+    def get_askrene_layers(self) -> Dict:
+        """Available askrene route planning layers. Cached 5min."""
+        key = "askrene-listlayers"
+        cached = self._get_cached(key, TTL_LONG)
+        if cached is not None:
+            return cached
+        result = self._plugin.rpc.call("askrene-listlayers", {})
+        self._set_cached(key, result)
+        return result
+
+    def get_feerates(self, style: str = "perkb") -> Dict:
+        """On-chain fee estimates. Cached 5min."""
+        key = f"feerates:{style}"
+        cached = self._get_cached(key, TTL_LONG)
+        if cached is not None:
+            return cached
+        result = self._plugin.rpc.feerates(style=style)
+        self._set_cached(key, result)
+        return result
