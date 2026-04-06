@@ -542,3 +542,37 @@ class TestMsatPrecision:
     def test_msat_constant_exported(self):
         """MSAT_PER_SAT constant is available for consumers."""
         assert MSAT_PER_SAT == 1000
+
+
+class TestCapexStatusOutput:
+    """Verify capex status output format matches RPC contract."""
+
+    def test_allocations_has_required_fields(self):
+        """CapexAllocations has all fields needed for RPC output."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=500_000,
+                    fees_earned_msat=500_000,
+                    total_forward_count=50,
+                ),
+            },
+        )
+        alloc = engine.compute_allocations()
+
+        # Required fields for RPC output
+        assert hasattr(alloc, 'priority_class')
+        assert hasattr(alloc, 'global_envelope_sats')
+        assert hasattr(alloc, 'fleet_exploration_budget_sats')
+        assert hasattr(alloc, 'tactical_budget_sats')
+        assert hasattr(alloc, 'total_fleet_contribution_sats')
+        assert hasattr(alloc, 'allocated_by_priority_sats')
+        assert hasattr(alloc, 'channel_budgets')
+
+        # Channel budget fields
+        for ch_id, b in alloc.channel_budgets.items():
+            assert hasattr(b, 'budget_sats')
+            assert hasattr(b, 'tier')
+            assert hasattr(b, 'tier_ppm')
+            assert hasattr(b, 'priority_class')
+            assert hasattr(b, 'hive_multiplier')

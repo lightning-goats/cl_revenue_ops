@@ -4830,6 +4830,68 @@ def revenue_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[
         return {"error": str(e)}
 
 
+@plugin.method("revenue-capex-status")
+def revenue_capex_status(plugin, **kwargs):
+    """Return unified capex budget allocations.
+
+    Shows per-channel budgets, fleet exploration budget, tactical budget,
+    priority class, and global envelope. Pushes summary to datastore.
+    """
+    global capex_engine
+    if capex_engine is None:
+        return {"error": "Capex engine not initialized"}
+
+    try:
+        alloc = capex_engine.compute_allocations()
+    except Exception as e:
+        return {"error": f"Allocation failed: {e}"}
+
+    # Format channel budgets
+    channels = {}
+    for ch_id, b in alloc.channel_budgets.items():
+        channels[ch_id] = {
+            "budget_sats": b.budget_sats,
+            "tier": b.tier,
+            "tier_ppm": b.tier_ppm,
+            "priority_class": b.priority_class,
+            "hive_multiplier": b.hive_multiplier,
+        }
+
+    result = {
+        "priority_class": alloc.priority_class,
+        "global_envelope_sats": alloc.global_envelope_sats,
+        "fleet_exploration_budget_sats": alloc.fleet_exploration_budget_sats,
+        "tactical_budget_sats": alloc.tactical_budget_sats,
+        "total_fleet_contribution_sats": alloc.total_fleet_contribution_sats,
+        "allocated_by_priority_sats": alloc.allocated_by_priority_sats,
+        "channel_count": len(channels),
+        "channels": channels,
+    }
+
+    # Push to datastore for MCP consumption
+    try:
+        import json as _json
+        summary = {
+            "timestamp": int(time.time()),
+            "priority_class": alloc.priority_class,
+            "global_envelope_sats": alloc.global_envelope_sats,
+            "fleet_exploration_budget_sats": alloc.fleet_exploration_budget_sats,
+            "tactical_budget_sats": alloc.tactical_budget_sats,
+            "total_fleet_contribution_sats": alloc.total_fleet_contribution_sats,
+            "allocated_by_priority_sats": alloc.allocated_by_priority_sats,
+            "channel_count": len(channels),
+        }
+        plugin.rpc.datastore(
+            key=["revenue", "capex-summary"],
+            string=_json.dumps(summary),
+            mode="create-or-replace",
+        )
+    except Exception:
+        plugin.log("Datastore push failed for capex-summary", level="debug")
+
+    return result
+
+
 @plugin.method("revenue-spend-ledger")
 def revenue_spend_ledger(
     plugin: Plugin,
