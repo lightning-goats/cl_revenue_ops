@@ -51,7 +51,6 @@ class HiveRouter:
         self._our_id: Optional[str] = None
         self._last_refresh: float = 0
         self.profitability_analyzer = None  # Injected by main plugin
-        self.rpc_cache = None  # Injected by main plugin — shared RPC result cache
         self.data_service = None  # Unified data service (injected by main plugin)
         # Fleet member channel balances from gossip (refreshed each cycle)
         self._fleet_balances: Dict[str, Dict] = {}  # peer_id -> {capacity_sats, available_sats, topology}
@@ -60,9 +59,7 @@ class HiveRouter:
         self._route_cache_ts: float = 0
 
     def _listpeerchannels(self) -> Dict:
-        """Use cached listpeerchannels when available."""
-        if self.rpc_cache:
-            return self.rpc_cache.listpeerchannels()
+        """Use data_service for listpeerchannels when available."""
         if self.data_service:
             return self.data_service.get_peer_channels()
         return self.plugin.rpc.listpeerchannels()

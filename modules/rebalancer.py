@@ -434,7 +434,6 @@ class EVRebalancer:
         self.hive_hints = None
         self._hive_router = None  # HiveRouter for fleet route discovery
         self.rebalance_executor = None  # RebalanceExecutor (safe explicit-route executor)
-        self.rpc_cache = None  # Shared RPC cache (injected by main plugin)
         self.data_service = None  # Unified data service (injected by main plugin)
 
 

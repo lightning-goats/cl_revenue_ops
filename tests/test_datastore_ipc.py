@@ -65,11 +65,7 @@ def _setup_integration_mocks(analyzer, plugin, config, database, ch_id="100x1x0"
             "opener": "local",
         }]
     }
-    # RPC cache for listpeerchannels (fallback)
-    rpc_cache = MagicMock()
-    rpc_cache.listpeerchannels.return_value = channels_response
-    analyzer.rpc_cache = rpc_cache
-    # data_service.get_peer_channels (primary path)
+    # data_service.get_peer_channels
     analyzer.data_service.get_peer_channels.return_value = channels_response
 
     # Bookkeeper (income_events)

@@ -1231,6 +1231,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     safe_plugin = ThreadSafePluginProxy(plugin)
     plugin.log("Thread-safe RPC proxy initialized", level="info")
 
+    from modules.data_service import DataService
+    data_service = DataService(safe_plugin)
+
     # Optional Boltz CLI integration (manual quotes/swaps, wallet ops).
     try:
         boltz_cfg = BoltzCliConfig(
@@ -1265,12 +1268,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # =========================================================================
     try:
         # Try modern 'plugin list' command first, fallback to 'listplugins' for older nodes
-        try:
-            # Modern CLN (v23.08+)
-            plugins_result = safe_plugin.rpc.plugin("list")
-        except RpcError:
-            # Fallback for older CLN versions
-            plugins_result = safe_plugin.rpc.listplugins()
+        plugins_result = data_service.list_plugins()
             
         active_plugins = [p.get("name", "").lower() for p in plugins_result.get("plugins", [])]
         
@@ -1353,7 +1351,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             hydration_floor = now - (max_hydration_days * 86400)
             start_time = max(start_time, hydration_floor)
             try:
-                result = safe_plugin.rpc.listforwards(status="settled")
+                result = data_service.get_forwards(status="settled")
             except Exception as e:
                 plugin.log(f"Warning: listforwards RPC failed during hydration: {e}. "
                            f"Flow analysis will use existing database data only.", level='warn')
@@ -1391,11 +1389,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Snapshot currently connected peers for baseline state on restart
     # This establishes a known state for uptime tracking after plugin restarts
     try:
-        peers = safe_plugin.rpc.listpeers()
+        peers = data_service.get_peers()
         total_peers = len(peers.get("peers", []))
         connected_peers = 0
         snapshot_count = 0
-        
+
         plugin.log(f"Checking {total_peers} peers for connection snapshot...")
         
         for peer in peers.get("peers", []):
@@ -1496,19 +1494,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hive_router = HiveRouter(safe_plugin, hive_hints)
         plugin.log("HiveRouter initialized - fleet route discovery enabled")
 
-    # Shared RPC cache: deduplicates expensive RPCs (listpeerchannels, listfunds, etc.)
-    # across modules within a 30-second window.  Reduces RPC load from ~15 to ~3 per cycle.
-    from modules.rpc_cache import RpcCache
-    rpc_cache = RpcCache(safe_plugin, ttl=30)
-
-    from modules.data_service import DataService
-    data_service = DataService(safe_plugin)
-
     if rebalancer is not None and hive_router is not None:
         rebalancer.hive_router = hive_router
 
     if hive_router is not None:
-        hive_router.rpc_cache = rpc_cache
         hive_router.data_service = data_service
         if profitability_analyzer is not None:
             hive_router.profitability_analyzer = profitability_analyzer
@@ -1524,21 +1513,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     rebalance_executor.data_service = data_service
     if rebalancer is not None:
         rebalancer.rebalance_executor = rebalance_executor
-        rebalancer.rpc_cache = rpc_cache
         rebalancer.data_service = data_service
     plugin.log("RebalanceExecutor initialized - native rebalance engine enabled")
 
     if fee_controller is not None:
-        fee_controller.rpc_cache = rpc_cache
         fee_controller.data_service = data_service
     if profitability_analyzer is not None:
-        profitability_analyzer.rpc_cache = rpc_cache
         profitability_analyzer.data_service = data_service
     if policy_manager is not None:
-        policy_manager.rpc_cache = rpc_cache
         policy_manager.data_service = data_service
     if flow_analyzer is not None:
-        flow_analyzer.rpc_cache = rpc_cache
         flow_analyzer.data_service = data_service
     if capacity_planner is not None:
         capacity_planner.data_service = data_service
@@ -1778,10 +1762,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
         
         try:
-            peers = safe_plugin.rpc.listpeers()
+            peers = data_service.get_peers() if data_service else safe_plugin.rpc.listpeers()
             connected_count = 0
             snapshot_count = 0
-            
+
             for peer in peers.get("peers", []):
                 if peer.get("connected", False):
                     connected_count += 1
@@ -2146,7 +2130,7 @@ def revenue_rebalance_debug(
 
     # Check capital controls
     try:
-        listfunds = safe_plugin.rpc.listfunds()
+        listfunds = data_service.get_funds() if data_service else safe_plugin.rpc.listfunds()
         onchain_sats = sum(
             (_parse_msat(o.get("amount_msat", 0)) // 1000)
             for o in listfunds.get("outputs", [])
@@ -3873,7 +3857,7 @@ def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
         # Get all currently open channels
         open_ids = set()
         try:
-            channels = safe_plugin.rpc.call("listpeerchannels")
+            channels = data_service.get_peer_channels() if data_service else safe_plugin.rpc.call("listpeerchannels")
             for ch in channels.get('channels', []):
                 scid = normalize_scid(ch.get('short_channel_id', ''))
                 if scid:
@@ -3896,7 +3880,7 @@ def revenue_cleanup_closed(plugin: Plugin) -> Dict[str, Any]:
         # Get closure info from listclosedchannels
         closed_info = {}
         try:
-            closed_list = safe_plugin.rpc.call("listclosedchannels")
+            closed_list = data_service.get_closed_channels() if data_service else safe_plugin.rpc.call("listclosedchannels")
             for ch in closed_list.get('closedchannels', []):
                 scid = normalize_scid(ch.get('short_channel_id', ''))
                 if scid:
@@ -4044,7 +4028,7 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
                 return _scid_to_peer_cache[scid_norm]
 
         try:
-            result = safe_plugin.rpc.listpeerchannels()
+            result = data_service.get_peer_channels() if data_service else safe_plugin.rpc.listpeerchannels()
             new_cache = {}
             for channel in result.get("channels", []):
                 channel_scid = channel.get("short_channel_id") or channel.get("channel_id")
@@ -4106,14 +4090,19 @@ def _resolve_event_channel_scid(event: Dict[str, Any]) -> Optional[str]:
         return None
 
     # Try open channels first (likely for ONCHAIN/FUNDING_SPEND_SEEN transitions)
-    peer_payloads = []
+    # Try per-peer first (filtered), then all channels as fallback
+    peer_queries = []
     if isinstance(peer_id, str) and len(peer_id) == 66:
-        peer_payloads.append({"id": peer_id})
-    peer_payloads.append({})
+        peer_queries.append(peer_id)
+    peer_queries.append(None)  # None = all channels
 
-    for payload in peer_payloads:
+    for query_peer_id in peer_queries:
         try:
-            channels = safe_plugin.rpc.call("listpeerchannels", payload).get("channels", [])
+            if data_service:
+                channels = data_service.get_peer_channels(query_peer_id).get("channels", [])
+            else:
+                payload = {"id": query_peer_id} if query_peer_id else {}
+                channels = safe_plugin.rpc.call("listpeerchannels", payload).get("channels", [])
             scid = _match_scid_from_channels(channels)
             if scid:
                 return scid
@@ -4123,7 +4112,8 @@ def _resolve_event_channel_scid(event: Dict[str, Any]) -> Optional[str]:
 
     # Fallback for CLOSED events where the channel may already be gone
     try:
-        closed = safe_plugin.rpc.call("listclosedchannels").get("closedchannels", [])
+        closed_result = data_service.get_closed_channels() if data_service else safe_plugin.rpc.call("listclosedchannels")
+        closed = closed_result.get("closedchannels", [])
         for ch in closed:
             if not isinstance(ch, dict):
                 continue
@@ -4609,13 +4599,13 @@ def _get_closure_costs_from_bookkeeper(bkpr_account: str) -> Optional[Dict[str, 
         Dict with closure_fee_sats, htlc_sweep_fee_sats, funding_txid, closing_txid
         or None if bookkeeper unavailable
     """
-    global safe_plugin
+    global safe_plugin, data_service
 
     if safe_plugin is None:
         return None
 
     try:
-        result = safe_plugin.rpc.call("bkpr-inspect", {"account": bkpr_account})
+        result = data_service.bkpr_inspect(bkpr_account) if data_service else safe_plugin.rpc.call("bkpr-inspect", {"account": bkpr_account})
 
         if not result or "txs" not in result:
             return None
@@ -4719,8 +4709,8 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
         capacity_sats = 0
         if safe_plugin:
             try:
-                closed = safe_plugin.rpc.call("listclosedchannels")
-                for ch in closed.get('closedchannels', []):
+                closed_result = data_service.get_closed_channels() if data_service else safe_plugin.rpc.call("listclosedchannels")
+                for ch in closed_result.get('closedchannels', []):
                     if normalize_scid(ch.get('short_channel_id', '')) == channel_id:
                         capacity_sats = _parse_msat(ch.get('total_msat', 0)) // 1000
                         if not peer_id:
@@ -5498,7 +5488,7 @@ def _boltz_dynamic_channel_tuning(*,
 def _get_confirmed_onchain_sats() -> int:
     """Return confirmed on-chain wallet outputs in sats from CLN listfunds."""
     try:
-        lf = safe_plugin.rpc.listfunds()
+        lf = data_service.get_funds() if data_service else safe_plugin.rpc.listfunds()
     except Exception as e:
         plugin.log(f"listfunds RPC failed for onchain balance: {e}", level='debug')
         return 0

@@ -664,7 +664,6 @@ class FlowAnalyzer:
         self.plugin = plugin
         self.config = config
         self.database = database
-        self.rpc_cache = None
         self.data_service = None  # Unified data service (injected by main plugin)
         # v2.1: Kalman filter state cache (channel_id -> KalmanFlowFilter)
         self._kalman_filters: Dict[str, KalmanFlowFilter] = {}

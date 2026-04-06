@@ -1635,7 +1635,6 @@ class FeeController:
         self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
         self.temporary_fee_overlay_active = temporary_fee_overlay_active
-        self.rpc_cache = None
         self.data_service = None  # Unified data service (injected by main plugin)
         if self.policy_manager and hasattr(self.policy_manager, "register_on_change"):
             try:

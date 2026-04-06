@@ -476,7 +476,6 @@ class ChannelProfitabilityAnalyzer:
         self.config = config
         self.database = database
         self.hive_hints = None  # Injected by main plugin for routing-aware classification
-        self.rpc_cache = None
         self.data_service = None  # Unified data service (injected by main plugin)
 
         # Cache for profitability data (refreshed periodically)
