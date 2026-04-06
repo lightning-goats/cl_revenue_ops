@@ -1540,6 +1540,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if flow_analyzer is not None:
         flow_analyzer.rpc_cache = rpc_cache
         flow_analyzer.data_service = data_service
+    if capacity_planner is not None:
+        capacity_planner.data_service = data_service
 
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client

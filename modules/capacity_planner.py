@@ -47,6 +47,7 @@ class CapacityPlanner:
         self.config = config
         self.rebalancer = None
         self.hive_hints = None  # Injected by main plugin
+        self.data_service = None  # Injected by main plugin
         # Unified budget provider: injected by main plugin for cross-module budget gating
         self.global_budget_limit_provider = None
         self.external_liquidity_cost_provider = None
@@ -158,9 +159,9 @@ class CapacityPlanner:
             return cache[peer_id]
         try:
             if direction == "destination":
-                result = self.plugin.rpc.listchannels(destination=peer_id).get("channels", [])
+                result = (self.data_service.get_channels(destination=peer_id) if self.data_service else self.plugin.rpc.listchannels(destination=peer_id)).get("channels", [])
             else:
-                result = self.plugin.rpc.listchannels(source=peer_id).get("channels", [])
+                result = (self.data_service.get_channels(source=peer_id) if self.data_service else self.plugin.rpc.listchannels(source=peer_id)).get("channels", [])
         except Exception:
             result = []
         cache[peer_id] = result
@@ -171,7 +172,8 @@ class CapacityPlanner:
         if peer_id in self._cycle_nodes_by_id:
             return self._cycle_nodes_by_id[peer_id]
         try:
-            nodes = self.plugin.rpc.listnodes(id=peer_id).get("nodes", [])
+            rpc_result = self.data_service.get_node_info(peer_id) if self.data_service else self.plugin.rpc.listnodes(id=peer_id)
+            nodes = rpc_result.get("nodes", [])
             if nodes:
                 self._cycle_nodes_by_id[peer_id] = nodes[0]
                 return nodes[0]
@@ -310,7 +312,7 @@ class CapacityPlanner:
         # 5. Check portfolio balance before opening
         portfolio_state = "healthy"
         try:
-            peer_channels = self.plugin.rpc.listpeerchannels().get("channels", [])
+            peer_channels = (self.data_service.get_peer_channels() if self.data_service else self.plugin.rpc.listpeerchannels()).get("channels", [])
             portfolio_state = self._check_portfolio_balance_gate(peer_channels)
             if portfolio_state == "watch":
                 self.plugin.log(f"Portfolio balance governor: {portfolio_state} — opens permitted with warning", level='info')
@@ -332,7 +334,7 @@ class CapacityPlanner:
             # Get available funds for sizing
             available_sats = 0
             try:
-                funds = self.plugin.rpc.listfunds()
+                funds = self.data_service.get_funds() if self.data_service else self.plugin.rpc.listfunds()
                 confirmed = sum(
                     base_to_sats_floor(parse_msat(o.get("amount_msat", 0)))
                     for o in funds.get("outputs", [])
@@ -455,7 +457,7 @@ class CapacityPlanner:
     def _get_mempool_recommendation(self) -> str:
         """Query feerates and return a graduated recommendation based on opening costs."""
         try:
-            feerates = self.plugin.rpc.feerates(style="perkb")
+            feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
             perkb = feerates.get("perkb", {})
             # opening fee in perkb, we want sat/vB (divide by 1000)
             opening_kvb = perkb.get("opening", 1000)
@@ -919,8 +921,7 @@ class CapacityPlanner:
 
         # Get our own node ID
         try:
-            info = self.plugin.rpc.getinfo()
-            our_node_id = info.get("id")
+            our_node_id = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id")
         except Exception:
             return []
 
@@ -990,7 +991,7 @@ class CapacityPlanner:
         No bulk gossip fetches — only uses data already in memory.
         """
         try:
-            our_node_id = self.plugin.rpc.getinfo().get("id")
+            our_node_id = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id")
         except Exception:
             return []
 
@@ -1041,7 +1042,7 @@ class CapacityPlanner:
             return []
 
         try:
-            our_node_id = self.plugin.rpc.getinfo().get("id")
+            our_node_id = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id")
         except Exception:
             return []
 
@@ -1196,8 +1197,7 @@ class CapacityPlanner:
         # Age gate: >60 days
         try:
             open_block = int(scid.split("x")[0])
-            info = self.plugin.rpc.getinfo()
-            current_block = info.get("blockheight", 0)
+            current_block = self.data_service.get_block_height() if self.data_service else self.plugin.rpc.getinfo().get("blockheight", 0)
             age_days = (current_block - open_block) * 10 / 1440
             if age_days < 60:
                 return False, f"Channel age {age_days:.0f}d < 60d minimum"
@@ -1244,7 +1244,7 @@ class CapacityPlanner:
 
         # On-chain costs
         try:
-            feerates = self.plugin.rpc.feerates(style="perkb")
+            feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
             sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
             close_cost = int(sat_per_vb * 200)
             open_cost = int(sat_per_vb * 140)
@@ -1544,7 +1544,7 @@ class CapacityPlanner:
     def _check_fee_gate(self, cfg) -> tuple:
         """Check on-chain fee rate is acceptable. Returns (ok, reason)."""
         try:
-            feerates = self.plugin.rpc.feerates(style="perkb")
+            feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
             opening_kvb = feerates.get("perkb", {}).get("opening", 1000)
             sat_per_vb = opening_kvb / 1000.0
             if sat_per_vb > cfg.planner_max_fee_rate_sat_vb:
@@ -1556,7 +1556,7 @@ class CapacityPlanner:
     def _check_reserve(self, cfg, required_sats: int) -> tuple:
         """Check on-chain balance has sufficient reserve after operation."""
         try:
-            funds = self.plugin.rpc.listfunds()
+            funds = self.data_service.get_funds() if self.data_service else self.plugin.rpc.listfunds()
             confirmed = sum(
                 base_to_sats_floor(parse_msat(o.get("amount_msat", 0)))
                 for o in funds.get("outputs", [])
@@ -1766,7 +1766,7 @@ class CapacityPlanner:
 
         # Estimate on-chain costs
         try:
-            feerates = self.plugin.rpc.feerates(style="perkb")
+            feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
             sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
             open_cost = int(sat_per_vb * 140)   # ~140 vbytes for open tx
             close_cost = int(sat_per_vb * 200)  # ~200 vbytes for close tx
@@ -1833,7 +1833,7 @@ class CapacityPlanner:
     def _estimate_open_cost(self) -> int:
         """Estimate the on-chain cost of opening a channel."""
         try:
-            feerates = self.plugin.rpc.feerates(style="perkb")
+            feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
             sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
             return int(sat_per_vb * 140)  # ~140 vbytes for funding tx
         except Exception:
@@ -1860,7 +1860,7 @@ class CapacityPlanner:
         if request_amt and compact_lease:
             params["request_amt"] = request_amt
             params["compact_lease"] = compact_lease
-        return self.plugin.rpc.call("fundchannel", params)
+        return self.data_service.fund_channel(**params) if self.data_service else self.plugin.rpc.call("fundchannel", params)
 
     def _execute_open(self, peer_id: str, amount_sats: int, cfg, reason: str) -> Dict:
         """Execute a channel open via fundchannel RPC.
@@ -1989,7 +1989,7 @@ class CapacityPlanner:
             if retry_amount and retry_amount > amount_sats and retry_amount <= cfg.planner_max_channel_sats:
                 # Check if we can afford the retry
                 try:
-                    funds = self.plugin.rpc.listfunds()
+                    funds = self.data_service.get_funds() if self.data_service else self.plugin.rpc.listfunds()
                     onchain = sum(
                         base_to_sats_floor(parse_msat(o.get("amount_msat", 0)))
                         for o in funds.get("outputs", [])
@@ -2176,4 +2176,4 @@ class CapacityPlanner:
             return {"action_id": action_id, "status": "failed", "error": str(e)}
 
     def _rpc_close(self, channel_id: str) -> Dict[str, Any]:
-        return self.plugin.rpc.call("close", {"id": channel_id})
+        return self.data_service.close_channel(id=channel_id) if self.data_service else self.plugin.rpc.call("close", {"id": channel_id})
