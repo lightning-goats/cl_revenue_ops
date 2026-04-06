@@ -238,3 +238,156 @@ class DataService:
         result = self._plugin.rpc.feerates(style=style)
         self._set_cached(key, result)
         return result
+
+    # ------------------------------------------------------------------
+    # Never cached — transactional, always live
+    # ------------------------------------------------------------------
+
+    # --- Channel management ---
+
+    def set_channel(self, **kwargs) -> Dict:
+        """Set channel fees/htlc params. Invalidates peer channels cache."""
+        result = self._plugin.rpc.setchannel(**kwargs)
+        self.invalidate("listpeerchannels")
+        return result
+
+    def fund_channel(self, **kwargs) -> Dict:
+        """Open a new channel. Invalidates funds + peer channels cache."""
+        result = self._plugin.rpc.call("fundchannel", kwargs)
+        self.invalidate("listfunds")
+        self.invalidate("listpeerchannels")
+        return result
+
+    def close_channel(self, **kwargs) -> Dict:
+        """Close a channel. Invalidates funds + peer channels cache."""
+        result = self._plugin.rpc.call("close", kwargs)
+        self.invalidate("listfunds")
+        self.invalidate("listpeerchannels")
+        return result
+
+    # --- Route discovery ---
+
+    def get_route(self, node_id: str, amount_msat: int, **kwargs) -> Dict:
+        """Discover route to node. Never cached (amount-dependent)."""
+        return self._plugin.rpc.getroute(node_id, amount_msat, **kwargs)
+
+    def get_routes(self, **kwargs) -> Dict:
+        """Multi-route search via askrene. Never cached."""
+        return self._plugin.rpc.call("getroutes", kwargs)
+
+    # --- Payment lifecycle ---
+
+    def create_invoice(self, amount_msat: int, label: str, description: str,
+                       **kwargs) -> Dict:
+        """Create a payment invoice."""
+        return self._plugin.rpc.invoice(amount_msat, label, description, **kwargs)
+
+    def send_pay(self, route: List, payment_hash: str, **kwargs) -> Dict:
+        """Send payment along explicit route."""
+        return self._plugin.rpc.sendpay(route, payment_hash, **kwargs)
+
+    def wait_send_pay(self, payment_hash: str, timeout: int = 120, **kwargs) -> Dict:
+        """Wait for payment to complete or fail."""
+        return self._plugin.rpc.waitsendpay(payment_hash, timeout, **kwargs)
+
+    def delete_pay(self, payment_hash: str, status: str) -> Dict:
+        """Delete a payment record."""
+        return self._plugin.rpc.delpay(payment_hash, status)
+
+    def delete_invoice(self, label: str, status: str) -> Dict:
+        """Delete an invoice."""
+        return self._plugin.rpc.delinvoice(label, status)
+
+    def pay(self, bolt11: str, **kwargs) -> Dict:
+        """Pay a bolt11 invoice."""
+        params = {"bolt11": bolt11, **kwargs}
+        return self._plugin.rpc.call("pay", params)
+
+    def list_pays(self, **kwargs) -> Dict:
+        """List payment attempts."""
+        return self._plugin.rpc.call("listpays", kwargs if kwargs else {})
+
+    def decode(self, string: str) -> Dict:
+        """Decode a bolt11/bolt12 invoice or rune."""
+        return self._plugin.rpc.call("decode", {"string": string})
+
+    # --- Bookkeeper ---
+
+    def bkpr_inspect(self, account: str) -> Dict:
+        """Inspect bookkeeper account."""
+        return self._plugin.rpc.call("bkpr-inspect", {"account": account})
+
+    def bkpr_list_account_events(self, account: str = None) -> Dict:
+        """List bookkeeper account events."""
+        params = {}
+        if account:
+            params["account"] = account
+        return self._plugin.rpc.call("bkpr-listaccountevents", params)
+
+    # --- Askrene mutation operations ---
+
+    def askrene_create_layer(self, layer: str) -> Dict:
+        """Create an askrene route planning layer. Invalidates layers cache."""
+        result = self._plugin.rpc.call("askrene-create-layer", {"layer": layer})
+        self.invalidate("askrene-listlayers")
+        return result
+
+    def askrene_remove_layer(self, layer: str) -> Dict:
+        """Remove an askrene layer. Invalidates layers cache."""
+        result = self._plugin.rpc.call("askrene-remove-layer", {"layer": layer})
+        self.invalidate("askrene-listlayers")
+        return result
+
+    def askrene_update_channel(self, layer: str, short_channel_id_dir: str,
+                                **kwargs) -> Dict:
+        """Set channel constraints in an askrene layer."""
+        params = {"layer": layer, "short_channel_id_dir": short_channel_id_dir,
+                  **kwargs}
+        return self._plugin.rpc.call("askrene-update-channel", params)
+
+    def askrene_bias_node(self, layer: str, node: str, description: str,
+                           **kwargs) -> Dict:
+        """Bias a node in route finding."""
+        params = {"layer": layer, "node": node, "description": description,
+                  **kwargs}
+        return self._plugin.rpc.call("askrene-bias-node", params)
+
+    def askrene_bias_channel(self, layer: str, short_channel_id_dir: str,
+                              description: str, **kwargs) -> Dict:
+        """Bias a channel's fees in route finding."""
+        params = {"layer": layer, "short_channel_id_dir": short_channel_id_dir,
+                  "description": description, **kwargs}
+        return self._plugin.rpc.call("askrene-bias-channel", params)
+
+    def askrene_inform_channel(self, layer: str, short_channel_id_dir: str,
+                                amount_msat: int, inform: str) -> Dict:
+        """Inform askrene about channel capacity observation."""
+        params = {"layer": layer, "short_channel_id_dir": short_channel_id_dir,
+                  "amount_msat": amount_msat, "inform": inform}
+        return self._plugin.rpc.call("askrene-inform-channel", params)
+
+    def askrene_reserve(self, path: List) -> Dict:
+        """Reserve a route in askrene."""
+        return self._plugin.rpc.call("askrene-reserve", {"path": path})
+
+    def askrene_unreserve(self, path: List) -> Dict:
+        """Release a reserved route in askrene."""
+        return self._plugin.rpc.call("askrene-unreserve", {"path": path})
+
+    # --- Datastore (raw passthrough for reads) ---
+
+    def list_datastore(self, key: List[str]) -> Dict:
+        """Read from CLN datastore. Not cached."""
+        return self._plugin.rpc.listdatastore(key=key)
+
+    # --- Misc ---
+
+    def list_plugins(self) -> Dict:
+        """List loaded plugins."""
+        try:
+            return self._plugin.rpc.plugin("list")
+        except Exception:
+            try:
+                return self._plugin.rpc.listplugins()
+            except Exception:
+                return {"plugins": []}

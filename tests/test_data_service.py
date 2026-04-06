@@ -300,3 +300,220 @@ class TestLongTier:
         ds._cache["feerates:perkb"]["ts"] -= 120
         ds.get_feerates()
         assert plugin.rpc.feerates.call_count == 2
+
+
+class TestNeverCachedTier:
+    """Transactional operations — always pass through, invalidate relevant caches."""
+
+    def test_set_channel_passes_through(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.setchannel.return_value = {"channels": []}
+        ds = DataService(plugin)
+        result = ds.set_channel(id="100x1x0", feebase=0, feeppm=500)
+        assert result == {"channels": []}
+        plugin.rpc.setchannel.assert_called_once_with(id="100x1x0", feebase=0, feeppm=500)
+
+    def test_set_channel_invalidates_peer_channels_cache(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        plugin.rpc.setchannel.return_value = {"channels": []}
+        ds = DataService(plugin)
+        ds.get_peer_channels()  # populate cache
+        ds.set_channel(id="100x1x0", feeppm=500)
+        ds.get_peer_channels()  # should re-fetch
+        assert plugin.rpc.listpeerchannels.call_count == 2
+
+    def test_fund_channel_invalidates_funds_and_channels(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listfunds.return_value = {"channels": []}
+        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        plugin.rpc.call.return_value = {"tx": "abc", "txid": "def"}
+        ds = DataService(plugin)
+        ds.get_funds()
+        ds.get_peer_channels()
+        ds.fund_channel(id="abc123", amount=1000000)
+        ds.get_funds()
+        ds.get_peer_channels()
+        assert plugin.rpc.listfunds.call_count == 2
+        assert plugin.rpc.listpeerchannels.call_count == 2
+
+    def test_close_channel_invalidates_funds_and_channels(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listfunds.return_value = {"channels": []}
+        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        plugin.rpc.call.return_value = {"type": "mutual"}
+        ds = DataService(plugin)
+        ds.get_funds()
+        ds.get_peer_channels()
+        ds.close_channel(id="100x1x0")
+        ds.get_funds()
+        ds.get_peer_channels()
+        assert plugin.rpc.listfunds.call_count == 2
+        assert plugin.rpc.listpeerchannels.call_count == 2
+
+    def test_get_route_never_cached(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.getroute.return_value = {"route": []}
+        ds = DataService(plugin)
+        ds.get_route("abc", 1000, riskfactor=10)
+        ds.get_route("abc", 1000, riskfactor=10)
+        assert plugin.rpc.getroute.call_count == 2
+
+    def test_get_routes_never_cached(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"routes": []}
+        ds = DataService(plugin)
+        ds.get_routes(source="a", destination="b", amount_msat=1000)
+        ds.get_routes(source="a", destination="b", amount_msat=1000)
+        assert plugin.rpc.call.call_count == 2
+
+    def test_create_invoice(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.invoice.return_value = {"bolt11": "lnbc...", "payment_hash": "abc"}
+        ds = DataService(plugin)
+        result = ds.create_invoice(1000, "test-label", "test desc")
+        assert result["bolt11"] == "lnbc..."
+
+    def test_send_pay(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.sendpay.return_value = {"status": "pending"}
+        ds = DataService(plugin)
+        result = ds.send_pay(route=[{"id": "abc"}], payment_hash="hash123")
+        assert result["status"] == "pending"
+
+    def test_wait_send_pay(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.waitsendpay.return_value = {"status": "complete"}
+        ds = DataService(plugin)
+        result = ds.wait_send_pay("hash123", timeout=60)
+        assert result["status"] == "complete"
+
+    def test_delete_pay(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.delpay.return_value = {"payments": []}
+        ds = DataService(plugin)
+        ds.delete_pay("hash123", "failed")
+        plugin.rpc.delpay.assert_called_once_with("hash123", "failed")
+
+    def test_delete_invoice(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.delinvoice.return_value = {}
+        ds = DataService(plugin)
+        ds.delete_invoice("label123", "unpaid")
+        plugin.rpc.delinvoice.assert_called_once_with("label123", "unpaid")
+
+    def test_pay(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"status": "complete"}
+        ds = DataService(plugin)
+        result = ds.pay(bolt11="lnbc...")
+        assert result["status"] == "complete"
+
+    def test_list_pays(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"pays": []}
+        ds = DataService(plugin)
+        result = ds.list_pays()
+        assert "pays" in result
+
+    def test_decode(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"type": "bolt11"}
+        ds = DataService(plugin)
+        result = ds.decode("lnbc...")
+        assert result["type"] == "bolt11"
+
+
+class TestAskrenePassthrough:
+    """Askrene mutation operations — uncached, some invalidate layers cache."""
+
+    def test_askrene_create_layer(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"layers": []}
+        ds = DataService(plugin)
+        ds.askrene_create_layer("test-layer")
+        plugin.rpc.call.assert_called_with("askrene-create-layer", {"layer": "test-layer"})
+
+    def test_askrene_remove_layer(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {}
+        ds = DataService(plugin)
+        ds.askrene_remove_layer("test-layer")
+        plugin.rpc.call.assert_called_with("askrene-remove-layer", {"layer": "test-layer"})
+
+    def test_askrene_create_invalidates_layers_cache(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"layers": []}
+        ds = DataService(plugin)
+        ds.get_askrene_layers()
+        ds.askrene_create_layer("new-layer")
+        ds.get_askrene_layers()
+        assert plugin.rpc.call.call_count == 3
+
+    def test_askrene_update_channel(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {}
+        ds = DataService(plugin)
+        ds.askrene_update_channel(layer="test", short_channel_id_dir="100x1x0/0",
+                                   enabled=True)
+        plugin.rpc.call.assert_called_once()
+
+    def test_askrene_bias_node(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {}
+        ds = DataService(plugin)
+        ds.askrene_bias_node(layer="test", node="abc", description="test", feebasefactor=0.5)
+        plugin.rpc.call.assert_called_once()
+
+    def test_askrene_bias_channel(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {}
+        ds = DataService(plugin)
+        ds.askrene_bias_channel(layer="test", short_channel_id_dir="100x1x0/0",
+                                 description="test", feebasefactor=0.5)
+        plugin.rpc.call.assert_called_once()
+
+    def test_askrene_inform_channel(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {}
+        ds = DataService(plugin)
+        ds.askrene_inform_channel(layer="test", short_channel_id_dir="100x1x0/0",
+                                   amount_msat=1000, inform="unconstrained")
+        plugin.rpc.call.assert_called_once()
+
+    def test_askrene_reserve(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {}
+        ds = DataService(plugin)
+        ds.askrene_reserve(path=[{"short_channel_id_dir": "100x1x0/0"}])
+        plugin.rpc.call.assert_called_once()
+
+    def test_askrene_unreserve(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {}
+        ds = DataService(plugin)
+        ds.askrene_unreserve(path=[{"short_channel_id_dir": "100x1x0/0"}])
+        plugin.rpc.call.assert_called_once()
