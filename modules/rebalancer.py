@@ -1936,13 +1936,6 @@ class EVRebalancer:
         self.rebalance_executor = None  # RebalanceExecutor (safe explicit-route executor)
         self.rpc_cache = None  # Shared RPC cache (injected by main plugin)
 
-        # Log deprecation notices for replaced config fields
-        if hasattr(self.config, 'enable_proportional_budget') and self.config.enable_proportional_budget:
-            self.plugin.log(
-                "DEPRECATION: enable_proportional_budget is superseded by capex per-channel budgets. "
-                "Set daily_budget_sats=0 to fully delegate to per-channel budgets.",
-                level='info'
-            )
 
     @property
     def hive_router(self):
@@ -4513,15 +4506,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 budget_window_hours = max(1, int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24))
                 since_24h = now - (budget_window_hours * 3600)
 
-                # Calculate effective budget (same logic as _check_capital_controls)
                 effective_budget = cfg.daily_budget_sats
-                if cfg.enable_proportional_budget:
-                    revenue_24h_msat = self.database.get_total_routing_revenue(since_24h)
-                    revenue_24h = revenue_24h_msat // 1000
-                    proportional_budget = int(revenue_24h * cfg.proportional_budget_pct)
-                    effective_budget = max(cfg.daily_budget_sats, proportional_budget)
-                # Only override with global provider if one is configured;
-                # otherwise preserve the proportional budget calculated above.
+                # Only override with global provider if one is configured.
                 if getattr(self, "global_budget_limit_provider", None) is not None:
                     effective_budget = self._get_global_budget_limit(cfg)
 
@@ -4558,11 +4544,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
                 # Compute effective weekly budget for atomic reservation
                 _effective_weekly = cfg.weekly_budget_sats
-                if cfg.enable_proportional_budget:
-                    _weekly_rev_msat = self.database.get_total_routing_revenue(now - 7 * 86400)
-                    _weekly_rev = _weekly_rev_msat // 1000
-                    _prop_weekly = int(_weekly_rev * cfg.proportional_budget_pct)
-                    _effective_weekly = max(cfg.weekly_budget_sats, _prop_weekly)
 
                 reserved, remaining = self.database.reserve_budget(
                     reservation_id=str(rebalance_id),
@@ -5010,31 +4991,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 )
 
             # --- Budget check (DB-only, no RPC needed) ---
-            # Calculate effective daily budget
-            # If proportional budget enabled: max(fixed_floor, revenue_24h * percentage)
-            effective_budget = cfg.daily_budget_sats
-
-            # R-R6-1 FIX: Compute budget_window_hours once, used by both
-            # proportional budget and fee-spent check below.
             now = int(time.time())
             budget_window_hours = max(1, int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24))
 
-            if cfg.enable_proportional_budget:
-                # E4 FIX: Use configurable budget window, matching execute_rebalance (line 3760)
-                # instead of hardcoded 86400 which ignores total_cost_budget_window_hours.
-                revenue_window_msat = self.database.get_total_routing_revenue(now - (budget_window_hours * 3600))
-                revenue_window = revenue_window_msat // 1000
-                proportional_budget = int(revenue_window * cfg.proportional_budget_pct)
-                effective_budget = max(cfg.daily_budget_sats, proportional_budget)
-
-                self.plugin.log(
-                    f"CAPITAL CONTROL: Revenue-proportional budget active. "
-                    f"Revenue {budget_window_hours}h: {revenue_window} sats, {cfg.proportional_budget_pct*100:.1f}% = {proportional_budget} sats, "
-                    f"Effective budget: {effective_budget} sats (floor: {cfg.daily_budget_sats})",
-                    level='debug'
-                )
-            # Only override with global provider if one is configured;
-            # otherwise preserve the proportional budget calculated above.
+            effective_budget = cfg.daily_budget_sats
+            # Only override with global provider if one is configured.
             if getattr(self, "global_budget_limit_provider", None) is not None:
                 effective_budget = self._get_global_budget_limit(cfg)
 
@@ -5063,18 +5024,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
             # --- Weekly budget check ---
             effective_weekly = cfg.weekly_budget_sats
-
-            if cfg.enable_proportional_budget:
-                weekly_revenue_msat = self.database.get_total_routing_revenue(now - 7 * 86400)
-                weekly_revenue = weekly_revenue_msat // 1000
-                proportional_weekly = int(weekly_revenue * cfg.proportional_budget_pct)
-                effective_weekly = max(cfg.weekly_budget_sats, proportional_weekly)
-                self.plugin.log(
-                    f"CAPITAL CONTROL: Proportional weekly budget. "
-                    f"Revenue 7d: {weekly_revenue} sats, {cfg.proportional_budget_pct*100:.1f}% = {proportional_weekly} sats, "
-                    f"Effective weekly: {effective_weekly} sats (floor: {cfg.weekly_budget_sats})",
-                    level='debug'
-                )
 
             weekly_fees_spent = self.database.get_total_rebalance_fees(now - 7 * 86400)
             # B2 FIX: ext_spent is a 24h figure. Scale to 7d for weekly comparison.
