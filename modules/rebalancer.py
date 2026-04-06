@@ -603,6 +603,18 @@ class EVRebalancer:
         return False
 
     @staticmethod
+    def _classify_error(error_msg: str) -> str:
+        """Classify a rebalance error message for failure-informed routing."""
+        msg = error_msg.lower()
+        if any(s in msg for s in ("no route", "no_route", "unknown_next_peer", "no path", "no channels")):
+            return "no_route"
+        if any(s in msg for s in ("timeout", "timed out", "deadline")):
+            return "timeout"
+        if any(s in msg for s in ("route_over_budget", "budget", "exceeded")):
+            return "budget_exceeded"
+        return "other"
+
+    @staticmethod
     def _apply_fee_escalation(ev_max_fee_ppm: int, fail_count: int, last_attempted_ppm: int) -> int:
         """
         Escalate fee budget based on failure history.
@@ -3149,12 +3161,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                                 rebalance_id, 'completed',
                                 actual_fee_sats=base_to_sats_floor(exec_result.fee_msat),
                             )
+                        # Success resets failure count so channel re-enters rotation
+                        self.database.reset_failure_count(dest_channel)
                     else:
+                        error_str = exec_result.error or "no_routes"
                         res = {
                             "success": False,
-                            "error": exec_result.error or "no_routes",
+                            "error": error_str,
                             "message": (
-                                f"RebalanceExecutor: {exec_result.error} "
+                                f"RebalanceExecutor: {error_str} "
                                 f"({exec_result.attempts} attempts, "
                                 f"type={exec_result.route_type})"
                             ),
@@ -3162,14 +3177,33 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         if rebalance_id:
                             self.database.update_rebalance_result(
                                 rebalance_id, 'failed',
-                                error_message=exec_result.error,
+                                error_message=error_str,
                             )
+                        # Record failure for futility breaker
+                        error_type = self._classify_error(error_str)
+                        self.database.increment_failure_count(
+                            dest_channel,
+                            attempted_ppm=candidate.max_fee_ppm,
+                            attempted_amount=candidate.amount_sats,
+                            error_type=error_type,
+                        )
                 except Exception as e:
                     res = {"success": False, "error": str(e)}
                     if rebalance_id:
                         self.database.update_rebalance_result(
                             rebalance_id, 'failed', error_message=str(e),
                         )
+                    # Record failure for futility breaker
+                    error_type = self._classify_error(str(e))
+                    try:
+                        self.database.increment_failure_count(
+                            dest_channel,
+                            attempted_ppm=candidate.max_fee_ppm,
+                            attempted_amount=candidate.amount_sats,
+                            error_type=error_type,
+                        )
+                    except Exception:
+                        pass
             else:
                 # No executor available — cannot rebalance
                 res = {"success": False, "error": "no_rebalance_executor"}
