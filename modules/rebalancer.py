@@ -1965,6 +1965,25 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # Per-rebalance fee ceiling
             ppm_cap_sats = (amount_needed * tier_ppm) // 1_000_000
             max_fee_sats = min(budget_sats, max(1, ppm_cap_sats))
+
+            # Viability gate: if budget constrains fee below a realistic minimum,
+            # reduce the rebalance amount so the fee-to-amount ratio stays viable.
+            # A 1-hop direct rebalance needs ~0 ppm, but multi-hop typically needs
+            # 100+ ppm. We use 50 ppm as a floor — if the budget can't cover that,
+            # shrink the amount until it can.
+            effective_ppm = (max_fee_sats * 1_000_000) // max(1, amount_needed)
+            min_viable_ppm = 50
+            if effective_ppm < min_viable_ppm and budget_sats > 0:
+                # Scale amount down so budget covers at least min_viable_ppm
+                max_viable_amount = (budget_sats * 1_000_000) // min_viable_ppm
+                if max_viable_amount < cfg.rebalance_min_amount:
+                    skipped_no_budget += 1
+                    continue
+                amount_needed = max(cfg.rebalance_min_amount, max_viable_amount)
+                # Recalculate fee ceiling with reduced amount
+                ppm_cap_sats = (amount_needed * tier_ppm) // 1_000_000
+                max_fee_sats = min(budget_sats, max(1, ppm_cap_sats))
+
             max_fee_msat = sats_to_base(max_fee_sats)
             max_fee_ppm = min(tier_ppm, (max_fee_sats * 1_000_000) // max(1, amount_needed))
 
