@@ -60,3 +60,46 @@ def parse_msat(msat_val: Any) -> int:
         _log.debug("parse_msat: failed to convert %r (type %s): %s", msat_val, type(msat_val).__name__, e)
         return 0
 
+
+# ---------------------------------------------------------------------------
+# Lightning Network base unit configuration
+# ---------------------------------------------------------------------------
+# Today: millisatoshi (msat). Future: microsatoshi (usat) or smaller.
+# Change BASE_UNITS_PER_SAT when the network adopts a smaller unit.
+BASE_UNITS_PER_SAT = 1000
+BASE_UNIT_NAME = "msat"
+
+
+def base_to_sats_ceil(base: int) -> int:
+    """Convert base units to sats, rounding UP.
+
+    Use for: fees, budgets, costs — never undercharge or underbudget.
+    """
+    return -(-base // BASE_UNITS_PER_SAT)
+
+
+def base_to_sats_floor(base: int) -> int:
+    """Convert base units to sats, rounding DOWN.
+
+    Use for: capacity, balance, revenue reporting — never overstate.
+    """
+    return base // BASE_UNITS_PER_SAT
+
+
+def sats_to_base(sats: int) -> int:
+    """Convert sats to base units (msat today)."""
+    return sats * BASE_UNITS_PER_SAT
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible aliases
+# ---------------------------------------------------------------------------
+# Existing code uses parse_msat and MSAT_PER_SAT. New code should prefer
+# the generic names (base_to_sats_ceil, parse_base_unit, etc.) for
+# future-proofing, but the aliases are permanent and safe to use.
+MSAT_PER_SAT = BASE_UNITS_PER_SAT
+parse_base_unit = parse_msat
+msat_to_sats_ceil = base_to_sats_ceil
+msat_to_sats_floor = base_to_sats_floor
+sats_to_msat = sats_to_base
+
