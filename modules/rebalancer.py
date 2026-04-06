@@ -2099,10 +2099,11 @@ class EVRebalancer:
         """
         Check if a channel should be skipped by the futility breaker.
 
-        No-route failures trigger at 4 attempts (path likely doesn't exist).
+        No-route and budget-exceeded failures trigger at 4 attempts
+        (structural problems unlikely to resolve within a cycle).
         Other failures trigger at 10 (existing threshold).
         """
-        if last_error_type == "no_route" and fail_count >= 4:
+        if last_error_type in ("no_route", "budget_exceeded") and fail_count >= 4:
             return True
         if fail_count >= 10:
             return True
@@ -2525,7 +2526,8 @@ class EVRebalancer:
                     now = int(time.time())
                     futility_cooldown = getattr(cfg, 'futility_cooldown_hours', 48) * 3600
                     if (now - last_fail) < futility_cooldown:
-                        threshold = "4 no_route" if fail_meta["last_error_type"] == "no_route" else "10"
+                        fast_fail = fail_meta["last_error_type"] in ("no_route", "budget_exceeded")
+                        threshold = f"4 {fail_meta['last_error_type']}" if fast_fail else "10"
                         self.plugin.log(
                             f"FUTILITY BREAKER: Skipping {dest_id[:12]}... - {fail_count} failures "
                             f"(threshold: {threshold}), "

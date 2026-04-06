@@ -112,6 +112,10 @@ class TestFailureClassification:
         from modules.rebalancer import JobManager
         assert JobManager._classify_sling_error("exceeded fee budget") == "budget_exceeded"
 
+    def test_route_over_budget_classified(self):
+        from modules.rebalancer import JobManager
+        assert JobManager._classify_sling_error("route_over_budget: fee 1500 > budget 1000") == "budget_exceeded"
+
     def test_unknown_error_is_other(self):
         from modules.rebalancer import JobManager
         assert JobManager._classify_sling_error("something weird happened") == "other"
@@ -213,6 +217,17 @@ class TestFasterNoRouteFutility:
         """10 timeout failures should trigger futility."""
         for _ in range(10):
             db.increment_failure_count("100x1x0", error_type="timeout")
+
+        count, _ = db.get_failure_count("100x1x0")
+        meta = db.get_failure_metadata("100x1x0")
+
+        from modules.rebalancer import EVRebalancer
+        assert EVRebalancer._should_skip_futility(count, meta["last_error_type"]) is True
+
+    def test_budget_exceeded_futile_at_4(self, db):
+        """4 budget_exceeded failures should trigger futility (structural, not transient)."""
+        for _ in range(4):
+            db.increment_failure_count("100x1x0", error_type="budget_exceeded")
 
         count, _ = db.get_failure_count("100x1x0")
         meta = db.get_failure_metadata("100x1x0")
