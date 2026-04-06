@@ -3506,7 +3506,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     dest_outbound_fee_ppm=outbound_fee_ppm,
                     dest_inbound_fee_ppm=0,
                 )
-            except Exception:
+            except Exception as e:
+                self.plugin.log(f"CAPEX_FALLBACK: source selection failed for {dest_id}: {e}", level='debug')
                 source_result = []
 
             if not source_result:
