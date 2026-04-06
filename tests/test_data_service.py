@@ -132,3 +132,109 @@ class TestForeverTier:
         # Should still return cached value, not re-call RPC
         assert ds.get_node_id() == "02abc123" + "00" * 29
         plugin.rpc.getinfo.assert_called_once()
+
+
+class TestMediumTier:
+    """30-second TTL: listpeerchannels, listfunds, listpeers, etc."""
+
+    def test_get_peer_channels_broadcast(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [{"peer_id": "abc", "state": "CHANNELD_NORMAL"}]
+        }
+        ds = DataService(plugin)
+        result = ds.get_peer_channels()
+        assert result == {"channels": [{"peer_id": "abc", "state": "CHANNELD_NORMAL"}]}
+        # Second call uses cache
+        ds.get_peer_channels()
+        plugin.rpc.listpeerchannels.assert_called_once()
+
+    def test_get_peer_channels_per_peer_not_cached(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        ds = DataService(plugin)
+        ds.get_peer_channels(peer_id="abc")
+        ds.get_peer_channels(peer_id="abc")
+        assert plugin.rpc.listpeerchannels.call_count == 2
+
+    def test_get_funds(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listfunds.return_value = {"channels": [], "outputs": []}
+        ds = DataService(plugin)
+        result = ds.get_funds()
+        assert "channels" in result
+        ds.get_funds()
+        plugin.rpc.listfunds.assert_called_once()
+
+    def test_get_peers(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listpeers.return_value = {"peers": []}
+        ds = DataService(plugin)
+        result = ds.get_peers()
+        assert "peers" in result
+        ds.get_peers()
+        plugin.rpc.listpeers.assert_called_once()
+
+    def test_get_channels_by_source(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listchannels.return_value = {"channels": [{"source": "abc"}]}
+        ds = DataService(plugin)
+        result = ds.get_channels(source="abc")
+        assert result == {"channels": [{"source": "abc"}]}
+
+    def test_get_channels_by_destination(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listchannels.return_value = {"channels": [{"destination": "def"}]}
+        ds = DataService(plugin)
+        result = ds.get_channels(destination="def")
+        assert result == {"channels": [{"destination": "def"}]}
+
+    def test_get_channels_cached_by_params(self):
+        """Different source params get different cache entries."""
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listchannels.return_value = {"channels": []}
+        ds = DataService(plugin)
+        ds.get_channels(source="abc")
+        ds.get_channels(source="def")
+        ds.get_channels(source="abc")  # cached
+        assert plugin.rpc.listchannels.call_count == 2
+
+    def test_get_forwards(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listforwards.return_value = {"forwards": []}
+        ds = DataService(plugin)
+        result = ds.get_forwards(status="settled")
+        assert "forwards" in result
+
+    def test_get_closed_channels(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"closedchannels": []}
+        ds = DataService(plugin)
+        result = ds.get_closed_channels()
+        assert "closedchannels" in result
+
+    def test_get_block_height(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        ds = DataService(plugin)
+        assert ds.get_block_height() == 850000
+
+    def test_medium_tier_expires_after_ttl(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listfunds.return_value = {"channels": []}
+        ds = DataService(plugin)
+        ds.get_funds()
+        # Backdate cache entry
+        ds._cache["listfunds"]["ts"] -= 60
+        ds.get_funds()
+        assert plugin.rpc.listfunds.call_count == 2

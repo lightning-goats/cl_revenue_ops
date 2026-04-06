@@ -115,3 +115,92 @@ class DataService:
             result = self._plugin.rpc.listconfigs()
             self._forever["listconfigs"] = result
             return result
+
+    # ------------------------------------------------------------------
+    # Medium tier — 30 second TTL
+    # ------------------------------------------------------------------
+
+    def get_peer_channels(self, peer_id: str = None) -> Dict:
+        """All channels or per-peer channels. Broadcast cached 30s; per-peer uncached."""
+        if peer_id:
+            return self._plugin.rpc.listpeerchannels(peer_id)
+
+        key = "listpeerchannels"
+        cached = self._get_cached(key, TTL_MEDIUM)
+        if cached is not None:
+            return cached
+        result = self._plugin.rpc.listpeerchannels()
+        self._set_cached(key, result)
+        return result
+
+    def get_funds(self) -> Dict:
+        """Wallet and channel balances. Cached 30s."""
+        key = "listfunds"
+        cached = self._get_cached(key, TTL_MEDIUM)
+        if cached is not None:
+            return cached
+        result = self._plugin.rpc.listfunds()
+        self._set_cached(key, result)
+        return result
+
+    def get_peers(self) -> Dict:
+        """Peer connection state. Cached 30s."""
+        key = "listpeers"
+        cached = self._get_cached(key, TTL_MEDIUM)
+        if cached is not None:
+            return cached
+        result = self._plugin.rpc.listpeers()
+        self._set_cached(key, result)
+        return result
+
+    def get_channels(self, source: str = None, destination: str = None,
+                     short_channel_id: str = None) -> Dict:
+        """Gossip channel graph. Cached 30s per unique param combination."""
+        key = f"listchannels:{source}:{destination}:{short_channel_id}"
+        cached = self._get_cached(key, TTL_MEDIUM)
+        if cached is not None:
+            return cached
+        kwargs = {}
+        if source:
+            kwargs["source"] = source
+        if destination:
+            kwargs["destination"] = destination
+        if short_channel_id:
+            kwargs["short_channel_id"] = short_channel_id
+        result = self._plugin.rpc.listchannels(**kwargs)
+        self._set_cached(key, result)
+        return result
+
+    def get_forwards(self, status: str = None) -> Dict:
+        """Forward history. Cached 30s per status."""
+        key = f"listforwards:{status}"
+        cached = self._get_cached(key, TTL_MEDIUM)
+        if cached is not None:
+            return cached
+        kwargs = {}
+        if status:
+            kwargs["status"] = status
+        result = self._plugin.rpc.listforwards(**kwargs)
+        self._set_cached(key, result)
+        return result
+
+    def get_closed_channels(self) -> Dict:
+        """Closed channel history. Cached 30s."""
+        key = "listclosedchannels"
+        cached = self._get_cached(key, TTL_MEDIUM)
+        if cached is not None:
+            return cached
+        result = self._plugin.rpc.call("listclosedchannels")
+        self._set_cached(key, result)
+        return result
+
+    def get_block_height(self) -> int:
+        """Current block height. Cached 30s (via getinfo medium cache)."""
+        key = "getinfo:blockheight"
+        cached = self._get_cached(key, TTL_MEDIUM)
+        if cached is not None:
+            return cached
+        result = self._plugin.rpc.getinfo()
+        height = result.get("blockheight", 0)
+        self._set_cached(key, height)
+        return height
