@@ -745,7 +745,14 @@ class TestAuditRound8Regressions:
 
     def test_get_channels_info_handles_msat_strings(self, mock_database, mock_plugin):
         """_get_channels_info should handle CLN string msat values like '1000000msat'."""
+        from unittest.mock import MagicMock as _MM
         fc = self._make_fc(mock_plugin, mock_database)
+        ds = _MM()
+        ds.get_peer_channels.side_effect = lambda peer_id=None, **kw: (
+            mock_plugin.rpc.listpeerchannels(peer_id) if peer_id is not None
+            else mock_plugin.rpc.listpeerchannels()
+        )
+        fc.data_service = ds
 
         mock_plugin.rpc.listpeerchannels.return_value = {
             "channels": [{

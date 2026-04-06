@@ -10,6 +10,26 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _make_data_service(mock_plugin):
+    """Build a data_service MagicMock that delegates to mock_plugin.rpc.
+
+    This lets tests configure mock_plugin.rpc.* as before while the
+    FeeController calls data_service.* internally.  set_channel also
+    forwards to mock_plugin.rpc.setchannel so existing call assertions work.
+    """
+    ds = MagicMock()
+    ds.get_peer_channels.side_effect = lambda peer_id=None, **kw: (
+        mock_plugin.rpc.listpeerchannels(peer_id) if peer_id is not None
+        else mock_plugin.rpc.listpeerchannels()
+    )
+    ds.get_channels.side_effect = lambda **kw: mock_plugin.rpc.listchannels(**kw)
+    ds.get_node_id.side_effect = lambda: mock_plugin.rpc.getinfo().get("id", "")
+    ds.set_channel.side_effect = lambda **kw: mock_plugin.rpc.setchannel(**kw)
+    ds.get_feerates.side_effect = lambda **kw: mock_plugin.rpc.feerates(**kw)
+    ds.get_askrene_layers.side_effect = lambda: mock_plugin.rpc.call("askrene-listlayers", {})
+    return ds
+
+
 def _listpeerchannels_payload(
     channel_id: str,
     peer_id: str,
@@ -83,6 +103,7 @@ class TestChannelInfoShaping:
         )
 
         fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         channel_info = fc._get_channels_info()[channel_id]
 
         assert channel_info["htlc_minimum_msat"] == 42_000
@@ -109,6 +130,7 @@ class TestSetChannelFeeLimits:
         mock_database.record_fee_change = MagicMock()
 
         fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
 
         fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=True)
 
@@ -134,6 +156,7 @@ class TestSetChannelFeeLimits:
         mock_database.record_fee_change = MagicMock()
 
         fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
 
         fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=False)
 
@@ -154,7 +177,9 @@ class TestSetChannelFeeHtlcMin:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        return FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
+        return fc
 
     def test_set_channel_fee_omits_htlcmin_when_not_requested(self, mock_plugin, mock_database):
         fc = self._make_controller(mock_plugin, mock_database)
@@ -211,6 +236,7 @@ class TestGossipRefreshExecution:
         mock_database.get_last_forward_time.return_value = int(time.time()) - 86400 * 2
 
         fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
 
         # Provide a real-ish state and ensure the fee change will be applied.
         st = ChannelCycleState(
@@ -305,6 +331,7 @@ class TestBoundedExplorationEndToEnd:
         mock_database.get_historical_inbound_fee_ppm.return_value = None
 
         fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
 
         channel_info = {
             "channel_id": channel_id,
@@ -362,6 +389,7 @@ class TestBoundedExplorationEndToEnd:
         mock_database.get_historical_inbound_fee_ppm.return_value = None
 
         fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
 
         channel_info = {
             "channel_id": channel_id,
@@ -405,6 +433,7 @@ class TestBoundedExplorationEndToEnd:
         mock_database.record_fee_change = MagicMock()
 
         fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         fc._cycle_states[channel_id] = ChannelCycleState(
             last_fee_ppm=200,
             last_broadcast_fee_ppm=200,
@@ -454,6 +483,7 @@ class TestSetInitialFee:
         fc = FeeController(
             mock_plugin, cfg, mock_database, policy_manager
         )
+        fc.data_service = _make_data_service(mock_plugin)
         return fc
 
     def test_initial_fee_sets_dts_prior_sample(self, mock_plugin, mock_database):

@@ -1675,7 +1675,7 @@ class FeeController:
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
         try:
-            self._our_node_id: str = self.plugin.rpc.getinfo().get("id", "")
+            self._our_node_id: str = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id", "")
         except Exception:
             self._our_node_id = ""
 
@@ -1762,7 +1762,7 @@ class FeeController:
         or None if no data available.
         """
         try:
-            channels = self.plugin.rpc.listchannels(source=peer_id)
+            channels = self.data_service.get_channels(source=peer_id)
             peer_channels = channels.get("channels", [])
             if not peer_channels:
                 return None
@@ -1824,7 +1824,7 @@ class FeeController:
     def _get_our_id(self) -> str:
         """Return our node ID, cached forever (never changes at runtime)."""
         if not self._our_node_id:
-            self._our_node_id = self.plugin.rpc.getinfo().get("id", "")
+            self._our_node_id = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id", "")
         return self._our_node_id
 
     def _get_peer_inbound_channels(self, peer_id: str) -> list:
@@ -1839,7 +1839,7 @@ class FeeController:
             return cached["value"]
 
         try:
-            channels = self.plugin.rpc.listchannels(destination=peer_id)
+            channels = self.data_service.get_channels(destination=peer_id)
             result = channels.get("channels", [])
         except Exception:
             result = []
@@ -2046,7 +2046,7 @@ class FeeController:
         try:
             layer = getattr(cfg, 'askrene_layer', 'xpay')
             max_age = getattr(cfg, 'askrene_max_age_sec', 900)
-            res = self.plugin.rpc.call("askrene-listlayers", {"layer": layer})
+            res = self.data_service.get_askrene_layers()
             cache: Dict[str, int] = {}
             for lyr in res.get("layers", []):
                 if lyr.get("layer") != layer:
@@ -4494,7 +4494,7 @@ class FeeController:
             if htlcmax_msat is not None:
                 rpc_params["htlcmax"] = f"{htlcmax_msat}msat"
 
-            self.plugin.rpc.setchannel(**rpc_params)
+            self.data_service.set_channel(**rpc_params)
 
 
             # M-13: Removed per-channel sleep+verify+retry loop from hot path.
@@ -4598,7 +4598,7 @@ class FeeController:
 
         try:
             # Resolve channel via listpeerchannels to get SCID and info
-            result = self.plugin.rpc.listpeerchannels(peer_id)
+            result = self.data_service.get_peer_channels(peer_id=peer_id)
             target_ch = None
             for ch in result.get('channels', []):
                 if ch.get('state') != 'CHANNELD_NORMAL':
@@ -4871,7 +4871,7 @@ class FeeController:
         """
         try:
             # Query feerates - prefer 'perkb' style for calculations
-            feerates = self.plugin.rpc.feerates(style="perkb")
+            feerates = self.data_service.get_feerates(style="perkb")
             
             # Get a medium-term estimate (12 blocks ~2 hours)
             perkb = feerates.get("perkb", {})
@@ -5151,7 +5151,7 @@ class FeeController:
         channels = {}
         
         try:
-            result = self.rpc_cache.listpeerchannels() if self.rpc_cache else self.plugin.rpc.listpeerchannels()
+            result = self.data_service.get_peer_channels()
 
             for channel in result.get("channels", []):
                 if channel.get("state") != "CHANNELD_NORMAL":

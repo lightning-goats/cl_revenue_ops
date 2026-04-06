@@ -8,6 +8,21 @@ from unittest.mock import MagicMock, call
 from modules.fee_controller import FeeController
 
 
+def _make_data_service(mock_plugin):
+    """Build a data_service MagicMock that delegates to mock_plugin.rpc."""
+    ds = MagicMock()
+    ds.get_peer_channels.side_effect = lambda peer_id=None, **kw: (
+        mock_plugin.rpc.listpeerchannels(peer_id) if peer_id is not None
+        else mock_plugin.rpc.listpeerchannels()
+    )
+    ds.get_channels.side_effect = lambda **kw: mock_plugin.rpc.listchannels(**kw)
+    ds.get_node_id.side_effect = lambda: mock_plugin.rpc.getinfo().get("id", "")
+    ds.set_channel.side_effect = lambda **kw: mock_plugin.rpc.setchannel(**kw)
+    ds.get_feerates.side_effect = lambda **kw: mock_plugin.rpc.feerates(**kw)
+    ds.get_askrene_layers.side_effect = lambda: mock_plugin.rpc.call("askrene-listlayers", {})
+    return ds
+
+
 @pytest.fixture
 def mock_plugin():
     p = MagicMock()
@@ -33,7 +48,9 @@ def mock_database():
 @pytest.fixture
 def fc(mock_plugin, mock_config, mock_database):
     mock_plugin.rpc.getinfo.return_value = {"id": "02our_node_id"}
-    return FeeController(mock_plugin, mock_config, mock_database)
+    controller = FeeController(mock_plugin, mock_config, mock_database)
+    controller.data_service = _make_data_service(mock_plugin)
+    return controller
 
 
 class TestGetOurId:
@@ -55,6 +72,7 @@ class TestGetOurId:
     def test_handles_empty_id(self, mock_plugin, mock_config, mock_database):
         mock_plugin.rpc.getinfo.return_value = {}
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         assert fc._get_our_id() == ""
 
 

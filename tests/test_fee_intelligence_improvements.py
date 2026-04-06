@@ -7,6 +7,21 @@ from modules.fee_controller import FeeController, GaussianThompsonState, Channel
 from modules.hive_hints import HiveHintAdapter
 
 
+def _make_data_service(mock_plugin):
+    """Build a data_service MagicMock that delegates to mock_plugin.rpc."""
+    ds = MagicMock()
+    ds.get_peer_channels.side_effect = lambda peer_id=None, **kw: (
+        mock_plugin.rpc.listpeerchannels(peer_id) if peer_id is not None
+        else mock_plugin.rpc.listpeerchannels()
+    )
+    ds.get_channels.side_effect = lambda **kw: mock_plugin.rpc.listchannels(**kw)
+    ds.get_node_id.side_effect = lambda: mock_plugin.rpc.getinfo().get("id", "")
+    ds.set_channel.side_effect = lambda **kw: mock_plugin.rpc.setchannel(**kw)
+    ds.get_feerates.side_effect = lambda **kw: mock_plugin.rpc.feerates(**kw)
+    ds.get_askrene_layers.side_effect = lambda: mock_plugin.rpc.call("askrene-listlayers", {})
+    return ds
+
+
 @pytest.fixture
 def mock_plugin():
     p = MagicMock()
@@ -39,6 +54,7 @@ class TestNetworkInformedPriors:
             ]
         }
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         result = fc._get_network_fee_prior("02peer", "123x1x0")
         assert result is not None
         assert result["mean"] == 300  # median
@@ -47,12 +63,14 @@ class TestNetworkInformedPriors:
     def test_prior_none_when_no_channels(self, mock_plugin, mock_config, mock_database):
         mock_plugin.rpc.listchannels.return_value = {"channels": []}
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         result = fc._get_network_fee_prior("02peer", "123x1x0")
         assert result is None
 
     def test_prior_none_on_rpc_failure(self, mock_plugin, mock_config, mock_database):
         mock_plugin.rpc.listchannels.side_effect = Exception("RPC error")
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         result = fc._get_network_fee_prior("02peer", "123x1x0")
         assert result is None
 
@@ -65,6 +83,7 @@ class TestNetworkInformedPriors:
             ]
         }
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         result = fc._get_network_fee_prior("02peer", "123x1x0")
         assert result is not None
         assert result["mean"] == 200  # Only sane value
@@ -187,6 +206,7 @@ class TestNeighborFeeAwareness:
             ]
         }
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         median = fc._get_neighbor_fee_median("02peer123")
         assert median == 200
 
@@ -198,6 +218,7 @@ class TestNeighborFeeAwareness:
             ]
         }
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         assert fc._get_neighbor_fee_median("02peer") is None
 
     def test_neighbor_excludes_our_node(self, mock_plugin, mock_config, mock_database):
@@ -211,6 +232,7 @@ class TestNeighborFeeAwareness:
             ]
         }
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         median = fc._get_neighbor_fee_median("02peer")
         assert median == 200  # Our 999 excluded
 
@@ -221,6 +243,7 @@ class TestNeighborFeeAwareness:
             for i in range(5)
         ]}
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         fc._get_neighbor_fee_median("02peer")
         fc._get_neighbor_fee_median("02peer")
         # listchannels called only once due to cache
@@ -237,6 +260,7 @@ class TestNeighborFeeAwareness:
             ]
         }
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         median = fc._get_neighbor_fee_median("02peer")
         assert median == 300  # Inactive node2 excluded; [100, 300, 400] -> 300
 
@@ -252,12 +276,14 @@ class TestNeighborFeeAwareness:
             ]
         }
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         median = fc._get_neighbor_fee_median("02peer")
         assert median == 200  # 0 and 50000 filtered out; [100, 200, 300] -> 200
 
     def test_neighbor_none_on_rpc_error(self, mock_plugin, mock_config, mock_database):
         mock_plugin.rpc.getinfo.side_effect = Exception("RPC error")
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         assert fc._get_neighbor_fee_median("02peer") is None
 
     def test_neighbor_cache_eviction(self, mock_plugin, mock_config, mock_database):
@@ -268,6 +294,7 @@ class TestNeighborFeeAwareness:
             for i in range(5)
         ]}
         fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
         # Fill cache with 501 stale entries
         old_ts = time.time() - 7200  # 2 hours old
         for i in range(501):
