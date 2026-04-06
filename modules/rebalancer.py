@@ -995,8 +995,113 @@ class EVRebalancer:
                 f"Found {len(depleted_channels)} depleted and {len(source_channels)} source channels "
                 f"(excluding {len(active_channels)} with active jobs)"
             )
-            
-            for dest_id, dest_info, dest_ratio in depleted_channels:
+
+            # =====================================================================
+            # HIVE-FIRST PASS: Fleet-routable destinations use capex budgets directly.
+            # Fleet routes cost ~0 ppm so the EV spread gate is wrong for them.
+            # =====================================================================
+            non_hive_depleted = []
+            if self.hive_router and self.hive_router.available and self._capex_engine:
+                for dest_id, dest_info, dest_ratio in depleted_channels:
+                    if dest_id in active_channels:
+                        non_hive_depleted.append((dest_id, dest_info, dest_ratio))
+                        continue
+                    dest_peer_id = dest_info.get("peer_id", "")
+                    if not dest_peer_id:
+                        non_hive_depleted.append((dest_id, dest_info, dest_ratio))
+                        continue
+                    # Futility check applies to hive candidates too
+                    fail_count, last_fail = self.database.get_failure_count(dest_id)
+                    fail_meta = self.database.get_failure_metadata(dest_id)
+                    if self._should_skip_futility(fail_count, fail_meta["last_error_type"]):
+                        futility_cooldown = getattr(cfg, 'futility_cooldown_hours', 48) * 3600
+                        if (int(time.time()) - last_fail) < futility_cooldown:
+                            continue
+                    try:
+                        hr = self.hive_router.discover_route(dest_peer_id, cfg.rebalance_min_amount)
+                    except Exception:
+                        hr = None
+                    if not hr:
+                        non_hive_depleted.append((dest_id, dest_info, dest_ratio))
+                        continue
+                    # Hive route found — use capex budget directly
+                    ch_budget = self._capex_engine.get_channel_budget(dest_id)
+                    if ch_budget.tier == "blocked" or ch_budget.budget_sats <= 0:
+                        non_hive_depleted.append((dest_id, dest_info, dest_ratio))
+                        continue
+                    # Build capex candidate with hive route
+                    capacity = dest_info.get("capacity", 0)
+                    spendable = dest_info.get("spendable", 0)
+                    headroom = capacity - spendable
+                    amount_needed = min(int(capacity * 0.5) - spendable, cfg.rebalance_max_amount)
+                    amount_needed = max(cfg.rebalance_min_amount, min(amount_needed, headroom))
+                    if amount_needed < cfg.rebalance_min_amount:
+                        non_hive_depleted.append((dest_id, dest_info, dest_ratio))
+                        continue
+                    # Fleet routes are ~0 ppm, so budget is viable at any size
+                    max_fee_sats = ch_budget.budget_sats
+                    max_fee_msat = sats_to_base(max_fee_sats)
+                    max_fee_ppm = min(ch_budget.tier_ppm, (max_fee_sats * 1_000_000) // max(1, amount_needed))
+                    # Source selection
+                    source_tuples = [(s[0], s[1], s[2] if len(s) > 2 else 0.0) for s in source_channels]
+                    try:
+                        source_result = self._select_source_candidates(
+                            sources=source_tuples, amount_needed=amount_needed,
+                            dest_channel=dest_id, dest_outbound_fee_ppm=dest_info.get("fee_ppm", 0),
+                            dest_inbound_fee_ppm=0,
+                        )
+                    except Exception:
+                        source_result = []
+                    if not source_result:
+                        non_hive_depleted.append((dest_id, dest_info, dest_ratio))
+                        continue
+                    # Promote hive source to primary
+                    source_scids = [s[0] for s in source_result]
+                    hive_scid_norm = hr.source_scid.replace(":", "x")
+                    for i, (cid, info, score, opp) in enumerate(source_result):
+                        if cid.replace(":", "x") == hive_scid_norm and i > 0:
+                            source_result.insert(0, source_result.pop(i))
+                            source_scids = [s[0] for s in source_result]
+                            break
+                    primary_source_id, primary_source_info, _, _ = source_result[0]
+                    candidate = RebalanceCandidate(
+                        source_candidates=source_scids,
+                        to_channel=dest_id,
+                        primary_source_peer_id=primary_source_info.get("peer_id", ""),
+                        to_peer_id=dest_peer_id,
+                        amount_sats=amount_needed,
+                        amount_msat=sats_to_base(amount_needed),
+                        outbound_fee_ppm=dest_info.get("fee_ppm", 0),
+                        inbound_fee_ppm=0,
+                        source_fee_ppm=primary_source_info.get("fee_ppm", 0),
+                        weighted_opp_cost_ppm=0,
+                        spread_ppm=0,
+                        max_budget_sats=max_fee_sats,
+                        max_budget_msat=max_fee_msat,
+                        max_fee_ppm=max_fee_ppm,
+                        expected_profit_sats=0,
+                        liquidity_ratio=dest_ratio,
+                        dest_flow_state="unknown",
+                        dest_turnover_rate=0.0,
+                        source_turnover_rate=0.0,
+                        reason_code=RebalanceReasonCode.CAPEX_FALLBACK.value,
+                        bleeder_status="none",
+                        hive_route_hops=hr.hops,
+                        source_candidate_peer_ids=[s[1].get("peer_id", "") for s in source_result],
+                    )
+                    candidates.append(candidate)
+                    self.plugin.log(
+                        f"HIVE CAPEX: {dest_id[:12]}... via fleet ({hr.hops} hops, {hr.fee_ppm} ppm), "
+                        f"budget {max_fee_sats} sats, amount {amount_needed} sats",
+                        level='info',
+                    )
+                    if len(candidates) >= available_slots:
+                        break
+            else:
+                non_hive_depleted = list(depleted_channels)
+
+            # EV profit gate for non-hive destinations
+            for dest_id, dest_info, dest_ratio in non_hive_depleted:
                 # =====================================================================
                 # FUTILITY CIRCUIT BREAKER (TODO #15)
                 # =====================================================================
@@ -1156,18 +1261,20 @@ class EVRebalancer:
                     budget_blocked=False,
                 )
             else:
-                # EV found nothing — try capex fallback
-                if depleted_channels and source_channels:
+                # EV found nothing for non-hive channels — try capex fallback
+                # (hive destinations already handled in hive-first pass above)
+                remaining_slots = available_slots - len(candidates)
+                if remaining_slots > 0 and non_hive_depleted and source_channels:
                     self.plugin.log(
-                        f"CAPEX_FALLBACK: EV found 0 candidates, evaluating "
-                        f"{len(depleted_channels)} destinations with capex budgets",
+                        f"CAPEX_FALLBACK: EV found 0 non-hive candidates, evaluating "
+                        f"{len(non_hive_depleted)} destinations with capex budgets",
                         level='info'
                     )
                     capex_candidates = self._capex_fallback_pass(
-                        depleted_channels=depleted_channels,
+                        depleted_channels=non_hive_depleted,
                         source_channels=source_channels,
                         active_channels=active_channels,
-                        available_slots=available_slots,
+                        available_slots=remaining_slots,
                         cfg=cfg,
                     )
                     if capex_candidates:
@@ -3182,7 +3289,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         # Record failure for futility breaker
                         error_type = self._classify_error(error_str)
                         self.database.increment_failure_count(
-                            dest_channel,
+                            candidate.to_channel,
                             attempted_ppm=candidate.max_fee_ppm,
                             attempted_amount=candidate.amount_sats,
                             error_type=error_type,
@@ -3197,7 +3304,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     error_type = self._classify_error(str(e))
                     try:
                         self.database.increment_failure_count(
-                            dest_channel,
+                            candidate.to_channel,
                             attempted_ppm=candidate.max_fee_ppm,
                             attempted_amount=candidate.amount_sats,
                             error_type=error_type,
