@@ -1055,8 +1055,36 @@ class EVRebalancer:
                     if amount_needed < cfg.rebalance_min_amount:
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
-                    # Fleet routes are ~0 ppm, so budget is viable at any size
-                    max_fee_sats = ch_budget.budget_sats
+                    dest_is_member = self.hive_router.is_hive_member(dest_peer_id)
+                    if dest_is_member:
+                        # Pure-hive: return hop is free (hive-fleet layer)
+                        max_fee_sats = ch_budget.budget_sats
+                    else:
+                        # Non-member: return hop charges published fees
+                        return_ppm = int(dest_info.get("peer_inbound_fee_ppm") or 0)
+                        return_base_msat = int(dest_info.get("peer_inbound_base_msat") or 0)
+                        return_fee_msat = return_base_msat + (sats_to_base(amount_needed) * return_ppm) // 1_000_000
+                        return_fee_sats = base_to_sats_ceil(return_fee_msat)
+                        if return_fee_sats >= ch_budget.budget_sats:
+                            # Budget can't cover return hop — try scaling down amount
+                            # Solve: base + (amount * ppm / 1M) <= budget
+                            if return_ppm > 0:
+                                max_amount_msat = ((ch_budget.budget_sats * 1000 - return_base_msat) * 1_000_000) // return_ppm
+                                amount_needed = max(0, base_to_sats_floor(max_amount_msat))
+                            else:
+                                amount_needed = 0
+                            if amount_needed < cfg.rebalance_min_amount:
+                                self.plugin.log(
+                                    f"HIVE CAPEX SKIP: {dest_id[:12]}... return hop {return_ppm} ppm "
+                                    f"({return_fee_sats} sats) exceeds budget {ch_budget.budget_sats} sats",
+                                    level='info',
+                                )
+                                non_hive_depleted.append((dest_id, dest_info, dest_ratio))
+                                continue
+                            # Recalculate return fee at reduced amount
+                            return_fee_msat = return_base_msat + (sats_to_base(amount_needed) * return_ppm) // 1_000_000
+                            return_fee_sats = base_to_sats_ceil(return_fee_msat)
+                        max_fee_sats = ch_budget.budget_sats
                     max_fee_msat = sats_to_base(max_fee_sats)
                     max_fee_ppm = min(ch_budget.tier_ppm, (max_fee_sats * 1_000_000) // max(1, amount_needed))
                     # Source selection
@@ -1104,16 +1132,20 @@ class EVRebalancer:
                         reason_code=RebalanceReasonCode.CAPEX_FALLBACK.value,
                         bleeder_status="none",
                         hive_route_hops=hr.hops,
-                        dest_is_hive_member=self.hive_router.is_hive_member(dest_peer_id),
+                        dest_is_hive_member=dest_is_member,
                         source_candidate_peer_ids=[s[1].get("peer_id", "") for s in source_result],
                     )
                     candidates.append(candidate)
-                    route_type = "pure-hive (zero cost)" if candidate.dest_is_hive_member else "fleet"
-                    self.plugin.log(
-                        f"HIVE CAPEX: {dest_id[:12]}... {route_type} ({hr.hops} hops, {hr.fee_ppm} ppm), "
+                    route_type = "pure-hive (zero cost)" if dest_is_member else "fleet"
+                    log_parts = [
+                        f"HIVE CAPEX: {dest_id[:12]}... {route_type} ({hr.hops} hops, {hr.fee_ppm} ppm)",
                         f"budget {max_fee_sats} sats, amount {amount_needed} sats",
-                        level='info',
-                    )
+                    ]
+                    if not dest_is_member:
+                        rp = int(dest_info.get("peer_inbound_fee_ppm") or 0)
+                        rf = base_to_sats_ceil(int(dest_info.get("peer_inbound_base_msat") or 0) + (sats_to_base(amount_needed) * rp) // 1_000_000)
+                        log_parts.append(f"return hop {rp} ppm ({rf} sats)")
+                    self.plugin.log(", ".join(log_parts), level='info')
                     if len(candidates) >= available_slots:
                         break
             else:
