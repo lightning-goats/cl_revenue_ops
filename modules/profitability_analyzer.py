@@ -595,6 +595,13 @@ class ChannelProfitabilityAnalyzer:
                 "days_open": p.days_open,
                 "role": p.channel_role.value,
                 "fee_multiplier": round(self.get_fee_multiplier(ch_id), 2),
+                # Sourced metrics for inbound valuation
+                "forward_count": p.revenue.forward_count,
+                "sourced_forward_count": p.revenue.sourced_forward_count,
+                "total_forward_count": p.revenue.total_forward_count,
+                "fees_earned_sats": p.revenue.fees_earned_sats,
+                "sourced_fee_contribution_sats": p.revenue.sourced_fee_contribution_sats,
+                "total_contribution_sats": p.revenue.total_contribution_sats,
             }
 
         payload = {
