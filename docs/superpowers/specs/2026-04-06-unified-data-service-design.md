@@ -282,15 +282,23 @@ fee_controller = FeeController(plugin, database, data_service, ...)
 
 Phase 7 applies corrections found from validating all 30 RPC methods against
 https://docs.corelightning.org/reference. Since all RPC calls will route through
-DataService by that phase, fixes are centralized in one file. Known areas to
-validate:
+DataService by that phase, fixes are centralized in one file.
 
-- `listpeers` — may be deprecated in favor of `listpeerchannels`
-- `listchannels` — deprecation status
-- `getroute` — `maxhops` parameter validity
-- `feerates` — `style="perkb"` vs newer alternatives
-- `decodepay` — may be replaced by `decode`
-- Response field names across all methods
+**Validated against https://docs.corelightning.org/reference (2026-04-06):**
+
+All 30+ RPC methods validated. Only 1 issue found:
+
+- `decodepay` — **DEPRECATED in CLN v24.11.** Use `decode` instead.
+  `boltz_manager.py:457` tries `decodepay` first with `decode` fallback.
+  Fix: invert the order (call `decode` first, drop `decodepay`).
+
+Everything else confirmed correct:
+- `listpeers` — NOT deprecated (only one feature string renamed in v24.08)
+- `listchannels` — NOT deprecated, all params valid
+- `getroute` — `maxhops` still supported (default 20)
+- `feerates` — `style="perkb"` remains valid
+- `askrene-bias-node` — requires CLN v25.12+
+- Response field names all correct across all methods
 
 ## Migration Phases
 
