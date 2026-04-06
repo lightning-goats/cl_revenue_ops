@@ -135,6 +135,14 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_bootstrap_bps': int,
     'rebalance_bootstrap_max_sats': int,
     'rebalance_grace_days': int,
+    # Unified Capex Budget Engine
+    'capex_reinvestment_rate': float,
+    'capex_bootstrap_bps': int,
+    'capex_bootstrap_max_sats': int,
+    'capex_grace_days': int,
+    'capex_exploration_rate': float,
+    'capex_tactical_rate': float,
+    'capex_global_envelope_sats': int,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -222,6 +230,14 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_bootstrap_bps': (0, 100),
     'rebalance_bootstrap_max_sats': (0, 10000),
     'rebalance_grace_days': (0, 90),
+    # Unified Capex Budget Engine
+    'capex_reinvestment_rate': (0.0, 1.0),
+    'capex_bootstrap_bps': (0, 100),
+    'capex_bootstrap_max_sats': (0, 10000),
+    'capex_grace_days': (0, 90),
+    'capex_exploration_rate': (0.0, 1.0),
+    'capex_tactical_rate': (0.0, 1.0),
+    'capex_global_envelope_sats': (0, 100_000_000),
 }
 
 # Valid values for string enum fields
@@ -396,6 +412,16 @@ class Config:
     # Hive Hints integration
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
+
+    # Unified Capex Budget Engine
+    capex_reinvestment_rate: float = 0.50       # Fraction of channel contribution for all capex
+    capex_bootstrap_bps: int = 10               # Bootstrap: basis points of capacity per 30d
+    capex_bootstrap_max_sats: int = 200         # Bootstrap cap per channel per 30d
+    capex_grace_days: int = 14                  # Days before bootstrap activates
+    capex_exploration_rate: float = 0.10        # Fleet contribution fraction for opens/growth
+    capex_tactical_rate: float = 0.15           # Fleet contribution fraction for Boltz treasury
+    capex_global_envelope_sats: int = 0         # Global cap (0 = auto-computed)
+
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -753,6 +779,14 @@ class ConfigSnapshot:
     rebalance_bootstrap_bps: int = 10
     rebalance_bootstrap_max_sats: int = 200
     rebalance_grace_days: int = 14
+    # Unified Capex Budget Engine
+    capex_reinvestment_rate: float = 0.50
+    capex_bootstrap_bps: int = 10
+    capex_bootstrap_max_sats: int = 200
+    capex_grace_days: int = 14
+    capex_exploration_rate: float = 0.10
+    capex_tactical_rate: float = 0.15
+    capex_global_envelope_sats: int = 0
     # Version tracking
     version: int = 0
     
