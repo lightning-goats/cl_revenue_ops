@@ -103,3 +103,65 @@ class TestTacticalBudgetGate:
 
         result = mgr.check_tactical_budget(estimated_fee_sats=500, channel_id=None)
         assert result["allowed"] is True
+
+
+class TestCostAttribution:
+    """Swap costs attributed via engine.attribute_boltz_cost()."""
+
+    def _make_boltz_with_engine(self):
+        from modules.boltz_manager import BoltzCliManager, BoltzCliConfig
+        mock_plugin = MagicMock()
+        mock_rpc = MagicMock()
+        cfg = BoltzCliConfig(
+            enabled=True,
+            cli_path="/usr/bin/boltzcli",
+            datadir="/tmp/test_boltz",
+            daily_budget_sats=50000,
+            enforce_budget=True,
+        )
+        mgr = BoltzCliManager(mock_plugin, mock_rpc, cfg)
+
+        mock_engine = MagicMock(spec=CapexBudgetEngine)
+        mock_engine.attribute_boltz_cost.return_value = {"channel": 100, "tactical": 100}
+        mock_engine.get_tactical_budget.return_value = 10000
+        mgr.set_capex_engine(mock_engine)
+        return mgr
+
+    def test_pure_treasury_all_tactical(self):
+        """Pure treasury swap attributed 100% to tactical."""
+        mgr = self._make_boltz_with_engine()
+        mgr._capex_engine.attribute_boltz_cost.return_value = {"channel": 0, "tactical": 200}
+
+        result = mgr.compute_cost_attribution(cost_sats=200, channel_id=None)
+
+        assert result["channel"] == 0
+        assert result["tactical"] == 200
+        mgr._capex_engine.attribute_boltz_cost.assert_called_with(200, channel_id=None)
+
+    def test_channel_targeted_50_50(self):
+        """Channel-targeted swap gets 50/50 split."""
+        mgr = self._make_boltz_with_engine()
+        mgr._capex_engine.attribute_boltz_cost.return_value = {"channel": 100, "tactical": 100}
+
+        result = mgr.compute_cost_attribution(cost_sats=200, channel_id="100x1x0")
+
+        assert result["channel"] == 100
+        assert result["tactical"] == 100
+        mgr._capex_engine.attribute_boltz_cost.assert_called_with(200, channel_id="100x1x0")
+
+    def test_no_engine_returns_all_tactical(self):
+        """Without engine, all cost attributed to tactical (safe default)."""
+        from modules.boltz_manager import BoltzCliManager, BoltzCliConfig
+        cfg = BoltzCliConfig(
+            enabled=True,
+            cli_path="/usr/bin/boltzcli",
+            datadir="/tmp/test_boltz",
+            daily_budget_sats=3000,
+            enforce_budget=True,
+        )
+        mgr = BoltzCliManager(MagicMock(), MagicMock(), cfg)
+
+        result = mgr.compute_cost_attribution(cost_sats=200, channel_id=None)
+
+        assert result["channel"] == 0
+        assert result["tactical"] == 200

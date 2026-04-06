@@ -93,6 +93,20 @@ class BoltzCliManager:
             }
         return {"allowed": True, "reason": None}
 
+    def compute_cost_attribution(self, cost_sats: int, channel_id=None) -> dict:
+        """Compute cost attribution for a Boltz swap.
+
+        Uses the capex engine's attribute_boltz_cost() for the split.
+        Without an engine, all cost is attributed to tactical (safe default).
+
+        Returns:
+            {"channel": amount_sats, "tactical": amount_sats}
+        """
+        if self._capex_engine:
+            return self._capex_engine.attribute_boltz_cost(cost_sats, channel_id=channel_id)
+        # No engine: attribute everything to tactical
+        return {"channel": 0, "tactical": cost_sats}
+
     @property
     def enabled(self) -> bool:
         """Compatibility property for callers that check boltz_manager.enabled."""
@@ -1013,6 +1027,11 @@ class BoltzCliManager:
                 rec["created_at"] = st
             if metadata:
                 rec.update({k: v for k, v in metadata.items() if v is not None})
+            # Compute capex cost attribution
+            fee = self._estimate_swap_fee_sats(s)
+            trigger_ch = (metadata or {}).get("trigger_channel_id")
+            attribution = self.compute_cost_attribution(fee, channel_id=trigger_ch)
+            rec["capex_attribution"] = attribution
             by_id[sid] = rec
         if by_id:
             merged = list(by_id.values())
