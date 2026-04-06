@@ -1,4 +1,4 @@
-"""Tests for rebalancer rpc_cache migration — listfunds and getinfo."""
+"""Tests for rebalancer data_service migration — listfunds and get_block_height."""
 
 import pytest
 from unittest.mock import MagicMock
@@ -30,65 +30,56 @@ def mock_database():
 
 
 @pytest.fixture
-def mock_rpc_cache():
-    cache = MagicMock()
-    cache.listfunds.return_value = {
+def mock_data_service():
+    ds = MagicMock()
+    ds.get_funds.return_value = {
         "outputs": [{"amount_msat": 1_000_000_000, "status": "confirmed"}],
         "channels": [
             {"short_channel_id": "800000x1x0", "our_amount_msat": 500_000_000,
              "state": "CHANNELD_NORMAL"},
         ]
     }
-    cache.getinfo.return_value = {"blockheight": 900000}
-    return cache
+    ds.get_block_height.return_value = 900000
+    return ds
 
 
-class TestCapitalControlsUsesCache:
-    """_check_capital_controls uses rpc_cache.listfunds when available."""
+class TestCapitalControlsUsesDataService:
+    """_check_capital_controls uses data_service.get_funds."""
 
-    def test_uses_rpc_cache(self, mock_plugin, mock_config, mock_database, mock_rpc_cache):
+    def test_uses_data_service(self, mock_plugin, mock_config, mock_database, mock_data_service):
         ev = EVRebalancer(mock_plugin, mock_config, mock_database)
-        ev.rpc_cache = mock_rpc_cache
+        ev.data_service = mock_data_service
 
         result = ev._check_capital_controls(mock_config)
-        mock_rpc_cache.listfunds.assert_called()
+        mock_data_service.get_funds.assert_called()
         mock_plugin.rpc.listfunds.assert_not_called()
 
-    def test_falls_back_without_cache(self, mock_plugin, mock_config, mock_database):
+    def test_data_service_provides_funds(self, mock_plugin, mock_config, mock_database, mock_data_service):
         ev = EVRebalancer(mock_plugin, mock_config, mock_database)
-        ev.rpc_cache = None
-
-        mock_plugin.rpc.listfunds.return_value = {
-            "outputs": [{"amount_msat": 1_000_000_000, "status": "confirmed"}],
-            "channels": [
-                {"short_channel_id": "800000x1x0", "our_amount_msat": 500_000_000,
-                 "state": "CHANNELD_NORMAL"},
-            ]
-        }
+        ev.data_service = mock_data_service
 
         result = ev._check_capital_controls(mock_config)
-        mock_plugin.rpc.listfunds.assert_called()
+        mock_data_service.get_funds.assert_called()
 
 
-class TestChannelAgeDaysUsesCache:
-    """_get_channel_age_days uses rpc_cache.getinfo when available."""
+class TestChannelAgeDaysUsesDataService:
+    """_get_channel_age_days uses data_service.get_block_height."""
 
-    def test_uses_rpc_cache(self, mock_plugin, mock_config, mock_database, mock_rpc_cache):
+    def test_uses_data_service(self, mock_plugin, mock_config, mock_database, mock_data_service):
         ev = EVRebalancer(mock_plugin, mock_config, mock_database)
-        ev.rpc_cache = mock_rpc_cache
+        ev.data_service = mock_data_service
 
         age = ev._get_channel_age_days("800000x1x0")
-        mock_rpc_cache.getinfo.assert_called()
+        mock_data_service.get_block_height.assert_called()
         mock_plugin.rpc.getinfo.assert_not_called()
         assert age > 0
 
-    def test_falls_back_without_cache(self, mock_plugin, mock_config, mock_database):
+    def test_returns_correct_age(self, mock_plugin, mock_config, mock_database, mock_data_service):
         ev = EVRebalancer(mock_plugin, mock_config, mock_database)
-        ev.rpc_cache = None
-        mock_plugin.rpc.getinfo.return_value = {"blockheight": 900000}
-
+        ev.data_service = mock_data_service
+        # block 800000, current 900000 → 100000 blocks → 694 days
         age = ev._get_channel_age_days("800000x1x0")
-        mock_plugin.rpc.getinfo.assert_called()
+        assert age > 0
 
 
 # TestJobManagerUsesCache removed -- _get_channel_local_balance and

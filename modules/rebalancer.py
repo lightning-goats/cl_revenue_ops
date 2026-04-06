@@ -319,7 +319,7 @@ class JobManager:
             if self._askrene_cache_ts and (now - self._askrene_cache_ts) < 30:
                 return
         try:
-            res = self.plugin.rpc.call("askrene-listlayers", {"layer": self.askrene_layer})
+            res = self.data_service.get_askrene_layers()
             layers = res.get("layers", [])
             cache: Dict[str, int] = {}
             for layer in layers:
@@ -721,8 +721,7 @@ class EVRebalancer:
         if self._our_node_id:
             return self._our_node_id
         try:
-            info = self.plugin.rpc.getinfo()
-            node_id = info.get("id", "")
+            node_id = self.data_service.get_node_id()
             if node_id:
                 self._our_node_id = node_id
             return node_id or None
@@ -754,8 +753,7 @@ class EVRebalancer:
                 return 0
 
             # Get current block height
-            getinfo = self.rpc_cache.getinfo() if self.rpc_cache else self.plugin.rpc.getinfo()
-            current_height = getinfo.get("blockheight", 0)
+            current_height = self.data_service.get_block_height()
 
             if current_height <= 0 or block_height <= 0:
                 return 0
@@ -878,8 +876,7 @@ class EVRebalancer:
                 self.hive_router.refresh_fleet_balances()
                 self.hive_router.clear_route_cache()
             # Invalidate RPC cache at cycle start for fresh data
-            if self.rpc_cache:
-                self.rpc_cache.invalidate()
+            self.data_service.invalidate()
             
             # Hoist peer connection status call - do it once instead of per-candidate
             peer_status = self._get_peer_connection_status()
@@ -1555,7 +1552,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 if source_scid and self.hive_router:
                     try:
                         # Find which fleet peer this source channel connects to
-                        for ch in self.plugin.rpc.listpeerchannels().get("channels", []):
+                        for ch in self.data_service.get_peer_channels().get("channels", []):
                             if (ch.get("short_channel_id", "") == source_scid
                                     and ch.get("state") == "CHANNELD_NORMAL"):
                                 source_peer = ch.get("peer_id", "")
@@ -2472,7 +2469,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             try:
                 our_id = self._get_our_node_id()
                 if our_id:
-                    channels = self.plugin.rpc.listchannels(source=peer_id)
+                    channels = self.data_service.get_channels(source=peer_id)
                     for ch in channels.get("channels", []):
                         if ch.get("destination") == our_id:
                             ppm = int(ch.get("fee_per_millionth", 0) or 0)
@@ -2498,7 +2495,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         if amount_msat <= 0:
             return None
         try:
-            route = self.plugin.rpc.getroute(id=peer_id, amount_msat=amount_msat, riskfactor=10, maxhops=6)
+            route = self.data_service.get_route(id=peer_id, amount_msat=amount_msat, riskfactor=10, maxhops=6)
             if route.get("route"):
                 first_hop = route["route"][0].get("amount_msat", amount_msat)
                 first_hop = self._parse_msat(first_hop) if not isinstance(first_hop, int) else first_hop
@@ -2811,7 +2808,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
     def _get_peer_connection_status(self) -> Dict:
         status = {}
         try:
-            for p in self.plugin.rpc.listpeers().get("peers", []):
+            for p in self.data_service.get_peers().get("peers", []):
                 status[p.get("id")] = {"connected": p.get("connected", False)}
         except Exception as e:
             self.plugin.log(f"Failed to get peer connection status: {e}", level='debug')
@@ -2828,8 +2825,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         for attempt in range(1, max_attempts + 1):
             channels: Dict[str, Dict[str, Any]] = {}
             try:
-                listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
-                listpeerchannels = self.rpc_cache.listpeerchannels() if self.rpc_cache else self.plugin.rpc.listpeerchannels()
+                listfunds = self.data_service.get_funds()
+                listpeerchannels = self.data_service.get_peer_channels()
 
                 # Build peer info map from listpeerchannels
                 peer_info = {}
@@ -3442,7 +3439,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         try:
             # --- Reserve check (needs listfunds RPC) ---
             try:
-                listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
+                listfunds = self.data_service.get_funds()
                 onchain_sats = 0
                 for output in listfunds.get("outputs", []):
                     if output.get("status") == "confirmed":

@@ -91,6 +91,7 @@ class TestLastHopFeeUnits:
     def test_get_last_hop_fee_converts_base_fee_to_ppm(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
+        from unittest.mock import MagicMock
 
         cfg = Config(dry_run=True)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -98,8 +99,9 @@ class TestLastHopFeeUnits:
         peer_id = "02" + "e" * 64
         our_id = "02" + "f" * 64
 
-        mock_plugin.rpc.getinfo.return_value = {"id": our_id}
-        mock_plugin.rpc.listchannels.return_value = {
+        mock_data_service = MagicMock()
+        mock_data_service.get_node_id.return_value = our_id
+        mock_data_service.get_channels.return_value = {
             "channels": [
                 {
                     "destination": our_id,
@@ -108,6 +110,7 @@ class TestLastHopFeeUnits:
                 }
             ]
         }
+        r.data_service = mock_data_service
 
         # At 100k sats (100,000,000 msat), a 1 sat base fee ~= 10 ppm.
         ppm = r._get_last_hop_fee(peer_id, amount_msat=100_000_000)
@@ -682,8 +685,9 @@ class TestNoDeplestedSourceDiagnostics:
         r.job_manager.active_channels = set()
         r.job_manager.active_job_count = 0
 
+        mock_data_service = MagicMock()
         # All channels in balanced range (30-70%)
-        mock_plugin.rpc.listpeerchannels.return_value = {
+        mock_data_service.get_peer_channels.return_value = {
             "channels": [
                 {
                     "short_channel_id": "111x1x0",
@@ -705,12 +709,7 @@ class TestNoDeplestedSourceDiagnostics:
                 },
             ]
         }
-        mock_database.get_total_rebalance_fees.return_value = 0
-        mock_database.cleanup_stale_reservations.return_value = 0
-        mock_database.get_external_liquidity_costs_24h.return_value = {"spent": 0, "reserved": 0}
-        mock_database.get_hot_channel_depletion_thresholds.return_value = {}
-        mock_database.get_total_routing_revenue.return_value = 10000
-        mock_plugin.rpc.listfunds.return_value = {
+        mock_data_service.get_funds.return_value = {
             "outputs": [{"status": "confirmed", "amount_msat": 10_000_000_000}],
             "channels": [
                 {
@@ -729,6 +728,13 @@ class TestNoDeplestedSourceDiagnostics:
                 },
             ],
         }
+        r.data_service = mock_data_service
+
+        mock_database.get_total_rebalance_fees.return_value = 0
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.get_external_liquidity_costs_24h.return_value = {"spent": 0, "reserved": 0}
+        mock_database.get_hot_channel_depletion_thresholds.return_value = {}
+        mock_database.get_total_routing_revenue.return_value = 10000
 
         candidates = r.find_rebalance_candidates()
         assert candidates == []
