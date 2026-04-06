@@ -36,6 +36,7 @@ from .utils import parse_msat as _shared_parse_msat
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
+    from .capex_budget import CapexBudgetEngine
 
 
 class JobStatus(Enum):
@@ -1904,6 +1905,7 @@ class EVRebalancer:
         self._our_node_id: Optional[str] = None
         self._fee_cache: Dict[Tuple[str, int], Optional[int]] = {}  # F11 FIX: Initialize in __init__
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
+        self._capex_engine: Optional['CapexBudgetEngine'] = None
 
         # Optional callback injected by cl-revenue-ops to report external liquidity
         # costs (e.g. Boltz swap fees) for unified budget gating.
@@ -2285,6 +2287,10 @@ class EVRebalancer:
     def set_profitability_analyzer(self, analyzer: 'ChannelProfitabilityAnalyzer') -> None:
         self._profitability_analyzer = analyzer
 
+    def set_capex_engine(self, engine: 'CapexBudgetEngine'):
+        """Inject the unified capex budget engine."""
+        self._capex_engine = engine
+
     def set_capacity_planner(self, planner) -> None:
         """Set reference to capacity planner for coordination."""
         self._capacity_planner = planner
@@ -2313,6 +2319,13 @@ class EVRebalancer:
 
         # Thread-safe config snapshot for this rebalance cycle
         cfg = self.config.snapshot()
+
+        # Compute capex allocations for this cycle (engine does all budget math)
+        if self._capex_engine:
+            try:
+                self._capex_engine.compute_allocations()
+            except Exception as e:
+                self.plugin.log(f"Capex engine allocation failed: {e}", level='warn')
 
         # Issue #24: Clean up stale reservations before each rebalance cycle
         # This prevents budget leakage from crashed jobs
