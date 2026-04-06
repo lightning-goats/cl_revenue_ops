@@ -1577,7 +1577,7 @@ class ChannelProfitabilityAnalyzer:
 
         try:
             # Get on-chain balance from listfunds
-            listfunds = self.rpc_cache.listfunds() if self.rpc_cache else self.plugin.rpc.listfunds()
+            listfunds = self.data_service.get_funds() if self.data_service else self.plugin.rpc.listfunds()
 
             for output in listfunds.get("outputs", []):
                 if output.get("status") == "confirmed":
@@ -1618,13 +1618,13 @@ class ChannelProfitabilityAnalyzer:
         channels = {}
         
         try:
-            result = self.rpc_cache.listpeerchannels() if self.rpc_cache else self.plugin.rpc.listpeerchannels()
+            result = self.data_service.get_peer_channels() if self.data_service else self.plugin.rpc.listpeerchannels()
 
             for channel in result.get("channels", []):
                 state = channel.get("state", "")
                 if state != "CHANNELD_NORMAL":
                     continue
-                
+
                 channel_id = channel.get("short_channel_id")
                 if not channel_id:
                     continue
@@ -1936,7 +1936,7 @@ class ChannelProfitabilityAnalyzer:
             reversed_txid = self._reverse_txid(funding_txid)
             
             # Query bookkeeper for this account's events
-            result = self.plugin.rpc.call(
+            result = self.data_service.bkpr_list_account_events(reversed_txid) if self.data_service else self.plugin.rpc.call(
                 "bkpr-listaccountevents",
                 {"account": reversed_txid}
             )
@@ -1988,7 +1988,7 @@ class ChannelProfitabilityAnalyzer:
             
             # Alternative: check wallet account for the same txid
             # This catches cases where we opened the channel
-            wallet_result = self.plugin.rpc.call(
+            wallet_result = self.data_service.bkpr_list_account_events("wallet") if self.data_service else self.plugin.rpc.call(
                 "bkpr-listaccountevents",
                 {"account": "wallet"}
             )

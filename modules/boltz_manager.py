@@ -51,6 +51,7 @@ class BoltzCliManager:
         self._ignored_swaps_lock = threading.Lock()
         # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
         self._swap_creation_lock = threading.Lock()
+        self.data_service = None
         # Optional callback set by cl-revenue-ops plugin to provide non-Boltz liquidity costs
         # (e.g. market rebalance spend/reservations) for unified budget accounting.
         self.external_liquidity_cost_provider = None
@@ -271,7 +272,7 @@ class BoltzCliManager:
 
     def _resolve_peer_channel_ids(self, peer_id: str) -> List[str]:
         try:
-            result = self.rpc.listpeerchannels(peer_id)
+            result = self.data_service.get_peer_channels(peer_id=peer_id) if self.data_service else self.rpc.listpeerchannels(peer_id)
         except Exception as e:
             self.plugin.log(f"BOLTZ: listpeerchannels failed for peer {peer_id[:12]}...: {e}", level='warn')
             return []
@@ -295,7 +296,7 @@ class BoltzCliManager:
         target_scid = (str(channel_id).replace(':', 'x') if channel_id else None)
         warnings: List[str] = []
         try:
-            result = self.rpc.call("listpeerchannels")
+            result = self.data_service.get_peer_channels() if self.data_service else self.rpc.call("listpeerchannels")
         except Exception as e:
             raise BoltzCliError(f"listpeerchannels failed while resolving first-hop target: {e}")
         channels = result.get("channels", []) if isinstance(result, dict) else []
@@ -347,7 +348,7 @@ class BoltzCliManager:
         """
         warnings: List[str] = []
         try:
-            result = self.rpc.call("listpeerchannels")
+            result = self.data_service.get_peer_channels() if self.data_service else self.rpc.call("listpeerchannels")
         except Exception as e:
             raise BoltzCliError(f"listpeerchannels failed while building excludes: {e}")
         channels = result.get("channels", []) if isinstance(result, dict) else []
@@ -432,7 +433,7 @@ class BoltzCliManager:
         """Best-effort CLN pay lookup for a bolt11 invoice after timeouts/errors."""
         out: Dict[str, Any] = {"available": False, "matches": []}
         try:
-            res = self.rpc.call("listpays", {"bolt11": invoice})
+            res = self.data_service.list_pays(bolt11=invoice) if self.data_service else self.rpc.call("listpays", {"bolt11": invoice})
             pays = res.get("pays", []) if isinstance(res, dict) else []
             out = {"available": True, "source": "listpays", "matches": pays}
             if pays:
@@ -440,7 +441,7 @@ class BoltzCliManager:
         except Exception as e:
             out = {"available": False, "error": str(e), "source": "listpays"}
         try:
-            res2 = self.rpc.call("listpays")
+            res2 = self.data_service.list_pays() if self.data_service else self.rpc.call("listpays")
             pays2 = res2.get("pays", []) if isinstance(res2, dict) else []
             matches = [p for p in pays2 if isinstance(p, dict) and str(p.get("bolt11") or "") == str(invoice)]
             return {"available": True, "source": "listpays_scan", "matches": matches}
@@ -452,14 +453,10 @@ class BoltzCliManager:
                                    retry_for: int = 120) -> Dict[str, Any]:
         if not invoice or not str(invoice).lower().startswith("ln"):
             raise BoltzCliError("Invalid bolt11 invoice for external reverse swap payment")
-        decode = None
         try:
-            decode = self.rpc.call("decodepay", {"bolt11": invoice})
-        except Exception:
-            try:
-                decode = self.rpc.call("decode", {"string": invoice})
-            except Exception as e:
-                raise BoltzCliError(f"decodepay failed for external reverse swap invoice: {e}")
+            decode = self.data_service.decode(invoice) if self.data_service else self.rpc.call("decode", {"string": invoice})
+        except Exception as e:
+            raise BoltzCliError(f"decode failed for external reverse swap invoice: {e}")
 
         exclude, warnings = self._build_first_hop_excludes(preferred_peer_id, preferred_channel_id)
         payee_pubkey = self._decodepay_payee_pubkey(decode)
@@ -489,7 +486,7 @@ class BoltzCliManager:
                 pass
 
         try:
-            pay_result = self.rpc.call("pay", pay_params)
+            pay_result = self.data_service.pay(**pay_params) if self.data_service else self.rpc.call("pay", pay_params)
             status = "submitted"
             pay_error = None
             pay_lookup = None

@@ -1667,7 +1667,7 @@ class FlowAnalyzer:
         - htlcs: List of currently active HTLCs
         """
         try:
-            result = self.rpc_cache.listpeerchannels() if self.rpc_cache else self.plugin.rpc.listpeerchannels()
+            result = self.data_service.get_peer_channels() if self.data_service else self.plugin.rpc.listpeerchannels()
             channels = []
 
             # listpeerchannels returns channels grouped by peer

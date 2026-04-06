@@ -55,9 +55,7 @@ def _setup_integration_mocks(analyzer, plugin, config, database, ch_id="100x1x0"
     """Wire up all mocks needed for analyze_all_channels to produce results."""
     now = int(time.time())
 
-    # RPC cache for listpeerchannels
-    rpc_cache = MagicMock()
-    rpc_cache.listpeerchannels.return_value = {
+    channels_response = {
         "channels": [{
             "state": "CHANNELD_NORMAL",
             "short_channel_id": ch_id,
@@ -67,7 +65,12 @@ def _setup_integration_mocks(analyzer, plugin, config, database, ch_id="100x1x0"
             "opener": "local",
         }]
     }
+    # RPC cache for listpeerchannels (fallback)
+    rpc_cache = MagicMock()
+    rpc_cache.listpeerchannels.return_value = channels_response
     analyzer.rpc_cache = rpc_cache
+    # data_service.get_peer_channels (primary path)
+    analyzer.data_service.get_peer_channels.return_value = channels_response
 
     # Bookkeeper (income_events)
     plugin.rpc.call.return_value = {"income_events": []}

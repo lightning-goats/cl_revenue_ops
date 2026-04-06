@@ -35,6 +35,7 @@ class HiveHintAdapter:
         self._ttl_override = ttl_override
         self._snapshot = None
         self._snapshot_fetched_at = 0
+        self.data_service = None
 
     # ------------------------------------------------------------------
     # Polling
@@ -53,7 +54,7 @@ class HiveHintAdapter:
         # Priority 1: Read from CLN datastore (fast, no cross-plugin RPC)
         try:
             import json as _json
-            ds = self._plugin.rpc.listdatastore(key=["hive", "hints"])
+            ds = self.data_service.list_datastore(["hive", "hints"]) if self.data_service else self._plugin.rpc.listdatastore(key=["hive", "hints"])
             entries = ds.get("datastore", [])
             if entries:
                 data_str = entries[0].get("string", "")

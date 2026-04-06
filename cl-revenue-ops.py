@@ -1542,6 +1542,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_analyzer.data_service = data_service
     if capacity_planner is not None:
         capacity_planner.data_service = data_service
+    if boltz_manager is not None:
+        boltz_manager.data_service = data_service
+    if hive_hints is not None:
+        hive_hints.data_service = data_service
 
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
