@@ -3423,79 +3423,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             hive_route_hops=hive_route.get("hops", 0) if hive_route else 0,
         )
 
-    def _calculate_channel_capex_budget(
-        self,
-        channel_id: str,
-        total_contribution_30d_sats: int,
-        rebalance_cost_30d_sats: int,
-        total_forward_count_30d: int,
-        capacity_sats: int,
-        days_open: int,
-        classification: str,
-        bleeder_status: str,
-        marginal_roi: float,
-        success_rate: Optional[float],
-    ) -> Tuple[int, str, int]:
-        """Calculate per-channel capex rebalance budget.
-
-        Returns:
-            (budget_sats, tier, tier_ppm) where:
-            - budget_sats: remaining 30d budget for this channel
-            - tier: "proven", "active", "bootstrap", or "blocked"
-            - tier_ppm: max PPM ceiling for individual rebalance attempts
-        """
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-
-        # --- Blocked channels: budget = 0 ---
-        if classification == "zombie":
-            return (0, "blocked", 0)
-        if bleeder_status == "hard":
-            return (0, "blocked", 0)
-        if days_open < cfg.rebalance_grace_days and total_contribution_30d_sats == 0:
-            return (0, "blocked", 0)
-        if marginal_roi < 0 and total_contribution_30d_sats == 0:
-            return (0, "blocked", 0)
-
-        # --- Success rate discount ---
-        if success_rate is not None:
-            discount = max(0.1, success_rate)
-        else:
-            discount = 1.0  # No history — no penalty
-
-        # --- Proven budget: reinvestment_rate * contribution - already spent ---
-        reinvestment = cfg.rebalance_reinvestment_rate
-        proven_budget = max(0, int(total_contribution_30d_sats * reinvestment) - rebalance_cost_30d_sats)
-
-        # --- Bootstrap budget: basis points of capacity, capped ---
-        bootstrap_budget = min(
-            int(capacity_sats * cfg.rebalance_bootstrap_bps / 10000),
-            cfg.rebalance_bootstrap_max_sats,
-        )
-
-        # --- Determine tier and PPM ceiling ---
-        if total_contribution_30d_sats > 100:
-            tier = "proven"
-            tier_ppm = 2000
-        elif total_forward_count_30d > 5:
-            tier = "active"
-            tier_ppm = 500
-        elif days_open >= cfg.rebalance_grace_days:
-            tier = "bootstrap"
-            tier_ppm = 250
-        else:
-            tier = "blocked"
-            tier_ppm = 0
-            return (0, tier, tier_ppm)
-
-        # --- Pick budget: proven earners use only reinvestment; others get bootstrap floor ---
-        if tier == "proven":
-            raw_budget = proven_budget
-        else:
-            raw_budget = max(proven_budget, bootstrap_budget)
-
-        budget = int(raw_budget * discount)
-        return (budget, tier, tier_ppm)
-
     def _capex_fallback_pass(
         self,
         depleted_channels: list,
@@ -3504,12 +3431,18 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         available_slots: int,
         cfg=None,
     ) -> list:
-        """Capex fallback: re-evaluate depleted channels with cost-ceiling budgets.
+        """Capex fallback: re-evaluate depleted channels with engine budgets.
 
         Called when the EV profit gate found 0 profitable candidates. Uses
-        per-channel budgets from _calculate_channel_capex_budget instead of
-        per-trade profit requirements.
+        per-channel budgets from the unified CapexBudgetEngine.
         """
+        if not self._capex_engine:
+            self.plugin.log(
+                "CAPEX_FALLBACK: No capex engine available, skipping",
+                level='warn'
+            )
+            return []
+
         if cfg is None:
             cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
 
@@ -3527,62 +3460,18 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
             evaluated += 1
 
-            # Get profitability data for budget calculation
-            prof = None
-            if self._profitability_analyzer:
-                try:
-                    prof = self._profitability_analyzer.get_profitability(dest_id)
-                except Exception:
-                    pass
+            # Look up budget from engine (already computed in compute_allocations)
+            ch_budget = self._capex_engine.get_channel_budget(dest_id)
 
-            if prof is None:
+            if ch_budget.tier == "blocked":
                 skipped_blocked += 1
                 continue
-
-            # Get 30d P&L for contribution and cost data
-            try:
-                pnl = self.database.get_channel_full_pnl(dest_id, window_days=30)
-            except Exception:
-                skipped_blocked += 1
+            if ch_budget.budget_sats <= 0:
+                skipped_no_budget += 1
                 continue
 
-            contribution_sats = pnl.get('total_contribution_sats',
-                                        pnl.get('total_contribution_msat', 0) // 1000)
-            rebalance_cost = pnl.get('rebalance_cost_sats', 0)
-
-            # Get success rate
-            sr_data = self.database.get_channel_rebalance_success_rate(dest_id, 30)
-            success_rate = sr_data['success_rate'] if sr_data and sr_data.get('total', 0) >= 3 else None
-
-            # Get bleeder status
-            bleeder_status = "none"
-            try:
-                bleeder = self._profitability_analyzer.get_bleeder_status(dest_id)
-                if bleeder:
-                    bleeder_status = bleeder.classification
-            except Exception:
-                pass
-
-            # Calculate capex budget
-            budget, tier, tier_ppm = self._calculate_channel_capex_budget(
-                channel_id=dest_id,
-                total_contribution_30d_sats=contribution_sats,
-                rebalance_cost_30d_sats=rebalance_cost,
-                total_forward_count_30d=prof.revenue.total_forward_count,
-                capacity_sats=dest_info.get("capacity", 0),
-                days_open=prof.days_open,
-                classification=prof.classification.value if hasattr(prof.classification, 'value') else str(prof.classification),
-                bleeder_status=bleeder_status,
-                marginal_roi=getattr(prof, 'marginal_roi', 0.0),
-                success_rate=success_rate,
-            )
-
-            if budget <= 0:
-                if tier == "blocked":
-                    skipped_blocked += 1
-                else:
-                    skipped_no_budget += 1
-                continue
+            budget_sats = ch_budget.budget_sats
+            tier_ppm = ch_budget.tier_ppm
 
             # Determine rebalance amount
             capacity = dest_info.get("capacity", 0)
@@ -3602,11 +3491,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
 
             # Per-rebalance fee ceiling
             ppm_cap_sats = (amount_needed * tier_ppm) // 1_000_000
-            max_fee_sats = min(budget, max(1, ppm_cap_sats))
+            max_fee_sats = min(budget_sats, max(1, ppm_cap_sats))
             max_fee_msat = max_fee_sats * 1000
             max_fee_ppm = min(tier_ppm, (max_fee_sats * 1_000_000) // max(1, amount_needed))
 
-            # Find source channels — call with actual signature
+            # Find source channels
             outbound_fee_ppm = dest_info.get("fee_ppm", 0)
             source_tuples = [(s[0], s[1], s[2] if len(s) > 2 else 0.0) for s in source_channels]
             try:
@@ -3650,7 +3539,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 dest_turnover_rate=0.0,
                 source_turnover_rate=0.0,
                 reason_code=RebalanceReasonCode.CAPEX_FALLBACK.value,
-                bleeder_status=bleeder_status,
+                bleeder_status="none",
                 source_candidate_peer_ids=[
                     s[1].get("peer_id", "") for s in source_result
                 ],
