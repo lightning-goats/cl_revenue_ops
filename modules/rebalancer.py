@@ -136,6 +136,8 @@ class RebalanceCandidate:
     # Hive route discovery: if askrene found a cheap fleet route, store hop count
     # for RebalanceExecutor fleet-aware routing.
     hive_route_hops: int = 0
+    # True if destination peer is a hive member — enables zero-fee return hop
+    dest_is_hive_member: bool = False
 
     # Backwards compatibility property
     @property
@@ -999,10 +1001,17 @@ class EVRebalancer:
             # =====================================================================
             # HIVE-FIRST PASS: Fleet-routable destinations use capex budgets directly.
             # Fleet routes cost ~0 ppm so the EV spread gate is wrong for them.
+            # Pure-hive routes (dest is also a member) are truly zero cost —
+            # prioritize those by sorting hive members first.
             # =====================================================================
             non_hive_depleted = []
             if self.hive_router and self.hive_router.available and self._capex_engine:
-                for dest_id, dest_info, dest_ratio in depleted_channels:
+                # Sort: hive member destinations first (pure-hive = zero cost)
+                hive_sorted = sorted(
+                    depleted_channels,
+                    key=lambda d: (0 if self.hive_router.is_hive_member(d[1].get("peer_id", "")) else 1),
+                )
+                for dest_id, dest_info, dest_ratio in hive_sorted:
                     if dest_id in active_channels:
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
@@ -1095,11 +1104,13 @@ class EVRebalancer:
                         reason_code=RebalanceReasonCode.CAPEX_FALLBACK.value,
                         bleeder_status="none",
                         hive_route_hops=hr.hops,
+                        dest_is_hive_member=self.hive_router.is_hive_member(dest_peer_id),
                         source_candidate_peer_ids=[s[1].get("peer_id", "") for s in source_result],
                     )
                     candidates.append(candidate)
+                    route_type = "pure-hive (zero cost)" if candidate.dest_is_hive_member else "fleet"
                     self.plugin.log(
-                        f"HIVE CAPEX: {dest_id[:12]}... via fleet ({hr.hops} hops, {hr.fee_ppm} ppm), "
+                        f"HIVE CAPEX: {dest_id[:12]}... {route_type} ({hr.hops} hops, {hr.fee_ppm} ppm), "
                         f"budget {max_fee_sats} sats, amount {amount_needed} sats",
                         level='info',
                     )

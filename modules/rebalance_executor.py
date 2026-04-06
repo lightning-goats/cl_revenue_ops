@@ -612,9 +612,16 @@ class RebalanceExecutor:
         - Validate all params before calling getroutes (0 amounts → crash)
         - Try/except with auto-only fallback (unknown layer TOCTOU → crash)
         """
-        required_amount_msat, required_cltv = self._get_return_hop_policy(
-            candidate, job.amount_msat, our_id,
-        )
+        # Pure-hive routes (dest is fleet member): return hop is free — the
+        # hive-fleet layer sets their fee to 0. Skip the costly return-hop
+        # policy lookup and use amount_msat directly.
+        if getattr(candidate, 'dest_is_hive_member', False):
+            required_amount_msat = job.amount_msat
+            required_cltv = 24  # 18 base + 6 delta (safe default)
+        else:
+            required_amount_msat, required_cltv = self._get_return_hop_policy(
+                candidate, job.amount_msat, our_id,
+            )
 
         # Pre-validate: askrene can crash on degenerate inputs
         if required_amount_msat <= 0 or job.max_fee_msat <= 0:
