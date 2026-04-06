@@ -690,9 +690,9 @@ class RebalanceExecutor:
             inflated = int(full_route[0].get("amount_msat", 0) or 0)
             if inflated > required_amount_msat:
                 self._log(
-                    f"Fleet first-hop fee strip: {inflated} -> "
-                    f"{required_amount_msat} "
-                    f"(removed {inflated - required_amount_msat}msat "
+                    f"Fleet first-hop fee strip: {base_to_sats_floor(inflated)} -> "
+                    f"{base_to_sats_floor(required_amount_msat)} sats "
+                    f"(removed {base_to_sats_floor(inflated - required_amount_msat)} sats "
                     f"phantom channel fee)",
                 )
                 full_route[0]["amount_msat"] = required_amount_msat
@@ -870,7 +870,7 @@ class RebalanceExecutor:
 
                 self._log(
                     f"Job {job.job_id} SUCCESS: {candidate.to_channel} "
-                    f"fee={actual_fee}msat ({actual_ppm}ppm) "
+                    f"fee={base_to_sats_floor(actual_fee)} sats ({actual_ppm}ppm) "
                     f"{len(full_route)} hops",
                 )
                 return result
