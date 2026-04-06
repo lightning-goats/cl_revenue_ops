@@ -18,6 +18,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from modules.rebalance_memory import RebalanceRoutingMemory
+from modules.utils import base_to_sats_floor, sats_to_base
 
 
 class JobState(Enum):
@@ -882,8 +883,8 @@ class RebalanceExecutor:
                             source_peer = ch.get("peer_id", "")
                             if source_peer and self.hive_router.is_hive_member(source_peer):
                                 max_through = self.hive_router.max_rebalance_through_member(source_peer)
-                                if 0 < max_through < amount_msat // 1000:
-                                    amount_msat = max_through * 1000
+                                if 0 < max_through < base_to_sats_floor(amount_msat):
+                                    amount_msat = sats_to_base(max_through)
                                     self._log(
                                         f"Fleet sizing: capped to {max_through} sats "
                                         f"(peer {source_peer[:12]}...)",
