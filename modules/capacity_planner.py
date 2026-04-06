@@ -49,6 +49,7 @@ class CapacityPlanner:
         # Unified budget provider: injected by main plugin for cross-module budget gating
         self.global_budget_limit_provider = None
         self.external_liquidity_cost_provider = None
+        self._capex_engine = None
         # Coordination signals: cached from last execute_cycle for Boltz integration
         self._last_loser_scids: set = set()        # SCIDs with action=CLOSE
         self._last_funding_deficit_sats: int = 0    # On-chain shortfall for next open
@@ -65,6 +66,10 @@ class CapacityPlanner:
         self._cycle_nodes_by_id: Dict[str, dict] = {}
         self._cycle_channels_dest: Dict[str, list] = {}
         self._cycle_channels_source: Dict[str, list] = {}
+
+    def set_capex_engine(self, engine):
+        """Inject the unified capex budget engine."""
+        self._capex_engine = engine
 
     def get_boltz_coordination(self) -> Dict[str, Any]:
         """Return signals for Boltz planner coordination.
@@ -220,6 +225,13 @@ class CapacityPlanner:
 
         self._init_cycle_cache()
 
+        # Compute capex allocations for this cycle
+        if self._capex_engine:
+            try:
+                self._capex_engine.compute_allocations()
+            except Exception as e:
+                self.plugin.log(f"Capex engine allocation failed: {e}", level='warn')
+
         summary = {
             "opens": [],
             "closes": [],
@@ -347,12 +359,28 @@ class CapacityPlanner:
                         "min_amount_sats": min_open,
                     }
 
+            # Exploration budget gate: compute per-candidate shares
+            exploration_budget_sats = 0
+            estimated_open_cost = self._estimate_open_cost()
+            if self._capex_engine:
+                exploration_budget_sats = self._capex_engine.get_fleet_exploration_budget()
+            total_candidate_score = sum(c.get("score", 0) for c in candidates) if candidates else 0
+
             opens_this_cycle = 0
             for candidate in sorted(candidates, key=lambda c: c.get("score", 0), reverse=True):
                 if opens_this_cycle >= cfg.planner_max_opens_per_cycle:
                     break
 
                 peer_id = candidate["peer_id"]
+
+                # Exploration budget gate: defer if per-candidate share < open cost
+                if self._capex_engine and total_candidate_score > 0:
+                    candidate_share = int(exploration_budget_sats * (candidate.get("score", 0) / total_candidate_score))
+                    if candidate_share < estimated_open_cost:
+                        summary["skipped_reasons"].append(
+                            f"Exploration budget: {peer_id[:16]}... share {candidate_share} < open cost {estimated_open_cost}"
+                        )
+                        continue
 
                 # Size channel
                 channel_size = self._size_channel(candidate, candidates, available_sats, cfg)
