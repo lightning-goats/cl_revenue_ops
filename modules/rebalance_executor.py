@@ -790,8 +790,9 @@ class RebalanceExecutor:
                 # we still enforce the real budget before committing sats.
                 if total_fee > job.max_fee_msat:
                     raise ValueError(
-                        f"route_over_budget: {fee_ppm}ppm ({total_fee}msat) "
-                        f"exceeds budget {job.max_fee_msat}msat"
+                        f"route_over_budget: {fee_ppm}ppm "
+                        f"({base_to_sats_floor(total_fee)} sats) "
+                        f"exceeds budget {base_to_sats_floor(job.max_fee_msat)} sats"
                     )
 
                 self._log(
