@@ -1,4 +1,4 @@
-"""Tests for capex-aware rebalancer."""
+"""Tests for capex-aware rebalancer (engine-driven)."""
 
 import os
 import sys
@@ -14,39 +14,12 @@ sys.modules.setdefault('pyln.client', mock_pyln)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.config import Config, ConfigSnapshot
-from modules.rebalancer import EVRebalancer as Rebalancer
+from modules.rebalancer import EVRebalancer as Rebalancer, RebalanceReasonCode
+from modules.capex_budget import CapexBudgetEngine, ChannelCapexBudget, CapexAllocations
 
 
-class TestCapexConfig:
-    """New capex rebalancer config fields exist with correct defaults."""
-
-    def test_reinvestment_rate_default(self):
-        cfg = Config()
-        assert cfg.rebalance_reinvestment_rate == 0.50
-
-    def test_bootstrap_bps_default(self):
-        cfg = Config()
-        assert cfg.rebalance_bootstrap_bps == 10
-
-    def test_bootstrap_max_sats_default(self):
-        cfg = Config()
-        assert cfg.rebalance_bootstrap_max_sats == 200
-
-    def test_grace_days_default(self):
-        cfg = Config()
-        assert cfg.rebalance_grace_days == 14
-
-    def test_snapshot_includes_capex_fields(self):
-        cfg = Config()
-        snap = cfg.snapshot()
-        assert snap.rebalance_reinvestment_rate == 0.50
-        assert snap.rebalance_bootstrap_bps == 10
-        assert snap.rebalance_bootstrap_max_sats == 200
-        assert snap.rebalance_grace_days == 14
-
-
-def _make_rebalancer():
-    """Create a minimal Rebalancer for testing."""
+def _make_rebalancer(capex_engine=None):
+    """Create a minimal Rebalancer with optional capex engine."""
     mock_plugin = MagicMock()
     mock_plugin.rpc = MagicMock()
     mock_db = MagicMock()
@@ -55,6 +28,8 @@ def _make_rebalancer():
     mock_config.rebalance_bootstrap_bps = 10
     mock_config.rebalance_bootstrap_max_sats = 200
     mock_config.rebalance_grace_days = 14
+    mock_config.rebalance_max_amount = 5_000_000
+    mock_config.rebalance_min_amount = 50_000
     mock_config.snapshot.return_value = mock_config
 
     rebalancer = Rebalancer.__new__(Rebalancer)
@@ -62,254 +37,46 @@ def _make_rebalancer():
     rebalancer.database = mock_db
     rebalancer.config = mock_config
     rebalancer._profitability_analyzer = MagicMock()
+    rebalancer._capex_engine = capex_engine
     return rebalancer
 
 
-class TestChannelCapexBudget:
-    """_calculate_channel_capex_budget returns correct budgets."""
+class TestEngineInjection:
+    """Capex engine can be injected into the rebalancer."""
 
-    def test_proven_earner_gets_proportional_budget(self):
-        """Channel earning 1000 sats with 200 spent -> 240 remaining (with 0.8 success)."""
+    def test_set_capex_engine(self):
         r = _make_rebalancer()
-        budget, tier, tier_ppm = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=1000,
-            rebalance_cost_30d_sats=200,
-            total_forward_count_30d=50,
-            capacity_sats=5_000_000,
-            days_open=60,
-            classification="profitable",
-            bleeder_status="none",
-            marginal_roi=0.5,
-            success_rate=0.8,
-        )
-        # (1000 * 0.50 - 200) * 0.8 = 240
-        assert budget == 240
-        assert tier == "proven"
-        assert tier_ppm == 2000
+        mock_engine = MagicMock()
+        r.set_capex_engine(mock_engine)
+        assert r._capex_engine is mock_engine
 
-    def test_proven_earner_budget_exhausted(self):
-        """Channel earning 500 sats with 250 already spent -> 0."""
+    def test_default_no_engine(self):
         r = _make_rebalancer()
-        budget, tier, tier_ppm = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=500,
-            rebalance_cost_30d_sats=250,
-            total_forward_count_30d=50,
-            capacity_sats=5_000_000,
-            days_open=60,
-            classification="profitable",
-            bleeder_status="none",
-            marginal_roi=0.5,
-            success_rate=0.8,
+        assert r._capex_engine is None
+
+
+class TestCapexFallbackWithEngine:
+    """_capex_fallback_pass uses engine budgets."""
+
+    def _make_engine_with_budget(self, channel_id, budget_sats, tier, tier_ppm):
+        """Create a mock engine that returns a specific budget for one channel."""
+        mock_engine = MagicMock(spec=CapexBudgetEngine)
+        budget = ChannelCapexBudget(
+            channel_id=channel_id,
+            budget_msat=budget_sats * 1000,
+            tier=tier,
+            tier_ppm=tier_ppm,
+            priority_class="preservation" if tier in ("proven", "active") else "growth",
         )
-        assert budget == 0
+        mock_engine.get_channel_budget.return_value = budget
+        return mock_engine
 
-    def test_active_router_gets_bootstrap_when_higher(self):
-        """Channel with >5 forwards but low contribution gets bootstrap budget."""
-        r = _make_rebalancer()
-        budget, tier, tier_ppm = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=50,
-            rebalance_cost_30d_sats=0,
-            total_forward_count_30d=10,
-            capacity_sats=5_000_000,
-            days_open=60,
-            classification="break_even",
-            bleeder_status="none",
-            marginal_roi=0.0,
-            success_rate=0.9,
-        )
-        # proven = (50 * 0.50 - 0) = 25
-        # bootstrap = min(5_000_000 * 10/10000, 200) = min(5000, 200) = 200... wait
-        # Actually bootstrap_bps=10, so 5_000_000 * 10 / 10000 = 5000. Capped at 200.
-        # max(25, 200) = 200 (bootstrap wins) * 0.9 = 180
-        assert budget == 180
-        assert tier == "active"
-        assert tier_ppm == 500
+    def test_proven_channel_gets_candidate(self):
+        """Proven channel with budget gets a capex rebalance candidate."""
+        engine = self._make_engine_with_budget("100x1x0", 300, "proven", 2000)
+        r = _make_rebalancer(capex_engine=engine)
 
-    def test_bootstrap_channel_gets_capacity_budget(self):
-        """Channel past grace period with 0 history."""
-        r = _make_rebalancer()
-        budget, tier, tier_ppm = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=0,
-            rebalance_cost_30d_sats=0,
-            total_forward_count_30d=0,
-            capacity_sats=5_000_000,
-            days_open=20,
-            classification="stagnant_candidate",
-            bleeder_status="none",
-            marginal_roi=0.0,
-            success_rate=None,  # No history
-        )
-        # bootstrap = min(5_000_000 * 10/10000, 200) = 200
-        # no success rate data -> default 1.0
-        assert budget == 200
-        assert tier == "bootstrap"
-        assert tier_ppm == 250
-
-    def test_bootstrap_small_channel(self):
-        """Small channel gets proportionally small bootstrap."""
-        r = _make_rebalancer()
-        budget, tier, tier_ppm = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=0,
-            rebalance_cost_30d_sats=0,
-            total_forward_count_30d=0,
-            capacity_sats=500_000,
-            days_open=20,
-            classification="stagnant_candidate",
-            bleeder_status="none",
-            marginal_roi=0.0,
-            success_rate=None,
-        )
-        # bootstrap = min(500_000 * 10/10000, 200) = min(500, 200) = 200
-        # Actually 500_000 * 10 / 10000 = 500. Capped at 200.
-        assert budget == 200
-        assert tier == "bootstrap"
-
-    def test_young_channel_blocked(self):
-        """Channel younger than grace period gets 0 budget."""
-        r = _make_rebalancer()
-        budget, tier, tier_ppm = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=0,
-            rebalance_cost_30d_sats=0,
-            total_forward_count_30d=0,
-            capacity_sats=5_000_000,
-            days_open=10,
-            classification="stagnant_candidate",
-            bleeder_status="none",
-            marginal_roi=0.0,
-            success_rate=None,
-        )
-        assert budget == 0
-        assert tier == "blocked"
-
-    def test_hard_bleeder_blocked(self):
-        """Hard bleeder gets 0 budget regardless of contribution."""
-        r = _make_rebalancer()
-        budget, tier, tier_ppm = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=500,
-            rebalance_cost_30d_sats=100,
-            total_forward_count_30d=20,
-            capacity_sats=5_000_000,
-            days_open=60,
-            classification="underwater",
-            bleeder_status="hard",
-            marginal_roi=-0.5,
-            success_rate=0.5,
-        )
-        assert budget == 0
-        assert tier == "blocked"
-
-    def test_zombie_blocked(self):
-        """Zombie channel gets 0 budget."""
-        r = _make_rebalancer()
-        budget, tier, tier_ppm = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=0,
-            rebalance_cost_30d_sats=0,
-            total_forward_count_30d=0,
-            capacity_sats=5_000_000,
-            days_open=90,
-            classification="zombie",
-            bleeder_status="none",
-            marginal_roi=-1.0,
-            success_rate=None,
-        )
-        assert budget == 0
-        assert tier == "blocked"
-
-    def test_success_rate_discounts_budget(self):
-        """Low success rate reduces budget proportionally."""
-        r = _make_rebalancer()
-        budget_good, _, _ = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=1000,
-            rebalance_cost_30d_sats=0,
-            total_forward_count_30d=50,
-            capacity_sats=5_000_000,
-            days_open=60,
-            classification="profitable",
-            bleeder_status="none",
-            marginal_roi=0.5,
-            success_rate=1.0,
-        )
-        budget_bad, _, _ = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=1000,
-            rebalance_cost_30d_sats=0,
-            total_forward_count_30d=50,
-            capacity_sats=5_000_000,
-            days_open=60,
-            classification="profitable",
-            bleeder_status="none",
-            marginal_roi=0.5,
-            success_rate=0.2,
-        )
-        assert budget_good == 500  # 1000*0.5*1.0
-        assert budget_bad == 100   # 1000*0.5*0.2
-
-    def test_negative_roi_zero_contribution_blocked(self):
-        """Negative ROI + zero contribution = blocked."""
-        r = _make_rebalancer()
-        budget, tier, tier_ppm = r._calculate_channel_capex_budget(
-            channel_id="100x1x0",
-            total_contribution_30d_sats=0,
-            rebalance_cost_30d_sats=50,
-            total_forward_count_30d=0,
-            capacity_sats=5_000_000,
-            days_open=60,
-            classification="underwater",
-            bleeder_status="none",
-            marginal_roi=-0.3,
-            success_rate=0.5,
-        )
-        assert budget == 0
-        assert tier == "blocked"
-
-
-from modules.rebalancer import RebalanceReasonCode
-
-
-class TestCapexFallbackPass:
-    """_capex_fallback_pass re-evaluates destinations with capex budgets."""
-
-    def test_returns_candidate_for_proven_channel(self):
-        """Proven channel gets a capex candidate when EV rejected it."""
-        r = _make_rebalancer()
-
-        # Add required config fields for sizing
-        r.config.rebalance_max_amount = 5_000_000
-        r.config.rebalance_min_amount = 50_000
-
-        # Mock profitability data
-        mock_prof = MagicMock()
-        mock_prof.revenue.total_contribution_sats = 500
-        mock_prof.revenue.total_forward_count = 30
-        mock_prof.days_open = 60
-        mock_prof.classification.value = "profitable"
-        mock_prof.marginal_roi = 0.5
-        r._profitability_analyzer.get_profitability.return_value = mock_prof
-        r._profitability_analyzer.get_bleeder_status.return_value = MagicMock(
-            classification="none"
-        )
-
-        # Mock database
-        r.database.get_channel_full_pnl.return_value = {
-            'total_contribution_msat': 500_000,
-            'total_contribution_sats': 500,
-            'rebalance_cost_sats': 100,
-        }
-        r.database.get_channel_rebalance_success_rate.return_value = {
-            'success_rate': 0.8, 'total': 10
-        }
-
-        # Mock source selection to return one source (real signature)
-        source_scid = "200x1x0"
+        # Mock source selection
         source_info = {
             "peer_id": "02" + "b" * 64,
             "capacity": 5_000_000,
@@ -317,7 +84,7 @@ class TestCapexFallbackPass:
             "spendable": 3_000_000,
         }
         r._select_source_candidates = MagicMock(return_value=[
-            (source_scid, source_info, 50.0, 10)
+            ("200x1x0", source_info, 50.0, 10)
         ])
 
         depleted = [
@@ -328,9 +95,7 @@ class TestCapexFallbackPass:
                 "fee_ppm": 100,
             }, 0.10),
         ]
-        source_channels = [
-            (source_scid, source_info, 0.80),
-        ]
+        source_channels = [("200x1x0", source_info, 0.80)]
 
         candidates = r._capex_fallback_pass(
             depleted_channels=depleted,
@@ -340,34 +105,18 @@ class TestCapexFallbackPass:
             cfg=r.config,
         )
 
-        assert len(candidates) >= 1
+        assert len(candidates) == 1
         c = candidates[0]
         assert c.reason_code == "capex_fallback"
         assert c.max_budget_sats > 0
+        assert c.max_budget_sats <= 300
         assert c.max_fee_ppm <= 2000
+        engine.get_channel_budget.assert_called_with("100x1x0")
 
     def test_blocked_channel_skipped(self):
-        """Zombie channel gets no capex candidate."""
-        r = _make_rebalancer()
-        r.config.rebalance_max_amount = 5_000_000
-        r.config.rebalance_min_amount = 50_000
-
-        mock_prof = MagicMock()
-        mock_prof.revenue.total_contribution_sats = 0
-        mock_prof.revenue.total_forward_count = 0
-        mock_prof.days_open = 90
-        mock_prof.classification.value = "zombie"
-        mock_prof.marginal_roi = -1.0
-        r._profitability_analyzer.get_profitability.return_value = mock_prof
-        r._profitability_analyzer.get_bleeder_status.return_value = MagicMock(
-            classification="none"
-        )
-        r.database.get_channel_full_pnl.return_value = {
-            'total_contribution_msat': 0,
-            'total_contribution_sats': 0,
-            'rebalance_cost_sats': 0,
-        }
-        r.database.get_channel_rebalance_success_rate.return_value = None
+        """Blocked channel gets no candidate."""
+        engine = self._make_engine_with_budget("100x1x0", 0, "blocked", 0)
+        r = _make_rebalancer(capex_engine=engine)
 
         depleted = [
             ("100x1x0", {
@@ -390,28 +139,8 @@ class TestCapexFallbackPass:
 
     def test_zero_budget_channel_skipped(self):
         """Channel with exhausted budget gets no candidate."""
-        r = _make_rebalancer()
-        r.config.rebalance_max_amount = 5_000_000
-        r.config.rebalance_min_amount = 50_000
-
-        mock_prof = MagicMock()
-        mock_prof.revenue.total_contribution_sats = 200
-        mock_prof.revenue.total_forward_count = 20
-        mock_prof.days_open = 60
-        mock_prof.classification.value = "break_even"
-        mock_prof.marginal_roi = 0.0
-        r._profitability_analyzer.get_profitability.return_value = mock_prof
-        r._profitability_analyzer.get_bleeder_status.return_value = MagicMock(
-            classification="none"
-        )
-        r.database.get_channel_full_pnl.return_value = {
-            'total_contribution_msat': 200_000,
-            'total_contribution_sats': 200,
-            'rebalance_cost_sats': 100,  # 200*0.5 - 100 = 0
-        }
-        r.database.get_channel_rebalance_success_rate.return_value = {
-            'success_rate': 1.0, 'total': 5
-        }
+        engine = self._make_engine_with_budget("100x1x0", 0, "proven", 2000)
+        r = _make_rebalancer(capex_engine=engine)
 
         depleted = [
             ("100x1x0", {
@@ -432,27 +161,156 @@ class TestCapexFallbackPass:
 
         assert len(candidates) == 0
 
+    def test_no_engine_returns_empty(self):
+        """Without engine, fallback returns empty list."""
+        r = _make_rebalancer(capex_engine=None)
 
-class TestFallbackActivation:
-    """Capex fallback activates when EV returns empty."""
+        depleted = [
+            ("100x1x0", {
+                "peer_id": "02" + "a" * 64,
+                "capacity": 5_000_000,
+                "spendable": 500_000,
+                "fee_ppm": 100,
+            }, 0.10),
+        ]
 
-    def test_capex_fires_when_ev_empty(self):
-        """Verify _capex_fallback_pass is called when EV has no candidates."""
-        r = _make_rebalancer()
-        r._capex_fallback_pass = MagicMock(return_value=[])
-
-        r._capex_fallback_pass(
-            depleted_channels=[("100x1x0", {}, 0.1)],
-            source_channels=[("200x1x0", {}, 0.8)],
+        candidates = r._capex_fallback_pass(
+            depleted_channels=depleted,
+            source_channels=[("200x1x0", {}, 0.80)],
             active_channels=set(),
             available_slots=5,
             cfg=r.config,
         )
-        r._capex_fallback_pass.assert_called_once()
+
+        assert len(candidates) == 0
+
+    def test_active_channels_excluded(self):
+        """Channels with active rebalance jobs are skipped."""
+        engine = self._make_engine_with_budget("100x1x0", 300, "proven", 2000)
+        r = _make_rebalancer(capex_engine=engine)
+
+        depleted = [
+            ("100x1x0", {
+                "peer_id": "02" + "a" * 64,
+                "capacity": 5_000_000,
+                "spendable": 500_000,
+                "fee_ppm": 100,
+            }, 0.10),
+        ]
+
+        candidates = r._capex_fallback_pass(
+            depleted_channels=depleted,
+            source_channels=[("200x1x0", {}, 0.80)],
+            active_channels={"100x1x0"},  # Already being rebalanced
+            available_slots=5,
+            cfg=r.config,
+        )
+
+        assert len(candidates) == 0
+
+    def test_respects_available_slots(self):
+        """Stops after available_slots candidates found."""
+        mock_engine = MagicMock(spec=CapexBudgetEngine)
+
+        def _budget_for(ch_id):
+            return ChannelCapexBudget(
+                channel_id=ch_id,
+                budget_msat=500_000,
+                tier="proven",
+                tier_ppm=2000,
+                priority_class="preservation",
+            )
+
+        mock_engine.get_channel_budget.side_effect = _budget_for
+        r = _make_rebalancer(capex_engine=mock_engine)
+
+        source_info = {
+            "peer_id": "02" + "b" * 64,
+            "capacity": 5_000_000,
+            "fee_ppm": 100,
+            "spendable": 3_000_000,
+        }
+        r._select_source_candidates = MagicMock(return_value=[
+            ("900x1x0", source_info, 50.0, 10)
+        ])
+
+        depleted = [
+            (f"{i}00x1x0", {
+                "peer_id": "02" + "a" * 64,
+                "capacity": 5_000_000,
+                "spendable": 500_000,
+                "fee_ppm": 100,
+            }, 0.10)
+            for i in range(1, 6)  # 5 depleted channels
+        ]
+        source_channels = [("900x1x0", source_info, 0.80)]
+
+        candidates = r._capex_fallback_pass(
+            depleted_channels=depleted,
+            source_channels=source_channels,
+            active_channels=set(),
+            available_slots=2,  # Only room for 2
+            cfg=r.config,
+        )
+
+        assert len(candidates) == 2
+
+    def test_bootstrap_channel_gets_candidate(self):
+        """Bootstrap channel with small budget still gets candidate."""
+        engine = self._make_engine_with_budget("100x1x0", 200, "bootstrap", 250)
+        r = _make_rebalancer(capex_engine=engine)
+
+        source_info = {
+            "peer_id": "02" + "b" * 64,
+            "capacity": 5_000_000,
+            "fee_ppm": 100,
+            "spendable": 3_000_000,
+        }
+        r._select_source_candidates = MagicMock(return_value=[
+            ("200x1x0", source_info, 50.0, 10)
+        ])
+
+        depleted = [
+            ("100x1x0", {
+                "peer_id": "02" + "a" * 64,
+                "capacity": 5_000_000,
+                "spendable": 500_000,
+                "fee_ppm": 100,
+            }, 0.10),
+        ]
+        source_channels = [("200x1x0", source_info, 0.80)]
+
+        candidates = r._capex_fallback_pass(
+            depleted_channels=depleted,
+            source_channels=source_channels,
+            active_channels=set(),
+            available_slots=5,
+            cfg=r.config,
+        )
+
+        assert len(candidates) == 1
+        c = candidates[0]
+        assert c.max_fee_ppm <= 250  # Bootstrap ceiling
+
+
+class TestCapexConfig:
+    """Capex rebalancer config fields still exist (used by legacy code until Phase 6)."""
+
+    def test_reinvestment_rate_default(self):
+        assert Config().rebalance_reinvestment_rate == 0.50
+
+    def test_bootstrap_bps_default(self):
+        assert Config().rebalance_bootstrap_bps == 10
+
+    def test_bootstrap_max_sats_default(self):
+        assert Config().rebalance_bootstrap_max_sats == 200
+
+    def test_grace_days_default(self):
+        assert Config().rebalance_grace_days == 14
 
 
 class TestDeprecationCompat:
-    """Deprecated config fields log warnings but don't crash."""
+    """Deprecated config fields still exist for backward compat."""
 
     def test_enable_proportional_budget_still_exists(self):
         cfg = Config()
