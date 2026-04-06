@@ -589,3 +589,68 @@ class TestDatastorePush:
         ds = DataService(plugin)
         assert ds.datastore_push(["revenue", "test"], {"error": "something broke"}) is False
         plugin.rpc.datastore.assert_not_called()
+
+
+class TestMiscMethods:
+    """Bookkeeper, datastore read, and plugin listing methods."""
+
+    def test_bkpr_inspect(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"txs": []}
+        ds = DataService(plugin)
+        result = ds.bkpr_inspect("wallet")
+        assert "txs" in result
+        plugin.rpc.call.assert_called_once_with("bkpr-inspect", {"account": "wallet"})
+
+    def test_bkpr_list_account_events(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"events": []}
+        ds = DataService(plugin)
+        result = ds.bkpr_list_account_events("wallet")
+        assert "events" in result
+        plugin.rpc.call.assert_called_once_with("bkpr-listaccountevents", {"account": "wallet"})
+
+    def test_bkpr_list_account_events_no_account(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"events": []}
+        ds = DataService(plugin)
+        ds.bkpr_list_account_events()
+        plugin.rpc.call.assert_called_once_with("bkpr-listaccountevents", {})
+
+    def test_list_datastore(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.listdatastore.return_value = {"datastore": []}
+        ds = DataService(plugin)
+        result = ds.list_datastore(["hive", "hints"])
+        assert "datastore" in result
+        plugin.rpc.listdatastore.assert_called_once_with(key=["hive", "hints"])
+
+    def test_list_plugins(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.plugin.return_value = {"plugins": [{"name": "test"}]}
+        ds = DataService(plugin)
+        result = ds.list_plugins()
+        assert result == {"plugins": [{"name": "test"}]}
+
+    def test_list_plugins_fallback(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.plugin.side_effect = Exception("not found")
+        plugin.rpc.listplugins.return_value = {"plugins": []}
+        ds = DataService(plugin)
+        result = ds.list_plugins()
+        assert result == {"plugins": []}
+
+    def test_list_plugins_both_fail(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.plugin.side_effect = Exception("not found")
+        plugin.rpc.listplugins.side_effect = Exception("also not found")
+        ds = DataService(plugin)
+        result = ds.list_plugins()
+        assert result == {"plugins": []}

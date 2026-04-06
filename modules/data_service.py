@@ -396,11 +396,12 @@ class DataService:
         if "timestamp" not in payload:
             payload = {**payload, "timestamp": int(time.time())}
         encoded = json.dumps(payload)
-        if len(encoded.encode("utf-8")) > self._DATASTORE_MAX_BYTES:
+        encoded_bytes = len(encoded.encode("utf-8"))
+        if encoded_bytes > self._DATASTORE_MAX_BYTES:
             try:
                 self._plugin.log(
                     f"Datastore payload too large for {key}: "
-                    f"{len(encoded.encode('utf-8'))} bytes",
+                    f"{encoded_bytes} bytes",
                     level="warn",
                 )
             except Exception:
