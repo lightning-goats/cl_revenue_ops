@@ -22,8 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-# Sub-satoshi unit constant. Change when Lightning switches to microsatoshis.
-MSAT_PER_SAT = 1000
+from .utils import MSAT_PER_SAT, base_to_sats_ceil
 
 
 def _classify(obj) -> str:
@@ -46,7 +45,7 @@ class ChannelCapexBudget:
     @property
     def budget_sats(self) -> int:
         """Budget in sats, ceiling-rounded. Zero msat yields zero sats (no false floor)."""
-        return -(-self.budget_msat // MSAT_PER_SAT)
+        return base_to_sats_ceil(self.budget_msat)
 
 
 @dataclass
@@ -63,27 +62,27 @@ class CapexAllocations:
     @property
     def global_envelope_sats(self) -> int:
         """Global envelope in sats, ceiling-rounded."""
-        return -(-self.global_envelope_msat // MSAT_PER_SAT)
+        return base_to_sats_ceil(self.global_envelope_msat)
 
     @property
     def fleet_exploration_budget_sats(self) -> int:
         """Fleet exploration budget in sats, ceiling-rounded."""
-        return -(-self.fleet_exploration_budget_msat // MSAT_PER_SAT)
+        return base_to_sats_ceil(self.fleet_exploration_budget_msat)
 
     @property
     def tactical_budget_sats(self) -> int:
         """Tactical budget in sats, ceiling-rounded."""
-        return -(-self.tactical_budget_msat // MSAT_PER_SAT)
+        return base_to_sats_ceil(self.tactical_budget_msat)
 
     @property
     def total_fleet_contribution_sats(self) -> int:
         """Total fleet contribution in sats, ceiling-rounded."""
-        return -(-self.total_fleet_contribution_msat // MSAT_PER_SAT)
+        return base_to_sats_ceil(self.total_fleet_contribution_msat)
 
     @property
     def allocated_by_priority_sats(self) -> Dict[str, int]:
         """Allocated by priority in sats, ceiling-rounded."""
-        return {k: -(-v // MSAT_PER_SAT) for k, v in self.allocated_by_priority_msat.items()}
+        return {k: base_to_sats_ceil(v) for k, v in self.allocated_by_priority_msat.items()}
 
 
 class CapexBudgetEngine:
