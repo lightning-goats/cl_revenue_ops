@@ -2150,6 +2150,28 @@ class CapacityPlanner:
                 except Exception:
                     pass
 
+            # Record close cost in spend_events (matches open cost tracking pattern)
+            if db:
+                try:
+                    close_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+                    close_reservation_id = f"planner-close-{channel_id}-{int(time.time())}"
+                    reserved = db.reserve_spend(
+                        reservation_id=close_reservation_id,
+                        amount_sats=close_cost,
+                        category="channel_close",
+                        subcategory=reason if reason else "automated",
+                        metadata={"channel_id": channel_id, "peer_id": peer_id},
+                    )
+                    if reserved:
+                        db.mark_spend_reservation_spent(
+                            reservation_id=close_reservation_id,
+                            actual_spent_sats=close_cost,
+                            source="capacity_planner",
+                            record_event=True,
+                        )
+                except Exception as e:
+                    self.plugin.log(f"Failed to record close cost: {e}", level='debug')
+
             self.plugin.log(
                 f"Channel closed: {channel_id} (peer: {peer_id[:16]}...)",
                 level='info',

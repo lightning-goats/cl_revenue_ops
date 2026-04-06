@@ -85,3 +85,72 @@ class TestExplorationBudgetGate:
             flow_analyzer=MagicMock(),
         )
         assert planner._capex_engine is None
+
+
+class TestCloseCostRecording:
+    """Close costs recorded in spend_events like open costs."""
+
+    def _make_planner_for_close(self):
+        from modules.capacity_planner import CapacityPlanner
+        mock_plugin = MagicMock()
+        mock_profitability = MagicMock()
+        mock_profitability.database = MagicMock()
+        mock_flow = MagicMock()
+        mock_config = MagicMock()
+        mock_config.planner_dry_run = False
+
+        planner = CapacityPlanner(
+            plugin=mock_plugin,
+            profitability_analyzer=mock_profitability,
+            flow_analyzer=mock_flow,
+            config=mock_config,
+        )
+        # Enable close execution
+        planner._close_execution_enabled = MagicMock(return_value=True)
+        # Mock close RPC to succeed
+        planner._rpc_close = MagicMock(return_value={"txid": "abc123"})
+        return planner
+
+    def test_successful_close_records_spend(self):
+        """After a successful close, cost is recorded via reserve_spend + mark_spend_reservation_spent."""
+        planner = self._make_planner_for_close()
+        db = planner.profitability.database
+
+        db.record_planner_action.return_value = 1
+        db.reserve_spend.return_value = True
+
+        result = planner._execute_close("100x1x0", "02" + "a" * 64, planner.config, "zombie")
+
+        assert result["status"] == "completed"
+        # Verify spend was recorded
+        db.reserve_spend.assert_called_once()
+        # Check it was called with channel_close category
+        call_kwargs = db.reserve_spend.call_args[1]
+        assert call_kwargs["category"] == "channel_close"
+        db.mark_spend_reservation_spent.assert_called_once()
+
+    def test_dry_run_close_no_spend_recorded(self):
+        """Dry-run close does not record spend."""
+        planner = self._make_planner_for_close()
+        planner.config.planner_dry_run = True
+        db = planner.profitability.database
+
+        db.record_planner_action.return_value = 1
+
+        result = planner._execute_close("100x1x0", "02" + "a" * 64, planner.config, "zombie")
+
+        assert result["status"] == "dry_run"
+        db.reserve_spend.assert_not_called()
+
+    def test_recommended_close_no_spend_recorded(self):
+        """Recommendation-only close does not record spend."""
+        planner = self._make_planner_for_close()
+        planner._close_execution_enabled = MagicMock(return_value=False)
+        db = planner.profitability.database
+
+        db.record_planner_action.return_value = 1
+
+        result = planner._execute_close("100x1x0", "02" + "a" * 64, planner.config, "zombie")
+
+        assert result["status"] == "recommended"
+        db.reserve_spend.assert_not_called()
