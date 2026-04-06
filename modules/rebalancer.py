@@ -1934,6 +1934,14 @@ class EVRebalancer:
         self.rebalance_executor = None  # RebalanceExecutor (safe explicit-route executor)
         self.rpc_cache = None  # Shared RPC cache (injected by main plugin)
 
+        # Log deprecation notices for replaced config fields
+        if hasattr(self.config, 'enable_proportional_budget') and self.config.enable_proportional_budget:
+            self.plugin.log(
+                "DEPRECATION: enable_proportional_budget is superseded by capex per-channel budgets. "
+                "Set daily_budget_sats=0 to fully delegate to per-channel budgets.",
+                level='info'
+            )
+
     @property
     def hive_router(self):
         return self._hive_router
@@ -2650,6 +2658,32 @@ class EVRebalancer:
                     budget_blocked=False,
                 )
             else:
+                # EV found nothing — try capex fallback
+                if depleted_channels and source_channels:
+                    self.plugin.log(
+                        f"CAPEX_FALLBACK: EV found 0 candidates, evaluating "
+                        f"{len(depleted_channels)} destinations with capex budgets",
+                        level='info'
+                    )
+                    capex_candidates = self._capex_fallback_pass(
+                        depleted_channels=depleted_channels,
+                        source_channels=source_channels,
+                        active_channels=active_channels,
+                        available_slots=available_slots,
+                        cfg=cfg,
+                    )
+                    if capex_candidates:
+                        selected = capex_candidates[:available_slots]
+                        self._set_last_decision_summary(
+                            action="rebalance",
+                            reason="capex_fallback_candidates",
+                            dominant_input="capex_budget",
+                            safety_block=False,
+                            budget_blocked=False,
+                        )
+                        self._report_hive_liquidity_state(depleted_channels, source_channels, selected)
+                        return selected
+
                 self._set_last_decision_summary(
                     action="hold",
                     reason="no_profitable_candidates",
@@ -4592,6 +4626,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
                 ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)
                 rebalance_budget_limit = max(0, effective_budget - ext_spent - ext_reserved)
+                # Capex candidates use per-channel budget as their limit.
+                # Global daily/weekly caps only apply as emergency overrides when > 0.
+                is_capex = getattr(candidate, 'reason_code', '') == RebalanceReasonCode.CAPEX_FALLBACK.value
+                if is_capex:
+                    capex_limit = candidate.max_budget_sats
+                    if cfg.daily_budget_sats > 0:
+                        rebalance_budget_limit = min(capex_limit, rebalance_budget_limit)
+                    else:
+                        rebalance_budget_limit = capex_limit
                 hot_override_limit = int(getattr(candidate, 'dynamic_budget_override_sats', 0) or 0)
                 if hot_override_limit > 0:
                     # Candidate-specific protection budget can exceed the standard daily cap.

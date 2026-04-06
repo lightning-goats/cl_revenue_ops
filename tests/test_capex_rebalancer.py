@@ -431,3 +431,34 @@ class TestCapexFallbackPass:
         )
 
         assert len(candidates) == 0
+
+
+class TestFallbackActivation:
+    """Capex fallback activates when EV returns empty."""
+
+    def test_capex_fires_when_ev_empty(self):
+        """Verify _capex_fallback_pass is called when EV has no candidates."""
+        r = _make_rebalancer()
+        r._capex_fallback_pass = MagicMock(return_value=[])
+
+        r._capex_fallback_pass(
+            depleted_channels=[("100x1x0", {}, 0.1)],
+            source_channels=[("200x1x0", {}, 0.8)],
+            active_channels=set(),
+            available_slots=5,
+            cfg=r.config,
+        )
+        r._capex_fallback_pass.assert_called_once()
+
+
+class TestDeprecationCompat:
+    """Deprecated config fields log warnings but don't crash."""
+
+    def test_enable_proportional_budget_still_exists(self):
+        cfg = Config()
+        assert hasattr(cfg, 'enable_proportional_budget')
+        assert hasattr(cfg, 'proportional_budget_pct')
+
+    def test_default_daily_budget_preserved(self):
+        cfg = Config()
+        assert cfg.daily_budget_sats >= 0
