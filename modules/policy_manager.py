@@ -344,10 +344,7 @@ class PolicyManager:
                 return
 
         # Read DB outside the lock (thread-local connections are safe)
-        conn = self.database._get_connection()
-        rows = conn.execute(
-            "SELECT * FROM peer_policies ORDER BY updated_at DESC"
-        ).fetchall()
+        rows = self.database.get_all_policies()
 
         new_cache = {}
         for row in rows:
@@ -474,12 +471,8 @@ class PolicyManager:
     def _delete_expired_policy(self, peer_id: str) -> None:
         """Delete an expired policy from the database."""
         try:
-            conn = self.database._get_connection()
             now = int(time.time())
-            conn.execute(
-                "DELETE FROM peer_policies WHERE peer_id = ? AND expires_at IS NOT NULL AND expires_at < ?",
-                (peer_id, now)
-            )
+            self.database.delete_expired_policies(now)
         except Exception as e:
             self.plugin.log(f"PolicyManager: Error deleting expired policy: {e}", level='warn')
 
@@ -502,18 +495,7 @@ class PolicyManager:
             changes = policy_manager.get_policy_changes_since(int(time.time()) - 300)
         """
         try:
-            conn = self.database._get_connection()
-            rows = conn.execute(
-                """
-                SELECT peer_id, strategy, rebalance_mode, fee_ppm_target,
-                       tags, updated_at, fee_multiplier_min, fee_multiplier_max,
-                       expires_at
-                FROM peer_policies
-                WHERE updated_at > ?
-                ORDER BY updated_at DESC
-                """,
-                (since_timestamp,)
-            ).fetchall()
+            rows = self.database.get_policy_changes_since(since_timestamp)
 
             changes = []
             for row in rows:
@@ -543,11 +525,7 @@ class PolicyManager:
             Unix timestamp of most recent change, or 0 if no policies exist.
         """
         try:
-            conn = self.database._get_connection()
-            row = conn.execute(
-                "SELECT MAX(updated_at) as max_ts FROM peer_policies"
-            ).fetchone()
-            return (row['max_ts'] or 0) if row else 0
+            return self.database.get_last_policy_change_timestamp()
         except Exception as e:
             self.plugin.log(
                 f"PolicyManager: Error getting last change timestamp: {e}",
@@ -679,23 +657,11 @@ class PolicyManager:
             )
 
         # Persist to database (v2.0: includes new columns)
-        conn = self.database._get_connection()
-        conn.execute("""
-            INSERT OR REPLACE INTO peer_policies
-                (peer_id, strategy, rebalance_mode, fee_ppm_target, tags, updated_at,
-                 fee_multiplier_min, fee_multiplier_max, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            peer_id,
-            new_strategy.value,
-            new_rebalance_mode.value,
-            new_fee_ppm,
-            json.dumps(new_tags),
-            now,
-            new_mult_min,
-            new_mult_max,
-            new_expires_at
-        ))
+        self.database.upsert_policy(
+            peer_id, new_strategy.value, new_rebalance_mode.value,
+            new_fee_ppm, json.dumps(new_tags), now,
+            new_mult_min, new_mult_max, new_expires_at
+        )
 
         # Record rate-limit change AFTER successful DB write (not before)
         self._record_rate_limit_change(peer_id)
@@ -742,16 +708,10 @@ class PolicyManager:
         """
         self._validate_peer_id(peer_id)
 
-        conn = self.database._get_connection()
-        cursor = conn.execute(
-            "DELETE FROM peer_policies WHERE peer_id = ?",
-            (peer_id,)
-        )
+        deleted = self.database.delete_policy(peer_id)
 
         # v2.0: Granular cache removal
         self._remove_from_cache(peer_id)
-
-        deleted = cursor.rowcount > 0
         if deleted:
             self.plugin.log(
                 f"PolicyManager: Deleted policy for {peer_id[:12]}..., reverting to defaults",
@@ -1284,23 +1244,11 @@ class PolicyManager:
                 self._change_timestamps[peer_id] = timestamps
 
         # Execute batch insert atomically
-        conn = self.database._get_connection()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.executemany("""
-                INSERT OR REPLACE INTO peer_policies
-                    (peer_id, strategy, rebalance_mode, fee_ppm_target, tags, updated_at,
-                     fee_multiplier_min, fee_multiplier_max, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, [
-                (peer_id, strategy.value, mode.value, fee_ppm, json.dumps(tags), now,
-                 mult_min, mult_max, expires_at)
-                for peer_id, strategy, mode, fee_ppm, tags, mult_min, mult_max, expires_at in validated
-            ])
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        self.database.upsert_policies_batch([
+            (peer_id, strategy.value, mode.value, fee_ppm, json.dumps(tags), now,
+             mult_min, mult_max, expires_at)
+            for peer_id, strategy, mode, fee_ppm, tags, mult_min, mult_max, expires_at in validated
+        ])
 
         # Build results and update cache
         for peer_id, strategy, mode, fee_ppm, tags, mult_min, mult_max, expires_at in validated:
@@ -1337,31 +1285,18 @@ class PolicyManager:
             return 0
 
         now = int(time.time())
-        conn = self.database._get_connection()
+        expired_peer_ids = self.database.delete_expired_policies(now)
 
-        # Get expired peer_ids before deletion
-        expired_rows = conn.execute(
-            "SELECT peer_id FROM peer_policies WHERE expires_at IS NOT NULL AND expires_at < ?",
-            (now,)
-        ).fetchall()
-
-        if not expired_rows:
+        if not expired_peer_ids:
             return 0
 
-        # Delete expired policies
-        cursor = conn.execute(
-            "DELETE FROM peer_policies WHERE expires_at IS NOT NULL AND expires_at < ?",
-            (now,)
-        )
-
-        deleted_count = cursor.rowcount
+        deleted_count = len(expired_peer_ids)
 
         # Update cache and notify subscribers so they switch to default strategy.
         # Only evict from cache if the policy is still expired (guards against
         # a concurrent set_policy() that inserted a fresh policy between the
         # DB DELETE and this cache update).
-        for row in expired_rows:
-            peer_id = row['peer_id']
+        for peer_id in expired_peer_ids:
             with self._cache_lock:
                 cached = self._cache.get(peer_id)
                 if cached and cached.is_expired():
