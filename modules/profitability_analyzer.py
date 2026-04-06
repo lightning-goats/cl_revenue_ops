@@ -26,7 +26,7 @@ import threading
 
 from pyln.client import Plugin, RpcError
 
-from .utils import parse_msat as _shared_parse_msat
+from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base, MSAT_PER_SAT
 
 
 class BookkeeperCache:
@@ -81,11 +81,11 @@ class BookkeeperCache:
             if account == "wallet":
                 net_msat = totals["debit"] - totals["credit"]
                 if net_msat > 0:
-                    self._wallet_fees[txid] = net_msat // 1000
+                    self._wallet_fees[txid] = base_to_sats_floor(net_msat)
             else:
                 net_msat = totals["credit"] - totals["debit"]
                 if txid not in self._onchain_fees and net_msat > 0:
-                    self._onchain_fees[txid] = net_msat // 1000
+                    self._onchain_fees[txid] = base_to_sats_floor(net_msat)
 
     def get_open_cost_by_txid(self, funding_txid: str) -> int | None:
         """Look up the on-chain fee for a funding transaction.
@@ -190,24 +190,24 @@ class ChannelRevenue:
         """Fees earned in sats. Non-zero msat rounds up to at least 1 sat."""
         if self.fees_earned_msat <= 0:
             return 0
-        return max(1, self.fees_earned_msat // 1000)
+        return base_to_sats_ceil(self.fees_earned_msat)
 
     @property
     def volume_routed_sats(self) -> int:
         """Volume routed in sats (truncated, no ceiling needed for volume)."""
-        return self.volume_routed_msat // 1000
+        return base_to_sats_floor(self.volume_routed_msat)
 
     @property
     def sourced_fee_contribution_sats(self) -> int:
         """Sourced fee contribution in sats. Non-zero msat rounds up to at least 1 sat."""
         if self.sourced_fee_contribution_msat <= 0:
             return 0
-        return max(1, self.sourced_fee_contribution_msat // 1000)
+        return base_to_sats_ceil(self.sourced_fee_contribution_msat)
 
     @property
     def sourced_volume_sats(self) -> int:
         """Sourced volume in sats (truncated)."""
-        return self.sourced_volume_msat // 1000
+        return base_to_sats_floor(self.sourced_volume_msat)
 
     # --- Valuation properties ---
 
@@ -227,7 +227,7 @@ class ChannelRevenue:
         msat = self.total_contribution_msat
         if msat <= 0:
             return 0
-        return max(1, msat // 1000)
+        return base_to_sats_ceil(msat)
 
     @property
     def total_forward_count(self) -> int:
@@ -702,8 +702,8 @@ class ChannelProfitabilityAnalyzer:
             pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days=30)
             contribution_30d_msat = pnl_30d.get('total_contribution_msat', 0)
             rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
-            rebalance_cost_30d_msat = rebalance_cost_30d * 1000
-            marginal_profit_30d = (contribution_30d_msat - rebalance_cost_30d_msat) // 1000
+            rebalance_cost_30d_msat = sats_to_base(rebalance_cost_30d)
+            marginal_profit_30d = base_to_sats_floor(contribution_30d_msat - rebalance_cost_30d_msat)
 
             # Classify
             classification = self._classify_channel(
@@ -1178,7 +1178,7 @@ class ChannelProfitabilityAnalyzer:
         stats = self.database.get_lifetime_stats()
 
         # Convert revenue from msat to sats
-        lifetime_revenue_sats = stats["total_revenue_msat"] // 1000
+        lifetime_revenue_sats = base_to_sats_floor(stats["total_revenue_msat"])
 
         # Get costs (including closure and swap costs)
         lifetime_opening_costs_sats = stats["total_opening_cost_sats"]
@@ -1245,7 +1245,7 @@ class ChannelProfitabilityAnalyzer:
 
         # Get revenue (routing fees earned) — DB returns msat, convert at boundary
         gross_revenue_msat = self.database.get_total_routing_revenue(since_timestamp)
-        gross_revenue_sats = max(1, gross_revenue_msat // 1000) if gross_revenue_msat > 0 else 0
+        gross_revenue_sats = base_to_sats_ceil(gross_revenue_msat) if gross_revenue_msat > 0 else 0
 
         # Get volume and forward count for dashboard metrics
         volume_sats = self.database.get_total_volume_since(since_timestamp)
@@ -1321,7 +1321,7 @@ class ChannelProfitabilityAnalyzer:
 
                     # Check for bleeder condition: net < 0 AND has activity
                     # Now uses total_contribution which includes sourced fee value
-                    net_pnl_sats = pnl.get('net_pnl_sats', pnl.get('net_pnl_msat', 0) // 1000)
+                    net_pnl_sats = pnl.get('net_pnl_sats', base_to_sats_floor(pnl.get('net_pnl_msat', 0)))
                     if net_pnl_sats < 0 and total_activity > 0:
                         bleeders.append({
                             'channel_id': channel_id,
@@ -1403,9 +1403,9 @@ class ChannelProfitabilityAnalyzer:
 
                     # Extract metrics
                     rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
-                    revenue_30d = pnl_30d.get('total_contribution_sats', pnl_30d.get('total_contribution_msat', 0) // 1000)
-                    net_profit_30d = pnl_30d.get('net_pnl_sats', pnl_30d.get('net_pnl_msat', 0) // 1000)
-                    net_profit_7d = pnl_7d.get('net_pnl_sats', pnl_7d.get('net_pnl_msat', 0) // 1000)
+                    revenue_30d = pnl_30d.get('total_contribution_sats', base_to_sats_floor(pnl_30d.get('total_contribution_msat', 0)))
+                    net_profit_30d = pnl_30d.get('net_pnl_sats', base_to_sats_floor(pnl_30d.get('net_pnl_msat', 0)))
+                    net_profit_7d = pnl_7d.get('net_pnl_sats', base_to_sats_floor(pnl_7d.get('net_pnl_msat', 0)))
 
                     # Adjust for success rate — effective cost accounts for failed attempts
                     success_data = self.database.get_channel_rebalance_success_rate(channel_id, window_days)
@@ -1587,7 +1587,7 @@ class ChannelProfitabilityAnalyzer:
             for output in listfunds.get("outputs", []):
                 if output.get("status") == "confirmed":
                     amount_msat = self._parse_msat(output.get("amount_msat", 0))
-                    onchain_sats += amount_msat // 1000
+                    onchain_sats += base_to_sats_floor(amount_msat)
 
             # Get channel balances
             for channel in listfunds.get("channels", []):
@@ -1597,8 +1597,8 @@ class ChannelProfitabilityAnalyzer:
                 our_amount_msat = self._parse_msat(channel.get("our_amount_msat", 0))
                 amount_msat = self._parse_msat(channel.get("amount_msat", 0))
 
-                local_balance_sats += our_amount_msat // 1000
-                remote_balance_sats += (amount_msat - our_amount_msat) // 1000
+                local_balance_sats += base_to_sats_floor(our_amount_msat)
+                remote_balance_sats += base_to_sats_floor(amount_msat - our_amount_msat)
                 channel_count += 1
 
         except RpcError as e:
@@ -1636,13 +1636,13 @@ class ChannelProfitabilityAnalyzer:
                 
                 # Calculate capacity
                 capacity_msat = self._parse_msat(channel.get("total_msat", 0))
-                capacity = capacity_msat // 1000  # Convert to sats
+                capacity = base_to_sats_floor(capacity_msat)
                 
                 # If capacity is 0, try spendable + receivable
                 if capacity == 0:
                     spendable_msat = self._parse_msat(channel.get("spendable_msat", 0))
                     receivable_msat = self._parse_msat(channel.get("receivable_msat", 0))
-                    capacity = (spendable_msat + receivable_msat) // 1000
+                    capacity = base_to_sats_floor(spendable_msat + receivable_msat)
                 
                 funding_txid = channel.get("funding_txid", "")
                 
@@ -1963,7 +1963,7 @@ class ChannelProfitabilityAnalyzer:
             if found_events:
                 # Net fee = credits - debits
                 net_fee_msat = total_credit_msat - total_debit_msat
-                fee_sats = net_fee_msat // 1000
+                fee_sats = base_to_sats_floor(net_fee_msat)
                 
                 self.plugin.log(
                     f"Bookkeeper fee calculation for {funding_txid}: "
@@ -2014,7 +2014,7 @@ class ChannelProfitabilityAnalyzer:
                 # For wallet, the fee we paid is typically debits - credits
                 # (opposite of channel account perspective)
                 net_fee_msat = wallet_debit_msat - wallet_credit_msat
-                fee_sats = net_fee_msat // 1000
+                fee_sats = base_to_sats_floor(net_fee_msat)
                 
                 self.plugin.log(
                     f"Wallet fee calculation for {funding_txid}: "

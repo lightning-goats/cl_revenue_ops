@@ -29,14 +29,14 @@ class TestChannelRevenueMsat:
         )
         assert rev.fees_earned_msat == 5500
 
-    def test_fees_earned_sats_truncates_correctly(self):
+    def test_fees_earned_sats_ceils_correctly(self):
         rev = ChannelRevenue(
             channel_id="100x1x0",
             fees_earned_msat=5500,
             volume_routed_msat=1_000_000_000,
             forward_count=10,
         )
-        assert rev.fees_earned_sats == 5
+        assert rev.fees_earned_sats == 6  # ceiling: 5500 msat → 6 sats
 
     def test_sub_sat_fee_rounds_up_to_1(self):
         """A channel earning 50 msat should show 1 sat, not 0."""
@@ -340,7 +340,7 @@ class TestRevenueDataConstruction:
         result = analyzer._get_all_revenue_data()
         rev = result["200x1x0"]
         assert rev.fees_earned_msat == 5500
-        assert rev.fees_earned_sats == 5
+        assert rev.fees_earned_sats == 6  # ceiling: 5500 msat → 6 sats
         assert rev.volume_routed_msat == 1_000_000
 
     def test_get_channel_revenue_builds_msat_channel_revenue(self):
