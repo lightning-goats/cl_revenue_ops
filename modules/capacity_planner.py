@@ -458,7 +458,22 @@ class CapacityPlanner:
                 )
 
         summary["portfolio_state"] = portfolio_state
+        summary["winner_count"] = len(winners)
+        summary["loser_count"] = len(losers)
+        summary["candidate_count"] = len(candidates)
         summary["timestamp"] = int(time.time())
+
+        # Log skip reasons so we can diagnose why opens/closes aren't happening
+        if summary["skipped_reasons"]:
+            for reason in summary["skipped_reasons"]:
+                self.plugin.log(f"PLANNER SKIP: {reason}", level='info')
+        if not candidates and fee_ok and portfolio_state != "blocked":
+            self.plugin.log(
+                f"PLANNER: No open candidates discovered "
+                f"(winners={len(winners)}, losers={len(losers)})",
+                level='info',
+            )
+
         return summary
 
     def _get_mempool_recommendation(self) -> str:
