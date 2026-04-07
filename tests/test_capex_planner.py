@@ -113,9 +113,10 @@ class TestExplorationBudgetGate:
 
         summary = planner.execute_cycle()
 
-        # Each candidate gets 500 sats share, open cost is 5000 → both skipped
+        # Total budget 1000 < open cost 5000 → all opens blocked
         exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
-        assert len(exploration_skips) == 2
+        assert len(exploration_skips) >= 1
+        assert summary["opens"] == []
 
     def test_sufficient_budget_allows_open(self):
         """When per-candidate share >= open cost, open proceeds past budget gate."""

@@ -365,28 +365,33 @@ class CapacityPlanner:
                         "min_amount_sats": min_open,
                     }
 
-            # Exploration budget gate: compute per-candidate shares
+            # Exploration budget gate: check if budget can fund this cycle's opens
             exploration_budget_sats = 0
             estimated_open_cost = self._estimate_open_cost()
             if self._capex_engine:
                 exploration_budget_sats = self._capex_engine.get_fleet_exploration_budget()
-            total_candidate_score = sum(c.get("score", 0) for c in candidates) if candidates else 0
+            max_opens = cfg.planner_max_opens_per_cycle
+            exploration_budget_ok = exploration_budget_sats >= estimated_open_cost
+            if not exploration_budget_ok and self._capex_engine:
+                self.plugin.log(
+                    f"PLANNER: Exploration budget {exploration_budget_sats} sats "
+                    f"< open cost {estimated_open_cost} sats — skipping opens",
+                    level='info',
+                )
 
             opens_this_cycle = 0
             for candidate in sorted(candidates, key=lambda c: c.get("score", 0), reverse=True):
-                if opens_this_cycle >= cfg.planner_max_opens_per_cycle:
+                if opens_this_cycle >= max_opens:
                     break
 
                 peer_id = candidate["peer_id"]
 
-                # Exploration budget gate: defer if per-candidate share < open cost
-                if self._capex_engine and total_candidate_score > 0:
-                    candidate_share = int(exploration_budget_sats * (candidate.get("score", 0) / total_candidate_score))
-                    if candidate_share < estimated_open_cost:
-                        summary["skipped_reasons"].append(
-                            f"Exploration budget: {peer_id[:16]}... share {candidate_share} < open cost {estimated_open_cost}"
-                        )
-                        continue
+                # Exploration budget: check remaining budget covers the next open
+                if self._capex_engine and not exploration_budget_ok:
+                    summary["skipped_reasons"].append(
+                        f"Exploration budget: {exploration_budget_sats} < open cost {estimated_open_cost}"
+                    )
+                    break  # No point checking more candidates
 
                 # Size channel
                 channel_size = self._size_channel(candidate, candidates, available_sats, cfg)
