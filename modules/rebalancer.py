@@ -69,6 +69,7 @@ class RebalanceReasonCode(Enum):
     EV_POSITIVE = "ev_positive"                   # Normal EV-positive rebalance
     CAPEX_FALLBACK = "capex_fallback"             # Capex-aware fallback rebalance
     HIVE_EQUALIZATION = "hive_equalization"       # Fallback pure-hive inventory equalization
+    COORDINATED_REBALANCE = "coordinated_rebalance"  # Matched assigned fleet coordination hint
 
     # Skip codes (rebalance was not attempted)
     SKIP_HARD_BLEEDER = "skip_hard_bleeder"       # Channel is a hard bleeder (rebal_cost > 2x revenue)
@@ -127,6 +128,9 @@ class RebalanceCandidate:
     # Explainability fields
     reason_code: str = RebalanceReasonCode.EV_POSITIVE.value  # Why this rebalance was approved
     bleeder_status: str = "none"  # 'hard', 'soft', or 'none'
+    coordination_hint_type: str = ""
+    coordination_hint_id: str = ""
+    coordination_rank_bonus: float = 0.0
 
     # Direction: "pull" fills to_channel from sources; "push" drains to_channel to destinations
     direction: str = "pull"
@@ -178,6 +182,9 @@ class RebalanceCandidate:
             "num_source_candidates": len(self.source_candidates),
             "reason_code": self.reason_code,
             "bleeder_status": self.bleeder_status,
+            "coordination_hint_type": self.coordination_hint_type,
+            "coordination_hint_id": self.coordination_hint_id,
+            "coordination_rank_bonus": round(self.coordination_rank_bonus, 4),
             "direction": self.direction,
             "hot_channel_protection": self.hot_channel_protection,
             "hot_channel_protection_score": round(self.hot_channel_protection_score, 4),
@@ -797,6 +804,208 @@ class EVRebalancer:
             return 1.0
 
     @staticmethod
+    def _normalize_coordination_value(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return text.replace(":", "x")
+
+    @classmethod
+    def _normalize_route_segment(cls, segment: Any) -> Optional[Tuple[str, str]]:
+        if isinstance(segment, dict):
+            source = cls._normalize_coordination_value(segment.get("source"))
+            destination = cls._normalize_coordination_value(segment.get("destination"))
+            if source and destination:
+                return (source, destination)
+            return None
+        if isinstance(segment, str):
+            text = segment.strip()
+            if not text:
+                return None
+            separator = "->" if "->" in text else ">" if ">" in text else None
+            if separator is None:
+                return None
+            source, destination = text.split(separator, 1)
+            source = cls._normalize_coordination_value(source)
+            destination = cls._normalize_coordination_value(destination)
+            if source and destination:
+                return (source, destination)
+        return None
+
+    def _candidate_route_segments(self, candidate: RebalanceCandidate) -> set[Tuple[str, str]]:
+        segments: set[Tuple[str, str]] = set()
+        sink_scid = self._normalize_coordination_value(candidate.to_channel)
+        for source_scid in candidate.source_candidates:
+            normalized_source = self._normalize_coordination_value(source_scid)
+            if normalized_source and sink_scid:
+                segments.add((normalized_source, sink_scid))
+
+        sink_peer = self._normalize_coordination_value(candidate.to_peer_id)
+        source_peers = list(candidate.source_candidate_peer_ids or [])
+        if not source_peers and candidate.primary_source_peer_id:
+            source_peers = [candidate.primary_source_peer_id]
+        for source_peer in source_peers:
+            normalized_source = self._normalize_coordination_value(source_peer)
+            if normalized_source and sink_peer:
+                segments.add((normalized_source, sink_peer))
+        return segments
+
+    def _coordination_entry_view(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        view: Dict[str, Any] = dict(entry or {})
+        for nested_key in ("active_chunk_recommendation", "active_chunk_lease"):
+            nested = entry.get(nested_key) if isinstance(entry, dict) else None
+            if not isinstance(nested, dict):
+                continue
+            for key, value in nested.items():
+                if key not in view or not view.get(key):
+                    view[key] = value
+        return view
+
+    def _coordination_entry_segments(self, entry: Dict[str, Any]) -> set[Tuple[str, str]]:
+        view = self._coordination_entry_view(entry)
+        segments: set[Tuple[str, str]] = set()
+
+        for raw_segment in view.get("route_segments", []) or []:
+            normalized = self._normalize_route_segment(raw_segment)
+            if normalized:
+                segments.add(normalized)
+
+        source_scid = self._normalize_coordination_value(view.get("source_scid"))
+        sink_scid = self._normalize_coordination_value(view.get("sink_scid"))
+        if source_scid and sink_scid:
+            segments.add((source_scid, sink_scid))
+
+        source_peer = self._normalize_coordination_value(
+            view.get("source_peer_id") or view.get("from_peer_id")
+        )
+        dest_peer = self._normalize_coordination_value(
+            view.get("destination_peer_id")
+            or view.get("dest_peer_id")
+            or view.get("to_peer_id")
+            or view.get("target_peer_id")
+        )
+        if source_peer and dest_peer:
+            segments.add((source_peer, dest_peer))
+
+        return segments
+
+    def _candidate_matches_coordination_entry(
+        self,
+        candidate: RebalanceCandidate,
+        entry: Dict[str, Any],
+    ) -> bool:
+        view = self._coordination_entry_view(entry)
+        source_scid = self._normalize_coordination_value(view.get("source_scid"))
+        sink_scid = self._normalize_coordination_value(view.get("sink_scid"))
+        candidate_sink = self._normalize_coordination_value(candidate.to_channel)
+        candidate_sources = {
+            self._normalize_coordination_value(source_scid)
+            for source_scid in candidate.source_candidates
+            if source_scid
+        }
+        if source_scid and sink_scid:
+            return sink_scid == candidate_sink and source_scid in candidate_sources
+
+        candidate_segments = self._candidate_route_segments(candidate)
+        if not candidate_segments:
+            return False
+        return bool(candidate_segments & self._coordination_entry_segments(entry))
+
+    def _coordination_assignment_rank(self, entry: Dict[str, Any], our_node_id: Optional[str]) -> int:
+        if not our_node_id:
+            return 0
+        view = self._coordination_entry_view(entry)
+        primary = str(view.get("primary_executor_member_id") or "").strip()
+        if primary and primary == our_node_id:
+            return 2
+        fallbacks = view.get("fallback_executor_member_ids") or []
+        if isinstance(fallbacks, list) and our_node_id in [str(v).strip() for v in fallbacks]:
+            return 1
+        return 0
+
+    def _coordination_priority_score(self, entry: Dict[str, Any]) -> float:
+        view = self._coordination_entry_view(entry)
+        try:
+            return max(0.0, float(view.get("priority_score", 0.0) or 0.0))
+        except Exception:
+            return 0.0
+
+    def _is_active_foreign_lease(self, lease: Dict[str, Any], our_node_id: Optional[str]) -> bool:
+        owner = str(lease.get("owner_member_id") or "").strip()
+        if not owner or (our_node_id and owner == our_node_id):
+            return False
+        status = str(lease.get("status") or "").strip().lower()
+        if status and status not in {"active", "leased"}:
+            return False
+        try:
+            expires_at = int(lease.get("expires_at", 0) or 0)
+        except Exception:
+            expires_at = 0
+        return expires_at <= 0 or expires_at > int(time.time())
+
+    def _apply_coordinated_rebalance_hints(
+        self,
+        candidates: List[RebalanceCandidate],
+        *,
+        our_node_id: Optional[str],
+        leases: List[Dict[str, Any]],
+        recommendations: List[Dict[str, Any]],
+        campaigns: List[Dict[str, Any]],
+    ) -> List[RebalanceCandidate]:
+        if not candidates:
+            return candidates
+
+        filtered: List[RebalanceCandidate] = []
+        for candidate in candidates:
+            suppressed = False
+            for lease in leases:
+                if not self._is_active_foreign_lease(lease, our_node_id):
+                    continue
+                if self._candidate_matches_coordination_entry(candidate, lease):
+                    suppressed = True
+                    break
+            if suppressed:
+                continue
+
+            best_hint_type = candidate.coordination_hint_type
+            best_hint_id = candidate.coordination_hint_id
+            best_rank_bonus = float(candidate.coordination_rank_bonus or 0.0)
+
+            for recommendation in recommendations:
+                if self._coordination_assignment_rank(recommendation, our_node_id) <= 0:
+                    continue
+                if not self._candidate_matches_coordination_entry(candidate, recommendation):
+                    continue
+                rank_bonus = 25.0 + self._coordination_priority_score(recommendation)
+                if rank_bonus > best_rank_bonus:
+                    best_rank_bonus = rank_bonus
+                    best_hint_type = "recommendation"
+                    best_hint_id = str(recommendation.get("recommendation_id") or "").strip()
+
+            for campaign in campaigns:
+                if str(campaign.get("status") or "").strip().lower() != "active":
+                    continue
+                if self._coordination_assignment_rank(campaign, our_node_id) <= 0:
+                    continue
+                if not self._candidate_matches_coordination_entry(candidate, campaign):
+                    continue
+                rank_bonus = 50.0 + self._coordination_priority_score(campaign)
+                if rank_bonus > best_rank_bonus:
+                    best_rank_bonus = rank_bonus
+                    best_hint_type = "campaign"
+                    best_hint_id = str(campaign.get("campaign_id") or "").strip()
+
+            if best_rank_bonus > 0:
+                candidate.reason_code = RebalanceReasonCode.COORDINATED_REBALANCE.value
+                candidate.coordination_hint_type = best_hint_type
+                candidate.coordination_hint_id = best_hint_id
+                candidate.coordination_rank_bonus = best_rank_bonus
+
+            filtered.append(candidate)
+
+        return filtered
+
+    @staticmethod
     def _should_skip_futility(fail_count: int, last_error_type: str) -> bool:
         """
         Check if a channel should be skipped by the futility breaker.
@@ -1045,6 +1254,11 @@ class EVRebalancer:
             self.plugin.log(f"Cleaned {cleaned} stale budget reservations before rebalance cycle")
 
         try:
+            coordination_leases: List[Dict[str, Any]] = []
+            coordination_recommendations: List[Dict[str, Any]] = []
+            coordination_campaigns: List[Dict[str, Any]] = []
+            our_node_id: Optional[str] = None
+
             # Slot check (legacy sling monitoring removed; stubs always allow)
             available_slots = self.job_manager.slots_available()
             if available_slots <= 0:
@@ -1103,6 +1317,16 @@ class EVRebalancer:
                     self.hive_hints.poll()
                 except Exception:
                     pass
+                try:
+                    coordination_leases = list(self.hive_hints.get_route_segment_leases() or [])
+                    coordination_recommendations = list(self.hive_hints.get_rebalance_recommendations() or [])
+                    coordination_campaigns = list(self.hive_hints.get_rebalance_campaigns() or [])
+                except Exception:
+                    coordination_leases = []
+                    coordination_recommendations = []
+                    coordination_campaigns = []
+                if coordination_leases or coordination_recommendations or coordination_campaigns:
+                    our_node_id = self._get_our_node_id()
 
             # Refresh askrene hive-fleet layer and fleet balances for route discovery
             if self.hive_router:
@@ -1561,6 +1785,14 @@ class EVRebalancer:
             # Store for use in _select_source_candidates
             self._cycle_route_pair_in_channels = route_pair_in_channels
 
+            candidates = self._apply_coordinated_rebalance_hints(
+                candidates,
+                our_node_id=our_node_id,
+                leases=coordination_leases,
+                recommendations=coordination_recommendations,
+                campaigns=coordination_campaigns,
+            )
+
             # Sort by priority
             def sort_key(c):
                 dest_state = self.database.get_channel_state(c.to_channel)
@@ -1570,6 +1802,7 @@ class EVRebalancer:
                 route_bonus = 1.3 if c.to_channel in route_pair_out_channels else 1.0
                 hive_bias = self._get_hive_rebalance_bias(c.to_peer_id)
                 biased_profit = c.expected_profit_sats * hive_bias * route_bonus
+                biased_profit += float(getattr(c, "coordination_rank_bonus", 0.0) or 0.0)
                 return (priority, biased_profit)
 
             candidates.sort(key=sort_key, reverse=True)
