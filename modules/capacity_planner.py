@@ -8,6 +8,7 @@ and "Loser" channels for capital redeployment (Close).
 import json
 import math
 import time
+from statistics import median
 from typing import Dict, List, Any
 from pyln.client import Plugin
 from .config import ChainCostDefaults
@@ -19,6 +20,7 @@ from .utils import parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_ba
 _LOSER_SEVERITY = {
     "ZOMBIE": 3,
     "FIRE SALE": 2,
+    "DEAD_CAPITAL": 2,
     "STAGNANT+HARD_REBAL": 2,
     "STAGNANT": 1,
 }
@@ -30,7 +32,7 @@ STRATEGY_WEIGHTS = {
     "hive": 0.9,
     "route_pair": 0.85,
     "graph": 0.8,
-    "neighbor": 0.7,
+    "neighbor": 0.9,
 }
 
 
@@ -52,6 +54,7 @@ class CapacityPlanner:
         self.global_budget_limit_provider = None
         self.external_liquidity_cost_provider = None
         self._capex_engine = None
+        self._capital_efficiency = None
         # Coordination signals: cached from last execute_cycle for Boltz integration
         self._last_loser_scids: set = set()        # SCIDs with action=CLOSE
         self._last_funding_deficit_sats: int = 0    # On-chain shortfall for next open
@@ -72,6 +75,10 @@ class CapacityPlanner:
     def set_capex_engine(self, engine: 'CapexBudgetEngine'):
         """Inject the unified capex budget engine."""
         self._capex_engine = engine
+
+    def set_capital_efficiency(self, analyzer) -> None:
+        """Inject the capital-efficiency analyzer."""
+        self._capital_efficiency = analyzer
 
     def get_boltz_coordination(self) -> Dict[str, Any]:
         """Return signals for Boltz planner coordination.
@@ -580,6 +587,19 @@ class CapacityPlanner:
         # Route-pair protection: channels on top revenue routes get higher closure bar
         route_pair_channels = set()
         db = self.profitability.database if self.profitability else None
+        dead_capital_stages = {}
+        channel_efficiencies = {}
+        if self._capital_efficiency is not None:
+            try:
+                fleet_efficiency = self._capital_efficiency.analyze()
+                channel_efficiencies = getattr(fleet_efficiency, "channel_efficiencies", {}) or {}
+            except Exception:
+                channel_efficiencies = {}
+            if db is not None:
+                try:
+                    dead_capital_stages = db.get_dead_capital_stages() or {}
+                except Exception:
+                    dead_capital_stages = {}
         if db:
             try:
                 pairs = db.get_top_route_pairs(days=30, min_forwards=3, limit=10)
@@ -605,6 +625,24 @@ class CapacityPlanner:
 
         for scid, prof in all_profitability.items():
             flow_metrics = all_flow.get(scid)
+            scid_display = scid.replace(':', 'x')
+            channel_efficiency = channel_efficiencies.get(scid) or channel_efficiencies.get(scid_display)
+
+            if dead_capital_stages.get(scid_display) and not getattr(channel_efficiency, "is_dead_capital", False):
+                try:
+                    db.delete_dead_capital_stage(scid_display)
+                except Exception:
+                    pass
+
+            dead_capital_loser = self._build_dead_capital_loser(
+                scid_display,
+                prof,
+                channel_efficiency,
+                dead_capital_stages,
+            )
+            if dead_capital_loser is not None:
+                losers.append(dead_capital_loser)
+                continue
 
             # Fetch diagnostic stats from DB
             diag_stats = self.profitability.database.get_diagnostic_rebalance_stats(scid, days=14)
@@ -615,9 +653,6 @@ class CapacityPlanner:
             rebal_difficulty = 0.0
             if success_data and success_data.get('total', 0) >= 3:
                 rebal_difficulty = 1.0 - success_data.get('success_rate', 1.0)  # 0=easy, 1=impossible
-
-            # SCID formatting check - ensure 'x' separator
-            scid_display = scid.replace(':', 'x')
 
             # Hive member protection -- never recommend closing fleet channels
             if self.hive_hints is not None:
@@ -819,6 +854,90 @@ class CapacityPlanner:
 
         return losers
 
+    def _build_dead_capital_loser(
+        self,
+        scid: str,
+        prof,
+        channel_efficiency,
+        dead_capital_stages: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any] | None:
+        """Return staged dead-capital action when the analyzer flags a channel."""
+        if channel_efficiency is None or not getattr(channel_efficiency, "is_dead_capital", False):
+            return None
+
+        db = self.profitability.database if self.profitability else None
+        now = int(time.time())
+        opener = getattr(prof, "opener", "local")
+        stage_timeout = 48 * 3600 if opener == "remote" else 24 * 3600
+        stage_row = dead_capital_stages.get(scid, {})
+        stage = str(
+            getattr(channel_efficiency, "dead_capital_stage", "none")
+            or stage_row.get("stage")
+            or "none"
+        )
+        entered_at = int(stage_row.get("entered_at", 0) or 0)
+        persist_stage = None
+
+        if stage == "none":
+            action = "FEE_REDUCE"
+            stage = "fee_reduction"
+            entered_at = now
+            persist_stage = stage
+        elif stage == "fee_reduction" and entered_at and now - entered_at >= stage_timeout:
+            action = "DEFIBRILLATE"
+            stage = "defibrillation"
+            entered_at = now
+            persist_stage = stage
+        elif stage == "fee_reduction":
+            action = "FEE_REDUCE"
+        elif stage == "defibrillation" and entered_at and now - entered_at >= stage_timeout:
+            action = "CLOSE"
+            stage = "close"
+            entered_at = now
+            persist_stage = stage
+        elif stage == "defibrillation":
+            action = "DEFIBRILLATE"
+        else:
+            action = "CLOSE"
+            stage = "close"
+
+        if persist_stage is not None and db is not None:
+            try:
+                db.upsert_dead_capital_stage(scid, persist_stage, entered_at)
+            except Exception:
+                pass
+
+        uptime_pct = None
+        if db is not None:
+            try:
+                uptime_pct = db.get_peer_uptime_percent(
+                    prof.peer_id, duration_seconds=168 * 3600
+                )
+            except Exception:
+                pass
+
+        classification = prof.classification.value if hasattr(prof.classification, "value") else str(prof.classification)
+        return {
+            "scid": scid,
+            "peer_id": prof.peer_id,
+            "reason": "DEAD_CAPITAL",
+            "roi": round(getattr(prof, "roi_percent", 0.0), 2),
+            "marginal_roi": round(getattr(prof, "marginal_roi_percent", 0.0), 2),
+            "classification": classification,
+            "capacity": getattr(prof, "capacity_sats", 0),
+            "estimated_closure_cost_sats": ChainCostDefaults.CHANNEL_CLOSE_COST_SATS,
+            "rebal_difficulty": 0.0,
+            "opener": opener,
+            "action": action,
+            "is_hard_bleeder": False,
+            "hive_closure_flagged": False,
+            "uptime_pct": round(uptime_pct, 1) if isinstance(uptime_pct, (int, float)) else None,
+            "regime_change": False,
+            "is_fire_sale": False,
+            "marginal_profit_30d_sats": getattr(prof, "marginal_profit_30d_sats", 0),
+            "dead_capital_stage": stage,
+        }
+
     def _generate_recommendations(self, winners: List[Dict], losers: List[Dict]) -> List[str]:
         """
         Create actionable recommendations pairing winners and losers.
@@ -854,6 +973,7 @@ class CapacityPlanner:
                 pass  # On error, keep original action
 
         # Re-separate after demotion
+        fee_reduce = [l for l in losers if l.get("action") == "FEE_REDUCE"]
         defibrillate = [l for l in losers if l.get("action") == "DEFIBRILLATE"]
         closeable = [l for l in losers if l.get("action") == "CLOSE"]
 
@@ -899,6 +1019,12 @@ class CapacityPlanner:
                 f"Diagnostic rebalance required before closure can be recommended."
             )
 
+        for loser in fee_reduce:
+            recommendations.append(
+                f"FEE REDUCE: {loser['scid']} ({loser['reason']}, {loser['roi']:.1f}% ROI). "
+                f"Lower fees to the floor and wait one cycle for recovery."
+            )
+
         return recommendations
 
     def _discover_from_winners(self, winners: List[Dict]) -> List[Dict]:
@@ -925,63 +1051,258 @@ class CapacityPlanner:
         except Exception:
             return []
 
-        # Sort channels by marginal ROI, take top 3
-        sorted_channels = sorted(
-            all_profitability.values(),
-            key=lambda p: getattr(p, 'marginal_roi_percent', 0),
-            reverse=True
-        )[:3]
-
         # Get existing peer_ids to exclude
         existing_peers = set()
         for prof in all_profitability.values():
             if hasattr(prof, 'peer_id') and prof.peer_id:
                 existing_peers.add(prof.peer_id)
 
-        for patron in sorted_channels:
-            patron_peer_id = getattr(patron, 'peer_id', None)
+        if self._capital_efficiency is None:
+            # Sort channels by marginal ROI, take top 3
+            sorted_channels = sorted(
+                all_profitability.values(),
+                key=lambda p: getattr(p, 'marginal_roi_percent', 0),
+                reverse=True
+            )[:3]
+
+            for patron in sorted_channels:
+                patron_peer_id = getattr(patron, 'peer_id', None)
+                if not patron_peer_id:
+                    continue
+
+                try:
+                    channels = {"channels": self._get_cached_channels(patron_peer_id, "source")}
+                    patron_roi = getattr(patron, 'marginal_roi_percent', 0)
+                    # Score neighbors by capacity and fee competitiveness, not random order
+                    scored_neighbors = []
+                    for ch in channels.get("channels", []):
+                        dest = ch.get("destination")
+                        if not dest or dest == our_node_id or dest in existing_peers:
+                            continue
+                        cap = base_to_sats_floor(parse_msat(ch.get("amount_msat", 0)))
+                        fee_ppm = ch.get("fee_per_millionth", 0) or 0
+                        # Skip expensive or tiny channels (only filter when data is available)
+                        if fee_ppm > 1500:
+                            continue
+                        if cap > 0 and cap < 200000:
+                            continue
+                        # Score: patron ROI scaled, boosted by capacity and low fees
+                        base = max(patron_roi / 200.0, 0.1)
+                        if cap > 5_000_000:
+                            base *= 1.15
+                        if 0 < fee_ppm < 100:
+                            base *= 1.10
+                        scored_neighbors.append((dest, base))
+                    scored_neighbors.sort(key=lambda x: x[1], reverse=True)
+
+                    # Take top 5 neighbors per patron
+                    for neighbor_id, neighbor_score in scored_neighbors[:5]:
+                        candidates.append({
+                            "peer_id": neighbor_id,
+                            "source": "neighbor",
+                            "score": neighbor_score,
+                            "reason": f"Neighbor of top earner {patron_peer_id[:12]}...",
+                            "patron_peer_id": patron_peer_id,
+                        })
+                except Exception as e:
+                    self.plugin.log(f"Error discovering neighbors of {patron_peer_id[:12]}: {e}", level='debug')
+                    continue
+
+            return candidates[:10]  # Max 10 total from this strategy
+
+        patron_pool = self._build_neighbor_patron_pool(all_profitability)
+        first_degree: Dict[str, Dict[str, Any]] = {}
+        for patron in patron_pool:
+            patron_peer_id = patron.get("peer_id")
             if not patron_peer_id:
                 continue
 
             try:
-                channels = {"channels": self._get_cached_channels(patron_peer_id, "source")}
-                patron_roi = getattr(patron, 'marginal_roi_percent', 0)
-                # Score neighbors by capacity and fee competitiveness, not random order
-                scored_neighbors = []
-                for ch in channels.get("channels", []):
-                    dest = ch.get("destination")
-                    if not dest or dest == our_node_id or dest in existing_peers:
-                        continue
-                    cap = base_to_sats_floor(parse_msat(ch.get("amount_msat", 0)))
-                    fee_ppm = ch.get("fee_per_millionth", 0) or 0
-                    # Skip expensive or tiny channels (only filter when data is available)
-                    if fee_ppm > 1500:
-                        continue
-                    if cap > 0 and cap < 200000:
-                        continue
-                    # Score: patron ROI scaled, boosted by capacity and low fees
-                    base = max(patron_roi / 200.0, 0.1)
-                    if cap > 5_000_000:
-                        base *= 1.15
-                    if 0 < fee_ppm < 100:
-                        base *= 1.10
-                    scored_neighbors.append((dest, base))
-                scored_neighbors.sort(key=lambda x: x[1], reverse=True)
-
-                # Take top 5 neighbors per patron
-                for neighbor_id, neighbor_score in scored_neighbors[:5]:
-                    candidates.append({
-                        "peer_id": neighbor_id,
-                        "source": "neighbor",
-                        "score": neighbor_score,
-                        "reason": f"Neighbor of top earner {patron_peer_id[:12]}...",
-                        "patron_peer_id": patron_peer_id,
-                    })
+                channels = self._get_cached_channels(patron_peer_id, "source")
             except Exception as e:
                 self.plugin.log(f"Error discovering neighbors of {patron_peer_id[:12]}: {e}", level='debug')
                 continue
 
-        return candidates[:10]  # Max 10 total from this strategy
+            for ch in channels:
+                neighbor = self._build_neighbor_candidate(
+                    ch,
+                    patron,
+                    existing_peers,
+                    our_node_id,
+                    degree=1,
+                )
+                if neighbor is None:
+                    continue
+                current = first_degree.get(neighbor["peer_id"])
+                if current is None:
+                    neighbor["_patron_ids"] = {patron_peer_id}
+                    first_degree[neighbor["peer_id"]] = neighbor
+                    continue
+                current["_patron_ids"].add(patron_peer_id)
+                if neighbor["score"] > current["score"]:
+                    current.update({
+                        "score": neighbor["score"],
+                        "reason": neighbor["reason"],
+                        "patron_peer_id": patron_peer_id,
+                    })
+
+        first_degree_list = list(first_degree.values())
+        for candidate in first_degree_list:
+            patron_count = len(candidate.pop("_patron_ids", set()))
+            candidate["score"] += 0.15 * patron_count
+
+        first_degree_list.sort(key=lambda item: item["score"], reverse=True)
+        second_degree = self._discover_second_degree_neighbors(
+            first_degree_list[:3],
+            existing_peers,
+            our_node_id,
+        )
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        for candidate in first_degree_list + second_degree:
+            existing = merged.get(candidate["peer_id"])
+            if existing is None or candidate["score"] > existing["score"]:
+                merged[candidate["peer_id"]] = candidate
+
+        return sorted(merged.values(), key=lambda item: item["score"], reverse=True)[:10]
+
+    def _build_neighbor_patron_pool(self, all_profitability) -> List[Dict[str, Any]]:
+        """Build the combined patron pool for efficiency-aware neighbor discovery."""
+        try:
+            fleet_efficiency = self._capital_efficiency.analyze()
+        except Exception:
+            fleet_efficiency = None
+
+        channel_efficiencies = getattr(fleet_efficiency, "channel_efficiencies", {}) or {}
+        entries = []
+        for scid, prof in all_profitability.items():
+            revenue = getattr(prof, "revenue", None)
+            volume_routed_sats = getattr(revenue, "volume_routed_sats", 0)
+            try:
+                volume_routed_sats = int(volume_routed_sats or 0)
+            except (TypeError, ValueError):
+                volume_routed_sats = 0
+            channel_eff = channel_efficiencies.get(scid)
+            entries.append({
+                "channel_id": scid,
+                "peer_id": getattr(prof, "peer_id", None),
+                "patron_score": float(getattr(channel_eff, "efficiency_rank", 0.1) or 0.1),
+                "volume_routed_sats": volume_routed_sats,
+                "marginal_roi_percent": float(getattr(prof, "marginal_roi_percent", 0.0) or 0.0),
+            })
+
+        selected = []
+        selected.extend(sorted(entries, key=lambda item: item["patron_score"], reverse=True)[:5])
+        selected.extend(sorted(entries, key=lambda item: item["volume_routed_sats"], reverse=True)[:5])
+        selected.extend(sorted(entries, key=lambda item: item["marginal_roi_percent"], reverse=True)[:3])
+
+        deduped = {}
+        for entry in selected:
+            peer_id = entry.get("peer_id")
+            if not peer_id:
+                continue
+            current = deduped.get(peer_id)
+            if current is None or entry["patron_score"] > current["patron_score"]:
+                deduped[peer_id] = entry
+
+        return list(deduped.values())[:10]
+
+    def _build_neighbor_candidate(
+        self,
+        channel: Dict[str, Any],
+        patron: Dict[str, Any],
+        existing_peers: set,
+        our_node_id: str,
+        degree: int,
+    ) -> Dict[str, Any] | None:
+        """Score a first- or second-degree neighbor candidate."""
+        peer_id = channel.get("destination")
+        if not peer_id or peer_id == our_node_id or peer_id in existing_peers:
+            return None
+
+        capacity_sats = base_to_sats_floor(parse_msat(channel.get("amount_msat", 0)))
+        fee_ppm = int(channel.get("fee_per_millionth", 0) or 0)
+        if fee_ppm > 1500:
+            return None
+        if 0 < capacity_sats < 200000:
+            return None
+
+        base_score = float(patron.get("patron_score", 0.1) or 0.1)
+        if degree == 2:
+            base_score *= 0.5
+        capacity_bonus = min(capacity_sats / 5_000_000, 1.0) * 0.4 if capacity_sats > 0 else 0.0
+        if fee_ppm < 200:
+            fee_bonus = 0.2
+        elif fee_ppm < 500:
+            fee_bonus = 0.1
+        else:
+            fee_bonus = 0.0
+
+        score = base_score + capacity_bonus + fee_bonus
+        if degree == 2:
+            score *= 0.5
+
+        return {
+            "peer_id": peer_id,
+            "source": "neighbor",
+            "score": score,
+            "degree": degree,
+            "reason": f"Neighbor of capital-efficient patron {str(patron.get('peer_id', ''))[:12]}...",
+            "patron_peer_id": patron.get("peer_id"),
+        }
+
+    def _discover_second_degree_neighbors(
+        self,
+        first_degree_candidates: List[Dict[str, Any]],
+        existing_peers: set,
+        our_node_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Explore the top first-degree candidates one hop deeper."""
+        second_degree = []
+        for candidate in first_degree_candidates:
+            try:
+                channels = self._get_cached_channels(candidate["peer_id"], "source")
+            except Exception:
+                continue
+
+            active_channels = [ch for ch in channels if ch.get("destination")]
+            capacities = [
+                base_to_sats_floor(parse_msat(ch.get("amount_msat", 0)))
+                for ch in active_channels
+                if base_to_sats_floor(parse_msat(ch.get("amount_msat", 0))) > 0
+            ]
+            if active_channels:
+                channel_count_bonus = min(len(active_channels) / 20.0, 1.0) * 0.3
+                median_size_bonus = min((median(capacities) if capacities else 0) / 5_000_000, 1.0) * 0.4
+                fees = [int(ch.get("fee_per_millionth", 0) or 0) for ch in active_channels]
+                avg_fee_ppm = sum(fees) / len(fees) if fees else 0.0
+                if avg_fee_ppm < 200:
+                    fee_bonus = 0.2
+                elif avg_fee_ppm < 500:
+                    fee_bonus = 0.1
+                else:
+                    fee_bonus = 0.0
+                candidate["score"] += channel_count_bonus + median_size_bonus + fee_bonus
+
+            patron = {
+                "peer_id": candidate["peer_id"],
+                "patron_score": candidate["score"],
+            }
+            scored = []
+            for channel in active_channels:
+                child = self._build_neighbor_candidate(
+                    channel,
+                    patron,
+                    existing_peers,
+                    our_node_id,
+                    degree=2,
+                )
+                if child is not None:
+                    scored.append(child)
+            scored.sort(key=lambda item: item["score"], reverse=True)
+            second_degree.extend(scored[:3])
+
+        return second_degree
 
     def _discover_from_graph(self, existing_peer_ids: set) -> List[Dict]:
         """Strategy 3: Network centrality scoring from cached channel data.

@@ -57,6 +57,7 @@ from modules.capex_budget import (
     CapexAllocations,
     MSAT_PER_SAT,
 )
+from modules.capital_efficiency import ChannelEfficiency, FleetEfficiency
 
 
 def _make_engine(
@@ -65,6 +66,7 @@ def _make_engine(
     spend_by_channel=None,
     rebalance_cost_by_channel=None,
     hive_hints=None,
+    capital_efficiency=None,
     reserve_deficit=0,
     config_overrides=None,
 ):
@@ -97,6 +99,7 @@ def _make_engine(
         database=mock_db,
         config=cfg,
         hive_hints=hive_hints,
+        capital_efficiency=capital_efficiency,
     )
     # Patch the capex lookup to return test data
     capex_data = {}
@@ -154,6 +157,13 @@ def _make_mock_profitability(
     prof.classification.value = classification
     prof.marginal_roi = marginal_roi
     return prof
+
+
+def _make_efficiency_snapshot(*, median_rpsd=0.0, channel_data=None):
+    return FleetEfficiency(
+        median_rpsd=median_rpsd,
+        channel_efficiencies=channel_data or {},
+    )
 
 
 class TestPerChannelBudget:
@@ -264,6 +274,118 @@ class TestPerChannelBudget:
         b = alloc.channel_budgets["100x1x0"]
         assert b.tier == "blocked"
         assert b.budget_sats == 0
+
+    def test_dead_capital_channel_gets_zero_budget(self):
+        """Dead capital should receive no capex budget."""
+        efficiency = _make_efficiency_snapshot(
+            median_rpsd=100.0,
+            channel_data={
+                "100x1x0": ChannelEfficiency(
+                    channel_id="100x1x0",
+                    rpsd=0.0,
+                    efficiency_rank=0.0,
+                    forward_velocity=0.0,
+                    is_dead_capital=True,
+                    dead_capital_stage="fee_reduction",
+                ),
+            },
+        )
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
+                    total_forward_count=50,
+                ),
+            },
+            rebalance_cost_by_channel={"100x1x0": 200},
+            capital_efficiency=MagicMock(analyze=MagicMock(return_value=efficiency)),
+        )
+
+        alloc = engine.compute_allocations()
+
+        assert alloc.channel_budgets["100x1x0"].budget_sats == 0
+
+    def test_above_median_efficiency_increases_budget(self):
+        """RPSD above median should increase the computed budget."""
+        efficiency = _make_efficiency_snapshot(
+            median_rpsd=100.0,
+            channel_data={
+                "100x1x0": ChannelEfficiency(
+                    channel_id="100x1x0",
+                    rpsd=200.0,
+                    efficiency_rank=1.0,
+                    forward_velocity=3.0,
+                    is_dead_capital=False,
+                    dead_capital_stage="none",
+                ),
+            },
+        )
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
+                    total_forward_count=50,
+                ),
+            },
+            rebalance_cost_by_channel={"100x1x0": 200},
+            capital_efficiency=MagicMock(analyze=MagicMock(return_value=efficiency)),
+        )
+
+        alloc = engine.compute_allocations()
+
+        assert alloc.channel_budgets["100x1x0"].budget_sats == 375
+
+    def test_below_median_efficiency_reduces_budget(self):
+        """RPSD below median should reduce the computed budget with a 0.5 floor."""
+        efficiency = _make_efficiency_snapshot(
+            median_rpsd=100.0,
+            channel_data={
+                "100x1x0": ChannelEfficiency(
+                    channel_id="100x1x0",
+                    rpsd=25.0,
+                    efficiency_rank=0.0,
+                    forward_velocity=0.2,
+                    is_dead_capital=False,
+                    dead_capital_stage="none",
+                ),
+            },
+        )
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
+                    total_forward_count=50,
+                ),
+            },
+            rebalance_cost_by_channel={"100x1x0": 200},
+            capital_efficiency=MagicMock(analyze=MagicMock(return_value=efficiency)),
+        )
+
+        alloc = engine.compute_allocations()
+
+        assert alloc.channel_budgets["100x1x0"].budget_sats == 150
+
+    def test_missing_efficiency_data_is_neutral(self):
+        """Missing channel efficiency should keep the old budget behavior."""
+        efficiency = _make_efficiency_snapshot(median_rpsd=100.0, channel_data={})
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
+                    total_forward_count=50,
+                ),
+            },
+            rebalance_cost_by_channel={"100x1x0": 200},
+            capital_efficiency=MagicMock(analyze=MagicMock(return_value=efficiency)),
+        )
+
+        alloc = engine.compute_allocations()
+
+        assert alloc.channel_budgets["100x1x0"].budget_sats == 300
 
     def test_zombie_blocked(self):
         engine = _make_engine(

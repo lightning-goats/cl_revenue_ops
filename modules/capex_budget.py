@@ -98,11 +98,13 @@ class CapexBudgetEngine:
         database,
         config,
         hive_hints=None,
+        capital_efficiency=None,
     ):
         self._profitability = profitability_analyzer
         self._database = database
         self._config = config
         self._hive_hints = hive_hints
+        self._capital_efficiency = capital_efficiency
         self._last_allocations: Optional[CapexAllocations] = None
 
     def compute_allocations(self) -> CapexAllocations:
@@ -122,6 +124,12 @@ class CapexBudgetEngine:
 
         # Get total capex per channel (rebalance_costs + spend_events) — in sats
         capex_by_channel = self._get_total_capex_by_channel(window_days=30)
+        fleet_efficiency = None
+        if self._capital_efficiency is not None:
+            try:
+                fleet_efficiency = self._capital_efficiency.analyze()
+            except Exception:
+                fleet_efficiency = None
 
         # Compute per-channel budgets (all arithmetic in msat)
         channel_budgets: Dict[str, ChannelCapexBudget] = {}
@@ -157,6 +165,7 @@ class CapexBudgetEngine:
                 total_capex_30d_msat=total_capex_msat,
                 bleeder_status=bleeder_status,
                 cfg=cfg,
+                fleet_efficiency=fleet_efficiency,
             )
             channel_budgets[ch_id] = budget
 
@@ -277,6 +286,7 @@ class CapexBudgetEngine:
         total_capex_30d_msat: int,
         bleeder_status: str,
         cfg,
+        fleet_efficiency=None,
     ) -> ChannelCapexBudget:
         """Compute budget for a single channel (all arithmetic in msat)."""
         classification = _classify(prof.classification)
@@ -366,7 +376,8 @@ class CapexBudgetEngine:
                 channel_id=ch_id, tier="blocked", hive_multiplier=hive_mult,
             )
 
-        budget_msat = int(raw_budget_msat * discount * hive_mult)
+        efficiency_mult = self._get_efficiency_multiplier(ch_id, fleet_efficiency)
+        budget_msat = int(raw_budget_msat * discount * hive_mult * efficiency_mult)
 
         return ChannelCapexBudget(
             channel_id=ch_id,
@@ -376,6 +387,29 @@ class CapexBudgetEngine:
             priority_class=priority,
             hive_multiplier=hive_mult,
         )
+
+    def _get_efficiency_multiplier(self, channel_id: str, fleet_efficiency) -> float:
+        """Return the capital-efficiency multiplier for a channel budget."""
+        if fleet_efficiency is None:
+            return 1.0
+
+        channel_efficiencies = getattr(fleet_efficiency, "channel_efficiencies", {}) or {}
+        channel_eff = channel_efficiencies.get(channel_id)
+        if channel_eff is None:
+            return 1.0
+
+        if getattr(channel_eff, "is_dead_capital", False):
+            return 0.0
+
+        median_rpsd = float(getattr(fleet_efficiency, "median_rpsd", 0.0) or 0.0)
+        rpsd = float(getattr(channel_eff, "rpsd", 0.0) or 0.0)
+        if median_rpsd <= 0:
+            return 1.0
+
+        if rpsd >= median_rpsd:
+            return 1.0 + min(0.5, (rpsd / median_rpsd - 1.0) * 0.25)
+
+        return max(0.5, rpsd / median_rpsd)
 
     def _detect_priority_class(
         self,

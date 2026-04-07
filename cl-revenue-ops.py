@@ -50,6 +50,7 @@ from modules.policy_manager import (
 )
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.capex_budget import CapexBudgetEngine
+from modules.capital_efficiency import CapitalEfficiencyAnalyzer
 from modules.utils import normalize_scid, parse_msat
 
 
@@ -1470,12 +1471,22 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
         capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
 
+    capital_efficiency = CapitalEfficiencyAnalyzer(
+        profitability_analyzer=profitability_analyzer,
+        flow_analyzer=flow_analyzer,
+        database=database,
+        hive_hints=hive_hints,
+        config=config,
+    )
+    plugin.log("CapitalEfficiencyAnalyzer initialized")
+
     # Construct unified capex budget engine (after hive_hints are available)
     capex_engine = CapexBudgetEngine(
         profitability_analyzer=profitability_analyzer,
         database=database,
         config=config,
         hive_hints=hive_hints,
+        capital_efficiency=capital_efficiency,
     )
     plugin.log("CapexBudgetEngine initialized")
 
@@ -1483,6 +1494,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if rebalancer is not None:
         rebalancer.set_capex_engine(capex_engine)
     if capacity_planner is not None:
+        capacity_planner.set_capital_efficiency(capital_efficiency)
         capacity_planner.set_capex_engine(capex_engine)
     if boltz_manager is not None:
         boltz_manager.set_capex_engine(capex_engine)

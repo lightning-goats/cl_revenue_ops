@@ -259,6 +259,47 @@ class TestAuditTurn3KalmanNaNGuard:
             "variance_ratio": float('inf'),
         })
 
+
+class TestDeadCapitalStages:
+    """Real SQLite tests for dead-capital stage persistence."""
+
+    def _make_db(self, tmp_path):
+        db_path = os.path.join(tmp_path, "test_dead_capital.db")
+        plugin = MagicMock()
+        db = Database(db_path, plugin)
+        db.initialize()
+        return db
+
+    def test_dead_capital_stage_round_trip(self, tmp_path):
+        """Stages can be inserted and read back by channel id."""
+        db = self._make_db(tmp_path)
+
+        db.upsert_dead_capital_stage("100x1x0", "fee_reduction", 123)
+
+        stages = db.get_dead_capital_stages()
+        assert stages["100x1x0"]["stage"] == "fee_reduction"
+        assert stages["100x1x0"]["entered_at"] == 123
+
+    def test_upsert_replaces_existing_stage(self, tmp_path):
+        """Upsert should replace stage and entered_at for an existing row."""
+        db = self._make_db(tmp_path)
+
+        db.upsert_dead_capital_stage("100x1x0", "fee_reduction", 123)
+        db.upsert_dead_capital_stage("100x1x0", "close", 456)
+
+        stages = db.get_dead_capital_stages()
+        assert stages["100x1x0"]["stage"] == "close"
+        assert stages["100x1x0"]["entered_at"] == 456
+
+    def test_delete_dead_capital_stage(self, tmp_path):
+        """Deleting a stage removes it from the lookup."""
+        db = self._make_db(tmp_path)
+
+        db.upsert_dead_capital_stage("100x1x0", "close", 123)
+        db.delete_dead_capital_stage("100x1x0")
+
+        assert "100x1x0" not in db.get_dead_capital_stages()
+
         states = db.get_all_kalman_states()
         assert len(states) == 0
 

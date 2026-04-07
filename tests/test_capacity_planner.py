@@ -19,6 +19,7 @@ sys.modules['pyln.client'] = mock_pyln
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.capacity_planner import CapacityPlanner
+from modules.capital_efficiency import ChannelEfficiency, FleetEfficiency
 from modules.database import Database
 from modules.config import Config
 from modules.profitability_analyzer import ProfitabilityClass
@@ -756,6 +757,7 @@ def _make_loser_planner():
     prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 0}
     prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
     prof_analyzer.database.get_peer_uptime_percent.side_effect = Exception("not available")
+    prof_analyzer.database.get_dead_capital_stages.return_value = {}
     # identify_bleeders_v2 returns empty list by default
     prof_analyzer.identify_bleeders_v2.return_value = []
 
@@ -791,6 +793,13 @@ def _make_loser_flow(**kwargs):
     )
     defaults.update(kwargs)
     return _mock_flow(**defaults)
+
+
+def _make_efficiency_snapshot(*, median_rpsd=0.0, channel_efficiencies=None):
+    return FleetEfficiency(
+        median_rpsd=median_rpsd,
+        channel_efficiencies=channel_efficiencies or {},
+    )
 
 
 class TestEnrichedLosers:
@@ -946,6 +955,96 @@ class TestEnrichedLosers:
         losers = planner._identify_losers({scid: prof}, {scid: flow})
 
         assert len(losers) == 1
+
+
+class TestDeadCapitalLosers:
+    """Dead-capital channels should use the staged response pipeline."""
+
+    def test_dead_capital_channel_enters_fee_reduction_stage_first(self):
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow(daily_volume=0)
+        planner.set_capital_efficiency(MagicMock(analyze=MagicMock(return_value=_make_efficiency_snapshot(
+            channel_efficiencies={
+                scid: ChannelEfficiency(
+                    channel_id=scid,
+                    rpsd=0.0,
+                    efficiency_rank=0.0,
+                    forward_velocity=0.0,
+                    is_dead_capital=True,
+                    dead_capital_stage="none",
+                ),
+            },
+        ))))
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["reason"] == "DEAD_CAPITAL"
+        assert losers[0]["action"] == "FEE_REDUCE"
+        prof_analyzer.database.upsert_dead_capital_stage.assert_called_once()
+
+    def test_dead_capital_advances_to_defibrillate_after_stage_timeout(self):
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof()
+        flow = _make_loser_flow(daily_volume=0)
+        planner.set_capital_efficiency(MagicMock(analyze=MagicMock(return_value=_make_efficiency_snapshot(
+            channel_efficiencies={
+                scid: ChannelEfficiency(
+                    channel_id=scid,
+                    rpsd=0.0,
+                    efficiency_rank=0.0,
+                    forward_velocity=0.0,
+                    is_dead_capital=True,
+                    dead_capital_stage="fee_reduction",
+                ),
+            },
+        ))))
+        prof_analyzer.database.get_dead_capital_stages.return_value = {
+            scid: {"stage": "fee_reduction", "entered_at": int(time.time()) - 25 * 3600}
+        }
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "DEFIBRILLATE"
+        prof_analyzer.database.upsert_dead_capital_stage.assert_called_with(
+            scid, "defibrillation", pytest.approx(int(time.time()), abs=2)
+        )
+
+    def test_dead_capital_recovery_clears_stage_tracking(self):
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _mock_profitability(
+            scid=scid,
+            classification=ProfitabilityClass.BREAK_EVEN,
+            marginal_roi_percent=25.0,
+            roi_percent=10.0,
+            days_open=120,
+        )
+        flow = _make_loser_flow(daily_volume=1_500_000, flow_ratio=0.9)
+        planner.set_capital_efficiency(MagicMock(analyze=MagicMock(return_value=_make_efficiency_snapshot(
+            channel_efficiencies={
+                scid: ChannelEfficiency(
+                    channel_id=scid,
+                    rpsd=200.0,
+                    efficiency_rank=1.0,
+                    forward_velocity=3.0,
+                    is_dead_capital=False,
+                    dead_capital_stage="none",
+                ),
+            },
+        ))))
+        prof_analyzer.database.get_dead_capital_stages.return_value = {
+            scid: {"stage": "fee_reduction", "entered_at": 123}
+        }
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert losers == []
+        prof_analyzer.database.delete_dead_capital_stage.assert_called_once_with(scid)
 
     def test_loser_includes_uptime(self):
         """Loser dict includes peer uptime percentage."""
@@ -1435,6 +1534,131 @@ class TestPeerDiscovery:
 
         candidates = planner._discover_from_neighbors(all_profitability)
         assert len(candidates) <= 10
+
+    def test_discover_from_neighbors_uses_efficiency_patron_pool(self):
+        """High-efficiency patrons are explored even when ROI alone would exclude them."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        def listchannels_side_effect(source=None, destination=None):
+            if source == "patron_efficiency":
+                return {
+                    "channels": [
+                        {
+                            "source": "patron_efficiency",
+                            "destination": "neighbor_a",
+                            "amount_msat": "3000000000msat",
+                            "fee_per_millionth": 100,
+                        }
+                    ]
+                }
+            return {"channels": []}
+
+        plugin.rpc.listchannels.side_effect = listchannels_side_effect
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner.set_capital_efficiency(MagicMock(analyze=MagicMock(return_value=_make_efficiency_snapshot(
+            median_rpsd=50.0,
+            channel_efficiencies={
+                "1x1x0": ChannelEfficiency("1x1x0", 500.0, 1.0, 0.1, False, "none"),
+                "2x1x0": ChannelEfficiency("2x1x0", 10.0, 0.0, 0.1, False, "none"),
+                "3x1x0": ChannelEfficiency("3x1x0", 9.0, 0.0, 0.1, False, "none"),
+                "4x1x0": ChannelEfficiency("4x1x0", 8.0, 0.0, 0.1, False, "none"),
+            },
+        ))))
+
+        all_profitability = {}
+        for scid, peer_id, roi in (
+            ("1x1x0", "patron_efficiency", 1.0),
+            ("2x1x0", "roi_a", 100.0),
+            ("3x1x0", "roi_b", 90.0),
+            ("4x1x0", "roi_c", 80.0),
+        ):
+            prof = MagicMock()
+            prof.peer_id = peer_id
+            prof.marginal_roi_percent = roi
+            prof.revenue.volume_routed_sats = 0
+            all_profitability[scid] = prof
+
+        candidates = planner._discover_from_neighbors(all_profitability)
+
+        assert "neighbor_a" in {candidate["peer_id"] for candidate in candidates}
+
+    def test_discover_from_neighbors_includes_second_degree_candidates(self):
+        """Top first-degree neighbors should seed second-degree exploration with score dampening."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        def listchannels_side_effect(source=None, destination=None):
+            if source == "patron1":
+                return {
+                    "channels": [
+                        {
+                            "source": "patron1",
+                            "destination": "first_degree",
+                            "amount_msat": "4000000000msat",
+                            "fee_per_millionth": 100,
+                        }
+                    ]
+                }
+            if source == "first_degree":
+                return {
+                    "channels": [
+                        {
+                            "source": "first_degree",
+                            "destination": "second_degree",
+                            "amount_msat": "4000000000msat",
+                            "fee_per_millionth": 100,
+                        }
+                    ]
+                }
+            return {"channels": []}
+
+        plugin.rpc.listchannels.side_effect = listchannels_side_effect
+
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        planner.set_capital_efficiency(MagicMock(analyze=MagicMock(return_value=_make_efficiency_snapshot(
+            median_rpsd=50.0,
+            channel_efficiencies={
+                "1x1x0": ChannelEfficiency("1x1x0", 200.0, 1.0, 3.0, False, "none"),
+            },
+        ))))
+
+        patron_prof = MagicMock()
+        patron_prof.peer_id = "patron1"
+        patron_prof.marginal_roi_percent = 20.0
+        patron_prof.revenue.volume_routed_sats = 1_000_000
+
+        candidates = planner._discover_from_neighbors({"1x1x0": patron_prof})
+
+        first_degree = next(candidate for candidate in candidates if candidate["peer_id"] == "first_degree")
+        second_degree = next(candidate for candidate in candidates if candidate["peer_id"] == "second_degree")
+        assert second_degree["degree"] == 2
+        assert second_degree["score"] < first_degree["score"]
+
+
+class TestPlannerRecommendations:
+    """Recommendation output should include all staged loser actions."""
+
+    def test_generate_recommendations_includes_fee_reduce_actions(self):
+        plugin = MagicMock()
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+
+        recommendations = planner._generate_recommendations(
+            winners=[],
+            losers=[
+                {
+                    "scid": "100x1x0",
+                    "reason": "DEAD_CAPITAL",
+                    "roi": -5.0,
+                    "action": "FEE_REDUCE",
+                }
+            ],
+        )
+
+        assert recommendations == [
+            "FEE REDUCE: 100x1x0 (DEAD_CAPITAL, -5.0% ROI). Lower fees to the floor and wait one cycle for recovery."
+        ]
 
 
 class TestGraphDiscoveryAndScoring:

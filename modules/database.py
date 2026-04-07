@@ -1108,6 +1108,14 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_peer ON planner_actions(peer_id)")
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS dead_capital_stage (
+                channel_id TEXT PRIMARY KEY,
+                stage TEXT NOT NULL DEFAULT 'fee_reduction',
+                entered_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS planner_recycle_ops (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 close_scid TEXT NOT NULL,
@@ -5471,6 +5479,37 @@ class Database:
             ORDER BY created_at DESC
         """, (peer_id, since)).fetchall()
         return [dict(row) for row in rows]
+
+    def get_dead_capital_stages(self) -> Dict[str, Dict[str, Any]]:
+        """Return dead-capital stage rows keyed by channel id."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT channel_id, stage, entered_at
+            FROM dead_capital_stage
+        """).fetchall()
+        return {
+            str(row["channel_id"]): {
+                "stage": str(row["stage"]),
+                "entered_at": int(row["entered_at"]),
+            }
+            for row in rows
+        }
+
+    def upsert_dead_capital_stage(self, channel_id: str, stage: str, entered_at: int) -> None:
+        """Insert or update dead-capital stage state for a channel."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT INTO dead_capital_stage (channel_id, stage, entered_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                stage = excluded.stage,
+                entered_at = excluded.entered_at
+        """, (channel_id, stage, entered_at))
+
+    def delete_dead_capital_stage(self, channel_id: str) -> None:
+        """Delete dead-capital stage state for a channel."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM dead_capital_stage WHERE channel_id = ?", (channel_id,))
 
     # =========================================================================
     # Mempool Fee History Methods (Vegas Reflex)
