@@ -115,6 +115,56 @@ class HiveHintAdapter:
         hints = self._snapshot.get("hints", {})
         return hints.get(peer_id, {})
 
+    @staticmethod
+    def _normalize_str_list(values) -> list:
+        if isinstance(values, str):
+            return [values] if values else []
+        if not isinstance(values, list):
+            return []
+        normalized = []
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized
+
+    @staticmethod
+    def _normalize_route_segments(values) -> list:
+        if not isinstance(values, list):
+            return []
+
+        normalized = []
+        for value in values:
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    normalized.append(text)
+                continue
+            if not isinstance(value, dict):
+                return []
+            source = str(value.get("source", "")).strip()
+            destination = str(value.get("destination", "")).strip()
+            if not source or not destination:
+                return []
+            normalized.append({"source": source, "destination": destination})
+        return normalized
+
+    def _get_section_entries(self, section_name: str, validator) -> list:
+        if not self.is_fresh():
+            return []
+        section = self._snapshot.get(section_name, [])
+        if not isinstance(section, list):
+            return []
+
+        entries = []
+        for raw in section:
+            entry = validator(raw)
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
     # ------------------------------------------------------------------
     # Membership
     # ------------------------------------------------------------------
@@ -290,6 +340,77 @@ class HiveHintAdapter:
                 "topology": hint.get("fleet_topology", []),
             }
         return {}
+
+    # ------------------------------------------------------------------
+    # Coordination sections
+    # ------------------------------------------------------------------
+
+    def _validate_route_segment_lease(self, raw) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        lease_id = raw.get("lease_id")
+        route_segments = raw.get("route_segments")
+        if not isinstance(lease_id, str) or not lease_id.strip():
+            return None
+        if not isinstance(route_segments, list):
+            return None
+        normalized_route_segments = self._normalize_route_segments(route_segments)
+        if route_segments and not normalized_route_segments:
+            return None
+        lease = dict(raw)
+        lease["lease_id"] = lease_id.strip()
+        lease["route_segments"] = normalized_route_segments
+        return lease
+
+    def _validate_rebalance_recommendation(self, raw) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        recommendation_id = raw.get("recommendation_id")
+        route_segments = raw.get("route_segments")
+        if not isinstance(recommendation_id, str) or not recommendation_id.strip():
+            return None
+        if not isinstance(route_segments, list):
+            return None
+        normalized_route_segments = self._normalize_route_segments(route_segments)
+        if route_segments and not normalized_route_segments:
+            return None
+        recommendation = dict(raw)
+        recommendation["recommendation_id"] = recommendation_id.strip()
+        recommendation["route_segments"] = normalized_route_segments
+        return recommendation
+
+    def _validate_rebalance_campaign(self, raw) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        campaign_id = str(raw.get("campaign_id", "")).strip()
+        status = str(raw.get("status", "")).strip()
+        if not campaign_id or not status:
+            return None
+        campaign = dict(raw)
+        campaign["campaign_id"] = campaign_id
+        campaign["status"] = status
+        return campaign
+
+    def get_route_segment_leases(self) -> list[dict]:
+        """Return validated route-segment leases or [] if unavailable/stale."""
+        return self._get_section_entries(
+            "route_segment_leases",
+            self._validate_route_segment_lease,
+        )
+
+    def get_rebalance_recommendations(self) -> list[dict]:
+        """Return validated rebalance recommendations or [] if unavailable/stale."""
+        return self._get_section_entries(
+            "rebalance_recommendations",
+            self._validate_rebalance_recommendation,
+        )
+
+    def get_rebalance_campaigns(self) -> list[dict]:
+        """Return validated rebalance campaigns or [] if unavailable/stale."""
+        return self._get_section_entries(
+            "rebalance_campaigns",
+            self._validate_rebalance_campaign,
+        )
 
     # ------------------------------------------------------------------
     # Channel-open hints
