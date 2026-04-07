@@ -14,6 +14,11 @@ def test_public_runtime_keys_are_safety_only():
         "daily_budget_sats",
         "min_fee_ppm",
         "max_fee_ppm",
+        "planner_enabled",
+        "planner_dry_run",
+        "planner_execute_closes",
+        "planner_max_opens_per_cycle",
+        "planner_max_closes_per_cycle",
     ]
 
 
@@ -33,6 +38,11 @@ def test_public_runtime_dict_returns_only_public_keys():
         "daily_budget_sats": 1200,
         "min_fee_ppm": 15,
         "max_fee_ppm": 2500,
+        "planner_enabled": False,
+        "planner_dry_run": False,
+        "planner_execute_closes": False,
+        "planner_max_opens_per_cycle": 1,
+        "planner_max_closes_per_cycle": 0,
     }
 
 
@@ -184,8 +194,13 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "max_fee_ppm",
         "min_fee_ppm",
         "paused",
+        "planner_dry_run",
+        "planner_enabled",
+        "planner_execute_closes",
+        "planner_max_closes_per_cycle",
+        "planner_max_opens_per_cycle",
     ]
-    assert result["count"] == 4
+    assert result["count"] == 9
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -198,6 +213,11 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "daily_budget_sats": 1200,
         "min_fee_ppm": 15,
         "max_fee_ppm": 2500,
+        "planner_enabled": False,
+        "planner_dry_run": False,
+        "planner_execute_closes": False,
+        "planner_max_opens_per_cycle": 1,
+        "planner_max_closes_per_cycle": 0,
     }
 
 
@@ -326,6 +346,11 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "daily_budget_sats": 1200,
         "min_fee_ppm": 15,
         "max_fee_ppm": 2500,
+        "planner_enabled": False,
+        "planner_dry_run": False,
+        "planner_execute_closes": False,
+        "planner_max_opens_per_cycle": 1,
+        "planner_max_closes_per_cycle": 0,
     }
     assert "config" not in result
 

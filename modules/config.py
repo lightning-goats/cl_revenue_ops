@@ -29,6 +29,11 @@ PUBLIC_RUNTIME_KEYS = (
     'daily_budget_sats',
     'min_fee_ppm',
     'max_fee_ppm',
+    'planner_enabled',
+    'planner_dry_run',
+    'planner_execute_closes',
+    'planner_max_opens_per_cycle',
+    'planner_max_closes_per_cycle',
 )
 
 # Type mapping for config fields (for validation)

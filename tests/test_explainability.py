@@ -135,12 +135,22 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "daily_budget_sats",
         "min_fee_ppm",
         "max_fee_ppm",
+        "planner_enabled",
+        "planner_dry_run",
+        "planner_execute_closes",
+        "planner_max_opens_per_cycle",
+        "planner_max_closes_per_cycle",
     ]
     assert result["operator_controls"]["values"] == {
         "paused": False,
         "daily_budget_sats": 2400,
         "min_fee_ppm": 25,
         "max_fee_ppm": 1800,
+        "planner_enabled": False,
+        "planner_dry_run": False,
+        "planner_execute_closes": False,
+        "planner_max_opens_per_cycle": 1,
+        "planner_max_closes_per_cycle": 0,
     }
     assert "config" not in result
 
