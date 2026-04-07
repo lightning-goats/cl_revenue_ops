@@ -119,6 +119,18 @@ class RebalanceExecutor:
     # Layer Selection
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_hive_equalization_candidate(candidate) -> bool:
+        """Return True when the candidate requires strict pure-hive routing."""
+        return getattr(candidate, "reason_code", "") == "hive_equalization"
+
+    def _effective_max_fee_msat(self, candidate) -> int:
+        """Return the internal max-fee budget used for route discovery/execution."""
+        max_fee_msat = int(getattr(candidate, "max_budget_msat", 0) or 0)
+        if self._is_hive_equalization_candidate(candidate) and max_fee_msat <= 0:
+            return 1
+        return max_fee_msat
+
     def _get_layers(self, route_type: str) -> List[str]:
         """Build layer list based on route type.
 
@@ -145,6 +157,16 @@ class RebalanceExecutor:
         except Exception:
             pass
         return layers
+
+    def _validate_pure_hive_path(self, path: List[Dict]) -> None:
+        """Reject fleet paths that leave the hive-only route set."""
+        if self.hive_router is None:
+            raise ValueError("non_pure_hive_route")
+
+        for hop in path:
+            node_id = hop.get("next_node_id", "")
+            if not node_id or not self.hive_router.is_hive_member(node_id):
+                raise ValueError("non_pure_hive_route")
 
     # ------------------------------------------------------------------
     # Route Conversion
@@ -612,6 +634,7 @@ class RebalanceExecutor:
         - Validate all params before calling getroutes (0 amounts → crash)
         - Try/except with auto-only fallback (unknown layer TOCTOU → crash)
         """
+        requires_pure_hive = self._is_hive_equalization_candidate(candidate)
         # Pure-hive routes (dest is fleet member): return hop is free — the
         # hive-fleet layer sets their fee to 0. Skip the costly return-hop
         # policy lookup and use amount_msat directly.
@@ -672,6 +695,8 @@ class RebalanceExecutor:
         path = routes[0].get("path", [])
         if not path:
             raise ValueError("no_fleet_route")
+        if requires_pure_hive:
+            self._validate_pure_hive_path(path)
 
         full_route = self._getroutes_to_sendpay(
             path,
@@ -771,6 +796,8 @@ class RebalanceExecutor:
                             job, candidate, our_id,
                         )
                     except Exception:
+                        if self._is_hive_equalization_candidate(candidate):
+                            raise
                         full_route, inform_path = self._compute_network_route(
                             job, candidate, our_id, excludes
                         )
@@ -985,7 +1012,7 @@ class RebalanceExecutor:
             channel_id=candidate.to_channel,
             peer_id=candidate.to_peer_id,
             amount_msat=amount_msat,
-            max_fee_msat=candidate.max_budget_msat,
+            max_fee_msat=self._effective_max_fee_msat(candidate),
             route_type=route_type,
         )
 
@@ -1012,7 +1039,7 @@ class RebalanceExecutor:
             channel_id=candidate.to_channel,
             peer_id=candidate.to_peer_id,
             amount_msat=candidate.amount_msat,
-            max_fee_msat=candidate.max_budget_msat,
+            max_fee_msat=self._effective_max_fee_msat(candidate),
             route_type=route_type,
         )
 

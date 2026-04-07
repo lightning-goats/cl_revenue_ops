@@ -76,6 +76,11 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_max_amount': int,
     'rebalance_min_amount': int,
     'rebalance_cooldown_hours': int,
+    'hive_equalization_enabled': bool,
+    'hive_equalization_low_pct': float,
+    'hive_equalization_high_pct': float,
+    'hive_equalization_cooldown_hours': int,
+    'hive_equalization_max_candidates_per_cycle': int,
     'futility_cooldown_hours': int,
     'inbound_fee_estimate_ppm': int,
     # Vegas Reflex
@@ -193,6 +198,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hot_channel_protection_profit_budget_pct': (0.0, 1.0),
     'inbound_fee_estimate_ppm': (0, 5000),
     'rebalance_cooldown_hours': (1, 168),
+    'hive_equalization_low_pct': (0.0, 1.0),
+    'hive_equalization_high_pct': (0.0, 1.0),
+    'hive_equalization_cooldown_hours': (1, 168),
+    'hive_equalization_max_candidates_per_cycle': (1, 10),
     'futility_cooldown_hours': (1, 168),
     'target_flow': (1000, 100000000),
     'estimated_open_cost_sats': (0, 1000000),
@@ -285,6 +294,11 @@ class Config:
     low_liquidity_threshold: float = 0.3  # Below 30% = low outbound
     high_liquidity_threshold: float = 0.7 # Above 70% = high outbound
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
+    hive_equalization_enabled: bool = True  # Fallback pure-hive inventory equalization
+    hive_equalization_low_pct: float = 0.35  # Lower bound for hive balance band
+    hive_equalization_high_pct: float = 0.65  # Upper bound for hive balance band
+    hive_equalization_cooldown_hours: int = 48  # Longer than standard rebalance cooldown
+    hive_equalization_max_candidates_per_cycle: int = 1
     futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
     inbound_fee_estimate_ppm: int = 50  # Route cost buffer added on top of last-hop fee (PPM)
     
@@ -393,7 +407,11 @@ class Config:
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants on direct construction."""
-        pass
+        if self.hive_equalization_low_pct >= self.hive_equalization_high_pct:
+            raise ValueError(
+                "hive_equalization_low_pct must be less than "
+                "hive_equalization_high_pct"
+            )
     
     def snapshot(self) -> 'ConfigSnapshot':
         """
@@ -447,6 +465,11 @@ class Config:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
                 # high_liquidity_threshold is very small (e.g., < 0.05).
                 self.low_liquidity_threshold = max(0.0, self.high_liquidity_threshold - 0.05)
+        if hasattr(self, 'hive_equalization_low_pct') and hasattr(self, 'hive_equalization_high_pct'):
+            if self.hive_equalization_low_pct >= self.hive_equalization_high_pct:
+                self.hive_equalization_low_pct = max(
+                    0.0, self.hive_equalization_high_pct - 0.05
+                )
         return list(self._override_warnings)
 
     def _apply_override(self, key: str, value: str) -> None:
@@ -553,6 +576,10 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
+            if key == 'hive_equalization_low_pct' and typed_value >= self.hive_equalization_high_pct:
+                return {"error": f"hive_equalization_low_pct ({typed_value}) must be less than hive_equalization_high_pct ({self.hive_equalization_high_pct})"}
+            if key == 'hive_equalization_high_pct' and typed_value <= self.hive_equalization_low_pct:
+                return {"error": f"hive_equalization_high_pct ({typed_value}) must be greater than hive_equalization_low_pct ({self.hive_equalization_low_pct})"}
             # AUDIT FIX I-5: Validate sink/source threshold cross-field consistency
             if key == 'sink_threshold' and typed_value >= self.source_threshold:
                 return {"error": f"sink_threshold ({typed_value}) must be less than source_threshold ({self.source_threshold})"}
@@ -650,6 +677,11 @@ class ConfigSnapshot:
     low_liquidity_threshold: float
     high_liquidity_threshold: float
     rebalance_cooldown_hours: int
+    hive_equalization_enabled: bool
+    hive_equalization_low_pct: float
+    hive_equalization_high_pct: float
+    hive_equalization_cooldown_hours: int
+    hive_equalization_max_candidates_per_cycle: int
     futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
 

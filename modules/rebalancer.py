@@ -68,6 +68,7 @@ class RebalanceReasonCode(Enum):
     # Success codes (rebalance was attempted)
     EV_POSITIVE = "ev_positive"                   # Normal EV-positive rebalance
     CAPEX_FALLBACK = "capex_fallback"             # Capex-aware fallback rebalance
+    HIVE_EQUALIZATION = "hive_equalization"       # Fallback pure-hive inventory equalization
 
     # Skip codes (rebalance was not attempted)
     SKIP_HARD_BLEEDER = "skip_hard_bleeder"       # Channel is a hard bleeder (rebal_cost > 2x revenue)
@@ -635,6 +636,146 @@ class EVRebalancer:
             )
         self.plugin.log(" ".join(parts), level='info')
 
+    @staticmethod
+    def _compute_hive_equalization_amount(
+        source_info: Dict[str, Any],
+        dest_info: Dict[str, Any],
+        cfg: ConfigSnapshot,
+    ) -> int:
+        """Return the conservative amount that moves one pair back into band."""
+        source_capacity = int(source_info.get("capacity", 0) or 0)
+        source_spendable = int(source_info.get("spendable_sats", 0) or 0)
+        dest_capacity = int(dest_info.get("capacity", 0) or 0)
+        dest_spendable = int(dest_info.get("spendable_sats", 0) or 0)
+        if source_capacity <= 0 or dest_capacity <= 0:
+            return 0
+
+        source_excess = max(
+            0,
+            source_spendable - int(source_capacity * float(cfg.hive_equalization_high_pct)),
+        )
+        dest_needed = max(
+            0,
+            int(dest_capacity * float(cfg.hive_equalization_low_pct)) - dest_spendable,
+        )
+        return max(0, min(source_excess, dest_needed, int(cfg.rebalance_max_amount)))
+
+    def _log_hive_equalization_diagnostics(
+        self,
+        hive_low_channels: List[Tuple[str, Dict[str, Any], float]],
+        hive_high_channels: List[Tuple[str, Dict[str, Any], float]],
+        *,
+        selected_count: int = 0,
+        skip_reasons: Optional[Counter] = None,
+    ) -> None:
+        """Summarize the fallback equalization inventory state for the cycle."""
+        if not hive_low_channels and not hive_high_channels and not selected_count and not skip_reasons:
+            return
+
+        parts = [
+            "HIVE_EQUALIZATION:",
+            f"lows={len(hive_low_channels)}",
+            f"highs={len(hive_high_channels)}",
+            f"selected={selected_count}",
+        ]
+        if skip_reasons:
+            parts.append(
+                "skip_reasons="
+                + ",".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(skip_reasons.items())
+                )
+            )
+        self.plugin.log(" ".join(parts), level='info')
+
+    def _build_hive_equalization_candidates(
+        self,
+        hive_low_channels: List[Tuple[str, Dict[str, Any], float]],
+        hive_high_channels: List[Tuple[str, Dict[str, Any], float]],
+        *,
+        available_slots: int,
+        cfg: ConfigSnapshot,
+    ) -> Tuple[List[RebalanceCandidate], Counter[str]]:
+        """Build fallback pure-hive inventory equalization candidates."""
+        if (
+            not cfg.hive_equalization_enabled
+            or available_slots <= 0
+            or not hive_low_channels
+            or not hive_high_channels
+        ):
+            return [], Counter()
+
+        limit = min(
+            available_slots,
+            max(1, int(getattr(cfg, "hive_equalization_max_candidates_per_cycle", 1) or 1)),
+        )
+        cooldown = int(max(0.0, float(cfg.hive_equalization_cooldown_hours)) * 3600)
+        now = int(time.time())
+        lows = sorted(hive_low_channels, key=lambda item: item[2])
+        highs = sorted(hive_high_channels, key=lambda item: item[2], reverse=True)
+        high_index = 0
+        candidates: List[RebalanceCandidate] = []
+        skip_reasons: Counter[str] = Counter()
+
+        for dest_id, dest_info, dest_ratio in lows:
+            if len(candidates) >= limit or high_index >= len(highs):
+                break
+
+            fail_count, last_fail = self.database.get_failure_count(dest_id)
+            fail_meta = self.database.get_failure_metadata(dest_id)
+            if self._should_skip_futility(fail_count, fail_meta["last_error_type"]):
+                futility_cooldown = int(float(getattr(cfg, "futility_cooldown_hours", 48)) * 3600)
+                if futility_cooldown > 0 and (now - last_fail) < futility_cooldown:
+                    skip_reasons["futility_cooldown"] += 1
+                    continue
+
+            last_equalization = self.database.get_last_rebalance_time(
+                dest_id,
+                reason_code=RebalanceReasonCode.HIVE_EQUALIZATION.value,
+            )
+            if cooldown > 0 and last_equalization and now - last_equalization < cooldown:
+                skip_reasons["cooldown"] += 1
+                continue
+
+            source_id, source_info, source_ratio = highs[high_index]
+            high_index += 1
+            amount_sats = self._compute_hive_equalization_amount(source_info, dest_info, cfg)
+            if amount_sats < cfg.rebalance_min_amount:
+                skip_reasons["amount_below_min"] += 1
+                continue
+
+            source_peer_id = str(source_info.get("peer_id", "")).strip()
+            dest_peer_id = str(dest_info.get("peer_id", "")).strip()
+            candidates.append(
+                RebalanceCandidate(
+                    source_candidates=[source_id],
+                    source_candidate_peer_ids=[source_peer_id],
+                    to_channel=dest_id,
+                    primary_source_peer_id=source_peer_id,
+                    to_peer_id=dest_peer_id,
+                    amount_sats=amount_sats,
+                    amount_msat=sats_to_base(amount_sats),
+                    outbound_fee_ppm=0,
+                    inbound_fee_ppm=0,
+                    source_fee_ppm=0,
+                    weighted_opp_cost_ppm=0,
+                    spread_ppm=0,
+                    max_budget_sats=0,
+                    max_budget_msat=0,
+                    max_fee_ppm=0,
+                    expected_profit_sats=0,
+                    liquidity_ratio=dest_ratio,
+                    dest_flow_state="hive_equalization",
+                    dest_turnover_rate=0.0,
+                    source_turnover_rate=0.0,
+                    reason_code=RebalanceReasonCode.HIVE_EQUALIZATION.value,
+                    hive_route_hops=1,
+                    dest_is_hive_member=True,
+                )
+            )
+
+        return candidates, skip_reasons
+
     def _get_hive_rebalance_bias(self, peer_id: str) -> float:
         """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""
         if self.hive_hints is None:
@@ -878,6 +1019,8 @@ class EVRebalancer:
         channels: Dict[str, Dict[str, Any]] = {}
         depleted_channels: List[Tuple[str, Dict[str, Any], float]] = []
         source_channels: List[Tuple[str, Dict[str, Any], float]] = []
+        hive_low_channels: List[Tuple[str, Dict[str, Any], float]] = []
+        hive_high_channels: List[Tuple[str, Dict[str, Any], float]] = []
         pure_hive_skip_reasons: Counter[str] = Counter()
         pure_hive_selected = 0
 
@@ -1012,6 +1155,15 @@ class EVRebalancer:
                 if channel_id in planner_loser_scids:
                     continue
 
+                if cfg.hive_equalization_enabled and self._is_hive_member(peer_id):
+                    if outbound_ratio < cfg.hive_equalization_low_pct:
+                        hive_low_channels.append((channel_id, info, outbound_ratio))
+                    elif outbound_ratio > cfg.hive_equalization_high_pct:
+                        if peer_id and self.policy_manager:
+                            if not self.policy_manager.should_rebalance(peer_id, as_destination=False):
+                                continue
+                        hive_high_channels.append((channel_id, info, outbound_ratio))
+
                 # STAGNANT INVENTORY DETECTION
                 # Check if a channel is "Stagnant" (Balanced but not moving for ~1 week)
                 # Threshold: turnover < 0.0015 per day (~1% per week)
@@ -1030,12 +1182,24 @@ class EVRebalancer:
                     elif outbound_ratio > cfg.high_liquidity_threshold:
                         source_channels.append((channel_id, info, outbound_ratio))
             
-            if not depleted_channels or not source_channels:
+            can_try_hive_equalization = (
+                cfg.hive_equalization_enabled
+                and bool(hive_low_channels)
+                and bool(hive_high_channels)
+            )
+
+            if (not depleted_channels or not source_channels) and not can_try_hive_equalization:
                 self._log_pure_hive_diagnostics(
                     depleted_channels,
                     source_channels,
                     selected_count=pure_hive_selected,
                 )
+                if cfg.hive_equalization_enabled and (hive_low_channels or hive_high_channels):
+                    self._log_hive_equalization_diagnostics(
+                        hive_low_channels,
+                        hive_high_channels,
+                        selected_count=0,
+                    )
                 total = len(channels) - len(active_channels)
                 if not depleted_channels and not source_channels:
                     self.plugin.log(
@@ -1056,10 +1220,15 @@ class EVRebalancer:
                         f"channels (>{cfg.high_liquidity_threshold:.0%} outbound) to drain.",
                         level='info'
                     )
+                summary_reason = "no_rebalance_candidates"
+                dominant_input = "liquidity_balance"
+                if cfg.hive_equalization_enabled and (hive_low_channels or hive_high_channels):
+                    summary_reason = "no_hive_equalization_pairs"
+                    dominant_input = "hive_equalization"
                 self._set_last_decision_summary(
                     action="hold",
-                    reason="no_rebalance_candidates",
-                    dominant_input="liquidity_balance",
+                    reason=summary_reason,
+                    dominant_input=dominant_input,
                     safety_block=False,
                     budget_blocked=False,
                 )
@@ -1434,10 +1603,42 @@ class EVRebalancer:
                         self._report_hive_liquidity_state(depleted_channels, source_channels, selected)
                         return selected
 
+                equalization_candidates, equalization_skip_reasons = self._build_hive_equalization_candidates(
+                    hive_low_channels=hive_low_channels,
+                    hive_high_channels=hive_high_channels,
+                    available_slots=available_slots,
+                    cfg=cfg,
+                )
+                self._log_hive_equalization_diagnostics(
+                    hive_low_channels,
+                    hive_high_channels,
+                    selected_count=len(equalization_candidates),
+                    skip_reasons=equalization_skip_reasons,
+                )
+                if equalization_candidates:
+                    selected = equalization_candidates[:available_slots]
+                    self._set_last_decision_summary(
+                        action="rebalance",
+                        reason="hive_equalization_candidates",
+                        dominant_input=RebalanceReasonCode.HIVE_EQUALIZATION.value,
+                        safety_block=False,
+                        budget_blocked=False,
+                    )
+                    self._report_hive_liquidity_state(depleted_channels, source_channels, selected)
+                    return selected
+
                 self._set_last_decision_summary(
                     action="hold",
-                    reason="no_profitable_candidates",
-                    dominant_input="ev_filter",
+                    reason=(
+                        "no_hive_equalization_pairs"
+                        if cfg.hive_equalization_enabled and (hive_low_channels or hive_high_channels)
+                        else "no_profitable_candidates"
+                    ),
+                    dominant_input=(
+                        "hive_equalization"
+                        if cfg.hive_equalization_enabled and (hive_low_channels or hive_high_channels)
+                        else "ev_filter"
+                    ),
                     safety_block=False,
                     budget_blocked=False,
                 )
