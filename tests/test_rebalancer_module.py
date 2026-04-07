@@ -1255,6 +1255,59 @@ class TestHiveEqualizationObservability:
             for msg in messages
         ), messages[-10:]
 
+    def test_hive_equalization_refreshes_stale_hints_before_classifying_members(
+        self, mock_plugin, mock_database
+    ):
+        hive_source_peer = "02" + "7" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 660_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": "02" + "8" * 64,
+                "capacity": 1_000_000,
+                "spendable_sats": 500_000,
+                "fee_ppm": 25,
+            },
+        })
+
+        state = {"fresh": False, "members": set()}
+
+        def poll_hints():
+            state["fresh"] = True
+
+        def refresh_layer():
+            state["members"] = {hive_source_peer} if state["fresh"] else set()
+            return True
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll.side_effect = poll_hints
+
+        r.hive_router = MagicMock()
+        r.hive_router.available = True
+        r.hive_router.refresh_layer.side_effect = refresh_layer
+        r.hive_router.refresh_fleet_balances.return_value = None
+        r.hive_router.clear_route_cache.return_value = None
+        r.hive_router.is_hive_member.side_effect = lambda peer_id: peer_id in state["members"]
+
+        assert r.find_rebalance_candidates() == []
+        summary = r.get_last_decision_summary()
+
+        assert summary["reason"] == "no_hive_equalization_pairs"
+        r.hive_hints.poll.assert_called_once()
+        messages = [c.args[0] for c in mock_plugin.log.call_args_list]
+        assert any(
+            "HIVE_EQUALIZATION:" in msg
+            and "lows=0" in msg
+            and "highs=1" in msg
+            and "selected=0" in msg
+            for msg in messages
+        ), messages[-10:]
+
     def test_hive_equalization_logs_skip_reasons(self, mock_plugin, mock_database):
         from modules.rebalancer import RebalanceReasonCode
 

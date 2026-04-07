@@ -1094,6 +1094,16 @@ class EVRebalancer:
             # Note: _peer_inbound_fees cache is now populated by _get_channels_with_balances()
             # This provides actual peer fees from listpeerchannels.updates.remote
 
+            # Refresh hive hints before rebuilding askrene hive membership.
+            # Rebalance cycles can run long after the last fee cycle; without a
+            # fresh hint snapshot, direct hive channels stop classifying as
+            # hive members and equalization silently disables itself.
+            if self.hive_hints is not None:
+                try:
+                    self.hive_hints.poll()
+                except Exception:
+                    pass
+
             # Refresh askrene hive-fleet layer and fleet balances for route discovery
             if self.hive_router:
                 self.hive_router.refresh_layer()
