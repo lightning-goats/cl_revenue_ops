@@ -1255,6 +1255,42 @@ class TestHiveEqualizationObservability:
             for msg in messages
         ), messages[-10:]
 
+    def test_hive_equalization_logs_skip_reasons(self, mock_plugin, mock_database):
+        from modules.rebalancer import RebalanceReasonCode
+
+        hive_source_peer = "02" + "5" * 64
+        hive_dest_peer = "02" + "6" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 660_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 340_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+        mock_database.get_last_rebalance_time.side_effect = (
+            lambda channel_id, reason_code=None: int(time.time())
+            if reason_code == RebalanceReasonCode.HIVE_EQUALIZATION.value
+            else 0
+        )
+
+        assert r.find_rebalance_candidates() == []
+        messages = [c.args[0] for c in mock_plugin.log.call_args_list]
+        assert any(
+            "HIVE_EQUALIZATION:" in msg
+            and "selected=0" in msg
+            and "skip_reasons=cooldown=1" in msg
+            for msg in messages
+        ), messages[-10:]
+
 
 class TestLastDecisionSummary:
     def test_execute_rebalance_records_budget_blocked_summary(self, mock_plugin, mock_database):
