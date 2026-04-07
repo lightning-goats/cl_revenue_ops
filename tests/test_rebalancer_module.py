@@ -745,6 +745,111 @@ class TestNoDeplestedSourceDiagnostics:
         assert found_diag, f"Expected diagnostic log about balanced range, got: {log_calls[-5:]}"
 
 
+class TestPureHiveDiagnostics:
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            dry_run=True,
+            low_liquidity_threshold=0.30,
+            high_liquidity_threshold=0.70,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.policy_manager = MagicMock()
+        r.policy_manager.should_rebalance.return_value = True
+        r.job_manager = MagicMock()
+        r.job_manager.slots_available.return_value = 5
+        r.job_manager.active_channels = set()
+        r.job_manager.active_job_count = 0
+        r.job_manager.get_active_rebalancing_peers.return_value = []
+        r.job_manager.get_source_failure_count.return_value = 0
+        r.data_service = MagicMock()
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        r._analyze_rebalance_ev = MagicMock(return_value=None)
+        r._capex_fallback_pass = MagicMock(return_value=[])
+
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        mock_database.get_top_route_pairs.return_value = []
+        return r
+
+    def test_logs_when_hive_sources_exist_but_no_hive_destinations(self, mock_plugin, mock_database):
+        hive_peer = "02" + "c" * 64
+        non_hive_peer = "02" + "d" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 900_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": non_hive_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 100_000,
+                "fee_ppm": 100,
+            },
+        })
+        r.hive_router = MagicMock()
+        r.hive_router.available = True
+        r.hive_router.is_hive_member.side_effect = lambda peer_id: peer_id == hive_peer
+        r.hive_router.discover_route.return_value = None
+
+        assert r.find_rebalance_candidates() == []
+
+        messages = [c.args[0] for c in mock_plugin.log.call_args_list]
+        assert any(
+            "PURE_HIVE_DIAGNOSTIC" in msg
+            and "depleted_hive_destinations=0" in msg
+            and "overfull_hive_sources=1" in msg
+            for msg in messages
+        ), messages[-10:]
+
+    def test_logs_skip_reasons_for_pure_hive_destinations(self, mock_plugin, mock_database):
+        hive_dest_peer = "02" + "e" * 64
+        hive_source_peer = "02" + "f" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "333x3x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 900_000,
+                "fee_ppm": 0,
+            },
+            "444x4x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 100_000,
+                "fee_ppm": 50,
+            },
+        })
+        r.hive_router = MagicMock()
+        r.hive_router.available = True
+        r.hive_router.is_hive_member.side_effect = (
+            lambda peer_id: peer_id in {hive_dest_peer, hive_source_peer}
+        )
+        r.hive_router.discover_route.return_value = None
+        r._capex_engine = MagicMock()
+
+        assert r.find_rebalance_candidates() == []
+
+        messages = [c.args[0] for c in mock_plugin.log.call_args_list]
+        assert any(
+            "PURE_HIVE_DIAGNOSTIC" in msg
+            and "depleted_hive_destinations=1" in msg
+            and "overfull_hive_sources=1" in msg
+            and "no_route=1" in msg
+            for msg in messages
+        ), messages[-10:]
+
+
 class TestLastDecisionSummary:
     def test_execute_rebalance_records_budget_blocked_summary(self, mock_plugin, mock_database):
         from modules.config import Config

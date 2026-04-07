@@ -23,6 +23,7 @@ import math
 import time
 import json
 import threading
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
 from enum import Enum
@@ -569,6 +570,71 @@ class EVRebalancer:
         if self.data_service:
             self.data_service.datastore_push(["revenue", "liquidity-state"], payload)
 
+    def _is_hive_member(self, peer_id: str) -> bool:
+        """Check hive membership from the live router first, then cached hints."""
+        if not peer_id:
+            return False
+        if self.hive_router is not None:
+            try:
+                return bool(self.hive_router.is_hive_member(peer_id))
+            except Exception:
+                pass
+        if self.hive_hints is not None:
+            try:
+                return bool(self.hive_hints.is_hive_member(peer_id))
+            except Exception:
+                pass
+        return False
+
+    def _log_pure_hive_diagnostics(
+        self,
+        depleted_channels: List[Tuple[str, Dict[str, Any], float]],
+        source_channels: List[Tuple[str, Dict[str, Any], float]],
+        *,
+        skip_reasons: Optional[Counter] = None,
+        selected_count: int = 0,
+    ) -> None:
+        """Summarize whether a cycle had enough hive endpoints for pure-hive rebalances."""
+        if self.hive_router is None and self.hive_hints is None:
+            return
+
+        hive_depleted = [
+            channel_id
+            for channel_id, info, _ in depleted_channels
+            if self._is_hive_member(str(info.get("peer_id", "")).strip())
+        ]
+        hive_sources = [
+            channel_id
+            for channel_id, info, _ in source_channels
+            if self._is_hive_member(str(info.get("peer_id", "")).strip())
+        ]
+        if not hive_depleted and not hive_sources and not selected_count and not skip_reasons:
+            return
+
+        parts = [
+            "PURE_HIVE_DIAGNOSTIC:",
+            f"depleted_hive_destinations={len(hive_depleted)}",
+            f"overfull_hive_sources={len(hive_sources)}",
+            f"selected={selected_count}",
+        ]
+        if hive_depleted:
+            parts.append(f"destinations={','.join(hive_depleted[:3])}")
+        else:
+            parts.append("status=no_depleted_hive_destinations")
+        if hive_sources:
+            parts.append(f"sources={','.join(hive_sources[:3])}")
+        else:
+            parts.append("status=no_overfull_hive_sources")
+        if skip_reasons:
+            parts.append(
+                "skip_reasons="
+                + ",".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(skip_reasons.items())
+                )
+            )
+        self.plugin.log(" ".join(parts), level='info')
+
     def _get_hive_rebalance_bias(self, peer_id: str) -> float:
         """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""
         if self.hive_hints is None:
@@ -812,6 +878,8 @@ class EVRebalancer:
         channels: Dict[str, Dict[str, Any]] = {}
         depleted_channels: List[Tuple[str, Dict[str, Any], float]] = []
         source_channels: List[Tuple[str, Dict[str, Any], float]] = []
+        pure_hive_skip_reasons: Counter[str] = Counter()
+        pure_hive_selected = 0
 
         # Initialize ephemeral fee cache for this run (cleared at end)
         self._fee_cache: Dict[Tuple[str, int], Optional[int]] = {}
@@ -963,6 +1031,11 @@ class EVRebalancer:
                         source_channels.append((channel_id, info, outbound_ratio))
             
             if not depleted_channels or not source_channels:
+                self._log_pure_hive_diagnostics(
+                    depleted_channels,
+                    source_channels,
+                    selected_count=pure_hive_selected,
+                )
                 total = len(channels) - len(active_channels)
                 if not depleted_channels and not source_channels:
                     self.plugin.log(
@@ -1009,13 +1082,20 @@ class EVRebalancer:
                 # Sort: hive member destinations first (pure-hive = zero cost)
                 hive_sorted = sorted(
                     depleted_channels,
-                    key=lambda d: (0 if self.hive_router.is_hive_member(d[1].get("peer_id", "")) else 1),
+                    key=lambda d: (0 if self._is_hive_member(d[1].get("peer_id", "")) else 1),
                 )
                 for dest_id, dest_info, dest_ratio in hive_sorted:
+                    dest_peer_id = dest_info.get("peer_id", "")
+                    dest_is_member = self._is_hive_member(dest_peer_id)
+
+                    def record_pure_hive_skip(reason: str) -> None:
+                        if dest_is_member:
+                            pure_hive_skip_reasons[reason] += 1
+
                     if dest_id in active_channels:
+                        record_pure_hive_skip("active_job")
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
-                    dest_peer_id = dest_info.get("peer_id", "")
                     if not dest_peer_id:
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
@@ -1025,12 +1105,14 @@ class EVRebalancer:
                     if self._should_skip_futility(fail_count, fail_meta["last_error_type"]):
                         futility_cooldown = getattr(cfg, 'futility_cooldown_hours', 48) * 3600
                         if (int(time.time()) - last_fail) < futility_cooldown:
+                            record_pure_hive_skip("futility_cooldown")
                             continue
                     try:
                         hr = self.hive_router.discover_route(dest_peer_id, cfg.rebalance_min_amount)
                     except Exception:
                         hr = None
                     if not hr:
+                        record_pure_hive_skip("no_route")
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
                     # Hive route found — check cooldown before proceeding
@@ -1039,11 +1121,13 @@ class EVRebalancer:
                         cd_hours = float(getattr(cfg, 'rebalance_cooldown_hours', 1.0))
                         cooldown = int(cd_hours * 3600)
                         if cooldown > 0 and int(time.time()) - last_rebalance < cooldown:
+                            record_pure_hive_skip("cooldown")
                             non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                             continue
                     # Use capex budget directly
                     ch_budget = self._capex_engine.get_channel_budget(dest_id)
                     if ch_budget.tier == "blocked" or ch_budget.budget_sats <= 0:
+                        record_pure_hive_skip("no_budget")
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
                     # Build capex candidate with hive route
@@ -1053,9 +1137,9 @@ class EVRebalancer:
                     amount_needed = min(int(capacity * 0.5) - spendable, cfg.rebalance_max_amount)
                     amount_needed = max(cfg.rebalance_min_amount, min(amount_needed, headroom))
                     if amount_needed < cfg.rebalance_min_amount:
+                        record_pure_hive_skip("amount_below_min")
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
-                    dest_is_member = self.hive_router.is_hive_member(dest_peer_id)
                     if dest_is_member:
                         # Pure-hive: return hop is free (hive-fleet layer)
                         max_fee_sats = ch_budget.budget_sats
@@ -1098,6 +1182,7 @@ class EVRebalancer:
                     except Exception:
                         source_result = []
                     if not source_result:
+                        record_pure_hive_skip("no_source_candidates")
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
                     # Promote hive source to primary
@@ -1136,6 +1221,8 @@ class EVRebalancer:
                         source_candidate_peer_ids=[s[1].get("peer_id", "") for s in source_result],
                     )
                     candidates.append(candidate)
+                    if dest_is_member:
+                        pure_hive_selected += 1
                     route_type = "pure-hive (zero cost)" if dest_is_member else "fleet"
                     log_parts = [
                         f"HIVE CAPEX: {dest_id[:12]}... {route_type} ({hr.hops} hops, {hr.fee_ppm} ppm)",
@@ -1150,6 +1237,13 @@ class EVRebalancer:
                         break
             else:
                 non_hive_depleted = list(depleted_channels)
+
+            self._log_pure_hive_diagnostics(
+                depleted_channels,
+                source_channels,
+                skip_reasons=pure_hive_skip_reasons,
+                selected_count=pure_hive_selected,
+            )
 
             # EV profit gate for non-hive destinations
             for dest_id, dest_info, dest_ratio in non_hive_depleted:
