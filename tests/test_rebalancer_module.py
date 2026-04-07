@@ -1,6 +1,8 @@
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
 
 def _rpc_calls_for(mock_plugin, method: str):
     """Return all rpc.call invocations for a given RPC method name."""
@@ -754,6 +756,7 @@ class TestPureHiveDiagnostics:
             dry_run=True,
             low_liquidity_threshold=0.30,
             high_liquidity_threshold=0.70,
+            hive_equalization_enabled=False,
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         r.policy_manager = MagicMock()
@@ -850,6 +853,445 @@ class TestPureHiveDiagnostics:
         ), messages[-10:]
 
 
+class TestHiveEqualizationFallback:
+    def _make_rebalancer(self, mock_plugin, mock_database, **config_overrides):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        base_config = {
+            "dry_run": True,
+            "low_liquidity_threshold": 0.30,
+            "high_liquidity_threshold": 0.70,
+            "rebalance_min_amount": 10_000,
+            "rebalance_max_amount": 500_000,
+        }
+        base_config.update(config_overrides)
+        cfg = Config(**base_config)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.policy_manager = MagicMock()
+        r.policy_manager.should_rebalance.return_value = True
+        r.job_manager = MagicMock()
+        r.job_manager.slots_available.return_value = 5
+        r.job_manager.active_channels = set()
+        r.job_manager.active_job_count = 0
+        r.job_manager.get_active_rebalancing_peers.return_value = []
+        r.job_manager.get_source_failure_count.return_value = 0
+        r.data_service = MagicMock()
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        r._analyze_rebalance_ev = MagicMock(return_value=None)
+        r._capex_fallback_pass = MagicMock(return_value=[])
+        r.hive_router = MagicMock()
+        r.hive_router.available = True
+
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        mock_database.get_top_route_pairs.return_value = []
+        mock_database.get_channel_state.return_value = None
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        return r
+
+    def test_equalization_runs_only_when_normal_candidates_are_empty(self, mock_plugin, mock_database):
+        from modules.rebalancer import RebalanceReasonCode
+
+        hive_source_peer = "02" + "1" * 64
+        hive_dest_peer = "02" + "2" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 900_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 100_000,
+                "fee_ppm": 50,
+            },
+        })
+        r.hive_router.is_hive_member.side_effect = lambda peer_id: peer_id in {
+            hive_source_peer,
+            hive_dest_peer,
+        }
+        profitable = _candidate(
+            source_candidates=["111x1x0"],
+            to_channel="222x2x0",
+            primary_source_peer_id=hive_source_peer,
+            to_peer_id=hive_dest_peer,
+            amount_sats=50_000,
+        )
+        r._analyze_rebalance_ev.return_value = profitable
+
+        result = r.find_rebalance_candidates()
+
+        assert result == [profitable]
+        assert result[0].reason_code != RebalanceReasonCode.HIVE_EQUALIZATION.value
+
+    def test_equalization_selects_most_imbalanced_pair_first(self, mock_plugin, mock_database):
+        from modules.rebalancer import RebalanceReasonCode
+
+        hive_source_a = "02" + "3" * 64
+        hive_source_b = "02" + "4" * 64
+        hive_dest_a = "02" + "5" * 64
+        hive_dest_b = "02" + "6" * 64
+        r = self._make_rebalancer(
+            mock_plugin,
+            mock_database,
+            hive_equalization_max_candidates_per_cycle=1,
+        )
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_a,
+                "capacity": 1_000_000,
+                "spendable_sats": 950_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_source_b,
+                "capacity": 1_000_000,
+                "spendable_sats": 800_000,
+                "fee_ppm": 0,
+            },
+            "333x3x0": {
+                "peer_id": hive_dest_a,
+                "capacity": 1_000_000,
+                "spendable_sats": 50_000,
+                "fee_ppm": 25,
+            },
+            "444x4x0": {
+                "peer_id": hive_dest_b,
+                "capacity": 1_000_000,
+                "spendable_sats": 200_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+
+        result = r.find_rebalance_candidates()
+
+        assert len(result) == 1
+        assert result[0].from_channel == "111x1x0"
+        assert result[0].to_channel == "333x3x0"
+        assert result[0].reason_code == RebalanceReasonCode.HIVE_EQUALIZATION.value
+
+    def test_equalization_amount_stops_at_band_edge(self, mock_plugin, mock_database):
+        hive_source_peer = "02" + "7" * 64
+        hive_dest_peer = "02" + "8" * 64
+        r = self._make_rebalancer(
+            mock_plugin,
+            mock_database,
+            rebalance_max_amount=600_000,
+        )
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 2_000_000,
+                "spendable_sats": 1_800_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 100_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+
+        result = r.find_rebalance_candidates()
+
+        assert len(result) == 1
+        assert result[0].amount_sats == 250_000
+
+    def test_equalization_skips_when_no_hive_low_or_high(self, mock_plugin, mock_database):
+        hive_source_peer = "02" + "9" * 64
+        hive_balanced_peer = "02" + "a" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 900_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_balanced_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 500_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+
+        assert r.find_rebalance_candidates() == []
+
+    def test_equalization_disabled_skips_fallback(self, mock_plugin, mock_database):
+        hive_source_peer = "02" + "b" * 64
+        hive_dest_peer = "02" + "c" * 64
+        r = self._make_rebalancer(
+            mock_plugin,
+            mock_database,
+            hive_equalization_enabled=False,
+        )
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 660_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 340_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+
+        assert r.find_rebalance_candidates() == []
+
+    def test_equalization_respects_source_side_rebalance_policy(self, mock_plugin, mock_database):
+        hive_source_peer = "02" + "c" * 64
+        hive_dest_peer = "02" + "d" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 660_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 340_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+        r.policy_manager.should_rebalance.side_effect = (
+            lambda peer_id, as_destination: not (
+                peer_id == hive_source_peer and as_destination is False
+            )
+        )
+
+        assert r.find_rebalance_candidates() == []
+
+    def test_equalization_respects_destination_futility_breaker(self, mock_plugin, mock_database):
+        hive_source_peer = "02" + "e" * 64
+        hive_dest_peer = "02" + "f" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 660_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 340_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+
+        now = int(time.time())
+        mock_database.get_failure_count.return_value = (10, now)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+
+        assert r.find_rebalance_candidates() == []
+
+    def test_equalization_uses_reason_filtered_cooldown_lookup(self, mock_plugin, mock_database):
+        from modules.rebalancer import RebalanceReasonCode
+
+        hive_source_peer = "02" + "d" * 64
+        hive_dest_peer = "02" + "e" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 660_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 340_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+
+        now = int(time.time())
+
+        def last_rebalance(channel_id, reason_code=None):
+            if reason_code == RebalanceReasonCode.HIVE_EQUALIZATION.value:
+                return now
+            return 0
+
+        mock_database.get_last_rebalance_time.side_effect = last_rebalance
+
+        assert r.find_rebalance_candidates() == []
+        assert any(
+            call.kwargs.get("reason_code") == RebalanceReasonCode.HIVE_EQUALIZATION.value
+            for call in mock_database.get_last_rebalance_time.call_args_list
+        )
+
+
+class TestHiveEqualizationObservability:
+    def _make_rebalancer(self, mock_plugin, mock_database, **config_overrides):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        base_config = {
+            "dry_run": True,
+            "low_liquidity_threshold": 0.30,
+            "high_liquidity_threshold": 0.70,
+            "rebalance_min_amount": 10_000,
+            "rebalance_max_amount": 500_000,
+        }
+        base_config.update(config_overrides)
+        cfg = Config(**base_config)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.policy_manager = MagicMock()
+        r.policy_manager.should_rebalance.return_value = True
+        r.job_manager = MagicMock()
+        r.job_manager.slots_available.return_value = 5
+        r.job_manager.active_channels = set()
+        r.job_manager.active_job_count = 0
+        r.job_manager.get_active_rebalancing_peers.return_value = []
+        r.job_manager.get_source_failure_count.return_value = 0
+        r.data_service = MagicMock()
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        r._analyze_rebalance_ev = MagicMock(return_value=None)
+        r._capex_fallback_pass = MagicMock(return_value=[])
+        r.hive_router = MagicMock()
+        r.hive_router.available = True
+
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        mock_database.get_top_route_pairs.return_value = []
+        mock_database.get_channel_state.return_value = None
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        return r
+
+    def test_hive_equalization_logs_lows_highs_and_selected(self, mock_plugin, mock_database):
+        hive_source_peer = "02" + "1" * 64
+        hive_dest_peer = "02" + "2" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 660_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 340_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+
+        result = r.find_rebalance_candidates()
+
+        assert len(result) == 1
+        messages = [c.args[0] for c in mock_plugin.log.call_args_list]
+        assert any(
+            "HIVE_EQUALIZATION:" in msg
+            and "lows=1" in msg
+            and "highs=1" in msg
+            and "selected=1" in msg
+            for msg in messages
+        ), messages[-10:]
+
+    def test_hive_equalization_hold_reason_when_no_pairs(self, mock_plugin, mock_database):
+        hive_source_peer = "02" + "3" * 64
+        hive_balanced_peer = "02" + "4" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 660_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_balanced_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 500_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+
+        assert r.find_rebalance_candidates() == []
+        summary = r.get_last_decision_summary()
+
+        assert summary["reason"] == "no_hive_equalization_pairs"
+        messages = [c.args[0] for c in mock_plugin.log.call_args_list]
+        assert any(
+            "HIVE_EQUALIZATION:" in msg
+            and "lows=0" in msg
+            and "highs=1" in msg
+            and "selected=0" in msg
+            for msg in messages
+        ), messages[-10:]
+
+    def test_hive_equalization_logs_skip_reasons(self, mock_plugin, mock_database):
+        from modules.rebalancer import RebalanceReasonCode
+
+        hive_source_peer = "02" + "5" * 64
+        hive_dest_peer = "02" + "6" * 64
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        r._get_channels_with_balances = MagicMock(return_value={
+            "111x1x0": {
+                "peer_id": hive_source_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 660_000,
+                "fee_ppm": 0,
+            },
+            "222x2x0": {
+                "peer_id": hive_dest_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 340_000,
+                "fee_ppm": 25,
+            },
+        })
+        r.hive_router.is_hive_member.return_value = True
+        mock_database.get_last_rebalance_time.side_effect = (
+            lambda channel_id, reason_code=None: int(time.time())
+            if reason_code == RebalanceReasonCode.HIVE_EQUALIZATION.value
+            else 0
+        )
+
+        assert r.find_rebalance_candidates() == []
+        messages = [c.args[0] for c in mock_plugin.log.call_args_list]
+        assert any(
+            "HIVE_EQUALIZATION:" in msg
+            and "selected=0" in msg
+            and "skip_reasons=cooldown=1" in msg
+            for msg in messages
+        ), messages[-10:]
+
+
 class TestLastDecisionSummary:
     def test_execute_rebalance_records_budget_blocked_summary(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -870,3 +1312,99 @@ class TestLastDecisionSummary:
         assert summary["dominant_input"] == "daily_budget_sats"
         assert summary["safety_block"] is True
         assert summary["budget_blocked"] is True
+
+
+class TestHiveEqualizationConfigSurface:
+    def test_hive_equalization_defaults_are_present_in_config_and_snapshot(self):
+        from modules.config import Config
+
+        cfg = Config()
+        snapshot = cfg.snapshot()
+
+        assert cfg.hive_equalization_enabled is True
+        assert cfg.hive_equalization_low_pct == 0.35
+        assert cfg.hive_equalization_high_pct == 0.65
+        assert cfg.hive_equalization_cooldown_hours == 48
+        assert cfg.hive_equalization_max_candidates_per_cycle == 1
+
+        assert snapshot.hive_equalization_enabled is True
+        assert snapshot.hive_equalization_low_pct == 0.35
+        assert snapshot.hive_equalization_high_pct == 0.65
+        assert snapshot.hive_equalization_cooldown_hours == 48
+        assert snapshot.hive_equalization_max_candidates_per_cycle == 1
+
+    def test_hive_equalization_direct_construction_requires_valid_band(self):
+        from modules.config import Config
+
+        with pytest.raises(ValueError, match="hive_equalization_low_pct"):
+            Config(hive_equalization_low_pct=0.7, hive_equalization_high_pct=0.6)
+
+    def test_hive_equalization_runtime_updates_use_typed_validation(self):
+        from modules.config import Config
+
+        cfg = Config()
+        stored_values = {}
+        database = MagicMock()
+
+        def set_config_override(key, value):
+            stored_values[key] = value
+            return 99
+
+        def get_config_override(key):
+            return stored_values.get(key)
+
+        database.set_config_override.side_effect = set_config_override
+        database.get_config_override.side_effect = get_config_override
+        database.delete_config_override.return_value = True
+
+        result = cfg.update_runtime(database, "hive_equalization_enabled", "false")
+        assert result["status"] == "success"
+        assert cfg.hive_equalization_enabled is False
+
+        result = cfg.update_runtime(database, "hive_equalization_low_pct", "0.4")
+        assert result["status"] == "success"
+        assert cfg.hive_equalization_low_pct == 0.4
+
+        result = cfg.update_runtime(database, "hive_equalization_high_pct", "0.7")
+        assert result["status"] == "success"
+        assert cfg.hive_equalization_high_pct == 0.7
+
+        result = cfg.update_runtime(database, "hive_equalization_cooldown_hours", "72")
+        assert result["status"] == "success"
+        assert cfg.hive_equalization_cooldown_hours == 72
+
+        result = cfg.update_runtime(database, "hive_equalization_max_candidates_per_cycle", "3")
+        assert result["status"] == "success"
+        assert cfg.hive_equalization_max_candidates_per_cycle == 3
+
+        result = cfg.update_runtime(database, "hive_equalization_low_pct", "1.5")
+        assert "out of range" in result["error"]
+
+        result = cfg.update_runtime(database, "hive_equalization_low_pct", "0.8")
+        assert "must be less than" in result["error"]
+
+        result = cfg.update_runtime(database, "hive_equalization_high_pct", "0.39")
+        assert "must be greater than" in result["error"]
+
+    def test_hive_equalization_load_overrides_repairs_invalid_band(self):
+        from modules.config import Config
+
+        cfg = Config()
+        database = MagicMock()
+        database.get_all_config_overrides.return_value = {
+            "hive_equalization_low_pct": "0.8",
+            "hive_equalization_high_pct": "0.6",
+        }
+        database.get_config_version.return_value = 7
+
+        warnings = cfg.load_overrides(database)
+
+        assert warnings == []
+        assert cfg.hive_equalization_high_pct == 0.6
+        assert cfg.hive_equalization_low_pct == pytest.approx(0.55)
+        assert cfg.snapshot().hive_equalization_low_pct == pytest.approx(0.55)
+
+    def test_reason_code_includes_hive_equalization(self):
+        from modules.rebalancer import RebalanceReasonCode
+
+        assert RebalanceReasonCode.HIVE_EQUALIZATION.value == "hive_equalization"

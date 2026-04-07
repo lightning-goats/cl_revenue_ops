@@ -179,6 +179,93 @@ class TestPeerAndSourceRebalanceSuccessRate:
         assert abs(source_result["success_rate"] - (2 / 3)) < 0.01
 
 
+class TestLastRebalanceTime:
+    """Real SQLite tests for reason-aware rebalance cooldown lookups."""
+
+    def _make_db(self, tmp_path):
+        db_path = os.path.join(tmp_path, "test_last_rebalance_time.db")
+        plugin = MagicMock()
+        db = Database(db_path, plugin)
+        db.initialize()
+        return db
+
+    def test_unfiltered_last_rebalance_time_preserves_existing_behavior(self, tmp_path):
+        db = self._make_db(tmp_path)
+        conn = db._get_connection()
+        channel = "111x222x0"
+        now = int(time.time())
+
+        conn.execute(
+            "INSERT INTO rebalance_history "
+            "(from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats, "
+            "status, rebalance_type, reason_code, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("src-a", channel, 50_000, 100, 10, "success", "normal", "ev_positive", now - 120),
+        )
+        conn.execute(
+            "INSERT INTO rebalance_history "
+            "(from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats, "
+            "status, rebalance_type, reason_code, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("src-b", channel, 50_000, 100, 10, "success", "normal", "hive_equalization", now - 30),
+        )
+        conn.commit()
+
+        assert db.get_last_rebalance_time(channel) == now - 30
+
+    def test_reason_filtered_last_rebalance_time_returns_latest_matching_success(self, tmp_path):
+        db = self._make_db(tmp_path)
+        conn = db._get_connection()
+        channel = "111x222x0"
+        now = int(time.time())
+
+        rows = [
+            ("src-a", channel, 50_000, 100, 10, "success", "normal", "ev_positive", now - 240),
+            ("src-b", channel, 50_000, 100, 10, "success", "normal", "hive_equalization", now - 180),
+            ("src-c", channel, 50_000, 100, 10, "failed", "normal", "hive_equalization", now - 60),
+            ("src-d", channel, 50_000, 100, 10, "success", "normal", "hive_equalization", now - 45),
+        ]
+        for row in rows:
+            conn.execute(
+                "INSERT INTO rebalance_history "
+                "(from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats, "
+                "status, rebalance_type, reason_code, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+        conn.commit()
+
+        assert db.get_last_rebalance_time(channel, reason_code="hive_equalization") == now - 45
+        assert db.get_last_rebalance_time(channel, reason_code="ev_positive") == now - 240
+        assert db.get_last_rebalance_time(channel, reason_code="capex_fallback") is None
+
+    def test_reason_filtered_lookup_keeps_distinct_cooldowns_per_reason(self, tmp_path):
+        db = self._make_db(tmp_path)
+        conn = db._get_connection()
+        channel = "111x222x0"
+        now = int(time.time())
+
+        rows = [
+            ("src-a", channel, 50_000, 100, 10, "success", "normal", "capex_fallback", now - 300),
+            ("src-b", channel, 50_000, 100, 10, "success", "normal", "ev_positive", now - 200),
+            ("src-c", channel, 50_000, 100, 10, "success", "normal", "hive_equalization", now - 100),
+        ]
+        for row in rows:
+            conn.execute(
+                "INSERT INTO rebalance_history "
+                "(from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats, "
+                "status, rebalance_type, reason_code, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+        conn.commit()
+
+        assert db.get_last_rebalance_time(channel) == now - 100
+        assert db.get_last_rebalance_time(channel, reason_code="capex_fallback") == now - 300
+        assert db.get_last_rebalance_time(channel, reason_code="ev_positive") == now - 200
+        assert db.get_last_rebalance_time(channel, reason_code="hive_equalization") == now - 100
+
+
 # =============================================================================
 # Audit Round 8 – Turn 3 Regression Tests
 # =============================================================================

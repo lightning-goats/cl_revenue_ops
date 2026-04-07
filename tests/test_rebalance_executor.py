@@ -31,6 +31,8 @@ class MockCandidate:
     max_fee_ppm: int = 200
     hive_route_hops: int = 0
     direction: str = "pull"
+    reason_code: str = "ev_positive"
+    dest_is_hive_member: bool = False
 
 
 class MockHiveRouter:
@@ -495,6 +497,122 @@ class TestExecuteFailure:
 
         # delinvoice should be called for cleanup
         plugin.rpc.delinvoice.assert_called_once()
+
+
+class TestHiveEqualizationRouteValidation:
+    def test_equalization_rejects_non_hive_intermediate(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": [{"layer": "hive-fleet"}, {"layer": "revenue-local"}]}
+            if method == "getroutes":
+                return {
+                    "routes": [{
+                        "amount_msat": 500_000_000,
+                        "path": [
+                            {
+                                "short_channel_id_dir": "100x1x0/1",
+                                "next_node_id": "non_hive_mid",
+                                "amount_msat": 500_000_000,
+                                "delay": 42,
+                            },
+                            {
+                                "short_channel_id_dir": "300x1x0/0",
+                                "next_node_id": "dest_peer_abc",
+                                "amount_msat": 500_000_000,
+                                "delay": 30,
+                            },
+                        ],
+                    }],
+                    "probability_ppm": 999999,
+                }
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
+        hive_router = MagicMock()
+        hive_router.is_hive_member.side_effect = lambda pid: pid == "dest_peer_abc"
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock(), hive_router=hive_router)
+
+        result = executor.execute(
+            MockCandidate(
+                hive_route_hops=2,
+                reason_code="hive_equalization",
+                dest_is_hive_member=True,
+                max_budget_sats=0,
+                max_budget_msat=0,
+            )
+        )
+
+        assert result.success is False
+        assert "non_pure_hive_route" in result.error
+        plugin.rpc.getroute.assert_not_called()
+        plugin.rpc.sendpay.assert_not_called()
+
+    def test_equalization_accepts_all_hive_intermediates(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.waitsendpay.return_value = {
+            "status": "complete", "amount_sent_msat": 500_000_000
+        }
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": [{"layer": "hive-fleet"}, {"layer": "revenue-local"}]}
+            if method == "getroutes":
+                return {
+                    "routes": [{
+                        "amount_msat": 500_000_000,
+                        "path": [
+                            {
+                                "short_channel_id_dir": "100x1x0/1",
+                                "next_node_id": "hive_mid",
+                                "amount_msat": 500_000_000,
+                                "delay": 42,
+                            },
+                            {
+                                "short_channel_id_dir": "300x1x0/0",
+                                "next_node_id": "dest_peer_abc",
+                                "amount_msat": 500_000_000,
+                                "delay": 30,
+                            },
+                        ],
+                    }],
+                    "probability_ppm": 999999,
+                }
+            if method == "askrene-inform-channel":
+                return {}
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
+        hive_router = MagicMock()
+        hive_router.is_hive_member.side_effect = (
+            lambda pid: pid in {"hive_mid", "dest_peer_abc"}
+        )
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock(), hive_router=hive_router)
+
+        result = executor.execute(
+            MockCandidate(
+                hive_route_hops=2,
+                reason_code="hive_equalization",
+                dest_is_hive_member=True,
+                max_budget_sats=0,
+                max_budget_msat=0,
+            )
+        )
+
+        assert result.success is True
+        assert result.route_type == "fleet"
+        plugin.rpc.getroute.assert_not_called()
 
     def test_retries_on_route_failure_with_exclude(self):
         plugin = MagicMock()

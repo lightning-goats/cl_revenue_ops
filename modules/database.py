@@ -1903,7 +1903,11 @@ class Database:
         """, (limit,)).fetchall()
         return [dict(row) for row in rows]
     
-    def get_last_rebalance_time(self, channel_id: str) -> Optional[int]:
+    def get_last_rebalance_time(
+        self,
+        channel_id: str,
+        reason_code: Optional[str] = None,
+    ) -> Optional[int]:
         """
         Get the timestamp of the last successful rebalance for a channel.
         
@@ -1911,16 +1915,24 @@ class Database:
         
         Args:
             channel_id: The destination channel of the rebalance
+            reason_code: Optional rebalance reason code filter
             
         Returns:
             Unix timestamp of last successful rebalance, or None if never
         """
         conn = self._get_connection()
-        row = conn.execute("""
-            SELECT MAX(timestamp) as last_time
-            FROM rebalance_history 
-            WHERE to_channel = ? AND status = 'success'
-        """, (channel_id,)).fetchone()
+        if reason_code:
+            row = conn.execute("""
+                SELECT MAX(timestamp) as last_time
+                FROM rebalance_history 
+                WHERE to_channel = ? AND status = 'success' AND reason_code = ?
+            """, (channel_id, reason_code)).fetchone()
+        else:
+            row = conn.execute("""
+                SELECT MAX(timestamp) as last_time
+                FROM rebalance_history 
+                WHERE to_channel = ? AND status = 'success'
+            """, (channel_id,)).fetchone()
         
         if row and row['last_time']:
             return row['last_time']
