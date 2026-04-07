@@ -1936,17 +1936,20 @@ class CapacityPlanner:
             budget = int(budget_info.get("effective_budget_sats", 0) or 0)
             if budget <= 0:
                 return False, "Unified budget provider returned zero limit"
-            remaining = int(budget_info.get("remaining_sats", budget) or budget)
-            # Also check external costs if available
-            ext_provider = getattr(self, "external_liquidity_cost_provider", None)
-            if callable(ext_provider):
-                try:
-                    ext = ext_provider()
-                    if isinstance(ext, dict):
-                        remaining -= int(ext.get("spent_24h_sats", 0) or 0)
-                        remaining -= int(ext.get("reserved_24h_sats", 0) or 0)
-                except Exception:
-                    pass
+            remaining_raw = budget_info.get("remaining_sats", None)
+            if remaining_raw is None:
+                remaining = budget
+                ext_provider = getattr(self, "external_liquidity_cost_provider", None)
+                if callable(ext_provider):
+                    try:
+                        ext = ext_provider()
+                        if isinstance(ext, dict):
+                            remaining -= int(ext.get("spent_24h_sats", 0) or 0)
+                            remaining -= int(ext.get("reserved_24h_sats", 0) or 0)
+                    except Exception:
+                        pass
+            else:
+                remaining = int(remaining_raw or 0)
             if estimated_cost_sats > max(0, remaining):
                 return False, (
                     f"Unified budget: estimated cost {estimated_cost_sats} sats "
@@ -1969,9 +1972,8 @@ class CapacityPlanner:
             reserve_ok, reserve_reason = self._check_reserve(cfg, amount_sats)
             if not reserve_ok:
                 return False, reserve_reason
-            # Unified budget check: on-chain costs count against the global liquidity budget
-            estimated_chain_cost = int(amount_sats * 0.002) + ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
-            budget_ok, budget_reason = self._check_unified_budget(estimated_chain_cost)
+            # Unified budget gates the immediate on-chain spend for the open.
+            budget_ok, budget_reason = self._check_unified_budget(self._estimate_open_cost())
             if not budget_ok:
                 return False, budget_reason
 

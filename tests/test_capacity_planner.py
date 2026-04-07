@@ -2291,6 +2291,21 @@ class TestSafetyGuards:
         assert ok is False
         assert "zero limit" in reason
 
+    def test_unified_budget_uses_provider_remaining_without_external_double_count(self):
+        """Provider remaining_sats is already net of external costs."""
+        planner = self._make_planner()
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 2000, "remaining_sats": 2000}
+        )
+        planner.external_liquidity_cost_provider = MagicMock(
+            return_value={"spent_24h_sats": 700, "reserved_24h_sats": 300}
+        )
+
+        ok, reason = planner._check_unified_budget(estimated_cost_sats=1500)
+
+        assert ok is True
+        assert "Unified budget OK" in reason
+
     def test_safety_guards_checks_all_pass(self):
         """_check_safety_guards passes when all checks pass for opens."""
         planner = self._make_planner(
@@ -2306,6 +2321,28 @@ class TestSafetyGuards:
         cfg = self._make_cfg(max_fee_rate=50.0, min_reserve=500000)
 
         ok, reason = planner._check_safety_guards(cfg, "open", "peer1", amount_sats=1000000)
+        assert ok is True
+        assert "All guards passed" in reason
+
+    def test_safety_guards_open_budget_uses_estimated_open_cost(self):
+        """Open guard should use the same immediate cost model as execution."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 10000}},  # 10 sat/vB => 1400 sats open cost
+            listfunds_return={
+                "outputs": [
+                    {"amount_msat": 5000000_000, "status": "confirmed"},
+                ],
+                "channels": [],
+            },
+            recent_actions=[],
+        )
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 2000, "remaining_sats": 2000}
+        )
+        cfg = self._make_cfg(max_fee_rate=50.0, min_reserve=500000)
+
+        ok, reason = planner._check_safety_guards(cfg, "open", "peer1", amount_sats=1000000)
+
         assert ok is True
         assert "All guards passed" in reason
 
