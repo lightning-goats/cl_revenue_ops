@@ -895,6 +895,15 @@ class EVRebalancer:
         entry: Dict[str, Any],
     ) -> bool:
         view = self._coordination_entry_view(entry)
+        for amount_key in ("amount_sats", "chunk_size_sats", "active_chunk_amount_sats"):
+            if view.get(amount_key) is None:
+                continue
+            try:
+                expected_amount = int(view.get(amount_key) or 0)
+            except Exception:
+                expected_amount = 0
+            if expected_amount > 0 and int(candidate.amount_sats or 0) != expected_amount:
+                return False
         source_scid = self._normalize_coordination_value(view.get("source_scid"))
         sink_scid = self._normalize_coordination_value(view.get("sink_scid"))
         candidate_sink = self._normalize_coordination_value(candidate.to_channel)
@@ -918,9 +927,6 @@ class EVRebalancer:
         primary = str(view.get("primary_executor_member_id") or "").strip()
         if primary and primary == our_node_id:
             return 2
-        fallbacks = view.get("fallback_executor_member_ids") or []
-        if isinstance(fallbacks, list) and our_node_id in [str(v).strip() for v in fallbacks]:
-            return 1
         return 0
 
     def _coordination_priority_score(self, entry: Dict[str, Any]) -> float:
@@ -1319,11 +1325,15 @@ class EVRebalancer:
                     pass
                 try:
                     coordination_leases = list(self.hive_hints.get_route_segment_leases() or [])
-                    coordination_recommendations = list(self.hive_hints.get_rebalance_recommendations() or [])
-                    coordination_campaigns = list(self.hive_hints.get_rebalance_campaigns() or [])
                 except Exception:
                     coordination_leases = []
+                try:
+                    coordination_recommendations = list(self.hive_hints.get_rebalance_recommendations() or [])
+                except Exception:
                     coordination_recommendations = []
+                try:
+                    coordination_campaigns = list(self.hive_hints.get_rebalance_campaigns() or [])
+                except Exception:
                     coordination_campaigns = []
                 if coordination_leases or coordination_recommendations or coordination_campaigns:
                     our_node_id = self._get_our_node_id()
@@ -1798,12 +1808,17 @@ class EVRebalancer:
                 dest_state = self.database.get_channel_state(c.to_channel)
                 flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
                 priority = 2 if flow_state == "source" else 1
+                coordination_priority = 0
+                if getattr(c, "coordination_hint_type", "") == "campaign":
+                    coordination_priority = 2
+                elif getattr(c, "coordination_hint_type", "") == "recommendation":
+                    coordination_priority = 1
                 # Boost channels on proven revenue routes
                 route_bonus = 1.3 if c.to_channel in route_pair_out_channels else 1.0
                 hive_bias = self._get_hive_rebalance_bias(c.to_peer_id)
                 biased_profit = c.expected_profit_sats * hive_bias * route_bonus
                 biased_profit += float(getattr(c, "coordination_rank_bonus", 0.0) or 0.0)
-                return (priority, biased_profit)
+                return (coordination_priority, priority, biased_profit)
 
             candidates.sort(key=sort_key, reverse=True)
 

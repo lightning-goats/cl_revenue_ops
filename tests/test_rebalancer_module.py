@@ -490,6 +490,228 @@ class TestCoordinatedRebalanceHints:
         assert candidates[0].reason_code == RebalanceReasonCode.COORDINATED_REBALANCE.value
         assert candidates[1].reason_code == RebalanceReasonCode.EV_POSITIVE.value
 
+    def test_campaign_chunk_preferred_even_over_flow_priority_candidate(
+        self, mock_plugin, mock_database
+    ):
+        from modules.rebalancer import RebalanceReasonCode
+
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        def channel_state(scid):
+            if scid == ids["sink_b_scid"]:
+                return {"state": "source"}
+            return {"state": "balanced"}
+
+        mock_database.get_channel_state.side_effect = channel_state
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = []
+        r.hive_hints.get_rebalance_recommendations.return_value = []
+        r.hive_hints.get_rebalance_campaigns.return_value = [{
+            "campaign_id": "camp-1",
+            "status": "active",
+            "primary_executor_member_id": our_id,
+            "fallback_executor_member_ids": [],
+            "active_chunk_lease": {
+                "route_segments": [{
+                    "source": ids["source_peer"],
+                    "destination": ids["sink_a_peer"],
+                }]
+            },
+            "chunk_size_sats": 75_000,
+            "priority_score": 0.95,
+        }]
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 10
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_a_scid"], ids["sink_b_scid"]]
+        assert candidates[0].reason_code == RebalanceReasonCode.COORDINATED_REBALANCE.value
+
+    def test_foreign_lease_still_suppresses_when_campaign_fetch_fails(self, mock_plugin, mock_database):
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = [{
+            "lease_id": "lease-1",
+            "owner_member_id": "02" + "9" * 64,
+            "route_segments": [f"{ids['source_scid']}>{ids['sink_a_scid']}"],
+            "expires_at": int(time.time()) + 300,
+        }]
+        r.hive_hints.get_rebalance_recommendations.return_value = []
+        r.hive_hints.get_rebalance_campaigns.side_effect = RuntimeError("campaigns unavailable")
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=60_000,
+                )
+                c.expected_profit_sats = 15
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=55_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_b_scid"]]
+
+    def test_campaign_chunk_requires_matching_amount(self, mock_plugin, mock_database):
+        from modules.rebalancer import RebalanceReasonCode
+
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = []
+        r.hive_hints.get_rebalance_recommendations.return_value = []
+        r.hive_hints.get_rebalance_campaigns.return_value = [{
+            "campaign_id": "camp-1",
+            "status": "active",
+            "primary_executor_member_id": our_id,
+            "fallback_executor_member_ids": [],
+            "active_chunk_lease": {
+                "route_segments": [{
+                    "source": ids["source_peer"],
+                    "destination": ids["sink_a_peer"],
+                }]
+            },
+            "chunk_size_sats": 50_000,
+            "priority_score": 0.95,
+        }]
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 10
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_b_scid"], ids["sink_a_scid"]]
+        assert candidates[1].reason_code == RebalanceReasonCode.EV_POSITIVE.value
+
+    def test_fallback_executor_does_not_take_primary_recommendation_bonus(
+        self, mock_plugin, mock_database
+    ):
+        from modules.rebalancer import RebalanceReasonCode
+
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = []
+        r.hive_hints.get_rebalance_recommendations.return_value = [{
+            "recommendation_id": "rec-1",
+            "source_scid": ids["source_scid"],
+            "sink_scid": ids["sink_a_scid"],
+            "primary_executor_member_id": "02" + "9" * 64,
+            "fallback_executor_member_ids": [our_id],
+            "priority_score": 0.9,
+        }]
+        r.hive_hints.get_rebalance_campaigns.return_value = []
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=70_000,
+                )
+                c.expected_profit_sats = 10
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=70_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_b_scid"], ids["sink_a_scid"]]
+        assert all(c.reason_code == RebalanceReasonCode.EV_POSITIVE.value for c in candidates)
+
 
 
 # Sling-specific test classes removed: TestJobMonitorPrefersSlingStats,
