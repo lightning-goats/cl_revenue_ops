@@ -18,6 +18,27 @@ def mock_plugin():
 VALID_SNAPSHOT = {
     "generated_at": int(time.time()),
     "ttl_seconds": 900,
+    "route_segment_leases": [
+        {
+            "lease_id": "lease-1",
+            "route_segments": ["a->b"],
+            "owner_member_id": "03owner",
+        },
+    ],
+    "rebalance_recommendations": [
+        {
+            "recommendation_id": "rec-1",
+            "route_segments": ["a->b"],
+            "priority_score": 12.5,
+        },
+    ],
+    "rebalance_campaigns": [
+        {
+            "campaign_id": "camp-1",
+            "status": "active",
+            "remaining_amount_sats": 100000,
+        },
+    ],
     "hints": {
         "02aabbcc": {
             "member": True,
@@ -36,6 +57,30 @@ VALID_SNAPSHOT = {
             "rebalance_preference": "source",
         },
     },
+}
+
+VALID_COORDINATION_SNAPSHOT_SECTIONS = {
+    "route_segment_leases": [
+        {
+            "lease_id": "lease-1",
+            "route_segments": [{"source": "node-a", "destination": "node-b"}],
+            "lease_weight": 0.8,
+        },
+    ],
+    "rebalance_recommendations": [
+        {
+            "recommendation_id": "rec-1",
+            "route_segments": [{"source": "node-c", "destination": "node-d"}],
+            "priority": "high",
+        },
+    ],
+    "rebalance_campaigns": [
+        {
+            "campaign_id": "camp-1",
+            "status": "active",
+            "budget_sats": 100000,
+        },
+    ],
 }
 
 
@@ -110,6 +155,78 @@ class TestTTL:
     def test_no_snapshot_is_not_fresh(self, mock_plugin):
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
         assert not adapter.is_fresh()
+
+
+class TestCoordinationSections:
+    def test_valid_snapshot_exposes_coordination_sections(self, mock_plugin):
+        snapshot = dict(VALID_SNAPSHOT)
+        snapshot["generated_at"] = int(time.time())
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_route_segment_leases()[0]["lease_id"] == "lease-1"
+        assert (
+            adapter.get_rebalance_recommendations()[0]["recommendation_id"] == "rec-1"
+        )
+        assert adapter.get_rebalance_campaigns()[0]["campaign_id"] == "camp-1"
+
+    def test_stale_snapshot_returns_empty_coordination_sections(self, mock_plugin):
+        snapshot = dict(VALID_SNAPSHOT)
+        snapshot["generated_at"] = int(time.time()) - 2000
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_route_segment_leases() == []
+        assert adapter.get_rebalance_recommendations() == []
+        assert adapter.get_rebalance_campaigns() == []
+
+    def test_malformed_coordination_entries_are_filtered(self, mock_plugin):
+        snapshot = dict(VALID_SNAPSHOT)
+        snapshot["generated_at"] = int(time.time())
+        snapshot["route_segment_leases"] = [
+            {"lease_id": "lease-ok", "route_segments": ["a->b"]},
+            {"lease_id": "", "route_segments": ["bad"]},
+            {"lease_id": "lease-missing-routes"},
+        ]
+        snapshot["rebalance_recommendations"] = [
+            {"recommendation_id": "rec-ok", "route_segments": ["b->c"]},
+            {"recommendation_id": "rec-bad", "route_segments": "oops"},
+            {"route_segments": ["missing-id"]},
+        ]
+        snapshot["rebalance_campaigns"] = [
+            {"campaign_id": "camp-ok", "status": "active"},
+            {"campaign_id": "", "status": "active"},
+            {"campaign_id": "camp-missing-status"},
+        ]
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert [lease["lease_id"] for lease in adapter.get_route_segment_leases()] == [
+            "lease-ok",
+        ]
+        assert [
+            rec["recommendation_id"]
+            for rec in adapter.get_rebalance_recommendations()
+        ] == ["rec-ok"]
+        assert [camp["campaign_id"] for camp in adapter.get_rebalance_campaigns()] == [
+            "camp-ok",
+        ]
+
+    def test_existing_peer_hint_methods_still_behave_with_coordination_sections(
+        self,
+        mock_plugin,
+    ):
+        snapshot = dict(VALID_SNAPSHOT)
+        snapshot["generated_at"] = int(time.time())
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_fee_bias("02aabbcc") > 1.0
+        assert adapter.get_rebalance_bias("02ddeeff") < 1.0
 
 
 class TestFeeBias:
@@ -562,6 +679,96 @@ class TestChannelOpenHints:
     def test_get_open_candidates_no_snapshot(self, mock_plugin):
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
         assert adapter.get_open_candidates() == []
+
+
+class TestCoordinationSections:
+    def _make_adapter(self, mock_plugin, snapshot):
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        return adapter
+
+    def test_valid_snapshot_exposes_route_segment_leases_recommendations_campaigns(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": VALID_SNAPSHOT["hints"],
+            **VALID_COORDINATION_SNAPSHOT_SECTIONS,
+        }
+        adapter = self._make_adapter(mock_plugin, snapshot)
+
+        assert adapter.get_route_segment_leases() == VALID_COORDINATION_SNAPSHOT_SECTIONS["route_segment_leases"]
+        assert adapter.get_rebalance_recommendations() == VALID_COORDINATION_SNAPSHOT_SECTIONS["rebalance_recommendations"]
+        assert adapter.get_rebalance_campaigns() == VALID_COORDINATION_SNAPSHOT_SECTIONS["rebalance_campaigns"]
+
+    def test_stale_snapshot_returns_empty_for_route_segment_leases_recommendations_rebalance_campaigns(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()) - 2000,
+            "ttl_seconds": 900,
+            "hints": VALID_SNAPSHOT["hints"],
+            **VALID_COORDINATION_SNAPSHOT_SECTIONS,
+        }
+        adapter = self._make_adapter(mock_plugin, snapshot)
+
+        assert adapter.get_route_segment_leases() == []
+        assert adapter.get_rebalance_recommendations() == []
+        assert adapter.get_rebalance_campaigns() == []
+
+    def test_malformed_route_segment_leases_recommendations_rebalance_campaigns_entries_are_filtered(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": VALID_SNAPSHOT["hints"],
+            "route_segment_leases": [
+                {"lease_id": "lease-ok", "route_segments": [{"source": "a", "destination": "b"}]},
+                {"lease_id": "lease-empty", "route_segments": []},
+                {"lease_id": "lease-missing-segments"},
+                {"route_segments": []},
+                {"lease_id": "lease-bad-type", "route_segments": "invalid"},
+                "not-a-dict",
+            ],
+            "rebalance_recommendations": [
+                {"recommendation_id": "rec-ok", "route_segments": [{"source": "c", "destination": "d"}]},
+                {"recommendation_id": "rec-empty", "route_segments": []},
+                {"recommendation_id": "rec-missing-segments"},
+                {"route_segments": []},
+                {"recommendation_id": "rec-bad-type", "route_segments": "invalid"},
+                42,
+            ],
+            "rebalance_campaigns": [
+                {"campaign_id": "camp-ok", "status": "queued"},
+                {"campaign_id": "camp-missing-status"},
+                {"status": "active"},
+                "bad",
+            ],
+        }
+        adapter = self._make_adapter(mock_plugin, snapshot)
+
+        assert adapter.get_route_segment_leases() == [
+            {"lease_id": "lease-ok", "route_segments": [{"source": "a", "destination": "b"}]},
+            {"lease_id": "lease-empty", "route_segments": []},
+        ]
+        assert adapter.get_rebalance_recommendations() == [
+            {"recommendation_id": "rec-ok", "route_segments": [{"source": "c", "destination": "d"}]},
+            {"recommendation_id": "rec-empty", "route_segments": []},
+        ]
+        assert adapter.get_rebalance_campaigns() == [
+            {"campaign_id": "camp-ok", "status": "queued"},
+        ]
+
+    def test_existing_peer_hint_methods_still_behave_unchanged(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": VALID_SNAPSHOT["hints"],
+            **VALID_COORDINATION_SNAPSHOT_SECTIONS,
+        }
+        adapter = self._make_adapter(mock_plugin, snapshot)
+
+        assert adapter.is_hive_member("02aabbcc") is True
+        assert adapter.get_corridor_role("02aabbcc") == "owner"
+        assert adapter.get_fee_bias("02aabbcc") > 1.0
+        assert adapter.get_rebalance_bias("02ddeeff") < 1.0
 
 
 class TestMemberLookup:

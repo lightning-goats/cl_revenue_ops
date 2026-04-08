@@ -33,6 +33,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ConfigSnapshot
 from .database import Database
 from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
+from .rebalance_executor import RebalanceExecutor
 from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
 if TYPE_CHECKING:
@@ -69,6 +70,7 @@ class RebalanceReasonCode(Enum):
     EV_POSITIVE = "ev_positive"                   # Normal EV-positive rebalance
     CAPEX_FALLBACK = "capex_fallback"             # Capex-aware fallback rebalance
     HIVE_EQUALIZATION = "hive_equalization"       # Fallback pure-hive inventory equalization
+    COORDINATED_REBALANCE = "coordinated_rebalance"  # Matched assigned fleet coordination hint
 
     # Skip codes (rebalance was not attempted)
     SKIP_HARD_BLEEDER = "skip_hard_bleeder"       # Channel is a hard bleeder (rebal_cost > 2x revenue)
@@ -127,6 +129,9 @@ class RebalanceCandidate:
     # Explainability fields
     reason_code: str = RebalanceReasonCode.EV_POSITIVE.value  # Why this rebalance was approved
     bleeder_status: str = "none"  # 'hard', 'soft', or 'none'
+    coordination_hint_type: str = ""
+    coordination_hint_id: str = ""
+    coordination_rank_bonus: float = 0.0
 
     # Direction: "pull" fills to_channel from sources; "push" drains to_channel to destinations
     direction: str = "pull"
@@ -178,6 +183,9 @@ class RebalanceCandidate:
             "num_source_candidates": len(self.source_candidates),
             "reason_code": self.reason_code,
             "bleeder_status": self.bleeder_status,
+            "coordination_hint_type": self.coordination_hint_type,
+            "coordination_hint_id": self.coordination_hint_id,
+            "coordination_rank_bonus": round(self.coordination_rank_bonus, 4),
             "direction": self.direction,
             "hot_channel_protection": self.hot_channel_protection,
             "hot_channel_protection_score": round(self.hot_channel_protection_score, 4),
@@ -797,6 +805,526 @@ class EVRebalancer:
             return 1.0
 
     @staticmethod
+    def _normalize_coordination_value(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return text.replace(":", "x")
+
+    @classmethod
+    def _normalize_route_segment(cls, segment: Any) -> Optional[Tuple[str, str]]:
+        if isinstance(segment, dict):
+            source = cls._normalize_coordination_value(segment.get("source"))
+            destination = cls._normalize_coordination_value(segment.get("destination"))
+            if source and destination:
+                return (source, destination)
+            return None
+        if isinstance(segment, str):
+            text = segment.strip()
+            if not text:
+                return None
+            separator = "->" if "->" in text else ">" if ">" in text else None
+            if separator is None:
+                return None
+            source, destination = text.split(separator, 1)
+            source = cls._normalize_coordination_value(source)
+            destination = cls._normalize_coordination_value(destination)
+            if source and destination:
+                return (source, destination)
+        return None
+
+    def _candidate_route_segments(self, candidate: RebalanceCandidate) -> set[Tuple[str, str]]:
+        segments: set[Tuple[str, str]] = set()
+        sink_scid = self._normalize_coordination_value(candidate.to_channel)
+        for source_scid in candidate.source_candidates:
+            normalized_source = self._normalize_coordination_value(source_scid)
+            if normalized_source and sink_scid:
+                segments.add((normalized_source, sink_scid))
+
+        sink_peer = self._normalize_coordination_value(candidate.to_peer_id)
+        source_peers = list(candidate.source_candidate_peer_ids or [])
+        if not source_peers and candidate.primary_source_peer_id:
+            source_peers = [candidate.primary_source_peer_id]
+        for source_peer in source_peers:
+            normalized_source = self._normalize_coordination_value(source_peer)
+            if normalized_source and sink_peer:
+                segments.add((normalized_source, sink_peer))
+        return segments
+
+    def _coordination_entry_view(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        view: Dict[str, Any] = dict(entry or {})
+        for nested_key in ("active_chunk_recommendation", "active_chunk_lease"):
+            nested = entry.get(nested_key) if isinstance(entry, dict) else None
+            if not isinstance(nested, dict):
+                continue
+            for key, value in nested.items():
+                if key not in view or not view.get(key):
+                    view[key] = value
+        return view
+
+    def _coordination_entry_segments(self, entry: Dict[str, Any]) -> set[Tuple[str, str]]:
+        view = self._coordination_entry_view(entry)
+        segments: set[Tuple[str, str]] = set()
+
+        for raw_segment in view.get("route_segments", []) or []:
+            normalized = self._normalize_route_segment(raw_segment)
+            if normalized:
+                segments.add(normalized)
+
+        source_scid = self._normalize_coordination_value(view.get("source_scid"))
+        sink_scid = self._normalize_coordination_value(view.get("sink_scid"))
+        if source_scid and sink_scid:
+            segments.add((source_scid, sink_scid))
+
+        source_peer = self._normalize_coordination_value(
+            view.get("source_peer_id") or view.get("from_peer_id")
+        )
+        dest_peer = self._normalize_coordination_value(
+            view.get("destination_peer_id")
+            or view.get("dest_peer_id")
+            or view.get("to_peer_id")
+            or view.get("target_peer_id")
+        )
+        if source_peer and dest_peer:
+            segments.add((source_peer, dest_peer))
+
+        return segments
+
+    def _candidate_matches_coordination_entry(
+        self,
+        candidate: RebalanceCandidate,
+        entry: Dict[str, Any],
+    ) -> bool:
+        view = self._coordination_entry_view(entry)
+        for amount_key in ("amount_sats", "chunk_size_sats", "active_chunk_amount_sats"):
+            if view.get(amount_key) is None:
+                continue
+            try:
+                expected_amount = int(view.get(amount_key) or 0)
+            except Exception:
+                expected_amount = 0
+            if expected_amount > 0 and int(candidate.amount_sats or 0) != expected_amount:
+                return False
+        source_scid = self._normalize_coordination_value(view.get("source_scid"))
+        sink_scid = self._normalize_coordination_value(view.get("sink_scid"))
+        candidate_sink = self._normalize_coordination_value(candidate.to_channel)
+        candidate_sources = {
+            self._normalize_coordination_value(source_scid)
+            for source_scid in candidate.source_candidates
+            if source_scid
+        }
+        if source_scid and sink_scid:
+            return sink_scid == candidate_sink and source_scid in candidate_sources
+
+        candidate_segments = self._candidate_route_segments(candidate)
+        if not candidate_segments:
+            return False
+        return bool(candidate_segments & self._coordination_entry_segments(entry))
+
+    def _coordination_assignment_rank(self, entry: Dict[str, Any], our_node_id: Optional[str]) -> int:
+        if not our_node_id:
+            return 0
+        view = self._coordination_entry_view(entry)
+        primary = str(view.get("primary_executor_member_id") or "").strip()
+        if primary and primary == our_node_id:
+            return 2
+        return 0
+
+    def _coordination_priority_score(self, entry: Dict[str, Any]) -> float:
+        view = self._coordination_entry_view(entry)
+        try:
+            return max(0.0, float(view.get("priority_score", 0.0) or 0.0))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _serialize_route_segments(segments: set[Tuple[str, str]]) -> List[str]:
+        serialized = []
+        for source, destination in sorted(segments):
+            if source and destination:
+                serialized.append(f"{source}>{destination}")
+        return serialized
+
+    def _is_coordinated_candidate(self, candidate: RebalanceCandidate) -> bool:
+        if not candidate:
+            return False
+        if getattr(candidate, "reason_code", "") == RebalanceReasonCode.COORDINATED_REBALANCE.value:
+            return True
+        return bool(
+            getattr(candidate, "coordination_hint_type", "") or
+            getattr(candidate, "coordination_hint_id", "")
+        )
+
+    def _get_coordination_execution_context(
+        self,
+        candidate: RebalanceCandidate,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._is_coordinated_candidate(candidate):
+            return None
+
+        route_segments = self._serialize_route_segments(
+            self._candidate_route_segments(candidate)
+        )
+        our_node_id = self._get_our_node_id() or ""
+        context: Dict[str, Any] = {
+            "coordination_hint_type": str(getattr(candidate, "coordination_hint_type", "") or "").strip(),
+            "coordination_hint_id": str(getattr(candidate, "coordination_hint_id", "") or "").strip(),
+            "recommendation_id": "",
+            "campaign_id": "",
+            "route_segments": route_segments,
+            "primary_executor_member_id": our_node_id,
+            "fallback_executor_member_ids": [],
+            "priority_score": float(getattr(candidate, "coordination_rank_bonus", 0.0) or 0.0),
+            "source_scid": str(candidate.from_channel or ""),
+            "sink_scid": str(candidate.to_channel or ""),
+            "amount_sats": int(candidate.amount_sats or 0),
+            "campaign_goal_type": "",
+            "campaign_target_peer_or_corridor": "",
+            "campaign_target_total_amount_sats": 0,
+            "campaign_remaining_amount_sats": None,
+            "campaign_chunk_size_sats": 0,
+            "campaign_chunk_index": 1,
+            "lease_id": None,
+        }
+
+        if context["coordination_hint_type"] == "campaign":
+            context["campaign_id"] = context["coordination_hint_id"]
+        elif context["coordination_hint_id"]:
+            context["recommendation_id"] = context["coordination_hint_id"]
+
+        entry: Dict[str, Any] = {}
+        if self.hive_hints is not None:
+            try:
+                if context["coordination_hint_type"] == "campaign":
+                    campaigns = list(self.hive_hints.get_rebalance_campaigns() or [])
+                    entry = next(
+                        (
+                            campaign for campaign in campaigns
+                            if str(campaign.get("campaign_id") or "").strip() == context["campaign_id"]
+                        ),
+                        {},
+                    )
+                    if not entry:
+                        entry = next(
+                            (
+                                campaign for campaign in campaigns
+                                if self._candidate_matches_coordination_entry(candidate, campaign)
+                            ),
+                            {},
+                        )
+                else:
+                    recommendations = list(self.hive_hints.get_rebalance_recommendations() or [])
+                    entry = next(
+                        (
+                            recommendation for recommendation in recommendations
+                            if str(recommendation.get("recommendation_id") or "").strip()
+                            == context["recommendation_id"]
+                        ),
+                        {},
+                    )
+                    if not entry:
+                        entry = next(
+                            (
+                                recommendation for recommendation in recommendations
+                                if self._candidate_matches_coordination_entry(candidate, recommendation)
+                            ),
+                            {},
+                        )
+            except Exception as e:
+                self.plugin.log(
+                    f"HIVE_COORDINATION: failed to refresh execution context: {e}",
+                    level='debug',
+                )
+                entry = {}
+
+        view = self._coordination_entry_view(entry)
+        if view:
+            recommendation_id = str(view.get("recommendation_id") or "").strip()
+            campaign_id = str(view.get("campaign_id") or "").strip()
+            if recommendation_id:
+                context["recommendation_id"] = recommendation_id
+            if campaign_id:
+                context["campaign_id"] = campaign_id
+            primary = str(view.get("primary_executor_member_id") or "").strip()
+            if primary:
+                context["primary_executor_member_id"] = primary
+            fallbacks = view.get("fallback_executor_member_ids")
+            if isinstance(fallbacks, list):
+                context["fallback_executor_member_ids"] = [
+                    str(member_id).strip()
+                    for member_id in fallbacks
+                    if str(member_id).strip()
+                ]
+            context["priority_score"] = self._coordination_priority_score(view)
+
+            entry_segments = self._serialize_route_segments(
+                self._coordination_entry_segments(view)
+            )
+            if entry_segments:
+                context["route_segments"] = entry_segments
+
+            context["source_scid"] = str(view.get("source_scid") or context["source_scid"] or "")
+            context["sink_scid"] = str(view.get("sink_scid") or context["sink_scid"] or "")
+            context["campaign_goal_type"] = str(view.get("goal_type") or "").strip()
+            context["campaign_target_peer_or_corridor"] = str(
+                view.get("target_peer_or_corridor") or ""
+            ).strip()
+            try:
+                total_amount = int(view.get("target_total_amount_sats") or 0)
+            except Exception:
+                total_amount = 0
+            context["campaign_target_total_amount_sats"] = total_amount
+            remaining_amount = view.get("remaining_amount_sats")
+            if remaining_amount is not None:
+                try:
+                    context["campaign_remaining_amount_sats"] = int(remaining_amount or 0)
+                except Exception:
+                    context["campaign_remaining_amount_sats"] = None
+            try:
+                context["campaign_chunk_size_sats"] = int(
+                    view.get("chunk_size_sats")
+                    or view.get("active_chunk_amount_sats")
+                    or 0
+                )
+            except Exception:
+                context["campaign_chunk_size_sats"] = 0
+            try:
+                context["campaign_chunk_index"] = max(1, int(view.get("chunk_index") or 1))
+            except Exception:
+                context["campaign_chunk_index"] = 1
+
+        return context
+
+    def _report_coordination_intent(
+        self,
+        candidate: RebalanceCandidate,
+    ) -> Optional[Dict[str, Any]]:
+        context = self._get_coordination_execution_context(candidate)
+        if not context:
+            return None
+
+        payload = {
+            "recommendation_id": context.get("recommendation_id", ""),
+            "route_segments": list(context.get("route_segments") or []),
+            "primary_executor_member_id": context.get("primary_executor_member_id", ""),
+            "priority_score": float(context.get("priority_score", 0.0) or 0.0),
+            "source_scid": context.get("source_scid"),
+            "sink_scid": context.get("sink_scid"),
+            "amount_sats": context.get("amount_sats"),
+            "fallback_executor_member_ids": list(context.get("fallback_executor_member_ids") or []),
+        }
+
+        if context.get("campaign_id"):
+            payload.update({
+                "campaign_goal_type": context.get("campaign_goal_type", ""),
+                "campaign_target_peer_or_corridor": context.get(
+                    "campaign_target_peer_or_corridor", ""
+                ),
+                "campaign_target_total_amount_sats": int(
+                    context.get("campaign_target_total_amount_sats", 0) or 0
+                ),
+                "campaign_chunk_size_sats": int(
+                    context.get("campaign_chunk_size_sats", 0) or 0
+                ),
+            })
+
+        try:
+            response = self.plugin.rpc.call("hive-report-rebalance-intent", payload)
+        except Exception as e:
+            context["intent_status"] = "report_failed"
+            self.plugin.log(
+                f"HIVE_COORDINATION: intent report failed for {candidate.to_channel}: {e}",
+                level='debug',
+            )
+            return context
+
+        if isinstance(response, dict):
+            status = str(response.get("status") or "").strip().lower()
+            context["intent_status"] = status or "invalid_response"
+            recommendation_id = str(response.get("recommendation_id") or "").strip()
+            if recommendation_id:
+                context["recommendation_id"] = recommendation_id
+            response_segments = response.get("route_segments")
+            if isinstance(response_segments, list) and response_segments:
+                context["route_segments"] = [
+                    str(segment).strip()
+                    for segment in response_segments
+                    if str(segment).strip()
+                ]
+            lease = response.get("lease")
+            if isinstance(lease, dict):
+                context["lease_id"] = lease.get("lease_id")
+            campaign = response.get("campaign")
+            if isinstance(campaign, dict):
+                context["campaign_id"] = (
+                    campaign.get("campaign_id") or context.get("campaign_id")
+                )
+                context["campaign_goal_type"] = str(
+                    campaign.get("goal_type") or context.get("campaign_goal_type") or ""
+                ).strip()
+                context["campaign_target_peer_or_corridor"] = str(
+                    campaign.get("target_peer_or_corridor")
+                    or context.get("campaign_target_peer_or_corridor")
+                    or ""
+                ).strip()
+                if campaign.get("target_total_amount_sats") is not None:
+                    try:
+                        context["campaign_target_total_amount_sats"] = int(
+                            campaign.get("target_total_amount_sats") or 0
+                        )
+                    except Exception:
+                        pass
+                if campaign.get("remaining_amount_sats") is not None:
+                    try:
+                        context["campaign_remaining_amount_sats"] = int(
+                            campaign.get("remaining_amount_sats") or 0
+                        )
+                    except Exception:
+                        pass
+                if campaign.get("chunk_size_sats") is not None:
+                    try:
+                        context["campaign_chunk_size_sats"] = int(
+                            campaign.get("chunk_size_sats") or 0
+                        )
+                    except Exception:
+                        pass
+                if campaign.get("chunk_index") is not None:
+                    try:
+                        context["campaign_chunk_index"] = max(
+                            1, int(campaign.get("chunk_index") or 1)
+                        )
+                    except Exception:
+                        pass
+        else:
+            context["intent_status"] = "invalid_response"
+        return context
+
+    def _report_coordination_outcome(
+        self,
+        candidate: RebalanceCandidate,
+        context: Optional[Dict[str, Any]],
+        *,
+        status: str,
+        reason: str = "",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if context is None:
+            context = self._get_coordination_execution_context(candidate)
+        if not context:
+            return
+
+        payload: Dict[str, Any] = {
+            "status": status,
+            "reason": reason,
+            "lease_id": context.get("lease_id"),
+            "campaign_id": context.get("campaign_id"),
+            "recommendation_id": context.get("recommendation_id", ""),
+            "amount_sats": context.get("amount_sats"),
+            "details": details or {},
+            "primary_executor_member_id": context.get("primary_executor_member_id", ""),
+            "fallback_executor_member_ids": list(context.get("fallback_executor_member_ids") or []),
+            "route_segments": list(context.get("route_segments") or []),
+            "priority_score": float(context.get("priority_score", 0.0) or 0.0),
+            "source_scid": context.get("source_scid"),
+            "sink_scid": context.get("sink_scid"),
+            "campaign_goal_type": context.get("campaign_goal_type", ""),
+            "campaign_target_peer_or_corridor": context.get(
+                "campaign_target_peer_or_corridor", ""
+            ),
+            "campaign_target_total_amount_sats": int(
+                context.get("campaign_target_total_amount_sats", 0) or 0
+            ),
+            "campaign_remaining_amount_sats": context.get("campaign_remaining_amount_sats"),
+            "campaign_chunk_size_sats": int(
+                context.get("campaign_chunk_size_sats", 0) or 0
+            ),
+            "campaign_chunk_index": int(context.get("campaign_chunk_index", 1) or 1),
+        }
+
+        try:
+            self.plugin.rpc.call("hive-report-rebalance-outcome", payload)
+        except Exception as e:
+            self.plugin.log(
+                f"HIVE_COORDINATION: outcome report failed for {candidate.to_channel}: {e}",
+                level='debug',
+            )
+
+    def _is_active_foreign_lease(self, lease: Dict[str, Any], our_node_id: Optional[str]) -> bool:
+        owner = str(lease.get("owner_member_id") or "").strip()
+        if not owner or (our_node_id and owner == our_node_id):
+            return False
+        status = str(lease.get("status") or "").strip().lower()
+        if status and status not in {"active", "leased"}:
+            return False
+        try:
+            expires_at = int(lease.get("expires_at", 0) or 0)
+        except Exception:
+            expires_at = 0
+        return expires_at <= 0 or expires_at > int(time.time())
+
+    def _apply_coordinated_rebalance_hints(
+        self,
+        candidates: List[RebalanceCandidate],
+        *,
+        our_node_id: Optional[str],
+        leases: List[Dict[str, Any]],
+        recommendations: List[Dict[str, Any]],
+        campaigns: List[Dict[str, Any]],
+    ) -> List[RebalanceCandidate]:
+        if not candidates:
+            return candidates
+
+        filtered: List[RebalanceCandidate] = []
+        for candidate in candidates:
+            suppressed = False
+            for lease in leases:
+                if not self._is_active_foreign_lease(lease, our_node_id):
+                    continue
+                if self._candidate_matches_coordination_entry(candidate, lease):
+                    suppressed = True
+                    break
+            if suppressed:
+                continue
+
+            best_hint_type = candidate.coordination_hint_type
+            best_hint_id = candidate.coordination_hint_id
+            best_rank_bonus = float(candidate.coordination_rank_bonus or 0.0)
+
+            for recommendation in recommendations:
+                if self._coordination_assignment_rank(recommendation, our_node_id) <= 0:
+                    continue
+                if not self._candidate_matches_coordination_entry(candidate, recommendation):
+                    continue
+                rank_bonus = 25.0 + self._coordination_priority_score(recommendation)
+                if rank_bonus > best_rank_bonus:
+                    best_rank_bonus = rank_bonus
+                    best_hint_type = "recommendation"
+                    best_hint_id = str(recommendation.get("recommendation_id") or "").strip()
+
+            for campaign in campaigns:
+                if str(campaign.get("status") or "").strip().lower() != "active":
+                    continue
+                if self._coordination_assignment_rank(campaign, our_node_id) <= 0:
+                    continue
+                if not self._candidate_matches_coordination_entry(candidate, campaign):
+                    continue
+                rank_bonus = 50.0 + self._coordination_priority_score(campaign)
+                if rank_bonus > best_rank_bonus:
+                    best_rank_bonus = rank_bonus
+                    best_hint_type = "campaign"
+                    best_hint_id = str(campaign.get("campaign_id") or "").strip()
+
+            if best_rank_bonus > 0:
+                candidate.reason_code = RebalanceReasonCode.COORDINATED_REBALANCE.value
+                candidate.coordination_hint_type = best_hint_type
+                candidate.coordination_hint_id = best_hint_id
+                candidate.coordination_rank_bonus = best_rank_bonus
+
+            filtered.append(candidate)
+
+        return filtered
+
+    @staticmethod
     def _should_skip_futility(fail_count: int, last_error_type: str) -> bool:
         """
         Check if a channel should be skipped by the futility breaker.
@@ -937,7 +1465,7 @@ class EVRebalancer:
                 self.plugin.log(f"Global budget limit provider failed: {e}", level='warn')
         return max(0, int((cfg or self.config.snapshot()).daily_budget_sats))
 
-    def _get_our_node_id(self) -> str:
+    def _get_our_node_id(self) -> Optional[str]:
         if self._our_node_id:
             return self._our_node_id
         try:
@@ -1045,6 +1573,11 @@ class EVRebalancer:
             self.plugin.log(f"Cleaned {cleaned} stale budget reservations before rebalance cycle")
 
         try:
+            coordination_leases: List[Dict[str, Any]] = []
+            coordination_recommendations: List[Dict[str, Any]] = []
+            coordination_campaigns: List[Dict[str, Any]] = []
+            our_node_id: Optional[str] = None
+
             # Slot check (legacy sling monitoring removed; stubs always allow)
             available_slots = self.job_manager.slots_available()
             if available_slots <= 0:
@@ -1103,6 +1636,20 @@ class EVRebalancer:
                     self.hive_hints.poll()
                 except Exception:
                     pass
+                try:
+                    coordination_leases = list(self.hive_hints.get_route_segment_leases() or [])
+                except Exception:
+                    coordination_leases = []
+                try:
+                    coordination_recommendations = list(self.hive_hints.get_rebalance_recommendations() or [])
+                except Exception:
+                    coordination_recommendations = []
+                try:
+                    coordination_campaigns = list(self.hive_hints.get_rebalance_campaigns() or [])
+                except Exception:
+                    coordination_campaigns = []
+                if coordination_leases or coordination_recommendations or coordination_campaigns:
+                    our_node_id = self._get_our_node_id()
 
             # Refresh askrene hive-fleet layer and fleet balances for route discovery
             if self.hive_router:
@@ -1197,6 +1744,9 @@ class EVRebalancer:
                 and bool(hive_low_channels)
                 and bool(hive_high_channels)
             )
+
+            # Track depleted count for Boltz coordination signal
+            self._last_depleted_count = len(depleted_channels)
 
             if (not depleted_channels or not source_channels) and not can_try_hive_equalization:
                 self._log_pure_hive_diagnostics(
@@ -1561,16 +2111,30 @@ class EVRebalancer:
             # Store for use in _select_source_candidates
             self._cycle_route_pair_in_channels = route_pair_in_channels
 
+            candidates = self._apply_coordinated_rebalance_hints(
+                candidates,
+                our_node_id=our_node_id,
+                leases=coordination_leases,
+                recommendations=coordination_recommendations,
+                campaigns=coordination_campaigns,
+            )
+
             # Sort by priority
             def sort_key(c):
                 dest_state = self.database.get_channel_state(c.to_channel)
                 flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
                 priority = 2 if flow_state == "source" else 1
+                coordination_priority = 0
+                if getattr(c, "coordination_hint_type", "") == "campaign":
+                    coordination_priority = 2
+                elif getattr(c, "coordination_hint_type", "") == "recommendation":
+                    coordination_priority = 1
                 # Boost channels on proven revenue routes
                 route_bonus = 1.3 if c.to_channel in route_pair_out_channels else 1.0
                 hive_bias = self._get_hive_rebalance_bias(c.to_peer_id)
                 biased_profit = c.expected_profit_sats * hive_bias * route_bonus
-                return (priority, biased_profit)
+                biased_profit += float(getattr(c, "coordination_rank_bonus", 0.0) or 0.0)
+                return (coordination_priority, priority, biased_profit)
 
             candidates.sort(key=sort_key, reverse=True)
 
@@ -1774,7 +2338,6 @@ class EVRebalancer:
             return None
         
         # Dynamic targeting based on flow state
-        # Note: sink channels are filtered out at method entry (return None)
         if dest_flow_state == "source":
             target_ratio = 0.85
         else:
@@ -2818,14 +3381,16 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         expected_income = int(spread * amount * expected_utilization / 1_000_000)
         expected_profit = expected_income - expected_fee_sats
 
-        # Resolve peer IDs for the destination (source_candidates in push semantics)
+        # Push semantics: drain overfull src_channel (sats flow OUT through it)
+        # and fill depleted dest channels (sats flow BACK IN through dest_scids[0]).
+        # Executor routes: source_candidates[0] = first hop (out), to_channel = last hop (in).
         resolved_peer_ids = dest_peer_ids or []
 
         return RebalanceCandidate(
-            source_candidates=dest_scids,
-            to_channel=src_channel,
-            primary_source_peer_id=resolved_peer_ids[0] if resolved_peer_ids else "",
-            to_peer_id=src_peer_id,
+            source_candidates=[src_channel],
+            to_channel=dest_scids[0] if dest_scids else src_channel,
+            primary_source_peer_id=src_peer_id,
+            to_peer_id=resolved_peer_ids[0] if resolved_peer_ids else "",
             amount_sats=amount,
             amount_msat=sats_to_base(amount),
             outbound_fee_ppm=src_fee,
@@ -2843,7 +3408,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             source_turnover_rate=0.0,
             expected_fee_sats=expected_fee_sats,
             direction="push",
-            source_candidate_peer_ids=resolved_peer_ids,
+            source_candidate_peer_ids=[src_peer_id],
         )
 
     def _estimate_inbound_fee(self, peer_id: str, amount_msat: int = 100000000) -> int:
@@ -3351,12 +3916,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     level='info'
                 )
 
-        # Track exhaustion for Boltz coordination: depleted channels exist
-        # but no profitable rebalance is possible → Boltz should step up
-        try:
-            self._last_depleted_count = len(depleted_channels)
-        except Exception:
-            pass
         self._last_profitable_count = len(candidates)
         self._last_cycle_ts = int(time.time())
 
@@ -3478,9 +4037,19 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         rebalance_id: Optional[int] = None
         reserved_budget = False
         job_started = False
+        coordination_context: Optional[Dict[str, Any]] = None
+        coordination_started = False
         try:
             # Validation: Return error on empty/None channel IDs (HO-01)
             if not candidate.from_channel or not candidate.to_channel:
+                if self._is_coordinated_candidate(candidate):
+                    self._report_coordination_outcome(
+                        candidate,
+                        None,
+                        status="declined",
+                        reason="local_policy_block",
+                        details={"error": "invalid_channel_ids"},
+                    )
                 self._set_last_decision_summary(
                     action="suppressed",
                     reason="invalid_channel_ids",
@@ -3621,12 +4190,24 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         f"Unified liquidity budget exhausted: only {remaining} sats available "
                         f"for rebalances after external costs"
                     )
+                    result["error"] = "local_budget_block"
                     self.plugin.log(
                         f"CAPITAL CONTROL: Budget reservation failed for {db_to_channel}. "
                         f"Remaining for rebalances: {remaining} sats "
                         f"(external costs: spent={ext_spent}, reserved={ext_reserved}, total_budget={effective_budget})",
                         level='warn'
                     )
+                    if self._is_coordinated_candidate(candidate):
+                        self._report_coordination_outcome(
+                            candidate,
+                            None,
+                            status="declined",
+                            reason="local_budget_block",
+                            details={
+                                "remaining_budget_sats": remaining,
+                                "effective_budget_sats": effective_budget,
+                            },
+                        )
                     # Budget exhaustion is global; don't backoff a specific channel.
                     with self._pending_lock:
                         self._pending.pop(candidate.to_channel, None)
@@ -3636,68 +4217,197 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # Fleet planning still uses hive intelligence before execution.
             # Network routes use revenue-* layers (best available paths).
             if self.rebalance_executor:
-                try:
-                    exec_result = self.rebalance_executor.execute(candidate)
-                    if exec_result.success:
-                        res = {
-                            "success": True,
-                            "message": (
-                                f"Rebalance completed via {exec_result.route_type} engine "
-                                f"({exec_result.fee_ppm}ppm, {exec_result.hops} hops, "
-                                f"{exec_result.parts} parts, {exec_result.attempts} attempts)"
-                            ),
-                        }
-                        if rebalance_id:
-                            self.database.update_rebalance_result(
-                                rebalance_id, 'completed',
-                                actual_fee_sats=base_to_sats_ceil(exec_result.fee_msat),
-                            )
-                        # Success resets failure count so channel re-enters rotation
-                        self.database.reset_failure_count(dest_channel)
-                    else:
-                        error_str = exec_result.error or "no_routes"
+                if self._is_coordinated_candidate(candidate):
+                    coordination_context = self._report_coordination_intent(candidate)
+                    intent_status = str(
+                        (coordination_context or {}).get("intent_status") or ""
+                    ).strip().lower()
+                    if intent_status != "accepted":
+                        intent_failure_reason = "shared_conflict_changed"
+                        if intent_status in {"report_failed", "invalid_response"}:
+                            intent_failure_reason = "local_execution_failed"
+                        self._report_coordination_outcome(
+                            candidate,
+                            coordination_context,
+                            status="declined",
+                            reason=intent_failure_reason,
+                            details={"intent_status": intent_status},
+                        )
                         res = {
                             "success": False,
-                            "error": error_str,
-                            "message": (
-                                f"RebalanceExecutor: {error_str} "
-                                f"({exec_result.attempts} attempts, "
-                                f"type={exec_result.route_type})"
-                            ),
+                            "error": intent_failure_reason,
+                            "message": f"Coordination intent rejected: {intent_status}",
                         }
+                    else:
+                        self._report_coordination_outcome(
+                            candidate,
+                            coordination_context,
+                            status="started",
+                        )
+                        coordination_started = True
+                        try:
+                            exec_result = self.rebalance_executor.execute(candidate)
+                            if exec_result.success:
+                                actual_fee_sats = base_to_sats_ceil(exec_result.fee_msat)
+                                res = {
+                                    "success": True,
+                                    "actual_fee_sats": actual_fee_sats,
+                                    "message": (
+                                        f"Rebalance completed via {exec_result.route_type} engine "
+                                        f"({exec_result.fee_ppm}ppm, {exec_result.hops} hops, "
+                                        f"{exec_result.parts} parts, {exec_result.attempts} attempts)"
+                                    ),
+                                }
+                                if rebalance_id:
+                                    self.database.update_rebalance_result(
+                                        rebalance_id, 'completed',
+                                        actual_fee_sats=actual_fee_sats,
+                                    )
+                                self.database.reset_failure_count(candidate.to_channel)
+                                self._report_coordination_outcome(
+                                    candidate,
+                                    coordination_context,
+                                    status="succeeded",
+                                    details={
+                                        "route_type": exec_result.route_type,
+                                        "attempts": exec_result.attempts,
+                                        "parts": exec_result.parts,
+                                        "fee_ppm": exec_result.fee_ppm,
+                                    },
+                                )
+                            else:
+                                error_str = exec_result.error or "no_routes"
+                                stable_error = RebalanceExecutor.stable_failure_reason(error_str)
+                                res = {
+                                    "success": False,
+                                    "error": stable_error,
+                                    "message": (
+                                        f"RebalanceExecutor: {error_str} "
+                                        f"({exec_result.attempts} attempts, "
+                                        f"type={exec_result.route_type})"
+                                    ),
+                                }
+                                if rebalance_id:
+                                    self.database.update_rebalance_result(
+                                        rebalance_id, 'failed',
+                                        error_message=error_str,
+                                    )
+                                error_type = self._classify_error(error_str)
+                                self.database.increment_failure_count(
+                                    candidate.to_channel,
+                                    attempted_ppm=candidate.max_fee_ppm,
+                                    attempted_amount=candidate.amount_sats,
+                                    error_type=error_type,
+                                )
+                                self._report_coordination_outcome(
+                                    candidate,
+                                    coordination_context,
+                                    status="failed",
+                                    reason=stable_error,
+                                    details={
+                                        "executor_error": error_str,
+                                        "route_type": exec_result.route_type,
+                                        "attempts": exec_result.attempts,
+                                    },
+                                )
+                        except Exception as e:
+                            stable_error = "local_execution_failed"
+                            res = {"success": False, "error": stable_error}
+                            if rebalance_id:
+                                self.database.update_rebalance_result(
+                                    rebalance_id, 'failed', error_message=str(e),
+                                )
+                            error_type = self._classify_error(str(e))
+                            try:
+                                self.database.increment_failure_count(
+                                    candidate.to_channel,
+                                    attempted_ppm=candidate.max_fee_ppm,
+                                    attempted_amount=candidate.amount_sats,
+                                    error_type=error_type,
+                                )
+                            except Exception:
+                                pass
+                            self._report_coordination_outcome(
+                                candidate,
+                                coordination_context,
+                                status="failed",
+                                reason=stable_error,
+                                details={"exception": str(e)},
+                            )
+                else:
+                    try:
+                        exec_result = self.rebalance_executor.execute(candidate)
+                        if exec_result.success:
+                            actual_fee_sats = base_to_sats_ceil(exec_result.fee_msat)
+                            res = {
+                                "success": True,
+                                "actual_fee_sats": actual_fee_sats,
+                                "message": (
+                                    f"Rebalance completed via {exec_result.route_type} engine "
+                                    f"({exec_result.fee_ppm}ppm, {exec_result.hops} hops, "
+                                    f"{exec_result.parts} parts, {exec_result.attempts} attempts)"
+                                ),
+                            }
+                            if rebalance_id:
+                                self.database.update_rebalance_result(
+                                    rebalance_id, 'completed',
+                                    actual_fee_sats=actual_fee_sats,
+                                )
+                            # Success resets failure count so channel re-enters rotation
+                            self.database.reset_failure_count(candidate.to_channel)
+                        else:
+                            error_str = exec_result.error or "no_routes"
+                            res = {
+                                "success": False,
+                                "error": error_str,
+                                "message": (
+                                    f"RebalanceExecutor: {error_str} "
+                                    f"({exec_result.attempts} attempts, "
+                                    f"type={exec_result.route_type})"
+                                ),
+                            }
+                            if rebalance_id:
+                                self.database.update_rebalance_result(
+                                    rebalance_id, 'failed',
+                                    error_message=error_str,
+                                )
+                            # Record failure for futility breaker
+                            error_type = self._classify_error(error_str)
+                            self.database.increment_failure_count(
+                                candidate.to_channel,
+                                attempted_ppm=candidate.max_fee_ppm,
+                                attempted_amount=candidate.amount_sats,
+                                error_type=error_type,
+                            )
+                    except Exception as e:
+                        res = {"success": False, "error": str(e)}
                         if rebalance_id:
                             self.database.update_rebalance_result(
-                                rebalance_id, 'failed',
-                                error_message=error_str,
+                                rebalance_id, 'failed', error_message=str(e),
                             )
                         # Record failure for futility breaker
-                        error_type = self._classify_error(error_str)
-                        self.database.increment_failure_count(
-                            candidate.to_channel,
-                            attempted_ppm=candidate.max_fee_ppm,
-                            attempted_amount=candidate.amount_sats,
-                            error_type=error_type,
-                        )
-                except Exception as e:
-                    res = {"success": False, "error": str(e)}
-                    if rebalance_id:
-                        self.database.update_rebalance_result(
-                            rebalance_id, 'failed', error_message=str(e),
-                        )
-                    # Record failure for futility breaker
-                    error_type = self._classify_error(str(e))
-                    try:
-                        self.database.increment_failure_count(
-                            candidate.to_channel,
-                            attempted_ppm=candidate.max_fee_ppm,
-                            attempted_amount=candidate.amount_sats,
-                            error_type=error_type,
-                        )
-                    except Exception:
-                        pass
+                        error_type = self._classify_error(str(e))
+                        try:
+                            self.database.increment_failure_count(
+                                candidate.to_channel,
+                                attempted_ppm=candidate.max_fee_ppm,
+                                attempted_amount=candidate.amount_sats,
+                                error_type=error_type,
+                            )
+                        except Exception:
+                            pass
             else:
                 # No executor available — cannot rebalance
-                res = {"success": False, "error": "no_rebalance_executor"}
+                stable_error = "local_policy_block" if self._is_coordinated_candidate(candidate) else "no_rebalance_executor"
+                res = {"success": False, "error": stable_error}
+                if self._is_coordinated_candidate(candidate):
+                    self._report_coordination_outcome(
+                        candidate,
+                        None,
+                        status="declined",
+                        reason=stable_error,
+                        details={"error": "no_rebalance_executor"},
+                    )
 
             if res.get("success"):
                 self._set_last_decision_summary(
@@ -3708,6 +4418,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     budget_blocked=False,
                 )
                 job_started = True
+                if reserved_budget and rebalance_id is not None:
+                    try:
+                        self.database.mark_budget_spent(
+                            str(rebalance_id),
+                            res.get("actual_fee_sats", 0) or 0,
+                        )
+                    except Exception:
+                        pass
                 with self._pending_lock:
                     self._pending.pop(candidate.to_channel, None)
                 result.update({
@@ -3728,9 +4446,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     safety_block=False,
                     budget_blocked=False,
                 )
-                self.database.update_rebalance_result(
-                    rebalance_id, 'failed', error_message=error
-                )
+                if rebalance_id:
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'failed', error_message=error
+                    )
+                result["error"] = error
                 result["message"] = f"Failed: {error}"
                 self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
                 if reserved_budget:
@@ -3746,6 +4466,16 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 safety_block=False,
                 budget_blocked=False,
             )
+            if self._is_coordinated_candidate(candidate):
+                reason = "local_execution_failed" if coordination_started else "local_policy_block"
+                self._report_coordination_outcome(
+                    candidate,
+                    coordination_context,
+                    status="failed" if coordination_started else "declined",
+                    reason=reason,
+                    details={"exception": str(e)},
+                )
+                result["error"] = reason
             result["message"] = str(e)
             self.plugin.log(f"Execution error: {e}", level='error')
             if rebalance_id is not None:
@@ -3859,28 +4589,23 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 reason_code='defibrillator'
             )
 
-            result = self.job_manager.execute_once(
-                scid=channel_id,
-                direction="pull",
-                amount=shock_amount,
-                maxppm=2000,
-                onceamount=shock_amount,
-                candidates=[best_source_id]
-            )
-
-            # Update database with outcome
-            if result.get("success"):
-                fee_sats = result.get("actual_fee_sats")
-                self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=fee_sats)
+            if self.rebalance_executor:
+                exec_result = self.rebalance_executor.execute(candidate)
+                if exec_result.success:
+                    self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=base_to_sats_ceil(exec_result.fee_msat))
+                else:
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'failed',
+                        error_message=exec_result.error or "rebalance failed"
+                    )
+                shock_ok = exec_result.success
             else:
-                self.database.update_rebalance_result(
-                    rebalance_id, 'failed',
-                    error_message=result.get("error", "rebalance failed")
-                )
+                self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no executor available")
+                shock_ok = False
 
             return {
                 "success": True,
-                "message": f"Defibrillator active: Zero-Fee flag set + Shock {'completed' if result.get('success') else 'failed'}"
+                "message": f"Defibrillator active: Zero-Fee flag set + Shock {'completed' if shock_ok else 'failed'}"
             }
 
         except Exception as e:
@@ -3969,17 +4694,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             reason_code='manual'
         )
 
-        once_result = self.job_manager.execute_once(
-            scid=to_channel,
-            direction="pull",
-            amount=amount_sats,
-            maxppm=max_fee_ppm,
-            onceamount=amount_sats,
-            candidates=[from_channel]
-        )
+        if not self.rebalance_executor:
+            self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no executor available")
+            return {"success": False, "error": "no executor available"}
 
-        if once_result.get("success"):
-            fee_sats = once_result.get("actual_fee_sats")
+        exec_result = self.rebalance_executor.execute(cand)
+
+        if exec_result.success:
+            fee_sats = base_to_sats_ceil(exec_result.fee_msat)
             self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=fee_sats)
             if fee_sats and fee_sats > 0:
                 try:
@@ -3992,13 +4714,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     )
                 except Exception as e:
                     self.plugin.log(f"Failed to record rebalance cost for {to_channel}: {e}", level='debug')
-            result = {"success": True, "message": once_result.get("message", "completed"), "actual_fee_sats": fee_sats}
+            result = {"success": True, "message": "completed", "actual_fee_sats": fee_sats}
         else:
             self.database.update_rebalance_result(
                 rebalance_id, 'failed',
-                error_message=once_result.get("error", "")
+                error_message=exec_result.error or ""
             )
-            result = {"success": False, "error": once_result.get("error", "rebalance failed")}
+            result = {"success": False, "error": exec_result.error or "rebalance failed"}
 
         # Include capital controls warning in result (unless force=True)
         if not capital_ok and not force:
@@ -4086,12 +4808,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             effective_weekly = cfg.weekly_budget_sats
 
             weekly_fees_spent = self.database.get_total_rebalance_fees(now - 7 * 86400)
-            # B2 FIX: ext_spent is a 24h figure. Scale to 7d for weekly comparison.
-            weekly_total_spent = weekly_fees_spent + (ext_spent * 7)
+            # Use daily external spend as-is for the weekly check rather than
+            # multiplying by 7 (which grossly overestimates after a single
+            # large Boltz swap).  The weekly rebalance fees already cover 7
+            # days; adding one day of external costs is conservative enough.
+            weekly_total_spent = weekly_fees_spent + ext_spent
             if weekly_total_spent >= effective_weekly:
                 self.plugin.log(
                     f"CAPITAL CONTROL: Weekly budget exceeded "
-                    f"(rebalance_fees_7d={weekly_fees_spent} + external_spent_7d_est={ext_spent * 7} "
+                    f"(rebalance_fees_7d={weekly_fees_spent} + external_spent_24h={ext_spent} "
                     f"= {weekly_total_spent} >= {effective_weekly})",
                     level='warn'
                 )

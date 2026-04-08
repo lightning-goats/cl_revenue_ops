@@ -103,6 +103,45 @@ class RebalanceExecutor:
         if self.plugin:
             self.plugin.log(f"[RebalanceExecutor] {msg}", level=level)
 
+    @staticmethod
+    def stable_failure_reason(error: Optional[str]) -> str:
+        """Map executor-local errors to stable cl-hive coordination reasons."""
+        normalized = str(error or "").strip().lower()
+        if not normalized:
+            return "local_execution_failed"
+        if normalized == "job_already_active":
+            return "local_policy_block"
+        if normalized in {
+            "no_route_back",
+            "no_fleet_route",
+            "fleet_self_route",
+            "non_pure_hive_route",
+        }:
+            return "no_viable_hive_path"
+        if normalized == "constrained_route" or normalized.startswith("route_over_budget"):
+            return "route_segment_exhausted"
+        if normalized.startswith("sendpay_error:"):
+            sendpay_error = normalized.split(":", 1)[1].strip()
+            if sendpay_error in {
+                "no_route_back",
+                "no_fleet_route",
+                "fleet_self_route",
+                "non_pure_hive_route",
+            }:
+                return "no_viable_hive_path"
+            if sendpay_error == "constrained_route" or sendpay_error.startswith("route_over_budget"):
+                return "route_segment_exhausted"
+            if any(token in normalized for token in ("temporary_channel_failure", "fee_insufficient")):
+                return "shared_conflict_changed"
+            if any(token in normalized for token in ("timeout", "timed out", "deadline")):
+                return "executor_timeout"
+            return "local_execution_failed"
+        if normalized.startswith("invoice_error:") or normalized == "invoice_failed":
+            return "local_execution_failed"
+        if normalized == "no_node_id":
+            return "local_execution_failed"
+        return "local_execution_failed"
+
     def _get_our_id(self) -> Optional[str]:
         if self._our_id:
             return self._our_id
@@ -1034,11 +1073,38 @@ class RebalanceExecutor:
                       callback: Callable[[RebalanceResult], None] = None) -> str:
         """Submit a rebalance job. Returns job_id."""
         route_type = "fleet" if candidate.hive_route_hops > 0 else "network"
+
+        # Fleet-aware sizing (same logic as execute())
+        amount_msat = candidate.amount_msat
+        if route_type == "fleet" and self.hive_router:
+            try:
+                source_scid = candidate.source_candidates[0] if candidate.source_candidates else ""
+                if source_scid:
+                    if self.data_service:
+                        channels = self.data_service.get_peer_channels()
+                    else:
+                        channels = self.plugin.rpc.listpeerchannels()
+                    for ch in channels.get("channels", []):
+                        if (ch.get("short_channel_id") == source_scid
+                                and ch.get("state") == "CHANNELD_NORMAL"):
+                            source_peer = ch.get("peer_id", "")
+                            if source_peer and self.hive_router.is_hive_member(source_peer):
+                                max_through = self.hive_router.max_rebalance_through_member(source_peer)
+                                if 0 < max_through < base_to_sats_floor(amount_msat):
+                                    amount_msat = sats_to_base(max_through)
+                                    self._log(
+                                        f"Fleet sizing (async): capped to {max_through} sats "
+                                        f"(peer {source_peer[:12]}...)",
+                                    )
+                            break
+            except Exception:
+                pass
+
         job = RebalanceJob(
             job_id=secrets.token_hex(8),
             channel_id=candidate.to_channel,
             peer_id=candidate.to_peer_id,
-            amount_msat=candidate.amount_msat,
+            amount_msat=amount_msat,
             max_fee_msat=self._effective_max_fee_msat(candidate),
             route_type=route_type,
         )
@@ -1049,19 +1115,18 @@ class RebalanceExecutor:
                 return ""
             self._jobs[normalized] = job
 
-        def _run():
-            try:
-                result = self._execute_single(job, candidate)
-                if callback:
-                    callback(result)
-                return result
-            finally:
-                with self._lock:
-                    self._jobs.pop(normalized, None)
-                    self._futures.pop(normalized, None)
+            def _run():
+                try:
+                    result = self._execute_single(job, candidate)
+                    if callback:
+                        callback(result)
+                    return result
+                finally:
+                    with self._lock:
+                        self._jobs.pop(normalized, None)
+                        self._futures.pop(normalized, None)
 
-        future = self._pool.submit(_run)
-        with self._lock:
+            future = self._pool.submit(_run)
             self._futures[normalized] = future
 
         return job.job_id

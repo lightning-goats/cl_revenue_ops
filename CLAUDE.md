@@ -146,7 +146,7 @@ cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a s
 
 **Module:** `modules/hive_hints.py` (`HiveHintAdapter`)
 
-**Enable:** `revenue-ops-hive-hints-enabled = true` (disabled by default)
+**Enable:** `revenue-ops-hive-hints-enabled = true` (enabled by default)
 
 **How it works:**
 - Polls `hive-export-hints` RPC once per fee cycle

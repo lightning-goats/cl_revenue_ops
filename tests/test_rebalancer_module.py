@@ -49,6 +49,71 @@ def _candidate(
     )
 
 
+def _make_coordination_rebalancer(mock_plugin, mock_database):
+    from modules.config import Config
+    from modules.rebalancer import EVRebalancer
+
+    cfg = Config(
+        dry_run=True,
+        low_liquidity_threshold=0.2,
+        high_liquidity_threshold=0.8,
+    )
+    r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+    r.data_service = MagicMock()
+    r.data_service.invalidate = MagicMock()
+    r.data_service.datastore_push.return_value = True
+
+    r._check_capital_controls = MagicMock(return_value=True)
+    r._get_peer_connection_status = MagicMock(return_value={})
+    r._calculate_turnover_rate = MagicMock(return_value=0.05)
+
+    source_scid = "111x1x0"
+    sink_a_scid = "222x2x0"
+    sink_b_scid = "333x3x0"
+    source_peer = "02" + "a" * 64
+    sink_a_peer = "02" + "b" * 64
+    sink_b_peer = "02" + "c" * 64
+
+    r._get_channels_with_balances = MagicMock(return_value={
+        source_scid: {
+            "peer_id": source_peer,
+            "capacity": 1_000_000,
+            "spendable_sats": 900_000,
+            "fee_ppm": 100,
+        },
+        sink_a_scid: {
+            "peer_id": sink_a_peer,
+            "capacity": 1_000_000,
+            "spendable_sats": 100_000,
+            "fee_ppm": 200,
+        },
+        sink_b_scid: {
+            "peer_id": sink_b_peer,
+            "capacity": 1_000_000,
+            "spendable_sats": 120_000,
+            "fee_ppm": 220,
+        },
+    })
+
+    mock_database.cleanup_stale_reservations.return_value = 0
+    mock_database.list_hot_channel_protection_override_peers.return_value = []
+    mock_database.get_failure_count.return_value = (0, 0)
+    mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+    mock_database.get_last_rebalance_time.return_value = 0
+    mock_database.get_top_route_pairs.return_value = []
+    mock_database.get_channel_state.return_value = {"state": "balanced"}
+
+    return r, {
+        "source_scid": source_scid,
+        "sink_a_scid": sink_a_scid,
+        "sink_b_scid": sink_b_scid,
+        "source_peer": source_peer,
+        "sink_a_peer": sink_a_peer,
+        "sink_b_peer": sink_b_peer,
+    }
+
+
 class TestExecuteRebalanceBudgetReservationLifecycle:
     def test_execute_rebalance_dry_run_does_not_reserve_budget_and_clears_pending(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -87,6 +152,281 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
         assert res["success"] is False
         mock_database.reserve_budget.assert_called_once()
         mock_database.release_budget_reservation.assert_called_once_with('456')
+
+
+class TestCoordinatedRebalanceReporting:
+    def _mock_coordination_rpc(self, mock_plugin, intent_response=None):
+        intent_calls = []
+        outcome_calls = []
+
+        def side_effect(method, params=None):
+            if method == "hive-report-rebalance-intent":
+                intent_calls.append(params)
+                return intent_response or {
+                    "status": "accepted",
+                    "recommendation_id": "rec-1",
+                    "route_segments": ["02" + "a" * 64 + ">" + "02" + "b" * 64],
+                    "lease": {"lease_id": "lease-1"},
+                    "campaign": {"campaign_id": "campaign-1"},
+                }
+            if method == "hive-report-rebalance-outcome":
+                outcome_calls.append(params)
+                return {"status": "accepted"}
+            return {}
+
+        mock_plugin.rpc.call.side_effect = side_effect
+        return intent_calls, outcome_calls
+
+    def test_execute_rebalance_reports_intent_started_and_success(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer, RebalanceReasonCode
+        from modules.rebalance_executor import RebalanceResult
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.data_service = MagicMock()
+        r.data_service.invalidate = MagicMock()
+        r.data_service.datastore_push.return_value = True
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.05)
+        r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
+        r.rebalance_executor = MagicMock()
+        r.rebalance_executor.execute.return_value = RebalanceResult(
+            success=True,
+            fee_msat=2500,
+            fee_ppm=50,
+            hops=3,
+            route_type="fleet",
+            attempts=1,
+            parts=1,
+        )
+
+        mock_database.record_rebalance = MagicMock(return_value=321)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(True, 9999))
+        mock_database.release_budget_reservation = MagicMock(return_value=True)
+        intent_calls, outcome_calls = self._mock_coordination_rpc(mock_plugin)
+
+        candidate = _candidate(
+            source_candidates=["111x1x0"],
+            to_channel="222x2x0",
+            primary_source_peer_id="02" + "a" * 64,
+            to_peer_id="02" + "b" * 64,
+            amount_sats=50_000,
+        )
+        candidate.reason_code = RebalanceReasonCode.COORDINATED_REBALANCE.value
+        candidate.coordination_hint_type = "recommendation"
+        candidate.coordination_hint_id = "rec-1"
+        candidate.coordination_rank_bonus = 1.25
+
+        result = r.execute_rebalance(candidate, enforce_budget=True)
+
+        assert result["success"] is True
+        assert len(intent_calls) == 1
+        assert len(outcome_calls) == 2
+        assert outcome_calls[0]["status"] == "started"
+        assert outcome_calls[1]["status"] == "succeeded"
+        assert outcome_calls[0]["lease_id"] == "lease-1"
+        assert outcome_calls[0]["campaign_id"] == "campaign-1"
+        assert outcome_calls[1]["lease_id"] == "lease-1"
+        assert outcome_calls[1]["campaign_id"] == "campaign-1"
+        assert outcome_calls[1]["recommendation_id"] == "rec-1"
+        assert outcome_calls[1]["route_segments"] == ["02" + "a" * 64 + ">" + "02" + "b" * 64]
+
+    def test_execute_rebalance_reports_failed_with_stable_reason(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer, RebalanceReasonCode
+        from modules.rebalance_executor import RebalanceResult
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.data_service = MagicMock()
+        r.data_service.invalidate = MagicMock()
+        r.data_service.datastore_push.return_value = True
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.05)
+        r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
+        r.rebalance_executor = MagicMock()
+        r.rebalance_executor.execute.return_value = RebalanceResult(
+            success=False,
+            route_type="fleet",
+            attempts=2,
+            error="sendpay_error: no_route_back",
+        )
+
+        mock_database.record_rebalance = MagicMock(return_value=322)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(True, 9999))
+        mock_database.release_budget_reservation = MagicMock(return_value=True)
+        intent_calls, outcome_calls = self._mock_coordination_rpc(mock_plugin)
+
+        candidate = _candidate(
+            source_candidates=["111x1x0"],
+            to_channel="222x2x0",
+            primary_source_peer_id="02" + "a" * 64,
+            to_peer_id="02" + "b" * 64,
+            amount_sats=50_000,
+        )
+        candidate.reason_code = RebalanceReasonCode.COORDINATED_REBALANCE.value
+        candidate.coordination_hint_type = "recommendation"
+        candidate.coordination_hint_id = "rec-2"
+        candidate.coordination_rank_bonus = 1.25
+
+        result = r.execute_rebalance(candidate, enforce_budget=True)
+
+        assert result["success"] is False
+        assert result["error"] == "no_viable_hive_path"
+        assert len(intent_calls) == 1
+        assert len(outcome_calls) == 2
+        assert outcome_calls[0]["status"] == "started"
+        assert outcome_calls[1]["status"] == "failed"
+        assert outcome_calls[1]["reason"] == "no_viable_hive_path"
+
+    def test_execute_rebalance_declines_without_executor(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer, RebalanceReasonCode
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.data_service = MagicMock()
+        r.data_service.invalidate = MagicMock()
+        r.data_service.datastore_push.return_value = True
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.05)
+        r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
+        r.rebalance_executor = None
+
+        mock_database.record_rebalance = MagicMock(return_value=323)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(True, 9999))
+        mock_database.release_budget_reservation = MagicMock(return_value=True)
+        intent_calls, outcome_calls = self._mock_coordination_rpc(mock_plugin)
+
+        candidate = _candidate(
+            source_candidates=["111x1x0"],
+            to_channel="222x2x0",
+            primary_source_peer_id="02" + "a" * 64,
+            to_peer_id="02" + "b" * 64,
+            amount_sats=50_000,
+        )
+        candidate.reason_code = RebalanceReasonCode.COORDINATED_REBALANCE.value
+        candidate.coordination_hint_type = "recommendation"
+        candidate.coordination_hint_id = "rec-3"
+        candidate.coordination_rank_bonus = 1.25
+
+        result = r.execute_rebalance(candidate, enforce_budget=True)
+
+        assert result["success"] is False
+        assert result["error"] == "local_policy_block"
+        assert len(intent_calls) == 0
+        assert len(outcome_calls) == 1
+        assert outcome_calls[0]["status"] == "declined"
+        assert outcome_calls[0]["reason"] == "local_policy_block"
+
+    def test_execute_rebalance_reports_budget_block_decline_for_coordinated_candidate(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer, RebalanceReasonCode
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.data_service = MagicMock()
+        r.data_service.invalidate = MagicMock()
+        r.data_service.datastore_push.return_value = True
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.05)
+        r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
+        r.rebalance_executor = MagicMock()
+
+        mock_database.record_rebalance = MagicMock(return_value=324)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(False, 0))
+        intent_calls, outcome_calls = self._mock_coordination_rpc(mock_plugin)
+
+        candidate = _candidate(
+            source_candidates=["111x1x0"],
+            to_channel="222x2x0",
+            primary_source_peer_id="02" + "a" * 64,
+            to_peer_id="02" + "b" * 64,
+            amount_sats=50_000,
+        )
+        candidate.reason_code = RebalanceReasonCode.COORDINATED_REBALANCE.value
+        candidate.coordination_hint_type = "recommendation"
+        candidate.coordination_hint_id = "rec-4"
+        candidate.coordination_rank_bonus = 1.25
+
+        result = r.execute_rebalance(candidate, enforce_budget=True)
+
+        assert result["success"] is False
+        assert len(intent_calls) == 0
+        assert len(outcome_calls) == 1
+        assert outcome_calls[0]["status"] == "declined"
+        assert outcome_calls[0]["reason"] == "local_budget_block"
+
+    def test_execute_rebalance_declines_when_intent_report_fails(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer, RebalanceReasonCode
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.data_service = MagicMock()
+        r.data_service.invalidate = MagicMock()
+        r.data_service.datastore_push.return_value = True
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.05)
+        r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
+        r.rebalance_executor = MagicMock()
+
+        mock_database.record_rebalance = MagicMock(return_value=325)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(True, 9999))
+        mock_database.release_budget_reservation = MagicMock(return_value=True)
+        outcome_calls = []
+
+        def side_effect(method, params=None):
+            if method == "hive-report-rebalance-intent":
+                raise RuntimeError("intent rpc unavailable")
+            if method == "hive-report-rebalance-outcome":
+                outcome_calls.append(params)
+                return {"status": "accepted"}
+            return {}
+
+        mock_plugin.rpc.call.side_effect = side_effect
+
+        candidate = _candidate(
+            source_candidates=["111x1x0"],
+            to_channel="222x2x0",
+            primary_source_peer_id="02" + "a" * 64,
+            to_peer_id="02" + "b" * 64,
+            amount_sats=50_000,
+        )
+        candidate.reason_code = RebalanceReasonCode.COORDINATED_REBALANCE.value
+        candidate.coordination_hint_type = "recommendation"
+        candidate.coordination_hint_id = "rec-5"
+        candidate.coordination_rank_bonus = 1.25
+
+        result = r.execute_rebalance(candidate, enforce_budget=True)
+
+        assert result["success"] is False
+        assert result["error"] == "local_execution_failed"
+        r.rebalance_executor.execute.assert_not_called()
+        assert len(outcome_calls) == 1
+        assert outcome_calls[0]["status"] == "declined"
+        assert outcome_calls[0]["reason"] == "local_execution_failed"
 
 
 class TestLastHopFeeUnits:
@@ -264,6 +604,390 @@ class TestHiveLiquidityReporting:
         mock_ds.datastore_push.assert_called()
 
 
+class TestCoordinatedRebalanceHints:
+    def test_foreign_lease_suppresses_overlapping_candidate(self, mock_plugin, mock_database):
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = [{
+            "lease_id": "lease-1",
+            "owner_member_id": "02" + "9" * 64,
+            "route_segments": [f"{ids['source_scid']}>{ids['sink_a_scid']}"],
+            "expires_at": int(time.time()) + 300,
+        }]
+        r.hive_hints.get_rebalance_recommendations.return_value = []
+        r.hive_hints.get_rebalance_campaigns.return_value = []
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=60_000,
+                )
+                c.expected_profit_sats = 15
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=55_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_b_scid"]]
+
+    def test_assigned_coordinated_rebalance_boosts_ranking_without_bypassing_ev(self, mock_plugin, mock_database):
+        from modules.rebalancer import RebalanceReasonCode
+
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = []
+        r.hive_hints.get_rebalance_recommendations.return_value = [{
+            "recommendation_id": "rec-1",
+            "source_scid": ids["source_scid"],
+            "sink_scid": ids["sink_a_scid"],
+            "route_segments": [f"{ids['source_scid']}>{ids['sink_a_scid']}"],
+            "primary_executor_member_id": our_id,
+            "fallback_executor_member_ids": [],
+            "priority_score": 0.9,
+            "confidence": 0.8,
+        }]
+        r.hive_hints.get_rebalance_campaigns.return_value = []
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=70_000,
+                )
+                c.expected_profit_sats = 10
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=70_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_a_scid"], ids["sink_b_scid"]]
+        assert candidates[0].reason_code == RebalanceReasonCode.COORDINATED_REBALANCE.value
+        assert candidates[1].reason_code == RebalanceReasonCode.EV_POSITIVE.value
+
+    def test_assigned_active_campaign_chunk_is_preferred_when_local_candidate_matches(
+        self, mock_plugin, mock_database
+    ):
+        from modules.rebalancer import RebalanceReasonCode
+
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = []
+        r.hive_hints.get_rebalance_recommendations.return_value = []
+        r.hive_hints.get_rebalance_campaigns.return_value = [{
+            "campaign_id": "camp-1",
+            "status": "active",
+            "primary_executor_member_id": our_id,
+            "fallback_executor_member_ids": [],
+            "active_chunk_lease": {
+                "route_segments": [{
+                    "source": ids["source_peer"],
+                    "destination": ids["sink_a_peer"],
+                }]
+            },
+            "chunk_size_sats": 75_000,
+            "priority_score": 0.95,
+        }]
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 10
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_a_scid"], ids["sink_b_scid"]]
+        assert candidates[0].reason_code == RebalanceReasonCode.COORDINATED_REBALANCE.value
+        assert candidates[1].reason_code == RebalanceReasonCode.EV_POSITIVE.value
+
+    def test_campaign_chunk_preferred_even_over_flow_priority_candidate(
+        self, mock_plugin, mock_database
+    ):
+        from modules.rebalancer import RebalanceReasonCode
+
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        def channel_state(scid):
+            if scid == ids["sink_b_scid"]:
+                return {"state": "source"}
+            return {"state": "balanced"}
+
+        mock_database.get_channel_state.side_effect = channel_state
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = []
+        r.hive_hints.get_rebalance_recommendations.return_value = []
+        r.hive_hints.get_rebalance_campaigns.return_value = [{
+            "campaign_id": "camp-1",
+            "status": "active",
+            "primary_executor_member_id": our_id,
+            "fallback_executor_member_ids": [],
+            "active_chunk_lease": {
+                "route_segments": [{
+                    "source": ids["source_peer"],
+                    "destination": ids["sink_a_peer"],
+                }]
+            },
+            "chunk_size_sats": 75_000,
+            "priority_score": 0.95,
+        }]
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 10
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_a_scid"], ids["sink_b_scid"]]
+        assert candidates[0].reason_code == RebalanceReasonCode.COORDINATED_REBALANCE.value
+
+    def test_foreign_lease_still_suppresses_when_campaign_fetch_fails(self, mock_plugin, mock_database):
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = [{
+            "lease_id": "lease-1",
+            "owner_member_id": "02" + "9" * 64,
+            "route_segments": [f"{ids['source_scid']}>{ids['sink_a_scid']}"],
+            "expires_at": int(time.time()) + 300,
+        }]
+        r.hive_hints.get_rebalance_recommendations.return_value = []
+        r.hive_hints.get_rebalance_campaigns.side_effect = RuntimeError("campaigns unavailable")
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=60_000,
+                )
+                c.expected_profit_sats = 15
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=55_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_b_scid"]]
+
+    def test_campaign_chunk_requires_matching_amount(self, mock_plugin, mock_database):
+        from modules.rebalancer import RebalanceReasonCode
+
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = []
+        r.hive_hints.get_rebalance_recommendations.return_value = []
+        r.hive_hints.get_rebalance_campaigns.return_value = [{
+            "campaign_id": "camp-1",
+            "status": "active",
+            "primary_executor_member_id": our_id,
+            "fallback_executor_member_ids": [],
+            "active_chunk_lease": {
+                "route_segments": [{
+                    "source": ids["source_peer"],
+                    "destination": ids["sink_a_peer"],
+                }]
+            },
+            "chunk_size_sats": 50_000,
+            "priority_score": 0.95,
+        }]
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 10
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=75_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_b_scid"], ids["sink_a_scid"]]
+        assert candidates[1].reason_code == RebalanceReasonCode.EV_POSITIVE.value
+
+    def test_fallback_executor_does_not_take_primary_recommendation_bonus(
+        self, mock_plugin, mock_database
+    ):
+        from modules.rebalancer import RebalanceReasonCode
+
+        r, ids = _make_coordination_rebalancer(mock_plugin, mock_database)
+        our_id = "02" + "f" * 64
+
+        r.hive_hints = MagicMock()
+        r.hive_hints.poll = MagicMock()
+        r.hive_hints.get_rebalance_bias.return_value = 1.0
+        r.hive_hints.get_route_segment_leases.return_value = []
+        r.hive_hints.get_rebalance_recommendations.return_value = [{
+            "recommendation_id": "rec-1",
+            "source_scid": ids["source_scid"],
+            "sink_scid": ids["sink_a_scid"],
+            "primary_executor_member_id": "02" + "9" * 64,
+            "fallback_executor_member_ids": [our_id],
+            "priority_score": 0.9,
+        }]
+        r.hive_hints.get_rebalance_campaigns.return_value = []
+        r._get_our_node_id = MagicMock(return_value=our_id)
+
+        def analyze(dest_id, *_args, **_kwargs):
+            if dest_id == ids["sink_a_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_a_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_a_peer"],
+                    amount_sats=70_000,
+                )
+                c.expected_profit_sats = 10
+                return c
+            if dest_id == ids["sink_b_scid"]:
+                c = _candidate(
+                    source_candidates=[ids["source_scid"]],
+                    to_channel=ids["sink_b_scid"],
+                    primary_source_peer_id=ids["source_peer"],
+                    to_peer_id=ids["sink_b_peer"],
+                    amount_sats=70_000,
+                )
+                c.expected_profit_sats = 12
+                return c
+            return None
+
+        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
+
+        candidates = r.find_rebalance_candidates()
+
+        assert [c.to_channel for c in candidates] == [ids["sink_b_scid"], ids["sink_a_scid"]]
+        assert all(c.reason_code == RebalanceReasonCode.EV_POSITIVE.value for c in candidates)
+
+
 
 # Sling-specific test classes removed: TestJobMonitorPrefersSlingStats,
 # TestParallelJobsParameter, TestFlowAwareDepletion, TestPinnedStatsSchema,
@@ -302,9 +1026,9 @@ class TestPushCandidateDetection:
 
         assert result is not None
         assert result.direction == "push"
-        assert result.to_channel == src_id
+        assert result.source_candidates == [src_id]
+        assert result.to_channel == dest_scids[0]
         assert result.dest_flow_state == "push_drain"
-        assert result.source_candidates == dest_scids
 
     def test_push_candidates_skipped_below_threshold(self, mock_plugin, mock_database):
         """Source with ratio 0.80 or <3 failures -> no push candidate."""
@@ -344,18 +1068,18 @@ class TestPushCandidateDetection:
 
 
 class TestExecuteOnceDiagnostic:
-    """Diagnostic rebalance uses execute_once instead of execute_rebalance."""
+    """Diagnostic rebalance uses rebalance_executor.execute()."""
 
-    def test_diagnostic_uses_execute_once(self, mock_plugin, mock_database):
+    def test_diagnostic_uses_rebalance_executor(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
+        from modules.rebalance_executor import RebalanceResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         channel_id = "111x222x0"
 
-        # Mock _get_channels_with_balances
         r._get_channels_with_balances = MagicMock(return_value={
             channel_id: {"capacity": 1_000_000, "spendable_sats": 50_000, "peer_id": "02" + "b" * 64, "fee_ppm": 100},
             "333x444x0": {"capacity": 2_000_000, "spendable_sats": 1_500_000, "peer_id": "02" + "c" * 64, "fee_ppm": 200},
@@ -365,17 +1089,19 @@ class TestExecuteOnceDiagnostic:
         mock_database.record_rebalance = MagicMock(return_value=99)
         mock_database.update_rebalance_result = MagicMock()
 
-        r.job_manager.execute_once = MagicMock(return_value={"success": True, "message": "done"})
+        mock_executor = MagicMock()
+        mock_executor.execute.return_value = RebalanceResult(success=True, fee_msat=5000)
+        r.rebalance_executor = mock_executor
 
         result = r.diagnostic_rebalance(channel_id)
 
-        r.job_manager.execute_once.assert_called_once()
-        call_kwargs = r.job_manager.execute_once.call_args
-        assert call_kwargs[1]["scid"] == channel_id or call_kwargs[0][0] == channel_id
+        mock_executor.execute.assert_called_once()
+        assert result["success"] is True
 
     def test_diagnostic_records_in_database(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
+        from modules.rebalance_executor import RebalanceResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -390,7 +1116,9 @@ class TestExecuteOnceDiagnostic:
         mock_database.record_rebalance = MagicMock(return_value=99)
         mock_database.update_rebalance_result = MagicMock()
 
-        r.job_manager.execute_once = MagicMock(return_value={"success": False, "error": "no route"})
+        mock_executor = MagicMock()
+        mock_executor.execute.return_value = RebalanceResult(success=False, error="no route")
+        r.rebalance_executor = mock_executor
 
         r.diagnostic_rebalance(channel_id)
 
@@ -399,11 +1127,12 @@ class TestExecuteOnceDiagnostic:
 
 
 class TestExecuteOnceManual:
-    """Manual rebalance uses execute_once instead of execute_rebalance."""
+    """Manual rebalance uses rebalance_executor.execute()."""
 
-    def test_manual_uses_execute_once(self, mock_plugin, mock_database):
+    def test_manual_uses_rebalance_executor(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
+        from modules.rebalance_executor import RebalanceResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -420,16 +1149,19 @@ class TestExecuteOnceManual:
         mock_database.record_rebalance = MagicMock(return_value=55)
         mock_database.update_rebalance_result = MagicMock()
 
-        r.job_manager.execute_once = MagicMock(return_value={"success": True, "message": "completed"})
+        mock_executor = MagicMock()
+        mock_executor.execute.return_value = RebalanceResult(success=True, fee_msat=5000)
+        r.rebalance_executor = mock_executor
 
         result = r.manual_rebalance(from_ch, to_ch, 100_000, max_fee_sats=50)
 
-        r.job_manager.execute_once.assert_called_once()
+        mock_executor.execute.assert_called_once()
         assert result["success"] is True
 
     def test_manual_handles_failure(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
+        from modules.rebalance_executor import RebalanceResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -446,7 +1178,9 @@ class TestExecuteOnceManual:
         mock_database.record_rebalance = MagicMock(return_value=55)
         mock_database.update_rebalance_result = MagicMock()
 
-        r.job_manager.execute_once = MagicMock(return_value={"success": False, "error": "no route found"})
+        mock_executor = MagicMock()
+        mock_executor.execute.return_value = RebalanceResult(success=False, error="no route found")
+        r.rebalance_executor = mock_executor
 
         result = r.manual_rebalance(from_ch, to_ch, 100_000, max_fee_sats=50)
 
@@ -466,7 +1200,9 @@ class TestExecuteOnceManual:
 class TestAuditTurn2PushPeerIds:
     """P0-2 regression: Push candidates must have populated peer IDs."""
 
-    def test_push_ev_populates_source_candidate_peer_ids(self, mock_plugin, mock_database):
+    def test_push_ev_populates_peer_ids_correctly(self, mock_plugin, mock_database):
+        """Push: source_candidates=[src_channel], to_channel=dest[0].
+        So primary_source_peer_id=src_peer, to_peer_id=dest_peer[0]."""
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
@@ -477,19 +1213,22 @@ class TestAuditTurn2PushPeerIds:
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
-        src_info = {"peer_id": "02" + "a" * 64, "fee_ppm": 500, "capacity": 1_000_000}
+        src_peer = "02" + "a" * 64
+        src_info = {"peer_id": src_peer, "fee_ppm": 500, "capacity": 1_000_000}
         dest_scids = ["100x1x0", "200x2x0"]
         dest_peer_ids = ["02" + "b" * 64, "02" + "c" * 64]
 
-        # Mock inbound fee estimation to return a value lower than src_fee
         r._estimate_inbound_fee = MagicMock(return_value=100)
 
         result = r._estimate_push_ev("300x3x0", src_info, 0.90, dest_scids, dest_peer_ids)
         assert result is not None
-        assert result.source_candidate_peer_ids == dest_peer_ids
-        assert result.primary_source_peer_id == dest_peer_ids[0]
+        assert result.source_candidates == ["300x3x0"]
+        assert result.to_channel == dest_scids[0]
+        assert result.primary_source_peer_id == src_peer
+        assert result.source_candidate_peer_ids == [src_peer]
+        assert result.to_peer_id == dest_peer_ids[0]
 
-    def test_push_ev_empty_dest_peer_ids_uses_empty_string(self, mock_plugin, mock_database):
+    def test_push_ev_empty_dest_peer_ids(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
@@ -500,15 +1239,16 @@ class TestAuditTurn2PushPeerIds:
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
-        src_info = {"peer_id": "02" + "a" * 64, "fee_ppm": 500, "capacity": 1_000_000}
+        src_peer = "02" + "a" * 64
+        src_info = {"peer_id": src_peer, "fee_ppm": 500, "capacity": 1_000_000}
         dest_scids = ["100x1x0"]
         r._estimate_inbound_fee = MagicMock(return_value=100)
 
-        # No dest_peer_ids passed (backward compat)
         result = r._estimate_push_ev("300x3x0", src_info, 0.90, dest_scids)
         assert result is not None
-        assert result.source_candidate_peer_ids == []
-        assert result.primary_source_peer_id == ""
+        assert result.source_candidates == ["300x3x0"]
+        assert result.primary_source_peer_id == src_peer
+        assert result.to_peer_id == ""
 
 
 class TestAuditTurn2ManualRebalanceZeroFee:
