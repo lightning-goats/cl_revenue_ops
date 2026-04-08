@@ -257,7 +257,7 @@ class TestCoordinatedRebalanceReporting:
             success=False,
             route_type="fleet",
             attempts=2,
-            error="no_route_back",
+            error="sendpay_error: no_route_back",
         )
 
         mock_database.record_rebalance = MagicMock(return_value=322)
@@ -422,11 +422,11 @@ class TestCoordinatedRebalanceReporting:
         result = r.execute_rebalance(candidate, enforce_budget=True)
 
         assert result["success"] is False
-        assert result["error"] == "shared_conflict_changed"
+        assert result["error"] == "local_execution_failed"
         r.rebalance_executor.execute.assert_not_called()
         assert len(outcome_calls) == 1
         assert outcome_calls[0]["status"] == "declined"
-        assert outcome_calls[0]["reason"] == "shared_conflict_changed"
+        assert outcome_calls[0]["reason"] == "local_execution_failed"
 
 
 class TestLastHopFeeUnits:

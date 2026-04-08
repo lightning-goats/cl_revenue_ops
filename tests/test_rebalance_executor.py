@@ -504,8 +504,20 @@ class TestStableFailureReasonMapping:
         from modules.rebalance_executor import RebalanceExecutor
 
         assert RebalanceExecutor.stable_failure_reason("job_already_active") == "local_policy_block"
-        assert RebalanceExecutor.stable_failure_reason("no_route_back") == "no_viable_hive_path"
-        assert RebalanceExecutor.stable_failure_reason("constrained_route") == "route_segment_exhausted"
+        assert (
+            RebalanceExecutor.stable_failure_reason("sendpay_error: no_route_back")
+            == "no_viable_hive_path"
+        )
+        assert (
+            RebalanceExecutor.stable_failure_reason("sendpay_error: constrained_route")
+            == "route_segment_exhausted"
+        )
+        assert (
+            RebalanceExecutor.stable_failure_reason(
+                "sendpay_error: route_over_budget: 1200ppm exceeds budget"
+            )
+            == "route_segment_exhausted"
+        )
 
 
 class TestHiveEqualizationRouteValidation:

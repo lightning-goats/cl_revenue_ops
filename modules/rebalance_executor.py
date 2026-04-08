@@ -118,12 +118,24 @@ class RebalanceExecutor:
             "non_pure_hive_route",
         }:
             return "no_viable_hive_path"
+        if normalized == "constrained_route" or normalized.startswith("route_over_budget"):
+            return "route_segment_exhausted"
         if normalized in {
             "constrained_route",
             "route_over_budget",
         }:
             return "route_segment_exhausted"
         if normalized.startswith("sendpay_error:"):
+            sendpay_error = normalized.split(":", 1)[1].strip()
+            if sendpay_error in {
+                "no_route_back",
+                "no_fleet_route",
+                "fleet_self_route",
+                "non_pure_hive_route",
+            }:
+                return "no_viable_hive_path"
+            if sendpay_error == "constrained_route" or sendpay_error.startswith("route_over_budget"):
+                return "route_segment_exhausted"
             if any(token in normalized for token in ("temporary_channel_failure", "fee_insufficient")):
                 return "shared_conflict_changed"
             if any(token in normalized for token in ("timeout", "timed out", "deadline")):

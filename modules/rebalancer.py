@@ -4225,16 +4225,19 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         (coordination_context or {}).get("intent_status") or ""
                     ).strip().lower()
                     if intent_status != "accepted":
+                        intent_failure_reason = "shared_conflict_changed"
+                        if intent_status in {"report_failed", "invalid_response"}:
+                            intent_failure_reason = "local_execution_failed"
                         self._report_coordination_outcome(
                             candidate,
                             coordination_context,
                             status="declined",
-                            reason="shared_conflict_changed",
+                            reason=intent_failure_reason,
                             details={"intent_status": intent_status},
                         )
                         res = {
                             "success": False,
-                            "error": "shared_conflict_changed",
+                            "error": intent_failure_reason,
                             "message": f"Coordination intent rejected: {intent_status}",
                         }
                     else:
