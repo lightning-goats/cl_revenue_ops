@@ -1465,7 +1465,7 @@ class EVRebalancer:
                 self.plugin.log(f"Global budget limit provider failed: {e}", level='warn')
         return max(0, int((cfg or self.config.snapshot()).daily_budget_sats))
 
-    def _get_our_node_id(self) -> str:
+    def _get_our_node_id(self) -> Optional[str]:
         if self._our_node_id:
             return self._our_node_id
         try:
@@ -1744,6 +1744,9 @@ class EVRebalancer:
                 and bool(hive_low_channels)
                 and bool(hive_high_channels)
             )
+
+            # Track depleted count for Boltz coordination signal
+            self._last_depleted_count = len(depleted_channels)
 
             if (not depleted_channels or not source_channels) and not can_try_hive_equalization:
                 self._log_pure_hive_diagnostics(
@@ -2335,7 +2338,6 @@ class EVRebalancer:
             return None
         
         # Dynamic targeting based on flow state
-        # Note: sink channels are filtered out at method entry (return None)
         if dest_flow_state == "source":
             target_ratio = 0.85
         else:
@@ -3379,14 +3381,16 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         expected_income = int(spread * amount * expected_utilization / 1_000_000)
         expected_profit = expected_income - expected_fee_sats
 
-        # Resolve peer IDs for the destination (source_candidates in push semantics)
+        # Push semantics: drain overfull src_channel (sats flow OUT through it)
+        # and fill depleted dest channels (sats flow BACK IN through dest_scids[0]).
+        # Executor routes: source_candidates[0] = first hop (out), to_channel = last hop (in).
         resolved_peer_ids = dest_peer_ids or []
 
         return RebalanceCandidate(
-            source_candidates=dest_scids,
-            to_channel=src_channel,
-            primary_source_peer_id=resolved_peer_ids[0] if resolved_peer_ids else "",
-            to_peer_id=src_peer_id,
+            source_candidates=[src_channel],
+            to_channel=dest_scids[0] if dest_scids else src_channel,
+            primary_source_peer_id=src_peer_id,
+            to_peer_id=resolved_peer_ids[0] if resolved_peer_ids else "",
             amount_sats=amount,
             amount_msat=sats_to_base(amount),
             outbound_fee_ppm=src_fee,
@@ -3404,7 +3408,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             source_turnover_rate=0.0,
             expected_fee_sats=expected_fee_sats,
             direction="push",
-            source_candidate_peer_ids=resolved_peer_ids,
+            source_candidate_peer_ids=[src_peer_id],
         )
 
     def _estimate_inbound_fee(self, peer_id: str, amount_msat: int = 100000000) -> int:
@@ -3912,12 +3916,6 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     level='info'
                 )
 
-        # Track exhaustion for Boltz coordination: depleted channels exist
-        # but no profitable rebalance is possible → Boltz should step up
-        try:
-            self._last_depleted_count = len(depleted_channels)
-        except Exception:
-            pass
         self._last_profitable_count = len(candidates)
         self._last_cycle_ts = int(time.time())
 
@@ -4250,8 +4248,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                         try:
                             exec_result = self.rebalance_executor.execute(candidate)
                             if exec_result.success:
+                                actual_fee_sats = base_to_sats_ceil(exec_result.fee_msat)
                                 res = {
                                     "success": True,
+                                    "actual_fee_sats": actual_fee_sats,
                                     "message": (
                                         f"Rebalance completed via {exec_result.route_type} engine "
                                         f"({exec_result.fee_ppm}ppm, {exec_result.hops} hops, "
@@ -4261,7 +4261,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                                 if rebalance_id:
                                     self.database.update_rebalance_result(
                                         rebalance_id, 'completed',
-                                        actual_fee_sats=base_to_sats_ceil(exec_result.fee_msat),
+                                        actual_fee_sats=actual_fee_sats,
                                     )
                                 self.database.reset_failure_count(candidate.to_channel)
                                 self._report_coordination_outcome(
@@ -4338,8 +4338,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     try:
                         exec_result = self.rebalance_executor.execute(candidate)
                         if exec_result.success:
+                            actual_fee_sats = base_to_sats_ceil(exec_result.fee_msat)
                             res = {
                                 "success": True,
+                                "actual_fee_sats": actual_fee_sats,
                                 "message": (
                                     f"Rebalance completed via {exec_result.route_type} engine "
                                     f"({exec_result.fee_ppm}ppm, {exec_result.hops} hops, "
@@ -4349,7 +4351,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                             if rebalance_id:
                                 self.database.update_rebalance_result(
                                     rebalance_id, 'completed',
-                                    actual_fee_sats=base_to_sats_ceil(exec_result.fee_msat),
+                                    actual_fee_sats=actual_fee_sats,
                                 )
                             # Success resets failure count so channel re-enters rotation
                             self.database.reset_failure_count(candidate.to_channel)
@@ -4416,6 +4418,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     budget_blocked=False,
                 )
                 job_started = True
+                if reserved_budget and rebalance_id is not None:
+                    try:
+                        self.database.mark_budget_spent(
+                            str(rebalance_id),
+                            res.get("actual_fee_sats", 0) or 0,
+                        )
+                    except Exception:
+                        pass
                 with self._pending_lock:
                     self._pending.pop(candidate.to_channel, None)
                 result.update({
@@ -4579,28 +4589,23 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 reason_code='defibrillator'
             )
 
-            result = self.job_manager.execute_once(
-                scid=channel_id,
-                direction="pull",
-                amount=shock_amount,
-                maxppm=2000,
-                onceamount=shock_amount,
-                candidates=[best_source_id]
-            )
-
-            # Update database with outcome
-            if result.get("success"):
-                fee_sats = result.get("actual_fee_sats")
-                self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=fee_sats)
+            if self.rebalance_executor:
+                exec_result = self.rebalance_executor.execute(candidate)
+                if exec_result.success:
+                    self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=base_to_sats_ceil(exec_result.fee_msat))
+                else:
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'failed',
+                        error_message=exec_result.error or "rebalance failed"
+                    )
+                shock_ok = exec_result.success
             else:
-                self.database.update_rebalance_result(
-                    rebalance_id, 'failed',
-                    error_message=result.get("error", "rebalance failed")
-                )
+                self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no executor available")
+                shock_ok = False
 
             return {
                 "success": True,
-                "message": f"Defibrillator active: Zero-Fee flag set + Shock {'completed' if result.get('success') else 'failed'}"
+                "message": f"Defibrillator active: Zero-Fee flag set + Shock {'completed' if shock_ok else 'failed'}"
             }
 
         except Exception as e:
@@ -4689,17 +4694,14 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             reason_code='manual'
         )
 
-        once_result = self.job_manager.execute_once(
-            scid=to_channel,
-            direction="pull",
-            amount=amount_sats,
-            maxppm=max_fee_ppm,
-            onceamount=amount_sats,
-            candidates=[from_channel]
-        )
+        if not self.rebalance_executor:
+            self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no executor available")
+            return {"success": False, "error": "no executor available"}
 
-        if once_result.get("success"):
-            fee_sats = once_result.get("actual_fee_sats")
+        exec_result = self.rebalance_executor.execute(cand)
+
+        if exec_result.success:
+            fee_sats = base_to_sats_ceil(exec_result.fee_msat)
             self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=fee_sats)
             if fee_sats and fee_sats > 0:
                 try:
@@ -4712,13 +4714,13 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                     )
                 except Exception as e:
                     self.plugin.log(f"Failed to record rebalance cost for {to_channel}: {e}", level='debug')
-            result = {"success": True, "message": once_result.get("message", "completed"), "actual_fee_sats": fee_sats}
+            result = {"success": True, "message": "completed", "actual_fee_sats": fee_sats}
         else:
             self.database.update_rebalance_result(
                 rebalance_id, 'failed',
-                error_message=once_result.get("error", "")
+                error_message=exec_result.error or ""
             )
-            result = {"success": False, "error": once_result.get("error", "rebalance failed")}
+            result = {"success": False, "error": exec_result.error or "rebalance failed"}
 
         # Include capital controls warning in result (unless force=True)
         if not capital_ok and not force:
@@ -4806,12 +4808,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             effective_weekly = cfg.weekly_budget_sats
 
             weekly_fees_spent = self.database.get_total_rebalance_fees(now - 7 * 86400)
-            # B2 FIX: ext_spent is a 24h figure. Scale to 7d for weekly comparison.
-            weekly_total_spent = weekly_fees_spent + (ext_spent * 7)
+            # Use daily external spend as-is for the weekly check rather than
+            # multiplying by 7 (which grossly overestimates after a single
+            # large Boltz swap).  The weekly rebalance fees already cover 7
+            # days; adding one day of external costs is conservative enough.
+            weekly_total_spent = weekly_fees_spent + ext_spent
             if weekly_total_spent >= effective_weekly:
                 self.plugin.log(
                     f"CAPITAL CONTROL: Weekly budget exceeded "
-                    f"(rebalance_fees_7d={weekly_fees_spent} + external_spent_7d_est={ext_spent * 7} "
+                    f"(rebalance_fees_7d={weekly_fees_spent} + external_spent_24h={ext_spent} "
                     f"= {weekly_total_spent} >= {effective_weekly})",
                     level='warn'
                 )

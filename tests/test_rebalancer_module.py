@@ -1026,9 +1026,9 @@ class TestPushCandidateDetection:
 
         assert result is not None
         assert result.direction == "push"
-        assert result.to_channel == src_id
+        assert result.source_candidates == [src_id]
+        assert result.to_channel == dest_scids[0]
         assert result.dest_flow_state == "push_drain"
-        assert result.source_candidates == dest_scids
 
     def test_push_candidates_skipped_below_threshold(self, mock_plugin, mock_database):
         """Source with ratio 0.80 or <3 failures -> no push candidate."""
@@ -1068,18 +1068,18 @@ class TestPushCandidateDetection:
 
 
 class TestExecuteOnceDiagnostic:
-    """Diagnostic rebalance uses execute_once instead of execute_rebalance."""
+    """Diagnostic rebalance uses rebalance_executor.execute()."""
 
-    def test_diagnostic_uses_execute_once(self, mock_plugin, mock_database):
+    def test_diagnostic_uses_rebalance_executor(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
+        from modules.rebalance_executor import RebalanceResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
         channel_id = "111x222x0"
 
-        # Mock _get_channels_with_balances
         r._get_channels_with_balances = MagicMock(return_value={
             channel_id: {"capacity": 1_000_000, "spendable_sats": 50_000, "peer_id": "02" + "b" * 64, "fee_ppm": 100},
             "333x444x0": {"capacity": 2_000_000, "spendable_sats": 1_500_000, "peer_id": "02" + "c" * 64, "fee_ppm": 200},
@@ -1089,17 +1089,19 @@ class TestExecuteOnceDiagnostic:
         mock_database.record_rebalance = MagicMock(return_value=99)
         mock_database.update_rebalance_result = MagicMock()
 
-        r.job_manager.execute_once = MagicMock(return_value={"success": True, "message": "done"})
+        mock_executor = MagicMock()
+        mock_executor.execute.return_value = RebalanceResult(success=True, fee_msat=5000)
+        r.rebalance_executor = mock_executor
 
         result = r.diagnostic_rebalance(channel_id)
 
-        r.job_manager.execute_once.assert_called_once()
-        call_kwargs = r.job_manager.execute_once.call_args
-        assert call_kwargs[1]["scid"] == channel_id or call_kwargs[0][0] == channel_id
+        mock_executor.execute.assert_called_once()
+        assert result["success"] is True
 
     def test_diagnostic_records_in_database(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
+        from modules.rebalance_executor import RebalanceResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -1114,7 +1116,9 @@ class TestExecuteOnceDiagnostic:
         mock_database.record_rebalance = MagicMock(return_value=99)
         mock_database.update_rebalance_result = MagicMock()
 
-        r.job_manager.execute_once = MagicMock(return_value={"success": False, "error": "no route"})
+        mock_executor = MagicMock()
+        mock_executor.execute.return_value = RebalanceResult(success=False, error="no route")
+        r.rebalance_executor = mock_executor
 
         r.diagnostic_rebalance(channel_id)
 
@@ -1123,11 +1127,12 @@ class TestExecuteOnceDiagnostic:
 
 
 class TestExecuteOnceManual:
-    """Manual rebalance uses execute_once instead of execute_rebalance."""
+    """Manual rebalance uses rebalance_executor.execute()."""
 
-    def test_manual_uses_execute_once(self, mock_plugin, mock_database):
+    def test_manual_uses_rebalance_executor(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
+        from modules.rebalance_executor import RebalanceResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -1144,16 +1149,19 @@ class TestExecuteOnceManual:
         mock_database.record_rebalance = MagicMock(return_value=55)
         mock_database.update_rebalance_result = MagicMock()
 
-        r.job_manager.execute_once = MagicMock(return_value={"success": True, "message": "completed"})
+        mock_executor = MagicMock()
+        mock_executor.execute.return_value = RebalanceResult(success=True, fee_msat=5000)
+        r.rebalance_executor = mock_executor
 
         result = r.manual_rebalance(from_ch, to_ch, 100_000, max_fee_sats=50)
 
-        r.job_manager.execute_once.assert_called_once()
+        mock_executor.execute.assert_called_once()
         assert result["success"] is True
 
     def test_manual_handles_failure(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
+        from modules.rebalance_executor import RebalanceResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -1170,7 +1178,9 @@ class TestExecuteOnceManual:
         mock_database.record_rebalance = MagicMock(return_value=55)
         mock_database.update_rebalance_result = MagicMock()
 
-        r.job_manager.execute_once = MagicMock(return_value={"success": False, "error": "no route found"})
+        mock_executor = MagicMock()
+        mock_executor.execute.return_value = RebalanceResult(success=False, error="no route found")
+        r.rebalance_executor = mock_executor
 
         result = r.manual_rebalance(from_ch, to_ch, 100_000, max_fee_sats=50)
 
@@ -1190,7 +1200,9 @@ class TestExecuteOnceManual:
 class TestAuditTurn2PushPeerIds:
     """P0-2 regression: Push candidates must have populated peer IDs."""
 
-    def test_push_ev_populates_source_candidate_peer_ids(self, mock_plugin, mock_database):
+    def test_push_ev_populates_peer_ids_correctly(self, mock_plugin, mock_database):
+        """Push: source_candidates=[src_channel], to_channel=dest[0].
+        So primary_source_peer_id=src_peer, to_peer_id=dest_peer[0]."""
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
@@ -1201,19 +1213,22 @@ class TestAuditTurn2PushPeerIds:
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
-        src_info = {"peer_id": "02" + "a" * 64, "fee_ppm": 500, "capacity": 1_000_000}
+        src_peer = "02" + "a" * 64
+        src_info = {"peer_id": src_peer, "fee_ppm": 500, "capacity": 1_000_000}
         dest_scids = ["100x1x0", "200x2x0"]
         dest_peer_ids = ["02" + "b" * 64, "02" + "c" * 64]
 
-        # Mock inbound fee estimation to return a value lower than src_fee
         r._estimate_inbound_fee = MagicMock(return_value=100)
 
         result = r._estimate_push_ev("300x3x0", src_info, 0.90, dest_scids, dest_peer_ids)
         assert result is not None
-        assert result.source_candidate_peer_ids == dest_peer_ids
-        assert result.primary_source_peer_id == dest_peer_ids[0]
+        assert result.source_candidates == ["300x3x0"]
+        assert result.to_channel == dest_scids[0]
+        assert result.primary_source_peer_id == src_peer
+        assert result.source_candidate_peer_ids == [src_peer]
+        assert result.to_peer_id == dest_peer_ids[0]
 
-    def test_push_ev_empty_dest_peer_ids_uses_empty_string(self, mock_plugin, mock_database):
+    def test_push_ev_empty_dest_peer_ids(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
@@ -1224,15 +1239,16 @@ class TestAuditTurn2PushPeerIds:
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
-        src_info = {"peer_id": "02" + "a" * 64, "fee_ppm": 500, "capacity": 1_000_000}
+        src_peer = "02" + "a" * 64
+        src_info = {"peer_id": src_peer, "fee_ppm": 500, "capacity": 1_000_000}
         dest_scids = ["100x1x0"]
         r._estimate_inbound_fee = MagicMock(return_value=100)
 
-        # No dest_peer_ids passed (backward compat)
         result = r._estimate_push_ev("300x3x0", src_info, 0.90, dest_scids)
         assert result is not None
-        assert result.source_candidate_peer_ids == []
-        assert result.primary_source_peer_id == ""
+        assert result.source_candidates == ["300x3x0"]
+        assert result.primary_source_peer_id == src_peer
+        assert result.to_peer_id == ""
 
 
 class TestAuditTurn2ManualRebalanceZeroFee:

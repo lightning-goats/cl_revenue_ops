@@ -300,11 +300,11 @@ class TestB2WeeklyBudgetExtCosts:
         r = EVRebalancer(mock_plugin, cfg, mock_database)
         return r
 
-    def test_weekly_gate_blocks_when_ext_costs_scaled_to_7d(self, mock_plugin, mock_database):
-        """spent_24h_sats=200 -> 200*7=1400 > weekly_budget=1000 -> blocked.
+    def test_weekly_gate_uses_actual_24h_ext_costs(self, mock_plugin, mock_database):
+        """ext_spent is a 24h figure; adding it once (not *7) avoids
+        overestimation from a single large Boltz swap.
 
-        Without the fix: 0 + 200 = 200 < 1000 -> wrongly passes.
-        With the fix:    0 + 1400 = 1400 > 1000 -> correctly blocked.
+        weekly_fees=0 + ext_spent=200 = 200 < 1000 -> allowed.
         """
         r = self._make_rebalancer(mock_plugin, mock_database)
 
@@ -326,11 +326,35 @@ class TestB2WeeklyBudgetExtCosts:
 
         result = r._check_capital_controls()
 
-        # With the fix (ext_spent * 7 = 1400 > 1000), this should be False
+        # 24h ext_spent is added once (not multiplied by 7) to avoid
+        # grossly overestimating after a single large swap.
+        assert result is True, (
+            "Weekly budget should NOT block when 24h external costs (200) "
+            "plus 7d rebalance fees (0) = 200 < weekly_budget (1000)."
+        )
+
+    def test_weekly_gate_blocks_when_fees_plus_ext_exceed_budget(self, mock_plugin, mock_database):
+        """weekly_fees=900 + ext_spent=200 = 1100 > 1000 -> blocked."""
+        r = self._make_rebalancer(mock_plugin, mock_database)
+
+        mock_plugin.rpc.listfunds.return_value = {
+            "outputs": [{"status": "confirmed", "amount_msat": 10_000_000_000}],
+            "channels": [],
+        }
+
+        mock_database.get_total_rebalance_fees.return_value = 900
+        mock_database.get_total_routing_revenue.return_value = 0
+
+        r._get_external_liquidity_costs = MagicMock(return_value={
+            "spent_24h_sats": 200,
+            "reserved_24h_sats": 0,
+        })
+
+        result = r._check_capital_controls()
+
         assert result is False, (
-            "Weekly budget gate should block when 24h external costs scaled to "
-            "7d (200 * 7 = 1400) exceed weekly_budget_sats (1000). "
-            "Bug B2: ext_spent was not scaled to 7d for the weekly comparison."
+            "Weekly budget should block when 7d rebalance fees (900) "
+            "plus 24h external costs (200) = 1100 >= weekly_budget (1000)."
         )
         assert r._capital_control_blocker == "weekly_budget_sats"
 
