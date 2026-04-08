@@ -1131,6 +1131,7 @@ class EVRebalancer:
         try:
             response = self.plugin.rpc.call("hive-report-rebalance-intent", payload)
         except Exception as e:
+            context["intent_status"] = "report_failed"
             self.plugin.log(
                 f"HIVE_COORDINATION: intent report failed for {candidate.to_channel}: {e}",
                 level='debug',
@@ -1139,8 +1140,7 @@ class EVRebalancer:
 
         if isinstance(response, dict):
             status = str(response.get("status") or "").strip().lower()
-            if status:
-                context["intent_status"] = status
+            context["intent_status"] = status or "invalid_response"
             recommendation_id = str(response.get("recommendation_id") or "").strip()
             if recommendation_id:
                 context["recommendation_id"] = recommendation_id
@@ -1195,6 +1195,8 @@ class EVRebalancer:
                         )
                     except Exception:
                         pass
+        else:
+            context["intent_status"] = "invalid_response"
         return context
 
     def _report_coordination_outcome(
@@ -4220,9 +4222,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
                 if self._is_coordinated_candidate(candidate):
                     coordination_context = self._report_coordination_intent(candidate)
                     intent_status = str(
-                        (coordination_context or {}).get("intent_status") or "accepted"
+                        (coordination_context or {}).get("intent_status") or ""
                     ).strip().lower()
-                    if intent_status not in {"", "accepted"}:
+                    if intent_status != "accepted":
                         self._report_coordination_outcome(
                             candidate,
                             coordination_context,

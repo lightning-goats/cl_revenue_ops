@@ -374,6 +374,60 @@ class TestCoordinatedRebalanceReporting:
         assert outcome_calls[0]["status"] == "declined"
         assert outcome_calls[0]["reason"] == "local_budget_block"
 
+    def test_execute_rebalance_declines_when_intent_report_fails(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer, RebalanceReasonCode
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.data_service = MagicMock()
+        r.data_service.invalidate = MagicMock()
+        r.data_service.datastore_push.return_value = True
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.05)
+        r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
+        r.rebalance_executor = MagicMock()
+
+        mock_database.record_rebalance = MagicMock(return_value=325)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(True, 9999))
+        mock_database.release_budget_reservation = MagicMock(return_value=True)
+        outcome_calls = []
+
+        def side_effect(method, params=None):
+            if method == "hive-report-rebalance-intent":
+                raise RuntimeError("intent rpc unavailable")
+            if method == "hive-report-rebalance-outcome":
+                outcome_calls.append(params)
+                return {"status": "accepted"}
+            return {}
+
+        mock_plugin.rpc.call.side_effect = side_effect
+
+        candidate = _candidate(
+            source_candidates=["111x1x0"],
+            to_channel="222x2x0",
+            primary_source_peer_id="02" + "a" * 64,
+            to_peer_id="02" + "b" * 64,
+            amount_sats=50_000,
+        )
+        candidate.reason_code = RebalanceReasonCode.COORDINATED_REBALANCE.value
+        candidate.coordination_hint_type = "recommendation"
+        candidate.coordination_hint_id = "rec-5"
+        candidate.coordination_rank_bonus = 1.25
+
+        result = r.execute_rebalance(candidate, enforce_budget=True)
+
+        assert result["success"] is False
+        assert result["error"] == "shared_conflict_changed"
+        r.rebalance_executor.execute.assert_not_called()
+        assert len(outcome_calls) == 1
+        assert outcome_calls[0]["status"] == "declined"
+        assert outcome_calls[0]["reason"] == "shared_conflict_changed"
+
 
 class TestLastHopFeeUnits:
     def test_get_last_hop_fee_converts_base_fee_to_ppm(self, mock_plugin, mock_database):
