@@ -103,6 +103,38 @@ class RebalanceExecutor:
         if self.plugin:
             self.plugin.log(f"[RebalanceExecutor] {msg}", level=level)
 
+    @staticmethod
+    def stable_failure_reason(error: Optional[str]) -> str:
+        """Map executor-local errors to stable cl-hive coordination reasons."""
+        normalized = str(error or "").strip().lower()
+        if not normalized:
+            return "local_execution_failed"
+        if normalized == "job_already_active":
+            return "local_policy_block"
+        if normalized in {
+            "no_route_back",
+            "no_fleet_route",
+            "fleet_self_route",
+            "non_pure_hive_route",
+        }:
+            return "no_viable_hive_path"
+        if normalized in {
+            "constrained_route",
+            "route_over_budget",
+        }:
+            return "route_segment_exhausted"
+        if normalized.startswith("sendpay_error:"):
+            if any(token in normalized for token in ("temporary_channel_failure", "fee_insufficient")):
+                return "shared_conflict_changed"
+            if any(token in normalized for token in ("timeout", "timed out", "deadline")):
+                return "executor_timeout"
+            return "local_execution_failed"
+        if normalized.startswith("invoice_error:") or normalized == "invoice_failed":
+            return "local_execution_failed"
+        if normalized == "no_node_id":
+            return "local_execution_failed"
+        return "local_execution_failed"
+
     def _get_our_id(self) -> Optional[str]:
         if self._our_id:
             return self._our_id

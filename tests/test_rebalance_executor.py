@@ -499,6 +499,15 @@ class TestExecuteFailure:
         plugin.rpc.delinvoice.assert_called_once()
 
 
+class TestStableFailureReasonMapping:
+    def test_maps_known_executor_errors_to_cl_hive_reasons(self):
+        from modules.rebalance_executor import RebalanceExecutor
+
+        assert RebalanceExecutor.stable_failure_reason("job_already_active") == "local_policy_block"
+        assert RebalanceExecutor.stable_failure_reason("no_route_back") == "no_viable_hive_path"
+        assert RebalanceExecutor.stable_failure_reason("constrained_route") == "route_segment_exhausted"
+
+
 class TestHiveEqualizationRouteValidation:
     def test_equalization_rejects_non_hive_intermediate(self):
         plugin = MagicMock()
