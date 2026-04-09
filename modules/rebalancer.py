@@ -3761,12 +3761,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         Uses memoization via self._fee_cache to avoid repeated lookups
         within a single find_rebalance_candidates run.
         """
-        # Fleet members intend to charge 0 (cl-hive policy). Use 0 for
-        # candidate selection (cost estimation). The executor always queries
-        # the actual peer channel fee before sendpay, so stale gossip fees
-        # are handled at execution time, not selection time.
-        if self._is_hive_member(peer_id):
-            return 0
+        # Always use actual peer channel fees, even for fleet members.
+        # cl-hive intends 0 fee but gossip propagation is asynchronous —
+        # the real fee may still be non-zero. Using the actual fee gives
+        # accurate budget estimates and avoids WIRE_FEE_INSUFFICIENT.
 
         # Check cache first (memoization for this run)
         cache_key = (peer_id, int(amount_msat or 0))
