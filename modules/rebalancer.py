@@ -32,6 +32,7 @@ from pyln.client import Plugin, RpcError
 
 from .config import Config, ConfigSnapshot
 from .database import Database
+from .rebalance_state_v2 import build_state_snapshot as build_rebalance_state_v2_snapshot
 from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
 from .rebalance_executor import RebalanceExecutor
 from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
@@ -1617,6 +1618,10 @@ class EVRebalancer:
     def set_capex_engine(self, engine: 'CapexBudgetEngine'):
         """Inject the unified capex budget engine."""
         self._capex_engine = engine
+
+    def build_rebalance_state_v2(self, channels, capex_allocations):
+        """Build the normalized v2 state snapshot from normalized inputs."""
+        return build_rebalance_state_v2_snapshot(channels, capex_allocations)
 
     def set_capacity_planner(self, planner) -> None:
         """Set reference to capacity planner for coordination."""
