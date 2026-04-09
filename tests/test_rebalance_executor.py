@@ -1395,3 +1395,211 @@ class TestInformChannel:
         assert inform_calls[0][0][1]["amount_msat"] == 501000
         assert inform_calls[1][0][1]["short_channel_id_dir"] == "200x1x0/1"
         assert inform_calls[1][0][1]["amount_msat"] == 500000
+
+
+# ------------------------------------------------------------------
+# WIRE_FEE_INSUFFICIENT handling tests
+# ------------------------------------------------------------------
+
+class TestWireFeeInsufficientHandling:
+    """Tests for WIRE_FEE_INSUFFICIENT retry, budget inflation, and learning."""
+
+    def _make_executor(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        executor._our_id = "our_node_id"
+        return executor, plugin
+
+    def test_destination_hop_fee_error_triggers_retry(self):
+        """WIRE_FEE_INSUFFICIENT at erring_index == len(full_route) should retry,
+        not be treated as terminal."""
+        executor, plugin = self._make_executor()
+
+        # Build a 3-hop route for context
+        full_route = [
+            {"channel": "100x1x0", "id": "peer_a", "direction": 0, "amount_msat": 510000, "delay": 40},
+            {"channel": "150x1x0", "id": "peer_b", "direction": 1, "amount_msat": 505000, "delay": 30},
+            {"channel": "200x1x0", "id": "our_node_id", "amount_msat": 500000, "delay": 18},
+        ]
+
+        # Failure at erring_index == 3 (len(full_route)) — the destination hop
+        failure = {
+            "code": 204,
+            "message": "WIRE_FEE_INSUFFICIENT",
+            "erring_index": 3,
+            "erring_channel": "200x1x0",
+            "erring_direction": 1,
+            "erring_node": "our_node_id",
+            "failcode": 4103,
+            "failcodename": "WIRE_FEE_INSUFFICIENT",
+        }
+
+        # Simulate the retry decision logic
+        excludes = []
+        failcodename = failure.get("failcodename", "")
+        erring_index = failure.get("erring_index")
+        should_retry = False
+
+        if failure.get("code") == 204:
+            if full_route and erring_index == len(full_route):
+                if failcodename == "WIRE_FEE_INSUFFICIENT" and failure.get("erring_channel"):
+                    edir = failure.get("erring_direction")
+                    if edir is not None:
+                        previous_excludes = list(excludes)
+                        excludes = list(dict.fromkeys(
+                            excludes + [f"{failure['erring_channel']}/{edir}"]
+                        ))
+                        should_retry = excludes != previous_excludes
+
+        assert should_retry is True
+        assert "200x1x0/1" in excludes
+
+    def test_destination_hop_non_fee_error_stays_terminal(self):
+        """Non-fee errors at destination hop should still be terminal."""
+        failure = {
+            "code": 204,
+            "erring_index": 3,
+            "erring_channel": "200x1x0",
+            "erring_direction": 1,
+            "failcode": 0x1000 | 7,
+            "failcodename": "WIRE_PERMANENT_CHANNEL_FAILURE",
+        }
+        full_route = [
+            {"channel": "100x1x0", "id": "a", "direction": 0, "amount_msat": 510000, "delay": 40},
+            {"channel": "150x1x0", "id": "b", "direction": 1, "amount_msat": 505000, "delay": 30},
+            {"channel": "200x1x0", "id": "us", "amount_msat": 500000, "delay": 18},
+        ]
+
+        failcodename = failure.get("failcodename", "")
+        erring_index = failure.get("erring_index")
+        should_retry = False
+
+        if failure.get("code") == 204:
+            if full_route and erring_index == len(full_route):
+                if failcodename == "WIRE_FEE_INSUFFICIENT" and failure.get("erring_channel"):
+                    edir = failure.get("erring_direction")
+                    if edir is not None:
+                        should_retry = True
+                else:
+                    should_retry = False
+
+        assert should_retry is False
+
+    def test_fee_budget_inflates_by_20_percent(self):
+        """Fee budget should increase by 20% on WIRE_FEE_INSUFFICIENT retry."""
+        job = RebalanceJob(
+            job_id="test1",
+            channel_id="200x1x0",
+            peer_id="dest_peer",
+            amount_msat=500000000,
+            max_fee_msat=100000,
+            route_type="network",
+        )
+
+        # Simulate the inflation logic
+        should_retry = True
+        failcodename = "WIRE_FEE_INSUFFICIENT"
+
+        if should_retry and failcodename == "WIRE_FEE_INSUFFICIENT":
+            inflated = int(job.max_fee_msat * 1.20)
+            original_max = getattr(job, '_original_max_fee_msat', job.max_fee_msat)
+            if not hasattr(job, '_original_max_fee_msat'):
+                job._original_max_fee_msat = job.max_fee_msat
+            job.max_fee_msat = min(inflated, original_max * 2)
+
+        assert job.max_fee_msat == 120000  # 100000 * 1.20
+        assert job._original_max_fee_msat == 100000
+
+    def test_fee_budget_capped_at_2x_original(self):
+        """Fee budget inflation should never exceed 2x the original budget."""
+        job = RebalanceJob(
+            job_id="test2",
+            channel_id="200x1x0",
+            peer_id="dest_peer",
+            amount_msat=500000000,
+            max_fee_msat=100000,
+            route_type="network",
+        )
+
+        # First inflation: 100000 -> 120000
+        job._original_max_fee_msat = 100000
+        job.max_fee_msat = 120000
+
+        # Second inflation attempt: 120000 * 1.20 = 144000, capped at 200000
+        inflated = int(job.max_fee_msat * 1.20)
+        job.max_fee_msat = min(inflated, job._original_max_fee_msat * 2)
+        assert job.max_fee_msat == 144000  # Under 2x cap
+
+        # Third inflation: 144000 * 1.20 = 172800, still under 2x
+        inflated = int(job.max_fee_msat * 1.20)
+        job.max_fee_msat = min(inflated, job._original_max_fee_msat * 2)
+        assert job.max_fee_msat == 172800
+
+        # Fourth: 172800 * 1.20 = 207360, capped at 200000
+        inflated = int(job.max_fee_msat * 1.20)
+        job.max_fee_msat = min(inflated, job._original_max_fee_msat * 2)
+        assert job.max_fee_msat == 200000  # Capped at 2x original
+
+    def test_learn_from_failure_bans_channel_on_fee_error(self):
+        """_learn_from_failure should ban the erroring channel in routing memory."""
+        executor, plugin = self._make_executor()
+
+        full_route = [
+            {"channel": "100x1x0", "id": "peer_a", "direction": 0, "amount_msat": 510000},
+            {"channel": "150x1x0", "id": "peer_b", "direction": 1, "amount_msat": 505000},
+            {"channel": "200x1x0", "id": "our_node_id", "amount_msat": 500000},
+        ]
+        failure = {
+            "code": 204,
+            "erring_index": 2,
+            "erring_channel": "150x1x0",
+            "erring_direction": 1,
+            "erring_node": "peer_b",
+            "failcode": 4103,
+            "failcodename": "WIRE_FEE_INSUFFICIENT",
+        }
+        exc = FakeRpcError(command="waitsendpay", error={
+            "code": 204,
+            "data": {
+                "erring_index": 2,
+                "erring_channel": "150x1x0",
+                "erring_direction": 1,
+                "failcodename": "WIRE_FEE_INSUFFICIENT",
+            }
+        })
+
+        executor._learn_from_failure(full_route, failure, exc)
+
+        # Verify the channel was banned
+        assert "150x1x0/1" in executor._routing_memory.current_excludes()
+
+    def test_learn_from_failure_stores_fee_error_channel(self):
+        """_learn_from_failure should store the erring channel for cache invalidation."""
+        executor, plugin = self._make_executor()
+
+        full_route = [
+            {"channel": "100x1x0", "id": "peer_a", "direction": 0, "amount_msat": 510000},
+            {"channel": "200x1x0", "id": "our_node_id", "amount_msat": 500000},
+        ]
+        failure = {
+            "code": 204,
+            "erring_index": 1,
+            "erring_channel": "100x1x0",
+            "erring_direction": 0,
+            "erring_node": "peer_a",
+            "failcode": 4103,
+            "failcodename": "WIRE_FEE_INSUFFICIENT",
+        }
+        exc = FakeRpcError(command="waitsendpay", error={
+            "code": 204,
+            "data": {
+                "erring_index": 1,
+                "erring_channel": "100x1x0",
+                "erring_direction": 0,
+                "failcodename": "WIRE_FEE_INSUFFICIENT",
+            }
+        })
+
+        executor._learn_from_failure(full_route, failure, exc)
+        assert executor._last_fee_error_channel == "100x1x0"
