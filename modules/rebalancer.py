@@ -841,6 +841,13 @@ class EVRebalancer:
 
             src_id, src_info, src_ratio = best_source
 
+            # Budget: fleet members intend 0 fee, but gossip may not have
+            # propagated yet. Use actual return hop fee estimate with margin
+            # to handle the transition period.
+            return_hop_ppm = self._get_last_hop_fee(peer_id) or 0
+            effective_fee_ppm = max(50, int(return_hop_ppm * 1.2))
+            push_budget_sats = max(10, (push_amount * effective_fee_ppm) // 1_000_000)
+
             candidates.append(RebalanceCandidate(
                 source_candidates=[src_id],
                 to_channel=channel_id,
@@ -849,13 +856,13 @@ class EVRebalancer:
                 amount_sats=push_amount,
                 amount_msat=sats_to_base(push_amount),
                 outbound_fee_ppm=0,
-                inbound_fee_ppm=0,
+                inbound_fee_ppm=return_hop_ppm,
                 source_fee_ppm=0,
                 weighted_opp_cost_ppm=0,
                 spread_ppm=0,
-                max_budget_sats=max(1, (push_amount * 50) // 1_000_000),
-                max_budget_msat=max(1000, (push_amount * 50 * 1000) // 1_000_000),
-                max_fee_ppm=50,
+                max_budget_sats=push_budget_sats,
+                max_budget_msat=sats_to_base(push_budget_sats),
+                max_fee_ppm=effective_fee_ppm,
                 expected_profit_sats=0,
                 liquidity_ratio=local_ratio,
                 dest_flow_state="hive_push",
@@ -3754,7 +3761,10 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         Uses memoization via self._fee_cache to avoid repeated lookups
         within a single find_rebalance_candidates run.
         """
-        # Fleet members charge 0 on their channels — no need to query gossip
+        # Fleet members intend to charge 0 (cl-hive policy). Use 0 for
+        # candidate selection (cost estimation). The executor always queries
+        # the actual peer channel fee before sendpay, so stale gossip fees
+        # are handled at execution time, not selection time.
         if self._is_hive_member(peer_id):
             return 0
 

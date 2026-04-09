@@ -677,16 +677,13 @@ class RebalanceExecutor:
         - Try/except with auto-only fallback (unknown layer TOCTOU → crash)
         """
         requires_pure_hive = self._is_hive_equalization_candidate(candidate)
-        # Pure-hive routes (dest is fleet member): return hop is free — the
-        # hive-fleet layer sets their fee to 0. Skip the costly return-hop
-        # policy lookup and use amount_msat directly.
-        if getattr(candidate, 'dest_is_hive_member', False):
-            required_amount_msat = job.amount_msat
-            required_cltv = 24  # 18 base + 6 delta (safe default)
-        else:
-            required_amount_msat, required_cltv = self._get_return_hop_policy(
-                candidate, job.amount_msat, our_id,
-            )
+        # Always query actual peer channel fee for the return hop.
+        # Even fleet members may have non-zero fees in their gossip
+        # announcement if cl-hive's 0-fee policy hasn't propagated yet.
+        # CLN enforces the gossip-advertised fee at the protocol level.
+        required_amount_msat, required_cltv = self._get_return_hop_policy(
+            candidate, job.amount_msat, our_id,
+        )
 
         # Pre-validate: askrene can crash on degenerate inputs
         if required_amount_msat <= 0 or job.max_fee_msat <= 0:
