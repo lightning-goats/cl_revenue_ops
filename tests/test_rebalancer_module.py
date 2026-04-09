@@ -2250,3 +2250,78 @@ class TestGetLastHopFeeFleetMember:
         result = r._get_last_hop_fee("03a93b" + "0" * 58)
         # Should NOT have short-circuited to 0
         assert result != 0 or result is None
+
+
+class TestCapexAwareSourceSelection:
+    """Source selection with max_cost_ppm bypasses spread gate."""
+
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True, rebalance_min_profit=10)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r._fee_cache = {}
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.05)
+        r.job_manager = MagicMock()
+        r.job_manager.active_channels = set()
+        r.job_manager.get_source_failure_count.return_value = 0
+        r.policy_manager = None
+        r.hive_hints = None
+        r._hive_router = None
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        mock_database.get_source_rebalance_success_rate = MagicMock(return_value=None)
+        return r
+
+    def _make_source(self, scid, peer_id, fee_ppm, spendable, capacity, ratio):
+        return (scid, {"peer_id": peer_id, "fee_ppm": fee_ppm, "spendable_sats": spendable, "capacity": capacity}, ratio)
+
+    def test_negative_spread_rejected_without_max_cost(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        sources = [self._make_source("100x1x0", "02aa" + "0" * 62, 200, 500000, 1000000, 0.95)]
+        result = r._select_source_candidates(
+            sources=sources, amount_needed=100000,
+            dest_channel="200x2x0", dest_outbound_fee_ppm=25, dest_inbound_fee_ppm=0,
+        )
+        assert len(result) == 0
+
+    def test_negative_spread_accepted_with_max_cost(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        sources = [self._make_source("100x1x0", "02aa" + "0" * 62, 200, 500000, 1000000, 0.95)]
+        result = r._select_source_candidates(
+            sources=sources, amount_needed=100000,
+            dest_channel="200x2x0", dest_outbound_fee_ppm=25, dest_inbound_fee_ppm=0,
+            max_cost_ppm=500,
+        )
+        assert len(result) >= 1
+
+    def test_source_exceeding_cost_cap_rejected(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        mock_database.get_channel_state.return_value = {"state": "source"}
+        # fee_ppm=10000 -> weighted_opp_cost = 10000 * 0.075 = 750 > max_cost_ppm=500
+        sources = [self._make_source("100x1x0", "02aa" + "0" * 62, 10000, 500000, 1000000, 0.95)]
+        result = r._select_source_candidates(
+            sources=sources, amount_needed=100000,
+            dest_channel="200x2x0", dest_outbound_fee_ppm=25, dest_inbound_fee_ppm=0,
+            max_cost_ppm=500,
+        )
+        assert len(result) == 0
+
+    def test_dual_benefit_ranking_prefers_overfull_sources(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        sources = [
+            self._make_source("100x1x0", "02aa" + "0" * 62, 100, 500000, 1000000, 0.60),
+            self._make_source("200x2x0", "02bb" + "0" * 62, 150, 500000, 1000000, 0.99),
+        ]
+        result = r._select_source_candidates(
+            sources=sources, amount_needed=100000,
+            dest_channel="300x3x0", dest_outbound_fee_ppm=25, dest_inbound_fee_ppm=0,
+            max_cost_ppm=500,
+        )
+        assert len(result) == 2
+        assert result[0][0] == "200x2x0"  # 99% local ranked first

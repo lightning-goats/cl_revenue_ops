@@ -3638,6 +3638,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         dest_outbound_fee_ppm: int,
         dest_inbound_fee_ppm: int,
         peer_status: Optional[Dict] = None,
+        max_cost_ppm: int = 0,
     ) -> List[Tuple[str, Dict[str, Any], int, float]]:
         """
         Select all profitable source channels for a rebalance.
@@ -3645,7 +3646,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         Instead of returning a single "best" source, this returns ALL sources
         that have a positive spread (EV > 0), sorted by score (highest first).
         This allows Sling to handle pathfinding failover automatically.
-        
+
+        When max_cost_ppm > 0, operates in CapEx mode: sources are accepted if
+        total cost (inbound + opp_cost) is within the cap, even with negative
+        spread. Sources ranked by dual-benefit score (cost efficiency + drain benefit).
+
         Args:
             sources: List of (channel_id, info, outbound_ratio) tuples
             amount_needed: Amount to rebalance in sats
@@ -3653,7 +3658,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             dest_outbound_fee_ppm: Outbound fee of destination channel
             dest_inbound_fee_ppm: Estimated inbound fee to destination
             peer_status: Pre-fetched peer connection status (optimization)
-            
+            max_cost_ppm: CapEx cost cap in PPM. 0 = legacy EV mode (default).
+                When >0, bypass spread gate and accept sources within cost cap.
+
         Returns:
             List of (channel_id, info, score, weighted_opp_cost) tuples,
             sorted by score (highest first). Empty list if no profitable sources.
@@ -3677,7 +3684,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             'unstable_uptime': 0,
             'source_protected': 0,
             'negative_spread': 0,
-            'below_profit_threshold': 0
+            'below_profit_threshold': 0,
+            'exceeds_cost_cap': 0,
         }
         best_rejected_spread = None  # Track closest-to-profitable rejection
 
@@ -3798,72 +3806,108 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             turnover_weight = base_turnover_weight * flow_multiplier
             weighted_opp_cost = int(source_fee_ppm * turnover_weight)
 
-            # Calculate spread: what we earn minus what it costs
+            # Calculate total cost and spread
+            total_cost_ppm = dest_inbound_fee_ppm + weighted_opp_cost
             spread_ppm = dest_outbound_fee_ppm - dest_inbound_fee_ppm - weighted_opp_cost
 
-            # Require non-negative spread to avoid consistent leakage.
-            if spread_ppm < 0:
-                rejections['negative_spread'] += 1
-                # Track the best rejected spread for diagnostics
-                if best_rejected_spread is None or spread_ppm > best_rejected_spread['spread']:
-                    best_rejected_spread = {
-                        'channel': cid,
-                        'spread': spread_ppm,
-                        'dest_fee': dest_outbound_fee_ppm,
-                        'inbound_fee': dest_inbound_fee_ppm,
-                        'opp_cost': weighted_opp_cost,
-                        'flow_state': flow_state,
-                    }
-                continue
-
-            # Check minimum profit threshold
-            # PPM-BASED PROFIT GATE: Scale threshold with amount to decouple from chunk size
-            expected_profit_estimate = (spread_ppm * amount_needed) // 1_000_000
-            if self.config.rebalance_min_profit_ppm > 0:
-                min_profit_threshold = (amount_needed * self.config.rebalance_min_profit_ppm) // 1_000_000
+            if max_cost_ppm > 0:
+                # =============================================================
+                # CapEx mode: accept if total cost within tier cap.
+                # Spread can be negative — CapEx budget covers the investment.
+                # =============================================================
+                if total_cost_ppm > max_cost_ppm:
+                    rejections['exceeds_cost_cap'] += 1
+                    if best_rejected_spread is None or total_cost_ppm < best_rejected_spread.get('total_cost', float('inf')):
+                        best_rejected_spread = {
+                            'channel': cid,
+                            'spread': spread_ppm,
+                            'total_cost': total_cost_ppm,
+                            'dest_fee': dest_outbound_fee_ppm,
+                            'inbound_fee': dest_inbound_fee_ppm,
+                            'opp_cost': weighted_opp_cost,
+                            'flow_state': flow_state,
+                        }
+                    continue
+                # Spread can be negative — CapEx budget covers the investment
             else:
-                min_profit_threshold = self.config.rebalance_min_profit
-            if expected_profit_estimate < min_profit_threshold:
-                rejections['below_profit_threshold'] += 1
-                continue
+                # =============================================================
+                # Legacy EV mode: require positive spread + profit threshold
+                # =============================================================
+                if spread_ppm < 0:
+                    rejections['negative_spread'] += 1
+                    # Track the best rejected spread for diagnostics
+                    if best_rejected_spread is None or spread_ppm > best_rejected_spread['spread']:
+                        best_rejected_spread = {
+                            'channel': cid,
+                            'spread': spread_ppm,
+                            'dest_fee': dest_outbound_fee_ppm,
+                            'inbound_fee': dest_inbound_fee_ppm,
+                            'opp_cost': weighted_opp_cost,
+                            'flow_state': flow_state,
+                        }
+                    continue
 
-            # Calculate score for sorting (higher is better)
-            score = (ratio * 50) - (source_fee_ppm / 10)
+                # Check minimum profit threshold
+                # PPM-BASED PROFIT GATE: Scale threshold with amount to decouple from chunk size
+                expected_profit_estimate = (spread_ppm * amount_needed) // 1_000_000
+                if self.config.rebalance_min_profit_ppm > 0:
+                    min_profit_threshold = (amount_needed * self.config.rebalance_min_profit_ppm) // 1_000_000
+                else:
+                    min_profit_threshold = self.config.rebalance_min_profit
+                if expected_profit_estimate < min_profit_threshold:
+                    rejections['below_profit_threshold'] += 1
+                    continue
 
-            # Bonus for sink/balanced channels (they have excess outbound we want to use)
-            if flow_state == "sink":
-                score += 100
-            elif flow_state in ("balanced", "balanced_active"):
-                # Apply Stagnant Inventory Bonus (only for truly dormant channels)
-                if flow_state == "balanced" and source_turnover_rate < 0.0015:
-                    score += 10 # Awakening Bonus
-                    self.plugin.log(f"STAGNANT BONUS: Applying +10 priority to stagnant channel {cid[:12]}...", level='info')
+            # =================================================================
+            # SCORING
+            # =================================================================
+            if max_cost_ppm > 0:
+                # CapEx dual-benefit scoring:
+                # 50% cost efficiency (how much headroom under the cap)
+                # 50% drain benefit (prefer draining overfull sources)
+                cost_efficiency = max(0.0, (max_cost_ppm - total_cost_ppm) / max(1, max_cost_ppm))
+                drain_benefit = max(0.0, (ratio - 0.50) / 0.50)
+                score = int((0.5 * cost_efficiency + 0.5 * drain_benefit) * 1000)
+                if is_hive_source:
+                    score += 200
+            else:
+                # Legacy EV scoring
+                score = (ratio * 50) - (source_fee_ppm / 10)
 
-                score += 20
+                # Bonus for sink/balanced channels (they have excess outbound we want to use)
+                if flow_state == "sink":
+                    score += 100
+                elif flow_state in ("balanced", "balanced_active"):
+                    # Apply Stagnant Inventory Bonus (only for truly dormant channels)
+                    if flow_state == "balanced" and source_turnover_rate < 0.0015:
+                        score += 10 # Awakening Bonus
+                        self.plugin.log(f"STAGNANT BONUS: Applying +10 priority to stagnant channel {cid[:12]}...", level='info')
 
-            # Fleet rebalance bias is the public, bounded integration surface.
-            # Convert the multiplicative bias into a moderate additive score delta.
-            source_peer = info.get("peer_id", "")
-            if source_peer:
-                score += int(round((self._get_hive_rebalance_bias(source_peer) - 1.0) * 200))
+                    score += 20
 
-            # HIVE FLEET BONUS: Strongly prefer hive member sources.
-            # Routes through fleet peers have a free first hop, making
-            # circular rebalances much cheaper.
-            if is_hive_source:
-                score += 200
-                self.plugin.log(
-                    f"HIVE SOURCE BONUS: +200 priority for {cid[:12]}... "
-                    f"(peer {pid[:12]}... is fleet member, fee=0)",
-                    level='debug'
-                )
+                # Fleet rebalance bias is the public, bounded integration surface.
+                # Convert the multiplicative bias into a moderate additive score delta.
+                source_peer = info.get("peer_id", "")
+                if source_peer:
+                    score += int(round((self._get_hive_rebalance_bias(source_peer) - 1.0) * 200))
 
-            # Route-pair bonus: inbound revenue legs are ideal sources.
-            # Draining local balance creates headroom for the inbound traffic
-            # that generates fees on this route.
-            route_pair_ins = getattr(self, '_cycle_route_pair_in_channels', set())
-            if normalized in route_pair_ins:
-                score += 40
+                # HIVE FLEET BONUS: Strongly prefer hive member sources.
+                # Routes through fleet peers have a free first hop, making
+                # circular rebalances much cheaper.
+                if is_hive_source:
+                    score += 200
+                    self.plugin.log(
+                        f"HIVE SOURCE BONUS: +200 priority for {cid[:12]}... "
+                        f"(peer {pid[:12]}... is fleet member, fee=0)",
+                        level='debug'
+                    )
+
+                # Route-pair bonus: inbound revenue legs are ideal sources.
+                # Draining local balance creates headroom for the inbound traffic
+                # that generates fees on this route.
+                route_pair_ins = getattr(self, '_cycle_route_pair_in_channels', set())
+                if normalized in route_pair_ins:
+                    score += 40
 
             # Persistent source-channel reliability from rebalance history.
             # This complements the in-memory recent-failure penalty below.
