@@ -3564,11 +3564,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         Uses memoization via self._fee_cache to avoid repeated lookups
         within a single find_rebalance_candidates run.
         """
+        # Fleet members charge 0 on their channels — no need to query gossip
+        if self._is_hive_member(peer_id):
+            return 0
+
         # Check cache first (memoization for this run)
         cache_key = (peer_id, int(amount_msat or 0))
         if cache_key in self._fee_cache:
             return self._fee_cache[cache_key]
-        
+
         result = None
         
         # PRIORITY 1: Use actual peer inbound fee from listpeerchannels.updates.remote

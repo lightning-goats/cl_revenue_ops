@@ -2201,3 +2201,52 @@ class TestHiveEqualizationConfigSurface:
         from modules.rebalancer import RebalanceReasonCode
 
         assert RebalanceReasonCode.HIVE_EQUALIZATION.value == "hive_equalization"
+
+
+class TestGetLastHopFeeFleetMember:
+    """Fleet members charge 0 — _get_last_hop_fee should return 0 immediately."""
+
+    def test_returns_zero_for_hive_member_via_router(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        mock_router = MagicMock()
+        mock_router.is_hive_member.return_value = True
+        r.hive_router = mock_router
+
+        result = r._get_last_hop_fee("03796a" + "0" * 58)
+        assert result == 0
+        mock_plugin.rpc.listpeerchannels.assert_not_called()
+
+    def test_returns_zero_for_hive_member_via_hints(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        mock_hints = MagicMock()
+        mock_hints.is_hive_member.return_value = True
+        r.hive_hints = mock_hints
+
+        result = r._get_last_hop_fee("028f58" + "0" * 58)
+        assert result == 0
+
+    def test_returns_normal_fee_for_non_member(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        mock_router = MagicMock()
+        mock_router.is_hive_member.return_value = False
+        r.hive_router = mock_router
+        mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+
+        result = r._get_last_hop_fee("03a93b" + "0" * 58)
+        # Should NOT have short-circuited to 0
+        assert result != 0 or result is None
