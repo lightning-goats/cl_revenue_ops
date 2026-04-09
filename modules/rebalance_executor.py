@@ -298,6 +298,27 @@ class RebalanceExecutor:
         required_cltv = 18 + cltv_delta
         return required_amount_msat, required_cltv
 
+    def _fleet_local_excludes(self, our_id: str, selected_source_scid: str) -> List[str]:
+        """Exclude our other local channels so fleet routes honor the selected source."""
+        selected = selected_source_scid.replace(":", "x")
+        excludes: List[str] = []
+        try:
+            if self.data_service:
+                channels = self.data_service.get_peer_channels()
+            else:
+                channels = self.plugin.rpc.listpeerchannels()
+        except Exception:
+            return excludes
+
+        for ch in channels.get("channels", []):
+            scid = str(ch.get("short_channel_id", "") or "").replace(":", "x")
+            peer_id = str(ch.get("peer_id", "") or "")
+            if not scid or not peer_id or scid == selected:
+                continue
+            direction = 1 if our_id > peer_id else 0
+            excludes.append(f"{scid}/{direction}")
+        return excludes
+
     def _validate_sendpay_route(self, route: List[Dict], final_amount_msat: int) -> None:
         """Reject malformed routes before they can crash lightningd."""
         if not route:
@@ -668,6 +689,7 @@ class RebalanceExecutor:
         job: RebalanceJob,
         candidate,
         our_id: str,
+        excludes: Optional[List[str]] = None,
     ) -> tuple[List[Dict], List[Dict]]:
         """Build a circular route using getroutes for fleet rebalances.
 
@@ -677,6 +699,12 @@ class RebalanceExecutor:
         - Try/except with auto-only fallback (unknown layer TOCTOU → crash)
         """
         requires_pure_hive = self._is_hive_equalization_candidate(candidate)
+        selected_source_scid = (
+            candidate.source_candidates[0].replace(":", "x")
+            if getattr(candidate, "source_candidates", None) else ""
+        )
+        if not selected_source_scid:
+            raise ValueError("fleet_source_missing")
         # Always query actual peer channel fee for the return hop.
         # Even fleet members may have non-zero fees in their gossip
         # announcement if cl-hive's 0-fee policy hasn't propagated yet.
@@ -704,6 +732,11 @@ class RebalanceExecutor:
         # is lower than askrene estimates.  Use a generous 1% cap (matching
         # HiveRouter discovery) to avoid "excessive cost" rejections.
         fleet_maxfee = max(job.max_fee_msat, required_amount_msat // 100)
+        merged_excludes = list(dict.fromkeys(
+            (excludes or [])
+            + self._routing_memory.current_excludes()
+            + self._fleet_local_excludes(our_id, selected_source_scid)
+        ))
 
         params = {
             "source": our_id,
@@ -714,6 +747,8 @@ class RebalanceExecutor:
             "final_cltv": required_cltv,
             "maxparts": 1,
         }
+        if merged_excludes:
+            params["exclude"] = merged_excludes
         # SAFETY: TOCTOU race on layer names can crash askrene (lesson 504).
         # Catch and retry with auto-only layers.
         try:
@@ -734,6 +769,10 @@ class RebalanceExecutor:
         path = routes[0].get("path", [])
         if not path:
             raise ValueError("no_fleet_route")
+        first_hop_scid_dir = str(path[0].get("short_channel_id_dir", "") or "")
+        first_hop_scid = first_hop_scid_dir.split("/")[0].replace(":", "x")
+        if first_hop_scid != selected_source_scid:
+            raise ValueError("fleet_source_mismatch")
         if requires_pure_hive:
             self._validate_pure_hive_path(path)
 
@@ -841,13 +880,13 @@ class RebalanceExecutor:
             inform_path: List[Dict] = []
             attempt_reserved = False
             try:
-                if route_type == "fleet" and attempt == 1:
+                if route_type == "fleet":
                     try:
                         full_route, inform_path = self._compute_fleet_route(
-                            job, candidate, our_id,
+                            job, candidate, our_id, excludes,
                         )
                     except Exception:
-                        if self._is_hive_equalization_candidate(candidate):
+                        if self._is_hive_equalization_candidate(candidate) or job.attempts:
                             raise
                         # Fleet route unavailable or no fleet hops — fall back
                         # to network route with proper budget constraints.
@@ -960,13 +999,21 @@ class RebalanceExecutor:
             except Exception as e:
                 failure = self._parse_failure(e)
                 last_error = f"sendpay_error: {e}"
+                final_hop_temp_failure = (
+                    route_type == "fleet"
+                    and failure.get("code") == 204
+                    and failure.get("failcodename") == "WIRE_TEMPORARY_CHANNEL_FAILURE"
+                    and full_route
+                    and int(failure.get("erring_index") or 0) == len(full_route)
+                )
                 if attempt_reserved and self.hive_router:
                     try:
                         self.hive_router.unreserve_path(inform_path)
                     except Exception:
                         pass
-                self._learn_from_failure(full_route, failure, e)
-                if inform_path:
+                if not final_hop_temp_failure:
+                    self._learn_from_failure(full_route, failure, e)
+                if inform_path and not final_hop_temp_failure:
                     self._inform_failure(inform_path, failure)
                 self._cleanup_failed_payment(job.payment_hash)
                 job.attempts.append({
@@ -996,9 +1043,11 @@ class RebalanceExecutor:
                     if erring_index == 0 or (erring_index == 1 and is_node_error):
                         should_retry = False
                     elif full_route and erring_index == len(full_route):
-                        # Destination hop errors are usually terminal, EXCEPT fee errors
-                        # which can be recovered by finding a different route
-                        if failcodename == "WIRE_FEE_INSUFFICIENT" and failure.get("erring_channel"):
+                        # Destination hop errors are usually terminal. Fleet return-hop
+                        # failures are an exception: retry once without switching models.
+                        if route_type == "fleet" and failcodename == "WIRE_TEMPORARY_CHANNEL_FAILURE":
+                            should_retry = True
+                        elif failcodename == "WIRE_FEE_INSUFFICIENT" and failure.get("erring_channel"):
                             edir = failure.get("erring_direction")
                             if edir is not None:
                                 previous_excludes = list(excludes)

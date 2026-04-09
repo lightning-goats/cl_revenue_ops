@@ -735,8 +735,8 @@ class TestHiveEqualizationRouteValidation:
         assert any(c[0][1]["inform"] == "constrained" for c in inform_calls)
         assert any(c[0][1]["inform"] == "succeeded" for c in inform_calls)
 
-    def test_fleet_retries_on_fee_insufficient_with_exclude(self):
-        """Fleet attempt 1 uses getroutes, retry falls back to getroute + excludes."""
+    def test_fleet_retries_on_fee_insufficient_without_network_fallback(self):
+        """Fleet fee retries stay on getroutes instead of switching route models."""
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
         plugin.rpc.invoice.return_value = {
@@ -778,7 +778,7 @@ class TestHiveEqualizationRouteValidation:
                         "amount_msat": 500_000_000,
                         "path": [
                             {
-                                "short_channel_id_dir": "300x1x0/1",
+                                "short_channel_id_dir": "100x1x0/1",
                                 "next_node_id": "dest_peer_abc",
                                 "amount_msat": 500_000_000,
                                 "delay": 24,
@@ -791,27 +791,14 @@ class TestHiveEqualizationRouteValidation:
             return {}
 
         plugin.rpc.call.side_effect = call_side_effect
-
-        # Retry (attempt 2) falls back to getroute + excludes
-        plugin.rpc.getroute.return_value = {
-            "route": [
-                {
-                    "id": "dest_peer_abc",
-                    "channel": "301x1x0",
-                    "direction": 0,
-                    "amount_msat": 500_000_000,
-                    "delay": 24,
-                },
-            ]
-        }
         plugin.rpc.waitsendpay.side_effect = [
             FakeRpcError(error={
                 "code": 204,
                 "message": "failed: WIRE_FEE_INSUFFICIENT",
                 "data": {
-                    "erring_index": 1,
-                    "erring_channel": "300x1x0",
-                    "erring_direction": 1,
+                    "erring_index": 2,
+                    "erring_channel": "200x1x0",
+                    "erring_direction": 0,
                     "erring_node": "dest_peer_abc",
                     "failcode": 4108,
                     "failcodename": "WIRE_FEE_INSUFFICIENT",
@@ -829,9 +816,135 @@ class TestHiveEqualizationRouteValidation:
         assert result.success is True
         assert result.route_type == "fleet"
         assert result.attempts == 2
-        # Attempt 1 used getroutes (fleet), attempt 2 used getroute (network fallback)
-        assert plugin.rpc.getroute.call_count == 1
-        assert plugin.rpc.getroute.call_args.kwargs["exclude"] == ["300x1x0/1"]
+        plugin.rpc.getroute.assert_not_called()
+
+    def test_compute_fleet_route_rejects_unplanned_first_hop(self):
+        plugin = MagicMock()
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": [{"layer": "hive-fleet"}]}
+            if method == "getroutes":
+                return {
+                    "routes": [{
+                        "path": [
+                            {
+                                "short_channel_id_dir": "999x1x0/0",
+                                "next_node_id": "dest_peer_abc",
+                                "amount_msat": 500_000_000,
+                                "delay": 24,
+                            },
+                        ],
+                    }],
+                }
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
+        hive_router = MagicMock()
+        hive_router.is_hive_member.return_value = True
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock(), hive_router=hive_router)
+
+        job = RebalanceJob(
+            job_id="job-1",
+            channel_id="200x1x0",
+            peer_id="dest_peer_abc",
+            amount_msat=500_000_000,
+            max_fee_msat=100_000,
+            route_type="fleet",
+        )
+
+        with pytest.raises(ValueError, match="fleet_source_mismatch"):
+            executor._compute_fleet_route(job, MockCandidate(hive_route_hops=2), "our_id")
+
+    def test_fleet_retry_after_send_failure_stays_on_fleet_path(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123", "payment_secret": "secret123",
+            "bolt11": "lnbc5u1..."
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+
+        getroutes_calls = []
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": [{"layer": "hive-fleet"}]}
+            if method == "getroutes":
+                getroutes_calls.append(params)
+                return {
+                    "routes": [{
+                        "path": [
+                            {
+                                "short_channel_id_dir": "100x1x0/1",
+                                "next_node_id": "dest_peer_abc",
+                                "amount_msat": 500_000_000,
+                                "delay": 24,
+                            },
+                        ],
+                    }],
+                }
+            if method == "askrene-inform-channel":
+                return {}
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
+        plugin.rpc.waitsendpay.side_effect = [
+            FakeRpcError(error={
+                "code": 204,
+                "message": "failed: WIRE_TEMPORARY_CHANNEL_FAILURE",
+                "data": {
+                    "erring_index": 2,
+                    "erring_channel": "200x1x0",
+                    "erring_direction": 0,
+                    "erring_node": "dest_peer_abc",
+                    "failcode": 4103,
+                    "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+                },
+            }),
+            {
+                "status": "complete",
+                "amount_sent_msat": 500_000_000,
+            },
+        ]
+
+        hive_router = MagicMock()
+        hive_router.is_hive_member.return_value = True
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock(), hive_router=hive_router)
+
+        result = executor.execute(MockCandidate(hive_route_hops=2))
+
+        assert result.success is True
+        assert result.route_type == "fleet"
+        assert len(getroutes_calls) == 2
+        plugin.rpc.getroute.assert_not_called()
 
     def test_runtime_memory_excludes_banned_channel(self):
         plugin = MagicMock()

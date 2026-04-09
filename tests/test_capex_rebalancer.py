@@ -542,6 +542,105 @@ class TestCapexMainPath:
         capex_candidates = [c for c in result if c.reason_code == RebalanceReasonCode.CAPEX_FALLBACK.value]
         assert len(capex_candidates) == 0
 
+    def test_hive_capex_member_destination_uses_actual_return_hop_fee(self, mock_plugin, mock_database):
+        """HIVE-first source selection must price the member return hop using actual peer fees."""
+        from modules.rebalancer import EVRebalancer, RebalanceReasonCode
+
+        cfg = Config(
+            dry_run=True,
+            hive_push_enabled=False,
+            hive_equalization_enabled=False,
+            low_liquidity_threshold=0.2,
+            high_liquidity_threshold=0.8,
+            rebalance_min_amount=50_000,
+            rebalance_max_amount=5_000_000,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        mock_ds = MagicMock()
+        mock_ds.datastore_push.return_value = True
+        r.data_service = mock_ds
+
+        dest_scid = "100x1x0"
+        source_scid = "200x1x0"
+        dest_peer = "02" + "a" * 64
+        source_peer = "02" + "b" * 64
+
+        mock_engine = MagicMock(spec=CapexBudgetEngine)
+        budget = ChannelCapexBudget(
+            channel_id=dest_scid,
+            budget_msat=500_000,
+            tier="active",
+            tier_ppm=1500,
+            priority_class="preservation",
+        )
+        mock_engine.get_channel_budget.return_value = budget
+        mock_engine.compute_allocations.return_value = None
+        r.set_capex_engine(mock_engine)
+
+        mock_router = MagicMock()
+        mock_router.available = True
+        mock_router.discover_route.return_value = MagicMock(
+            hops=3,
+            fee_ppm=1,
+            source_scid=source_scid,
+        )
+        r.hive_router = mock_router
+        r._is_hive_member = MagicMock(side_effect=lambda pid: pid == dest_peer)
+
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        mock_database.get_top_route_pairs.return_value = []
+        mock_database.get_rebalance_success_signal.return_value = None
+        mock_database.get_peer_uptime_percent.return_value = 99.0
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.01)
+
+        r._get_channels_with_balances = MagicMock(return_value={
+            dest_scid: {
+                "peer_id": dest_peer,
+                "capacity": 5_000_000,
+                "spendable_sats": 500_000,
+                "fee_ppm": 25,
+                "peer_inbound_fee_ppm": 275,
+                "peer_inbound_base_msat": 1000,
+            },
+            source_scid: {
+                "peer_id": source_peer,
+                "capacity": 5_000_000,
+                "spendable_sats": 4_950_000,
+                "fee_ppm": 100,
+            },
+        })
+
+        source_info = {
+            "peer_id": source_peer,
+            "capacity": 5_000_000,
+            "fee_ppm": 100,
+            "spendable_sats": 4_950_000,
+        }
+        r._select_source_candidates = MagicMock(return_value=[
+            (source_scid, source_info, 50.0, 10)
+        ])
+        r._analyze_rebalance_ev = MagicMock(return_value=None)
+
+        result = r.find_rebalance_candidates()
+
+        capex_candidates = [
+            c for c in result if c.reason_code == RebalanceReasonCode.CAPEX_FALLBACK.value
+        ]
+        assert len(capex_candidates) == 1
+        assert capex_candidates[0].dest_is_hive_member is True
+        assert capex_candidates[0].inbound_fee_ppm == 275
+
+        select_kwargs = r._select_source_candidates.call_args.kwargs
+        assert select_kwargs["dest_inbound_fee_ppm"] == 275
+
 
 class TestDefaultBudgetPreserved:
     """Basic config fields still exist."""
