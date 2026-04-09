@@ -29,7 +29,6 @@ PUBLIC_RUNTIME_KEYS = (
     'daily_budget_sats',
     'min_fee_ppm',
     'max_fee_ppm',
-    'rebalance_engine',
     'planner_enabled',
     'planner_dry_run',
     'planner_execute_closes',
