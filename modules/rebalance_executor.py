@@ -740,6 +740,18 @@ class RebalanceExecutor:
         if requires_pure_hive:
             self._validate_pure_hive_path(path)
 
+        # Verify the route actually uses fleet members as intermediaries.
+        # getroutes may find a cheaper non-fleet path even with hive layers.
+        # If no fleet member is in the path, reject — the caller will fall
+        # back to _compute_network_route with proper budget constraints.
+        if not requires_pure_hive and self.hive_router:
+            has_fleet_hop = any(
+                self.hive_router.is_hive_member(hop.get("next_node_id", ""))
+                for hop in path
+            )
+            if not has_fleet_hop:
+                raise ValueError("no_fleet_route")
+
         full_route = self._getroutes_to_sendpay(
             path,
             candidate.to_channel,
@@ -840,6 +852,10 @@ class RebalanceExecutor:
                     except Exception:
                         if self._is_hive_equalization_candidate(candidate):
                             raise
+                        # Fleet route unavailable or no fleet hops — fall back
+                        # to network route with proper budget constraints.
+                        route_type = "network"
+                        job.route_type = "network"
                         full_route, inform_path = self._compute_network_route(
                             job, candidate, our_id, excludes
                         )
