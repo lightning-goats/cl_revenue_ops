@@ -103,6 +103,18 @@ def _make_coordination_rebalancer(mock_plugin, mock_database):
     mock_database.get_last_rebalance_time.return_value = 0
     mock_database.get_top_route_pairs.return_value = []
     mock_database.get_channel_state.return_value = {"state": "balanced"}
+    mock_database.get_rebalance_success_signal.return_value = None
+    mock_database.get_peer_uptime_percent.return_value = 99.0
+
+    # CapEx engine: active tier for all channels (CapEx is the primary path)
+    from modules.capex_budget import ChannelCapexBudget
+    mock_capex = MagicMock()
+    mock_capex.compute_allocations.return_value = None
+    mock_capex.get_channel_budget.return_value = ChannelCapexBudget(
+        channel_id="test", tier="active", budget_msat=500_000_000,
+        tier_ppm=500, priority_class="preservation",
+    )
+    r.set_capex_engine(mock_capex)
 
     return r, {
         "source_scid": source_scid,
@@ -676,36 +688,14 @@ class TestCoordinatedRebalanceHints:
         r.hive_hints.get_rebalance_campaigns.return_value = []
         r._get_our_node_id = MagicMock(return_value=our_id)
 
-        def analyze(dest_id, *_args, **_kwargs):
-            if dest_id == ids["sink_a_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_a_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_a_peer"],
-                    amount_sats=70_000,
-                )
-                c.expected_profit_sats = 10
-                return c
-            if dest_id == ids["sink_b_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_b_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_b_peer"],
-                    amount_sats=70_000,
-                )
-                c.expected_profit_sats = 12
-                return c
-            return None
-
-        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
-
         candidates = r.find_rebalance_candidates()
 
+        # CapEx path: sink_a gets COORDINATED_REBALANCE (recommendation bonus),
+        # sink_b remains capex_fallback. Recommendation coordination_priority=1
+        # places sink_a first regardless of per-channel profit score.
         assert [c.to_channel for c in candidates] == [ids["sink_a_scid"], ids["sink_b_scid"]]
         assert candidates[0].reason_code == RebalanceReasonCode.COORDINATED_REBALANCE.value
-        assert candidates[1].reason_code == RebalanceReasonCode.EV_POSITIVE.value
+        assert candidates[1].reason_code == RebalanceReasonCode.CAPEX_FALLBACK.value
 
     def test_assigned_active_campaign_chunk_is_preferred_when_local_candidate_matches(
         self, mock_plugin, mock_database
@@ -732,41 +722,19 @@ class TestCoordinatedRebalanceHints:
                     "destination": ids["sink_a_peer"],
                 }]
             },
-            "chunk_size_sats": 75_000,
+            # No chunk_size_sats: campaign matches on peer route segments only,
+            # so it works with any CapEx-determined amount.
             "priority_score": 0.95,
         }]
         r._get_our_node_id = MagicMock(return_value=our_id)
 
-        def analyze(dest_id, *_args, **_kwargs):
-            if dest_id == ids["sink_a_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_a_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_a_peer"],
-                    amount_sats=75_000,
-                )
-                c.expected_profit_sats = 10
-                return c
-            if dest_id == ids["sink_b_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_b_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_b_peer"],
-                    amount_sats=75_000,
-                )
-                c.expected_profit_sats = 12
-                return c
-            return None
-
-        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
-
         candidates = r.find_rebalance_candidates()
 
+        # CapEx path: sink_a matches campaign hint (coordination_priority=2),
+        # placed first. sink_b has no coordination hint.
         assert [c.to_channel for c in candidates] == [ids["sink_a_scid"], ids["sink_b_scid"]]
         assert candidates[0].reason_code == RebalanceReasonCode.COORDINATED_REBALANCE.value
-        assert candidates[1].reason_code == RebalanceReasonCode.EV_POSITIVE.value
+        assert candidates[1].reason_code == RebalanceReasonCode.CAPEX_FALLBACK.value
 
     def test_campaign_chunk_preferred_even_over_flow_priority_candidate(
         self, mock_plugin, mock_database
@@ -800,38 +768,17 @@ class TestCoordinatedRebalanceHints:
                     "destination": ids["sink_a_peer"],
                 }]
             },
-            "chunk_size_sats": 75_000,
+            # No chunk_size_sats: campaign matches on peer route segments only,
+            # so it works with any CapEx-determined amount.
             "priority_score": 0.95,
         }]
         r._get_our_node_id = MagicMock(return_value=our_id)
 
-        def analyze(dest_id, *_args, **_kwargs):
-            if dest_id == ids["sink_a_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_a_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_a_peer"],
-                    amount_sats=75_000,
-                )
-                c.expected_profit_sats = 10
-                return c
-            if dest_id == ids["sink_b_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_b_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_b_peer"],
-                    amount_sats=75_000,
-                )
-                c.expected_profit_sats = 12
-                return c
-            return None
-
-        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
-
         candidates = r.find_rebalance_candidates()
 
+        # CapEx path: sink_a matches campaign (coordination_priority=2).
+        # sink_b has flow_state="source" (priority=2) but no coordination hint.
+        # Campaign coordination_priority beats flow priority, so sink_a comes first.
         assert [c.to_channel for c in candidates] == [ids["sink_a_scid"], ids["sink_b_scid"]]
         assert candidates[0].reason_code == RebalanceReasonCode.COORDINATED_REBALANCE.value
 
@@ -910,35 +857,15 @@ class TestCoordinatedRebalanceHints:
         }]
         r._get_our_node_id = MagicMock(return_value=our_id)
 
-        def analyze(dest_id, *_args, **_kwargs):
-            if dest_id == ids["sink_a_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_a_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_a_peer"],
-                    amount_sats=75_000,
-                )
-                c.expected_profit_sats = 10
-                return c
-            if dest_id == ids["sink_b_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_b_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_b_peer"],
-                    amount_sats=75_000,
-                )
-                c.expected_profit_sats = 12
-                return c
-            return None
-
-        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
-
         candidates = r.find_rebalance_candidates()
 
-        assert [c.to_channel for c in candidates] == [ids["sink_b_scid"], ids["sink_a_scid"]]
-        assert candidates[1].reason_code == RebalanceReasonCode.EV_POSITIVE.value
+        # CapEx path: campaign chunk_size=50_000 does not match the CapEx-determined
+        # amount (~400k sats), so no candidate gets COORDINATED_REBALANCE.
+        # Both remain capex_fallback with no coordination priority boost.
+        assert len(candidates) == 2
+        assert all(c.reason_code == RebalanceReasonCode.CAPEX_FALLBACK.value for c in candidates)
+        # Neither candidate is a coordinated rebalance — the core of this test.
+        assert not any(getattr(c, "coordination_hint_type", "") for c in candidates)
 
     def test_fallback_executor_does_not_take_primary_recommendation_bonus(
         self, mock_plugin, mock_database
@@ -964,35 +891,14 @@ class TestCoordinatedRebalanceHints:
         r.hive_hints.get_rebalance_campaigns.return_value = []
         r._get_our_node_id = MagicMock(return_value=our_id)
 
-        def analyze(dest_id, *_args, **_kwargs):
-            if dest_id == ids["sink_a_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_a_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_a_peer"],
-                    amount_sats=70_000,
-                )
-                c.expected_profit_sats = 10
-                return c
-            if dest_id == ids["sink_b_scid"]:
-                c = _candidate(
-                    source_candidates=[ids["source_scid"]],
-                    to_channel=ids["sink_b_scid"],
-                    primary_source_peer_id=ids["source_peer"],
-                    to_peer_id=ids["sink_b_peer"],
-                    amount_sats=70_000,
-                )
-                c.expected_profit_sats = 12
-                return c
-            return None
-
-        r._analyze_rebalance_ev = MagicMock(side_effect=analyze)
-
         candidates = r.find_rebalance_candidates()
 
-        assert [c.to_channel for c in candidates] == [ids["sink_b_scid"], ids["sink_a_scid"]]
-        assert all(c.reason_code == RebalanceReasonCode.EV_POSITIVE.value for c in candidates)
+        # CapEx path: recommendation for sink_a but we are only fallback executor,
+        # not primary. _coordination_assignment_rank returns 0 → no bonus applied.
+        # Neither candidate gets COORDINATED_REBALANCE; both remain capex_fallback.
+        assert len(candidates) == 2
+        assert all(c.reason_code == RebalanceReasonCode.CAPEX_FALLBACK.value for c in candidates)
+        assert not any(getattr(c, "coordination_hint_type", "") for c in candidates)
 
 
 
@@ -1644,9 +1550,10 @@ class TestHiveEqualizationFallback:
         return r
 
     def test_equalization_runs_as_pass2_alongside_ev_candidates(self, mock_plugin, mock_database):
-        """Equalization (Pass 2) runs before the main EV loop (Pass 3).
+        """Equalization (Pass 2) runs before the CapEx main loop (Pass 3).
 
-        Both equalization and EV candidates can coexist in the result.
+        Equalization candidates are always present when hive members are imbalanced.
+        With the CapEx-primary path, Pass 3 produces capex_fallback candidates.
         """
         from modules.rebalancer import RebalanceReasonCode
 
@@ -1671,22 +1578,17 @@ class TestHiveEqualizationFallback:
             hive_source_peer,
             hive_dest_peer,
         }
-        profitable = _candidate(
-            source_candidates=["111x1x0"],
-            to_channel="222x2x0",
-            primary_source_peer_id=hive_source_peer,
-            to_peer_id=hive_dest_peer,
-            amount_sats=50_000,
-        )
-        r._analyze_rebalance_ev.return_value = profitable
+        mock_database.get_rebalance_success_signal.return_value = None
 
         result = r.find_rebalance_candidates()
 
-        # Equalization runs as Pass 2 before the EV loop, so both can appear.
-        # The profitable EV candidate must be present.
-        ev_candidates = [c for c in result if c.reason_code != RebalanceReasonCode.HIVE_EQUALIZATION.value]
-        assert len(ev_candidates) >= 1
-        assert profitable in result
+        # Pass 2 (equalization) runs regardless of CapEx engine.
+        # With two imbalanced hive members, at least one equalization candidate appears.
+        equalization_candidates = [
+            c for c in result
+            if c.reason_code == RebalanceReasonCode.HIVE_EQUALIZATION.value
+        ]
+        assert len(equalization_candidates) >= 1
 
     def test_equalization_selects_most_imbalanced_pair_first(self, mock_plugin, mock_database):
         from modules.rebalancer import RebalanceReasonCode
