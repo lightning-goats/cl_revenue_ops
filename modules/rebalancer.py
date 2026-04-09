@@ -2026,6 +2026,102 @@ class EVRebalancer:
                 candidate = self._analyze_rebalance_ev(
                     dest_id, dest_info, dest_ratio, source_channels, peer_status, cfg=cfg
                 )
+
+                # If EV analysis found nothing, try CapEx-budgeted approach
+                if candidate is None and self._capex_engine:
+                    try:
+                        capex_budget = self._capex_engine.get_channel_budget(dest_id)
+                        if capex_budget and capex_budget.tier != "blocked" and capex_budget.budget_msat > 0:
+                            # Compute rebalance amount (same logic as _capex_fallback_pass)
+                            _cap = dest_info.get("capacity", 0)
+                            _spendable = dest_info.get("spendable_sats", 0)
+                            _headroom = _cap - _spendable
+                            if _headroom > 0:
+                                _amount = min(int(_cap * 0.5) - _spendable, cfg.rebalance_max_amount)
+                                _amount = max(cfg.rebalance_min_amount, min(_amount, _headroom))
+
+                                if _amount >= cfg.rebalance_min_amount:
+                                    # Per-rebalance fee ceiling
+                                    _ppm_cap_sats = (_amount * capex_budget.tier_ppm) // 1_000_000
+                                    _max_fee_sats = min(capex_budget.budget_sats, max(1, _ppm_cap_sats))
+
+                                    # Viability gate: shrink amount if budget can't cover min viable ppm
+                                    _eff_ppm = (_max_fee_sats * 1_000_000) // max(1, _amount)
+                                    _min_viable_ppm = 50
+                                    if _eff_ppm < _min_viable_ppm and capex_budget.budget_sats > 0:
+                                        _max_viable = (capex_budget.budget_sats * 1_000_000) // _min_viable_ppm
+                                        if _max_viable >= cfg.rebalance_min_amount:
+                                            _amount = max(cfg.rebalance_min_amount, _max_viable)
+                                            _ppm_cap_sats = (_amount * capex_budget.tier_ppm) // 1_000_000
+                                            _max_fee_sats = min(capex_budget.budget_sats, max(1, _ppm_cap_sats))
+                                        else:
+                                            _amount = 0  # signal skip
+
+                                    if _amount >= cfg.rebalance_min_amount:
+                                        _max_fee_msat = sats_to_base(_max_fee_sats)
+                                        _max_fee_ppm = min(capex_budget.tier_ppm, (_max_fee_sats * 1_000_000) // max(1, _amount))
+                                        _outbound_fee_ppm = dest_info.get("fee_ppm", 0)
+                                        _dest_peer_id = dest_info.get("peer_id", "")
+
+                                        # Source selection with CapEx cost cap (no spread requirement)
+                                        _source_tuples = [(s[0], s[1], s[2] if len(s) > 2 else 0.0) for s in source_channels]
+                                        try:
+                                            _source_result = self._select_source_candidates(
+                                                sources=_source_tuples,
+                                                amount_needed=_amount,
+                                                dest_channel=dest_id,
+                                                dest_outbound_fee_ppm=_outbound_fee_ppm,
+                                                dest_inbound_fee_ppm=0,
+                                                max_cost_ppm=capex_budget.tier_ppm,
+                                                peer_status=peer_status,
+                                            )
+                                        except Exception as _e:
+                                            self.plugin.log(
+                                                f"CAPEX_MAIN: source selection failed for {dest_id}: {_e}",
+                                                level='debug',
+                                            )
+                                            _source_result = []
+
+                                        if _source_result:
+                                            _source_scids = [s[0] for s in _source_result]
+                                            _primary_id, _primary_info, _, _ = _source_result[0]
+                                            candidate = RebalanceCandidate(
+                                                source_candidates=_source_scids,
+                                                to_channel=dest_id,
+                                                primary_source_peer_id=_primary_info.get("peer_id", ""),
+                                                to_peer_id=_dest_peer_id,
+                                                amount_sats=_amount,
+                                                amount_msat=sats_to_base(_amount),
+                                                outbound_fee_ppm=_outbound_fee_ppm,
+                                                inbound_fee_ppm=0,
+                                                source_fee_ppm=_primary_info.get("fee_ppm", 0),
+                                                weighted_opp_cost_ppm=0,
+                                                spread_ppm=0,
+                                                max_budget_sats=_max_fee_sats,
+                                                max_budget_msat=_max_fee_msat,
+                                                max_fee_ppm=_max_fee_ppm,
+                                                expected_profit_sats=0,
+                                                liquidity_ratio=dest_ratio,
+                                                dest_flow_state="unknown",
+                                                dest_turnover_rate=0.0,
+                                                source_turnover_rate=0.0,
+                                                reason_code=RebalanceReasonCode.CAPEX_FALLBACK.value,
+                                                bleeder_status="none",
+                                                source_candidate_peer_ids=[
+                                                    s[1].get("peer_id", "") for s in _source_result
+                                                ],
+                                            )
+                                            self.plugin.log(
+                                                f"CAPEX_MAIN: {dest_id[:12]}... budget={capex_budget.budget_sats}sats "
+                                                f"tier={capex_budget.tier} amount={_amount} fee_cap={_max_fee_ppm}ppm",
+                                                level='info',
+                                            )
+                    except Exception as _capex_err:
+                        self.plugin.log(
+                            f"CAPEX_MAIN: budget check failed for {dest_id}: {_capex_err}",
+                            level='debug',
+                        )
+
                 if candidate:
                     if last_rebalance:
                         cd_hours = float(getattr(candidate, 'recommended_cooldown_hours', 0.0) or 0.0)
@@ -2039,7 +2135,7 @@ class EVRebalancer:
                             )
                             continue
                     candidates.append(candidate)
-                    
+
                     # Stop if we have enough candidates to fill available slots
                     if len(candidates) >= available_slots:
                         break
@@ -2149,34 +2245,6 @@ class EVRebalancer:
                     budget_blocked=False,
                 )
             else:
-                # EV found nothing for non-hive channels — try capex fallback
-                # (hive destinations already handled in hive-first pass above)
-                remaining_slots = available_slots - len(candidates)
-                if remaining_slots > 0 and non_hive_depleted and source_channels:
-                    self.plugin.log(
-                        f"CAPEX_FALLBACK: EV found 0 non-hive candidates, evaluating "
-                        f"{len(non_hive_depleted)} destinations with capex budgets",
-                        level='info'
-                    )
-                    capex_candidates = self._capex_fallback_pass(
-                        depleted_channels=non_hive_depleted,
-                        source_channels=source_channels,
-                        active_channels=active_channels,
-                        available_slots=remaining_slots,
-                        cfg=cfg,
-                    )
-                    if capex_candidates:
-                        selected = capex_candidates[:available_slots]
-                        self._set_last_decision_summary(
-                            action="rebalance",
-                            reason="capex_fallback_candidates",
-                            dominant_input="capex_budget",
-                            safety_block=False,
-                            budget_blocked=False,
-                        )
-                        self._report_hive_liquidity_state(depleted_channels, source_channels, selected)
-                        return selected
-
                 equalization_candidates, equalization_skip_reasons = self._build_hive_equalization_candidates(
                     hive_low_channels=hive_low_channels,
                     hive_high_channels=hive_high_channels,
