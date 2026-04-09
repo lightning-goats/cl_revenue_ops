@@ -431,6 +431,7 @@ class EVRebalancer:
         self._last_depleted_count: int = 0
         self._last_profitable_count: int = 0
         self._last_cycle_ts: int = 0
+        self.rebalance_engine_v2 = None  # Optional v2 engine injected by the caller
 
         self._last_decision_summary: Dict[str, Any] = {
             "action": "hold",
@@ -1649,6 +1650,11 @@ class EVRebalancer:
 
         # Thread-safe config snapshot for this rebalance cycle
         cfg = self.config.snapshot()
+
+        if getattr(cfg, "rebalance_engine", "v1") == "v2":
+            engine_v2 = getattr(self, "rebalance_engine_v2", None)
+            if engine_v2 is not None:
+                return engine_v2.find_candidates()
 
         # Compute capex allocations for this cycle (engine does all budget math)
         if self._capex_engine:

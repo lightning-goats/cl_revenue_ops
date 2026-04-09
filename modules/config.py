@@ -29,6 +29,7 @@ PUBLIC_RUNTIME_KEYS = (
     'daily_budget_sats',
     'min_fee_ppm',
     'max_fee_ppm',
+    'rebalance_engine',
     'planner_enabled',
     'planner_dry_run',
     'planner_execute_closes',
@@ -115,6 +116,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'routing_intelligence_cache_seconds': int,
     # Fields present in CONFIG_FIELD_RANGES that need type registration
     'base_fee_msat': int,
+    'rebalance_engine': str,
     'flow_window_days': int,
     'estimated_open_cost_sats': int,
     'target_flow': int,
@@ -242,6 +244,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 # Valid values for string enum fields
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
     'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
+    'rebalance_engine': ('v1', 'v2'),
 }
 
 
@@ -301,6 +304,7 @@ class Config:
                                         # Recommended: 20 ppm (~10 sats per 500k chunk)
     rebalance_max_amount: int = 5000000  # Max rebalance amount in sats
     rebalance_min_amount: int = 50000    # Min rebalance amount in sats
+    rebalance_engine: str = 'v1'        # Rebalance engine selector
     low_liquidity_threshold: float = 0.3  # Below 30% = low outbound
     high_liquidity_threshold: float = 0.7 # Above 70% = high outbound
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
@@ -422,6 +426,11 @@ class Config:
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants on direct construction."""
+        if isinstance(self.rebalance_engine, str):
+            self.rebalance_engine = self.rebalance_engine.lower()
+        if self.rebalance_engine not in STRING_ENUM_VALID_VALUES['rebalance_engine']:
+            valid = ", ".join(STRING_ENUM_VALID_VALUES['rebalance_engine'])
+            raise ValueError(f"rebalance_engine must be one of: {valid}")
         if self.hive_equalization_low_pct >= self.hive_equalization_high_pct:
             raise ValueError(
                 "hive_equalization_low_pct must be less than "
@@ -689,6 +698,7 @@ class ConfigSnapshot:
     rebalance_min_profit_ppm: int
     rebalance_max_amount: int
     rebalance_min_amount: int
+    rebalance_engine: str
     low_liquidity_threshold: float
     high_liquidity_threshold: float
     rebalance_cooldown_hours: int
