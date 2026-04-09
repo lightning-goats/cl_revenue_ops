@@ -1716,7 +1716,24 @@ class EVRebalancer:
                     self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                     return candidates
 
-                return engine_v2.find_candidates()
+                delegated_candidates = list(engine_v2.find_candidates())
+                if delegated_candidates:
+                    self._set_last_decision_summary(
+                        action="rebalance",
+                        reason="rebalance_engine_v2_candidates_found",
+                        dominant_input="rebalance_engine_v2",
+                        safety_block=False,
+                        budget_blocked=False,
+                    )
+                else:
+                    self._set_last_decision_summary(
+                        action="hold",
+                        reason="rebalance_engine_v2_no_candidates",
+                        dominant_input="rebalance_engine_v2",
+                        safety_block=False,
+                        budget_blocked=False,
+                    )
+                return delegated_candidates
             
             channels = self._get_channels_with_balances()
             if not channels:

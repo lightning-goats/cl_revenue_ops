@@ -46,6 +46,13 @@ def test_rebalancer_delegates_to_v2_after_shared_preflight(mock_plugin, mock_dat
         ("capital", "v2"),
         ("delegate", None),
     ]
+    assert r.get_last_decision_summary() == {
+        "action": "hold",
+        "reason": "rebalance_engine_v2_no_candidates",
+        "dominant_input": "rebalance_engine_v2",
+        "safety_block": False,
+        "budget_blocked": False,
+    }
     r.rebalance_engine_v2.find_candidates.assert_called_once()
 
 
@@ -93,4 +100,36 @@ def test_rebalancer_delegates_to_v2_when_flag_enabled(mock_plugin, mock_database
     result = r.find_rebalance_candidates()
 
     assert result == []
+    assert r.get_last_decision_summary() == {
+        "action": "hold",
+        "reason": "rebalance_engine_v2_no_candidates",
+        "dominant_input": "rebalance_engine_v2",
+        "safety_block": False,
+        "budget_blocked": False,
+    }
     r.rebalance_engine_v2.find_candidates.assert_called_once()
+
+
+def test_rebalancer_v2_summary_reports_candidates_found(mock_plugin, mock_database):
+    from modules.config import Config
+    from modules.rebalancer import EVRebalancer
+
+    cfg = Config(dry_run=True)
+    cfg.rebalance_engine = "v2"
+    mock_database.cleanup_stale_reservations.return_value = 0
+
+    r = EVRebalancer(mock_plugin, cfg, mock_database)
+    r._check_capital_controls = MagicMock(return_value=True)
+    r.rebalance_engine_v2 = MagicMock()
+    r.rebalance_engine_v2.find_candidates.return_value = ["candidate"]
+
+    result = r.find_rebalance_candidates()
+
+    assert result == ["candidate"]
+    assert r.get_last_decision_summary() == {
+        "action": "rebalance",
+        "reason": "rebalance_engine_v2_candidates_found",
+        "dominant_input": "rebalance_engine_v2",
+        "safety_block": False,
+        "budget_blocked": False,
+    }
