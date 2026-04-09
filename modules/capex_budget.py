@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from .utils import MSAT_PER_SAT, base_to_sats_ceil
 
@@ -37,7 +37,7 @@ class ChannelCapexBudget:
     """Per-channel capex budget computed by the engine."""
     channel_id: str
     budget_msat: int = 0           # Remaining 30d budget (millisatoshis)
-    tier: str = "blocked"          # proven / active / bootstrap / blocked
+    tier: str = "blocked"          # proven / active / bootstrap / fleet / blocked
     tier_ppm: int = 0              # Max PPM per rebalance attempt
     priority_class: str = "growth" # defensive / preservation / operational / growth
     hive_multiplier: float = 1.0   # 1.0 / 1.5 / 2.0
@@ -99,12 +99,14 @@ class CapexBudgetEngine:
         config,
         hive_hints=None,
         capital_efficiency=None,
+        hive_member_check: Callable[[str], bool] = None,
     ):
         self._profitability = profitability_analyzer
         self._database = database
         self._config = config
         self._hive_hints = hive_hints
         self._capital_efficiency = capital_efficiency
+        self._hive_member_check = hive_member_check
         self._last_allocations: Optional[CapexAllocations] = None
 
     def compute_allocations(self) -> CapexAllocations:
@@ -295,10 +297,11 @@ class CapexBudgetEngine:
         days_open = prof.days_open
         marginal_roi = getattr(prof, 'marginal_roi', 0.0)
 
+        peer_id = getattr(prof, 'peer_id', '')
+
         # Hive multiplier
         hive_mult = 1.0
         if self._hive_hints:
-            peer_id = getattr(prof, 'peer_id', '')
             try:
                 if self._hive_hints.is_hive_member(peer_id):
                     hive_mult = 1.5
@@ -307,6 +310,26 @@ class CapexBudgetEngine:
                     hive_mult = 2.0
             except Exception:
                 pass
+
+        # FLEET tier: hive member channels enable free fleet routing.
+        # These channels earn 0 direct fee revenue (0 ppm policy) so they'd
+        # normally be BOOTSTRAP or BLOCKED.  Recognise their strategic value
+        # before the BLOCKED gates can reject them.
+        if self._hive_member_check and self._hive_member_check(peer_id):
+            capacity_sats = getattr(prof, 'capacity_sats', 0) or 0
+            fleet_budget_msat = min(
+                int(capacity_sats * 1000 * 50 / 10000),  # 50 bps of capacity in msat
+                200 * MSAT_PER_SAT,  # cap at bootstrap max (200 sats default)
+            )
+            fleet_budget_msat = max(fleet_budget_msat, 10_000)  # At least 10 sats
+            return ChannelCapexBudget(
+                channel_id=ch_id,
+                tier="fleet",
+                budget_msat=fleet_budget_msat,
+                tier_ppm=50,
+                priority_class="fleet_coordination",
+                hive_multiplier=hive_mult,
+            )
 
         # Blocked channels
         if classification == "zombie":
