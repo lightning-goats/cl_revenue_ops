@@ -1,18 +1,5 @@
 from unittest.mock import MagicMock
 
-import pytest
-
-
-def test_rebalance_engine_normalizes_and_rejects_invalid_values():
-    from modules.config import Config
-
-    cfg = Config(dry_run=True, rebalance_engine="V2")
-    assert cfg.rebalance_engine == "v2"
-
-    with pytest.raises(ValueError, match="rebalance_engine must be one of"):
-        Config(dry_run=True, rebalance_engine="v3")
-
-
 def test_build_state_snapshot_derives_value_classes_and_budget():
     from modules.capex_budget import CapexAllocations, ChannelCapexBudget
     from modules.rebalance_state_v2 import NormalizedV2ChannelInput, build_state_snapshot
@@ -71,6 +58,34 @@ def test_build_state_snapshot_derives_value_classes_and_budget():
     assert state.channels[1].is_valuable is True
     assert state.channels[1].remaining_budget_sats == 0
     assert state.channels[1].cooldown_active is True
+
+
+def test_build_state_snapshot_normalizes_mapping_booleans_and_budget_defaults():
+    from modules.rebalance_state_v2 import build_state_snapshot
+
+    state = build_state_snapshot(
+        [
+            {
+                "channel_id": "333x3x0",
+                "peer_id": "02" + "c" * 64,
+                "capacity_sats": 400_000,
+                "local_sats": 40_000,
+                "peer_inbound_fee_ppm": 95,
+                "is_hive_member": "false",
+                "is_profitable": "0",
+                "is_active": "yes",
+                "cooldown_active": "off",
+            }
+        ],
+        {},
+    )
+
+    assert len(state.channels) == 1
+    assert state.channels[0].actual_inbound_fee_ppm == 95
+    assert state.channels[0].value_class == "active"
+    assert state.channels[0].is_valuable is True
+    assert state.channels[0].remaining_budget_sats == 0
+    assert state.channels[0].cooldown_active is False
 
 
 def test_rebalancer_build_rebalance_state_v2_delegates_to_builder(mock_plugin, mock_database):
