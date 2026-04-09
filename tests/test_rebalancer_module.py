@@ -2325,3 +2325,49 @@ class TestCapexAwareSourceSelection:
         )
         assert len(result) == 2
         assert result[0][0] == "200x2x0"  # 99% local ranked first
+
+
+class TestHivePush:
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+        cfg = Config(dry_run=True, hive_push_enabled=True, hive_push_trigger_ratio=0.60,
+                     hive_push_target_ratio=0.50, rebalance_min_amount=10000, rebalance_max_amount=5000000)
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        mock_database.get_top_route_pairs.return_value = []
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        return EVRebalancer(mock_plugin, cfg, mock_database)
+
+    def test_hive_push_for_locally_heavy_fleet_channel(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        fleet_ch = ("933791x3241x0", {"capacity": 2935694, "spendable_sats": 2906337, "peer_id": "03796a" + "0" * 58, "fee_ppm": 0}, 0.99)
+        sources = [("100x1x0", {"capacity": 5000000, "spendable_sats": 4900000, "peer_id": "02aa" + "0" * 62, "fee_ppm": 100}, 0.98)]
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        candidates = r._build_hive_push_candidates([fleet_ch], sources, cfg=r.config.snapshot())
+        assert len(candidates) >= 1
+        c = candidates[0]
+        assert c.to_channel == "933791x3241x0"
+        assert c.dest_is_hive_member is True
+        assert c.reason_code == "hive_push"
+        assert c.amount_sats > 1000000
+
+    def test_hive_push_skipped_below_trigger(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        fleet_ch = ("933791x3241x0", {"capacity": 2935694, "spendable_sats": 1614632, "peer_id": "03796a" + "0" * 58, "fee_ppm": 0}, 0.55)
+        candidates = r._build_hive_push_candidates([fleet_ch], [], cfg=r.config.snapshot())
+        assert len(candidates) == 0
+
+    def test_hive_push_prefers_most_overfull_source(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        fleet_ch = ("933791x3241x0", {"capacity": 2935694, "spendable_sats": 2906337, "peer_id": "03796a" + "0" * 58, "fee_ppm": 0}, 0.99)
+        sources = [
+            ("100x1x0", {"capacity": 5000000, "spendable_sats": 4900000, "peer_id": "02aa" + "0" * 62, "fee_ppm": 100}, 0.60),
+            ("200x2x0", {"capacity": 5000000, "spendable_sats": 4900000, "peer_id": "02bb" + "0" * 62, "fee_ppm": 200}, 0.99),
+        ]
+        candidates = r._build_hive_push_candidates([fleet_ch], sources, cfg=r.config.snapshot())
+        assert len(candidates) >= 1
+        assert candidates[0].source_candidates[0] == "200x2x0"  # 99% local preferred

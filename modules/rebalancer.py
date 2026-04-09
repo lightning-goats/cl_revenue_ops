@@ -70,6 +70,7 @@ class RebalanceReasonCode(Enum):
     EV_POSITIVE = "ev_positive"                   # Normal EV-positive rebalance
     CAPEX_FALLBACK = "capex_fallback"             # Capex-aware fallback rebalance
     HIVE_EQUALIZATION = "hive_equalization"       # Fallback pure-hive inventory equalization
+    HIVE_PUSH = "hive_push"                      # Deploy capital to fleet member channels
     COORDINATED_REBALANCE = "coordinated_rebalance"  # Matched assigned fleet coordination hint
 
     # Skip codes (rebalance was not attempted)
@@ -783,6 +784,85 @@ class EVRebalancer:
             )
 
         return candidates, skip_reasons
+
+    def _build_hive_push_candidates(
+        self,
+        hive_channels: List[Tuple[str, Dict[str, Any], float]],
+        source_channels: List[Tuple[str, Dict[str, Any], float]],
+        cfg=None,
+    ) -> List[RebalanceCandidate]:
+        """Build candidates for hive push: deploy capital to fleet member channels.
+
+        Creates inbound capacity by pushing our local balance to the fleet member's side.
+        Near-zero cost (fleet routing free). Prefers most overfull non-hive sources.
+        """
+        cfg = cfg or self.config.snapshot()
+        candidates = []
+
+        for channel_id, info, local_ratio in hive_channels:
+            if local_ratio < cfg.hive_push_trigger_ratio:
+                continue
+
+            capacity = info.get("capacity", 0)
+            if capacity <= 0:
+                continue
+
+            target_sats = int(capacity * cfg.hive_push_target_ratio)
+            current_local = info.get("spendable_sats", 0)
+            push_amount = current_local - target_sats
+            push_amount = max(cfg.rebalance_min_amount, min(push_amount, cfg.rebalance_max_amount))
+
+            if push_amount < cfg.rebalance_min_amount:
+                continue
+
+            peer_id = info.get("peer_id", "")
+
+            # Select best source: most overfull (highest drain benefit)
+            best_source = None
+            best_drain = -1.0
+            for src_id, src_info, src_ratio in source_channels:
+                if src_id == channel_id:
+                    continue
+                src_spendable = src_info.get("spendable_sats", 0)
+                if src_spendable < push_amount:
+                    continue
+                drain = max(0.0, (src_ratio - 0.50) / 0.50)
+                if drain > best_drain:
+                    best_drain = drain
+                    best_source = (src_id, src_info, src_ratio)
+
+            if not best_source:
+                continue
+
+            src_id, src_info, src_ratio = best_source
+
+            candidates.append(RebalanceCandidate(
+                source_candidates=[src_id],
+                to_channel=channel_id,
+                primary_source_peer_id=src_info.get("peer_id", ""),
+                to_peer_id=peer_id,
+                amount_sats=push_amount,
+                amount_msat=push_amount * 1000,
+                outbound_fee_ppm=0,
+                inbound_fee_ppm=0,
+                source_fee_ppm=0,
+                weighted_opp_cost_ppm=0,
+                spread_ppm=0,
+                max_budget_sats=max(1, (push_amount * 50) // 1_000_000),
+                max_budget_msat=max(1000, (push_amount * 50 * 1000) // 1_000_000),
+                max_fee_ppm=50,
+                expected_profit_sats=0,
+                liquidity_ratio=local_ratio,
+                dest_flow_state="hive_push",
+                dest_turnover_rate=0.0,
+                source_turnover_rate=0.0,
+                reason_code=RebalanceReasonCode.HIVE_PUSH.value,
+                hive_route_hops=1,
+                dest_is_hive_member=True,
+                source_candidate_peer_ids=[src_info.get("peer_id", "")],
+            ))
+
+        return candidates
 
     def _get_hive_rebalance_bias(self, peer_id: str) -> float:
         """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""

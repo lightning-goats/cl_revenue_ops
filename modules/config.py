@@ -86,6 +86,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hive_equalization_high_pct': float,
     'hive_equalization_cooldown_hours': int,
     'hive_equalization_max_candidates_per_cycle': int,
+    'hive_push_enabled': bool,
+    'hive_push_trigger_ratio': float,
+    'hive_push_target_ratio': float,
     'futility_cooldown_hours': int,
     'inbound_fee_estimate_ppm': int,
     # Vegas Reflex
@@ -304,6 +307,9 @@ class Config:
     hive_equalization_high_pct: float = 0.65  # Upper bound for hive balance band
     hive_equalization_cooldown_hours: int = 48  # Longer than standard rebalance cooldown
     hive_equalization_max_candidates_per_cycle: int = 1
+    hive_push_enabled: bool = True            # Deploy capital to fleet member channels
+    hive_push_trigger_ratio: float = 0.60     # Push when local ratio exceeds this
+    hive_push_target_ratio: float = 0.50      # Push balance toward this ratio
     futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
     inbound_fee_estimate_ppm: int = 50  # Route cost buffer added on top of last-hop fee (PPM)
     
@@ -687,6 +693,9 @@ class ConfigSnapshot:
     hive_equalization_high_pct: float
     hive_equalization_cooldown_hours: int
     hive_equalization_max_candidates_per_cycle: int
+    hive_push_enabled: bool
+    hive_push_trigger_ratio: float
+    hive_push_target_ratio: float
     futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
 
