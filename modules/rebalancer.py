@@ -70,6 +70,7 @@ class RebalanceReasonCode(Enum):
     EV_POSITIVE = "ev_positive"                   # Normal EV-positive rebalance
     CAPEX_FALLBACK = "capex_fallback"             # Capex-aware fallback rebalance
     HIVE_EQUALIZATION = "hive_equalization"       # Fallback pure-hive inventory equalization
+    HIVE_PUSH = "hive_push"                      # Deploy capital to fleet member channels
     COORDINATED_REBALANCE = "coordinated_rebalance"  # Matched assigned fleet coordination hint
 
     # Skip codes (rebalance was not attempted)
@@ -783,6 +784,90 @@ class EVRebalancer:
             )
 
         return candidates, skip_reasons
+
+    def _build_hive_push_candidates(
+        self,
+        hive_channels: List[Tuple[str, Dict[str, Any], float]],
+        source_channels: List[Tuple[str, Dict[str, Any], float]],
+        cfg=None,
+    ) -> List[RebalanceCandidate]:
+        """Build candidates for hive push: deploy capital to fleet member channels.
+
+        Creates inbound capacity by pushing our local balance to the fleet member's side.
+        Near-zero cost (fleet routing free). Prefers most overfull non-hive sources.
+        """
+        cfg = cfg or self.config.snapshot()
+        candidates = []
+
+        for channel_id, info, local_ratio in hive_channels:
+            if local_ratio < cfg.hive_push_trigger_ratio:
+                continue
+
+            capacity = info.get("capacity", 0)
+            if capacity <= 0:
+                continue
+
+            target_sats = int(capacity * cfg.hive_push_target_ratio)
+            current_local = info.get("spendable_sats", 0)
+            push_amount = current_local - target_sats
+            push_amount = max(cfg.rebalance_min_amount, min(push_amount, cfg.rebalance_max_amount))
+
+            if push_amount < cfg.rebalance_min_amount:
+                continue
+
+            peer_id = info.get("peer_id", "")
+
+            # Select best source: most overfull non-hive channel (highest drain benefit)
+            best_source = None
+            best_drain = -1.0
+            for src_id, src_info, src_ratio in source_channels:
+                if src_id == channel_id:
+                    continue
+                # Don't use hive member channels as push sources —
+                # that just moves sats between fleet channels with no strategic value
+                src_peer = src_info.get("peer_id", "")
+                if src_peer and self._is_hive_member(src_peer):
+                    continue
+                src_spendable = src_info.get("spendable_sats", 0)
+                if src_spendable < push_amount:
+                    continue
+                drain = max(0.0, (src_ratio - 0.50) / 0.50)
+                if drain > best_drain:
+                    best_drain = drain
+                    best_source = (src_id, src_info, src_ratio)
+
+            if not best_source:
+                continue
+
+            src_id, src_info, src_ratio = best_source
+
+            candidates.append(RebalanceCandidate(
+                source_candidates=[src_id],
+                to_channel=channel_id,
+                primary_source_peer_id=src_info.get("peer_id", ""),
+                to_peer_id=peer_id,
+                amount_sats=push_amount,
+                amount_msat=sats_to_base(push_amount),
+                outbound_fee_ppm=0,
+                inbound_fee_ppm=0,
+                source_fee_ppm=0,
+                weighted_opp_cost_ppm=0,
+                spread_ppm=0,
+                max_budget_sats=max(1, (push_amount * 50) // 1_000_000),
+                max_budget_msat=max(1000, (push_amount * 50 * 1000) // 1_000_000),
+                max_fee_ppm=50,
+                expected_profit_sats=0,
+                liquidity_ratio=local_ratio,
+                dest_flow_state="hive_push",
+                dest_turnover_rate=0.0,
+                source_turnover_rate=0.0,
+                reason_code=RebalanceReasonCode.HIVE_PUSH.value,
+                hive_route_hops=1,
+                dest_is_hive_member=True,
+                source_candidate_peer_ids=[src_info.get("peer_id", "")],
+            ))
+
+        return candidates
 
     def _get_hive_rebalance_bias(self, peer_id: str) -> float:
         """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""
@@ -1748,13 +1833,67 @@ class EVRebalancer:
             # Track depleted count for Boltz coordination signal
             self._last_depleted_count = len(depleted_channels)
 
-            if (not depleted_channels or not source_channels) and not can_try_hive_equalization:
+            # =====================================================
+            # PASS 1: HIVE PUSH (deploy capital to fleet channels)
+            # =====================================================
+            if cfg.hive_push_enabled and self.hive_router and self.hive_router.available and source_channels and available_slots > 0:
+                hive_member_channels = []
+                for cid, info in channels.items():
+                    peer_id = info.get("peer_id", "")
+                    if not self._is_hive_member(peer_id):
+                        continue
+                    if cid in active_channels:
+                        continue
+                    cap = max(1, info.get("capacity", 1))
+                    ratio = info.get("spendable_sats", 0) / cap
+                    if ratio > cfg.hive_push_trigger_ratio:
+                        hive_member_channels.append((cid, info, ratio))
+
+                if hive_member_channels:
+                    push_candidates = self._build_hive_push_candidates(
+                        hive_channels=hive_member_channels,
+                        source_channels=source_channels,
+                        cfg=cfg,
+                    )
+                    for pc in push_candidates[:available_slots]:
+                        candidates.append(pc)
+                    available_slots = max(0, available_slots - len(push_candidates))
+                    if push_candidates:
+                        self.plugin.log(
+                            f"HIVE PUSH: {len(push_candidates)} fleet channel candidates "
+                            f"({available_slots} slots remaining)"
+                        )
+
+            # =====================================================
+            # PASS 2: HIVE EQUALIZATION (balance between fleet members)
+            # =====================================================
+            if can_try_hive_equalization and available_slots > 0:
+                equalization_candidates, eq_skip = self._build_hive_equalization_candidates(
+                    hive_low_channels=hive_low_channels,
+                    hive_high_channels=hive_high_channels,
+                    available_slots=available_slots,
+                    cfg=cfg,
+                )
+                for ec in equalization_candidates[:available_slots]:
+                    candidates.append(ec)
+                available_slots = max(0, available_slots - len(equalization_candidates))
+                self._log_hive_equalization_diagnostics(
+                    hive_low_channels,
+                    hive_high_channels,
+                    selected_count=len(equalization_candidates),
+                    skip_reasons=eq_skip,
+                )
+
+            # =====================================================
+            # PASS 3: CAPEX REBALANCING (main depleted channel loop)
+            # =====================================================
+            if (not depleted_channels or not source_channels) and not candidates:
                 self._log_pure_hive_diagnostics(
                     depleted_channels,
                     source_channels,
                     selected_count=pure_hive_selected,
                 )
-                if cfg.hive_equalization_enabled and (hive_low_channels or hive_high_channels):
+                if cfg.hive_equalization_enabled and (hive_low_channels or hive_high_channels) and not candidates:
                     self._log_hive_equalization_diagnostics(
                         hive_low_channels,
                         hive_high_channels,
@@ -1794,6 +1933,11 @@ class EVRebalancer:
                 )
                 self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
+
+            if available_slots <= 0:
+                # Passes 1-2 filled all slots; skip EV loop
+                self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
+                return candidates[:self.job_manager.slots_available()]
 
             self.plugin.log(
                 f"Found {len(depleted_channels)} depleted and {len(source_channels)} source channels "
@@ -2026,6 +2170,102 @@ class EVRebalancer:
                 candidate = self._analyze_rebalance_ev(
                     dest_id, dest_info, dest_ratio, source_channels, peer_status, cfg=cfg
                 )
+
+                # If EV analysis found nothing, try CapEx-budgeted approach
+                if candidate is None and self._capex_engine:
+                    try:
+                        capex_budget = self._capex_engine.get_channel_budget(dest_id)
+                        if capex_budget and capex_budget.tier != "blocked" and capex_budget.budget_msat > 0:
+                            # Compute rebalance amount (same logic as _capex_fallback_pass)
+                            _cap = dest_info.get("capacity", 0)
+                            _spendable = dest_info.get("spendable_sats", 0)
+                            _headroom = _cap - _spendable
+                            if _headroom > 0:
+                                _amount = min(int(_cap * 0.5) - _spendable, cfg.rebalance_max_amount)
+                                _amount = max(cfg.rebalance_min_amount, min(_amount, _headroom))
+
+                                if _amount >= cfg.rebalance_min_amount:
+                                    # Per-rebalance fee ceiling
+                                    _ppm_cap_sats = (_amount * capex_budget.tier_ppm) // 1_000_000
+                                    _max_fee_sats = min(capex_budget.budget_sats, max(1, _ppm_cap_sats))
+
+                                    # Viability gate: shrink amount if budget can't cover min viable ppm
+                                    _eff_ppm = (_max_fee_sats * 1_000_000) // max(1, _amount)
+                                    _min_viable_ppm = 50
+                                    if _eff_ppm < _min_viable_ppm and capex_budget.budget_sats > 0:
+                                        _max_viable = (capex_budget.budget_sats * 1_000_000) // _min_viable_ppm
+                                        if _max_viable >= cfg.rebalance_min_amount:
+                                            _amount = max(cfg.rebalance_min_amount, _max_viable)
+                                            _ppm_cap_sats = (_amount * capex_budget.tier_ppm) // 1_000_000
+                                            _max_fee_sats = min(capex_budget.budget_sats, max(1, _ppm_cap_sats))
+                                        else:
+                                            _amount = 0  # signal skip
+
+                                    if _amount >= cfg.rebalance_min_amount:
+                                        _max_fee_msat = sats_to_base(_max_fee_sats)
+                                        _max_fee_ppm = min(capex_budget.tier_ppm, (_max_fee_sats * 1_000_000) // max(1, _amount))
+                                        _outbound_fee_ppm = dest_info.get("fee_ppm", 0)
+                                        _dest_peer_id = dest_info.get("peer_id", "")
+
+                                        # Source selection with CapEx cost cap (no spread requirement)
+                                        _source_tuples = [(s[0], s[1], s[2] if len(s) > 2 else 0.0) for s in source_channels]
+                                        try:
+                                            _source_result = self._select_source_candidates(
+                                                sources=_source_tuples,
+                                                amount_needed=_amount,
+                                                dest_channel=dest_id,
+                                                dest_outbound_fee_ppm=_outbound_fee_ppm,
+                                                dest_inbound_fee_ppm=0,
+                                                max_cost_ppm=capex_budget.tier_ppm,
+                                                peer_status=peer_status,
+                                            )
+                                        except Exception as _e:
+                                            self.plugin.log(
+                                                f"CAPEX_MAIN: source selection failed for {dest_id}: {_e}",
+                                                level='debug',
+                                            )
+                                            _source_result = []
+
+                                        if _source_result:
+                                            _source_scids = [s[0] for s in _source_result]
+                                            _primary_id, _primary_info, _, _ = _source_result[0]
+                                            candidate = RebalanceCandidate(
+                                                source_candidates=_source_scids,
+                                                to_channel=dest_id,
+                                                primary_source_peer_id=_primary_info.get("peer_id", ""),
+                                                to_peer_id=_dest_peer_id,
+                                                amount_sats=_amount,
+                                                amount_msat=sats_to_base(_amount),
+                                                outbound_fee_ppm=_outbound_fee_ppm,
+                                                inbound_fee_ppm=0,
+                                                source_fee_ppm=_primary_info.get("fee_ppm", 0),
+                                                weighted_opp_cost_ppm=0,
+                                                spread_ppm=0,
+                                                max_budget_sats=_max_fee_sats,
+                                                max_budget_msat=_max_fee_msat,
+                                                max_fee_ppm=_max_fee_ppm,
+                                                expected_profit_sats=0,
+                                                liquidity_ratio=dest_ratio,
+                                                dest_flow_state="unknown",
+                                                dest_turnover_rate=0.0,
+                                                source_turnover_rate=0.0,
+                                                reason_code=RebalanceReasonCode.CAPEX_FALLBACK.value,
+                                                bleeder_status="none",
+                                                source_candidate_peer_ids=[
+                                                    s[1].get("peer_id", "") for s in _source_result
+                                                ],
+                                            )
+                                            self.plugin.log(
+                                                f"CAPEX_MAIN: {dest_id[:12]}... budget={capex_budget.budget_sats}sats "
+                                                f"tier={capex_budget.tier} amount={_amount} fee_cap={_max_fee_ppm}ppm",
+                                                level='info',
+                                            )
+                    except Exception as _capex_err:
+                        self.plugin.log(
+                            f"CAPEX_MAIN: budget check failed for {dest_id}: {_capex_err}",
+                            level='debug',
+                        )
+
                 if candidate:
                     if last_rebalance:
                         cd_hours = float(getattr(candidate, 'recommended_cooldown_hours', 0.0) or 0.0)
@@ -2039,7 +2279,7 @@ class EVRebalancer:
                             )
                             continue
                     candidates.append(candidate)
-                    
+
                     # Stop if we have enough candidates to fill available slots
                     if len(candidates) >= available_slots:
                         break
@@ -2149,58 +2389,8 @@ class EVRebalancer:
                     budget_blocked=False,
                 )
             else:
-                # EV found nothing for non-hive channels — try capex fallback
-                # (hive destinations already handled in hive-first pass above)
-                remaining_slots = available_slots - len(candidates)
-                if remaining_slots > 0 and non_hive_depleted and source_channels:
-                    self.plugin.log(
-                        f"CAPEX_FALLBACK: EV found 0 non-hive candidates, evaluating "
-                        f"{len(non_hive_depleted)} destinations with capex budgets",
-                        level='info'
-                    )
-                    capex_candidates = self._capex_fallback_pass(
-                        depleted_channels=non_hive_depleted,
-                        source_channels=source_channels,
-                        active_channels=active_channels,
-                        available_slots=remaining_slots,
-                        cfg=cfg,
-                    )
-                    if capex_candidates:
-                        selected = capex_candidates[:available_slots]
-                        self._set_last_decision_summary(
-                            action="rebalance",
-                            reason="capex_fallback_candidates",
-                            dominant_input="capex_budget",
-                            safety_block=False,
-                            budget_blocked=False,
-                        )
-                        self._report_hive_liquidity_state(depleted_channels, source_channels, selected)
-                        return selected
-
-                equalization_candidates, equalization_skip_reasons = self._build_hive_equalization_candidates(
-                    hive_low_channels=hive_low_channels,
-                    hive_high_channels=hive_high_channels,
-                    available_slots=available_slots,
-                    cfg=cfg,
-                )
-                self._log_hive_equalization_diagnostics(
-                    hive_low_channels,
-                    hive_high_channels,
-                    selected_count=len(equalization_candidates),
-                    skip_reasons=equalization_skip_reasons,
-                )
-                if equalization_candidates:
-                    selected = equalization_candidates[:available_slots]
-                    self._set_last_decision_summary(
-                        action="rebalance",
-                        reason="hive_equalization_candidates",
-                        dominant_input=RebalanceReasonCode.HIVE_EQUALIZATION.value,
-                        safety_block=False,
-                        budget_blocked=False,
-                    )
-                    self._report_hive_liquidity_state(depleted_channels, source_channels, selected)
-                    return selected
-
+                # Hive equalization already ran in Pass 2 above.
+                # If we still have no candidates, report hold.
                 self._set_last_decision_summary(
                     action="hold",
                     reason=(
@@ -3564,11 +3754,15 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         Uses memoization via self._fee_cache to avoid repeated lookups
         within a single find_rebalance_candidates run.
         """
+        # Fleet members charge 0 on their channels — no need to query gossip
+        if self._is_hive_member(peer_id):
+            return 0
+
         # Check cache first (memoization for this run)
         cache_key = (peer_id, int(amount_msat or 0))
         if cache_key in self._fee_cache:
             return self._fee_cache[cache_key]
-        
+
         result = None
         
         # PRIORITY 1: Use actual peer inbound fee from listpeerchannels.updates.remote
@@ -3634,6 +3828,7 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         dest_outbound_fee_ppm: int,
         dest_inbound_fee_ppm: int,
         peer_status: Optional[Dict] = None,
+        max_cost_ppm: int = 0,
     ) -> List[Tuple[str, Dict[str, Any], int, float]]:
         """
         Select all profitable source channels for a rebalance.
@@ -3641,7 +3836,11 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
         Instead of returning a single "best" source, this returns ALL sources
         that have a positive spread (EV > 0), sorted by score (highest first).
         This allows Sling to handle pathfinding failover automatically.
-        
+
+        When max_cost_ppm > 0, operates in CapEx mode: sources are accepted if
+        total cost (inbound + opp_cost) is within the cap, even with negative
+        spread. Sources ranked by dual-benefit score (cost efficiency + drain benefit).
+
         Args:
             sources: List of (channel_id, info, outbound_ratio) tuples
             amount_needed: Amount to rebalance in sats
@@ -3649,7 +3848,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             dest_outbound_fee_ppm: Outbound fee of destination channel
             dest_inbound_fee_ppm: Estimated inbound fee to destination
             peer_status: Pre-fetched peer connection status (optimization)
-            
+            max_cost_ppm: CapEx cost cap in PPM. 0 = legacy EV mode (default).
+                When >0, bypass spread gate and accept sources within cost cap.
+
         Returns:
             List of (channel_id, info, score, weighted_opp_cost) tuples,
             sorted by score (highest first). Empty list if no profitable sources.
@@ -3673,7 +3874,8 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             'unstable_uptime': 0,
             'source_protected': 0,
             'negative_spread': 0,
-            'below_profit_threshold': 0
+            'below_profit_threshold': 0,
+            'exceeds_cost_cap': 0,
         }
         best_rejected_spread = None  # Track closest-to-profitable rejection
 
@@ -3739,14 +3941,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # HIVE FLEET: If source peer is a hive member, they charge us
             # 0 fee — the first hop is free.  This dramatically improves the
             # spread for circular routes through the fleet.
-            is_hive_source = False
-            if pid:
-                if self.hive_router:
-                    is_hive_source = self.hive_router.is_hive_member(pid)
-                elif self.hive_hints:
-                    is_hive_source = self.hive_hints.is_hive_member(pid)
-                if is_hive_source:
-                    source_fee_ppm = 0
+            is_hive_source = self._is_hive_member(pid) if pid else False
+            if is_hive_source:
+                source_fee_ppm = 0
 
             # E5 FIX: Reuse state from source protection check above (line 3244)
             # instead of making a duplicate DB query for the same channel.
@@ -3794,72 +3991,115 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             turnover_weight = base_turnover_weight * flow_multiplier
             weighted_opp_cost = int(source_fee_ppm * turnover_weight)
 
-            # Calculate spread: what we earn minus what it costs
+            # Calculate total cost and spread
+            total_cost_ppm = dest_inbound_fee_ppm + weighted_opp_cost
             spread_ppm = dest_outbound_fee_ppm - dest_inbound_fee_ppm - weighted_opp_cost
 
-            # Require non-negative spread to avoid consistent leakage.
-            if spread_ppm < 0:
-                rejections['negative_spread'] += 1
-                # Track the best rejected spread for diagnostics
-                if best_rejected_spread is None or spread_ppm > best_rejected_spread['spread']:
-                    best_rejected_spread = {
-                        'channel': cid,
-                        'spread': spread_ppm,
-                        'dest_fee': dest_outbound_fee_ppm,
-                        'inbound_fee': dest_inbound_fee_ppm,
-                        'opp_cost': weighted_opp_cost,
-                        'flow_state': flow_state,
-                    }
-                continue
-
-            # Check minimum profit threshold
-            # PPM-BASED PROFIT GATE: Scale threshold with amount to decouple from chunk size
-            expected_profit_estimate = (spread_ppm * amount_needed) // 1_000_000
-            if self.config.rebalance_min_profit_ppm > 0:
-                min_profit_threshold = (amount_needed * self.config.rebalance_min_profit_ppm) // 1_000_000
+            if max_cost_ppm > 0:
+                # =============================================================
+                # CapEx mode: accept if total cost within tier cap.
+                # Spread can be negative — CapEx budget covers the investment.
+                # =============================================================
+                if total_cost_ppm > max_cost_ppm:
+                    rejections['exceeds_cost_cap'] += 1
+                    if best_rejected_spread is None or total_cost_ppm < best_rejected_spread.get('total_cost', float('inf')):
+                        best_rejected_spread = {
+                            'channel': cid,
+                            'spread': spread_ppm,
+                            'total_cost': total_cost_ppm,
+                            'dest_fee': dest_outbound_fee_ppm,
+                            'inbound_fee': dest_inbound_fee_ppm,
+                            'opp_cost': weighted_opp_cost,
+                            'flow_state': flow_state,
+                        }
+                    continue
+                # Spread can be negative — CapEx budget covers the investment
             else:
-                min_profit_threshold = self.config.rebalance_min_profit
-            if expected_profit_estimate < min_profit_threshold:
-                rejections['below_profit_threshold'] += 1
-                continue
+                # =============================================================
+                # Legacy EV mode: require positive spread + profit threshold
+                # =============================================================
+                if spread_ppm < 0:
+                    rejections['negative_spread'] += 1
+                    # Track the best rejected spread for diagnostics
+                    if best_rejected_spread is None or spread_ppm > best_rejected_spread['spread']:
+                        best_rejected_spread = {
+                            'channel': cid,
+                            'spread': spread_ppm,
+                            'dest_fee': dest_outbound_fee_ppm,
+                            'inbound_fee': dest_inbound_fee_ppm,
+                            'opp_cost': weighted_opp_cost,
+                            'flow_state': flow_state,
+                        }
+                    continue
 
-            # Calculate score for sorting (higher is better)
-            score = (ratio * 50) - (source_fee_ppm / 10)
+                # Check minimum profit threshold
+                # PPM-BASED PROFIT GATE: Scale threshold with amount to decouple from chunk size
+                expected_profit_estimate = (spread_ppm * amount_needed) // 1_000_000
+                if self.config.rebalance_min_profit_ppm > 0:
+                    min_profit_threshold = (amount_needed * self.config.rebalance_min_profit_ppm) // 1_000_000
+                else:
+                    min_profit_threshold = self.config.rebalance_min_profit
+                if expected_profit_estimate < min_profit_threshold:
+                    rejections['below_profit_threshold'] += 1
+                    continue
 
-            # Bonus for sink/balanced channels (they have excess outbound we want to use)
-            if flow_state == "sink":
-                score += 100
-            elif flow_state in ("balanced", "balanced_active"):
-                # Apply Stagnant Inventory Bonus (only for truly dormant channels)
-                if flow_state == "balanced" and source_turnover_rate < 0.0015:
-                    score += 10 # Awakening Bonus
-                    self.plugin.log(f"STAGNANT BONUS: Applying +10 priority to stagnant channel {cid[:12]}...", level='info')
+            # =================================================================
+            # SCORING
+            # =================================================================
+            if max_cost_ppm > 0:
+                # CapEx dual-benefit scoring with configurable weights:
+                # w_cost: cost efficiency (how much headroom under the cap)
+                # w_drain: drain benefit (prefer draining overfull sources)
+                cfg = self.config.snapshot()
+                w_cost = cfg.capex_cost_efficiency_weight
+                w_drain = cfg.capex_drain_benefit_weight
+                w_total = w_cost + w_drain
+                cost_efficiency = max(0.0, (max_cost_ppm - total_cost_ppm) / max(1, max_cost_ppm))
+                drain_benefit = max(0.0, (ratio - 0.50) / 0.50)
+                if w_total > 0:
+                    score = int(((w_cost * cost_efficiency + w_drain * drain_benefit) / w_total) * 1000)
+                else:
+                    score = int(cost_efficiency * 1000)
+                if is_hive_source:
+                    score += 200
+            else:
+                # Legacy EV scoring
+                score = (ratio * 50) - (source_fee_ppm / 10)
 
-                score += 20
+                # Bonus for sink/balanced channels (they have excess outbound we want to use)
+                if flow_state == "sink":
+                    score += 100
+                elif flow_state in ("balanced", "balanced_active"):
+                    # Apply Stagnant Inventory Bonus (only for truly dormant channels)
+                    if flow_state == "balanced" and source_turnover_rate < 0.0015:
+                        score += 10 # Awakening Bonus
+                        self.plugin.log(f"STAGNANT BONUS: Applying +10 priority to stagnant channel {cid[:12]}...", level='info')
 
-            # Fleet rebalance bias is the public, bounded integration surface.
-            # Convert the multiplicative bias into a moderate additive score delta.
-            source_peer = info.get("peer_id", "")
-            if source_peer:
-                score += int(round((self._get_hive_rebalance_bias(source_peer) - 1.0) * 200))
+                    score += 20
 
-            # HIVE FLEET BONUS: Strongly prefer hive member sources.
-            # Routes through fleet peers have a free first hop, making
-            # circular rebalances much cheaper.
-            if is_hive_source:
-                score += 200
-                self.plugin.log(
-                    f"HIVE SOURCE BONUS: +200 priority for {cid[:12]}... "
-                    f"(peer {pid[:12]}... is fleet member, fee=0)",
-                    level='debug'
-                )
+                # Fleet rebalance bias is the public, bounded integration surface.
+                # Convert the multiplicative bias into a moderate additive score delta.
+                source_peer = info.get("peer_id", "")
+                if source_peer:
+                    score += int(round((self._get_hive_rebalance_bias(source_peer) - 1.0) * 200))
 
-            # Route-pair bonus: inbound revenue legs are ideal sources.
-            # Draining local balance creates headroom for the inbound traffic
-            # that generates fees on this route.
-            route_pair_ins = getattr(self, '_cycle_route_pair_in_channels', set())
-            if normalized in route_pair_ins:
-                score += 40
+                # HIVE FLEET BONUS: Strongly prefer hive member sources.
+                # Routes through fleet peers have a free first hop, making
+                # circular rebalances much cheaper.
+                if is_hive_source:
+                    score += 200
+                    self.plugin.log(
+                        f"HIVE SOURCE BONUS: +200 priority for {cid[:12]}... "
+                        f"(peer {pid[:12]}... is fleet member, fee=0)",
+                        level='debug'
+                    )
+
+                # Route-pair bonus: inbound revenue legs are ideal sources.
+                # Draining local balance creates headroom for the inbound traffic
+                # that generates fees on this route.
+                route_pair_ins = getattr(self, '_cycle_route_pair_in_channels', set())
+                if normalized in route_pair_ins:
+                    score += 40
 
             # Persistent source-channel reliability from rebalance history.
             # This complements the in-memory recent-failure penalty below.

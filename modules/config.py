@@ -86,6 +86,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hive_equalization_high_pct': float,
     'hive_equalization_cooldown_hours': int,
     'hive_equalization_max_candidates_per_cycle': int,
+    'hive_push_enabled': bool,
+    'hive_push_trigger_ratio': float,
+    'hive_push_target_ratio': float,
     'futility_cooldown_hours': int,
     'inbound_fee_estimate_ppm': int,
     # Vegas Reflex
@@ -142,6 +145,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'capex_exploration_rate': float,
     'capex_tactical_rate': float,
     'capex_global_envelope_sats': int,
+    'capex_cost_efficiency_weight': float,
+    'capex_drain_benefit_weight': float,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -304,6 +309,9 @@ class Config:
     hive_equalization_high_pct: float = 0.65  # Upper bound for hive balance band
     hive_equalization_cooldown_hours: int = 48  # Longer than standard rebalance cooldown
     hive_equalization_max_candidates_per_cycle: int = 1
+    hive_push_enabled: bool = True            # Deploy capital to fleet member channels
+    hive_push_trigger_ratio: float = 0.60     # Push when local ratio exceeds this
+    hive_push_target_ratio: float = 0.50      # Push balance toward this ratio
     futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
     inbound_fee_estimate_ppm: int = 50  # Route cost buffer added on top of last-hop fee (PPM)
     
@@ -404,6 +412,8 @@ class Config:
     capex_exploration_rate: float = 0.10        # Fleet contribution fraction for opens/growth
     capex_tactical_rate: float = 0.15           # Fleet contribution fraction for Boltz treasury
     capex_global_envelope_sats: int = 0         # Global cap (0 = auto-computed)
+    capex_cost_efficiency_weight: float = 0.5   # Weight for cost-efficiency in dual-benefit score
+    capex_drain_benefit_weight: float = 0.5     # Weight for drain-benefit in dual-benefit score
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -687,6 +697,9 @@ class ConfigSnapshot:
     hive_equalization_high_pct: float
     hive_equalization_cooldown_hours: int
     hive_equalization_max_candidates_per_cycle: int
+    hive_push_enabled: bool
+    hive_push_trigger_ratio: float
+    hive_push_target_ratio: float
     futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
 
@@ -775,6 +788,8 @@ class ConfigSnapshot:
     capex_exploration_rate: float = 0.10
     capex_tactical_rate: float = 0.15
     capex_global_envelope_sats: int = 0
+    capex_cost_efficiency_weight: float = 0.5
+    capex_drain_benefit_weight: float = 0.5
     # Version tracking
     version: int = 0
     

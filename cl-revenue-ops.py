@@ -1487,6 +1487,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         config=config,
         hive_hints=hive_hints,
         capital_efficiency=capital_efficiency,
+        hive_member_check=rebalancer._is_hive_member if rebalancer is not None else None,
     )
     plugin.log("CapexBudgetEngine initialized")
 

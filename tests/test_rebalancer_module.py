@@ -611,6 +611,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = [{
             "lease_id": "lease-1",
@@ -659,6 +660,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = [{
@@ -715,6 +717,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = []
@@ -782,6 +785,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = []
@@ -837,6 +841,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = [{
             "lease_id": "lease-1",
@@ -885,6 +890,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = []
@@ -944,6 +950,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = [{
@@ -1604,6 +1611,7 @@ class TestHiveEqualizationFallback:
             "high_liquidity_threshold": 0.70,
             "rebalance_min_amount": 10_000,
             "rebalance_max_amount": 500_000,
+            "hive_push_enabled": False,  # Isolate equalization tests from push
         }
         base_config.update(config_overrides)
         cfg = Config(**base_config)
@@ -1635,7 +1643,11 @@ class TestHiveEqualizationFallback:
         mock_database.get_peer_uptime_percent.return_value = 100.0
         return r
 
-    def test_equalization_runs_only_when_normal_candidates_are_empty(self, mock_plugin, mock_database):
+    def test_equalization_runs_as_pass2_alongside_ev_candidates(self, mock_plugin, mock_database):
+        """Equalization (Pass 2) runs before the main EV loop (Pass 3).
+
+        Both equalization and EV candidates can coexist in the result.
+        """
         from modules.rebalancer import RebalanceReasonCode
 
         hive_source_peer = "02" + "1" * 64
@@ -1670,8 +1682,11 @@ class TestHiveEqualizationFallback:
 
         result = r.find_rebalance_candidates()
 
-        assert result == [profitable]
-        assert result[0].reason_code != RebalanceReasonCode.HIVE_EQUALIZATION.value
+        # Equalization runs as Pass 2 before the EV loop, so both can appear.
+        # The profitable EV candidate must be present.
+        ev_candidates = [c for c in result if c.reason_code != RebalanceReasonCode.HIVE_EQUALIZATION.value]
+        assert len(ev_candidates) >= 1
+        assert profitable in result
 
     def test_equalization_selects_most_imbalanced_pair_first(self, mock_plugin, mock_database):
         from modules.rebalancer import RebalanceReasonCode
@@ -2026,6 +2041,7 @@ class TestHiveEqualizationObservability:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll.side_effect = poll_hints
+        r.hive_hints.is_hive_member.return_value = False
 
         r.hive_router = MagicMock()
         r.hive_router.available = True
@@ -2201,3 +2217,173 @@ class TestHiveEqualizationConfigSurface:
         from modules.rebalancer import RebalanceReasonCode
 
         assert RebalanceReasonCode.HIVE_EQUALIZATION.value == "hive_equalization"
+
+
+class TestGetLastHopFeeFleetMember:
+    """Fleet members charge 0 — _get_last_hop_fee should return 0 immediately."""
+
+    def test_returns_zero_for_hive_member_via_router(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        mock_router = MagicMock()
+        mock_router.is_hive_member.return_value = True
+        r.hive_router = mock_router
+
+        result = r._get_last_hop_fee("03796a" + "0" * 58)
+        assert result == 0
+        mock_plugin.rpc.listpeerchannels.assert_not_called()
+
+    def test_returns_zero_for_hive_member_via_hints(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        mock_hints = MagicMock()
+        mock_hints.is_hive_member.return_value = True
+        r.hive_hints = mock_hints
+
+        result = r._get_last_hop_fee("028f58" + "0" * 58)
+        assert result == 0
+
+    def test_returns_normal_fee_for_non_member(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        mock_router = MagicMock()
+        mock_router.is_hive_member.return_value = False
+        r.hive_router = mock_router
+        mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+
+        result = r._get_last_hop_fee("03a93b" + "0" * 58)
+        # Should NOT have short-circuited to 0
+        assert result != 0 or result is None
+
+
+class TestCapexAwareSourceSelection:
+    """Source selection with max_cost_ppm bypasses spread gate."""
+
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=True, rebalance_min_profit=10)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r._fee_cache = {}
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.05)
+        r.job_manager = MagicMock()
+        r.job_manager.active_channels = set()
+        r.job_manager.get_source_failure_count.return_value = 0
+        r.policy_manager = None
+        r.hive_hints = None
+        r._hive_router = None
+        mock_database.get_peer_uptime_percent.return_value = 100.0
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        mock_database.get_source_rebalance_success_rate = MagicMock(return_value=None)
+        return r
+
+    def _make_source(self, scid, peer_id, fee_ppm, spendable, capacity, ratio):
+        return (scid, {"peer_id": peer_id, "fee_ppm": fee_ppm, "spendable_sats": spendable, "capacity": capacity}, ratio)
+
+    def test_negative_spread_rejected_without_max_cost(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        sources = [self._make_source("100x1x0", "02aa" + "0" * 62, 200, 500000, 1000000, 0.95)]
+        result = r._select_source_candidates(
+            sources=sources, amount_needed=100000,
+            dest_channel="200x2x0", dest_outbound_fee_ppm=25, dest_inbound_fee_ppm=0,
+        )
+        assert len(result) == 0
+
+    def test_negative_spread_accepted_with_max_cost(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        sources = [self._make_source("100x1x0", "02aa" + "0" * 62, 200, 500000, 1000000, 0.95)]
+        result = r._select_source_candidates(
+            sources=sources, amount_needed=100000,
+            dest_channel="200x2x0", dest_outbound_fee_ppm=25, dest_inbound_fee_ppm=0,
+            max_cost_ppm=500,
+        )
+        assert len(result) >= 1
+
+    def test_source_exceeding_cost_cap_rejected(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        mock_database.get_channel_state.return_value = {"state": "source"}
+        # fee_ppm=10000 -> weighted_opp_cost = 10000 * 0.075 = 750 > max_cost_ppm=500
+        sources = [self._make_source("100x1x0", "02aa" + "0" * 62, 10000, 500000, 1000000, 0.95)]
+        result = r._select_source_candidates(
+            sources=sources, amount_needed=100000,
+            dest_channel="200x2x0", dest_outbound_fee_ppm=25, dest_inbound_fee_ppm=0,
+            max_cost_ppm=500,
+        )
+        assert len(result) == 0
+
+    def test_dual_benefit_ranking_prefers_overfull_sources(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        sources = [
+            self._make_source("100x1x0", "02aa" + "0" * 62, 100, 500000, 1000000, 0.60),
+            self._make_source("200x2x0", "02bb" + "0" * 62, 150, 500000, 1000000, 0.99),
+        ]
+        result = r._select_source_candidates(
+            sources=sources, amount_needed=100000,
+            dest_channel="300x3x0", dest_outbound_fee_ppm=25, dest_inbound_fee_ppm=0,
+            max_cost_ppm=500,
+        )
+        assert len(result) == 2
+        assert result[0][0] == "200x2x0"  # 99% local ranked first
+
+
+class TestHivePush:
+    def _make_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+        cfg = Config(dry_run=True, hive_push_enabled=True, hive_push_trigger_ratio=0.60,
+                     hive_push_target_ratio=0.50, rebalance_min_amount=10000, rebalance_max_amount=5000000)
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        mock_database.get_top_route_pairs.return_value = []
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        return EVRebalancer(mock_plugin, cfg, mock_database)
+
+    def test_hive_push_for_locally_heavy_fleet_channel(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        fleet_ch = ("933791x3241x0", {"capacity": 2935694, "spendable_sats": 2906337, "peer_id": "03796a" + "0" * 58, "fee_ppm": 0}, 0.99)
+        sources = [("100x1x0", {"capacity": 5000000, "spendable_sats": 4900000, "peer_id": "02aa" + "0" * 62, "fee_ppm": 100}, 0.98)]
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        candidates = r._build_hive_push_candidates([fleet_ch], sources, cfg=r.config.snapshot())
+        assert len(candidates) >= 1
+        c = candidates[0]
+        assert c.to_channel == "933791x3241x0"
+        assert c.dest_is_hive_member is True
+        assert c.reason_code == "hive_push"
+        assert c.amount_sats > 1000000
+
+    def test_hive_push_skipped_below_trigger(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        fleet_ch = ("933791x3241x0", {"capacity": 2935694, "spendable_sats": 1614632, "peer_id": "03796a" + "0" * 58, "fee_ppm": 0}, 0.55)
+        candidates = r._build_hive_push_candidates([fleet_ch], [], cfg=r.config.snapshot())
+        assert len(candidates) == 0
+
+    def test_hive_push_prefers_most_overfull_source(self, mock_plugin, mock_database):
+        r = self._make_rebalancer(mock_plugin, mock_database)
+        fleet_ch = ("933791x3241x0", {"capacity": 2935694, "spendable_sats": 2906337, "peer_id": "03796a" + "0" * 58, "fee_ppm": 0}, 0.99)
+        sources = [
+            ("100x1x0", {"capacity": 5000000, "spendable_sats": 4900000, "peer_id": "02aa" + "0" * 62, "fee_ppm": 100}, 0.60),
+            ("200x2x0", {"capacity": 5000000, "spendable_sats": 4900000, "peer_id": "02bb" + "0" * 62, "fee_ppm": 200}, 0.99),
+        ]
+        candidates = r._build_hive_push_candidates([fleet_ch], sources, cfg=r.config.snapshot())
+        assert len(candidates) >= 1
+        assert candidates[0].source_candidates[0] == "200x2x0"  # 99% local preferred
