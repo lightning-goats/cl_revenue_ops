@@ -2058,6 +2058,8 @@ class EVRebalancer:
                             sources=source_tuples, amount_needed=amount_needed,
                             dest_channel=dest_id, dest_outbound_fee_ppm=dest_info.get("fee_ppm", 0),
                             dest_inbound_fee_ppm=0,
+                            max_cost_ppm=ch_budget.tier_ppm,
+                            peer_status=peer_status,
                         )
                     except Exception:
                         source_result = []
