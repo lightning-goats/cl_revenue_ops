@@ -1828,13 +1828,67 @@ class EVRebalancer:
             # Track depleted count for Boltz coordination signal
             self._last_depleted_count = len(depleted_channels)
 
-            if (not depleted_channels or not source_channels) and not can_try_hive_equalization:
+            # =====================================================
+            # PASS 1: HIVE PUSH (deploy capital to fleet channels)
+            # =====================================================
+            if cfg.hive_push_enabled and source_channels and available_slots > 0:
+                hive_member_channels = []
+                for cid, info in channels.items():
+                    peer_id = info.get("peer_id", "")
+                    if not self._is_hive_member(peer_id):
+                        continue
+                    if cid in active_channels:
+                        continue
+                    cap = max(1, info.get("capacity", 1))
+                    ratio = info.get("spendable_sats", 0) / cap
+                    if ratio > cfg.hive_push_trigger_ratio:
+                        hive_member_channels.append((cid, info, ratio))
+
+                if hive_member_channels:
+                    push_candidates = self._build_hive_push_candidates(
+                        hive_channels=hive_member_channels,
+                        source_channels=source_channels,
+                        cfg=cfg,
+                    )
+                    for pc in push_candidates[:available_slots]:
+                        candidates.append(pc)
+                    available_slots = max(0, available_slots - len(push_candidates))
+                    if push_candidates:
+                        self.plugin.log(
+                            f"HIVE PUSH: {len(push_candidates)} fleet channel candidates "
+                            f"({available_slots} slots remaining)"
+                        )
+
+            # =====================================================
+            # PASS 2: HIVE EQUALIZATION (balance between fleet members)
+            # =====================================================
+            if can_try_hive_equalization and available_slots > 0:
+                equalization_candidates, eq_skip = self._build_hive_equalization_candidates(
+                    hive_low_channels=hive_low_channels,
+                    hive_high_channels=hive_high_channels,
+                    available_slots=available_slots,
+                    cfg=cfg,
+                )
+                for ec in equalization_candidates[:available_slots]:
+                    candidates.append(ec)
+                available_slots = max(0, available_slots - len(equalization_candidates))
+                self._log_hive_equalization_diagnostics(
+                    hive_low_channels,
+                    hive_high_channels,
+                    selected_count=len(equalization_candidates),
+                    skip_reasons=eq_skip,
+                )
+
+            # =====================================================
+            # PASS 3: CAPEX REBALANCING (main depleted channel loop)
+            # =====================================================
+            if (not depleted_channels or not source_channels) and not candidates:
                 self._log_pure_hive_diagnostics(
                     depleted_channels,
                     source_channels,
                     selected_count=pure_hive_selected,
                 )
-                if cfg.hive_equalization_enabled and (hive_low_channels or hive_high_channels):
+                if cfg.hive_equalization_enabled and (hive_low_channels or hive_high_channels) and not candidates:
                     self._log_hive_equalization_diagnostics(
                         hive_low_channels,
                         hive_high_channels,
@@ -1874,6 +1928,11 @@ class EVRebalancer:
                 )
                 self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
+
+            if available_slots <= 0:
+                # Passes 1-2 filled all slots; skip EV loop
+                self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
+                return candidates[:self.job_manager.slots_available()]
 
             self.plugin.log(
                 f"Found {len(depleted_channels)} depleted and {len(source_channels)} source channels "
@@ -2325,30 +2384,8 @@ class EVRebalancer:
                     budget_blocked=False,
                 )
             else:
-                equalization_candidates, equalization_skip_reasons = self._build_hive_equalization_candidates(
-                    hive_low_channels=hive_low_channels,
-                    hive_high_channels=hive_high_channels,
-                    available_slots=available_slots,
-                    cfg=cfg,
-                )
-                self._log_hive_equalization_diagnostics(
-                    hive_low_channels,
-                    hive_high_channels,
-                    selected_count=len(equalization_candidates),
-                    skip_reasons=equalization_skip_reasons,
-                )
-                if equalization_candidates:
-                    selected = equalization_candidates[:available_slots]
-                    self._set_last_decision_summary(
-                        action="rebalance",
-                        reason="hive_equalization_candidates",
-                        dominant_input=RebalanceReasonCode.HIVE_EQUALIZATION.value,
-                        safety_block=False,
-                        budget_blocked=False,
-                    )
-                    self._report_hive_liquidity_state(depleted_channels, source_channels, selected)
-                    return selected
-
+                # Hive equalization already ran in Pass 2 above.
+                # If we still have no candidates, report hold.
                 self._set_last_decision_summary(
                     action="hold",
                     reason=(

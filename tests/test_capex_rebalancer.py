@@ -552,3 +552,178 @@ class TestDefaultBudgetPreserved:
     def test_default_daily_budget_preserved(self):
         cfg = Config()
         assert cfg.daily_budget_sats >= 0
+
+
+class TestRebalanceFlowOrdering:
+    """Hive push runs before equalization, which runs before general rebalancing."""
+
+    def test_hive_push_runs_before_equalization(self, mock_plugin, mock_database):
+        """Pass 1 (push) executes before Pass 2 (equalization)."""
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(
+            dry_run=True,
+            hive_push_enabled=True,
+            hive_equalization_enabled=True,
+            rebalance_min_amount=10_000,
+            rebalance_max_amount=500_000,
+            low_liquidity_threshold=0.20,
+            high_liquidity_threshold=0.80,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        # Inject mock data_service
+        mock_ds = MagicMock()
+        mock_ds.datastore_push.return_value = True
+        r.data_service = mock_ds
+
+        call_order = []
+        original_push = r._build_hive_push_candidates
+        original_eq = r._build_hive_equalization_candidates
+
+        def mock_push(*a, **kw):
+            call_order.append("hive_push")
+            return []
+
+        def mock_eq(*a, **kw):
+            call_order.append("hive_equalization")
+            return ([], {})
+
+        r._build_hive_push_candidates = mock_push
+        r._build_hive_equalization_candidates = mock_eq
+
+        # Channels: one hive-member overfull (push candidate) + one hive-low + one hive-high
+        hive_peer = "02" + "a" * 64
+        other_peer = "02" + "b" * 64
+        r._is_hive_member = MagicMock(side_effect=lambda pid: pid == hive_peer)
+
+        r._get_channels_with_balances = MagicMock(return_value={
+            "100x1x0": {
+                "peer_id": hive_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 700_000,  # 70% local — above push trigger
+                "fee_ppm": 0,
+            },
+            "200x1x0": {
+                "peer_id": other_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 900_000,  # 90% local — source
+                "fee_ppm": 100,
+            },
+            "300x1x0": {
+                "peer_id": hive_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 100_000,  # 10% local — depleted & hive_low
+                "fee_ppm": 50,
+            },
+        })
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        mock_database.get_top_route_pairs.return_value = []
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._analyze_rebalance_ev = MagicMock(return_value=None)
+
+        r.find_rebalance_candidates()
+
+        # Both passes must have been called, push before equalization
+        if "hive_push" in call_order and "hive_equalization" in call_order:
+            assert call_order.index("hive_push") < call_order.index("hive_equalization")
+        # At minimum, push must have been called (equalization needs both low+high)
+        assert "hive_push" in call_order
+
+    def test_equalization_no_longer_last_resort_fallback(self, mock_plugin, mock_database):
+        """Equalization runs even when the main EV loop produces candidates."""
+        from modules.rebalancer import EVRebalancer, RebalanceCandidate, RebalanceReasonCode
+
+        cfg = Config(
+            dry_run=True,
+            hive_push_enabled=False,
+            hive_equalization_enabled=True,
+            rebalance_min_amount=10_000,
+            rebalance_max_amount=500_000,
+            low_liquidity_threshold=0.20,
+            high_liquidity_threshold=0.80,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        mock_ds = MagicMock()
+        mock_ds.datastore_push.return_value = True
+        r.data_service = mock_ds
+
+        eq_called = []
+
+        def mock_eq(*a, **kw):
+            eq_called.append(True)
+            return ([], {})
+
+        r._build_hive_equalization_candidates = mock_eq
+
+        hive_peer = "02" + "a" * 64
+        other_peer = "02" + "b" * 64
+        r._is_hive_member = MagicMock(side_effect=lambda pid: pid == hive_peer)
+
+        # Two hive channels (one low, one high) + depleted + source
+        r._get_channels_with_balances = MagicMock(return_value={
+            "100x1x0": {
+                "peer_id": hive_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 100_000,  # 10% — hive_low + depleted
+                "fee_ppm": 0,
+            },
+            "200x1x0": {
+                "peer_id": hive_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 900_000,  # 90% — hive_high + source
+                "fee_ppm": 0,
+            },
+            "300x1x0": {
+                "peer_id": other_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 100_000,  # depleted
+                "fee_ppm": 100,
+            },
+            "400x1x0": {
+                "peer_id": other_peer,
+                "capacity": 1_000_000,
+                "spendable_sats": 900_000,  # source
+                "fee_ppm": 200,
+            },
+        })
+
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        mock_database.get_top_route_pairs.return_value = []
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+        r._get_peer_connection_status = MagicMock(return_value={})
+
+        # EV analysis would produce a candidate for the main loop
+        mock_candidate = MagicMock()
+        mock_candidate.reason_code = RebalanceReasonCode.CAPEX_FALLBACK.value
+        mock_candidate.to_channel = "300x1x0"
+        mock_candidate.source_candidates = ["400x1x0"]
+        mock_candidate.expected_profit_sats = 100
+        mock_candidate.to_peer_id = other_peer
+        mock_candidate.primary_source_peer_id = other_peer
+        mock_candidate.coordination_hint_type = ""
+        mock_candidate.coordination_rank_bonus = 0
+        mock_candidate.recommended_cooldown_hours = 0
+        mock_candidate.hive_route_hops = 0
+        mock_candidate.dest_is_hive_member = False
+        r._analyze_rebalance_ev = MagicMock(return_value=mock_candidate)
+
+        r.find_rebalance_candidates()
+
+        # Equalization must have been called BEFORE the main loop would have
+        # acted as a last-resort fallback
+        assert len(eq_called) >= 1, "Equalization should run as Pass 2, not just as fallback"

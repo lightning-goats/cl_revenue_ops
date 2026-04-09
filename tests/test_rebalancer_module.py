@@ -611,6 +611,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = [{
             "lease_id": "lease-1",
@@ -659,6 +660,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = [{
@@ -715,6 +717,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = []
@@ -782,6 +785,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = []
@@ -837,6 +841,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = [{
             "lease_id": "lease-1",
@@ -885,6 +890,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = []
@@ -944,6 +950,7 @@ class TestCoordinatedRebalanceHints:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll = MagicMock()
+        r.hive_hints.is_hive_member.return_value = False
         r.hive_hints.get_rebalance_bias.return_value = 1.0
         r.hive_hints.get_route_segment_leases.return_value = []
         r.hive_hints.get_rebalance_recommendations.return_value = [{
@@ -1604,6 +1611,7 @@ class TestHiveEqualizationFallback:
             "high_liquidity_threshold": 0.70,
             "rebalance_min_amount": 10_000,
             "rebalance_max_amount": 500_000,
+            "hive_push_enabled": False,  # Isolate equalization tests from push
         }
         base_config.update(config_overrides)
         cfg = Config(**base_config)
@@ -1635,7 +1643,11 @@ class TestHiveEqualizationFallback:
         mock_database.get_peer_uptime_percent.return_value = 100.0
         return r
 
-    def test_equalization_runs_only_when_normal_candidates_are_empty(self, mock_plugin, mock_database):
+    def test_equalization_runs_as_pass2_alongside_ev_candidates(self, mock_plugin, mock_database):
+        """Equalization (Pass 2) runs before the main EV loop (Pass 3).
+
+        Both equalization and EV candidates can coexist in the result.
+        """
         from modules.rebalancer import RebalanceReasonCode
 
         hive_source_peer = "02" + "1" * 64
@@ -1670,8 +1682,11 @@ class TestHiveEqualizationFallback:
 
         result = r.find_rebalance_candidates()
 
-        assert result == [profitable]
-        assert result[0].reason_code != RebalanceReasonCode.HIVE_EQUALIZATION.value
+        # Equalization runs as Pass 2 before the EV loop, so both can appear.
+        # The profitable EV candidate must be present.
+        ev_candidates = [c for c in result if c.reason_code != RebalanceReasonCode.HIVE_EQUALIZATION.value]
+        assert len(ev_candidates) >= 1
+        assert profitable in result
 
     def test_equalization_selects_most_imbalanced_pair_first(self, mock_plugin, mock_database):
         from modules.rebalancer import RebalanceReasonCode
@@ -2026,6 +2041,7 @@ class TestHiveEqualizationObservability:
 
         r.hive_hints = MagicMock()
         r.hive_hints.poll.side_effect = poll_hints
+        r.hive_hints.is_hive_member.return_value = False
 
         r.hive_router = MagicMock()
         r.hive_router.available = True
