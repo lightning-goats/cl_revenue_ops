@@ -1651,11 +1651,6 @@ class EVRebalancer:
         # Thread-safe config snapshot for this rebalance cycle
         cfg = self.config.snapshot()
 
-        if getattr(cfg, "rebalance_engine", "v1") == "v2":
-            engine_v2 = getattr(self, "rebalance_engine_v2", None)
-            if engine_v2 is not None:
-                return engine_v2.find_candidates()
-
         # Compute capex allocations for this cycle (engine does all budget math)
         if self._capex_engine:
             try:
@@ -1703,6 +1698,25 @@ class EVRebalancer:
                 )
                 self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
+
+            if getattr(cfg, "rebalance_engine", "v1") == "v2":
+                engine_v2 = getattr(self, "rebalance_engine_v2", None)
+                if engine_v2 is None:
+                    self._set_last_decision_summary(
+                        action="suppressed",
+                        reason="rebalance_engine_v2_unavailable",
+                        dominant_input="rebalance_engine",
+                        safety_block=True,
+                        budget_blocked=False,
+                    )
+                    self.plugin.log(
+                        "rebalance_engine=v2 requested but no v2 engine is injected; suppressing rebalance candidate search",
+                        level='warn',
+                    )
+                    self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
+                    return candidates
+
+                return engine_v2.find_candidates()
             
             channels = self._get_channels_with_balances()
             if not channels:
