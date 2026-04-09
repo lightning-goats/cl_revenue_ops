@@ -727,3 +727,120 @@ class TestRebalanceFlowOrdering:
         # Equalization must have been called BEFORE the main loop would have
         # acted as a last-resort fallback
         assert len(eq_called) >= 1, "Equalization should run as Pass 2, not just as fallback"
+
+
+class TestCapexRebalancerIntegration:
+    """End-to-end test mimicking real nexus-01 fleet state.
+
+    Real situation: 44 channels, 40 at >50% local, 2 depleted, 2 fleet members.
+    Old system: 0 candidates (spread gate blocks everything at 25 ppm dest fee).
+    New system: should produce >= 1 candidate (hive push for cyber-hornet, or capex fallback).
+    """
+
+    def test_real_world_fleet_produces_candidates(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer, RebalanceReasonCode
+
+        cfg = Config(
+            dry_run=True,
+            hive_push_enabled=True,
+            hive_push_trigger_ratio=0.60,
+            hive_push_target_ratio=0.50,
+            hive_equalization_enabled=True,
+            rebalance_min_amount=10000,
+            rebalance_max_amount=500000,
+            low_liquidity_threshold=0.20,
+            high_liquidity_threshold=0.80,
+        )
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+
+        # Inject mock data_service
+        mock_ds = MagicMock()
+        mock_ds.datastore_push.return_value = True
+        mock_ds.invalidate.return_value = None
+        r.data_service = mock_ds
+
+        # Mock capex engine with bootstrap budgets
+        from modules.capex_budget import ChannelCapexBudget
+        mock_capex = MagicMock()
+
+        def get_budget(channel_id):
+            # Fleet channels get fleet tier, others get bootstrap
+            if channel_id == "933791x3241x0":
+                return ChannelCapexBudget(
+                    channel_id=channel_id, tier="fleet",
+                    budget_msat=100_000_000, tier_ppm=50,
+                    priority_class="fleet_coordination",
+                )
+            return ChannelCapexBudget(
+                channel_id=channel_id, tier="bootstrap",
+                budget_msat=200_000_000, tier_ppm=250,
+                priority_class="growth",
+            )
+
+        mock_capex.get_channel_budget.side_effect = get_budget
+        mock_capex.compute_allocations.return_value = None
+        r._capex_engine = mock_capex
+
+        # Mock hive membership: cyber-hornet and gondor are fleet members
+        fleet_members = {"03796a" + "0" * 58, "028f58" + "0" * 58}
+        mock_router = MagicMock()
+        mock_router.is_hive_member.side_effect = lambda pid: pid in fleet_members
+        mock_router.available = True
+        mock_router.discover_route.return_value = None
+        mock_router.refresh_layer.return_value = None
+        mock_router.refresh_fleet_balances.return_value = None
+        mock_router.clear_route_cache.return_value = None
+        r.hive_router = mock_router
+
+        # Real-world channel state (key channels)
+        channels = {
+            # Fleet member: cyber-hornet at 99% local (should trigger hive push)
+            "933791x3241x0": {
+                "capacity": 2_935_694, "spendable_sats": 2_906_337,
+                "peer_id": "03796a" + "0" * 58, "fee_ppm": 0,
+            },
+            # Stagnant source: kappa at 99% local, 200 ppm fee
+            "931308x1256x0": {
+                "capacity": 14_738_204, "spendable_sats": 14_590_822,
+                "peer_id": "0324ba" + "0" * 62, "fee_ppm": 200,
+            },
+            # Stagnant source: The Wall at 99% local, 145 ppm
+            "931308x1256x1": {
+                "capacity": 4_895_612, "spendable_sats": 4_846_656,
+                "peer_id": "0203e5" + "0" * 62, "fee_ppm": 145,
+            },
+            # Active corridor: cyberdyne at 75% local, 20 ppm (the depleted dest from logs)
+            "931199x1231x0": {
+                "capacity": 9_739_182, "spendable_sats": 7_353_082,
+                "peer_id": "03a93b" + "0" * 62, "fee_ppm": 20,
+            },
+        }
+        r._get_channels_with_balances = MagicMock(return_value=channels)
+        r._estimate_inbound_fee = MagicMock(return_value=50)
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        mock_database.get_channel_state.return_value = {"state": "balanced"}
+        mock_database.get_failure_count.return_value = (0, 0)
+        mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
+        mock_database.get_last_rebalance_time.return_value = 0
+        mock_database.get_top_route_pairs.return_value = []
+        mock_database.cleanup_stale_reservations.return_value = 0
+        mock_database.list_hot_channel_protection_override_peers.return_value = []
+
+        candidates = r.find_rebalance_candidates()
+
+        # Should produce at least 1 candidate -- hive push for cyber-hornet
+        assert len(candidates) >= 1
+
+        # Verify hive push candidate exists
+        hive_pushes = [c for c in candidates if c.reason_code == RebalanceReasonCode.HIVE_PUSH.value]
+        assert len(hive_pushes) >= 1
+        push = hive_pushes[0]
+        assert push.to_channel == "933791x3241x0"
+        assert push.dest_is_hive_member is True
+        # Source should be one of the stagnant 99% channels (most overfull)
+        assert push.source_candidates[0] in ("931308x1256x0", "931308x1256x1")
+        # Amount should push toward 50/50 (~1.4M sats, capped at max_amount=500k)
+        assert push.amount_sats >= 500_000
