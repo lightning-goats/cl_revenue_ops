@@ -817,11 +817,16 @@ class EVRebalancer:
 
             peer_id = info.get("peer_id", "")
 
-            # Select best source: most overfull (highest drain benefit)
+            # Select best source: most overfull non-hive channel (highest drain benefit)
             best_source = None
             best_drain = -1.0
             for src_id, src_info, src_ratio in source_channels:
                 if src_id == channel_id:
+                    continue
+                # Don't use hive member channels as push sources —
+                # that just moves sats between fleet channels with no strategic value
+                src_peer = src_info.get("peer_id", "")
+                if src_peer and self._is_hive_member(src_peer):
                     continue
                 src_spendable = src_info.get("spendable_sats", 0)
                 if src_spendable < push_amount:
@@ -842,7 +847,7 @@ class EVRebalancer:
                 primary_source_peer_id=src_info.get("peer_id", ""),
                 to_peer_id=peer_id,
                 amount_sats=push_amount,
-                amount_msat=push_amount * 1000,
+                amount_msat=sats_to_base(push_amount),
                 outbound_fee_ppm=0,
                 inbound_fee_ppm=0,
                 source_fee_ppm=0,
@@ -1831,7 +1836,7 @@ class EVRebalancer:
             # =====================================================
             # PASS 1: HIVE PUSH (deploy capital to fleet channels)
             # =====================================================
-            if cfg.hive_push_enabled and source_channels and available_slots > 0:
+            if cfg.hive_push_enabled and self.hive_router and self.hive_router.available and source_channels and available_slots > 0:
                 hive_member_channels = []
                 for cid, info in channels.items():
                     peer_id = info.get("peer_id", "")
@@ -3936,14 +3941,9 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # HIVE FLEET: If source peer is a hive member, they charge us
             # 0 fee — the first hop is free.  This dramatically improves the
             # spread for circular routes through the fleet.
-            is_hive_source = False
-            if pid:
-                if self.hive_router:
-                    is_hive_source = self.hive_router.is_hive_member(pid)
-                elif self.hive_hints:
-                    is_hive_source = self.hive_hints.is_hive_member(pid)
-                if is_hive_source:
-                    source_fee_ppm = 0
+            is_hive_source = self._is_hive_member(pid) if pid else False
+            if is_hive_source:
+                source_fee_ppm = 0
 
             # E5 FIX: Reuse state from source protection check above (line 3244)
             # instead of making a duplicate DB query for the same channel.

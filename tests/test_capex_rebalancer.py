@@ -572,10 +572,14 @@ class TestRebalanceFlowOrdering:
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
-        # Inject mock data_service
+        # Inject mock data_service and hive_router (required for hive push)
         mock_ds = MagicMock()
         mock_ds.datastore_push.return_value = True
         r.data_service = mock_ds
+        mock_router = MagicMock()
+        mock_router.available = True
+        mock_router.is_hive_member.return_value = False
+        r.hive_router = mock_router
 
         call_order = []
         original_push = r._build_hive_push_candidates
