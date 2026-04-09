@@ -2176,12 +2176,10 @@ class EVRebalancer:
                 
                 last_rebalance = self.database.get_last_rebalance_time(dest_id)
 
-                candidate = self._analyze_rebalance_ev(
-                    dest_id, dest_info, dest_ratio, source_channels, peer_status, cfg=cfg
-                )
-
-                # If EV analysis found nothing, try CapEx-budgeted approach
-                if candidate is None and self._capex_engine:
+                # CapEx-primary: the budget IS the investment decision.
+                # No EV spread gate — source selection uses tier PPM cap.
+                candidate = None
+                if self._capex_engine:
                     try:
                         capex_budget = self._capex_engine.get_channel_budget(dest_id)
                         if capex_budget and capex_budget.tier != "blocked" and capex_budget.budget_msat > 0:

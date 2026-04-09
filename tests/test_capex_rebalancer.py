@@ -340,6 +340,8 @@ class TestCapexMainPath:
         r._check_capital_controls = MagicMock(return_value=True)
         r._get_peer_connection_status = MagicMock(return_value={})
         r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        mock_database.get_rebalance_success_signal.return_value = None
+        mock_database.get_peer_uptime_percent.return_value = 99.0
 
         # Depleted dest (10% local, 25 ppm) + overfull source (99% local)
         r._get_channels_with_balances = MagicMock(return_value={
@@ -391,8 +393,8 @@ class TestCapexMainPath:
         ]
         assert len(capex_call) >= 1
 
-    def test_ev_positive_takes_priority_over_capex(self, mock_plugin, mock_database):
-        """When EV analysis returns a candidate, capex fallback is not triggered."""
+    def test_capex_is_primary_path_not_fallback(self, mock_plugin, mock_database):
+        """CapEx is the primary rebalance path, not a fallback after EV."""
         from modules.rebalancer import EVRebalancer, RebalanceCandidate, RebalanceReasonCode
 
         cfg = Config(
@@ -413,10 +415,19 @@ class TestCapexMainPath:
         dest_peer = "02" + "a" * 64
         source_peer = "02" + "b" * 64
 
-        # Set up CapEx engine (should NOT be called for source selection)
-        mock_engine = MagicMock(spec=CapexBudgetEngine)
+        # Set up CapEx engine — primary path for all rebalancing
+        mock_engine = MagicMock()
         mock_engine.compute_allocations.return_value = None
         r.set_capex_engine(mock_engine)
+
+        # Ensure no peer is treated as hive member
+        mock_hints = MagicMock()
+        mock_hints.is_hive_member.return_value = False
+        mock_hints.poll.return_value = None
+        mock_hints.get_route_segment_leases.return_value = []
+        mock_hints.get_rebalance_recommendations.return_value = []
+        mock_hints.get_rebalance_campaigns.return_value = []
+        r.hive_hints = mock_hints
 
         mock_database.cleanup_stale_reservations.return_value = 0
         mock_database.list_hot_channel_protection_override_peers.return_value = []
@@ -428,6 +439,8 @@ class TestCapexMainPath:
         r._check_capital_controls = MagicMock(return_value=True)
         r._get_peer_connection_status = MagicMock(return_value={})
         r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        mock_database.get_rebalance_success_signal.return_value = None
+        mock_database.get_peer_uptime_percent.return_value = 99.0
 
         r._get_channels_with_balances = MagicMock(return_value={
             dest_scid: {
@@ -444,37 +457,19 @@ class TestCapexMainPath:
             },
         })
 
-        # EV analysis returns a profitable candidate
-        ev_candidate = RebalanceCandidate(
-            source_candidates=[source_scid],
-            to_channel=dest_scid,
-            primary_source_peer_id=source_peer,
-            to_peer_id=dest_peer,
-            amount_sats=100_000,
-            amount_msat=100_000_000,
-            outbound_fee_ppm=500,
-            inbound_fee_ppm=0,
-            source_fee_ppm=100,
-            weighted_opp_cost_ppm=50,
-            spread_ppm=350,
-            max_budget_sats=10,
-            max_budget_msat=10_000,
-            max_fee_ppm=2000,
-            expected_profit_sats=5,
-            liquidity_ratio=0.10,
-            dest_flow_state="balanced",
-            dest_turnover_rate=0.01,
-            source_turnover_rate=0.01,
-            reason_code=RebalanceReasonCode.EV_POSITIVE.value,
+        # CapEx engine returns active tier budget
+        from modules.capex_budget import ChannelCapexBudget
+        mock_engine.get_channel_budget.return_value = ChannelCapexBudget(
+            channel_id=dest_scid, tier="active", budget_msat=500_000_000,
+            tier_ppm=500, priority_class="preservation",
         )
-        r._analyze_rebalance_ev = MagicMock(return_value=ev_candidate)
 
         result = r.find_rebalance_candidates()
 
         assert len(result) >= 1
-        assert result[0].reason_code == RebalanceReasonCode.EV_POSITIVE.value
-        # CapEx engine should NOT have been queried for budget
-        mock_engine.get_channel_budget.assert_not_called()
+        assert result[0].reason_code == RebalanceReasonCode.CAPEX_FALLBACK.value
+        # CapEx engine IS the primary path — it should be queried
+        mock_engine.get_channel_budget.assert_called()
 
     def test_capex_blocked_tier_skipped(self, mock_plugin, mock_database):
         """Channel with blocked CapEx tier gets no capex fallback."""
@@ -521,6 +516,8 @@ class TestCapexMainPath:
         r._check_capital_controls = MagicMock(return_value=True)
         r._get_peer_connection_status = MagicMock(return_value={})
         r._calculate_turnover_rate = MagicMock(return_value=0.01)
+        mock_database.get_rebalance_success_signal.return_value = None
+        mock_database.get_peer_uptime_percent.return_value = 99.0
 
         r._get_channels_with_balances = MagicMock(return_value={
             dest_scid: {

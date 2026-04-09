@@ -1999,7 +1999,7 @@ def run_rebalance_check():
     
     try:
         candidates = rebalancer.find_rebalance_candidates()
-        plugin.log(f"Rebalance check complete: {len(candidates)} profitable candidates found")
+        plugin.log(f"Rebalance check complete: {len(candidates)} candidates found")
         
         for candidate in candidates:
             rebalancer.execute_rebalance(candidate)
