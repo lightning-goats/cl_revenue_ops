@@ -346,11 +346,11 @@ class CapexBudgetEngine:
             return ChannelCapexBudget(
                 channel_id=ch_id, tier="blocked", hive_multiplier=hive_mult,
             )
-        if marginal_roi < 0 and contribution_msat == 0:
-            return ChannelCapexBudget(
-                channel_id=ch_id, tier="blocked", priority_class="defensive",
-                hive_multiplier=hive_mult,
-            )
+        # NOTE: Removed the marginal_roi < 0 + zero contribution block.
+        # New channels have negative ROI (open cost > 0, revenue = 0) and
+        # zero contribution. Blocking them prevents the capital deployment
+        # that would START generating returns. The BOOTSTRAP tier handles
+        # these channels with conservative budgets.
 
         # Success rate discount
         sr_data = None

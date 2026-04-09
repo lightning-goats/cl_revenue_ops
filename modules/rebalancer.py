@@ -2007,6 +2007,11 @@ class EVRebalancer:
                     # Use capex budget directly
                     ch_budget = self._capex_engine.get_channel_budget(dest_id)
                     if ch_budget.tier == "blocked" or ch_budget.budget_sats <= 0:
+                        self.plugin.log(
+                            f"HIVE CAPEX BLOCKED: {dest_id[:12]}... tier={ch_budget.tier} "
+                            f"budget={ch_budget.budget_sats}sats",
+                            level='info',
+                        )
                         record_pure_hive_skip("no_budget")
                         non_hive_depleted.append((dest_id, dest_info, dest_ratio))
                         continue
@@ -2182,6 +2187,16 @@ class EVRebalancer:
                 if self._capex_engine:
                     try:
                         capex_budget = self._capex_engine.get_channel_budget(dest_id)
+                        if capex_budget and capex_budget.tier == "blocked":
+                            self.plugin.log(
+                                f"CAPEX_MAIN BLOCKED: {dest_id[:12]}... tier=blocked",
+                                level='info',
+                            )
+                        elif capex_budget and capex_budget.budget_msat <= 0:
+                            self.plugin.log(
+                                f"CAPEX_MAIN NO_BUDGET: {dest_id[:12]}... tier={capex_budget.tier} budget=0",
+                                level='info',
+                            )
                         if capex_budget and capex_budget.tier != "blocked" and capex_budget.budget_msat > 0:
                             # Compute rebalance amount (same logic as _capex_fallback_pass)
                             _cap = dest_info.get("capacity", 0)
