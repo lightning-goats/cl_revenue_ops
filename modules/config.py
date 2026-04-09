@@ -145,6 +145,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'capex_exploration_rate': float,
     'capex_tactical_rate': float,
     'capex_global_envelope_sats': int,
+    'capex_cost_efficiency_weight': float,
+    'capex_drain_benefit_weight': float,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -410,6 +412,8 @@ class Config:
     capex_exploration_rate: float = 0.10        # Fleet contribution fraction for opens/growth
     capex_tactical_rate: float = 0.15           # Fleet contribution fraction for Boltz treasury
     capex_global_envelope_sats: int = 0         # Global cap (0 = auto-computed)
+    capex_cost_efficiency_weight: float = 0.5   # Weight for cost-efficiency in dual-benefit score
+    capex_drain_benefit_weight: float = 0.5     # Weight for drain-benefit in dual-benefit score
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -784,6 +788,8 @@ class ConfigSnapshot:
     capex_exploration_rate: float = 0.10
     capex_tactical_rate: float = 0.15
     capex_global_envelope_sats: int = 0
+    capex_cost_efficiency_weight: float = 0.5
+    capex_drain_benefit_weight: float = 0.5
     # Version tracking
     version: int = 0
     

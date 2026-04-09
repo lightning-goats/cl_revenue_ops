@@ -4047,12 +4047,19 @@ target_ratio={target_ratio:.0%} vel={velocity:.3f} roi={float(hot_profile.get('m
             # SCORING
             # =================================================================
             if max_cost_ppm > 0:
-                # CapEx dual-benefit scoring:
-                # 50% cost efficiency (how much headroom under the cap)
-                # 50% drain benefit (prefer draining overfull sources)
+                # CapEx dual-benefit scoring with configurable weights:
+                # w_cost: cost efficiency (how much headroom under the cap)
+                # w_drain: drain benefit (prefer draining overfull sources)
+                cfg = self.config.snapshot()
+                w_cost = cfg.capex_cost_efficiency_weight
+                w_drain = cfg.capex_drain_benefit_weight
+                w_total = w_cost + w_drain
                 cost_efficiency = max(0.0, (max_cost_ppm - total_cost_ppm) / max(1, max_cost_ppm))
                 drain_benefit = max(0.0, (ratio - 0.50) / 0.50)
-                score = int((0.5 * cost_efficiency + 0.5 * drain_benefit) * 1000)
+                if w_total > 0:
+                    score = int(((w_cost * cost_efficiency + w_drain * drain_benefit) / w_total) * 1000)
+                else:
+                    score = int(cost_efficiency * 1000)
                 if is_hive_source:
                     score += 200
             else:
