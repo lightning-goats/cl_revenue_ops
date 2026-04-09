@@ -617,6 +617,9 @@ class RebalanceExecutor:
                 "WIRE_FEE_INSUFFICIENT",
             }:
                 self._routing_memory.ban_channel(scid_dir, ttl_seconds=self.CHANNEL_BAN_TTL)
+            if failcodename == "WIRE_FEE_INSUFFICIENT":
+                # Store the erring channel so the caller can invalidate fee caches
+                self._last_fee_error_channel = erring_channel
             if failcodename == "WIRE_TEMPORARY_CHANNEL_FAILURE":
                 amount_idx = min(max(erring_index - 1, 0), len(full_route) - 1)
                 constrained_amount = max(
@@ -961,6 +964,18 @@ class RebalanceExecutor:
                 self._log(f"Job {job.job_id} failed attempt {attempt}: {last_error}", level="info")
 
                 should_retry = False
+                failcodename = failure.get("failcodename", "")
+
+                # Log actionable diagnostics for fee errors
+                if failcodename == "WIRE_FEE_INSUFFICIENT":
+                    self._log(
+                        f"Job {job.job_id}: WIRE_FEE_INSUFFICIENT from "
+                        f"{failure.get('erring_channel', 'unknown')} "
+                        f"(budget {base_to_sats_ceil(job.max_fee_msat)} sats, "
+                        f"erring_index={failure.get('erring_index')}, "
+                        f"route_hops={len(full_route)})"
+                    )
+
                 if attempt < self.MAX_ATTEMPTS and failure.get("code") == 204:
                     erring_index = failure.get("erring_index")
                     failcode = int(failure.get("failcode", 0) or 0)
@@ -968,7 +983,18 @@ class RebalanceExecutor:
                     if erring_index == 0 or (erring_index == 1 and is_node_error):
                         should_retry = False
                     elif full_route and erring_index == len(full_route):
-                        should_retry = False
+                        # Destination hop errors are usually terminal, EXCEPT fee errors
+                        # which can be recovered by finding a different route
+                        if failcodename == "WIRE_FEE_INSUFFICIENT" and failure.get("erring_channel"):
+                            edir = failure.get("erring_direction")
+                            if edir is not None:
+                                previous_excludes = list(excludes)
+                                excludes = list(dict.fromkeys(
+                                    excludes + [f"{failure['erring_channel']}/{edir}"]
+                                ))
+                                should_retry = excludes != previous_excludes
+                        else:
+                            should_retry = False
                     else:
                         previous_excludes = list(excludes)
                         if is_node_error and failure.get("erring_node"):
@@ -980,6 +1006,20 @@ class RebalanceExecutor:
                                 f"{failure['erring_channel']}/{failure['erring_direction']}"
                             ]))
                         should_retry = excludes != previous_excludes
+
+                # Inflate fee budget on WIRE_FEE_INSUFFICIENT to accommodate
+                # higher-than-expected fees on retry
+                if should_retry and failcodename == "WIRE_FEE_INSUFFICIENT":
+                    inflated = int(job.max_fee_msat * 1.20)
+                    original_max = getattr(job, '_original_max_fee_msat', job.max_fee_msat)
+                    if not hasattr(job, '_original_max_fee_msat'):
+                        job._original_max_fee_msat = job.max_fee_msat
+                    job.max_fee_msat = min(inflated, original_max * 2)
+                    self._log(
+                        f"Job {job.job_id}: inflating fee budget to "
+                        f"{base_to_sats_ceil(job.max_fee_msat)} sats "
+                        f"after WIRE_FEE_INSUFFICIENT"
+                    )
 
                 if should_retry:
                     job.state = JobState.ROUTING
