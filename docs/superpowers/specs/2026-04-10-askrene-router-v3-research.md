@@ -722,7 +722,161 @@ Each of these steps is a concrete RPC. The v2 executor's behavior is already ver
 
 ## 7. setconfig Runtime-Switch Verification
 
-_PENDING: Task 7_
+### 7.1 setconfig contract
+
+`setconfig` was added in CLN **v23.08** (`doc/schemas/setconfig.json#L4`). Required params:
+
+| Param | Type | Added | Purpose |
+|---|---|---|---|
+| `config` | string | v23.08 | Config variable name |
+| `val` | string / int / bool | v23.08 | New value |
+| `transient` | bool | v25.02 | If true, don't persist to config.setconfig file |
+
+From the schema: *"This new value will also be written at the end of the config.setconfig file... for persistence across restarts... Note that you can also adjust existing options for stopped plugins; they will have an effect when the plugin is restarted."*
+
+### 7.2 Live test — setconfig on a dynamic cl-revenue-ops option
+
+The live node has three dynamic `revenue-ops-*` options:
+
+```
+revenue-ops-boltz-daily-budget-sats = 3000
+revenue-ops-boltz-enforce-budget    = true
+revenue-ops-planner-execute-closes  = true
+```
+
+**Test: toggle `revenue-ops-boltz-enforce-budget` from `true` → `false` → back to `true`, with `transient=true` so nothing persists across restart.**
+
+```
+$ ssh lnnode 'KEY="revenue-ops-boltz-enforce-budget"
+  OLD=$(lightning-cli listconfigs "$KEY" | jq -r ".configs[\"$KEY\"].value_str")
+  echo "OLD=$OLD"
+  lightning-cli -k setconfig config="$KEY" val=false transient=true'
+
+OLD=true
+=== setconfig NEW=false with transient ===
+{
+   "config": {
+      "config": "revenue-ops-boltz-enforce-budget",
+      "value_str": "false",
+      "source": "setconfig transient",
+      "plugin": "/data/lightningd/plugins/cl_revenue_ops/cl-revenue-ops.py",
+      "dynamic": true
+   }
+}
+AFTER=false
+RESTORED=true
+```
+
+The change took effect immediately (`AFTER=false`), was reversible (`RESTORED=true`), and the `source` field switched to `"setconfig transient"` to indicate the change is not persisted. Lightningd's log also records each transition:
+
+```
+2026-04-10T16:22:40.731Z INFO lightningd: setconfig: revenue-ops-boltz-enforce-budget false (updated NULL:0)
+2026-04-10T16:22:40.758Z INFO lightningd: setconfig: revenue-ops-boltz-enforce-budget true (updated NULL:0)
+```
+
+**Important CLI gotcha**: `lightning-cli setconfig ...` (positional args) did not parse `transient=true` correctly (it was treated as a malformed value token). Using `lightning-cli -k setconfig config=KEY val=VAL transient=true` (keyword-arg JSON mode) worked. Any v3 documentation or operator runbook must prescribe the `-k` invocation.
+
+### 7.3 pyln-client's notification model
+
+The setconfig RPC is dispatched to pyln-client via a built-in internal method `_set_config` (`plugin.py#L289`: `'setconfig': Method('setconfig', self._set_config, MethodType.RPCMETHOD)`).
+
+The implementation (`plugin.py#L1042-1050`):
+
+```python
+def _set_config(self, config: str, val: Optional[Any]) -> None:
+    """Called when the value of a dynamic option is changed"""
+    opt = self.options[config]
+    cb = opt.on_change
+    if cb is not None:
+        # This may throw an exception: caller will turn into error msg for user.
+        cb(self, config, val)
+    opt.value = val
+```
+
+**Notification semantics**:
+
+- If the plugin registered the option with an `on_change` callback, that callback is invoked synchronously with `(plugin, config_name, new_value)`. The callback can raise — the error propagates back to the setconfig caller.
+- If no callback, the value is still updated on `self.options[config].value`, and the plugin can read it on demand.
+
+The option registration signature (`plugin.py#L447-454`):
+
+```python
+def add_option(self, name: str, default: Optional[Any],
+               description: Optional[str],
+               opt_type: str = "string",
+               deprecated: Optional[Union[bool, List[str]]] = None,
+               multi: bool = False,
+               dynamic=False,
+               on_change: Optional[Callable[["Plugin", str, Optional[Any]], None]] = None,
+               ) -> None:
+```
+
+**Key constraints**:
+
+- `dynamic=True` is required for any option that `setconfig` should be able to modify. Non-dynamic options refuse setconfig calls.
+- `on_change` cannot be set without `dynamic=True` (`plugin.py#L471-474`: `'Option {} has on_change callback but is not dynamic'`).
+- Callback is called synchronously before the value is updated on the option object. Order matters: inside the callback, `self.options[config].value` still holds the OLD value.
+
+### 7.4 Implication for v3 runtime switch
+
+Two valid implementation patterns:
+
+**Pattern A — poll per cycle (simplest)**:
+
+```python
+plugin.add_option(
+    "rebalance-router",
+    default="v2",
+    description="v2 (getroute) or v3 (askrene getroutes + layers)",
+    opt_type="string",
+    dynamic=True,
+)
+
+# Inside the engine:
+def _active_router(self):
+    want = self.plugin.options["rebalance-router"].value
+    if want == "v3" and self.router_v3 is not None:
+        return self.router_v3
+    return self.router_v2
+```
+
+Each cycle reads the option fresh. `setconfig` writes to `options[...].value` atomically before returning. No callback needed. Matches the design spec's "re-read each cycle" pattern exactly.
+
+**Pattern B — on_change callback (explicit)**:
+
+```python
+def _on_router_change(plugin, option_name, new_value):
+    if new_value not in ("v2", "v3"):
+        raise ValueError(f"rebalance-router must be 'v2' or 'v3', got {new_value!r}")
+    if new_value == "v3" and rebalancer.rebalance_engine_v2.router_v3 is None:
+        raise ValueError("askrene unavailable; cannot switch to v3")
+    plugin.log(f"rebalance-router switched to {new_value} (takes effect next cycle)", level="info")
+
+plugin.add_option(
+    "rebalance-router",
+    default="v2",
+    description="v2 (getroute) or v3 (askrene getroutes + layers)",
+    opt_type="string",
+    dynamic=True,
+    on_change=_on_router_change,
+)
+```
+
+This gives immediate validation (the `setconfig` call fails with a clear error message if the operator tries `v3` on a non-askrene node) and visible log feedback for operators.
+
+**Recommendation**: **Pattern B**. The validation-at-call-time behavior is exactly what the design spec wants (config validator rejects `v3` when askrene is unavailable), and the runtime log line is what Section 5 of the design requires (*"one warning log at init, no per-cycle noise"*). Pattern A is simpler but silent.
+
+### 7.5 Verdict
+
+`setconfig` hot-reload works, is natively supported by pyln-client, and gives v3 everything needed for a runtime A/B switch:
+
+- Config validator rejection of invalid values ✓ (via `on_change` raising)
+- Operator-visible confirmation logs ✓ (via plugin.log in callback)
+- Per-cycle atomicity ✓ (engine captures router at cycle start, callback doesn't need to interrupt in-flight work)
+- No plugin restart required ✓ (verified live on `revenue-ops-boltz-enforce-budget`)
+- Persistence control ✓ (`transient=true` for experiments; no flag for permanent)
+
+**Decision for Section 9: Pattern B (on_change callback with validation)**. Implementation cost is ~15 lines in `cl-revenue-ops.py` at option-registration time, plus the engine reading `self.plugin.options["rebalance-router"].value` in `_active_router()`.
 
 ## 8. Failure-Mode Taxonomy
 
