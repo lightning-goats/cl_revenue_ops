@@ -15,6 +15,7 @@ from .rebalance_audit_v2 import RebalanceAudit
 from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
 from .rebalance_planner_v2 import RebalancePlanner
 from .rebalance_router_v2 import RebalanceRouter
+from .rebalance_router_v3 import RebalanceRouterV3, _parse_layer_names
 from .rebalance_state_v2 import StateSnapshot, build_state_snapshot
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
 
@@ -64,6 +65,81 @@ class RebalanceEngine:
         self._pair_failures: Dict[Tuple[str, str], List[float]] = {}
         self._futility_threshold: int = 3
         self._futility_window_sec: float = 1800.0  # 30 minutes
+
+        # Build v2 router unconditionally — no RPC dependency at construction.
+        our_id = self._get_our_id() or ""
+        self.router_v2 = RebalanceRouter(plugin, our_id)
+
+        # Build v3 router iff askrene is available. Missing askrene means
+        # standalone fallback: the active router stays on v2 regardless of
+        # config.rebalance_router.
+        self.router_v3: Optional[RebalanceRouterV3] = None
+        if self._probe_askrene():
+            layer_names = _parse_layer_names(
+                getattr(config, "askrene_layers", "")
+            )
+            self.router_v3 = RebalanceRouterV3(
+                plugin=plugin,
+                our_node_id=our_id,
+                layer_names=layer_names,
+                log=self._log,
+            )
+            # Clean any orphan exclude layers from a previous crashed cycle.
+            self._sweep_orphan_exclude_layers()
+
+        self._cycle_router: Any = self._active_router()
+
+    def _probe_askrene(self) -> bool:
+        """One-shot probe: does this CLN instance have askrene loaded?"""
+        try:
+            self.plugin.rpc.call("askrene-listlayers", {})
+            return True
+        except Exception:
+            return False
+
+    def _active_router(self) -> Any:
+        """Return the router currently configured for dispatch.
+
+        Reads config.rebalance_router each call so setconfig can hot-switch
+        between cycles. Falls back to v2 if v3 is requested but unavailable.
+        """
+        want = getattr(self.config, "rebalance_router", "v2")
+        if want == "v3" and self.router_v3 is not None:
+            return self.router_v3
+        return self.router_v2
+
+    def _sweep_orphan_exclude_layers(self) -> int:
+        """Remove leftover rebalance-exclude-* layers from previous crashed cycles.
+
+        Called once at init after the askrene probe succeeds. Iterates every
+        live layer and removes any whose name matches the prefix. Returns
+        the number removed, for logging only.
+        """
+        try:
+            result = self.plugin.rpc.call("askrene-listlayers", {})
+        except Exception as e:
+            self._log(f"orphan sweep failed to list layers: {e}", level="warn")
+            return 0
+
+        orphans = [
+            l.get("layer", "")
+            for l in result.get("layers", [])
+            if l.get("layer", "").startswith("rebalance-exclude-")
+        ]
+        for name in orphans:
+            try:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": name})
+            except Exception as e:
+                self._log(
+                    f"failed to remove orphan layer {name}: {e}",
+                    level="warn",
+                )
+        if orphans:
+            self._log(
+                f"swept {len(orphans)} orphan rebalance-exclude-* layer(s)",
+                level="info",
+            )
+        return len(orphans)
 
     def shutdown(self) -> None:
         """Release thread pool resources."""
@@ -184,7 +260,12 @@ class RebalanceEngine:
         """Dry-run: build snapshot, plan, and return candidates without executing.
 
         This is the entry point called by EVRebalancer when rebalance_engine=v2.
+        Captures the active router at the start of the cycle so mid-cycle
+        config flips do not split a cycle across two routers.
         """
+        self._cycle_router = self._active_router()
+        router_tag = "v3" if self._cycle_router is self.router_v3 else "v2"
+
         snapshot = self._build_snapshot()
         if not snapshot or not snapshot.channels:
             self._log("No channels in snapshot")
@@ -201,10 +282,9 @@ class RebalanceEngine:
 
         plan = planner.plan(snapshot)
 
-        # Route-price selected pairs
-        our_id = self._get_our_id()
-        if our_id and plan.selected:
-            router = RebalanceRouter(self.plugin, our_id)
+        # Route-price selected pairs using the cycle's captured router
+        if plan.selected:
+            router = self._cycle_router
             priced = []
             for pair in plan.selected:
                 route_result = router.price_pair(
@@ -229,6 +309,7 @@ class RebalanceEngine:
                             pair.amount_sats,
                             route_result.route_cost_sats,
                             pair.score,
+                            router=router_tag,
                         )
                     else:
                         plan.skipped.append(SkipRecord(
@@ -260,6 +341,7 @@ class RebalanceEngine:
                 skip.value_class,
                 skip.remaining_budget_sats,
                 detail=skip.detail or "",
+                router=router_tag,
             )
 
         self._audit.log_cycle_summary(
