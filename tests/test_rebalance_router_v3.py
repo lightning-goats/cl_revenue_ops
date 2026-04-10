@@ -459,3 +459,78 @@ def test_price_pair_handles_getroutes_rpc_error():
     )
     assert result.success is False
     assert "unknown_source_node" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Task 8: exclude-via-layer context manager (isolation tests)
+# ---------------------------------------------------------------------------
+
+
+def test_exclude_layer_creates_and_removes():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    r = _make_v3_router(plugin)
+
+    # Snapshot call count before the context (ignores the listlayers probe)
+    initial_calls = [
+        c for c in plugin.rpc.call.call_args_list
+        if c.args and c.args[0] in ("askrene-create-layer", "askrene-update-channel", "askrene-remove-layer")
+    ]
+    assert initial_calls == []
+
+    with r._exclude_layer(["100x1x0", "200x2x0"]) as layer_name:
+        assert layer_name is not None
+        assert layer_name.startswith("rebalance-exclude-")
+        create_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c.args and c.args[0] == "askrene-create-layer"
+        ]
+        update_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c.args and c.args[0] == "askrene-update-channel"
+        ]
+        assert len(create_calls) == 1
+        # 2 scids x 2 directions = 4 update-channel calls
+        assert len(update_calls) == 4
+
+    remove_calls = [
+        c for c in plugin.rpc.call.call_args_list
+        if c.args and c.args[0] == "askrene-remove-layer"
+    ]
+    assert len(remove_calls) == 1
+
+
+def test_exclude_layer_removes_on_exception():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    r = _make_v3_router(plugin)
+
+    try:
+        with r._exclude_layer(["100x1x0"]) as layer_name:
+            assert layer_name is not None
+            raise RuntimeError("simulated failure inside retry body")
+    except RuntimeError:
+        pass
+
+    remove_calls = [
+        c for c in plugin.rpc.call.call_args_list
+        if c.args and c.args[0] == "askrene-remove-layer"
+    ]
+    assert len(remove_calls) == 1, "remove-layer must be called even on exception"
+
+
+def test_exclude_layer_empty_list_is_noop():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    r = _make_v3_router(plugin)
+
+    with r._exclude_layer([]) as layer_name:
+        assert layer_name is None
+
+    create_calls = [
+        c for c in plugin.rpc.call.call_args_list
+        if c.args and c.args[0] == "askrene-create-layer"
+    ]
+    remove_calls = [
+        c for c in plugin.rpc.call.call_args_list
+        if c.args and c.args[0] == "askrene-remove-layer"
+    ]
+    assert create_calls == []
+    assert remove_calls == []
