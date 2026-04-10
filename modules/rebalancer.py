@@ -32,6 +32,7 @@ from pyln.client import Plugin, RpcError
 
 from .config import Config, ConfigSnapshot
 from .database import Database
+from .rebalance_state_v2 import build_state_snapshot as build_state_snapshot_v2
 from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
 from .rebalance_executor import RebalanceExecutor
 from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
@@ -431,6 +432,7 @@ class EVRebalancer:
         self._last_depleted_count: int = 0
         self._last_profitable_count: int = 0
         self._last_cycle_ts: int = 0
+        self.rebalance_engine_v2 = None  # Optional v2 engine injected by the caller
 
         self._last_decision_summary: Dict[str, Any] = {
             "action": "hold",
@@ -1617,6 +1619,10 @@ class EVRebalancer:
         """Inject the unified capex budget engine."""
         self._capex_engine = engine
 
+    def build_state_v2(self, channels, capex_allocations):
+        """Build the normalized v2 state snapshot from normalized inputs."""
+        return build_state_snapshot_v2(channels, capex_allocations)
+
     def set_capacity_planner(self, planner) -> None:
         """Set reference to capacity planner for coordination."""
         self._capacity_planner = planner
@@ -1697,6 +1703,55 @@ class EVRebalancer:
                 )
                 self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
+
+            if getattr(cfg, "rebalance_engine", "v1") == "v2":
+                engine_v2 = getattr(self, "rebalance_engine_v2", None)
+                if engine_v2 is None:
+                    self._set_last_decision_summary(
+                        action="suppressed",
+                        reason="rebalance_engine_v2_unavailable",
+                        dominant_input="rebalance_engine",
+                        safety_block=True,
+                        budget_blocked=False,
+                    )
+                    self.plugin.log(
+                        "rebalance_engine=v2 requested but no v2 engine is injected; suppressing rebalance candidate search",
+                        level='warn',
+                    )
+                    self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
+                    return candidates
+
+                # V2 handles its own execution via run_cycle() — the v1
+                # execute_rebalance path is bypassed entirely. Return []
+                # so the v1 caller has nothing to execute.
+                cycle_result = engine_v2.run_cycle()
+                executed = len(cycle_result.executions)
+                succeeded = sum(1 for e in cycle_result.executions if e.success)
+                if executed > 0:
+                    self._set_last_decision_summary(
+                        action="rebalance",
+                        reason=f"rebalance_engine_v2: {succeeded}/{executed} succeeded",
+                        dominant_input="rebalance_engine_v2",
+                        safety_block=False,
+                        budget_blocked=False,
+                    )
+                elif cycle_result.candidates:
+                    self._set_last_decision_summary(
+                        action="suppressed",
+                        reason="rebalance_engine_v2: candidates found but execution failed",
+                        dominant_input="rebalance_engine_v2",
+                        safety_block=False,
+                        budget_blocked=False,
+                    )
+                else:
+                    self._set_last_decision_summary(
+                        action="hold",
+                        reason="rebalance_engine_v2_no_candidates",
+                        dominant_input="rebalance_engine_v2",
+                        safety_block=False,
+                        budget_blocked=False,
+                    )
+                return []
             
             channels = self._get_channels_with_balances()
             if not channels:
