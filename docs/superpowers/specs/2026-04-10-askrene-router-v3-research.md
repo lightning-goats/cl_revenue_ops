@@ -508,7 +508,183 @@ create+5upd+remove: n=10 min=10.6ms median=12.1ms max=13.1ms mean=11.9ms
 
 ## 5. xpay API Surface
 
-_PENDING: Task 5_
+### 5.1 Version and availability
+
+`xpay` was added in CLN **v24.11** (`ElementsProject/lightning@b57edd21:doc/schemas/xpay.json#L4 "added": "v24.11"`). Live node runs v25.12.1, so available. The CLN plugin source is `plugins/xpay/xpay.c` (2,553 lines).
+
+### 5.2 Request parameters
+
+| Param | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `invstring` | string | yes | — | BOLT11, BOLT12, BOLT12 offer, or BIP353 name |
+| `amount_msat` | msat | only if bolt11 has no amount | — | Explicit amount for amountless invoices |
+| `maxfee` | msat | no | `5000msat or 1%, whichever is greater` | Absolute fee cap |
+| `layers` | string[] | no | `[]` | askrene layers to apply on top of xpay's own private layer |
+| `retry_for` | u32 (seconds) | no | `60` | How long xpay keeps finding new routes and retrying |
+| `partial_msat` | msat | no | — | Partial payment from multiple payers |
+| `maxdelay` | u32 (blocks) | no | `2016` | Max CLTV delay (v25.02+) |
+| `payer_note` | string | no | — | Note for BOLT12 (v26.04+) |
+
+**Critical absent parameter**: **there is no way to pass a precomputed route**. xpay always discovers its own route via `getroutes`. This directly answers Q4 research question #1: **xpay does not support route pinning**.
+
+### 5.3 Response shape
+
+```json
+{
+  "payment_preimage": "...",
+  "failed_parts": 0,
+  "successful_parts": 1,
+  "amount_msat": 1000,
+  "amount_sent_msat": 1000
+}
+```
+
+`successful_parts ≥ 1` for any successful payment (even single-path). MPP is reflected in these counters.
+
+### 5.4 Error codes
+
+| Code | Meaning |
+|---|---|
+| `-1` | Catchall nonspecific error |
+| `203` | Permanent failure from destination (e.g. "didn't recognize invoice") |
+| `205` | Couldn't find a route to destination |
+| `207` | Invoice expired |
+| `219` | Invoice already paid |
+| `209` | Other payment error |
+
+Cited from `doc/schemas/xpay.json#L120-128`.
+
+### 5.5 Internal architecture (from xpay.c)
+
+xpay is essentially a retry-loop wrapper around `getroutes` + `sendpay` + `askrene-reserve`/`unreserve`/`inform-channel`. Key touch points in the source:
+
+- **Calls `getroutes` for each attempt** (`xpay.c#L1444-1448`, inside `getroutes_for()`). The request is built at `xpay.c#L1449-1482`:
+  ```c
+  json_add_pubkey(req->js, "source", &xpay->local_id);  // L1449
+  json_add_pubkey(req->js, "destination", dst);          // L1450
+  ...
+  /* Add private layer */
+  json_add_string(req->js, NULL, payment->private_layer); // L1466
+  /* Add user-specified layers */
+  for (size_t i = 0; i < tal_count(payment->layers); i++) // L1468
+      json_add_string(req->js, NULL, payment->layers[i]);
+  if (payment->disable_mpp)
+      json_add_string(req->js, NULL, "auto.no_mpp_support"); // L1471
+  ```
+- **Source is always our node id** (`xpay->local_id` at `xpay.c#L1449`). **Destination is the invoice's receiver**. These are non-overridable by the caller.
+- **Always adds a private xpay layer** (`xpay.c#L1466`) — the `xpay` layer seen live in Section 2.5 is this persistent layer. xpay uses it to track learned routing constraints across calls.
+- **User-supplied `layers` are appended** to the getroutes call (`xpay.c#L1467-1469`). So yes, passing `layers=["hive-fleet"]` to xpay works and applies fleet intelligence.
+- **Uses `askrene-reserve`** (`xpay.c#L1287`) to lock capacity on the chosen path, **`askrene-unreserve`** (`xpay.c#L911`) to release after completion/failure, and **`askrene-inform-channel`** (`xpay.c#L877`) to feed observed success/failure back into askrene's learned constraints.
+
+### 5.6 MPP behavior
+
+`disable_mpp` is a per-payment boolean controlled by invoice features:
+
+- For **BOLT11**, `disable_mpp = !feature_offered(b11->features, OPT_BASIC_MPP)` (`xpay.c#L2067`). If the invoice doesn't advertise MPP support, xpay sends single-path.
+- For **BOLT12**, similar, with a deprecated compatibility flag (`xpay.c#L2029-2031`).
+- When `disable_mpp` is true, xpay adds the `auto.no_mpp_support` layer to every getroutes call (`xpay.c#L1470-1471`), forcing askrene's single-path algorithm.
+- `maxparts` is derived dynamically: for unannounced channels, capped at 6 (`xpay.c#L2106-2110`); otherwise passed through to askrene as `maxparts - count_pending`.
+
+**No direct way for a caller to disable MPP** via CLI parameters. MPP is controlled by invoice features, not the xpay call. A circular rebalancer wanting single-path behavior would need to generate an invoice without the `OPT_BASIC_MPP` feature flag. Possible but awkward.
+
+### 5.7 Retry and failure taxonomy
+
+`retry_for` defaults to 60 seconds. Within that window, xpay:
+
+1. Calls `getroutes` for the remaining amount
+2. Reserves the channels
+3. Sends via `sendpay`
+4. Waits for settlement or failure
+5. On hop failure, calls `askrene-inform-channel` to update the shared layer's constraints
+6. Loops back to step 1 with the updated information
+
+**This is a tight feedback loop**: every failed hop teaches askrene about reduced capacity or disabled channels, and the next getroutes call benefits. The `xpay` persistent layer accumulates this knowledge across multiple xpay invocations, which is why it's marked `persistent=true` (Section 2.5).
+
+**Implication for v3**: xpay's retry behavior is more sophisticated than v2's executor. If xpay were usable for our case, it would be strictly better at finding routes through unreliable topologies. It's not (see Section 5.9), but the feedback mechanism is worth copying into v3 if we ever build a custom executor that drives `askrene-inform-channel` directly.
+
+### 5.8 maxfee enforcement
+
+xpay's `maxfee` is a hard absolute cap. Default is **max(5000 msat, 1% of amount)** (`xpay.c#L2095-2099`):
+
+```c
+if (!amount_msat_fee(&payment->maxfee, payment->amount, 0, 1000000 / 100))
+    return command_fail(...);
+payment->maxfee = amount_msat_max(payment->maxfee, AMOUNT_MSAT(5000));
+```
+
+For an amount of 100,000 sats, the default maxfee is 1000 sats (1%). For a 1,000 sat rebalance, the default is 5 sats (the 5000 msat floor). The default is operator-unfriendly for small rebalances (5 sats is ~500 ppm for a 1000-sat payment) but is trivially overridden by passing explicit `maxfee` in the xpay call.
+
+xpay then passes the maxfee to getroutes as `maxfee_msat` (`xpay.c#L1473`). Askrene enforces this as the hard ceiling documented in Section 1.2.
+
+### 5.9 Self-pay behavior — THE BLOCKING FINDING
+
+**xpay explicitly shortcuts self-pay and does NOT route through the network.**
+
+Source (`xpay.c#L1404-1413`):
+
+```c
+if (payment->paths)
+    dst = &xpay->fakenode;
+else
+    dst = &payment->destination;
+
+/* Self-pay?  Shortcut all this */
+if (pubkey_eq(&xpay->local_id, dst)) {
+    struct attempt *attempt = new_attempt(payment, deliver, NULL);
+    return do_inject(aux_cmd, attempt);
+}
+```
+
+When the invoice's destination equals our own node id, xpay calls `do_inject()` (injectpaymentonion) — an in-memory payment injection that **never touches the wire**. No channel is routed through, no sats flow across any HTLC, and no fees are paid.
+
+**Live verification on the node:**
+
+```
+$ ssh lnnode 'PREIMAGE=$(openssl rand -hex 32)
+  INV=$(lightning-cli invoice amount_msat=1000 label="v3-research-selfpay-$(date +%s%N)" \
+                               description="v3 research self-pay test" expiry=300 preimage=$PREIMAGE)
+  BOLT11=$(echo "$INV" | jq -r .bolt11)
+  lightning-cli xpay "$BOLT11"'
+
+{
+   "payment_preimage": "cae5303e3fb58844769f88d35c773cd1a6eafb96b0b2daf6deef11e380d7b93e",
+   "amount_msat": 1000,
+   "amount_sent_msat": 1000,
+   "failed_parts": 0,
+   "successful_parts": 1
+}
+```
+
+The preimage was returned, but:
+
+- `amount_sent_msat == amount_msat == 1000` → **zero routing fees were paid**
+- `failed_parts == 0, successful_parts == 1` → exactly one "part" completed
+- The CLN log shows only `Resolved invoice 'v3-research-selfpay-...' with amount 1000msat in 1 htlcs` followed by xpay's success — no routing activity, no HTLC forwards across channels, no fee records
+
+**A real circular rebalance moves sats out one channel and back in another, paying intermediate peer fees.** xpay's self-pay shortcut bypasses this entirely. Calling xpay on a local invoice is functionally equivalent to a datastore no-op — it adjusts internal bookkeeping without moving any liquidity.
+
+**This is a hard blocker for using xpay as the v3 executor for circular rebalancing.** There is no caller-side flag to force xpay to actually route a self-pay. The only way to make xpay do real network routing is to pay an invoice from a DIFFERENT node, which is not the rebalancing model.
+
+### 5.10 Verdict on xpay integration depth (Q4 from the design spec)
+
+Reviewing the four options from the parent spec's Phase 2 Q4:
+
+| Option | Verdict | Reason |
+|---|---|---|
+| **(a) Full xpay takeover** | ❌ Rejected | xpay short-circuits self-pay. No circular rebalancing. |
+| **(b) xpay with pinned route** | ❌ Rejected | xpay has no route-pinning API; source/dest are derived from the invoice only. |
+| **(c) Keep v2 executor, xpay as alternative** | ❌ Rejected | xpay is strictly worse than v2 executor for the circular rebalance use case (it won't actually move sats). Having both executors would just confuse operators. |
+| **(d) Reject xpay entirely** | ✅ **Adopted** | v3 is router-only. v2 executor (invoice + sendpay + waitsendpay + retry with exclude) stays permanently. |
+
+**Phase 2 is closed**. The v3 deliverable is:
+
+- `rebalance_router_v3.py` using `getroutes` + cl-hive layers (Phase 1, implemented)
+- `rebalance_executor_v3.py` is **NOT built**. The `rebalance-executor` config key is removed from the parent spec; only `rebalance-router` remains.
+- The v2 executor (`rebalance_executor_v2.py`) is the sole execution path for both v2 and v3 routers.
+
+**This does NOT kill the v3 project** — v3's router upgrade is still the bulk of the value. Better route selection (layer-aware, fleet-biased, bad-peer-avoiding) is a meaningful win even with the v2 executor handling payment delivery. Section 9 will formalize this as the decision record.
+
+**One positive side-benefit** of this rejection: v3 phase 1 becomes the entire deliverable. No phase 2 gate, no conditional scope, no A/B framework for executors. The plan simplifies.
 
 ## 6. xpay vs sendpay+waitsendpay Behavior Diff For Circular Self-Pays
 
