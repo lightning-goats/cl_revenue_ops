@@ -360,7 +360,7 @@ class Config:
     askrene_max_age_sec: int = 900            # Max constraint age (seconds) to consider fresh
 
     # V3 rebalance router (askrene getroutes + cl-hive layers)
-    rebalance_router: str = 'v2'              # 'v2' (getroute, default) or 'v3' (askrene getroutes)
+    rebalance_router: str = 'v3'              # 'v3' (askrene getroutes, default) or 'v2' (getroute legacy)
     askrene_layers: str = 'hive-fleet'        # CSV of layers to pass to v3 router's getroutes calls
 
     # Safety flags
@@ -781,7 +781,7 @@ class ConfigSnapshot:
     askrene_max_age_sec: int = 900
 
     # V3 rebalance router (askrene getroutes + cl-hive layers)
-    rebalance_router: str = 'v2'
+    rebalance_router: str = 'v3'
     askrene_layers: str = 'hive-fleet'
 
     # Weekly budget cap (hard ceiling over daily burst)

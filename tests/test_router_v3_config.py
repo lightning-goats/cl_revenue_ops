@@ -1,10 +1,10 @@
 """Config tests for the v3 rebalance router opt-in keys."""
 
 
-def test_config_has_rebalance_router_default_v2():
+def test_config_has_rebalance_router_default_v3():
     from modules.config import Config
     cfg = Config()
-    assert cfg.rebalance_router == "v2"
+    assert cfg.rebalance_router == "v3"
 
 
 def test_config_has_askrene_layers_default_hive_fleet():

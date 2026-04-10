@@ -825,10 +825,10 @@ def _on_rebalance_router_change(plugin_: Plugin, option_name: str, new_value: An
 
 plugin.add_option(
     name='revenue-ops-rebalance-router',
-    default='v2',
-    description="Rebalance route discovery: 'v2' (getroute, default) or 'v3' (askrene getroutes + cl-hive layers). "
+    default='v3',
+    description="Rebalance route discovery: 'v3' (askrene getroutes + cl-hive layers, default) or 'v2' (legacy getroute). "
                 "v3 requires CLN v24.11+ with the askrene plugin loaded; otherwise the engine falls back to v2. "
-                "Runtime-switchable via 'lightning-cli -k setconfig config=revenue-ops-rebalance-router val=v3'.",
+                "Runtime-switchable via 'lightning-cli -k setconfig config=revenue-ops-rebalance-router val=v2'.",
     opt_type='string',
     dynamic=True,
     on_change=_on_rebalance_router_change,
@@ -1273,7 +1273,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
         hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
-        rebalance_router=str(options.get('revenue-ops-rebalance-router', 'v2') or 'v2').lower(),
+        rebalance_router=str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower(),
         askrene_layers=str(options.get('revenue-ops-askrene-layers', 'hive-fleet') or 'hive-fleet'),
     )
     try:
