@@ -1721,11 +1721,24 @@ class EVRebalancer:
                     self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                     return candidates
 
-                delegated_candidates = list(engine_v2.find_candidates())
-                if delegated_candidates:
+                # V2 handles its own execution via run_cycle() — the v1
+                # execute_rebalance path is bypassed entirely. Return []
+                # so the v1 caller has nothing to execute.
+                cycle_result = engine_v2.run_cycle()
+                executed = len(cycle_result.executions)
+                succeeded = sum(1 for e in cycle_result.executions if e.success)
+                if executed > 0:
                     self._set_last_decision_summary(
                         action="rebalance",
-                        reason="rebalance_engine_v2_candidates_found",
+                        reason=f"rebalance_engine_v2: {succeeded}/{executed} succeeded",
+                        dominant_input="rebalance_engine_v2",
+                        safety_block=False,
+                        budget_blocked=False,
+                    )
+                elif cycle_result.candidates:
+                    self._set_last_decision_summary(
+                        action="suppressed",
+                        reason="rebalance_engine_v2: candidates found but execution failed",
                         dominant_input="rebalance_engine_v2",
                         safety_block=False,
                         budget_blocked=False,
@@ -1738,7 +1751,7 @@ class EVRebalancer:
                         safety_block=False,
                         budget_blocked=False,
                     )
-                return delegated_candidates
+                return []
             
             channels = self._get_channels_with_balances()
             if not channels:

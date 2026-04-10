@@ -98,7 +98,7 @@ class RebalanceExecutor:
                 expiry=INVOICE_EXPIRY,
             )
             payment_hash = inv["payment_hash"]
-            bolt11 = inv["bolt11"]
+            bolt11 = inv.get("bolt11", "")
         except Exception as e:
             result.error = f"invoice_error: {e}"
             self._log(result.error, level="warn")

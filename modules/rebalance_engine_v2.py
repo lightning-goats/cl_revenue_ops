@@ -6,9 +6,8 @@ Single entry point: find_candidates() for dry-run, run_cycle() for live.
 
 from __future__ import annotations
 
-import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -55,7 +54,10 @@ class RebalanceEngine:
         self._pool = ThreadPoolExecutor(
             max_workers=3, thread_name_prefix="rebal-v2"
         )
-        self._lock = threading.Lock()
+
+    def shutdown(self) -> None:
+        """Release thread pool resources."""
+        self._pool.shutdown(wait=False)
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -144,7 +146,8 @@ class RebalanceEngine:
 
             # Cooldown: skip if rebalanced recently (default 1 hour)
             cooldown = False
-            cooldown_secs = getattr(cfg, 'rebalance_cooldown_secs', 3600)
+            cooldown_hours = getattr(cfg, 'rebalance_cooldown_hours', 24)
+            cooldown_secs = int(cooldown_hours * 3600)
             if self.database and cooldown_secs > 0:
                 try:
                     last_ts = self.database.get_last_rebalance_time(scid)
@@ -300,19 +303,25 @@ class RebalanceEngine:
             future = self._pool.submit(self._execute_pair, pair, executor)
             futures[future] = pair
 
-        # Collect results as they complete
-        for future in as_completed(futures, timeout=120):
-            pair = futures[future]
-            try:
-                exec_result = future.result()
-                if exec_result is not None:
-                    with self._lock:
+        # Collect results as they complete (main thread only — no lock needed)
+        try:
+            for future in as_completed(futures, timeout=120):
+                pair = futures[future]
+                try:
+                    exec_result = future.result()
+                    if exec_result is not None:
                         result.executions.append(exec_result)
-            except Exception as e:
-                self._log(
-                    f"Execution thread failed for "
-                    f"{pair.source_channel_id}->{pair.dest_channel_id}: {e}",
-                    level="warn",
-                )
+                except Exception as e:
+                    self._log(
+                        f"Execution thread failed for "
+                        f"{pair.source_channel_id}->{pair.dest_channel_id}: {e}",
+                        level="warn",
+                    )
+        except TimeoutError:
+            self._log(
+                f"Execution timed out after 120s, "
+                f"{len(result.executions)}/{len(futures)} completed",
+                level="warn",
+            )
 
         return result

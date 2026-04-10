@@ -18,6 +18,15 @@ def test_rebalance_engine_rejects_invalid_value():
         Config(dry_run=True, rebalance_engine="v3")
 
 
+def _make_cycle_result(candidates=None, executions=None):
+    """Build a mock CycleResult."""
+    from modules.rebalance_engine_v2 import CycleResult
+    cr = CycleResult()
+    cr.candidates = candidates or []
+    cr.executions = executions or []
+    return cr
+
+
 def test_rebalancer_delegates_to_v2_after_shared_preflight(mock_plugin, mock_database):
     from modules.config import Config
     from modules.rebalancer import EVRebalancer
@@ -34,17 +43,18 @@ def test_rebalancer_delegates_to_v2_after_shared_preflight(mock_plugin, mock_dat
     r.job_manager.slots_available = MagicMock(side_effect=lambda: calls.append(("slots", None)) or 1)
     r._check_capital_controls = MagicMock(side_effect=lambda snapshot: calls.append(("capital", snapshot.rebalance_engine)) or True)
     r.rebalance_engine_v2 = MagicMock()
-    r.rebalance_engine_v2.find_candidates.side_effect = lambda: calls.append(("delegate", None)) or []
+    r.rebalance_engine_v2.run_cycle.side_effect = lambda: (calls.append(("run_cycle", None)) or _make_cycle_result())
 
     result = r.find_rebalance_candidates()
 
+    # V2 always returns [] — it handles execution internally
     assert result == []
     assert calls == [
         ("capex", None),
         ("cleanup", cfg.reservation_timeout_hours * 3600),
         ("slots", None),
         ("capital", "v2"),
-        ("delegate", None),
+        ("run_cycle", None),
     ]
     assert r.get_last_decision_summary() == {
         "action": "hold",
@@ -53,7 +63,7 @@ def test_rebalancer_delegates_to_v2_after_shared_preflight(mock_plugin, mock_dat
         "safety_block": False,
         "budget_blocked": False,
     }
-    r.rebalance_engine_v2.find_candidates.assert_called_once()
+    r.rebalance_engine_v2.run_cycle.assert_called_once()
 
 
 def test_rebalancer_v2_without_engine_fails_closed(mock_plugin, mock_database):
@@ -95,10 +105,11 @@ def test_rebalancer_delegates_to_v2_when_flag_enabled(mock_plugin, mock_database
     r = EVRebalancer(mock_plugin, cfg, mock_database)
     r._check_capital_controls = MagicMock(return_value=True)
     r.rebalance_engine_v2 = MagicMock()
-    r.rebalance_engine_v2.find_candidates.return_value = []
+    r.rebalance_engine_v2.run_cycle.return_value = _make_cycle_result()
 
     result = r.find_rebalance_candidates()
 
+    # V2 handles execution internally — always returns []
     assert result == []
     assert r.get_last_decision_summary() == {
         "action": "hold",
@@ -107,12 +118,13 @@ def test_rebalancer_delegates_to_v2_when_flag_enabled(mock_plugin, mock_database
         "safety_block": False,
         "budget_blocked": False,
     }
-    r.rebalance_engine_v2.find_candidates.assert_called_once()
+    r.rebalance_engine_v2.run_cycle.assert_called_once()
 
 
-def test_rebalancer_v2_summary_reports_candidates_found(mock_plugin, mock_database):
+def test_rebalancer_v2_summary_reports_execution_results(mock_plugin, mock_database):
     from modules.config import Config
     from modules.rebalancer import EVRebalancer
+    from modules.rebalance_executor_v2 import ExecutionResult
 
     cfg = Config(dry_run=True)
     cfg.rebalance_engine = "v2"
@@ -121,15 +133,14 @@ def test_rebalancer_v2_summary_reports_candidates_found(mock_plugin, mock_databa
     r = EVRebalancer(mock_plugin, cfg, mock_database)
     r._check_capital_controls = MagicMock(return_value=True)
     r.rebalance_engine_v2 = MagicMock()
-    r.rebalance_engine_v2.find_candidates.return_value = ["candidate"]
+    r.rebalance_engine_v2.run_cycle.return_value = _make_cycle_result(
+        candidates=["candidate"],
+        executions=[ExecutionResult(success=True)],
+    )
 
     result = r.find_rebalance_candidates()
 
-    assert result == ["candidate"]
-    assert r.get_last_decision_summary() == {
-        "action": "rebalance",
-        "reason": "rebalance_engine_v2_candidates_found",
-        "dominant_input": "rebalance_engine_v2",
-        "safety_block": False,
-        "budget_blocked": False,
-    }
+    assert result == []  # v2 handles execution
+    summary = r.get_last_decision_summary()
+    assert summary["action"] == "rebalance"
+    assert "1/1 succeeded" in summary["reason"]

@@ -221,13 +221,17 @@ class RebalanceRouter:
             )
 
         # Step 3: Build the full circular route
-        # First hop: us → source_peer via source_channel
+        # First hop: us → source_peer via source_channel.
+        # getroute's middle_route[0].delay already accounts for cumulative
+        # CLTV through the middle path. We add dest peer's CLTV for the
+        # final hop (dest_peer → us) which getroute doesn't know about.
+        # We do NOT add our own source channel CLTV — the sender doesn't
+        # need its own forwarding delta.
         total_forward_msat = (amount_sats + final_hop_fee_sats + middle_fee_sats) * 1000
-        source_policy = self._get_source_channel_policy(source_peer_id)
+        dest_cltv = self._get_dest_channel_cltv(dest_peer_id)
         first_hop_delay = (
-            (middle_route[0].get("delay", 18) if middle_route else 0)
-            + self._get_dest_channel_cltv(dest_peer_id)
-            + source_policy.get("cltv_delta", 18)
+            (middle_route[0].get("delay", 0) if middle_route else 0)
+            + dest_cltv
         )
         first_hop = {
             "id": source_peer_id,
