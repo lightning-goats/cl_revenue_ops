@@ -232,6 +232,129 @@ class TestExecutorFailures:
         assert result.success is False
         assert "444x4x0" in result.excluded_channels
 
+    def test_diagnostic_log_fires_on_bare_exception(self):
+        """When waitsendpay raises a plain Exception with no .error attr,
+        the executor must emit EXECUTOR_FAIL_DIAG so operators can still
+        diagnose what happened. Regression guard for the Phase B Task 3
+        observation on nexus-01 2026-04-10 where 'Failed:  erring_channel=None'
+        masked the actual failure mode."""
+        executor, plugin = _make_executor()
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "abc123",
+            "bolt11": "lnbc...",
+        }
+
+        plugin.rpc.waitsendpay.side_effect = Exception("socket timeout")
+
+        executor.execute(
+            route=_make_route(),
+            amount_sats=50_000,
+            source_channel_id="111x1x0",
+            dest_channel_id="222x2x0",
+            max_fee_sats=10,
+        )
+
+        log_calls = [c.args[0] for c in plugin.log.call_args_list]
+        diag = [l for l in log_calls if "EXECUTOR_FAIL_DIAG" in l]
+        assert diag, f"expected EXECUTOR_FAIL_DIAG log, got: {log_calls}"
+        assert "has_error_attr=no" in diag[0]
+        assert "socket timeout" in diag[0]
+
+    def test_diagnostic_log_fires_on_rpc_error_with_empty_data(self):
+        """When waitsendpay raises an RpcError whose .error dict has no
+        'data' field (or an empty dict), EXECUTOR_FAIL_DIAG must show the
+        actual keys present so operators can see what CLN returned."""
+        executor, plugin = _make_executor()
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "abc123",
+            "bolt11": "lnbc...",
+        }
+
+        class RPCError(Exception):
+            def __init__(self):
+                super().__init__("payment failed")
+                self.error = {
+                    "code": 203,
+                    "message": "Ran out of routes to try",
+                    # No 'data' field on purpose
+                }
+
+        plugin.rpc.waitsendpay.side_effect = RPCError()
+
+        executor.execute(
+            route=_make_route(),
+            amount_sats=50_000,
+            source_channel_id="111x1x0",
+            dest_channel_id="222x2x0",
+            max_fee_sats=10,
+        )
+
+        log_calls = [c.args[0] for c in plugin.log.call_args_list]
+        diag = [l for l in log_calls if "EXECUTOR_FAIL_DIAG" in l]
+        assert diag, f"expected EXECUTOR_FAIL_DIAG log, got: {log_calls}"
+        assert "err_code=203" in diag[0]
+        assert "Ran out of routes to try" in diag[0]
+        assert "data_keys=None" in diag[0]
+
+    def test_diagnostic_log_shows_data_keys_when_present(self):
+        """Happy-path diagnostic: when data is a proper dict, its keys
+        appear in the log line."""
+        executor, plugin = _make_executor()
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "abc123",
+            "bolt11": "lnbc...",
+        }
+
+        class RPCError(Exception):
+            def __init__(self):
+                self.error = {
+                    "code": 203,
+                    "message": "Failed",
+                    "data": {
+                        "erring_channel": "555x5x0",
+                        "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+                        "erring_index": 1,
+                    },
+                }
+
+        plugin.rpc.waitsendpay.side_effect = RPCError()
+
+        executor.execute(
+            route=_make_route(),
+            amount_sats=50_000,
+            source_channel_id="111x1x0",
+            dest_channel_id="222x2x0",
+            max_fee_sats=10,
+        )
+
+        log_calls = [c.args[0] for c in plugin.log.call_args_list]
+        diag = [l for l in log_calls if "EXECUTOR_FAIL_DIAG" in l]
+        assert diag, f"expected EXECUTOR_FAIL_DIAG log, got: {log_calls}"
+        line = diag[0]
+        assert "erring_channel" in line
+        assert "failcodename" in line
+        assert "erring_index" in line
+
+    def test_extract_error_data_only_accepts_dict_data_field(self):
+        """Regression guard: _extract_error_data used to return err.get('data', {})
+        without type-checking, so a string data field would crash the
+        downstream .get() call. Now returns {} for any non-dict data."""
+        executor, _ = _make_executor()
+
+        class RPCErrStringData(Exception):
+            def __init__(self):
+                self.error = {"data": "a string, not a dict"}
+
+        result = executor._extract_error_data(RPCErrStringData())
+        assert result == {}
+
+        class RPCErrNoData(Exception):
+            def __init__(self):
+                self.error = {"code": 123}
+
+        result = executor._extract_error_data(RPCErrNoData())
+        assert result == {}
+
     def test_cleanup_delpays_on_failure(self):
         executor, plugin = _make_executor()
         plugin.rpc.invoice.return_value = {

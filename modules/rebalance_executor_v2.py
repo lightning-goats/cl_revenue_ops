@@ -175,6 +175,16 @@ class RebalanceExecutor:
             return result
 
         except Exception as e:
+            # Full-fidelity diagnostic log BEFORE structured extraction, so we
+            # never lose information when the exception shape is unexpected.
+            # This replaces the old 'Failed:  erring_channel=None' log that
+            # masked any non-conforming failure mode (timeouts, non-RpcError
+            # exceptions, missing error.data fields). See Phase B Task 3
+            # investigation on nexus-01 2026-04-10: the blank-failcode log
+            # turned out to hide a completely opaque failure, and adding
+            # this diagnostic is the first step to figuring out why.
+            self._log_executor_failure(e)
+
             error_data = self._extract_error_data(e)
             erring_channel = error_data.get("erring_channel")
             failcode = error_data.get("failcodename", "")
@@ -198,12 +208,64 @@ class RebalanceExecutor:
 
         return result
 
+    def _log_executor_failure(self, exc: Exception) -> None:
+        """Emit a full diagnostic dump of a sendpay/waitsendpay failure.
+
+        Captures exception type, repr, whether it has an .error attribute,
+        the shape of that .error (dict vs str), the top-level keys, and the
+        keys of .error.data if present. This produces one machine-grep'able
+        line per failure so operators can diagnose cases the structured
+        extractor misses without re-running with strace.
+        """
+        exc_type = type(exc).__name__
+        exc_repr = repr(exc)
+        err_attr = getattr(exc, "error", None)
+
+        if err_attr is None:
+            self._log(
+                f"EXECUTOR_FAIL_DIAG type={exc_type} has_error_attr=no "
+                f"repr={exc_repr}",
+                level="warn",
+            )
+            return
+
+        if isinstance(err_attr, dict):
+            top_keys = sorted(err_attr.keys())
+            data = err_attr.get("data")
+            data_keys = (
+                sorted(data.keys()) if isinstance(data, dict) else None
+            )
+            message = err_attr.get("message", "")
+            code = err_attr.get("code")
+            self._log(
+                f"EXECUTOR_FAIL_DIAG type={exc_type} "
+                f"err_code={code} err_message={message!r} "
+                f"err_keys={top_keys} data_keys={data_keys} "
+                f"err_dict={err_attr!r}",
+                level="warn",
+            )
+            return
+
+        self._log(
+            f"EXECUTOR_FAIL_DIAG type={exc_type} err_attr_type={type(err_attr).__name__} "
+            f"err_attr={err_attr!r} repr={exc_repr}",
+            level="warn",
+        )
+
     def _extract_error_data(self, error: Exception) -> Dict[str, Any]:
-        """Extract structured error data from RPC exception."""
+        """Extract structured error data from RPC exception.
+
+        Returns error.error['data'] as a dict if the exception is an
+        RpcError with a nested 'data' dict. Returns {} for any other
+        shape — the full diagnostic is logged separately by
+        _log_executor_failure so nothing is silently discarded.
+        """
         if hasattr(error, "error"):
             err = error.error
             if isinstance(err, dict):
-                return err.get("data", {})
+                data = err.get("data")
+                if isinstance(data, dict):
+                    return data
         return {}
 
     def _cleanup(
