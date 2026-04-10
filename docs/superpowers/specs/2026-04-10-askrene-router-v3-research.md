@@ -880,7 +880,142 @@ This gives immediate validation (the `setconfig` call fails with a clear error m
 
 ## 8. Failure-Mode Taxonomy
 
-_PENDING: Task 8_
+### 8.1 Scope reduction
+
+Sections 5 and 6 rejected xpay as the v3 executor. The failure-mode taxonomy therefore focuses on `getroutes` errors (the RPC v3 will actually call) and maps them to v2's existing skip reasons. The v2 executor's existing sendpay/waitsendpay error taxonomy is untouched by this research and stays as-is.
+
+### 8.2 v2 planner's current skip reason vocabulary
+
+Extracted from `modules/rebalance_planner_v2.py`, `modules/rebalance_engine_v2.py`, and `modules/rebalance_router_v2.py`:
+
+| Skip reason | Meaning | Emitted by |
+|---|---|---|
+| `inside_band` | Channel's local ratio is within the target imbalance band | planner |
+| `not_valuable` | Channel is not hive/profitable/active/bootstrap | planner |
+| `no_partner` | No eligible opposite-side partner channel | planner |
+| `cooldown` | Channel is in rebalance cooldown period | planner |
+| `no_budget` | Channel has exhausted its CapEx budget | planner |
+| `max_pairs_reached` | Per-cycle pair limit hit | planner |
+| `outcompeted` | Pair was outranked by a better pair | planner |
+| `no_route` | Router returned `success=False` with an empty-route error | engine |
+| `route_over_budget` | Route cost exceeded `pair_budget_sats` | engine |
+
+(These are the only values v3's audit logging needs to preserve. v2's old-era `RebalanceReasonCode` enum values with 13 unused entries were NOT migrated to v2 — they only remain in the stub `RebalanceReasonCode` class kept alive in `rebalancer.py` for `test_bleed_detection.py`.)
+
+### 8.3 askrene `getroutes` error surface
+
+**Request-validation errors** (return `JSONRPC2_INVALID_PARAMS` or `PAY_USER_ERROR`, should never happen from v3 since the caller validates inputs):
+
+| CLN error message | Source line | v3 handling |
+|---|---|---|
+| `"amount must be non-zero"` | `askrene.c#L879-882` | Assert — planner guarantees non-zero |
+| `"maxparts must be non-zero"` | `askrene.c#L884-887` | Assert — v3 passes default 100 or single-path layer |
+| `"maximum delay allowed is %d"` | `askrene.c#L889-893` | Assert — v3 passes 2016 default |
+| `"should be an array"` (layers) | `askrene.c#L182` | Assert — v3 always passes a list |
+| `"Unknown layer"` | `askrene.c#L143, L165` | **New skip reason**: `unknown_layer` — fires if operator configured a layer name that doesn't exist |
+
+**Node-not-in-gossmap** (returns `PAY_ROUTE_NOT_FOUND` from `do_getroutes()` inside `askrene.c`):
+
+| CLN error message | Source line | Maps to v3 skip reason |
+|---|---|---|
+| `"Unknown source node %s"` | `askrene.c#L592-596` | **New skip reason**: `unknown_source_node` |
+| `"Unknown destination node %s"` | `askrene.c#L602-606` | **New skip reason**: `unknown_dest_node` |
+
+**Route-finding failures** (return `PAY_ROUTE_NOT_FOUND` with a rich text message from `explain_failure.c`):
+
+The askrene child process calls `explain_failure()` (`child/explain_failure.c#L210`) when it cannot find a route. Every failure is wrapped in the base string `NO_USABLE_PATHS_STRING = "We could not find a usable set of paths."` and annotated with a specific reason. The annotations include:
+
+| Explanation prefix/keyword | Meaning | Source |
+|---|---|---|
+| `"There is no connection between source and destination at all"` | Graph has no path regardless of capacity | `explain_failure.c#L247` |
+| `"has no gossip"` | Shortest-path channel has no public gossip | `explain_failure.c#L295` |
+| (describe_disabled output) | Shortest-path channel is disabled | `explain_failure.c#L297` |
+| (describe_capacity output) | Shortest-path channel doesn't have enough capacity | `explain_failure.c#L299` |
+| (why_max_constrained output) | Amount exceeds a live constraint | `explain_failure.c#L301` |
+| `"exceeds htlc_maximum_msat ~%s"` | Channel's HTLC max too low | `explain_failure.c#L304-306` |
+| `"below htlc_minumum_msat ~%s"` [sic — typo in CLN] | Channel's HTLC min too high | `explain_failure.c#L307-309` |
+| `"produces a fee overflow for amount %s"` | Arithmetic overflow | `explain_failure.c#L270-272` |
+
+All of these map cleanly to the existing v3 skip reason **`no_route`**. The rich explanation string can be preserved in the router's `RouteResult.error` field and emitted in audit logs for operator debugging, but v3 does not need to branch on the text.
+
+**Child-process failures** (rare, indicate askrene internal problems):
+
+| CLN error message | Source line | v3 handling |
+|---|---|---|
+| `"child died with signal %u"` | `askrene.c#L417-420` | **New skip reason**: `askrene_child_died` — indicates askrene internal crash |
+| `"child produced no output"` | `askrene.c#L428-431` | Map to `askrene_child_died` |
+| `"failed to fork: %s"` | `askrene.c#L641-648` | Map to `askrene_child_died` |
+| `"failed to create pipes: %s"` | `askrene.c#L631-638` | Map to `askrene_child_died` |
+
+All four are transient plugin-level issues. v3 should log them at `warn` level, add the pair to the cycle's skip records, and continue (do not crash the cycle).
+
+### 8.4 Unified skip reason taxonomy for v3
+
+Combining v2's existing reasons with the new ones surfaced by this research:
+
+**Existing (unchanged)**: `inside_band`, `not_valuable`, `no_partner`, `cooldown`, `no_budget`, `max_pairs_reached`, `outcompeted`, `no_route`, `route_over_budget`.
+
+**New (added by v3)**:
+
+| Reason | When it fires | Severity |
+|---|---|---|
+| `unknown_source_node` | Askrene doesn't have the source peer in its gossmap (e.g. gossip not yet synced, or peer just disappeared from the network) | transient — may resolve next cycle |
+| `unknown_dest_node` | Askrene doesn't have the destination peer in its gossmap | transient — may resolve next cycle |
+| `unknown_layer` | Operator-configured layer name doesn't exist on the node | operator error — surface at init, not per-cycle |
+| `askrene_child_died` | Askrene subprocess crashed or failed to fork | plugin error — log warn, skip pair, continue cycle |
+| `path_loops_through_us` | (v3-specific, from Section 3.4 design decision) Getroutes returned a path where our own node is an intermediate hop, which doesn't fit the sendpay route format | design constraint — may indicate pair pinning failed, retry with different strategy |
+
+Total new reasons: **5**. These are small additions to `modules/rebalance_audit_v2.py`:
+
+```python
+# In rebalance_audit_v2.py, extend the valid reasons set
+VALID_SKIP_REASONS = {
+    # Existing
+    "inside_band", "not_valuable", "no_partner", "cooldown",
+    "no_budget", "max_pairs_reached", "outcompeted",
+    "no_route", "route_over_budget",
+    # V3-specific (added by rebalance_router_v3)
+    "unknown_source_node", "unknown_dest_node",
+    "unknown_layer", "askrene_child_died", "path_loops_through_us",
+}
+```
+
+### 8.5 Translation logic in the v3 router
+
+```python
+def _translate_getroutes_error(error: str) -> tuple[str, str]:
+    """Map a getroutes error string to (skip_reason, preserved_detail)."""
+    if "Unknown source node" in error:
+        return "unknown_source_node", error
+    if "Unknown destination node" in error:
+        return "unknown_dest_node", error
+    if "Unknown layer" in error:
+        return "unknown_layer", error
+    if "child died with signal" in error or "failed to fork" in error \
+       or "child produced no output" in error or "failed to create pipes" in error:
+        return "askrene_child_died", error
+    # Everything else — explain_failure.c output, MCF solver failures —
+    # maps to the generic no_route with the rich explanation preserved.
+    return "no_route", error
+```
+
+This function lives in `rebalance_router_v3.py` and is called when `getroutes` raises an RPC error. The returned `(reason, detail)` tuple is attached to the `RouteResult` for the engine to record in audit logs.
+
+### 8.6 Error codes
+
+askrene uses CLN's standard error codes; v3 should branch on code primarily and fall back to string-matching for precision:
+
+| CLN code | Constant | Meaning |
+|---|---|---|
+| `-32602` | `JSONRPC2_INVALID_PARAMS` | Request validation failure (should never fire from v3) |
+| `205` | `PAY_ROUTE_NOT_FOUND` | All getroutes failures (node unknown, no route, child died) |
+| `206` | `PAY_USER_ERROR` | `maxdelay` exceeded |
+
+pyln-client surfaces these as `RpcError` exceptions. v3 catches `RpcError` and inspects `e.error["code"]` + `e.error["message"]` to dispatch.
+
+### 8.7 Verdict
+
+The failure-mode taxonomy is small and tractable. **Five new skip reasons** to add to `rebalance_audit_v2.py`, one simple translation function in `rebalance_router_v3.py`, and no changes to the v2 executor's sendpay error handling. No ambiguous mappings — every askrene error has a clear target skip reason.
 
 ## 9. Decision Records
 
