@@ -4,7 +4,9 @@ Every cycle must explain itself. For every valuable channel the engine
 evaluates, one of the ``log_*`` helpers emits a deterministic, grep-friendly
 record that replaces the vague ad-hoc messages of the v1 engine.
 
-Canonical skip reasons live in ``VALID_SKIP_REASONS``.
+Canonical skip reasons live in ``VALID_SKIP_REASONS``. Reasons produced by
+the v3 askrene-based router are included so audit consumers grouped by
+``reason=`` can bucket both router versions identically.
 """
 
 from __future__ import annotations
@@ -21,11 +23,17 @@ VALID_SKIP_REASONS: frozenset[str] = frozenset({
     "no_budget",
     "max_pairs_reached",
     "outcompeted",
-    # Produced by the router / engine
+    # Produced by the router / engine (both v2 and v3)
     "no_route",
     "route_over_budget",
     # Produced by the engine's pair-level futility tracker
     "pair_futility",
+    # Produced by the v3 askrene router specifically
+    "unknown_source_node",
+    "unknown_dest_node",
+    "unknown_layer",
+    "askrene_child_died",
+    "path_loops_through_us",
 })
 
 
