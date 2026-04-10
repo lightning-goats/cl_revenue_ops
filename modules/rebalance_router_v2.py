@@ -18,7 +18,14 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class RouteResult:
-    """Result of a v2 route pricing attempt."""
+    """Result of a router's price_pair attempt.
+
+    Shared across v2 (getroute) and v3 (askrene getroutes) routers so the
+    engine consumes either transparently. probability_ppm is the router's
+    success-probability estimate in parts per million; v3/askrene populates
+    it from the MCF solver output, v2/getroute leaves it at 0 (unknown),
+    which the engine treats as "no probability-aware relaxation."
+    """
 
     success: bool
     route_cost_sats: int = 0
@@ -26,6 +33,7 @@ class RouteResult:
     hops: int = 0
     route: List[Dict[str, Any]] = field(default_factory=list)
     error: str = ""
+    probability_ppm: int = 0
 
 
 class RebalanceRouter:

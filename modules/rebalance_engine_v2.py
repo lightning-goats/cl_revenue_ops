@@ -217,7 +217,11 @@ class RebalanceEngine:
                 if route_result.success:
                     pair.route_cost_sats = route_result.route_cost_sats
                     pair.route = route_result.route
-                    if route_result.route_cost_sats <= pair.pair_budget_sats:
+                    effective_budget = self._probability_adjusted_budget(
+                        pair.pair_budget_sats,
+                        getattr(route_result, "probability_ppm", 0),
+                    )
+                    if route_result.route_cost_sats <= effective_budget:
                         priced.append(pair)
                         self._audit.log_pick(
                             pair.source_channel_id,
@@ -232,7 +236,11 @@ class RebalanceEngine:
                             reason="route_over_budget",
                             value_class="valuable",
                             remaining_budget_sats=pair.pair_budget_sats,
-                            detail=f"route_cost={route_result.route_cost_sats}",
+                            detail=(
+                                f"route_cost={route_result.route_cost_sats} "
+                                f"effective_budget={effective_budget} "
+                                f"probability_ppm={getattr(route_result, 'probability_ppm', 0)}"
+                            ),
                         ))
                 else:
                     plan.skipped.append(SkipRecord(
@@ -292,6 +300,33 @@ class RebalanceEngine:
     def _record_pair_success(self, source_channel_id: str, dest_channel_id: str) -> None:
         """Clear any failure history for this pair (success resets the counter)."""
         self._pair_failures.pop((source_channel_id, dest_channel_id), None)
+
+    def _probability_adjusted_budget(
+        self, pair_budget_sats: int, probability_ppm: int
+    ) -> int:
+        """Relax the raw pair budget by a probability-weighted bonus.
+
+        Returns the base pair_budget_sats unchanged when either the config
+        bonus rate is 0 (default) or the router reported no probability
+        (v2/getroute does this). With a positive bonus rate and non-zero
+        probability, the effective budget is:
+
+            pair_budget * (1 + clamp(probability_ppm, 0, 1_000_000) / 1_000_000 * bonus)
+
+        Example: bonus=0.25, probability_ppm=982_339 →
+            effective = pair_budget * (1 + 0.982339 * 0.25)
+                      = pair_budget * 1.2456
+
+        The intent is to unlock v3/askrene's high-probability-but-pricier
+        routes on topologies where v2/getroute's cheap paths are actually
+        unroutable (see Phase B test on nexus-01, 2026-04-10).
+        """
+        bonus_rate = getattr(self.config, "capex_probability_budget_bonus", 0.0)
+        if bonus_rate <= 0.0 or probability_ppm <= 0:
+            return pair_budget_sats
+        clamped = min(1.0, max(0.0, probability_ppm / 1_000_000.0))
+        bonus_fraction = clamped * bonus_rate
+        return int(pair_budget_sats * (1.0 + bonus_fraction))
 
     def _execute_pair(
         self,
