@@ -656,14 +656,6 @@ class EVRebalancer:
             return False
         return bool(candidate_segments & self._coordination_entry_segments(entry))
 
-    def _coordination_assignment_rank(self, entry: Dict[str, Any], our_node_id: Optional[str]) -> int:
-        if not our_node_id:
-            return 0
-        view = self._coordination_entry_view(entry)
-        primary = str(view.get("primary_executor_member_id") or "").strip()
-        if primary and primary == our_node_id:
-            return 2
-        return 0
 
     def _coordination_priority_score(self, entry: Dict[str, Any]) -> float:
         view = self._coordination_entry_view(entry)
@@ -984,18 +976,6 @@ class EVRebalancer:
                 level='debug',
             )
 
-    def _is_active_foreign_lease(self, lease: Dict[str, Any], our_node_id: Optional[str]) -> bool:
-        owner = str(lease.get("owner_member_id") or "").strip()
-        if not owner or (our_node_id and owner == our_node_id):
-            return False
-        status = str(lease.get("status") or "").strip().lower()
-        if status and status not in {"active", "leased"}:
-            return False
-        try:
-            expires_at = int(lease.get("expires_at", 0) or 0)
-        except Exception:
-            expires_at = 0
-        return expires_at <= 0 or expires_at > int(time.time())
 
 
     @staticmethod
