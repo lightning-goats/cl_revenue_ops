@@ -7,7 +7,7 @@ channel identities.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -25,6 +25,7 @@ class V2PairCandidate:
     amount_sats: int
     pair_budget_sats: int
     route_cost_sats: Optional[int] = None
+    route: Optional[List[Dict[str, Any]]] = None  # sendpay-ready route from router
     score: float = 0.0
     source_local_ratio: float = 0.0
     dest_local_ratio: float = 0.0

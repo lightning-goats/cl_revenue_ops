@@ -9,9 +9,7 @@ separate fleet and network execution models.
 
 from __future__ import annotations
 
-import os
 import secrets
-import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -32,7 +30,9 @@ class V2ExecutionResult:
 # Timeout and retry constants
 SENDPAY_TIMEOUT = 60
 INVOICE_EXPIRY = 300
-MAX_ATTEMPTS = 3
+# The executor does not re-route on failure — the orchestrator handles
+# retry-with-exclude at a higher level. One attempt per route.
+MAX_ATTEMPTS = 1
 
 
 class RebalanceExecutorV2:
@@ -127,90 +127,74 @@ class RebalanceExecutorV2:
         max_fee_sats: int,
         result: V2ExecutionResult,
     ) -> V2ExecutionResult:
-        """Try sendpay with retries, excluding failed channels."""
-        excluded: List[str] = []
-        current_route = route
+        """Execute a single sendpay attempt on the given route.
 
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            result.attempts = attempt
+        The executor does not re-route — on failure it records the erring
+        channel in excluded_channels and returns. The orchestrator can
+        re-price with excludes at a higher level.
+        """
+        result.attempts = 1
 
-            # Validate route fee
-            if current_route:
-                route_fee_msat = current_route[0].get("amount_msat", amount_msat) - amount_msat
-                route_fee_sats = (route_fee_msat + 999) // 1000
-                if route_fee_sats > max_fee_sats:
-                    result.error = (
-                        f"route_over_budget: {route_fee_sats} sats exceeds "
-                        f"budget {max_fee_sats} sats"
-                    )
-                    self._log(
-                        f"Attempt {attempt}: {result.error}",
-                        level="info",
-                    )
-                    break
-
-            # Send
-            try:
-                self.plugin.rpc.sendpay(
-                    route=current_route,
-                    payment_hash=payment_hash,
-                    bolt11=bolt11,
+        # Validate route fee before sending
+        if route:
+            route_fee_msat = route[0].get("amount_msat", amount_msat) - amount_msat
+            route_fee_sats = (route_fee_msat + 999) // 1000
+            if route_fee_sats > max_fee_sats:
+                result.error = (
+                    f"route_over_budget: {route_fee_sats} sats exceeds "
+                    f"budget {max_fee_sats} sats"
                 )
-            except Exception as e:
-                result.error = f"sendpay_error: {e}"
-                self._log(f"Attempt {attempt} sendpay failed: {e}", level="warn")
-                break
-
-            # Wait
-            try:
-                wait_result = self.plugin.rpc.waitsendpay(
-                    payment_hash=payment_hash,
-                    timeout=SENDPAY_TIMEOUT,
-                )
-                # Success
-                fee_msat = wait_result.get("amount_sent_msat", amount_msat) - amount_msat
-                result.success = True
-                result.fee_msat = fee_msat
-                result.fee_sats = (fee_msat + 999) // 1000
-                self._log(
-                    f"Success: {result.amount_sats} sats, fee {result.fee_sats} sats "
-                    f"({attempt} attempt{'s' if attempt > 1 else ''})"
-                )
+                self._log(result.error, level="info")
                 return result
 
-            except Exception as e:
-                error_data = self._extract_error_data(e)
-                erring_channel = error_data.get("erring_channel")
-                failcode = error_data.get("failcodename", "")
+        # Send
+        try:
+            self.plugin.rpc.sendpay(
+                route=route,
+                payment_hash=payment_hash,
+                bolt11=bolt11,
+            )
+        except Exception as e:
+            result.error = f"sendpay_error: {e}"
+            self._log(f"sendpay failed: {e}", level="warn")
+            return result
 
-                self._log(
-                    f"Attempt {attempt} failed: {failcode} "
-                    f"erring_channel={erring_channel}",
-                    level="info",
-                )
+        # Wait
+        try:
+            wait_result = self.plugin.rpc.waitsendpay(
+                payment_hash=payment_hash,
+                timeout=SENDPAY_TIMEOUT,
+            )
+            fee_msat = wait_result.get("amount_sent_msat", amount_msat) - amount_msat
+            result.success = True
+            result.fee_msat = fee_msat
+            result.fee_sats = (fee_msat + 999) // 1000
+            self._log(
+                f"Success: {result.amount_sats} sats, fee {result.fee_sats} sats"
+            )
+            return result
 
-                if erring_channel and erring_channel not in excluded:
-                    excluded.append(erring_channel)
-                    result.excluded_channels = excluded.copy()
+        except Exception as e:
+            error_data = self._extract_error_data(e)
+            erring_channel = error_data.get("erring_channel")
+            failcode = error_data.get("failcodename", "")
 
-                # Permanent failures — don't retry
-                if failcode in (
-                    "WIRE_PERMANENT_CHANNEL_FAILURE",
-                    "WIRE_UNKNOWN_NEXT_PEER",
-                    "WIRE_CHANNEL_DISABLED",
-                ):
-                    result.error = f"permanent_failure: {failcode}"
-                    break
+            self._log(
+                f"Failed: {failcode} erring_channel={erring_channel}",
+                level="info",
+            )
 
-                # Retriable — but need a new route
-                if attempt < MAX_ATTEMPTS:
-                    # Ask caller's router for a new route with excludes
-                    # For now, we just stop — the orchestrator handles re-routing
-                    result.error = f"retriable_failure: {failcode}"
-                    # Don't break — let the orchestrator re-price with excludes
-                    break
+            if erring_channel:
+                result.excluded_channels = [erring_channel]
 
-                result.error = f"exhausted_retries: {failcode}"
+            if failcode in (
+                "WIRE_PERMANENT_CHANNEL_FAILURE",
+                "WIRE_UNKNOWN_NEXT_PEER",
+                "WIRE_CHANNEL_DISABLED",
+            ):
+                result.error = f"permanent_failure: {failcode}"
+            else:
+                result.error = f"retriable_failure: {failcode}"
 
         return result
 

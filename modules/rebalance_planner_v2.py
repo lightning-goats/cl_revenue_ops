@@ -82,28 +82,41 @@ class RebalancePlannerV2:
             paired_sources.add(pair.source_channel_id)
             paired_dests.add(pair.dest_channel_id)
 
-        # Phase 3: emit no_partner skips for unpaired valuable channels
+        # Phase 3: emit skip records for ALL unpaired valuable channels.
+        # Design rule 6: every eligible channel must be explained.
+        at_capacity = len(candidates) >= self.max_pairs
+
         for ch in over_local:
             if ch.channel_id not in paired_sources:
                 if not over_remote:
-                    skipped.append(V2SkipRecord(
-                        channel_id=ch.channel_id,
-                        reason="no_partner",
-                        value_class=ch.value_class,
-                        remaining_budget_sats=ch.remaining_budget_sats,
-                        detail="no over-remote channels available",
-                    ))
+                    reason, detail = "no_partner", "no over-remote channels available"
+                elif at_capacity:
+                    reason, detail = "max_pairs_reached", f"limit={self.max_pairs}"
+                else:
+                    reason, detail = "outcompeted", "lower-scoring pairs selected"
+                skipped.append(V2SkipRecord(
+                    channel_id=ch.channel_id,
+                    reason=reason,
+                    value_class=ch.value_class,
+                    remaining_budget_sats=ch.remaining_budget_sats,
+                    detail=detail,
+                ))
 
         for ch in over_remote:
             if ch.channel_id not in paired_dests:
                 if not over_local:
-                    skipped.append(V2SkipRecord(
-                        channel_id=ch.channel_id,
-                        reason="no_partner",
-                        value_class=ch.value_class,
-                        remaining_budget_sats=ch.remaining_budget_sats,
-                        detail="no over-local channels available",
-                    ))
+                    reason, detail = "no_partner", "no over-local channels available"
+                elif at_capacity:
+                    reason, detail = "max_pairs_reached", f"limit={self.max_pairs}"
+                else:
+                    reason, detail = "outcompeted", "lower-scoring pairs selected"
+                skipped.append(V2SkipRecord(
+                    channel_id=ch.channel_id,
+                    reason=reason,
+                    value_class=ch.value_class,
+                    remaining_budget_sats=ch.remaining_budget_sats,
+                    detail=detail,
+                ))
 
         return V2PlanResult(selected=candidates, skipped=skipped)
 

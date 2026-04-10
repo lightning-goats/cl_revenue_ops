@@ -18,7 +18,7 @@ def _make_engine(channels=None, capex_budgets=None):
                 "peer_id": "02" + "bb" * 32,
                 "short_channel_id": "111x1x0",
                 "total_msat": 2_000_000_000,
-                "spendable_msat": 1_800_000_000,  # 90% local
+                "our_amount_msat": 1_800_000_000,  # 90% local
                 "updates": {"remote": {"fee_proportional_millionths": 200}},
             },
             {
@@ -26,7 +26,7 @@ def _make_engine(channels=None, capex_budgets=None):
                 "peer_id": "02" + "cc" * 32,
                 "short_channel_id": "222x2x0",
                 "total_msat": 2_000_000_000,
-                "spendable_msat": 200_000_000,  # 10% local
+                "our_amount_msat": 200_000_000,  # 10% local
                 "updates": {"remote": {"fee_proportional_millionths": 300}},
             },
         ]
@@ -101,7 +101,7 @@ class TestFindCandidates:
                 "peer_id": "02" + "bb" * 32,
                 "short_channel_id": "111x1x0",
                 "total_msat": 2_000_000_000,
-                "spendable_msat": 1_000_000_000,  # 50% — inside band
+                "our_amount_msat": 1_000_000_000,  # 50% — inside band
                 "updates": {"remote": {"fee_proportional_millionths": 200}},
             },
         ]

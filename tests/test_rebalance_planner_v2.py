@@ -135,6 +135,38 @@ class TestSkipReasons:
         assert len(no_partner) == 2
 
 
+    def test_emits_outcompeted_skip_for_losing_sources(self):
+        planner = RebalancePlannerV2()
+        # Two sources, one dest — loser gets outcompeted skip
+        winner = _ch(channel_id="winner", peer_id="02" + "aa" * 32,
+                     local_ratio=0.90, value_class="hive")
+        loser = _ch(channel_id="loser", peer_id="02" + "bb" * 32,
+                    local_ratio=0.80, value_class="active")
+        dest = _ch(channel_id="dest", peer_id="02" + "cc" * 32, local_ratio=0.10)
+        snap = _snap(winner, loser, dest)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        outcompeted = [s for s in result.skipped if s.reason == "outcompeted"]
+        assert len(outcompeted) == 1
+        assert outcompeted[0].channel_id == "loser"
+
+    def test_emits_max_pairs_reached_skip(self):
+        planner = RebalancePlannerV2(max_pairs=1)
+        src1 = _ch(channel_id="src1", peer_id="02" + "aa" * 32, local_ratio=0.90)
+        src2 = _ch(channel_id="src2", peer_id="02" + "bb" * 32, local_ratio=0.85)
+        dest1 = _ch(channel_id="dest1", peer_id="02" + "cc" * 32, local_ratio=0.10)
+        dest2 = _ch(channel_id="dest2", peer_id="02" + "dd" * 32, local_ratio=0.15)
+        snap = _snap(src1, src2, dest1, dest2)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        max_reached = [s for s in result.skipped if s.reason == "max_pairs_reached"]
+        assert len(max_reached) >= 1
+
+
 class TestScoring:
     def test_scores_hive_channels_higher(self):
         planner = RebalancePlannerV2()

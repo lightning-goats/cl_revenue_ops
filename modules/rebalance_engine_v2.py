@@ -6,6 +6,7 @@ Single entry point: find_candidates() for dry-run, run_cycle() for live.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +66,8 @@ class RebalanceEngineV2:
 
     def _build_snapshot(self) -> Optional[RebalanceStateV2Snapshot]:
         """Build a normalized state snapshot from live data."""
+        cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
+
         try:
             channels_raw = self.plugin.rpc.listpeerchannels().get("channels", [])
         except Exception as e:
@@ -96,10 +99,12 @@ class RebalanceEngineV2:
                 capacity_msat = int(capacity_msat.rstrip("msat"))
             capacity_sats = capacity_msat // 1000
 
-            spendable_msat = ch.get("spendable_msat", 0)
-            if isinstance(spendable_msat, str):
-                spendable_msat = int(spendable_msat.rstrip("msat"))
-            local_sats = spendable_msat // 1000
+            # Use our_amount_msat (true local balance) not spendable_msat
+            # (which subtracts channel reserves and in-flight HTLCs).
+            local_msat = ch.get("our_amount_msat", ch.get("to_us_msat", 0))
+            if isinstance(local_msat, str):
+                local_msat = int(local_msat.rstrip("msat"))
+            local_sats = local_msat // 1000
 
             # Actual inbound fee from peer's remote updates
             inbound_fee_ppm = 0
@@ -131,6 +136,17 @@ class RebalanceEngineV2:
                 except Exception:
                     pass
 
+            # Cooldown: skip if rebalanced recently (default 1 hour)
+            cooldown = False
+            cooldown_secs = getattr(cfg, 'rebalance_cooldown_secs', 3600)
+            if self.database and cooldown_secs > 0:
+                try:
+                    last_ts = self.database.get_last_rebalance_time(scid)
+                    if last_ts and (int(time.time()) - last_ts) < cooldown_secs:
+                        cooldown = True
+                except Exception:
+                    pass
+
             normalized.append({
                 "channel_id": scid,
                 "peer_id": peer_id,
@@ -140,7 +156,7 @@ class RebalanceEngineV2:
                 "is_hive_member": is_hive,
                 "is_profitable": is_profitable,
                 "is_active": is_active,
-                "cooldown_active": False,
+                "cooldown_active": cooldown,
             })
 
         return build_state_snapshot(normalized, capex_allocations)
@@ -175,11 +191,13 @@ class RebalanceEngineV2:
                 route_result = router.price_pair(
                     source_channel_id=pair.source_channel_id,
                     dest_channel_id=pair.dest_channel_id,
+                    source_peer_id=pair.source_peer_id,
                     dest_peer_id=pair.dest_peer_id,
                     amount_sats=pair.amount_sats,
                 )
                 if route_result.success:
                     pair.route_cost_sats = route_result.route_cost_sats
+                    pair.route = route_result.route
                     if route_result.route_cost_sats <= pair.pair_budget_sats:
                         priced.append(pair)
                         self._audit.log_pick(
@@ -193,6 +211,7 @@ class RebalanceEngineV2:
                         plan.skipped.append(V2SkipRecord(
                             channel_id=pair.dest_channel_id,
                             reason="route_over_budget",
+                            value_class="valuable",
                             remaining_budget_sats=pair.pair_budget_sats,
                             detail=f"route_cost={route_result.route_cost_sats}",
                         ))
@@ -200,6 +219,7 @@ class RebalanceEngineV2:
                     plan.skipped.append(V2SkipRecord(
                         channel_id=pair.dest_channel_id,
                         reason="no_route",
+                        value_class="valuable",
                         detail=route_result.error,
                     ))
 
@@ -226,7 +246,7 @@ class RebalanceEngineV2:
         return plan.selected
 
     def run_cycle(self) -> V2CycleResult:
-        """Live execution: find candidates, price routes, execute rebalances."""
+        """Live execution: find candidates (already priced), execute rebalances."""
         result = V2CycleResult()
 
         candidates = self.find_candidates()
@@ -235,33 +255,19 @@ class RebalanceEngineV2:
         if not candidates:
             return result
 
-        our_id = self._get_our_id()
-        if not our_id:
-            self._log("Cannot execute: no node ID", level="warn")
-            return result
-
         executor = RebalanceExecutorV2(self.plugin, self.database)
-        router = RebalanceRouterV2(self.plugin, our_id)
 
         for pair in candidates:
-            # Get route for execution
-            route_result = router.price_pair(
-                source_channel_id=pair.source_channel_id,
-                dest_channel_id=pair.dest_channel_id,
-                dest_peer_id=pair.dest_peer_id,
-                amount_sats=pair.amount_sats,
-            )
-
-            if not route_result.success:
+            if not pair.route:
                 self._log(
-                    f"Route failed for {pair.source_channel_id}->{pair.dest_channel_id}: "
-                    f"{route_result.error}",
+                    f"No route stored for {pair.source_channel_id}->"
+                    f"{pair.dest_channel_id}, skipping",
                     level="info",
                 )
                 continue
 
             exec_result = executor.execute(
-                route=route_result.route,
+                route=pair.route,
                 amount_sats=pair.amount_sats,
                 source_channel_id=pair.source_channel_id,
                 dest_channel_id=pair.dest_channel_id,

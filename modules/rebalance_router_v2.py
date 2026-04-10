@@ -61,9 +61,9 @@ class RebalanceRouterV2:
         Priority 2: listchannels for the dest peer's channel toward us.
         Returns None if fee cannot be determined.
         """
-        # --- Priority 1: listpeerchannels (our direct peer data) ---
+        # --- Priority 1: listpeerchannels filtered by peer ---
         try:
-            result = self.plugin.rpc.listpeerchannels()
+            result = self.plugin.rpc.listpeerchannels(id=dest_peer_id)
             for ch in result.get("channels", []):
                 if ch.get("peer_id") != dest_peer_id:
                     continue
@@ -95,7 +95,7 @@ class RebalanceRouterV2:
     @staticmethod
     def _compute_final_hop_fee_sats(amount_sats: int, fee_ppm: int) -> int:
         """Compute the fee in sats for the final hop at the given PPM rate."""
-        return max(1, math.ceil(amount_sats * fee_ppm / 1_000_000))
+        return math.ceil(amount_sats * fee_ppm / 1_000_000)
 
     @staticmethod
     def _route_fee_sats(route: List[Dict[str, Any]], amount_sats: int) -> int:
@@ -117,26 +117,57 @@ class RebalanceRouterV2:
     # Public API
     # ------------------------------------------------------------------
 
+    def _get_source_channel_policy(self, source_peer_id: str) -> Dict[str, Any]:
+        """Get our outbound fee/cltv for the source channel from peer's perspective."""
+        try:
+            result = self.plugin.rpc.listpeerchannels(id=source_peer_id)
+            for ch in result.get("channels", []):
+                updates = ch.get("updates") or {}
+                local = updates.get("local") or {}
+                return {
+                    "fee_ppm": local.get("fee_proportional_millionths", 0),
+                    "fee_base_msat": local.get("fee_base_msat", 0),
+                    "cltv_delta": local.get("cltv_expiry_delta", 18),
+                }
+        except Exception:
+            pass
+        return {"fee_ppm": 0, "fee_base_msat": 0, "cltv_delta": 18}
+
+    def _get_dest_channel_cltv(self, dest_peer_id: str) -> int:
+        """Get the dest peer's cltv_expiry_delta for the final hop."""
+        try:
+            result = self.plugin.rpc.listpeerchannels(id=dest_peer_id)
+            for ch in result.get("channels", []):
+                updates = ch.get("updates") or {}
+                remote = updates.get("remote") or {}
+                cltv = remote.get("cltv_expiry_delta")
+                if cltv is not None:
+                    return int(cltv)
+        except Exception:
+            pass
+        return 40  # safe default
+
     def price_pair(
         self,
         source_channel_id: str,
         dest_channel_id: str,
+        source_peer_id: str,
         dest_peer_id: str,
         amount_sats: int,
         exclude: Optional[List[str]] = None,
     ) -> V2RouteResult:
         """Discover and price a circular rebalance route.
 
-        1. Looks up the actual final-hop fee from the dest peer's channel
-           policy (listpeerchannels, falling back to listchannels).
-        2. Calls getroute from dest_peer_id -> our_node_id for
-           (amount_sats + final_hop_fee) to account for the inbound leg.
-        3. Computes total route cost (intermediate fees + final hop fee).
+        Builds a complete sendpay-ready route:
+          first_hop (our source channel) → getroute middle → final_hop (dest channel)
+
+        This pins the source and dest to the specific channels requested.
 
         Args:
             source_channel_id: SCID of the outbound (source) channel.
             dest_channel_id: SCID of the inbound (dest) channel.
-            dest_peer_id: Pubkey of the destination peer.
+            source_peer_id: Pubkey of the source peer (first hop after us).
+            dest_peer_id: Pubkey of the destination peer (last hop before us).
             amount_sats: Amount to rebalance in sats.
             exclude: Optional list of channels/nodes to exclude.
 
@@ -155,43 +186,71 @@ class RebalanceRouterV2:
             amount_sats, final_hop_fee_ppm
         )
 
-        # Step 2: getroute from dest_peer -> us (the return path)
-        # We request amount_sats + final_hop_fee so the route carries enough
-        # to cover the last-hop charge.
-        route_amount_sats = amount_sats + final_hop_fee_sats
-        try:
-            getroute_kwargs: Dict[str, Any] = {
-                "node_id": self.our_node_id,
-                "amount_msat": route_amount_sats * 1000,
-                "riskfactor": 10,
-            }
-            if exclude:
-                getroute_kwargs["exclude"] = exclude
-            # fromid tells getroute to start from dest_peer instead of us
-            getroute_kwargs["fromid"] = dest_peer_id
+        # Step 2: getroute for the middle path (source_peer → dest_peer)
+        # If source and dest are the same peer (direct channel pair), skip getroute
+        middle_route: List[Dict[str, Any]] = []
+        middle_fee_sats = 0
 
-            result = self.plugin.rpc.getroute(**getroute_kwargs)
-            route = result.get("route", [])
-        except Exception as e:
-            return V2RouteResult(
-                success=False,
-                error=f"getroute failed: {e}",
+        if source_peer_id != dest_peer_id:
+            route_amount_msat = (amount_sats + final_hop_fee_sats) * 1000
+            try:
+                getroute_kwargs: Dict[str, Any] = {
+                    "node_id": dest_peer_id,
+                    "amount_msat": route_amount_msat,
+                    "riskfactor": 10,
+                    "fromid": source_peer_id,
+                }
+                if exclude:
+                    getroute_kwargs["exclude"] = exclude
+
+                result = self.plugin.rpc.getroute(**getroute_kwargs)
+                middle_route = result.get("route", [])
+            except Exception as e:
+                return V2RouteResult(
+                    success=False,
+                    error=f"getroute failed: {e}",
+                )
+
+            if not middle_route:
+                return V2RouteResult(
+                    success=False,
+                    error="getroute returned empty route",
+                )
+            middle_fee_sats = self._route_fee_sats(
+                middle_route, amount_sats + final_hop_fee_sats
             )
 
-        if not route:
-            return V2RouteResult(
-                success=False,
-                error="getroute returned empty route",
-            )
+        # Step 3: Build the full circular route
+        # First hop: us → source_peer via source_channel
+        total_forward_msat = (amount_sats + final_hop_fee_sats + middle_fee_sats) * 1000
+        source_policy = self._get_source_channel_policy(source_peer_id)
+        first_hop_delay = (
+            (middle_route[0].get("delay", 18) if middle_route else 0)
+            + self._get_dest_channel_cltv(dest_peer_id)
+            + source_policy.get("cltv_delta", 18)
+        )
+        first_hop = {
+            "id": source_peer_id,
+            "channel": source_channel_id,
+            "amount_msat": total_forward_msat,
+            "delay": first_hop_delay,
+        }
 
-        # Step 3: Compute total cost
-        intermediate_fee_sats = self._route_fee_sats(route, route_amount_sats)
-        total_cost_sats = intermediate_fee_sats + final_hop_fee_sats
+        # Final hop: dest_peer → us via dest_channel
+        final_hop = {
+            "id": self.our_node_id,
+            "channel": dest_channel_id,
+            "amount_msat": amount_sats * 1000,
+            "delay": 0,
+        }
+
+        full_route = [first_hop] + middle_route + [final_hop]
+        total_cost_sats = middle_fee_sats + final_hop_fee_sats
 
         return V2RouteResult(
             success=True,
             route_cost_sats=total_cost_sats,
             final_hop_fee_ppm=final_hop_fee_ppm,
-            hops=len(route),
-            route=route,
+            hops=len(full_route),
+            route=full_route,
         )
