@@ -140,6 +140,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "planner_execute_closes",
         "planner_max_opens_per_cycle",
         "planner_max_closes_per_cycle",
+        "capex_probability_budget_bonus",
     ]
     assert result["operator_controls"]["values"] == {
         "paused": False,
@@ -151,6 +152,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "planner_execute_closes": False,
         "planner_max_opens_per_cycle": 1,
         "planner_max_closes_per_cycle": 0,
+        "capex_probability_budget_bonus": 0.0,
     }
     assert "config" not in result
 
