@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock
 
-from modules.rebalance_audit_v2 import RebalanceAuditV2
+from modules.rebalance_audit_v2 import RebalanceAudit
 
 
 # ------------------------------------------------------------------
@@ -8,7 +8,7 @@ from modules.rebalance_audit_v2 import RebalanceAuditV2
 # ------------------------------------------------------------------
 
 def test_format_pick_includes_all_fields():
-    msg = RebalanceAuditV2.format_pick(
+    msg = RebalanceAudit.format_pick(
         source_channel_id="111x1x0",
         dest_channel_id="222x2x0",
         amount_sats=50_000,
@@ -24,7 +24,7 @@ def test_format_pick_includes_all_fields():
 
 
 def test_format_skip_includes_reason_and_budget():
-    msg = RebalanceAuditV2.format_skip(
+    msg = RebalanceAudit.format_skip(
         channel_id="333x3x0",
         reason="skipped_no_budget",
         value_class="hive",
@@ -38,7 +38,7 @@ def test_format_skip_includes_reason_and_budget():
 
 
 def test_format_skip_omits_route_cost_when_zero():
-    msg = RebalanceAuditV2.format_skip(
+    msg = RebalanceAudit.format_skip(
         channel_id="444x4x0",
         reason="skipped_cooldown",
         value_class="active",
@@ -49,7 +49,7 @@ def test_format_skip_omits_route_cost_when_zero():
 
 
 def test_format_skip_with_detail():
-    msg = RebalanceAuditV2.format_skip(
+    msg = RebalanceAudit.format_skip(
         channel_id="555x5x0",
         reason="skipped_policy",
         value_class="profitable",
@@ -67,7 +67,7 @@ def test_format_skip_with_detail():
 
 def test_log_pick_calls_plugin_log():
     plugin = MagicMock()
-    audit = RebalanceAuditV2(plugin)
+    audit = RebalanceAudit(plugin)
 
     audit.log_pick(
         source_channel_id="111x1x0",
@@ -86,7 +86,7 @@ def test_log_pick_calls_plugin_log():
 
 def test_log_skip_calls_plugin_log():
     plugin = MagicMock()
-    audit = RebalanceAuditV2(plugin)
+    audit = RebalanceAudit(plugin)
 
     audit.log_skip(
         channel_id="333x3x0",
@@ -104,7 +104,7 @@ def test_log_skip_calls_plugin_log():
 
 def test_log_cycle_summary_format():
     plugin = MagicMock()
-    audit = RebalanceAuditV2(plugin)
+    audit = RebalanceAudit(plugin)
 
     audit.log_cycle_summary(
         selected_count=3,

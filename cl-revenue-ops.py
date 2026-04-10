@@ -1529,10 +1529,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalancer.data_service = data_service
     plugin.log("RebalanceExecutor initialized - native rebalance engine enabled")
 
-    # RebalanceEngineV2: unified actual-fee rebalance pipeline (behind feature flag)
+    # RebalanceEngine: unified actual-fee rebalance pipeline (behind feature flag)
     if getattr(config, 'rebalance_engine', 'v1') == 'v2' and rebalancer is not None:
-        from modules.rebalance_engine_v2 import RebalanceEngineV2
-        rebalancer.rebalance_engine_v2 = RebalanceEngineV2(
+        from modules.rebalance_engine_v2 import RebalanceEngine
+        rebalancer.rebalance_engine_v2 = RebalanceEngine(
             plugin=safe_plugin,
             config=config,
             database=database,
@@ -1540,7 +1540,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             profitability=profitability_analyzer,
             hive_hints=hive_hints,
         )
-        plugin.log("RebalanceEngineV2 initialized - v2 rebalance pipeline enabled")
+        plugin.log("RebalanceEngine initialized - v2 rebalance pipeline enabled")
 
     if fee_controller is not None:
         fee_controller.data_service = data_service

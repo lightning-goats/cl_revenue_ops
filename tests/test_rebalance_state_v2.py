@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 
 def test_build_state_snapshot_derives_value_classes_and_budget():
     from modules.capex_budget import CapexAllocations, ChannelCapexBudget
-    from modules.rebalance_state_v2 import NormalizedV2ChannelInput, build_state_snapshot
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
 
     allocations = CapexAllocations(
         channel_budgets={
@@ -19,7 +19,7 @@ def test_build_state_snapshot_derives_value_classes_and_budget():
 
     state = build_state_snapshot(
         [
-            NormalizedV2ChannelInput(
+            ChannelInput(
                 channel_id="111x1x0",
                 peer_id="02" + "a" * 64,
                 capacity_sats=1_000_000,
@@ -30,7 +30,7 @@ def test_build_state_snapshot_derives_value_classes_and_budget():
                 is_active=True,
                 cooldown_active=False,
             ),
-            NormalizedV2ChannelInput(
+            ChannelInput(
                 channel_id="222x2x0",
                 peer_id="02" + "b" * 64,
                 capacity_sats=500_000,
@@ -88,7 +88,7 @@ def test_build_state_snapshot_normalizes_mapping_booleans_and_budget_defaults():
     assert state.channels[0].cooldown_active is False
 
 
-def test_rebalancer_build_rebalance_state_v2_delegates_to_builder(mock_plugin, mock_database):
+def test_rebalancer_build_state_v2_delegates_to_builder(mock_plugin, mock_database):
     from modules.config import Config
     import modules.rebalancer as rebalancer_module
     from modules.rebalancer import EVRebalancer
@@ -96,9 +96,9 @@ def test_rebalancer_build_rebalance_state_v2_delegates_to_builder(mock_plugin, m
     cfg = Config(dry_run=True)
     r = EVRebalancer(mock_plugin, cfg, mock_database)
     builder = MagicMock(return_value="snapshot")
-    rebalancer_module.build_rebalance_state_v2_snapshot = builder
+    rebalancer_module.build_state_snapshot_v2 = builder
 
-    result = r.build_rebalance_state_v2(["channels"], "allocations")
+    result = r.build_state_v2(["channels"], "allocations")
 
     assert result == "snapshot"
     builder.assert_called_once_with(["channels"], "allocations")

@@ -14,7 +14,7 @@ from .utils import base_to_sats_ceil
 
 
 @dataclass(frozen=True)
-class NormalizedV2ChannelInput:
+class ChannelInput:
     """Normalized channel input for v2 state building."""
 
     channel_id: str
@@ -29,7 +29,7 @@ class NormalizedV2ChannelInput:
 
 
 @dataclass(frozen=True)
-class RebalanceStateV2Channel:
+class ChannelState:
     """Normalized per-channel state for the v2 rebalancer pipeline."""
 
     channel_id: str
@@ -44,10 +44,10 @@ class RebalanceStateV2Channel:
 
 
 @dataclass(frozen=True)
-class RebalanceStateV2Snapshot:
+class StateSnapshot:
     """Immutable normalized v2 state snapshot."""
 
-    channels: Tuple[RebalanceStateV2Channel, ...]
+    channels: Tuple[ChannelState, ...]
     total_capacity_sats: int = 0
     total_remaining_budget_sats: int = 0
     valuable_channel_count: int = 0
@@ -76,11 +76,11 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _normalize_channel_input(value: Any) -> NormalizedV2ChannelInput:
-    if isinstance(value, NormalizedV2ChannelInput):
+def _normalize_channel_input(value: Any) -> ChannelInput:
+    if isinstance(value, ChannelInput):
         return value
     if isinstance(value, Mapping):
-        return NormalizedV2ChannelInput(
+        return ChannelInput(
             channel_id=str(value.get("channel_id", "")).strip(),
             peer_id=str(value.get("peer_id", "")).strip(),
             capacity_sats=_as_int(value.get("capacity_sats", 0)),
@@ -137,7 +137,7 @@ def _budget_lookup(capex_allocations: Any) -> dict[str, int]:
     return lookup
 
 
-def _value_class(channel: NormalizedV2ChannelInput) -> str:
+def _value_class(channel: ChannelInput) -> str:
     if channel.is_hive_member:
         return "hive"
     if channel.is_profitable:
@@ -150,7 +150,7 @@ def _value_class(channel: NormalizedV2ChannelInput) -> str:
 def build_state_snapshot(
     channels: Iterable[Any],
     capex_allocations: Any,
-) -> RebalanceStateV2Snapshot:
+) -> StateSnapshot:
     """Build a normalized, immutable v2 state snapshot."""
 
     budget_by_channel = _budget_lookup(capex_allocations)
@@ -172,7 +172,7 @@ def build_state_snapshot(
         remaining_budget_sats = max(0, budget_by_channel.get(channel.channel_id, 0))
 
         normalized_channels.append(
-            RebalanceStateV2Channel(
+            ChannelState(
                 channel_id=channel.channel_id,
                 peer_id=channel.peer_id,
                 capacity_sats=capacity_sats,
@@ -189,7 +189,7 @@ def build_state_snapshot(
         if is_valuable:
             valuable_channel_count += 1
 
-    return RebalanceStateV2Snapshot(
+    return StateSnapshot(
         channels=tuple(normalized_channels),
         total_capacity_sats=total_capacity_sats,
         total_remaining_budget_sats=total_remaining_budget_sats,

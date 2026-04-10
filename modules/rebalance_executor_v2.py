@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
-class V2ExecutionResult:
+class ExecutionResult:
     """Result of a v2 rebalance execution attempt."""
 
     success: bool = False
@@ -35,7 +35,7 @@ INVOICE_EXPIRY = 300
 MAX_ATTEMPTS = 1
 
 
-class RebalanceExecutorV2:
+class RebalanceExecutor:
     """Execute rebalance routes using standard CLN RPCs.
 
     No fleet/network distinction — one code path for all routes.
@@ -67,7 +67,7 @@ class RebalanceExecutorV2:
         source_channel_id: str,
         dest_channel_id: str,
         max_fee_sats: int,
-    ) -> V2ExecutionResult:
+    ) -> ExecutionResult:
         """Execute a circular rebalance using invoice + sendpay + waitsendpay.
 
         Args:
@@ -78,14 +78,14 @@ class RebalanceExecutorV2:
             max_fee_sats: Maximum fee budget in sats.
 
         Returns:
-            V2ExecutionResult with success/failure details.
+            ExecutionResult with success/failure details.
         """
         our_id = self._get_our_id()
         if not our_id:
-            return V2ExecutionResult(error="no_node_id")
+            return ExecutionResult(error="no_node_id")
 
         amount_msat = amount_sats * 1000
-        result = V2ExecutionResult(amount_sats=amount_sats)
+        result = ExecutionResult(amount_sats=amount_sats)
 
         # Create self-paying invoice
         label = f"rebal-v2-{secrets.token_hex(8)}"
@@ -125,8 +125,8 @@ class RebalanceExecutorV2:
         bolt11: str,
         label: str,
         max_fee_sats: int,
-        result: V2ExecutionResult,
-    ) -> V2ExecutionResult:
+        result: ExecutionResult,
+    ) -> ExecutionResult:
         """Execute a single sendpay attempt on the given route.
 
         The executor does not re-route — on failure it records the erring
@@ -210,7 +210,7 @@ class RebalanceExecutorV2:
         self,
         label: str,
         payment_hash: Optional[str],
-        result: V2ExecutionResult,
+        result: ExecutionResult,
     ) -> None:
         """Clean up invoice and failed payment records."""
         try:

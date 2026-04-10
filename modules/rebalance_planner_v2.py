@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from .rebalance_state_v2 import RebalanceStateV2Channel, RebalanceStateV2Snapshot
-from .rebalance_types_v2 import V2PairCandidate, V2PlanResult, V2SkipRecord
+from .rebalance_state_v2 import ChannelState, StateSnapshot
+from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
 
 
 # Value class scores — hive channels win when routes are cheap, not via fake bonuses
@@ -23,7 +23,7 @@ _VALUE_SCORES = {
 }
 
 
-class RebalancePlannerV2:
+class RebalancePlanner:
     """Pair-based rebalance planner using actual fees and budgets."""
 
     def __init__(
@@ -38,11 +38,11 @@ class RebalancePlannerV2:
         self.max_chunk_sats = max_chunk_sats
         self.max_pairs = max_pairs
 
-    def plan(self, snapshot: RebalanceStateV2Snapshot) -> V2PlanResult:
+    def plan(self, snapshot: StateSnapshot) -> PlanResult:
         """Classify channels, generate pairs, score and select."""
-        over_local: List[RebalanceStateV2Channel] = []
-        over_remote: List[RebalanceStateV2Channel] = []
-        skipped: List[V2SkipRecord] = []
+        over_local: List[ChannelState] = []
+        over_remote: List[ChannelState] = []
+        skipped: List[SkipRecord] = []
 
         # Phase 1: classify every channel
         for ch in snapshot.channels:
@@ -56,7 +56,7 @@ class RebalancePlannerV2:
             elif ch.local_ratio < self.target_band_low:
                 over_remote.append(ch)
             else:
-                skipped.append(V2SkipRecord(
+                skipped.append(SkipRecord(
                     channel_id=ch.channel_id,
                     reason="inside_band",
                     value_class=ch.value_class,
@@ -66,7 +66,7 @@ class RebalancePlannerV2:
         # Phase 2: generate candidate pairs
         paired_sources = set()
         paired_dests = set()
-        candidates: List[V2PairCandidate] = []
+        candidates: List[PairCandidate] = []
 
         pairs = self._generate_pairs(over_local, over_remote)
         pairs.sort(key=lambda p: p.score, reverse=True)
@@ -94,7 +94,7 @@ class RebalancePlannerV2:
                     reason, detail = "max_pairs_reached", f"limit={self.max_pairs}"
                 else:
                     reason, detail = "outcompeted", "lower-scoring pairs selected"
-                skipped.append(V2SkipRecord(
+                skipped.append(SkipRecord(
                     channel_id=ch.channel_id,
                     reason=reason,
                     value_class=ch.value_class,
@@ -110,7 +110,7 @@ class RebalancePlannerV2:
                     reason, detail = "max_pairs_reached", f"limit={self.max_pairs}"
                 else:
                     reason, detail = "outcompeted", "lower-scoring pairs selected"
-                skipped.append(V2SkipRecord(
+                skipped.append(SkipRecord(
                     channel_id=ch.channel_id,
                     reason=reason,
                     value_class=ch.value_class,
@@ -118,26 +118,26 @@ class RebalancePlannerV2:
                     detail=detail,
                 ))
 
-        return V2PlanResult(selected=candidates, skipped=skipped)
+        return PlanResult(selected=candidates, skipped=skipped)
 
-    def _check_skip(self, ch: RebalanceStateV2Channel):
-        """Return a V2SkipRecord if the channel should be skipped pre-pairing."""
+    def _check_skip(self, ch: ChannelState):
+        """Return a SkipRecord if the channel should be skipped pre-pairing."""
         if not ch.is_valuable:
-            return V2SkipRecord(
+            return SkipRecord(
                 channel_id=ch.channel_id,
                 reason="not_valuable",
                 value_class=ch.value_class,
                 remaining_budget_sats=ch.remaining_budget_sats,
             )
         if ch.cooldown_active:
-            return V2SkipRecord(
+            return SkipRecord(
                 channel_id=ch.channel_id,
                 reason="cooldown",
                 value_class=ch.value_class,
                 remaining_budget_sats=ch.remaining_budget_sats,
             )
         if ch.remaining_budget_sats <= 0:
-            return V2SkipRecord(
+            return SkipRecord(
                 channel_id=ch.channel_id,
                 reason="no_budget",
                 value_class=ch.value_class,
@@ -147,9 +147,9 @@ class RebalancePlannerV2:
 
     def _generate_pairs(
         self,
-        over_local: List[RebalanceStateV2Channel],
-        over_remote: List[RebalanceStateV2Channel],
-    ) -> List[V2PairCandidate]:
+        over_local: List[ChannelState],
+        over_remote: List[ChannelState],
+    ) -> List[PairCandidate]:
         """Generate all valid candidate pairs with scores."""
         pairs = []
         for src in over_local:
@@ -184,7 +184,7 @@ class RebalancePlannerV2:
 
                 score = value_score * imbalance_score
 
-                pairs.append(V2PairCandidate(
+                pairs.append(PairCandidate(
                     source_channel_id=src.channel_id,
                     dest_channel_id=dest.channel_id,
                     source_peer_id=src.peer_id,

@@ -1,10 +1,10 @@
-"""Tests for RebalanceRouterV2 — route discovery and pricing via CLN RPCs."""
+"""Tests for RebalanceRouter — route discovery and pricing via CLN RPCs."""
 
 from unittest.mock import MagicMock, call
 
 import pytest
 
-from modules.rebalance_router_v2 import RebalanceRouterV2, V2RouteResult
+from modules.rebalance_router_v2 import RebalanceRouter, RouteResult
 
 
 OUR_ID = "02" + "aa" * 32
@@ -97,7 +97,7 @@ class TestFinalHopFeeFromListpeerchannels:
             },
             getroute={"route": middle_route},
         )
-        router = RebalanceRouterV2(plugin, OUR_ID)
+        router = RebalanceRouter(plugin, OUR_ID)
 
         result = router.price_pair(
             SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
@@ -137,7 +137,7 @@ class TestFallbackToListchannels:
             list_channels=list_channels,
             getroute={"route": middle_route},
         )
-        router = RebalanceRouterV2(plugin, OUR_ID)
+        router = RebalanceRouter(plugin, OUR_ID)
 
         result = router.price_pair(
             SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
@@ -164,7 +164,7 @@ class TestFullRoute:
             },
             getroute={"route": middle_route},
         )
-        router = RebalanceRouterV2(plugin, OUR_ID)
+        router = RebalanceRouter(plugin, OUR_ID)
 
         result = router.price_pair(
             SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
@@ -195,7 +195,7 @@ class TestExcludePassthrough:
             },
             getroute={"route": middle_route},
         )
-        router = RebalanceRouterV2(plugin, OUR_ID)
+        router = RebalanceRouter(plugin, OUR_ID)
 
         exclude_list = ["400x1x0/0", "03" + "dd" * 32]
         result = router.price_pair(
@@ -219,7 +219,7 @@ class TestFailureOnNoRoute:
             },
             getroute_error=Exception("Could not find a route"),
         )
-        router = RebalanceRouterV2(plugin, OUR_ID)
+        router = RebalanceRouter(plugin, OUR_ID)
 
         result = router.price_pair(
             SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
@@ -230,7 +230,7 @@ class TestFailureOnNoRoute:
 
     def test_router_returns_failure_when_fee_unknown(self):
         plugin = _make_plugin()
-        router = RebalanceRouterV2(plugin, OUR_ID)
+        router = RebalanceRouter(plugin, OUR_ID)
 
         result = router.price_pair(
             SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
@@ -256,7 +256,7 @@ class TestZeroFeePeer:
             },
             getroute={"route": middle_route},
         )
-        router = RebalanceRouterV2(plugin, OUR_ID)
+        router = RebalanceRouter(plugin, OUR_ID)
 
         result = router.price_pair(
             SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS

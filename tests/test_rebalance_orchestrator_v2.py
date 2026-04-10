@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-from modules.rebalance_engine_v2 import RebalanceEngineV2, V2CycleResult
+from modules.rebalance_engine_v2 import RebalanceEngine, CycleResult
 
 
 def _make_engine(channels=None, capex_budgets=None):
@@ -64,7 +64,7 @@ def _make_engine(channels=None, capex_budgets=None):
     prof_result.total_forward_count = 10
     profitability.get_channel_profitability.return_value = prof_result
 
-    engine = RebalanceEngineV2(
+    engine = RebalanceEngine(
         plugin=plugin,
         config=config,
         database=database,

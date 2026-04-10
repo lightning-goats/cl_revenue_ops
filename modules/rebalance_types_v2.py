@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
-class V2PairCandidate:
+class PairCandidate:
     """A scored candidate pair for rebalancing.
 
     source = channel we push sats *out of* (over-local).
@@ -32,7 +32,7 @@ class V2PairCandidate:
 
 
 @dataclass
-class V2SkipRecord:
+class SkipRecord:
     """Explains why a channel was not selected in this cycle."""
 
     channel_id: str
@@ -43,8 +43,8 @@ class V2SkipRecord:
 
 
 @dataclass
-class V2PlanResult:
+class PlanResult:
     """Output of the v2 rebalance planner for one cycle."""
 
-    selected: List[V2PairCandidate] = field(default_factory=list)
-    skipped: List[V2SkipRecord] = field(default_factory=list)
+    selected: List[PairCandidate] = field(default_factory=list)
+    skipped: List[SkipRecord] = field(default_factory=list)

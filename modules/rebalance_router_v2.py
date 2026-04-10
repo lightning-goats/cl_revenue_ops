@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
-class V2RouteResult:
+class RouteResult:
     """Result of a v2 route pricing attempt."""
 
     success: bool
@@ -28,7 +28,7 @@ class V2RouteResult:
     error: str = ""
 
 
-class RebalanceRouterV2:
+class RebalanceRouter:
     """Route discovery and pricing using official CLN RPCs only.
 
     Computes first-hop and final-hop fee requirements from live fee policy,
@@ -155,7 +155,7 @@ class RebalanceRouterV2:
         dest_peer_id: str,
         amount_sats: int,
         exclude: Optional[List[str]] = None,
-    ) -> V2RouteResult:
+    ) -> RouteResult:
         """Discover and price a circular rebalance route.
 
         Builds a complete sendpay-ready route:
@@ -172,12 +172,12 @@ class RebalanceRouterV2:
             exclude: Optional list of channels/nodes to exclude.
 
         Returns:
-            V2RouteResult with pricing or failure details.
+            RouteResult with pricing or failure details.
         """
         # Step 1: Get actual final-hop fee
         final_hop_fee_ppm = self._get_final_hop_fee_ppm(dest_peer_id)
         if final_hop_fee_ppm is None:
-            return V2RouteResult(
+            return RouteResult(
                 success=False,
                 error=f"cannot determine final-hop fee for peer {dest_peer_id}",
             )
@@ -206,13 +206,13 @@ class RebalanceRouterV2:
                 result = self.plugin.rpc.getroute(**getroute_kwargs)
                 middle_route = result.get("route", [])
             except Exception as e:
-                return V2RouteResult(
+                return RouteResult(
                     success=False,
                     error=f"getroute failed: {e}",
                 )
 
             if not middle_route:
-                return V2RouteResult(
+                return RouteResult(
                     success=False,
                     error="getroute returned empty route",
                 )
@@ -247,7 +247,7 @@ class RebalanceRouterV2:
         full_route = [first_hop] + middle_route + [final_hop]
         total_cost_sats = middle_fee_sats + final_hop_fee_sats
 
-        return V2RouteResult(
+        return RouteResult(
             success=True,
             route_cost_sats=total_cost_sats,
             final_hop_fee_ppm=final_hop_fee_ppm,

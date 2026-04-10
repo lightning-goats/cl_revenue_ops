@@ -4,13 +4,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modules.rebalance_executor_v2 import RebalanceExecutorV2, V2ExecutionResult
+from modules.rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
 
 
 def _make_executor():
     plugin = MagicMock()
     plugin.rpc.getinfo.return_value = {"id": "02" + "aa" * 32}
-    executor = RebalanceExecutorV2(plugin=plugin)
+    executor = RebalanceExecutor(plugin=plugin)
     return executor, plugin
 
 
@@ -125,7 +125,7 @@ class TestExecutorFailures:
     def test_returns_error_on_no_node_id(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.side_effect = Exception("connection refused")
-        executor = RebalanceExecutorV2(plugin=plugin)
+        executor = RebalanceExecutor(plugin=plugin)
 
         result = executor.execute(
             route=_make_route(),
