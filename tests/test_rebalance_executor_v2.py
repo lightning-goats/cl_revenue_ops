@@ -215,6 +215,7 @@ class TestExecutorFailures:
                 self.error = {
                     "data": {
                         "erring_channel": "444x4x0",
+                        "erring_direction": 1,
                         "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
                     }
                 }
@@ -230,7 +231,75 @@ class TestExecutorFailures:
         )
 
         assert result.success is False
-        assert "444x4x0" in result.excluded_channels
+        # Must be in directional form ``scid/dir`` so getroute and askrene
+        # accept it in their exclude parameters.
+        assert result.excluded_channels == ["444x4x0/1"]
+
+    def test_exclude_captures_directional_form_when_direction_present(self):
+        """Regression guard: live nexus-01 2026-04-10 18:54Z showed getroute
+        rejecting bare SCIDs in the exclude list with
+        'exclude: should be short_channel_id_dir or node_id'. The executor
+        must combine erring_channel + erring_direction into CLN's canonical
+        ``scid/dir`` format."""
+        executor, plugin = _make_executor()
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "abc123",
+            "bolt11": "lnbc...",
+        }
+
+        class RPCError(Exception):
+            def __init__(self):
+                self.error = {
+                    "data": {
+                        "erring_channel": "934667x311x8",
+                        "erring_direction": 0,
+                        "failcodename": "WIRE_FEE_INSUFFICIENT",
+                    }
+                }
+
+        plugin.rpc.waitsendpay.side_effect = RPCError()
+
+        result = executor.execute(
+            route=_make_route(),
+            amount_sats=50_000,
+            source_channel_id="111x1x0",
+            dest_channel_id="222x2x0",
+            max_fee_sats=10,
+        )
+
+        assert result.excluded_channels == ["934667x311x8/0"]
+
+    def test_exclude_falls_back_to_bare_scid_when_direction_missing(self):
+        """Some older CLN versions or wrapped failures may omit
+        erring_direction. The executor should still produce a non-empty
+        excluded_channels entry rather than dropping the hint entirely."""
+        executor, plugin = _make_executor()
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "abc123",
+            "bolt11": "lnbc...",
+        }
+
+        class RPCError(Exception):
+            def __init__(self):
+                self.error = {
+                    "data": {
+                        "erring_channel": "555x5x5",
+                        # No erring_direction
+                        "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+                    }
+                }
+
+        plugin.rpc.waitsendpay.side_effect = RPCError()
+
+        result = executor.execute(
+            route=_make_route(),
+            amount_sats=50_000,
+            source_channel_id="111x1x0",
+            dest_channel_id="222x2x0",
+            max_fee_sats=10,
+        )
+
+        assert result.excluded_channels == ["555x5x5"]
 
     def test_diagnostic_log_fires_on_bare_exception(self):
         """When waitsendpay raises a plain Exception with no .error attr,

@@ -187,15 +187,31 @@ class RebalanceExecutor:
 
             error_data = self._extract_error_data(e)
             erring_channel = error_data.get("erring_channel")
+            erring_direction = error_data.get("erring_direction")
             failcode = error_data.get("failcodename", "")
 
+            # Combine channel + direction into CLN's canonical exclude
+            # format (``scid/dir``). Both getroute and askrene's update-channel
+            # reject bare SCIDs:
+            #   "exclude: should be short_channel_id_dir or node_id: invalid token"
+            # (observed live on nexus-01 2026-04-10 18:54Z during the first
+            # engine retry attempt). When direction is missing from the
+            # error data, fall back to the bare SCID — a future call that
+            # needs directional precision can expand both dirs.
+            excluded_entry: Optional[str] = None
+            if erring_channel:
+                if erring_direction is not None:
+                    excluded_entry = f"{erring_channel}/{int(erring_direction)}"
+                else:
+                    excluded_entry = str(erring_channel)
+
             self._log(
-                f"Failed: {failcode} erring_channel={erring_channel}",
+                f"Failed: {failcode} erring_channel={excluded_entry}",
                 level="info",
             )
 
-            if erring_channel:
-                result.excluded_channels = [erring_channel]
+            if excluded_entry:
+                result.excluded_channels = [excluded_entry]
 
             if failcode in (
                 "WIRE_PERMANENT_CHANNEL_FAILURE",
