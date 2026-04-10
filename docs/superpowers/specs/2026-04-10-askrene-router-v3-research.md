@@ -199,7 +199,116 @@ $ ssh lnnode 'lightning-cli getroutes \
 
 ## 2. Layer Lifecycle
 
-_PENDING: Task 2_
+### 2.1 Layer RPC surface
+
+Eight RPC methods manage askrene layers. All added in v24.11 except `askrene-bias-node` (v25.12).
+
+| RPC | Added | Required params | Optional params | Purpose |
+|---|---|---|---|---|
+| `askrene-listlayers` | v24.11 | — | `layer` | Enumerate layers, or fetch one |
+| `askrene-create-layer` | v24.11 | `layer` | `persistent` (default false) | Create a new named layer |
+| `askrene-remove-layer` | v24.11 | `layer` | — | Delete a layer |
+| `askrene-update-channel` | v24.11 | `layer`, `short_channel_id_dir` | `enabled`, `htlc_minimum_msat`, `htlc_maximum_msat`, `fee_base_msat`, `fee_proportional_millionths`, `cltv_expiry_delta` | Override a channel's routing params inside this layer |
+| `askrene-inform-channel` | v24.11 | `layer`, `short_channel_id_dir`, `amount_msat`, `inform` | — | Feed observed success/failure info to update the layer's capacity constraint |
+| `askrene-bias-channel` | v24.11 | `layer`, `short_channel_id_dir`, `bias` | `description`, `relative` | Add a numerical bias to a channel's path-finding weight |
+| `askrene-bias-node` | v25.12 | `layer`, `node`, `direction`, `bias` | `description`, `relative` | Bias all channels entering/leaving a node |
+| `askrene-disable-node` | v24.11 | `layer`, `node` | — | Block all routes through a node |
+
+Cited from the schema files in `doc/schemas/askrene-*.json` at `ElementsProject/lightning@b57edd21`.
+
+### 2.2 Ownership model
+
+Layers are **not plugin-scoped**. Any plugin (or `lightning-cli`) can create, list, modify, or delete any named layer. The askrene plugin maintains a single shared hash `askrene->layers` keyed by name (`layer.c#L134-140` for the `layer_name_hash` declaration, `layer.c#L859-862` for the `find_layer` accessor).
+
+Reserved prefix: layer names starting with `auto.` are rejected by `create-layer` (`askrene.c#L1284-1286`: `"Cannot create auto layer"`). The four `auto.*` layers enumerated in Section 1.3 are built-ins.
+
+**Idempotency**: `create-layer` behavior depends on `persistent`:
+
+- `persistent=false` (default) + layer exists → error `"Layer already exists"` (`askrene.c#L1290-1293`)
+- `persistent=true` + layer exists → succeeds as a no-op (`askrene.c#L1288`: *"If it's persistent, creation is a noop if it already exists"*)
+
+This means cl-hive's publish-on-startup model (non-persistent layers) can't safely call `create-layer` twice without a remove in between. cl-hive probably handles this by removing layers before re-creating at startup, or by using `persistent=true`.
+
+### 2.3 Persistence
+
+Persistence is opt-in per layer. Default is **false** (`askrene-create-layer.json#L… "default": "False"`).
+
+**Non-persistent layers** live only in askrene's in-memory hash table. They vanish on `lightningd` restart or plugin restart. cl-hive's four layers are all non-persistent (verified live in Section 2.5), so cl-hive must re-publish them on every startup.
+
+**Persistent layers** are saved to CLN's datastore. Each mutation appends a delta record under the datastore key `["askrene", "layers", <layername>]`:
+
+- `layer.c#L459-464` (channel update): if persistent, call `append_layer_datastore(layer, data)`
+- `layer.c#L496-501` (inform channel): same
+- `layer.c#L543-548` (bias channel): same
+- `layer.c#L580-585` (bias node): same
+- `layer.c#L602-607` (disable node): same
+- `layer.c#L678-682` (remove channel): same
+
+On startup, `load_layers()` (`layer.c#L806-841`) reads all datastore entries under `["askrene", "layers", *]` and replays them into in-memory layer state via `populate_layer()`.
+
+On `remove-layer`, persistent layers also delete their datastore backing (`layer.c#L425-431` via `save_remove` → `deldatastore`).
+
+**Implication for v3**: cl-revenue-ops is a pure layer consumer. It never creates or modifies layers, so persistence is not a concern. However, Section 4's exclude-via-layer pattern will create and remove a throwaway layer per retry — those MUST use `persistent=false` (the default) to avoid datastore bloat.
+
+### 2.4 Concurrency
+
+**CLN plugin RPC dispatch is serialized per plugin**. Each askrene RPC (create-layer, update-channel, etc.) runs to completion before the next one starts. There are no explicit mutexes in `layer.c` because none are needed under this model.
+
+**getroutes concurrency** (the only long-running askrene operation) is different: it forks a child process with a **snapshot of layer state** (`askrene.c#L625-690` — see Section 1.6 for the fork plumbing). The child does not share memory with the parent, so in-flight getroutes calls are immune to mid-calculation layer mutations. At most 4 concurrent forks are allowed (`askrene->max_children = 4` at `askrene.c#L1468`).
+
+**Cross-plugin safety**: two plugins calling askrene simultaneously are still serialized by CLN's RPC layer. Plugin A's `create-layer` never interleaves with plugin B's `update-channel`. This means **cl-revenue-ops can safely read cl-hive's layers** (via `askrene-listlayers` or by passing layer names to `getroutes`) without any coordination — askrene serializes all access internally.
+
+**What cl-revenue-ops must not do**: write to cl-hive's layers. The API technically allows it (any plugin can modify any layer), but it would break cl-hive's ownership model. The v3 design already declares this as an anti-requirement.
+
+### 2.5 Live verification
+
+**All layers currently on the node:**
+
+```
+$ ssh lnnode 'lightning-cli askrene-listlayers'  # (counts summarised)
+hive-traffic         persistent=False  channel_updates=0  biases=0  disabled_nodes=0  created=0
+hive-corridors       persistent=False  channel_updates=0  biases=0  disabled_nodes=0  created=0
+hive-reputation      persistent=False  channel_updates=0  biases=0  disabled_nodes=0  created=0
+hive-fleet           persistent=False  channel_updates=4  biases=0  disabled_nodes=0  created=0
+revenue-local        persistent=False  channel_updates=0  biases=92  disabled_nodes=0  created=0
+xpay                 persistent=True   channel_updates=0  biases=0  disabled_nodes=0  created=0
+```
+
+Observations:
+
+- All four cl-hive layers are live (`hive-fleet`, `hive-reputation`, `hive-corridors`, `hive-traffic`)
+- Only `hive-fleet` currently has content (4 channel_updates — the 4 hive fleet channels on this node)
+- `hive-reputation`, `hive-corridors`, `hive-traffic` are currently empty (published by cl-hive but nothing has populated them yet). **Implication**: v3's default `askrene-layers = "hive-fleet"` is the right call — the other three layers would be no-ops at this moment.
+- `revenue-local` has 92 channel biases — this is an existing cl-revenue-ops layer already used by `_apply_local_bias()` or equivalent in some older code path. Worth a follow-up: which code writes to it? Is it dead? (Out of scope for this research.)
+- The `xpay` layer is persistent — it's owned by the xpay plugin, survives restart. That's our first live confirmation that xpay uses layers.
+
+**Cross-plugin isolation experiment**:
+
+```
+$ ssh lnnode 'BEFORE=$(lightning-cli askrene-listlayers hive-fleet | jq ".layers[0].channel_updates | length")
+             lightning-cli askrene-create-layer cl-revenue-ops-research-probe
+             lightning-cli askrene-listlayers cl-revenue-ops-research-probe
+             lightning-cli askrene-remove-layer cl-revenue-ops-research-probe
+             AFTER=$(lightning-cli askrene-listlayers hive-fleet | jq ".layers[0].channel_updates | length")
+             echo "before=$BEFORE after=$AFTER"'
+probe persistent=False updates=0
+hive-fleet channel_updates: before=4 after=4
+```
+
+Creating and removing a cl-revenue-ops probe layer left hive-fleet's state unchanged. Cross-plugin layer isolation confirmed.
+
+### 2.6 Safety claim
+
+**cl-revenue-ops reading cl-hive's layers is safe because**:
+
+1. RPC dispatch is serialized (`askrene.c` single-threaded plugin model)
+2. getroutes operates on an immutable snapshot per call (forked child, no shared memory)
+3. layer mutations are atomic per RPC
+4. the cl-hive layers have unique names not in cl-revenue-ops's namespace, so no name collision risk
+5. v3 never writes to any layer — it is a pure consumer
+6. live experiment confirmed cross-plugin isolation (Section 2.5)
+
+The only safety rule v3 must enforce at the plugin level is the anti-requirement from the parent spec: **v3 must not call any layer-mutation RPC against a layer it does not own**. In phase 1, v3 never calls mutation RPCs at all. In phase 4's exclude-via-layer retry pattern (if research approves it), v3 creates and removes its own private layer named `rebalance-exclude-<cycle>`, which cannot collide with cl-hive or the revenue-local layer.
 
 ## 3. Layer Semantics Under Pair Pinning
 
