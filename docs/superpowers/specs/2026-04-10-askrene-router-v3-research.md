@@ -1019,4 +1019,180 @@ The failure-mode taxonomy is small and tractable. **Five new skip reasons** to a
 
 ## 9. Decision Records
 
-_PENDING: Task 9 (partial — decisions that depend on deferred live-node data will be marked "pending experiment")_
+### 9.1 xpay integration depth
+
+**Decision:** **(d) Reject xpay entirely.** v3 is router-only; v2 executor stays permanent.
+
+**Evidence:** Section 5.9 — `xpay.c#L1410-1413` explicitly short-circuits self-pay via `do_inject()` (injectpaymentonion), bypassing the network. Live test on node 0382d558 with a 1000-msat self-invoice confirmed: `amount_sent_msat == amount_msat == 1000` (zero fee), one "successful part", and the CLN log shows `Resolved invoice ... in 1 htlcs` with no forwarding activity.
+
+**Rationale:** Circular rebalancing *requires* sats to actually flow through intermediate peers and pay forwarding fees. xpay's self-pay shortcut does not move any liquidity — it's an in-memory bookkeeping operation. There is no caller-side flag to force xpay to route a self-pay. Therefore xpay cannot be the executor for circular rebalances, and the parent spec's Phase 2 is closed with "researched, rejected" as an acceptable outcome.
+
+**Consequence:** v3's deliverable is `rebalance_router_v3.py` alone. The `rebalance-executor` config key is removed from the parent spec. `rebalance_executor_v2.py` remains the sole execution path for both v2 and v3 routers. The two-phase plan (phase 1 = router, phase 2 = executor) collapses into a single-phase deliverable, which simplifies scope.
+
+### 9.2 Exclude handling strategy
+
+**Decision:** **Throwaway-layer pattern.** V3 creates a `rebalance-exclude-<cycle_id>` layer per retry attempt, populates it with `askrene-update-channel enabled=false` for each failed channel, passes the layer name to `getroutes` alongside `hive-fleet`, and removes the layer on cycle completion.
+
+**Evidence:** Section 4 — live benchmark on the 63-peer / 46-active-channel live node measured median 3.3ms for empty create+remove, 12.1ms for create + 5 channel disables + remove (via `lightning-cli` subprocess). In-process RPC will be ~30–60% faster. Well under the 50ms-per-cycle threshold from the parent spec with ~4× headroom.
+
+**Rationale:** The throwaway-layer pattern is atomic, askrene-idiomatic, and comfortably performant. The alternative (v3-internal exclude translation) would duplicate gossip knowledge in the plugin and achieve no measurable win. Layer create/remove latency is the only cost, and it's far below budget.
+
+**Implementation notes:**
+- Layer name format: `rebalance-exclude-{cycle_id}` where `cycle_id` is a monotonic counter or timestamp
+- `persistent=false` (the default) — these layers must be ephemeral to avoid datastore bloat
+- Wrap in a Python context manager to guarantee cleanup on exception paths
+- At plugin init, sweep any orphan `rebalance-exclude-*` layers from a previous crashed cycle
+
+### 9.3 Default layer set
+
+**Decision:** **`askrene-layers = "hive-fleet"`** remains the default, unchanged from the parent spec.
+
+**Evidence:** Section 3 — Experiment A proved the hive-fleet layer is respected by askrene under pair pinning (10 msat fee reduction + 28 block cltv reduction when the path traverses a fleet channel). Section 2.5 live-node snapshot showed that `hive-fleet` is the only cl-hive layer with active content (4 channel overrides). The other three cl-hive layers (`hive-reputation`, `hive-corridors`, `hive-traffic`) are currently empty on the live node and would be no-ops even if configured.
+
+**Rationale:** Configuring only the layer that has actual content avoids processing overhead for no-op layers and keeps the default config matching observed reality. Operators on nodes with populated reputation/corridor/traffic layers can opt into them via the config key (`askrene-layers = "hive-fleet,hive-reputation,hive-corridors,hive-traffic"`).
+
+**Implementation note:** v3's init-time layer probe should log which of the requested layers were actually found. If an operator sets `hive-reputation` but the layer isn't published, the probe surfaces that clearly rather than silently ignoring it.
+
+### 9.4 Runtime switch mechanism
+
+**Decision:** **Pattern B — `on_change` callback with validation** (Section 7.4).
+
+**Evidence:** Section 7.3 — `plugin.py#L1042-1050` in pyln-client confirms `setconfig` dispatches to the option's `on_change` callback synchronously, and `plugin.py#L447-474` confirms the `add_option(dynamic=True, on_change=...)` API exists. Section 7.2 — live test on `revenue-ops-boltz-enforce-budget` confirmed `lightning-cli -k setconfig config=... val=... transient=true` works correctly, the change is immediate, and the plugin log records each transition.
+
+**Rationale:** Pattern B (callback) gives the validation-at-call-time behavior the design spec requires: an operator trying to set `rebalance-router=v3` on a non-askrene node will see a clear error message, not a silent acceptance that later produces runtime failures. The callback also emits an operator-visible log line confirming the switch took effect and will apply on the next cycle.
+
+**Implementation**:
+
+```python
+def _on_router_change(plugin, option_name, new_value):
+    if new_value not in ("v2", "v3"):
+        raise ValueError(f"rebalance-router must be 'v2' or 'v3', got {new_value!r}")
+    eng = getattr(rebalancer, "rebalance_engine_v2", None)
+    if eng is None:
+        raise ValueError("rebalance engine not initialized; cannot change router")
+    if new_value == "v3" and eng.router_v3 is None:
+        raise ValueError("askrene unavailable on this node; cannot switch to v3")
+    plugin.log(
+        f"rebalance-router switched to {new_value} (takes effect at next cycle boundary)",
+        level="info",
+    )
+
+plugin.add_option(
+    "rebalance-router",
+    default="v2",
+    description="Rebalance route discovery strategy: v2 (getroute) or v3 (askrene getroutes + layers)",
+    opt_type="string",
+    dynamic=True,
+    on_change=_on_router_change,
+)
+```
+
+The engine still captures the active router at the start of each cycle (per-cycle atomicity from the design spec), reading `self.plugin.options["rebalance-router"].value` inside `_active_router()`.
+
+**CLI invocation for operators:**
+
+```
+lightning-cli -k setconfig config=rebalance-router val=v3 transient=true   # A/B test
+lightning-cli -k setconfig config=rebalance-router val=v3                    # persist to config.setconfig
+```
+
+Document the `-k` keyword mode explicitly — positional-arg mode fails on the `transient` parameter.
+
+### 9.5 Phase 1 go/no-go
+
+**Decision:** **GO**, with the design deltas listed below.
+
+**Rationale:** Every research task returned a usable answer. The design's core approach — v3 router uses getroutes + layers, v2 router stays as fallback, runtime switch via setconfig, exclude-via-layer for retries — is confirmed viable by live experiments. The only surprise was the xpay rejection, which actually *simplifies* Phase 1 (eliminates the Phase 2 scope and the 2×2 executor matrix).
+
+### 9.6 Design deltas from the parent spec
+
+The following changes to `docs/superpowers/specs/2026-04-10-askrene-router-v3-design.md` must be incorporated into the Phase 1 implementation plan. None of these invalidate the core architecture; they are refinements discovered by research.
+
+**Delta 1: Phase 2 closed.** The parent spec's "Phase 2 — xpay executor (conditional)" section becomes "Phase 2 — closed, xpay rejected." `rebalance_executor_v3.py` is NOT built. The `rebalance-executor` config key is removed from the spec (only `rebalance-router` remains). See Section 9.1.
+
+**Delta 2: Pair-pinning path validation.** The parent spec assumed v3 could directly prepend/append first/last hops around a getroutes middle path. Section 3.4 showed askrene may return paths that (a) loop through our own node as an intermediate hop, or (b) bypass our node entirely. V3's `price_pair` must:
+- Validate that the returned path's first hop's `short_channel_id_dir` matches the requested `source_channel_id` (in the correct direction). If not, either reject the path or retry with a throwaway layer that disables `source_peer`'s other outgoing channels.
+- Validate that the returned path's last hop leads into `dest_peer` via the requested `dest_channel_id`.
+- Reject any path where an intermediate hop's `next_node_id` equals our own node id (a loop-through-us).
+
+If validation fails, emit skip reason `path_loops_through_us` or retry with the throwaway layer forcing the first hop.
+
+**Delta 3: getroutes path format translation.** The parent spec assumed `RouteResult.route` stays in sendpay format. Section 1.4 confirms `getroutes` returns a different hop shape (`short_channel_id_dir` instead of `channel`+`direction`, `next_node_id` instead of `id`). V3's router must translate each hop:
+
+```python
+def _translate_getroutes_hop_to_sendpay(hop: dict, final_cltv: int) -> dict:
+    scidd = hop["short_channel_id_dir"]  # "SCID/dir"
+    scid, direction = scidd.split("/")
+    return {
+        "id": hop["next_node_id"],
+        "channel": scid,
+        "direction": int(direction),
+        "amount_msat": hop["amount_msat"],
+        "delay": hop["delay"],
+    }
+```
+
+This is a per-hop trivial transformation. The v3 router applies it to every hop in the chosen route before returning the `RouteResult`.
+
+**Delta 4: Five new skip reasons.** Section 8.4 added `unknown_source_node`, `unknown_dest_node`, `unknown_layer`, `askrene_child_died`, `path_loops_through_us`. Add them to `rebalance_audit_v2.py`'s valid-reason set. The translation function `_translate_getroutes_error()` from Section 8.5 belongs in `rebalance_router_v3.py`.
+
+**Delta 5: CLN minimum version is v24.11, not v24.08.** Section 1.1 said `getroutes` was added in v24.08, but Section 2.1 showed the layer management RPCs (`askrene-create-layer`, `askrene-update-channel`, etc.) were added in v24.11. V3 uses both `getroutes` AND layer mutation (for exclude-via-layer), so the true minimum is **v24.11**. Update the design spec's "graceful degradation" matrix accordingly.
+
+**Delta 6: Runtime switch requires `-k` mode.** Section 7.2 showed `lightning-cli setconfig config val transient=true` (positional) fails on the `transient` parameter. Only `lightning-cli -k setconfig config=... val=... transient=true` works. Operator documentation must prescribe the `-k` mode explicitly.
+
+**Delta 7: Probe `askrene-listlayers` at init, not `help getroutes`.** The parent spec suggested probing for askrene via `plugin.rpc.help("getroutes")`. A cleaner probe is `plugin.rpc.call("askrene-listlayers")` — it exercises both the getroutes RPC availability AND the layer management surface in one call, and returns useful data (the list of found layers) that v3 can log immediately. This saves one RPC at init and produces a more informative startup log.
+
+**Delta 8: Orphan exclude-layer sweep at init.** Section 4.6 added this requirement. At plugin startup, call `askrene-listlayers`, iterate, and remove any layer matching `rebalance-exclude-*` (they indicate a previous crashed cycle left the layer behind). One-line safeguard, worth including.
+
+### 9.7 Phase 1 scope (as amended by deltas)
+
+**Scope additions from deltas:**
+- Path-shape validator in `rebalance_router_v3.py` (Delta 2)
+- Hop format translator in `rebalance_router_v3.py` (Delta 3)
+- Five new skip reasons in `rebalance_audit_v2.py` (Delta 4)
+- Askrene probe via `askrene-listlayers`, not `help getroutes` (Delta 7)
+- Orphan `rebalance-exclude-*` layer sweep at init (Delta 8)
+- `on_change` callback for `rebalance-router` config key in `cl-revenue-ops.py` (Delta 6 + 9.4)
+
+**Scope removals:**
+- `rebalance_executor_v3.py` (Delta 1)
+- `rebalance-executor` config key (Delta 1)
+- Phase 2 test matrix and A/B framework for executors (Delta 1)
+
+**Revised module layout**:
+
+```
+modules/
+├── rebalance_router_v2.py      # unchanged — fallback for CLN < v24.11
+├── rebalance_router_v3.py      # NEW — askrene getroutes + layers + hop translator + path validator
+├── rebalance_executor_v2.py    # unchanged — sole executor
+├── rebalance_engine_v2.py      # +router factory + runtime dispatch + init probe + orphan sweep
+├── rebalance_audit_v2.py       # +5 new skip reasons
+└── config.py                   # +rebalance-router and +askrene-layers config keys (only 2, not 4)
+```
+
+**Revised config keys:**
+
+| Key | Default | Purpose |
+|---|---|---|
+| `rebalance-router` | `"v2"` | `"v2"` or `"v3"`, runtime-switchable via setconfig |
+| `askrene-layers` | `"hive-fleet"` | CSV of layer names to pass to getroutes |
+
+(The original spec also proposed `askrene-probe-amounts` and `rebalance-executor`; both are removed.)
+
+### 9.8 Risk register
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Askrene solver finds no route that satisfies the path-shape validator for some pairs | Medium | Low | Retry with throwaway layer disabling source_peer's other channels (Delta 2 fallback). If still fails, emit `path_loops_through_us` skip reason and move on. |
+| cl-hive's layer content drift breaks v3's expectations | Low | Low | v3 is a pure consumer and treats layers as best-effort enrichment. Missing layers cause no errors; empty layers cause no-ops. |
+| CLN upgrade changes getroutes response shape | Low | Medium | Hop translator is isolated in `_translate_getroutes_hop_to_sendpay()`. A CLN schema change requires updating that function only. |
+| pyln-client changes `on_change` callback semantics | Low | Low | Both Pattern A (poll per cycle) and Pattern B (callback) remain valid; swap by removing `on_change=` from `add_option`. |
+| Operator sets `rebalance-router=v3` but `askrene-layers` is a typo | Medium | Low | Init-time probe logs found/missing layers (Section 2.5 + Delta 7). Operator sees the typo in plugin startup logs. |
+| v2 router's "pin source + pin dest + getroute middle" behavior subtly changes after v3 merge (regression) | Low | Medium | v2 router file is UNCHANGED by this work. Any regression is not caused by the v3 merge. |
+
+### 9.9 Next step
+
+Write the Phase 1 implementation plan at `docs/superpowers/plans/2026-04-10-askrene-router-v3-phase1.md`, incorporating all deltas from Section 9.6 and the revised scope from Section 9.7. The plan should follow TDD structure (one test + minimal impl + verify + commit per step) as per `superpowers:writing-plans`.
+
+This research doc is the input to that planning session. No further research is needed before Phase 1 implementation begins.
