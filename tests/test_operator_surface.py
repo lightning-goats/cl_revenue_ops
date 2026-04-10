@@ -283,6 +283,49 @@ def test_revenue_config_allows_public_resets():
     assert "removed" in result["message"]
 
 
+def test_revenue_config_no_args_returns_public_config_dict():
+    """Caller invokes ``lightning-cli revenue-config`` (or HTTP equivalent
+    with empty params) and gets the public config snapshot back instead of
+    a TypeError. Regression guard for the 22 traceback reports observed on
+    nexus-01 between Feb-Apr 2026 from rune_id 17 hitting the action-based
+    API with empty params."""
+    mod = _load_operator_surface_module()
+
+    result = mod.revenue_config(mod.plugin)
+
+    assert "config" in result
+    assert result["config"]["paused"] is True
+    assert result["config"]["daily_budget_sats"] == 1200
+
+
+def test_revenue_config_swallows_unknown_kwargs_from_wrapped_form_body():
+    """Some HTTP clients form-encode a JSON body and end up dispatching the
+    method with a single unrecognized key like
+    ``{'{"action":"get"}': ''}``. The handler must accept and ignore
+    extra keys rather than 500-ing on TypeError. Regression guard for the
+    same nexus-01 traceback class as the no-args case."""
+    mod = _load_operator_surface_module()
+
+    result = mod.revenue_config(
+        mod.plugin,
+        **{'{"action":"get"}': ""},
+    )
+
+    assert "config" in result
+
+
+def test_revenue_policy_no_args_returns_policy_list():
+    """``revenue-policy`` with no action defaults to listing all policies
+    rather than raising TypeError. Mirrors the revenue-config defaulting
+    so external monitoring callers don't pollute the log on probe."""
+    mod = _load_policy_surface_module()
+    mod.policy_manager.list_policies.return_value = []
+
+    result = mod.revenue_policy(mod.plugin)
+
+    assert "policies" in result or result.get("count", 0) == 0
+
+
 def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
     mod = load_plugin_module()
     mod.config = SimpleNamespace(

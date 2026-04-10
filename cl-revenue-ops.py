@@ -3088,7 +3088,7 @@ def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
 # =============================================================================
 
 @plugin.method("revenue-policy")
-def revenue_policy(plugin: Plugin, action: str, peer_id: str = None,
+def revenue_policy(plugin: Plugin, action: str = "list", peer_id: str = None,
                    strategy: str = None, rebalance: str = None,
                    fee_ppm: int = None, tag: str = None,
                    fee_multiplier_min: float = None,
@@ -3541,7 +3541,13 @@ def revenue_hot_channel_protection_peers(plugin: Plugin, action: str = "list", p
 
 
 @plugin.method("revenue-config")
-def revenue_config(plugin: Plugin, action: str, key: str = None, value: str = None) -> Dict[str, Any]:
+def revenue_config(
+    plugin: Plugin,
+    action: str = "get",
+    key: str = None,
+    value: str = None,
+    **_unused: Any,
+) -> Dict[str, Any]:
     """
     Get or set runtime configuration (Dynamic Runtime Configuration).
     
