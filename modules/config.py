@@ -142,6 +142,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'capex_bootstrap_bps': int,
     'capex_bootstrap_max_sats': int,
     'capex_grace_days': int,
+    'capex_probability_budget_bonus': float,
     'capex_exploration_rate': float,
     'capex_tactical_rate': float,
     'capex_global_envelope_sats': int,
@@ -236,6 +237,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'capex_grace_days': (0, 90),
     'capex_exploration_rate': (0.0, 1.0),
     'capex_tactical_rate': (0.0, 1.0),
+    'capex_probability_budget_bonus': (0.0, 1.0),
     'capex_global_envelope_sats': (0, 100_000_000),
 }
 
@@ -414,6 +416,11 @@ class Config:
     capex_global_envelope_sats: int = 0         # Global cap (0 = auto-computed)
     capex_cost_efficiency_weight: float = 0.5   # Weight for cost-efficiency in dual-benefit score
     capex_drain_benefit_weight: float = 0.5     # Weight for drain-benefit in dual-benefit score
+    # Probability-aware budget relaxation. When a router reports a route
+    # probability (v3/askrene does; v2/getroute returns 0), the engine allows
+    # the route to exceed the raw pair budget by up to (probability * bonus)
+    # fraction. Default 0.0 = disabled, preserving v2 behavior exactly.
+    capex_probability_budget_bonus: float = 0.0
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -790,6 +797,7 @@ class ConfigSnapshot:
     capex_global_envelope_sats: int = 0
     capex_cost_efficiency_weight: float = 0.5
     capex_drain_benefit_weight: float = 0.5
+    capex_probability_budget_bonus: float = 0.0
     # Version tracking
     version: int = 0
     
