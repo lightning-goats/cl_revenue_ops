@@ -21,7 +21,6 @@ Note: JobManager has been stripped of all sling-based code and retains only
 
 import math
 import time
-import json
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
@@ -33,7 +32,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ConfigSnapshot
 from .database import Database
 from .rebalance_state_v2 import build_state_snapshot as build_state_snapshot_v2
-from .policy_manager import PolicyManager, RebalanceMode, FeeStrategy
+from .policy_manager import PolicyManager
 from .rebalance_executor import RebalanceExecutor
 from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
