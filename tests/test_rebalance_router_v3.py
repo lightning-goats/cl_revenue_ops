@@ -480,11 +480,11 @@ def test_price_pair_defaults_probability_ppm_zero_when_askrene_omits_it():
 # ---------------------------------------------------------------------------
 
 
-def test_exclude_layer_creates_and_removes():
+def test_exclude_layer_creates_and_removes_bare_scids():
+    """Legacy input path: bare SCIDs expand to (0, 1) directional entries."""
     plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
     r = _make_v3_router(plugin)
 
-    # Snapshot call count before the context (ignores the listlayers probe)
     initial_calls = [
         c for c in plugin.rpc.call.call_args_list
         if c.args and c.args[0] in ("askrene-create-layer", "askrene-update-channel", "askrene-remove-layer")
@@ -505,12 +505,50 @@ def test_exclude_layer_creates_and_removes():
         assert len(create_calls) == 1
         # 2 scids x 2 directions = 4 update-channel calls
         assert len(update_calls) == 4
+        # Each update-channel call uses f"{scid}/{direction}"
+        scid_dirs = {c.args[1]["short_channel_id_dir"] for c in update_calls}
+        assert scid_dirs == {"100x1x0/0", "100x1x0/1", "200x2x0/0", "200x2x0/1"}
 
     remove_calls = [
         c for c in plugin.rpc.call.call_args_list
         if c.args and c.args[0] == "askrene-remove-layer"
     ]
     assert len(remove_calls) == 1
+
+
+def test_exclude_layer_passes_directional_form_through_unchanged():
+    """New input path: executor-emitted 'scid/dir' entries disable exactly
+    that direction, not both. Avoids producing invalid 'scid/dir/dir'
+    duplicates (regression guard for PR #82's executor change)."""
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    r = _make_v3_router(plugin)
+
+    with r._exclude_layer(["934667x311x8/0", "222x2x2/1"]) as layer_name:
+        assert layer_name is not None
+        update_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c.args and c.args[0] == "askrene-update-channel"
+        ]
+        # 2 entries x 1 direction each = 2 update calls
+        assert len(update_calls) == 2
+        scid_dirs = {c.args[1]["short_channel_id_dir"] for c in update_calls}
+        assert scid_dirs == {"934667x311x8/0", "222x2x2/1"}
+
+
+def test_exclude_layer_mixed_bare_and_directional():
+    """Bare and directional entries can coexist in the same call."""
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    r = _make_v3_router(plugin)
+
+    with r._exclude_layer(["100x1x0", "934667x311x8/0"]) as layer_name:
+        update_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c.args and c.args[0] == "askrene-update-channel"
+        ]
+        # Bare scid → 2 calls (both directions), directional → 1 call
+        assert len(update_calls) == 3
+        scid_dirs = {c.args[1]["short_channel_id_dir"] for c in update_calls}
+        assert scid_dirs == {"100x1x0/0", "100x1x0/1", "934667x311x8/0"}
 
 
 def test_exclude_layer_removes_on_exception():

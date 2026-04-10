@@ -382,16 +382,32 @@ class RebalanceRouterV3:
 
         try:
             self.plugin.rpc.call("askrene-create-layer", {"layer": layer_name})
-            for scid in failed_channel_ids:
-                for direction in (0, 1):
+            for entry in failed_channel_ids:
+                # rebalance_executor_v2 reports exclude entries in directional
+                # form 'scid/dir' (PR #82) so getroute and askrene both accept
+                # them directly. Detect the suffix and disable only that
+                # specific direction. Fall back to disabling both directions
+                # when a bare SCID is passed (legacy callers or diagnostic
+                # entries without direction info).
+                if "/" in entry:
                     self.plugin.rpc.call(
                         "askrene-update-channel",
                         {
                             "layer": layer_name,
-                            "short_channel_id_dir": f"{scid}/{direction}",
+                            "short_channel_id_dir": entry,
                             "enabled": False,
                         },
                     )
+                else:
+                    for direction in (0, 1):
+                        self.plugin.rpc.call(
+                            "askrene-update-channel",
+                            {
+                                "layer": layer_name,
+                                "short_channel_id_dir": f"{entry}/{direction}",
+                                "enabled": False,
+                            },
+                        )
             yield layer_name
         finally:
             try:
