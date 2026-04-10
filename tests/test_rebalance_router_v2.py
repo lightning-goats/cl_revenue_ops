@@ -29,10 +29,15 @@ def _make_plugin(
     """
     plugin = MagicMock()
 
-    def _listpeerchannels(**kwargs):
+    def _listpeerchannels(peer_id=None, short_channel_id=None):
+        """Matches pyln.client.LightningRpc.listpeerchannels signature.
+
+        Regression guard: if router code passes ``id=`` instead of
+        ``peer_id=`` (as the real pyln-client expects), this mock raises
+        TypeError just like the real RPC layer would on the live node.
+        """
         if listpeerchannels_error:
             raise listpeerchannels_error
-        peer_id = kwargs.get("id")
         if peer_channels_by_id and peer_id in peer_channels_by_id:
             return peer_channels_by_id[peer_id]
         return {"channels": []}
@@ -83,7 +88,7 @@ def _source_peer_channels(fee_ppm=0, cltv=18):
 
 class TestFinalHopFeeFromListpeerchannels:
     def test_router_gets_actual_final_hop_fee_from_listpeerchannels(self):
-        """Uses listpeerchannels(id=dest_peer_id) for fee lookup."""
+        """Uses listpeerchannels(peer_id=dest_peer_id) for fee lookup."""
         middle_route = [{
             "id": DEST_PEER,
             "channel": "300x1x0",
@@ -105,11 +110,42 @@ class TestFinalHopFeeFromListpeerchannels:
 
         assert result.success is True
         assert result.final_hop_fee_ppm == 275
-        # listpeerchannels called with id= filter (not unfiltered)
+        # listpeerchannels called with peer_id= filter (not unfiltered).
+        # Regression guard: pyln.client.LightningRpc.listpeerchannels
+        # accepts peer_id=, not id=. See the _make_plugin helper for the
+        # enforced signature.
         calls = plugin.rpc.listpeerchannels.call_args_list
-        dest_call = [c for c in calls if c.kwargs.get("id") == DEST_PEER]
+        dest_call = [c for c in calls if c.kwargs.get("peer_id") == DEST_PEER]
         assert len(dest_call) >= 1
         plugin.rpc.listchannels.assert_not_called()
+
+    def test_router_does_not_call_listpeerchannels_with_legacy_id_kwarg(self):
+        """Regression test: earlier versions passed id= which raised
+        TypeError on pyln.client.LightningRpc.listpeerchannels. Live nexus-01
+        surfaced the bug silently because the listchannels fallback caught it."""
+        plugin = _make_plugin(
+            peer_channels_by_id={
+                DEST_PEER: _dest_peer_channels(fee_ppm=275),
+                SOURCE_PEER: _source_peer_channels(),
+            },
+            getroute={"route": [{
+                "id": DEST_PEER,
+                "channel": "300x1x0",
+                "amount_msat": 50_014_000,
+                "delay": 40,
+            }]},
+        )
+        router = RebalanceRouter(plugin, OUR_ID)
+        router.price_pair(
+            SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
+        )
+
+        # Every listpeerchannels call must use the real pyln-client keyword
+        # (peer_id=), never the buggy id=.
+        for c in plugin.rpc.listpeerchannels.call_args_list:
+            assert "id" not in c.kwargs, (
+                f"listpeerchannels called with legacy id= kwarg: {c.kwargs}"
+            )
 
 
 class TestFallbackToListchannels:
