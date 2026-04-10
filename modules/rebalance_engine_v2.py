@@ -333,7 +333,18 @@ class RebalanceEngine:
         pair: PairCandidate,
         executor: RebalanceExecutor,
     ) -> Optional[ExecutionResult]:
-        """Execute a single pair in a worker thread."""
+        """Execute a single pair in a worker thread.
+
+        On retriable failure with an erring channel, re-prices the pair
+        with the failing channel excluded and attempts one retry. Covers
+        the common stale-gossip WIRE_FEE_INSUFFICIENT case where the
+        first attempt picks an intermediate whose real fee is higher
+        than gossip shows — the retry picks a different path that
+        bypasses the failing hop.
+
+        Only one retry per call, by design: unbounded retry would cascade
+        exclude layers and waste budget on repeatedly-failing topology.
+        """
         if not pair.route:
             self._log(
                 f"No route stored for {pair.source_channel_id}->"
@@ -356,8 +367,99 @@ class RebalanceEngine:
                 f"{pair.source_channel_id}->{pair.dest_channel_id} "
                 f"fee={exec_result.fee_sats} sats"
             )
+            return exec_result
 
+        # Retry on retriable failures that identified a specific bad hop.
+        # Permanent failures (channel disabled, unknown peer) can't be
+        # usefully retried with an exclude — the pair is dead for this cycle.
+        if not self._should_retry_with_exclude(exec_result):
+            return exec_result
+
+        retry_result = self._attempt_retry_with_exclude(pair, executor, exec_result)
+        if retry_result is not None:
+            return retry_result
         return exec_result
+
+    @staticmethod
+    def _should_retry_with_exclude(exec_result: "ExecutionResult") -> bool:
+        """Return True iff the executor failure is retriable AND it identified
+        at least one excluded channel we can try to route around."""
+        error = exec_result.error or ""
+        if "retriable_failure" not in error:
+            return False
+        return bool(exec_result.excluded_channels)
+
+    def _attempt_retry_with_exclude(
+        self,
+        pair: PairCandidate,
+        executor: RebalanceExecutor,
+        original_failure: "ExecutionResult",
+    ) -> Optional["ExecutionResult"]:
+        """Re-price the pair with the failing channel excluded, execute once.
+
+        Returns the retry ExecutionResult on actual retry (success or fail),
+        or None if the retry was abandoned (no route / over budget / no
+        router available). Caller treats None as "stick with original_failure".
+        """
+        router = getattr(self, "_cycle_router", None)
+        if router is None:
+            return None
+
+        self._log(
+            f"Retrying {pair.source_channel_id}->{pair.dest_channel_id} with "
+            f"exclude={original_failure.excluded_channels}",
+            level="info",
+        )
+        try:
+            new_route = router.price_pair(
+                source_channel_id=pair.source_channel_id,
+                dest_channel_id=pair.dest_channel_id,
+                source_peer_id=pair.source_peer_id,
+                dest_peer_id=pair.dest_peer_id,
+                amount_sats=pair.amount_sats,
+                exclude=list(original_failure.excluded_channels),
+            )
+        except Exception as e:
+            self._log(
+                f"Retry re-price raised {type(e).__name__}: {e}", level="warn"
+            )
+            return None
+
+        if not new_route.success:
+            self._log(
+                f"Retry re-price returned no route: {new_route.error}",
+                level="info",
+            )
+            return None
+
+        effective_budget = self._probability_adjusted_budget(
+            pair.pair_budget_sats,
+            getattr(new_route, "probability_ppm", 0),
+        )
+        if new_route.route_cost_sats > effective_budget:
+            self._log(
+                f"Retry re-price over budget: route_cost={new_route.route_cost_sats} "
+                f"effective_budget={effective_budget}",
+                level="info",
+            )
+            return None
+
+        pair.route = new_route.route
+        pair.route_cost_sats = new_route.route_cost_sats
+
+        retry_result = executor.execute(
+            route=pair.route,
+            amount_sats=pair.amount_sats,
+            source_channel_id=pair.source_channel_id,
+            dest_channel_id=pair.dest_channel_id,
+            max_fee_sats=pair.pair_budget_sats,
+        )
+        if retry_result.success:
+            self._log(
+                f"Retry succeeded: {pair.source_channel_id}->"
+                f"{pair.dest_channel_id} fee={retry_result.fee_sats} sats"
+            )
+        return retry_result
 
     def run_cycle(self) -> CycleResult:
         """Live execution: find candidates (already priced), execute concurrently.
