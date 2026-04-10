@@ -1,22 +1,14 @@
 """
 EV-Based Rebalancer module for cl-revenue-ops
 
-MODULE 3: EV-Based Rebalancing (Profit-Aware with Opportunity Cost)
+Automatic rebalance cycles delegate to RebalanceEngineV2 via
+find_rebalance_candidates(). Manual rebalance RPCs (manual_rebalance,
+execute_rebalance) still run through the in-module RebalanceExecutor
+path until a follow-up spec ports them to v2.
 
-This module implements Expected Value (EV) based rebalancing decisions.
-This module only triggers rebalances when the math shows positive expected profit.
-
-Architecture Pattern: "Strategist and Executor"
-- STRATEGIST (EVRebalancer): Calculates EV, determines IF and HOW MUCH to rebalance
-- EXECUTOR (RebalanceExecutor): Executes native safe single-path circular payments
-
-Async Job Queue
-- Decouples decision-making from execution
-- Allows concurrent rebalancing attempts
-
-Note: JobManager has been stripped of all sling-based code and retains only
-      source-failure tracking, AskRene constraint caching, and stub APIs
-      referenced by diagnostic RPCs.
+JobManager is a stripped stub that retains only source-failure tracking
+(used by the v1 manual paths) and no-op properties referenced by
+diagnostic RPCs and cl-revenue-ops.py.
 """
 
 import math
@@ -205,13 +197,10 @@ class RebalanceCandidate:
 
 
 class JobManager:
-    """
-    Stripped-down job manager — sling-based rebalancing removed.
+    """Stripped stub retaining only live surface.
 
-    All rebalancing is handled by RebalanceExecutor. This class retains:
-    - Source failure tracking (used by EVRebalancer for failure-informed routing)
-    - AskRene constraint cache (used by EVRebalancer for liquidity-aware sizing)
-    - Stub properties referenced by diagnostic RPCs and cl-revenue-ops.py
+    - Source failure tracking used by the v1 manual rebalance paths.
+    - No-op properties referenced by diagnostic RPCs and cl-revenue-ops.py.
     """
 
     def __init__(self, plugin: Plugin, config: Config, database: Database):
@@ -219,17 +208,10 @@ class JobManager:
         self.config = config
         self.database = database
 
-        # Source reliability tracking (used by EVRebalancer for failure-informed routing)
         self.source_failure_counts: Dict[str, float] = {}
         self._source_failures_lock = threading.Lock()
 
-
-        # HiveRouter for askrene job reservations (injected by EVRebalancer)
         self.hive_router = None
-
-    # ---- SCID helpers (used by EVRebalancer for AskRene lookups) ----
-
-
 
     # ---- Stubs for callers that still reference sling-era APIs ----
 
