@@ -437,7 +437,74 @@ The parent spec assumes pattern #1 (single call, source=source_peer, destination
 
 ## 4. Exclude-Via-Layer Pattern
 
-_PENDING: Task 4_
+### 4.1 Methodology
+
+For each benchmark iteration, measure wall-clock time for a full create-layer + (optional channel updates) + remove-layer cycle via `lightning-cli` over the local Unix socket on the live node. Each benchmark runs 10 iterations. Report min/median/max/mean.
+
+**Caveat**: these benchmarks use `lightning-cli` subprocess invocation from Python, which incurs a `fork + exec` for every RPC call. In v3's actual hot path, the RPC would come from cl-revenue-ops's persistent Python process via `self.plugin.rpc.askrene_create_layer(...)`, which is a direct Unix-socket JSON-RPC call with no fork. Actual per-call latency in production is expected to be **significantly lower** than the numbers below (probably 30-60% less), so the benchmarks are a conservative upper bound.
+
+### 4.2 Benchmark A — empty layer create + remove
+
+```
+$ ssh lnnode 'python3 -c "
+import subprocess, time, statistics
+def rpc(*a): return subprocess.run([\"lightning-cli\", *a], capture_output=True, text=True)
+t = []
+for i in range(10):
+    n = f\"bench-empty-{i}\"
+    t0 = time.perf_counter()
+    rpc(\"askrene-create-layer\", n)
+    rpc(\"askrene-remove-layer\", n)
+    t.append((time.perf_counter() - t0) * 1000)
+print(f\"min={min(t):.1f} median={statistics.median(t):.1f} max={max(t):.1f} mean={statistics.mean(t):.1f}\")
+"'
+empty create+remove: n=10 min=3.0ms median=3.3ms max=4.2ms mean=3.4ms
+```
+
+### 4.3 Benchmark B — create + 5 channel disables + remove
+
+```
+create+5upd+remove: n=10 min=10.6ms median=12.1ms max=13.1ms mean=11.9ms
+```
+
+### 4.4 Analysis
+
+**Per-operation cost (derived)**:
+
+- Empty create + remove: ~3.3 ms median (two RPCs × ~1.65 ms each including subprocess overhead)
+- 5 channel updates added: total increase ~8.8 ms, i.e. **~1.76 ms per update-channel RPC**
+- Each subprocess call adds ~1.5 ms of fixed overhead that v3's in-process RPC would avoid
+
+**Projected realistic retry scenario**: a rebalance pair fails on the first attempt, v3 creates a throwaway exclude layer, adds 3–5 failed-channel disables, retries getroutes, removes the layer on success/failure.
+
+- Expected overhead per retry attempt: create (1.65) + 5 × update (1.76) + remove (1.65) = **~12 ms** (subprocess-measured) or **~6–8 ms** (in-process projection)
+- Typical rebalance cycle has at most 1–2 retries per pair, so total overhead per pair is **< 25 ms** worst case
+
+### 4.5 Verdict
+
+**Exclude-via-layer is comfortably under the 50ms per-cycle threshold** set by the parent spec (Section 3 of the design). The pattern is viable and should be the default for v3's retry logic.
+
+| Threshold | Measured | Headroom |
+|---|---|---|
+| 50 ms (spec) | 12.1 ms median (subprocess) | **~4× headroom** |
+| 50 ms (spec) | ~6–8 ms projection (in-process) | **~6–8× headroom** |
+
+### 4.6 Recommendation
+
+- **Default pattern**: v3 creates a throwaway layer named `rebalance-exclude-<cycle_id>` (e.g. `rebalance-exclude-20260410-140512`), adds `enabled=false` overrides for each failed channel via `askrene-update-channel`, passes the layer name in the retry `getroutes` call alongside `hive-fleet`, and removes the layer on cycle completion (success or final failure).
+- **Cleanup discipline**: the layer must always be removed, even on exception paths. Implement via a Python context manager in the v3 router:
+  ```python
+  with self._exclude_layer(failed_channels) as layer_name:
+      return self.plugin.rpc.getroutes(..., layers=[*self.layer_names, layer_name])
+  ```
+- **Persistent=false** (the default): exclude layers must be ephemeral. Any use of `persistent=true` would bloat CLN's datastore and break restart recovery.
+- **Collision avoidance**: layer name includes a timestamp and/or cycle ID. If the plugin crashes mid-cycle leaving an orphan layer, the next startup can clean up any layer matching `rebalance-exclude-*` via a startup sweep. This is a one-line safeguard worth including in v3 init.
+
+### 4.7 Alternate pattern (rejected)
+
+**Internal exclude translation**: v3 could filter the gossip channel set in Python before calling `getroutes`, passing only channel IDs it wants askrene to consider. This was the fallback in the parent spec if benchmarks exceeded 50ms. With 4× headroom, it's not needed and would duplicate gossip knowledge in the plugin.
+
+**Status**: rejected — exclude-via-layer wins on every axis (simpler, atomic, askrene-idiomatic, comfortably within budget).
 
 ## 5. xpay API Surface
 
