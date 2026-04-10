@@ -1515,23 +1515,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         if profitability_analyzer is not None:
             hive_router.profitability_analyzer = profitability_analyzer
 
-    # RebalanceExecutor: native getroutes+sendpay rebalance engine
-    from modules.rebalance_executor import RebalanceExecutor
-    rebalance_executor = RebalanceExecutor(
-        plugin=safe_plugin,
-        config=config,
-        database=database,
-        hive_router=hive_router,
-    )
-    rebalance_executor.data_service = data_service
+    # Rebalance engine: unified actual-fee pipeline
+    from modules.rebalance_engine_v2 import RebalanceEngine
     if rebalancer is not None:
-        rebalancer.rebalance_executor = rebalance_executor
-        rebalancer.data_service = data_service
-    plugin.log("RebalanceExecutor initialized - native rebalance engine enabled")
-
-    # RebalanceEngine: unified actual-fee rebalance pipeline (behind feature flag)
-    if getattr(config, 'rebalance_engine', 'v1') == 'v2' and rebalancer is not None:
-        from modules.rebalance_engine_v2 import RebalanceEngine
         rebalancer.rebalance_engine_v2 = RebalanceEngine(
             plugin=safe_plugin,
             config=config,
@@ -1540,7 +1526,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             profitability=profitability_analyzer,
             hive_hints=hive_hints,
         )
-        plugin.log("RebalanceEngine initialized - v2 rebalance pipeline enabled")
+        rebalancer.data_service = data_service
+        plugin.log("RebalanceEngine initialized")
 
     if fee_controller is not None:
         fee_controller.data_service = data_service
