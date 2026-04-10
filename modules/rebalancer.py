@@ -33,16 +33,6 @@ if TYPE_CHECKING:
     from .capex_budget import CapexBudgetEngine
 
 
-class JobStatus(Enum):
-    """Status of a background rebalance job (legacy: sling; current: RebalanceExecutor)."""
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCESS = "success"
-    FAILED = "failed"
-    TIMEOUT = "timeout"
-    STOPPED = "stopped"
-
-
 # =============================================================================
 # REASON CODES FOR EXPLAINABILITY
 # =============================================================================
@@ -189,13 +179,6 @@ class RebalanceCandidate:
         }
 
 
-
-# ActiveJob dataclass removed — sling-based rebalancing deleted.
-# All rebalancing is handled by RebalanceExecutor.
-
-
-
-
 class JobManager:
     """Stripped stub retaining only live surface.
 
@@ -213,46 +196,31 @@ class JobManager:
 
         self.hive_router = None
 
-    # ---- Stubs for callers that still reference sling-era APIs ----
-
     @property
     def active_job_count(self) -> int:
-        """Legacy stub -- sling removed. Always 0."""
         return 0
 
     @property
     def active_channels(self) -> list:
-        """Legacy stub -- sling removed. Always empty."""
         return []
 
     def has_active_job(self, channel_id: str) -> bool:
-        """Legacy stub -- sling removed. Always False."""
         return False
 
     def slots_available(self) -> int:
-        """Legacy stub -- sling removed. Always 999 (unlimited)."""
         return 999
 
     def get_active_rebalancing_peers(self) -> List[str]:
-        """Legacy stub -- sling removed. Always empty."""
         return []
 
     def get_all_jobs_status(self) -> List[Dict[str, Any]]:
-        """Legacy stub -- sling removed. Always empty."""
         return []
 
     def stop_job(self, channel_id: str, reason: str = "manual") -> bool:
-        """Legacy stub -- sling removed. Always False (no jobs to stop)."""
         return False
 
     def stop_all_jobs(self, reason: str = "shutdown") -> int:
-        """Legacy stub -- sling removed. Always 0 (no jobs stopped)."""
         return 0
-
-    def execute_once(self, scid: str, direction: str, amount: int,
-                     maxppm: int, onceamount: int, candidates: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Legacy stub -- sling removed. Returns failure."""
-        return {"success": False, "error": "sling execute_once removed; use RebalanceExecutor"}
 
     # ---- Source failure tracking (still used by EVRebalancer) ----
 
