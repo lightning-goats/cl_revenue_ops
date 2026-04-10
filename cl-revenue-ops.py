@@ -235,20 +235,34 @@ class ThreadSafeRpcProxy:
         fn = getattr(self._rpc, name)
 
         def wrapper(*args, **kwargs):
-            timeout = 30
+            proxy_timeout = 30
             if config:
-                timeout = config.rpc_timeout_seconds
-            future = self._submit_main(fn, name, timeout, *args, **kwargs)
+                proxy_timeout = config.rpc_timeout_seconds
+            # If the caller supplies its own ``timeout`` kwarg (e.g.
+            # ``waitsendpay(timeout=60)``), extend the proxy's effective
+            # wait so we never cut a legitimately long call short. Adds a
+            # small grace period so the underlying method has time to
+            # settle before the proxy fires its own timeout.
+            user_timeout = kwargs.get("timeout")
+            if isinstance(user_timeout, (int, float)) and user_timeout > 0:
+                proxy_timeout = max(proxy_timeout, int(user_timeout) + 5)
+            future = self._submit_main(fn, name, proxy_timeout, *args, **kwargs)
             try:
-                return future.result(timeout=timeout)
+                return future.result(timeout=proxy_timeout)
             except (TimeoutError, self._FuturesTimeoutError):
-                self._plugin.log(f"RPC timeout after {timeout}s on {name}", level="warn")
+                self._plugin.log(f"RPC timeout after {proxy_timeout}s on {name}", level="warn")
                 raise RPCTimeoutError(name)
 
         return wrapper
 
-    def _submit_main(self, fn, method_name: str, timeout: int, *args, **kwargs):
-        acquire_timeout = min(max(float(timeout), 0.1), 1.0)
+    def _submit_main(self, fn, method_name: str, proxy_timeout: int, *args, **kwargs):
+        # NOTE: this parameter MUST NOT be named 'timeout'. Several CLN RPC
+        # methods (notably waitsendpay) accept a 'timeout' keyword argument
+        # of their own, and the proxy wrapper forwards **kwargs unchanged.
+        # A parameter named 'timeout' here collides with the user's kwarg
+        # and raises "TypeError: got multiple values for argument 'timeout'",
+        # silently breaking every rebalance execution attempt.
+        acquire_timeout = min(max(float(proxy_timeout), 0.1), 1.0)
         if not self._main_submit_slots.acquire(timeout=acquire_timeout):
             self._plugin.log(
                 f"RPC pool saturated on {method_name} (submission queue full)",
