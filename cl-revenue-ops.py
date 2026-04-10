@@ -792,6 +792,57 @@ plugin.add_option(
 )
 
 
+def _on_rebalance_router_change(plugin_: Plugin, option_name: str, new_value: Any) -> None:
+    """Validate + log a runtime rebalance-router flip triggered by setconfig.
+
+    Raises ValueError (surfaced to the setconfig caller) on invalid values or
+    when v3 is requested but askrene is unavailable. Also mirrors the new
+    value into the live Config object so the engine picks it up next cycle.
+    """
+    if new_value not in ("v2", "v3"):
+        raise ValueError(
+            f"rebalance-router must be 'v2' or 'v3', got {new_value!r}"
+        )
+    r = globals().get("rebalancer")
+    eng = getattr(r, "rebalance_engine_v2", None) if r is not None else None
+    if eng is None:
+        raise ValueError(
+            "rebalance engine not initialized; cannot change router"
+        )
+    if new_value == "v3" and getattr(eng, "router_v3", None) is None:
+        raise ValueError(
+            "askrene unavailable on this node; cannot switch to v3"
+        )
+    cfg = globals().get("config")
+    if cfg is not None:
+        cfg.rebalance_router = new_value
+    plugin_.log(
+        f"rebalance-router switched to {new_value} "
+        f"(takes effect at next cycle boundary)",
+        level="info",
+    )
+
+
+plugin.add_option(
+    name='revenue-ops-rebalance-router',
+    default='v3',
+    description="Rebalance route discovery: 'v3' (askrene getroutes + cl-hive layers, default) or 'v2' (legacy getroute). "
+                "v3 requires CLN v24.11+ with the askrene plugin loaded; otherwise the engine falls back to v2. "
+                "Runtime-switchable via 'lightning-cli -k setconfig config=revenue-ops-rebalance-router val=v2'.",
+    opt_type='string',
+    dynamic=True,
+    on_change=_on_rebalance_router_change,
+)
+
+plugin.add_option(
+    name='revenue-ops-askrene-layers',
+    default='hive-fleet',
+    description="CSV of askrene layer names passed to v3 router getroutes calls. "
+                "Missing layers are silently dropped by askrene. Empty string = standalone mode "
+                "with no cl-hive bias. Default: 'hive-fleet'."
+)
+
+
 def _boltz_auto_cycle_mark_state(**updates):
     with _boltz_auto_cycle_state_lock:
         _boltz_auto_cycle_state.update(updates)
@@ -1222,6 +1273,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
         hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
+        rebalance_router=str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower(),
+        askrene_layers=str(options.get('revenue-ops-askrene-layers', 'hive-fleet') or 'hive-fleet'),
     )
     try:
         config_fields = {f.name for f in dataclasses.fields(Config)}

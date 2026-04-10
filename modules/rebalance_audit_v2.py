@@ -4,7 +4,9 @@ Every cycle must explain itself. For every valuable channel the engine
 evaluates, one of the ``log_*`` helpers emits a deterministic, grep-friendly
 record that replaces the vague ad-hoc messages of the v1 engine.
 
-Canonical skip reasons live in ``VALID_SKIP_REASONS``.
+Canonical skip reasons live in ``VALID_SKIP_REASONS``. Reasons produced by
+the v3 askrene-based router are included so audit consumers grouped by
+``reason=`` can bucket both router versions identically.
 """
 
 from __future__ import annotations
@@ -21,11 +23,17 @@ VALID_SKIP_REASONS: frozenset[str] = frozenset({
     "no_budget",
     "max_pairs_reached",
     "outcompeted",
-    # Produced by the router / engine
+    # Produced by the router / engine (both v2 and v3)
     "no_route",
     "route_over_budget",
     # Produced by the engine's pair-level futility tracker
     "pair_futility",
+    # Produced by the v3 askrene router specifically
+    "unknown_source_node",
+    "unknown_dest_node",
+    "unknown_layer",
+    "askrene_child_died",
+    "path_loops_through_us",
 })
 
 
@@ -46,11 +54,12 @@ class RebalanceAudit:
         amount_sats: int,
         route_cost_sats: int,
         value_score: float,
+        router: str = "v2",
     ) -> str:
         return (
             f"REBAL_PICK source={source_channel_id} dest={dest_channel_id} "
             f"amount={amount_sats} route_cost_sats={route_cost_sats} "
-            f"value_score={value_score}"
+            f"value_score={value_score} router={router}"
         )
 
     @staticmethod
@@ -61,12 +70,14 @@ class RebalanceAudit:
         remaining_budget_sats: int = 0,
         route_cost_sats: int = 0,
         detail: str = "",
+        router: str = "v2",
     ) -> str:
         parts = [
             f"REBAL_SKIP channel={channel_id}",
             f"reason={reason}",
             f"value_class={value_class}",
             f"budget={remaining_budget_sats}",
+            f"router={router}",
         ]
         if route_cost_sats:
             parts.append(f"route_cost={route_cost_sats}")
@@ -99,6 +110,7 @@ class RebalanceAudit:
         amount_sats: int,
         route_cost_sats: int,
         value_score: float,
+        router: str = "v2",
     ) -> None:
         self._plugin.log(
             self.format_pick(
@@ -107,6 +119,7 @@ class RebalanceAudit:
                 amount_sats,
                 route_cost_sats,
                 value_score,
+                router=router,
             ),
             level="info",
         )
@@ -119,6 +132,7 @@ class RebalanceAudit:
         remaining_budget_sats: int = 0,
         route_cost_sats: int = 0,
         detail: str = "",
+        router: str = "v2",
     ) -> None:
         self._plugin.log(
             self.format_skip(
@@ -128,6 +142,7 @@ class RebalanceAudit:
                 remaining_budget_sats,
                 route_cost_sats,
                 detail,
+                router=router,
             ),
             level="info",
         )

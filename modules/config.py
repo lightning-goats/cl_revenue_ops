@@ -79,7 +79,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'reputation_decay': float,
     'max_concurrent_jobs': int,
     'askrene_layer': str,
+    'askrene_layers': str,
     'askrene_max_age_sec': int,
+    'rebalance_router': str,
     'rebalance_min_profit': int,
     'rebalance_min_profit_ppm': int,
     'rebalance_max_amount': int,
@@ -248,6 +250,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 # Valid values for string enum fields
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
     'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
+    'rebalance_router': ('v2', 'v3'),
 }
 
 
@@ -355,6 +358,10 @@ class Config:
     # AskRene (xpay) constraint integration
     askrene_layer: str = 'xpay'               # Layer name for askrene-listlayers
     askrene_max_age_sec: int = 900            # Max constraint age (seconds) to consider fresh
+
+    # V3 rebalance router (askrene getroutes + cl-hive layers)
+    rebalance_router: str = 'v3'              # 'v3' (askrene getroutes, default) or 'v2' (getroute legacy)
+    askrene_layers: str = 'hive-fleet'        # CSV of layers to pass to v3 router's getroutes calls
 
     # Safety flags
     paused: bool = False           # If True, suppress automated executor actions
@@ -772,6 +779,10 @@ class ConfigSnapshot:
     # M-27: xpay/askrene parameters (were missing from snapshot)
     askrene_layer: str = 'xpay'
     askrene_max_age_sec: int = 900
+
+    # V3 rebalance router (askrene getroutes + cl-hive layers)
+    rebalance_router: str = 'v3'
+    askrene_layers: str = 'hive-fleet'
 
     # Weekly budget cap (hard ceiling over daily burst)
     weekly_budget_sats: int = 35000
