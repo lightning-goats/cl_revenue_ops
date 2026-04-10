@@ -19,6 +19,7 @@ def test_public_runtime_keys_are_safety_only():
         "planner_execute_closes",
         "planner_max_opens_per_cycle",
         "planner_max_closes_per_cycle",
+        "capex_probability_budget_bonus",
     ]
 
 
@@ -43,6 +44,7 @@ def test_public_runtime_dict_returns_only_public_keys():
         "planner_execute_closes": False,
         "planner_max_opens_per_cycle": 1,
         "planner_max_closes_per_cycle": 0,
+        "capex_probability_budget_bonus": 0.0,
     }
 
 
@@ -190,6 +192,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
     result = mod.revenue_config(mod.plugin, "list-mutable")
 
     assert result["mutable_keys"] == [
+        "capex_probability_budget_bonus",
         "daily_budget_sats",
         "max_fee_ppm",
         "min_fee_ppm",
@@ -200,7 +203,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "planner_max_closes_per_cycle",
         "planner_max_opens_per_cycle",
     ]
-    assert result["count"] == 9
+    assert result["count"] == 10
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -218,6 +221,7 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "planner_execute_closes": False,
         "planner_max_opens_per_cycle": 1,
         "planner_max_closes_per_cycle": 0,
+        "capex_probability_budget_bonus": 0.0,
     }
 
 
@@ -351,6 +355,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "planner_execute_closes": False,
         "planner_max_opens_per_cycle": 1,
         "planner_max_closes_per_cycle": 0,
+        "capex_probability_budget_bonus": 0.0,
     }
     assert "config" not in result
 

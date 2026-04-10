@@ -34,6 +34,10 @@ PUBLIC_RUNTIME_KEYS = (
     'planner_execute_closes',
     'planner_max_opens_per_cycle',
     'planner_max_closes_per_cycle',
+    # V3 router probability-aware budget relaxation (default 0.0 = off).
+    # Exposed so operators running the askrene router can enable the
+    # reliability-weighted budget bonus without editing code or the database.
+    'capex_probability_budget_bonus',
 )
 
 # Type mapping for config fields (for validation)
