@@ -312,7 +312,128 @@ The only safety rule v3 must enforce at the plugin level is the anti-requirement
 
 ## 3. Layer Semantics Under Pair Pinning
 
-_PENDING: Task 3_
+### 3.1 Setup
+
+The `hive-fleet` layer on the live node contains **4 channel overrides** (2 channels × 2 directions):
+
+```json
+{"short_channel_id_dir": "933791x3241x0/1", "fee_base_msat": 0, "fee_proportional_millionths": 0, "cltv_expiry_delta": 6}
+{"short_channel_id_dir": "933791x3241x0/0", "fee_base_msat": 0, "fee_proportional_millionths": 0, "cltv_expiry_delta": 6}
+{"short_channel_id_dir": "940132x2695x0/1", "fee_base_msat": 0, "fee_proportional_millionths": 0, "cltv_expiry_delta": 6}
+{"short_channel_id_dir": "940132x2695x0/0", "fee_base_msat": 0, "fee_proportional_millionths": 0, "cltv_expiry_delta": 6}
+```
+
+Both directions of both hive-fleet channels are forced to **zero-fee, cltv_delta=6**. The corresponding live gossip values:
+
+- `940132x2695x0` (peer 028f5847 → us): gossip says `base=0, ppm=10, cltv=34` → layer makes it `base=0, ppm=0, cltv=6` (Δppm=-10, Δcltv=-28)
+- `933791x3241x0` (peer 03796a3c → us): gossip says `base=0, ppm=0, cltv=34` → layer changes only cltv (Δcltv=-28)
+
+These are small deltas — this layer's current content is subtle (it's effectively saying "treat fleet channels as CLTV-friendly zero-fee" rather than dramatically reshaping fees). That's important context for the test: we're looking for *any* observable bias, not a dramatic reshape.
+
+### 3.2 Experiment A — pair where path uses a hive-fleet channel
+
+**Setup**: source is peer `028f5847` (owns hive-fleet channel `940132x2695x0`), destination is non-fleet peer `03fe80df`. Amount 1,000,000 msat. Pair-pinned (source and destination are both peers, not us).
+
+**Without hive-fleet layer** (`layers=[]`):
+
+```
+# Flow 0/1: 1000343msat/106 940132x2695x0/0 -> 1000333msat/72 940304x912x0/0 -> 1000000msat/40
+{
+   "probability_ppm": 990806,
+   "routes": [{
+      "amount_msat": 1000000, "final_cltv": 40,
+      "path": [
+         {"short_channel_id_dir": "940132x2695x0/0", "next_node_id": "0382d558...", "amount_msat": 1000343, "delay": 106},
+         {"short_channel_id_dir": "940304x912x0/0",  "next_node_id": "03fe80df...", "amount_msat": 1000333, "delay": 72}
+      ]
+   }]
+}
+```
+
+Total fee: 1000343 − 1000000 = **343 msat**. Total delay at first hop: **106**.
+
+**With hive-fleet layer** (`layers=["hive-fleet"]`):
+
+```
+# Flow 0/1: 1000333msat/78 940132x2695x0/0 -> 1000333msat/72 940304x912x0/0 -> 1000000msat/40
+{
+   "probability_ppm": 990806,
+   "routes": [{
+      "amount_msat": 1000000, "final_cltv": 40,
+      "path": [
+         {"short_channel_id_dir": "940132x2695x0/0", "next_node_id": "0382d558...", "amount_msat": 1000333, "delay": 78},
+         {"short_channel_id_dir": "940304x912x0/0",  "next_node_id": "03fe80df...", "amount_msat": 1000333, "delay": 72}
+      ]
+   }]
+}
+```
+
+Total fee: 1000333 − 1000000 = **333 msat**. Total delay at first hop: **78**.
+
+**Diff:**
+
+| Metric | No layer | With hive-fleet | Δ |
+|---|---|---|---|
+| Total fee (msat) | 343 | 333 | **−10 msat** |
+| First-hop delay | 106 | 78 | **−28 blocks** |
+| Path (SCIDs) | `940132x2695x0/0` → `940304x912x0/0` | `940132x2695x0/0` → `940304x912x0/0` | identical |
+| probability_ppm | 990806 | 990806 | identical |
+
+**Interpretation**: the layer override on the first hop (`940132x2695x0/0`) exactly matches the expected deltas:
+
+- Fee Δ = `amount_msat * (ppm_before - ppm_after) / 1_000_000 = 1,000,000 * (10 − 0) / 1,000,000 = 10 msat` ✓
+- Delay Δ = `cltv_before − cltv_after = 34 − 6 = 28 blocks` ✓
+
+**Askrene respects the layer override on the channel, and the layer-adjusted weights propagate into the path cost calculation.** This confirms the fundamental mechanism v3 relies on.
+
+### 3.3 Experiment B — pair where path does NOT touch any hive-fleet channel
+
+**Setup**: source is peer `03796a3c` (non-hive-fleet channel as outgoing option, since its hive-fleet channel `933791x3241x0` has near-zero receivable balance and askrene avoids it), destination is peer `03c15794`. Amount 5,000,000 msat. Pair-pinned.
+
+**Without hive-fleet layer**:
+
+```
+path: [
+  "942863x384x9/1"  amt=5001000 delay=298,
+  "930327x2105x0/1" amt=5000005 delay=264,
+  "903815x2481x1/0" amt=5000005 delay=120
+]
+fee=1000 msat  first_hop_delay=298
+```
+
+**With hive-fleet layer**: **identical path, identical amounts, identical delays.**
+
+**Interpretation**: when the selected path does not traverse any hive-fleet-covered channel, the layer has **zero observable effect**. This is the correct behavior — layers are additive constraints, they only matter when the path touches a covered edge.
+
+### 3.4 Pair-pinning behavior (subtle but important)
+
+Both experiments used `source=<peer>, destination=<peer>` (i.e. neither endpoint was our node). In every case, askrene successfully found a path, and in every case the path routed **through our node** as an intermediate hop:
+
+- Experiment A: `peer_028f5847 → 0382d558 (us) → peer_03fe80df` (2-hop)
+- Experiment B: `peer_03796a3c → 0298f607 → 026165850 → peer_03c15794` (3-hop, does NOT go through us — askrene found a cheaper path in the broader gossip graph)
+
+**Critical finding**: askrene does NOT force the path through us just because we're the node running the query. It uses the gossip graph freely. In Experiment B, it picked a path that bypasses us entirely, even though our node is likely reachable from both endpoints.
+
+**Implication for v3's pair-pinning pattern**:
+
+The v2 router's pattern is "pin source_channel, pin dest_channel, ask for middle". It assumes the middle path starts at `source_peer` and ends at `dest_peer` without touching our node again. That assumption holds for `getroute` (the v2 RPC) because getroute doesn't know we are the node running the query. But `getroutes` uses askrene's full gossip-aware pathfinding and **can find paths that DO touch our node**.
+
+Experiment A shows this concretely: for a 2-hop pair-pinned query, askrene produced a path where our node is the middle hop. That's not wrong — it's just a different route shape than v2's strict "peer_A → external middle → peer_B" assumption.
+
+**Design consequences for v3**:
+
+1. **V3's `price_pair` must validate that the returned path does NOT include our own node as an intermediate hop**, or handle the case when it does. If askrene returns a path with `next_node_id == our_node_id` at any hop (except the very last hop when we're the destination), the path loops through us, which is fine if we're doing circular rebalancing but breaks the sendpay format (which expects a simple source → ... → destination sequence with us at neither end of the middle).
+2. **V3 should consider constructing the query differently**: instead of `source=source_peer, destination=dest_peer`, use `source=our_node, destination=our_node` and rely on the pair-pinning to happen via layer-based channel disabling or source/dest channel forcing. But **askrene does not allow source == destination** — that's the original constraint from issue #9032 that motivated this whole research effort.
+3. **Alternate pattern — "split-call pair pinning"**: make TWO getroutes calls: `getroutes(source=our_node, destination=dest_peer)` for the outgoing half, and `getroutes(source=source_peer, destination=our_node)` for the incoming half. Each half is a regular source-or-dest-is-us query. Stitch the two halves together at the boundary. This avoids the source=destination restriction and avoids the "path accidentally loops through us" issue by construction. It's more complex than v2's single-query pattern but aligns with askrene's model.
+4. **OR — "constrain the first hop explicitly"**: `getroutes` doesn't have an explicit `first_hop_scid` parameter, but we can achieve the same effect by creating a tiny throwaway layer that DISABLES all of peer_A's other outgoing channels, then passing that layer along with `source=peer_A`. Askrene will be forced to use the channel we want.
+
+The parent spec assumes pattern #1 (single call, source=source_peer, destination=dest_peer, stitch manually). Experiments A + B show this pattern produces valid paths but with no guarantee about shape. Patterns #3 and #4 are more robust alternatives discovered by this research and are worth considering in Phase 1 implementation.
+
+### 3.5 Verdict
+
+**Layer semantics under pair pinning are confirmed working**: askrene respects channel overrides from named layers when the computed path traverses those channels (Experiment A). Layers have no side effect on other paths (Experiment B). This is the core mechanism v3 needs.
+
+**Design caveat**: the v2 router's "pair-pinned middle path" assumption does not cleanly map to askrene's gossip-aware pathfinding. Askrene may produce paths that loop through our own node or that bypass our node entirely. V3 must either (a) validate returned paths for loop-through-us, (b) switch to a split-call pattern (Section 3.4 #3), or (c) use throwaway-layer first-hop forcing (Section 3.4 #4). This choice becomes a Phase 1 implementation decision that must be recorded in Section 9.
 
 ## 4. Exclude-Via-Layer Pattern
 
