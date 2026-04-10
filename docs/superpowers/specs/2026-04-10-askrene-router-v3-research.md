@@ -36,7 +36,166 @@ All claims have either a source citation or a captured live-node RPC transcript.
 
 ## 1. getroutes Contract
 
-_PENDING: Task 1_
+### 1.1 Version gate
+
+`getroutes` was added in **CLN v24.08** per the schema (`ElementsProject/lightning@b57edd21:doc/schemas/getroutes.json#L6 "added": "v24.08"`). Two later additions:
+
+- `maxdelay` added in v25.02 (`doc/schemas/getroutes.json#L63`)
+- `maxparts` added in v25.09 (`doc/schemas/getroutes.json#L74`)
+
+The live node runs v25.12.1, above all gates. **Implication for v3**: `rebalance-router = "v3"` requires CLN v24.08+. Operators on older CLN fall back to v2 per the engine factory.
+
+### 1.2 Request parameters
+
+| Param | Type | Required | Source | Meaning |
+|---|---|---|---|---|
+| `source` | pubkey | yes | `getroutes.json#L24-29` | Node pubkey where paths start |
+| `destination` | pubkey | yes | `getroutes.json#L30-35` | Node pubkey where paths end |
+| `amount_msat` | msat | yes | `getroutes.json#L36-41` | Amount delivered to destination |
+| `layers` | string[] | yes | `getroutes.json#L42-49` | Layer names to apply on top of gossip |
+| `maxfee_msat` | msat | yes | `getroutes.json#L50-55` | **Hard cap** — "we will never return a set of routes more expensive than this" |
+| `final_cltv` | u32 | yes | `getroutes.json#L56-61` | CLTV blocks for final hop |
+| `maxdelay` | u32 | opt (default 2016) | `getroutes.json#L62-69` | Max total CLTV delay blocks |
+| `maxparts` | u32 | opt (default 100) | `getroutes.json#L70-83` | Max routes in MPP solution |
+
+**Invariants enforced by the plugin**:
+
+- `amount_msat` must be non-zero (`askrene.c#L879-882`: `"amount must be non-zero"`)
+- `maxparts` must be non-zero (`askrene.c#L884-887`: `"maxparts must be non-zero"`)
+- `maxdelay` must be ≤ 2016 (`askrene.c#L889-893`: `"maximum delay allowed is %d"`). 2016 is the BOLT #4 `max_htlc_cltv`.
+
+### 1.3 The four automatic layers
+
+The schema calls these out directly (`getroutes.json#L10-14`):
+
+- **`auto.localchans`** — contains information on local channels from this node (including non-public ones), and their exact current spendable capacities. Useful when source is the current node.
+- **`auto.sourcefree`** — overrides all channels (including those from previous layers) leading out of *source* to be zero fee and zero delay. Useful when source is the current node.
+- **`auto.no_mpp_support`** — forces getroutes to return a single-path solution. Confirmed in `askrene.c#L608-615`: when this layer is requested, `dev_algo` is set to `ALGO_SINGLE_PATH`. Also triggered by `maxparts == 1` (`askrene.c#L616-621`).
+- **`auto.include_fees`** — fixes the send amount and deducts fees from there, i.e. the receiver pays fees instead of the sender (`askrene.c#L623`: `include_fees = have_layer(info->layers, "auto.include_fees");`).
+
+**Implication for v3**: `auto.no_mpp_support` is a clean way to force single-path in phase 1. The v2 executor only handles single-path routes, so this flag is the right default for phase 1. For pair-pinned queries where `source` is a peer (not our node), `auto.sourcefree` and `auto.localchans` do nothing useful (they target the source node's outgoing edges, which would be the peer's, not ours).
+
+### 1.4 Response shape
+
+Response is `{"probability_ppm": u64, "routes": [ {…} ]}` (`getroutes.json#L87-98`).
+
+Each route entry:
+
+| Field | Type | Meaning | Source |
+|---|---|---|---|
+| `probability_ppm` | u64 | Success probability of this path (millionths) | `getroutes.json#L112-116` |
+| `amount_msat` | msat | Amount delivered to destination (NOT total sent) | `getroutes.json#L118-122` |
+| `final_cltv` | u32 | Echo of caller's final_cltv | `getroutes.json#L124-128` |
+| `path` | object[] | Hops from source to destination | `getroutes.json#L130-134` |
+
+Each hop (`getroutes.json#L135-168`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `short_channel_id_dir` | string | Channel and direction (`"SCID/dir"`) |
+| `next_node_id` | pubkey | Peer id at the end of this hop |
+| `amount_msat` | msat | Amount to send INTO this hop (inclusive of downstream fees) |
+| `delay` | u32 | Total CLTV expected by the node at the start of this hop |
+
+**Critical format difference from `getroute`**: the path entries have `short_channel_id_dir` (not `channel`+`direction`) and `next_node_id` (not `id`). The schema says this explicitly (`getroutes.json#L9`: *"NOTE: The returned paths are a different format then getroute, being more appropriate for creating intermediary onion layers."*).
+
+**Implication for v3**: `RebalanceRouterV3.price_pair()` must translate the `getroutes` path format into the sendpay/executor route format. This is a simple per-hop transformation but it's not a drop-in replacement — v2's `RouteResult.route` list is currently in sendpay format, and the v3 router must produce the same format to preserve compatibility with `RebalanceExecutorV2`.
+
+### 1.5 Error modes
+
+Enumerated by grepping `command_fail` in `json_getroutes` and its helpers:
+
+| Error | Source | Maps to v2 skip reason |
+|---|---|---|
+| `"amount must be non-zero"` | `askrene.c#L880` | Should never fire from v3 (planner never passes zero) — assert instead |
+| `"maxparts must be non-zero"` | `askrene.c#L885` | Same — v3 passes default 1 or 100 |
+| `"maximum delay allowed is %d"` | `askrene.c#L890` | Should never fire (v3 passes 2016 default) |
+| `"Unknown source node %s"` | `askrene.c#L592-596` (inside `do_getroutes`) | New skip reason `unknown_source_node` |
+| `"Unknown destination node %s"` | `askrene.c#L602-606` | New skip reason `unknown_dest_node` |
+| Route-not-found (child process timeout or no path) | `askrene.c#L443, L697` via `PAY_ROUTE_NOT_FOUND` | Existing `no_route` |
+
+**Implication for v3**: need two new skip reasons for source/dest node gossip gaps. These are distinct from "route not found" — they indicate the source or destination pubkey is not in the local gossmap at all (e.g. peer disappeared, very new peer, or gossip not yet synced).
+
+### 1.6 Timeout behavior
+
+`askrene.c#L1467`: default route calculation deadline is **10 seconds** (`route_seconds = 10`), configurable via the dynamic option `askrene-timeout`.
+
+`askrene.c#L1468, L1477-1482`: default max concurrent route calculations is **4** (`max_children = 4`), configurable via the dynamic option `askrene-max-threads`. Both options are dynamic (hot-reloadable via `setconfig`).
+
+Route calculation runs in a forked child process (`askrene.c#L625-690`): `pipe()` + `fork()` + `run_child()`. On fork failure the request returns `PAY_ROUTE_NOT_FOUND` with an error like `"failed to fork: %s"`. On child timeout the deadline fires inside `run_child()` and the child reports `PAY_ROUTE_NOT_FOUND` back to the parent.
+
+**Implication for v3**: the router does not need its own timeout — askrene enforces 10s per call. However, v3 should pass a *caller* timeout to `self.plugin.rpc.getroutes(..., timeout=15)` or similar if pyln-client supports it, so cl-revenue-ops doesn't hang if the CLN RPC dispatch itself stalls.
+
+Also: at most 4 concurrent getroutes calls can run in parallel. The v2 planner processes pairs sequentially, so this is not a concern for phase 1. But if a future v3 planner parallelizes pair pricing, it must respect the 4-concurrent limit.
+
+### 1.7 Live verification
+
+**Probe 1 — direct peer, our node as source** (single hop):
+
+```
+$ ssh lnnode 'lightning-cli getroutes \
+    source=0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3 \
+    destination=03fe80dfe18b0feb77c2e619516a7563ab39423a6c02d06e5246c60eea0e276aac \
+    amount_msat=100000 layers=[] maxfee_msat=10000 final_cltv=40'
+{
+   "probability_ppm": 999990,
+   "routes": [
+      {
+         "probability_ppm": 999990,
+         "amount_msat": 100000,
+         "final_cltv": 40,
+         "path": [
+            {
+               "short_channel_id_dir": "940304x912x0/0",
+               "next_node_id": "03fe80dfe18b0feb77c2e619516a7563ab39423a6c02d06e5246c60eea0e276aac",
+               "amount_msat": 100033,
+               "delay": 72
+            }
+         ]
+      }
+   ]
+}
+```
+
+Observations: delivered 100000 msat, first hop sends 100033 msat (33 msat fee for this single hop), delay 72 = 40 final + 32 from the channel policy. Response matches the schema exactly.
+
+**Probe 2 — pair-pinned query (source and destination are both peers, not us)**:
+
+```
+$ ssh lnnode 'lightning-cli getroutes \
+    source=03fe80dfe18b0feb77c2e619516a7563ab39423a6c02d06e5246c60eea0e276aac \
+    destination=02f1a8c87607f415c8f22c00593002775941dea48869ce23096af27b0cfdcc0b69 \
+    amount_msat=100000 layers=[] maxfee_msat=10000 final_cltv=40'
+{
+   "probability_ppm": 999978,
+   "routes": [
+      {
+         "probability_ppm": 999978,
+         "amount_msat": 100000,
+         "final_cltv": 40,
+         "path": [
+            { "short_channel_id_dir": "940304x912x0/1",
+              "next_node_id": "0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
+              "amount_msat": 101003, "delay": 130 },
+            { "short_channel_id_dir": "939858x2330x0/1",
+              "next_node_id": "02b21730bc36061609cc1fe1bd7f5d3068e0a5e511aaf210a82c046b58020c4aa8",
+              "amount_msat": 100002, "delay": 96 },
+            { "short_channel_id_dir": "922759x492x2/0",
+              "next_node_id": "02f1a8c87607f415c8f22c00593002775941dea48869ce23096af27b0cfdcc0b69",
+              "amount_msat": 100000, "delay": 64 }
+         ]
+      }
+   ]
+}
+```
+
+**Critical observation**: askrene naturally routes the pair-pinned query **through our own node** as an intermediate hop. The path is `peer_A → us → peer_02b217 → peer_B`. The first hop uses channel `940304x912x0/1` (direction 1 = peer_A → us), which is the same SCID as our direct channel with peer_A seen in Probe 1.
+
+**Implication for v3's pair-pinning pattern**: askrene *can* produce circular-rebalance-shaped routes automatically when asked `source=outgoing_peer, destination=incoming_peer`. However the pattern is subtler than v2's prepend/append approach — askrene may pick an indirect middle even if a more direct one exists. V3 must validate that the returned path's first hop is on the desired source_channel (else reject the route), and it must handle the case where askrene's path traverses our node in an unexpected way (e.g. first hop is peer_A → some_other_peer, then eventually back to us). This is a concrete design surprise that Section 3's layer experiment must verify before phase 1 implementation.
+
+### 1.8 Interim verdict
+
+`getroutes` is well-specified, runs reliably on the live node, and exposes exactly the controls v3 needs: `layers` for cl-hive bias, `maxfee_msat` for hard budget enforcement, `auto.no_mpp_support` for single-path simplicity. The version gate (v24.08) is comfortably met. The only design surprise is the path-format delta from `getroute` (requires a translation step in `price_pair`) and the potentially indirect path shape under pair pinning (requires a first-hop validator in the router).
 
 ## 2. Layer Lifecycle
 
