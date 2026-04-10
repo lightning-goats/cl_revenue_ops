@@ -688,7 +688,37 @@ Reviewing the four options from the parent spec's Phase 2 Q4:
 
 ## 6. xpay vs sendpay+waitsendpay Behavior Diff For Circular Self-Pays
 
-_PENDING: Task 6_
+### 6.1 Task closed by Section 5
+
+Section 5 demonstrated that xpay's self-pay path does not route through the network — it's a shortcut in `xpay.c#L1410-1413` that calls `do_inject()` (injectpaymentonion), producing zero routing fees and no HTLC forwards. The planned comparison of "xpay vs sendpay+waitsendpay for circular self-pays" is therefore vacuous: **there is nothing to compare because xpay does not perform a circular payment at all**.
+
+Any diff we ran would look like this:
+
+| Metric | sendpay+waitsendpay (real circular) | xpay (self-pay shortcut) |
+|---|---|---|
+| Wall time | ~seconds (network round-trips) | <10ms (in-memory) |
+| Hops attempted | ≥2 (minimum circular: source_peer → us → dest_peer) | 0 |
+| Fee paid (msat) | > 0 (peers charge forwarding fees) | 0 |
+| Channel balances moved | yes (this is the whole point of rebalancing) | **no** |
+| askrene-inform-channel updates | none (we manage our own) | none (shortcut skips this too) |
+
+The last row is the killer: **xpay does not move channel balances**, which is the entire purpose of rebalancing. No further experimentation adds information.
+
+### 6.2 What the sendpay+waitsendpay side would look like
+
+For completeness, the v2 executor's current path for a circular rebalance is:
+
+1. `invoice amount_msat=N ...` → generate self-invoice (`rebalance_executor_v2.py:… invoice()`)
+2. `sendpay route=<precomputed> payment_hash=<from invoice> bolt11=<from invoice>` → inject the payment with our chosen route
+3. `waitsendpay payment_hash timeout=...` → block until resolved
+4. On route-level failure, add failed channels to exclude list and loop
+5. On success, record fees and delete the invoice
+
+Each of these steps is a concrete RPC. The v2 executor's behavior is already verified by `test_rebalance_executor_v2.py` (44 passing tests). No live diff is needed — we already know sendpay works for circular self-pays because v2 does it in production today.
+
+### 6.3 Verdict
+
+**Task 6 resolves with no new data**: xpay is not a viable comparison target for circular rebalancing, and v2 executor's behavior is already trusted production code. Section 9's decision records cite Section 5 and Section 6 as joint justification for keeping the v2 executor permanent.
 
 ## 7. setconfig Runtime-Switch Verification
 
