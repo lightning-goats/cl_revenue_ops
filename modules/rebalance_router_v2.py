@@ -63,7 +63,7 @@ class RebalanceRouter:
         """
         # --- Priority 1: listpeerchannels filtered by peer ---
         try:
-            result = self.plugin.rpc.listpeerchannels(id=dest_peer_id)
+            result = self.plugin.rpc.listpeerchannels(peer_id=dest_peer_id)
             for ch in result.get("channels", []):
                 if ch.get("peer_id") != dest_peer_id:
                     continue
@@ -120,7 +120,7 @@ class RebalanceRouter:
     def _get_source_channel_policy(self, source_peer_id: str) -> Dict[str, Any]:
         """Get our outbound fee/cltv for the source channel from peer's perspective."""
         try:
-            result = self.plugin.rpc.listpeerchannels(id=source_peer_id)
+            result = self.plugin.rpc.listpeerchannels(peer_id=source_peer_id)
             for ch in result.get("channels", []):
                 updates = ch.get("updates") or {}
                 local = updates.get("local") or {}
@@ -136,7 +136,7 @@ class RebalanceRouter:
     def _get_dest_channel_cltv(self, dest_peer_id: str) -> int:
         """Get the dest peer's cltv_expiry_delta for the final hop."""
         try:
-            result = self.plugin.rpc.listpeerchannels(id=dest_peer_id)
+            result = self.plugin.rpc.listpeerchannels(peer_id=dest_peer_id)
             for ch in result.get("channels", []):
                 updates = ch.get("updates") or {}
                 remote = updates.get("remote") or {}
