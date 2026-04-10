@@ -421,6 +421,60 @@ def test_price_pair_handles_getroutes_rpc_error():
     assert "unknown_source_node" in result.error
 
 
+def test_price_pair_populates_probability_ppm_from_askrene():
+    """V3 router must populate RouteResult.probability_ppm from the askrene
+    response so the engine's probability-aware budget relaxation can see it.
+
+    V2 router leaves probability_ppm=0 (no probability model). V3 must pass
+    through askrene's per-route probability so the planner can relax the
+    pair budget for high-probability reliable routes."""
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    plugin.rpc.getroutes.return_value = {
+        "probability_ppm": 982339,
+        "routes": [{
+            "probability_ppm": 982339,
+            "amount_msat": 100000,
+            "final_cltv": 40,
+            "path": _clean_middle_path_peer_A_to_peer_B(),
+        }],
+    }
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+    assert result.success is True
+    assert result.probability_ppm == 982339
+
+
+def test_price_pair_defaults_probability_ppm_zero_when_askrene_omits_it():
+    """If askrene's response lacks probability_ppm (older CLN or malformed
+    mock), v3 router must default to 0, not crash."""
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    plugin.rpc.getroutes.return_value = {
+        "routes": [{
+            "amount_msat": 100000,
+            "final_cltv": 40,
+            "path": _clean_middle_path_peer_A_to_peer_B(),
+        }],
+    }
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+    assert result.success is True
+    assert result.probability_ppm == 0
+
+
 # ---------------------------------------------------------------------------
 # Task 8: exclude-via-layer context manager (isolation tests)
 # ---------------------------------------------------------------------------

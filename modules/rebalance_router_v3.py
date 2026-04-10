@@ -336,12 +336,19 @@ class RebalanceRouterV3:
             (middle_fee_msat + 999) // 1000
         ) + final_hop_fee_sats
 
+        # Pass askrene's per-route success-probability estimate through to
+        # the engine so the probability-aware budget relaxation can see it.
+        # Missing field (older CLN or partial mock) defaults to 0 which the
+        # engine treats as "no relaxation" — identical to v2 router behavior.
+        probability_ppm = int(cheapest.get("probability_ppm", 0))
+
         return RouteResult(
             success=True,
             route_cost_sats=total_cost_sats,
             final_hop_fee_ppm=final_hop_fee_ppm,
             hops=len(full_route),
             route=full_route,
+            probability_ppm=probability_ppm,
         )
 
     @staticmethod
