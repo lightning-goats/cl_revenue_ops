@@ -19,6 +19,7 @@ _VALUE_SCORES = {
     "hive": 3,
     "profitable": 2,
     "active": 1,
+    "funded": 1,  # capex budget approved — bootstrap inventory
     "neutral": 0,
 }
 

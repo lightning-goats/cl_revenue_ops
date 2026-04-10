@@ -137,13 +137,15 @@ def _budget_lookup(capex_allocations: Any) -> dict[str, int]:
     return lookup
 
 
-def _value_class(channel: ChannelInput) -> str:
+def _value_class(channel: ChannelInput, remaining_budget_sats: int = 0) -> str:
     if channel.is_hive_member:
         return "hive"
     if channel.is_profitable:
         return "profitable"
     if channel.is_active:
         return "active"
+    if remaining_budget_sats > 0:
+        return "funded"
     return "neutral"
 
 
@@ -167,9 +169,9 @@ def build_state_snapshot(
         if capacity_sats > 0:
             local_ratio = min(1.0, max(0.0, local_sats / capacity_sats))
 
-        value_class = _value_class(channel)
-        is_valuable = value_class in {"hive", "profitable", "active"}
         remaining_budget_sats = max(0, budget_by_channel.get(channel.channel_id, 0))
+        value_class = _value_class(channel, remaining_budget_sats)
+        is_valuable = value_class != "neutral"
 
         normalized_channels.append(
             ChannelState(

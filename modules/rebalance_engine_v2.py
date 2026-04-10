@@ -135,12 +135,12 @@ class RebalanceEngine:
             is_active = False
             if self._profitability:
                 try:
-                    prof = self._profitability.get_channel_profitability(scid)
+                    prof = self._profitability.get_profitability(scid)
                     if prof:
-                        contribution = getattr(prof, 'revenue', None)
-                        if contribution:
-                            is_profitable = getattr(contribution, 'total_contribution_msat', 0) > 0
-                        is_active = getattr(prof, 'total_forward_count', 0) > 5
+                        revenue = getattr(prof, 'revenue', None)
+                        if revenue:
+                            is_profitable = getattr(revenue, 'total_contribution_msat', 0) > 0
+                            is_active = getattr(revenue, 'total_forward_count', 0) > 5
                 except Exception:
                     pass
 
