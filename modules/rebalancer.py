@@ -224,26 +224,13 @@ class JobManager:
         self.source_failure_counts: Dict[str, float] = {}
         self._source_failures_lock = threading.Lock()
 
-        # AskRene integration (read-only): used by EVRebalancer for preflight sizing.
-        self._askrene_cache_ts = 0
-        self._askrene_cache: Dict[str, int] = {}  # short_channel_id_dir -> maximum_msat
-        self._askrene_lock = threading.Lock()
-        self.askrene_layer = getattr(config, 'askrene_layer', 'xpay')
-        self.askrene_max_age_sec = getattr(config, 'askrene_max_age_sec', 900)
 
         # HiveRouter for askrene job reservations (injected by EVRebalancer)
         self.hive_router = None
 
     # ---- SCID helpers (used by EVRebalancer for AskRene lookups) ----
 
-    @staticmethod
-    def _normalize_scid(scid: str) -> str:
-        """Normalize SCID to consistent format (with 'x' separators)."""
-        return scid.replace(':', 'x')
 
-    def _parse_msat(self, v: Any) -> int:
-        """Delegate to shared parse_msat in utils.py."""
-        return _shared_parse_msat(v)
 
     # ---- Stubs for callers that still reference sling-era APIs ----
 
@@ -322,64 +309,7 @@ class JobManager:
 
     # ---- AskRene constraint cache (still used by EVRebalancer) ----
 
-    def _askrene_refresh_cache(self) -> None:
-        """Refresh AskRene constraints cache (best-effort).
 
-        Stores short_channel_id_dir -> maximum_msat for the configured layer.
-        Uses a time-based cache to avoid hammering RPC.
-        """
-        now = int(time.time())
-        with self._askrene_lock:
-            if self._askrene_cache_ts and (now - self._askrene_cache_ts) < 30:
-                return
-        try:
-            res = self.data_service.get_askrene_layers()
-            layers = res.get("layers", [])
-            cache: Dict[str, int] = {}
-            for layer in layers:
-                if layer.get("layer") != self.askrene_layer:
-                    continue
-                for c in layer.get("constraints", []) or []:
-                    scid_dir = c.get("short_channel_id_dir")
-                    try:
-                        ts = int(c.get("timestamp") or 0)
-                        max_msat = self._parse_msat(c.get("maximum_msat", 0))
-                    except (TypeError, ValueError):
-                        continue  # Skip malformed entry, keep rest of cache
-                    if not scid_dir or max_msat <= 0:
-                        continue
-                    # Age filter
-                    if ts and (now - ts) > int(self.askrene_max_age_sec):
-                        continue
-                    # Keep the tightest constraint if multiple
-                    if scid_dir not in cache or max_msat < cache[scid_dir]:
-                        cache[scid_dir] = max_msat
-            with self._askrene_lock:
-                self._askrene_cache = cache
-                self._askrene_cache_ts = now
-        except Exception:
-            # Silent: AskRene is optional.
-            return
-
-    def _askrene_max_sats_for_scid_dir(self, scid: str) -> Optional[int]:
-        """Return the tightest AskRene constraint (in sats) for a given scid (either dir).
-
-        We don't always know the correct /0 vs /1 mapping for pull/push here,
-        so we take the minimum across both directions when present.
-        """
-        self._askrene_refresh_cache()
-        with self._askrene_lock:
-            cache_snapshot = dict(self._askrene_cache)
-        best_msat = None
-        for suffix in ("/0", "/1"):
-            key = f"{scid}{suffix}"
-            v = cache_snapshot.get(key)
-            if v is None:
-                continue
-            best_msat = v if best_msat is None else min(best_msat, v)
-        if best_msat is None:
-            return None
-        return max(0, base_to_sats_floor(best_msat))
 
 
 
@@ -608,15 +538,6 @@ class EVRebalancer:
         except Exception:
             return 1.0
 
-    def _get_hive_corridor_utilization_bias(self, peer_id: str) -> float:
-        """Return bounded multiplicative utilization bias from hive corridor hints. 1.0 if unavailable."""
-        if self.hive_hints is None:
-            return 1.0
-        try:
-            bias = self.hive_hints.get_corridor_utilization_bias(peer_id)
-            return max(0.90, min(1.10, bias))
-        except Exception:
-            return 1.0
 
     @staticmethod
     def _normalize_coordination_value(value: Any) -> str:
@@ -1076,67 +997,6 @@ class EVRebalancer:
             expires_at = 0
         return expires_at <= 0 or expires_at > int(time.time())
 
-    def _apply_coordinated_rebalance_hints(
-        self,
-        candidates: List[RebalanceCandidate],
-        *,
-        our_node_id: Optional[str],
-        leases: List[Dict[str, Any]],
-        recommendations: List[Dict[str, Any]],
-        campaigns: List[Dict[str, Any]],
-    ) -> List[RebalanceCandidate]:
-        if not candidates:
-            return candidates
-
-        filtered: List[RebalanceCandidate] = []
-        for candidate in candidates:
-            suppressed = False
-            for lease in leases:
-                if not self._is_active_foreign_lease(lease, our_node_id):
-                    continue
-                if self._candidate_matches_coordination_entry(candidate, lease):
-                    suppressed = True
-                    break
-            if suppressed:
-                continue
-
-            best_hint_type = candidate.coordination_hint_type
-            best_hint_id = candidate.coordination_hint_id
-            best_rank_bonus = float(candidate.coordination_rank_bonus or 0.0)
-
-            for recommendation in recommendations:
-                if self._coordination_assignment_rank(recommendation, our_node_id) <= 0:
-                    continue
-                if not self._candidate_matches_coordination_entry(candidate, recommendation):
-                    continue
-                rank_bonus = 25.0 + self._coordination_priority_score(recommendation)
-                if rank_bonus > best_rank_bonus:
-                    best_rank_bonus = rank_bonus
-                    best_hint_type = "recommendation"
-                    best_hint_id = str(recommendation.get("recommendation_id") or "").strip()
-
-            for campaign in campaigns:
-                if str(campaign.get("status") or "").strip().lower() != "active":
-                    continue
-                if self._coordination_assignment_rank(campaign, our_node_id) <= 0:
-                    continue
-                if not self._candidate_matches_coordination_entry(candidate, campaign):
-                    continue
-                rank_bonus = 50.0 + self._coordination_priority_score(campaign)
-                if rank_bonus > best_rank_bonus:
-                    best_rank_bonus = rank_bonus
-                    best_hint_type = "campaign"
-                    best_hint_id = str(campaign.get("campaign_id") or "").strip()
-
-            if best_rank_bonus > 0:
-                candidate.reason_code = RebalanceReasonCode.COORDINATED_REBALANCE.value
-                candidate.coordination_hint_type = best_hint_type
-                candidate.coordination_hint_id = best_hint_id
-                candidate.coordination_rank_bonus = best_rank_bonus
-
-            filtered.append(candidate)
-
-        return filtered
 
     @staticmethod
     def _should_skip_futility(fail_count: int, last_error_type: str) -> bool:
@@ -1195,53 +1055,6 @@ class EVRebalancer:
         confidence = max(0.0, min(1.0, total / 10.0))
         return {"rate": rate, "confidence": confidence, "total": total}
 
-    def _estimate_rebalance_success_probability(
-        self,
-        *,
-        dest_peer_id: str,
-        dest_channel: str,
-        source_channel: str,
-    ) -> float:
-        """Blend forwarding reputation with rebalance-specific history."""
-        signals: List[tuple[float, float]] = []
-
-        try:
-            reputation = self.database.get_peer_reputation(dest_peer_id)
-            rep_score = float(reputation.get("score", 0.5) or 0.5)
-        except Exception:
-            rep_score = 0.5
-        signals.append((max(0.10, min(0.95, rep_score)), 0.20))
-
-        signal_sources = [
-            (
-                getattr(self.database, "get_peer_rebalance_success_rate", lambda *_a, **_k: None)(
-                    dest_peer_id, 30
-                ),
-                0.30,
-            ),
-            (
-                self.database.get_channel_rebalance_success_rate(dest_channel, 30),
-                0.30,
-            ),
-            (
-                getattr(self.database, "get_source_rebalance_success_rate", lambda *_a, **_k: None)(
-                    source_channel, 30
-                ),
-                0.20,
-            ),
-        ]
-
-        for raw_signal, base_weight in signal_sources:
-            signal = self._normalize_rebalance_success_signal(raw_signal)
-            if signal is None:
-                continue
-            signals.append((signal["rate"], base_weight * signal["confidence"]))
-
-        total_weight = sum(weight for _, weight in signals)
-        if total_weight <= 0:
-            return 0.5
-        probability = sum(rate * weight for rate, weight in signals) / total_weight
-        return max(0.10, min(0.95, probability))
 
     def _parse_msat(self, v: Any) -> int:
         """Delegate to shared parse_msat in utils.py."""
@@ -1484,23 +1297,6 @@ class EVRebalancer:
         except Exception: 
             return 0.05
 
-    def _get_kalman_metrics(self, channel_id: str) -> Dict[str, float]:
-        """Retrieve Kalman filter state for a channel from the DB.
-
-        Returns dict with flow_ratio, flow_velocity, uncertainty (sqrt of variance_ratio).
-        Falls back to neutral defaults if unavailable.
-        """
-        try:
-            ks = self.database.get_kalman_state(channel_id)
-            if ks:
-                return {
-                    "flow_ratio": float(ks.get("flow_ratio", 0.0)),
-                    "velocity": float(ks.get("flow_velocity", 0.0)),
-                    "uncertainty": math.sqrt(max(0.0, float(ks.get("variance_ratio", 0.1)))),
-                }
-        except Exception:
-            pass
-        return {"flow_ratio": 0.0, "velocity": 0.0, "uncertainty": 0.316}
 
     def _estimate_expected_fee_sats(self, dest_peer_id: str, rebalance_amount: int) -> int:
         """Estimate the expected routing fee (not the max budget) for a rebalance.
@@ -1940,18 +1736,6 @@ class EVRebalancer:
         
         return result
 
-    def _get_route_fee_estimate(self, peer_id: str, amount_msat: int) -> Optional[int]:
-        if amount_msat <= 0:
-            return None
-        try:
-            route = self.data_service.get_route(id=peer_id, amount_msat=amount_msat, riskfactor=10, maxhops=6)
-            if route.get("route"):
-                first_hop = route["route"][0].get("amount_msat", amount_msat)
-                first_hop = self._parse_msat(first_hop) if not isinstance(first_hop, int) else first_hop
-                return max(0, int(((first_hop - amount_msat) / amount_msat) * 1_000_000))
-        except Exception:
-            pass
-        return None
 
     def _select_source_candidates(
         self,
