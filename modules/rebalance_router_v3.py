@@ -170,6 +170,10 @@ class RebalanceRouterV3:
         self.layer_names = list(layer_names)
         self.log = log
         self.found_layers: List[str] = self._probe_layers()
+        # Reuse v2's fee and CLTV lookup helpers. Constructing a v2 instance
+        # here is cheap (no RPC until a method is called) and avoids duplicating
+        # ~80 lines of peer-fee lookup logic.
+        self._v2_helpers = RebalanceRouterV2(plugin, our_node_id)
 
     # ------------------------------------------------------------------
     # Init helpers
@@ -200,3 +204,166 @@ class RebalanceRouterV3:
             msg += f" missing={missing}"
         self.log(msg, "info")
         return found
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def price_pair(
+        self,
+        source_channel_id: str,
+        dest_channel_id: str,
+        source_peer_id: str,
+        dest_peer_id: str,
+        amount_sats: int,
+        exclude: Optional[List[str]] = None,
+    ) -> RouteResult:
+        """Discover and price a circular rebalance route via askrene getroutes.
+
+        Returns a RouteResult matching the v2 router's shape so the engine
+        and executor can consume either router's output transparently.
+        """
+        final_hop_fee_ppm = self._v2_helpers._get_final_hop_fee_ppm(dest_peer_id)
+        if final_hop_fee_ppm is None:
+            return RouteResult(
+                success=False,
+                error=f"cannot determine final-hop fee for peer {dest_peer_id}",
+            )
+        dest_cltv = self._v2_helpers._get_dest_channel_cltv(dest_peer_id)
+        final_hop_fee_sats = self._v2_helpers._compute_final_hop_fee_sats(
+            amount_sats, final_hop_fee_ppm
+        )
+
+        route_amount_msat = (amount_sats + final_hop_fee_sats) * 1000
+        layers = list(self.found_layers)
+        if exclude:
+            with self._exclude_layer(exclude) as exc_layer:
+                if exc_layer is not None:
+                    layers.append(exc_layer)
+                return self._price_pair_inner(
+                    source_channel_id=source_channel_id,
+                    dest_channel_id=dest_channel_id,
+                    source_peer_id=source_peer_id,
+                    dest_peer_id=dest_peer_id,
+                    amount_sats=amount_sats,
+                    route_amount_msat=route_amount_msat,
+                    final_hop_fee_ppm=final_hop_fee_ppm,
+                    dest_cltv=dest_cltv,
+                    layers=layers,
+                )
+        return self._price_pair_inner(
+            source_channel_id=source_channel_id,
+            dest_channel_id=dest_channel_id,
+            source_peer_id=source_peer_id,
+            dest_peer_id=dest_peer_id,
+            amount_sats=amount_sats,
+            route_amount_msat=route_amount_msat,
+            final_hop_fee_ppm=final_hop_fee_ppm,
+            dest_cltv=dest_cltv,
+            layers=layers,
+        )
+
+    def _price_pair_inner(
+        self,
+        *,
+        source_channel_id: str,
+        dest_channel_id: str,
+        source_peer_id: str,
+        dest_peer_id: str,
+        amount_sats: int,
+        route_amount_msat: int,
+        final_hop_fee_ppm: int,
+        dest_cltv: int,
+        layers: List[str],
+    ) -> RouteResult:
+        try:
+            result = self.plugin.rpc.getroutes(
+                source=source_peer_id,
+                destination=dest_peer_id,
+                amount_msat=route_amount_msat,
+                layers=layers,
+                maxfee_msat=route_amount_msat,
+                final_cltv=dest_cltv,
+            )
+        except Exception as e:
+            reason, detail = _translate_getroutes_error(str(e))
+            return RouteResult(success=False, error=f"{reason}: {detail}")
+
+        routes = result.get("routes", [])
+        if not routes:
+            return RouteResult(success=False, error="no_route: getroutes returned empty")
+
+        cheapest = min(routes, key=self._route_fee_msat)
+        path = cheapest.get("path", [])
+
+        ok, reason = _validate_path_shape(
+            path,
+            our_node_id=self.our_node_id,
+            source_channel_id=source_channel_id,
+            dest_channel_id=dest_channel_id,
+        )
+        if not ok:
+            return RouteResult(success=False, error=f"{reason}: path shape invalid")
+
+        sendpay_route = [_translate_getroutes_hop_to_sendpay(hop) for hop in path]
+        total_fee_msat = self._route_fee_msat(cheapest)
+        total_fee_sats = (total_fee_msat + 999) // 1000
+
+        return RouteResult(
+            success=True,
+            route_cost_sats=total_fee_sats,
+            final_hop_fee_ppm=final_hop_fee_ppm,
+            hops=len(sendpay_route),
+            route=sendpay_route,
+        )
+
+    @staticmethod
+    def _route_fee_msat(route: Dict[str, Any]) -> int:
+        path = route.get("path", [])
+        if not path:
+            return 10**18
+        first_amt = _parse_msat(path[0]["amount_msat"])
+        delivered = _parse_msat(route.get("amount_msat", 0))
+        return max(0, first_amt - delivered)
+
+    @contextmanager
+    def _exclude_layer(
+        self, failed_channel_ids: List[str]
+    ) -> Iterator[Optional[str]]:
+        """Create a throwaway layer disabling the given channels.
+
+        Yields the layer name (or None when the input is empty) and removes
+        the layer on context exit — even on exception. Ephemeral
+        (persistent=false) so the datastore never grows.
+        """
+        if not failed_channel_ids:
+            yield None
+            return
+
+        RebalanceRouterV3._exclude_counter += 1
+        import time as _time
+        layer_name = (
+            f"rebalance-exclude-{int(_time.time())}-{RebalanceRouterV3._exclude_counter}"
+        )
+
+        try:
+            self.plugin.rpc.call("askrene-create-layer", {"layer": layer_name})
+            for scid in failed_channel_ids:
+                for direction in (0, 1):
+                    self.plugin.rpc.call(
+                        "askrene-update-channel",
+                        {
+                            "layer": layer_name,
+                            "short_channel_id_dir": f"{scid}/{direction}",
+                            "enabled": False,
+                        },
+                    )
+            yield layer_name
+        finally:
+            try:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": layer_name})
+            except Exception as e:
+                self.log(
+                    f"[router-v3] failed to remove exclude layer {layer_name}: {e}",
+                    "warn",
+                )

@@ -277,3 +277,185 @@ def test_validate_path_rejects_empty():
     )
     assert ok is False
     assert reason == "path_loops_through_us"
+
+
+# ---------------------------------------------------------------------------
+# Task 7: price_pair happy path
+# ---------------------------------------------------------------------------
+
+
+OUR_ID = "0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3"
+SRC_PEER = "03" + "a" * 64
+DST_PEER = "03" + "b" * 64
+
+
+def _make_plugin_with_listchannels_fee(fee_ppm: int = 0, cltv: int = 40):
+    plugin = MagicMock()
+    plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    plugin.rpc.listchannels.return_value = {
+        "channels": [{
+            "source": DST_PEER,
+            "destination": OUR_ID,
+            "fee_per_millionth": fee_ppm,
+            "delay": cltv,
+        }]
+    }
+    return plugin
+
+
+def _make_v3_router(plugin, layer_names=("hive-fleet",)):
+    from modules.rebalance_router_v3 import RebalanceRouterV3
+    return RebalanceRouterV3(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        layer_names=list(layer_names),
+        log=lambda m, l: None,
+    )
+
+
+def test_price_pair_calls_getroutes_with_expected_args():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    plugin.rpc.getroutes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000,
+            "final_cltv": 40,
+            "path": [
+                {"short_channel_id_dir": "100x1x0/1", "next_node_id": SRC_PEER, "amount_msat": 100333, "delay": 106},
+                {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
+            ],
+        }],
+    }
+
+    r = _make_v3_router(plugin)
+    # Reverse the peer order — in price_pair we're asking for source_peer -> dest_peer,
+    # but the path is source_peer -> ... -> our_node. The first hop outbound from
+    # source_peer uses our channel with source_peer (direction /1 = peer->us).
+    # For the test, the path must match the requested (source_channel_id, dest_channel_id).
+    plugin.rpc.getroutes.return_value["routes"][0]["path"] = [
+        {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "c" * 64, "amount_msat": 100333, "delay": 106},
+        {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
+    ]
+
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+
+    assert result.success is True, f"unexpected failure: {result.error}"
+    plugin.rpc.getroutes.assert_called_once()
+    kwargs = plugin.rpc.getroutes.call_args.kwargs
+    assert kwargs["source"] == SRC_PEER
+    assert kwargs["destination"] == DST_PEER
+    assert kwargs["amount_msat"] == 100 * 1000
+    assert "hive-fleet" in kwargs["layers"]
+    assert result.hops == 2
+
+
+def test_price_pair_picks_cheapest_when_multiple_routes():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    plugin.rpc.getroutes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [
+            {"probability_ppm": 990000, "amount_msat": 100000, "final_cltv": 40, "path": [
+                {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "c" * 64, "amount_msat": 100500, "delay": 106},
+                {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
+            ]},
+            {"probability_ppm": 990000, "amount_msat": 100000, "final_cltv": 40, "path": [
+                {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "c" * 64, "amount_msat": 100100, "delay": 106},
+                {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
+            ]},
+        ],
+    }
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+    assert result.success is True
+    assert result.route_cost_sats <= 1  # cheapest route was 100 msat fee, rounds up to 1 sat
+
+
+def test_price_pair_returns_failure_on_empty_routes():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    plugin.rpc.getroutes.return_value = {"probability_ppm": 0, "routes": []}
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+    assert result.success is False
+    assert "no_route" in result.error
+
+
+def test_price_pair_rejects_loop_through_us():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    plugin.rpc.getroutes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{"probability_ppm": 990000, "amount_msat": 100000, "final_cltv": 40, "path": [
+            {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "c" * 64, "amount_msat": 100200, "delay": 106},
+            {"short_channel_id_dir": "999x9x9/0", "next_node_id": OUR_ID, "amount_msat": 100100, "delay": 80},
+            {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
+        ]}],
+    }
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+    assert result.success is False
+    assert "path_loops_through_us" in result.error
+
+
+def test_price_pair_returns_failure_when_final_hop_fee_unknown():
+    """When v2 helper can't find the dest peer's inbound fee, fail cleanly."""
+    plugin = MagicMock()
+    plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    plugin.rpc.listchannels.return_value = {"channels": []}  # no channel info for dest
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+    assert result.success is False
+    assert "fee" in result.error.lower()
+    # Should NOT have called getroutes — we bail before that
+    plugin.rpc.getroutes.assert_not_called()
+
+
+def test_price_pair_handles_getroutes_rpc_error():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    plugin.rpc.getroutes.side_effect = Exception("Unknown source node 03abc")
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+    assert result.success is False
+    assert "unknown_source_node" in result.error
