@@ -4,15 +4,29 @@ Every cycle must explain itself. For every valuable channel the engine
 evaluates, one of the ``log_*`` helpers emits a deterministic, grep-friendly
 record that replaces the vague ad-hoc messages of the v1 engine.
 
-Tag vocabulary (``reason`` field in REBAL_SKIP):
-    selected, skipped_inside_band, skipped_not_valuable, skipped_no_partner,
-    skipped_no_budget, skipped_no_route, skipped_route_over_budget,
-    skipped_cooldown, skipped_policy
+Canonical skip reasons live in ``VALID_SKIP_REASONS``.
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
+
+
+VALID_SKIP_REASONS: frozenset[str] = frozenset({
+    # Produced by the planner
+    "inside_band",
+    "not_valuable",
+    "no_partner",
+    "cooldown",
+    "no_budget",
+    "max_pairs_reached",
+    "outcompeted",
+    # Produced by the router / engine
+    "no_route",
+    "route_over_budget",
+    # Produced by the engine's pair-level futility tracker
+    "pair_futility",
+})
 
 
 class RebalanceAudit:

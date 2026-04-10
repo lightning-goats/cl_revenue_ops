@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .rebalance_audit_v2 import RebalanceAudit
 from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
@@ -54,6 +54,16 @@ class RebalanceEngine:
         self._pool = ThreadPoolExecutor(
             max_workers=3, thread_name_prefix="rebal-v2"
         )
+        # Pair-level futility tracker: {(src_scid, dst_scid): [failure_ts, ...]}.
+        # A pair that fails _futility_threshold times within _futility_window_sec
+        # is skipped from subsequent cycles until the stale entries decay out
+        # of the window. Prevents re-picking the same unroutable pair every
+        # cycle (the old JobManager futility breaker was stubbed during the
+        # cleanup refactor; this replaces it at the engine level so it covers
+        # both v2 and v3 routers).
+        self._pair_failures: Dict[Tuple[str, str], List[float]] = {}
+        self._futility_threshold: int = 3
+        self._futility_window_sec: float = 1800.0  # 30 minutes
 
     def shutdown(self) -> None:
         """Release thread pool resources."""
@@ -254,6 +264,35 @@ class RebalanceEngine:
 
         return plan.selected
 
+    def _prune_pair_failures(self, key: Tuple[str, str]) -> List[float]:
+        """Drop failure timestamps older than the futility window and return survivors."""
+        timestamps = self._pair_failures.get(key, [])
+        if not timestamps:
+            return timestamps
+        cutoff = time.time() - self._futility_window_sec
+        fresh = [t for t in timestamps if t >= cutoff]
+        if len(fresh) != len(timestamps):
+            if fresh:
+                self._pair_failures[key] = fresh
+            else:
+                self._pair_failures.pop(key, None)
+        return fresh
+
+    def _is_pair_in_futility(self, source_channel_id: str, dest_channel_id: str) -> bool:
+        """Return True if this pair has hit the failure threshold in the window."""
+        key = (source_channel_id, dest_channel_id)
+        fresh = self._prune_pair_failures(key)
+        return len(fresh) >= self._futility_threshold
+
+    def _record_pair_failure(self, source_channel_id: str, dest_channel_id: str) -> None:
+        """Record an execution failure for this pair at the current time."""
+        key = (source_channel_id, dest_channel_id)
+        self._pair_failures.setdefault(key, []).append(time.time())
+
+    def _record_pair_success(self, source_channel_id: str, dest_channel_id: str) -> None:
+        """Clear any failure history for this pair (success resets the counter)."""
+        self._pair_failures.pop((source_channel_id, dest_channel_id), None)
+
     def _execute_pair(
         self,
         pair: PairCandidate,
@@ -286,7 +325,11 @@ class RebalanceEngine:
         return exec_result
 
     def run_cycle(self) -> CycleResult:
-        """Live execution: find candidates (already priced), execute concurrently."""
+        """Live execution: find candidates (already priced), execute concurrently.
+
+        Filters out pairs in futility state before submitting to the executor,
+        and records success/failure in the pair tracker for the next cycle.
+        """
         result = CycleResult()
 
         candidates = self.find_candidates()
@@ -295,11 +338,35 @@ class RebalanceEngine:
         if not candidates:
             return result
 
+        # Pair-level futility filter: skip pairs that failed too many times in
+        # the recent window. Emits a pair_futility audit record so the skip is
+        # visible in the REBAL_SKIP stream.
+        live_candidates: List[PairCandidate] = []
+        for pair in candidates:
+            if self._is_pair_in_futility(pair.source_channel_id, pair.dest_channel_id):
+                fresh = self._pair_failures.get(
+                    (pair.source_channel_id, pair.dest_channel_id), []
+                )
+                self._audit.log_skip(
+                    channel_id=pair.dest_channel_id,
+                    reason="pair_futility",
+                    value_class="valuable",
+                    detail=(
+                        f"src={pair.source_channel_id} "
+                        f"failures={len(fresh)} in window {int(self._futility_window_sec)}s"
+                    ),
+                )
+                continue
+            live_candidates.append(pair)
+
+        if not live_candidates:
+            return result
+
         executor = RebalanceExecutor(self.plugin, self.database)
 
-        # Submit all candidates to the thread pool
+        # Submit the surviving candidates to the thread pool
         futures: Dict[Future, PairCandidate] = {}
-        for pair in candidates:
+        for pair in live_candidates:
             future = self._pool.submit(self._execute_pair, pair, executor)
             futures[future] = pair
 
@@ -311,7 +378,23 @@ class RebalanceEngine:
                     exec_result = future.result()
                     if exec_result is not None:
                         result.executions.append(exec_result)
+                        if exec_result.success:
+                            self._record_pair_success(
+                                pair.source_channel_id, pair.dest_channel_id
+                            )
+                        else:
+                            self._record_pair_failure(
+                                pair.source_channel_id, pair.dest_channel_id
+                            )
+                    else:
+                        # _execute_pair returned None (no route stored on the pair) — count as failure
+                        self._record_pair_failure(
+                            pair.source_channel_id, pair.dest_channel_id
+                        )
                 except Exception as e:
+                    self._record_pair_failure(
+                        pair.source_channel_id, pair.dest_channel_id
+                    )
                     self._log(
                         f"Execution thread failed for "
                         f"{pair.source_channel_id}->{pair.dest_channel_id}: {e}",
