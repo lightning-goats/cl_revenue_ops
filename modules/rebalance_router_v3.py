@@ -94,44 +94,34 @@ def _translate_getroutes_hop_to_sendpay(hop: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _validate_path_shape(
+def _validate_getroutes_middle_path(
     path: List[Dict[str, Any]],
     *,
     our_node_id: str,
-    source_channel_id: str,
-    dest_channel_id: str,
+    dest_peer_id: str,
 ) -> Tuple[bool, str]:
-    """Validate that a getroutes path has the expected circular shape.
+    """Validate that a getroutes response's middle path is a clean peer_A → peer_B path.
 
-    Accepts iff:
-      - path is non-empty
-      - first hop's SCID matches ``source_channel_id``
-      - last hop's SCID matches ``dest_channel_id``
-      - last hop lands at our node (``next_node_id == our_node_id``)
-      - no intermediate hop routes through our node (except the final hop)
+    A pair-pinned getroutes call asks for ``source=peer_A, destination=peer_B``
+    where neither endpoint is us. Askrene returns the internal path between
+    them. For a viable circular-rebalance middle, the path must:
 
-    Rejection reason is always ``path_loops_through_us`` — the planner
-    treats this as a specific skip reason and retries if appropriate.
-    See research Section 3.4 for why this validation matters.
+      - be non-empty
+      - terminate at ``dest_peer_id`` (askrene honored the destination)
+      - not contain our own node as any hop's ``next_node_id`` (routing
+        through us as an intermediate creates a degenerate loop — see
+        research Section 3.4)
+
+    V3 then prepends our outgoing source hop and appends our incoming
+    dest hop to build the full circular sendpay route.
     """
     if not path:
         return False, "path_loops_through_us"
-
-    first_scid, _ = path[0]["short_channel_id_dir"].rsplit("/", 1)
-    if first_scid != source_channel_id:
+    if path[-1]["next_node_id"] != dest_peer_id:
         return False, "path_loops_through_us"
-
-    last = path[-1]
-    if last["next_node_id"] != our_node_id:
-        return False, "path_loops_through_us"
-    last_scid, _ = last["short_channel_id_dir"].rsplit("/", 1)
-    if last_scid != dest_channel_id:
-        return False, "path_loops_through_us"
-
-    for hop in path[:-1]:
+    for hop in path:
         if hop["next_node_id"] == our_node_id:
             return False, "path_loops_through_us"
-
     return True, ""
 
 
@@ -291,30 +281,67 @@ class RebalanceRouterV3:
 
         routes = result.get("routes", [])
         if not routes:
-            return RouteResult(success=False, error="no_route: getroutes returned empty")
+            return RouteResult(
+                success=False, error="no_route: getroutes returned empty"
+            )
 
         cheapest = min(routes, key=self._route_fee_msat)
-        path = cheapest.get("path", [])
+        middle_path = cheapest.get("path", [])
 
-        ok, reason = _validate_path_shape(
-            path,
+        ok, reason = _validate_getroutes_middle_path(
+            middle_path,
             our_node_id=self.our_node_id,
-            source_channel_id=source_channel_id,
-            dest_channel_id=dest_channel_id,
+            dest_peer_id=dest_peer_id,
         )
         if not ok:
-            return RouteResult(success=False, error=f"{reason}: path shape invalid")
+            return RouteResult(
+                success=False, error=f"{reason}: middle path invalid"
+            )
 
-        sendpay_route = [_translate_getroutes_hop_to_sendpay(hop) for hop in path]
-        total_fee_msat = self._route_fee_msat(cheapest)
-        total_fee_sats = (total_fee_msat + 999) // 1000
+        middle_sendpay = [
+            _translate_getroutes_hop_to_sendpay(hop) for hop in middle_path
+        ]
+
+        # Wrap the middle path with our own first and last hops to produce
+        # a full circular sendpay route: us → peer_A → ... → peer_B → us.
+        # v2's executor expects sendpay format (channel, direction, id, amount, delay).
+        middle_fee_msat = self._route_fee_msat(cheapest)
+        final_hop_fee_sats = self._v2_helpers._compute_final_hop_fee_sats(
+            amount_sats, final_hop_fee_ppm
+        )
+        total_forward_msat = (
+            amount_sats + final_hop_fee_sats + (middle_fee_msat + 999) // 1000
+        ) * 1000
+
+        first_hop_delay = (
+            middle_sendpay[0]["delay"] if middle_sendpay else 0
+        ) + dest_cltv
+
+        first_hop = {
+            "id": source_peer_id,
+            "channel": source_channel_id,
+            "amount_msat": total_forward_msat,
+            "delay": first_hop_delay,
+        }
+        final_hop = {
+            "id": self.our_node_id,
+            "channel": dest_channel_id,
+            "amount_msat": amount_sats * 1000,
+            "delay": 0,
+        }
+
+        full_route = [first_hop] + middle_sendpay + [final_hop]
+
+        total_cost_sats = (
+            (middle_fee_msat + 999) // 1000
+        ) + final_hop_fee_sats
 
         return RouteResult(
             success=True,
-            route_cost_sats=total_fee_sats,
+            route_cost_sats=total_cost_sats,
             final_hop_fee_ppm=final_hop_fee_ppm,
-            hops=len(sendpay_route),
-            route=sendpay_route,
+            hops=len(full_route),
+            route=full_route,
         )
 
     @staticmethod

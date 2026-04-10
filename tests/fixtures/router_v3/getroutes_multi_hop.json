@@ -1,0 +1,30 @@
+{
+  "probability_ppm": 998678,
+  "routes": [
+    {
+      "probability_ppm": 998678,
+      "amount_msat": 5000000,
+      "final_cltv": 40,
+      "path": [
+        {
+          "short_channel_id_dir": "942863x384x9/1",
+          "next_node_id": "0298f6074a454a1f5345cb2a7c6f9fce206cd0bf675d177cdbf0ca7508dd28852f",
+          "amount_msat": 5001000,
+          "delay": 298
+        },
+        {
+          "short_channel_id_dir": "930327x2105x0/1",
+          "next_node_id": "026165850492521f4ac8abd9bd8088123446d126f648ca35e60f88177dc149ceb2",
+          "amount_msat": 5000005,
+          "delay": 264
+        },
+        {
+          "short_channel_id_dir": "903815x2481x1/0",
+          "next_node_id": "03c157946cc1cd376b929e36006e645fae490b1b1d4156b40db804e01b4bda48cd",
+          "amount_msat": 5000005,
+          "delay": 120
+        }
+      ]
+    }
+  ]
+}

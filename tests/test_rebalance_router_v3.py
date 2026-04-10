@@ -176,104 +176,61 @@ def test_translate_hop_msat_string_input():
 
 
 # ---------------------------------------------------------------------------
-# Task 6: path-shape validator
+# Task 6: middle-path validator
 # ---------------------------------------------------------------------------
 
 
-def test_validate_path_accepts_valid_circular_shape():
-    from modules.rebalance_router_v3 import _validate_path_shape
+def test_validate_middle_accepts_clean_peer_to_peer():
+    from modules.rebalance_router_v3 import _validate_getroutes_middle_path
     our_id = "03" + "u" * 64
+    dst_peer = "03" + "b" * 64
     path = [
-        {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "a" * 64, "amount_msat": 1000, "delay": 100},
-        {"short_channel_id_dir": "150x1x0/0", "next_node_id": "03" + "b" * 64, "amount_msat": 999, "delay": 80},
-        {"short_channel_id_dir": "200x2x0/0", "next_node_id": our_id, "amount_msat": 998, "delay": 40},
+        {"short_channel_id_dir": "100x1x0/0", "next_node_id": "03" + "x" * 64, "amount_msat": 1000, "delay": 80},
+        {"short_channel_id_dir": "200x2x0/0", "next_node_id": dst_peer, "amount_msat": 998, "delay": 40},
     ]
-    ok, reason = _validate_path_shape(
-        path,
-        our_node_id=our_id,
-        source_channel_id="100x1x0",
-        dest_channel_id="200x2x0",
+    ok, reason = _validate_getroutes_middle_path(
+        path, our_node_id=our_id, dest_peer_id=dst_peer
     )
     assert ok is True
     assert reason == ""
 
 
-def test_validate_path_rejects_loop_through_us():
-    from modules.rebalance_router_v3 import _validate_path_shape
+def test_validate_middle_rejects_path_through_us_as_intermediate():
+    from modules.rebalance_router_v3 import _validate_getroutes_middle_path
     our_id = "03" + "u" * 64
+    dst_peer = "03" + "b" * 64
     path = [
-        {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "a" * 64, "amount_msat": 1000, "delay": 100},
-        {"short_channel_id_dir": "999x9x9/0", "next_node_id": our_id, "amount_msat": 999, "delay": 80},
-        {"short_channel_id_dir": "200x2x0/0", "next_node_id": our_id, "amount_msat": 998, "delay": 40},
+        # Intermediate hop routes through us = degenerate loop
+        {"short_channel_id_dir": "100x1x0/0", "next_node_id": our_id, "amount_msat": 1000, "delay": 80},
+        {"short_channel_id_dir": "200x2x0/0", "next_node_id": dst_peer, "amount_msat": 998, "delay": 40},
     ]
-    ok, reason = _validate_path_shape(
-        path,
-        our_node_id=our_id,
-        source_channel_id="100x1x0",
-        dest_channel_id="200x2x0",
+    ok, reason = _validate_getroutes_middle_path(
+        path, our_node_id=our_id, dest_peer_id=dst_peer
     )
     assert ok is False
     assert reason == "path_loops_through_us"
 
 
-def test_validate_path_rejects_wrong_source_channel():
-    from modules.rebalance_router_v3 import _validate_path_shape
+def test_validate_middle_rejects_path_not_ending_at_dest_peer():
+    from modules.rebalance_router_v3 import _validate_getroutes_middle_path
     our_id = "03" + "u" * 64
+    dst_peer = "03" + "b" * 64
     path = [
-        {"short_channel_id_dir": "999x9x9/1", "next_node_id": "03" + "a" * 64, "amount_msat": 1000, "delay": 100},
-        {"short_channel_id_dir": "200x2x0/0", "next_node_id": our_id, "amount_msat": 998, "delay": 40},
-    ]
-    ok, reason = _validate_path_shape(
-        path,
-        our_node_id=our_id,
-        source_channel_id="100x1x0",
-        dest_channel_id="200x2x0",
-    )
-    assert ok is False
-    assert reason == "path_loops_through_us"
-
-
-def test_validate_path_rejects_wrong_dest_channel():
-    from modules.rebalance_router_v3 import _validate_path_shape
-    our_id = "03" + "u" * 64
-    path = [
-        {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "a" * 64, "amount_msat": 1000, "delay": 100},
-        {"short_channel_id_dir": "888x8x8/0", "next_node_id": our_id, "amount_msat": 998, "delay": 40},
-    ]
-    ok, reason = _validate_path_shape(
-        path,
-        our_node_id=our_id,
-        source_channel_id="100x1x0",
-        dest_channel_id="200x2x0",
-    )
-    assert ok is False
-    assert reason == "path_loops_through_us"
-
-
-def test_validate_path_rejects_path_not_landing_at_us():
-    from modules.rebalance_router_v3 import _validate_path_shape
-    our_id = "03" + "u" * 64
-    path = [
-        {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "a" * 64, "amount_msat": 1000, "delay": 100},
+        {"short_channel_id_dir": "100x1x0/0", "next_node_id": "03" + "x" * 64, "amount_msat": 1000, "delay": 80},
+        # Ends at wrong node
         {"short_channel_id_dir": "200x2x0/0", "next_node_id": "03" + "z" * 64, "amount_msat": 998, "delay": 40},
     ]
-    ok, reason = _validate_path_shape(
-        path,
-        our_node_id=our_id,
-        source_channel_id="100x1x0",
-        dest_channel_id="200x2x0",
+    ok, reason = _validate_getroutes_middle_path(
+        path, our_node_id=our_id, dest_peer_id=dst_peer
     )
     assert ok is False
     assert reason == "path_loops_through_us"
 
 
-def test_validate_path_rejects_empty():
-    from modules.rebalance_router_v3 import _validate_path_shape
-    ok, reason = _validate_path_shape(
-        [],
-        our_node_id="03" + "u" * 64,
-        source_channel_id="100x1x0",
-        dest_channel_id="200x2x0",
+def test_validate_middle_rejects_empty():
+    from modules.rebalance_router_v3 import _validate_getroutes_middle_path
+    ok, reason = _validate_getroutes_middle_path(
+        [], our_node_id="03" + "u" * 64, dest_peer_id="03" + "b" * 64
     )
     assert ok is False
     assert reason == "path_loops_through_us"
@@ -314,6 +271,14 @@ def _make_v3_router(plugin, layer_names=("hive-fleet",)):
     )
 
 
+def _clean_middle_path_peer_A_to_peer_B():
+    """Returns a middle path peer_A → X → peer_B that askrene might return."""
+    return [
+        {"short_channel_id_dir": "111x1x1/0", "next_node_id": "03" + "x" * 64, "amount_msat": 100333, "delay": 106},
+        {"short_channel_id_dir": "222x2x2/0", "next_node_id": DST_PEER, "amount_msat": 100000, "delay": 40},
+    ]
+
+
 def test_price_pair_calls_getroutes_with_expected_args():
     plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
     plugin.rpc.getroutes.return_value = {
@@ -322,23 +287,11 @@ def test_price_pair_calls_getroutes_with_expected_args():
             "probability_ppm": 990000,
             "amount_msat": 100000,
             "final_cltv": 40,
-            "path": [
-                {"short_channel_id_dir": "100x1x0/1", "next_node_id": SRC_PEER, "amount_msat": 100333, "delay": 106},
-                {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
-            ],
+            "path": _clean_middle_path_peer_A_to_peer_B(),
         }],
     }
 
     r = _make_v3_router(plugin)
-    # Reverse the peer order — in price_pair we're asking for source_peer -> dest_peer,
-    # but the path is source_peer -> ... -> our_node. The first hop outbound from
-    # source_peer uses our channel with source_peer (direction /1 = peer->us).
-    # For the test, the path must match the requested (source_channel_id, dest_channel_id).
-    plugin.rpc.getroutes.return_value["routes"][0]["path"] = [
-        {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "c" * 64, "amount_msat": 100333, "delay": 106},
-        {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
-    ]
-
     result = r.price_pair(
         source_channel_id="100x1x0",
         dest_channel_id="200x2x0",
@@ -354,7 +307,12 @@ def test_price_pair_calls_getroutes_with_expected_args():
     assert kwargs["destination"] == DST_PEER
     assert kwargs["amount_msat"] == 100 * 1000
     assert "hive-fleet" in kwargs["layers"]
-    assert result.hops == 2
+    # 2 middle hops + 1 first hop (us -> peer_A) + 1 final hop (peer_B -> us) = 4
+    assert result.hops == 4
+    assert result.route[0]["channel"] == "100x1x0"
+    assert result.route[0]["id"] == SRC_PEER
+    assert result.route[-1]["channel"] == "200x2x0"
+    assert result.route[-1]["id"] == OUR_ID
 
 
 def test_price_pair_picks_cheapest_when_multiple_routes():
@@ -362,13 +320,15 @@ def test_price_pair_picks_cheapest_when_multiple_routes():
     plugin.rpc.getroutes.return_value = {
         "probability_ppm": 990000,
         "routes": [
+            # Expensive middle path: 500 msat fee
             {"probability_ppm": 990000, "amount_msat": 100000, "final_cltv": 40, "path": [
-                {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "c" * 64, "amount_msat": 100500, "delay": 106},
-                {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
+                {"short_channel_id_dir": "111x1x1/0", "next_node_id": "03" + "x" * 64, "amount_msat": 100500, "delay": 106},
+                {"short_channel_id_dir": "222x2x2/0", "next_node_id": DST_PEER, "amount_msat": 100000, "delay": 40},
             ]},
+            # Cheap middle path: 100 msat fee
             {"probability_ppm": 990000, "amount_msat": 100000, "final_cltv": 40, "path": [
-                {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "c" * 64, "amount_msat": 100100, "delay": 106},
-                {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
+                {"short_channel_id_dir": "111x1x1/0", "next_node_id": "03" + "x" * 64, "amount_msat": 100100, "delay": 106},
+                {"short_channel_id_dir": "222x2x2/0", "next_node_id": DST_PEER, "amount_msat": 100000, "delay": 40},
             ]},
         ],
     }
@@ -382,7 +342,7 @@ def test_price_pair_picks_cheapest_when_multiple_routes():
         amount_sats=100,
     )
     assert result.success is True
-    assert result.route_cost_sats <= 1  # cheapest route was 100 msat fee, rounds up to 1 sat
+    assert result.route_cost_sats <= 1  # cheapest middle was 100 msat fee -> rounds to 1 sat
 
 
 def test_price_pair_returns_failure_on_empty_routes():
@@ -406,9 +366,9 @@ def test_price_pair_rejects_loop_through_us():
     plugin.rpc.getroutes.return_value = {
         "probability_ppm": 990000,
         "routes": [{"probability_ppm": 990000, "amount_msat": 100000, "final_cltv": 40, "path": [
-            {"short_channel_id_dir": "100x1x0/1", "next_node_id": "03" + "c" * 64, "amount_msat": 100200, "delay": 106},
-            {"short_channel_id_dir": "999x9x9/0", "next_node_id": OUR_ID, "amount_msat": 100100, "delay": 80},
-            {"short_channel_id_dir": "200x2x0/0", "next_node_id": OUR_ID, "amount_msat": 100000, "delay": 40},
+            # Middle path: peer_A → us → peer_B (us as intermediate — degenerate)
+            {"short_channel_id_dir": "111x1x1/0", "next_node_id": OUR_ID, "amount_msat": 100200, "delay": 106},
+            {"short_channel_id_dir": "222x2x2/0", "next_node_id": DST_PEER, "amount_msat": 100000, "delay": 40},
         ]}],
     }
 
@@ -534,3 +494,123 @@ def test_exclude_layer_empty_list_is_noop():
     ]
     assert create_calls == []
     assert remove_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Replay tests — captured live-node getroutes responses
+# ---------------------------------------------------------------------------
+
+
+import json
+import os
+
+
+def _load_fixture(name: str) -> dict:
+    path = os.path.join(
+        os.path.dirname(__file__), "fixtures", "router_v3", name
+    )
+    with open(path) as f:
+        return json.load(f)
+
+
+def test_replay_direct_pair_fixture_is_rejected_as_loop():
+    """Real live capture from Section 3.2 of research — peer_A → us → peer_B.
+
+    This fixture intentionally demonstrates the degenerate 'loops through us'
+    case that v3's path validator is built to reject. See the fixture README
+    for context.
+    """
+    plugin = MagicMock()
+    plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    plugin.rpc.listchannels.return_value = {
+        "channels": [{
+            "source": "03fe80dfe18b0feb77c2e619516a7563ab39423a6c02d06e5246c60eea0e276aac",
+            "destination": "0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
+            "fee_per_millionth": 0,
+            "delay": 40,
+        }]
+    }
+    plugin.rpc.getroutes.return_value = _load_fixture("getroutes_direct_pair.json")
+
+    from modules.rebalance_router_v3 import RebalanceRouterV3
+    r = RebalanceRouterV3(
+        plugin=plugin,
+        our_node_id="0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
+        layer_names=["hive-fleet"],
+        log=lambda m, l: None,
+    )
+    result = r.price_pair(
+        source_channel_id="940132x2695x0",
+        dest_channel_id="940304x912x0",
+        source_peer_id="028f5847b5b4b22e3fa3b0f09b896b256672ca789b4b1f9e2ef1401124a807089c",
+        dest_peer_id="03fe80dfe18b0feb77c2e619516a7563ab39423a6c02d06e5246c60eea0e276aac",
+        amount_sats=1000,
+    )
+    assert result.success is False
+    assert "path_loops_through_us" in result.error
+
+
+def test_replay_multi_hop_fixture_succeeds():
+    """Real live capture from Section 3.3 of research — peer_A → X → Y → peer_B.
+
+    Clean middle path that doesn't touch us. Should produce a full 5-hop
+    sendpay route (1 first + 3 middle + 1 final).
+    """
+    plugin = MagicMock()
+    plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    plugin.rpc.listchannels.return_value = {
+        "channels": [{
+            "source": "03c157946cc1cd376b929e36006e645fae490b1b1d4156b40db804e01b4bda48cd",
+            "destination": "0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
+            "fee_per_millionth": 0,
+            "delay": 40,
+        }]
+    }
+    plugin.rpc.getroutes.return_value = _load_fixture("getroutes_multi_hop.json")
+
+    from modules.rebalance_router_v3 import RebalanceRouterV3
+    r = RebalanceRouterV3(
+        plugin=plugin,
+        our_node_id="0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
+        layer_names=["hive-fleet"],
+        log=lambda m, l: None,
+    )
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03796a3c5b18080db99b0b880e2e326db9f5eb6bf3d7394b924f633da3eae31412",
+        dest_peer_id="03c157946cc1cd376b929e36006e645fae490b1b1d4156b40db804e01b4bda48cd",
+        amount_sats=5000,
+    )
+    assert result.success is True, f"unexpected failure: {result.error}"
+    # 3 middle hops + 1 first + 1 final = 5 total
+    assert result.hops == 5
+
+
+def test_replay_empty_fixture():
+    """getroutes returns no routes — should map to no_route failure."""
+    plugin = MagicMock()
+    plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    plugin.rpc.listchannels.return_value = {
+        "channels": [{
+            "source": DST_PEER,
+            "destination": OUR_ID,
+            "fee_per_millionth": 0,
+            "delay": 40,
+        }]
+    }
+    plugin.rpc.getroutes.return_value = _load_fixture("getroutes_empty.json")
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+    assert result.success is False
+    assert "no_route" in result.error
