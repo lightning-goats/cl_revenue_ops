@@ -265,15 +265,18 @@ class TestLongTier:
         ds.get_node_info("def")
         assert plugin.rpc.listnodes.call_count == 2
 
-    def test_get_askrene_layers(self):
+    def test_get_askrene_layers_is_not_cached(self):
         from modules.data_service import DataService
         plugin = _make_mock_plugin()
-        plugin.rpc.call.return_value = {"layers": [{"layer": "auto.localchans"}]}
+        plugin.rpc.call.side_effect = [
+            {"layers": [{"layer": "auto.localchans"}]},
+            {"layers": [{"layer": "auto.localchans"}, {"layer": "hive-fleet"}]},
+        ]
         ds = DataService(plugin)
         result = ds.get_askrene_layers()
         assert "layers" in result
-        ds.get_askrene_layers()
-        plugin.rpc.call.assert_called_once()
+        assert ds.get_askrene_layers()["layers"][-1]["layer"] == "hive-fleet"
+        assert plugin.rpc.call.call_count == 2
 
     def test_get_feerates(self):
         from modules.data_service import DataService
@@ -373,6 +376,28 @@ class TestNeverCachedTier:
         ds.get_routes(source="a", destination="b", amount_msat=1000)
         ds.get_routes(source="a", destination="b", amount_msat=1000)
         assert plugin.rpc.call.call_count == 2
+
+    def test_askrene_disable_node(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {}
+        ds = DataService(plugin)
+        ds.askrene_disable_node("layer-a", "peer-a")
+        plugin.rpc.call.assert_called_with(
+            "askrene-disable-node",
+            {"layer": "layer-a", "node": "peer-a"},
+        )
+
+    def test_askrene_age(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {}
+        ds = DataService(plugin)
+        ds.askrene_age("layer-a", cutoff=123)
+        plugin.rpc.call.assert_called_with(
+            "askrene-age",
+            {"layer": "layer-a", "cutoff": 123},
+        )
 
     def test_create_invoice(self):
         from modules.data_service import DataService

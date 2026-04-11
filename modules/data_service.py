@@ -7,9 +7,10 @@ plugin.rpc directly.
 
 Cache Tiers:
     FOREVER  — Cached once, never expires (node_id, network, alias, configs)
-    LONG     — 5-10 minute TTL (listnodes, askrene-listlayers, feerates)
+    LONG     — 5-10 minute TTL (listnodes, feerates)
     MEDIUM   — 30 second TTL (listpeerchannels, listfunds, listpeers)
-    NEVER    — Transactional, always live (sendpay, fundchannel, setchannel)
+    NEVER    — Transactional or shared mutable state, always live
+               (sendpay, fundchannel, setchannel, askrene-listlayers)
 
 Thread-safe: uses threading.Lock for all cache operations.
 """
@@ -220,14 +221,13 @@ class DataService:
         return result
 
     def get_askrene_layers(self) -> Dict:
-        """Available askrene route planning layers. Cached 5min."""
-        key = "askrene-listlayers"
-        cached = self._get_cached(key, TTL_LONG)
-        if cached is not None:
-            return cached
-        result = self._plugin.rpc.call("askrene-listlayers", {})
-        self._set_cached(key, result)
-        return result
+        """Available askrene route planning layers. Never cached.
+
+        askrene layers are shared mutable state across plugins. Caching the
+        layer list risks feeding getroutes names that were valid moments ago
+        but have since been removed by another plugin.
+        """
+        return self._plugin.rpc.call("askrene-listlayers", {})
 
     def get_feerates(self, style: str = "perkb") -> Dict:
         """On-chain fee estimates. Cached 5min."""
@@ -358,6 +358,20 @@ class DataService:
         params = {"layer": layer, "short_channel_id_dir": short_channel_id_dir,
                   "description": description, **kwargs}
         return self._plugin.rpc.call("askrene-bias-channel", params)
+
+    def askrene_disable_node(self, layer: str, node: str) -> Dict:
+        """Disable a node in route finding."""
+        return self._plugin.rpc.call(
+            "askrene-disable-node",
+            {"layer": layer, "node": node},
+        )
+
+    def askrene_age(self, layer: str, cutoff: int) -> Dict:
+        """Age stale data in an askrene layer."""
+        return self._plugin.rpc.call(
+            "askrene-age",
+            {"layer": layer, "cutoff": cutoff},
+        )
 
     def askrene_inform_channel(self, layer: str, short_channel_id_dir: str,
                                 amount_msat: int, inform: str) -> Dict:

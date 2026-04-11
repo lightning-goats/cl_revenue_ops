@@ -90,6 +90,22 @@ class TestHiveRouterRefresh:
         assert "askrene-create-layer" in methods
         assert "askrene-remove-layer" not in methods
 
+    def test_recreate_layer_reuses_existing_layer_without_remove(self):
+        plugin = MagicMock()
+
+        def rpc_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": [{"layer": "revenue-local"}]}
+            return {}
+
+        plugin.rpc.call.side_effect = rpc_side_effect
+
+        router = HiveRouter(plugin, MockHiveHints(["fleet_a"]))
+        router._recreate_layer("revenue-local")
+
+        methods = [c[0][0] for c in plugin.rpc.call.call_args_list]
+        assert methods == ["askrene-listlayers"]
+
 
 class TestHiveRouterDiscover:
     def test_discover_returns_route(self):

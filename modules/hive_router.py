@@ -92,19 +92,25 @@ class HiveRouter:
         return {layer.get("layer") for layer in result.get("layers", []) if layer.get("layer")}
 
     def _recreate_layer(self, layer: str) -> None:
-        """Create or recreate an askrene layer without noisy missing-layer RPCs."""
+        """Ensure an askrene layer exists without tearing down live state."""
         if not self.plugin:
             return
         existing = self._existing_layers()
-        if layer in existing:
+        if layer not in existing:
             if self.data_service:
-                self.data_service.askrene_remove_layer(layer)
+                self.data_service.askrene_create_layer(layer)
             else:
-                self.plugin.rpc.call("askrene-remove-layer", {"layer": layer})
-        if self.data_service:
-            self.data_service.askrene_create_layer(layer)
-        else:
-            self.plugin.rpc.call("askrene-create-layer", {"layer": layer})
+                self.plugin.rpc.call("askrene-create-layer", {"layer": layer})
+
+    def _age_layer(self, layer: str, cutoff: int) -> None:
+        """Age stale askrene state without depending on a destructive reset."""
+        try:
+            if self.data_service:
+                self.data_service.askrene_age(layer, cutoff=cutoff)
+            else:
+                self.plugin.rpc.call("askrene-age", {"layer": layer, "cutoff": cutoff})
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Layer Management
@@ -236,6 +242,7 @@ class HiveRouter:
             self._member_ids = member_ids
             self._last_refresh = time.time()
             self.available = updated > 0
+            self._age_layer(self.LAYER_NAME, cutoff=int(time.time()) - 900)
 
             if updated > 0:
                 self._log(
@@ -635,6 +642,8 @@ class HiveRouter:
                         biased += 1
                     except Exception:
                         pass
+
+            self._age_layer(self.LOCAL_LAYER, cutoff=int(time.time()) - 3600)
 
             if biased > 0:
                 self._log(f"Refreshed {self.LOCAL_LAYER} ({biased} profitability biases)")
