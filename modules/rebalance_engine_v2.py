@@ -43,6 +43,7 @@ class RebalanceEngine:
         capex_engine: Any = None,
         profitability: Any = None,
         hive_hints: Any = None,
+        data_service: Any = None,
     ):
         self.plugin = plugin
         self.config = config
@@ -50,6 +51,7 @@ class RebalanceEngine:
         self._capex_engine = capex_engine
         self._profitability = profitability
         self._hive_hints = hive_hints
+        self._data_service = data_service
 
         self._our_id: Optional[str] = None
         self._audit = RebalanceAudit(plugin)
@@ -73,7 +75,9 @@ class RebalanceEngine:
 
         # Build v2 router unconditionally — no RPC dependency at construction.
         our_id = self._get_our_id() or ""
-        self.router_v2 = RebalanceRouter(plugin, our_id)
+        self.router_v2 = RebalanceRouter(
+            plugin, our_id, data_service=self._data_service
+        )
 
         # Build v3 router iff askrene is available. Missing askrene means
         # standalone fallback: the active router stays on v2 regardless of
@@ -88,6 +92,7 @@ class RebalanceEngine:
                 our_node_id=our_id,
                 layer_names=layer_names,
                 log=self._log,
+                data_service=self._data_service,
             )
             # Clean any orphan exclude layers from a previous crashed cycle.
             self._sweep_orphan_exclude_layers()
@@ -97,7 +102,10 @@ class RebalanceEngine:
     def _probe_askrene(self) -> bool:
         """One-shot probe: does this CLN instance have askrene loaded?"""
         try:
-            self.plugin.rpc.call("askrene-listlayers", {})
+            if self._data_service is not None:
+                self._data_service.get_askrene_layers()
+            else:
+                self.plugin.rpc.call("askrene-listlayers", {})
             return True
         except Exception:
             return False
@@ -121,7 +129,10 @@ class RebalanceEngine:
         the number removed, for logging only.
         """
         try:
-            result = self.plugin.rpc.call("askrene-listlayers", {})
+            if self._data_service is not None:
+                result = self._data_service.get_askrene_layers()
+            else:
+                result = self.plugin.rpc.call("askrene-listlayers", {})
         except Exception as e:
             self._log(f"orphan sweep failed to list layers: {e}", level="warn")
             return 0
@@ -133,7 +144,10 @@ class RebalanceEngine:
         ]
         for name in orphans:
             try:
-                self.plugin.rpc.call("askrene-remove-layer", {"layer": name})
+                if self._data_service is not None:
+                    self._data_service.askrene_remove_layer(name)
+                else:
+                    self.plugin.rpc.call("askrene-remove-layer", {"layer": name})
             except Exception as e:
                 self._log(
                     f"failed to remove orphan layer {name}: {e}",
@@ -158,7 +172,10 @@ class RebalanceEngine:
         if self._our_id:
             return self._our_id
         try:
-            self._our_id = self.plugin.rpc.getinfo()["id"]
+            if self._data_service is not None:
+                self._our_id = self._data_service.get_node_id()
+            else:
+                self._our_id = self.plugin.rpc.getinfo()["id"]
         except Exception:
             pass
         return self._our_id
@@ -168,7 +185,10 @@ class RebalanceEngine:
         cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
 
         try:
-            channels_raw = self.plugin.rpc.listpeerchannels().get("channels", [])
+            if self._data_service is not None:
+                channels_raw = self._data_service.get_peer_channels().get("channels", [])
+            else:
+                channels_raw = self.plugin.rpc.listpeerchannels().get("channels", [])
         except Exception as e:
             self._log(f"Failed to get channels: {e}", level="warn")
             return None

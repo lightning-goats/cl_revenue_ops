@@ -7,7 +7,9 @@ absent from the codebase.  The current architecture is DTS+PID only.
 """
 import ast
 import importlib
+import inspect
 import os
+from pathlib import Path
 import pytest
 
 
@@ -18,6 +20,14 @@ def _source_files():
         if name.endswith(".py"):
             yield os.path.join(root, "modules", name)
     yield os.path.join(root, "cl-revenue-ops.py")
+
+
+ROOT = Path(__file__).resolve().parents[1]
+REBALANCE_BOUNDARY_FILES = [
+    ROOT / "modules" / "rebalance_engine_v2.py",
+    ROOT / "modules" / "rebalance_router_v2.py",
+    ROOT / "modules" / "rebalance_router_v3.py",
+]
 
 
 class TestNoHiveReintroduction:
@@ -83,3 +93,61 @@ class TestNoLegacyFeeAlgorithms:
     def test_dts_pid_sample_is_default_reason(self):
         from modules.fee_controller import FeeReasonCode
         assert hasattr(FeeReasonCode, "DTS_PID_SAMPLE")
+
+
+class TestRebalanceDataServiceBoundary:
+    """The active rebalance path must stay behind DataService."""
+
+    def test_hot_path_constructors_accept_data_service(self):
+        from modules.rebalance_engine_v2 import RebalanceEngine
+        from modules.rebalance_router_v2 import RebalanceRouter
+        from modules.rebalance_router_v3 import RebalanceRouterV3
+
+        assert "data_service" in inspect.signature(RebalanceEngine.__init__).parameters
+        assert "data_service" in inspect.signature(RebalanceRouter.__init__).parameters
+        assert "data_service" in inspect.signature(RebalanceRouterV3.__init__).parameters
+
+    def test_hot_path_modules_reference_data_service_wrappers(self):
+        expectations = {
+            "modules/rebalance_engine_v2.py": [
+                "self._data_service.get_askrene_layers",
+                "self._data_service.get_node_id",
+                "self._data_service.get_peer_channels",
+            ],
+            "modules/rebalance_router_v2.py": [
+                "self.data_service.get_peer_channels",
+                "self.data_service.get_channels",
+                "self.data_service.get_configs",
+                "self.data_service.get_route",
+            ],
+            "modules/rebalance_router_v3.py": [
+                "self.data_service.get_askrene_layers",
+                "self.data_service.get_routes",
+                "self.data_service.askrene_create_layer",
+                "self.data_service.askrene_update_channel",
+                "self.data_service.askrene_remove_layer",
+            ],
+        }
+
+        for rel, required_snippets in expectations.items():
+            source = (ROOT / rel).read_text()
+            for snippet in required_snippets:
+                assert snippet in source, f"{snippet} missing from {rel}"
+
+    def test_main_wires_data_service_into_rebalance_engine(self):
+        source = (ROOT / "cl-revenue-ops.py").read_text()
+        tree = ast.parse(source, filename="cl-revenue-ops.py")
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Name) or node.func.id != "RebalanceEngine":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "data_service":
+                    assert isinstance(keyword.value, ast.Name)
+                    assert keyword.value.id == "data_service"
+                    return
+            raise AssertionError("RebalanceEngine call missing data_service=...")
+
+        raise AssertionError("RebalanceEngine call not found in cl-revenue-ops.py")

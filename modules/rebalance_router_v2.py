@@ -48,9 +48,15 @@ class RebalanceRouter:
         our_node_id: Hex pubkey of our node.
     """
 
-    def __init__(self, plugin: Any, our_node_id: str) -> None:
+    def __init__(
+        self,
+        plugin: Any,
+        our_node_id: str,
+        data_service: Optional[Any] = None,
+    ) -> None:
         self.plugin = plugin
         self.our_node_id = our_node_id
+        self.data_service = data_service
         self._invoice_final_cltv: Optional[int] = None
 
     # ------------------------------------------------------------------
@@ -72,7 +78,10 @@ class RebalanceRouter:
         """
         # --- Priority 1: listpeerchannels filtered by peer ---
         try:
-            result = self.plugin.rpc.listpeerchannels(peer_id=dest_peer_id)
+            if self.data_service is not None:
+                result = self.data_service.get_peer_channels(dest_peer_id)
+            else:
+                result = self.plugin.rpc.listpeerchannels(peer_id=dest_peer_id)
             for ch in result.get("channels", []):
                 if ch.get("peer_id") != dest_peer_id:
                     continue
@@ -90,7 +99,10 @@ class RebalanceRouter:
 
         # --- Priority 2: listchannels fallback ---
         try:
-            result = self.plugin.rpc.listchannels(source=dest_peer_id)
+            if self.data_service is not None:
+                result = self.data_service.get_channels(source=dest_peer_id)
+            else:
+                result = self.plugin.rpc.listchannels(source=dest_peer_id)
             for ch in result.get("channels", []):
                 if ch.get("destination") == self.our_node_id:
                     fee_ppm = ch.get("fee_per_millionth")
@@ -129,7 +141,10 @@ class RebalanceRouter:
     def _get_source_channel_policy(self, source_peer_id: str) -> Dict[str, Any]:
         """Get our outbound fee/cltv for the source channel from peer's perspective."""
         try:
-            result = self.plugin.rpc.listpeerchannels(peer_id=source_peer_id)
+            if self.data_service is not None:
+                result = self.data_service.get_peer_channels(source_peer_id)
+            else:
+                result = self.plugin.rpc.listpeerchannels(peer_id=source_peer_id)
             for ch in result.get("channels", []):
                 updates = ch.get("updates") or {}
                 local = updates.get("local") or {}
@@ -145,7 +160,10 @@ class RebalanceRouter:
     def _get_dest_channel_cltv(self, dest_peer_id: str) -> int:
         """Get the dest peer's cltv_expiry_delta for the final hop."""
         try:
-            result = self.plugin.rpc.listpeerchannels(peer_id=dest_peer_id)
+            if self.data_service is not None:
+                result = self.data_service.get_peer_channels(dest_peer_id)
+            else:
+                result = self.plugin.rpc.listpeerchannels(peer_id=dest_peer_id)
             for ch in result.get("channels", []):
                 updates = ch.get("updates") or {}
                 remote = updates.get("remote") or {}
@@ -168,7 +186,10 @@ class RebalanceRouter:
         if self._invoice_final_cltv is not None:
             return self._invoice_final_cltv
         try:
-            result = self.plugin.rpc.listconfigs()
+            if self.data_service is not None:
+                result = self.data_service.get_configs()
+            else:
+                result = self.plugin.rpc.listconfigs()
             configs = result.get("configs", {})
             cltv_cfg = configs.get("cltv-final", {})
             value = cltv_cfg.get("value_int")
@@ -245,7 +266,10 @@ class RebalanceRouter:
                 if exclude:
                     getroute_kwargs["exclude"] = exclude
 
-                result = self.plugin.rpc.getroute(**getroute_kwargs)
+                if self.data_service is not None:
+                    result = self.data_service.get_route(**getroute_kwargs)
+                else:
+                    result = self.plugin.rpc.getroute(**getroute_kwargs)
                 middle_route = result.get("route", [])
             except Exception as e:
                 return RouteResult(

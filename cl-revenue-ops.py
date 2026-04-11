@@ -1592,6 +1592,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             capex_engine=capex_engine,
             profitability=profitability_analyzer,
             hive_hints=hive_hints,
+            data_service=data_service,
         )
         rebalancer.data_service = data_service
         plugin.log("RebalanceEngine initialized")

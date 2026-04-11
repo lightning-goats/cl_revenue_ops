@@ -265,13 +265,14 @@ def _make_plugin_with_listchannels_fee(fee_ppm: int = 0, cltv: int = 40):
     return plugin
 
 
-def _make_v3_router(plugin, layer_names=("hive-fleet",)):
+def _make_v3_router(plugin, layer_names=("hive-fleet",), data_service=None):
     from modules.rebalance_router_v3 import RebalanceRouterV3
     return RebalanceRouterV3(
         plugin=plugin,
         our_node_id=OUR_ID,
         layer_names=list(layer_names),
         log=lambda m, l: None,
+        data_service=data_service,
     )
 
 
@@ -617,6 +618,75 @@ def test_exclude_layer_removes_on_exception():
         if c.args and c.args[0] == "askrene-remove-layer"
     ]
     assert len(remove_calls) == 1, "remove-layer must be called even on exception"
+
+
+def test_v3_router_prefers_data_service_for_routes_and_policy_reads():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    data_service = MagicMock()
+
+    def _get_peer_channels(peer_id=None):
+        if peer_id == DST_PEER:
+            return {
+                "channels": [{
+                    "short_channel_id": "200x2x0",
+                    "peer_id": DST_PEER,
+                    "updates": {
+                        "remote": {
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 40,
+                        }
+                    },
+                }]
+            }
+        return {"channels": []}
+
+    data_service.get_askrene_layers.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    data_service.get_peer_channels.side_effect = _get_peer_channels
+    data_service.get_configs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    data_service.get_routes.return_value = {
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000,
+            "final_cltv": 40,
+            "path": _clean_middle_path_peer_A_to_peer_B(),
+        }],
+    }
+
+    r = _make_v3_router(plugin, data_service=data_service)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+
+    assert result.success is True
+    data_service.get_askrene_layers.assert_called_once_with()
+    data_service.get_routes.assert_called_once()
+    plugin.rpc.call.assert_not_called()
+    plugin.rpc.getroutes.assert_not_called()
+    plugin.rpc.listpeerchannels.assert_not_called()
+    plugin.rpc.listchannels.assert_not_called()
+    plugin.rpc.listconfigs.assert_not_called()
+
+
+def test_v3_exclude_layer_uses_data_service_mutations_when_available():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0)
+    data_service = MagicMock()
+    data_service.get_askrene_layers.return_value = {"layers": [{"layer": "hive-fleet"}]}
+
+    r = _make_v3_router(plugin, data_service=data_service)
+
+    with r._exclude_layer(["934667x311x8/0", "222x2x2/1"]) as layer_name:
+        assert layer_name is not None
+
+    data_service.askrene_create_layer.assert_called_once_with(layer_name)
+    assert data_service.askrene_update_channel.call_count == 2
+    data_service.askrene_remove_layer.assert_called_once_with(layer_name)
+    plugin.rpc.call.assert_not_called()
 
 
 def test_exclude_layer_empty_list_is_noop():

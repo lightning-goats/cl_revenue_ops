@@ -340,3 +340,46 @@ class TestZeroFeePeer:
         assert result.success is True
         assert result.final_hop_fee_ppm == 0
         assert result.route_cost_sats == 0
+
+
+class TestDataServiceRouting:
+    def test_router_prefers_data_service_for_reads_and_route_lookup(self):
+        middle_route = [{
+            "id": DEST_PEER,
+            "channel": "300x1x0",
+            "amount_msat": 50_014_000,
+            "delay": 40,
+        }]
+        plugin = _make_plugin()
+        data_service = MagicMock()
+
+        def _get_peer_channels(peer_id=None):
+            if peer_id == DEST_PEER:
+                return _dest_peer_channels(fee_ppm=275)
+            if peer_id == SOURCE_PEER:
+                return _source_peer_channels()
+            return {"channels": []}
+
+        data_service.get_peer_channels.side_effect = _get_peer_channels
+        data_service.get_channels.return_value = {"channels": []}
+        data_service.get_configs.return_value = {
+            "configs": {"cltv-final": {"value_int": 18}}
+        }
+        data_service.get_route.return_value = {"route": middle_route}
+
+        router = RebalanceRouter(plugin, OUR_ID, data_service=data_service)
+        result = router.price_pair(
+            SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
+        )
+
+        assert result.success is True
+        data_service.get_peer_channels.assert_any_call(DEST_PEER)
+        data_service.get_configs.assert_called_once_with()
+        data_service.get_route.assert_called_once()
+        kwargs = data_service.get_route.call_args.kwargs
+        assert kwargs["node_id"] == DEST_PEER
+        assert kwargs["fromid"] == SOURCE_PEER
+        plugin.rpc.listpeerchannels.assert_not_called()
+        plugin.rpc.listchannels.assert_not_called()
+        plugin.rpc.listconfigs.assert_not_called()
+        plugin.rpc.getroute.assert_not_called()

@@ -155,16 +155,22 @@ class RebalanceRouterV3:
         our_node_id: str,
         layer_names: List[str],
         log: Callable[[str, str], None],
+        data_service: Optional[Any] = None,
     ) -> None:
         self.plugin = plugin
         self.our_node_id = our_node_id
         self.layer_names = list(layer_names)
         self.log = log
+        self.data_service = data_service
         self.found_layers: List[str] = self._probe_layers()
         # Reuse v2's fee and CLTV lookup helpers. Constructing a v2 instance
         # here is cheap (no RPC until a method is called) and avoids duplicating
         # ~80 lines of peer-fee lookup logic.
-        self._v2_helpers = RebalanceRouterV2(plugin, our_node_id)
+        self._v2_helpers = RebalanceRouterV2(
+            plugin,
+            our_node_id,
+            data_service=data_service,
+        )
 
     # ------------------------------------------------------------------
     # Init helpers
@@ -179,7 +185,10 @@ class RebalanceRouterV3:
         names from getroutes calls, so this is never a hard failure.
         """
         try:
-            result = self.plugin.rpc.call("askrene-listlayers", {})
+            if self.data_service is not None:
+                result = self.data_service.get_askrene_layers()
+            else:
+                result = self.plugin.rpc.call("askrene-listlayers", {})
         except Exception as e:
             self.log(f"[router-v3] askrene-listlayers failed: {e}", "warn")
             return []
@@ -275,14 +284,18 @@ class RebalanceRouterV3:
         layers: List[str],
     ) -> RouteResult:
         try:
-            result = self.plugin.rpc.getroutes(
-                source=source_peer_id,
-                destination=dest_peer_id,
-                amount_msat=route_amount_msat,
-                layers=layers,
-                maxfee_msat=route_amount_msat,
-                final_cltv=required_final_cltv,
-            )
+            route_kwargs = {
+                "source": source_peer_id,
+                "destination": dest_peer_id,
+                "amount_msat": route_amount_msat,
+                "layers": layers,
+                "maxfee_msat": route_amount_msat,
+                "final_cltv": required_final_cltv,
+            }
+            if self.data_service is not None:
+                result = self.data_service.get_routes(**route_kwargs)
+            else:
+                result = self.plugin.rpc.getroutes(**route_kwargs)
         except Exception as e:
             reason, detail = _translate_getroutes_error(str(e))
             return RouteResult(success=False, error=f"{reason}: {detail}")
@@ -397,7 +410,10 @@ class RebalanceRouterV3:
         )
 
         try:
-            self.plugin.rpc.call("askrene-create-layer", {"layer": layer_name})
+            if self.data_service is not None:
+                self.data_service.askrene_create_layer(layer_name)
+            else:
+                self.plugin.rpc.call("askrene-create-layer", {"layer": layer_name})
             for entry in failed_channel_ids:
                 # rebalance_executor_v2 reports exclude entries in directional
                 # form 'scid/dir' (PR #82) so getroute and askrene both accept
@@ -406,28 +422,46 @@ class RebalanceRouterV3:
                 # when a bare SCID is passed (legacy callers or diagnostic
                 # entries without direction info).
                 if "/" in entry:
-                    self.plugin.rpc.call(
-                        "askrene-update-channel",
-                        {
-                            "layer": layer_name,
-                            "short_channel_id_dir": entry,
-                            "enabled": False,
-                        },
-                    )
-                else:
-                    for direction in (0, 1):
+                    if self.data_service is not None:
+                        self.data_service.askrene_update_channel(
+                            layer_name,
+                            entry,
+                            enabled=False,
+                        )
+                    else:
                         self.plugin.rpc.call(
                             "askrene-update-channel",
                             {
                                 "layer": layer_name,
-                                "short_channel_id_dir": f"{entry}/{direction}",
+                                "short_channel_id_dir": entry,
                                 "enabled": False,
                             },
                         )
+                else:
+                    for direction in (0, 1):
+                        scid_dir = f"{entry}/{direction}"
+                        if self.data_service is not None:
+                            self.data_service.askrene_update_channel(
+                                layer_name,
+                                scid_dir,
+                                enabled=False,
+                            )
+                        else:
+                            self.plugin.rpc.call(
+                                "askrene-update-channel",
+                                {
+                                    "layer": layer_name,
+                                    "short_channel_id_dir": scid_dir,
+                                    "enabled": False,
+                                },
+                            )
             yield layer_name
         finally:
             try:
-                self.plugin.rpc.call("askrene-remove-layer", {"layer": layer_name})
+                if self.data_service is not None:
+                    self.data_service.askrene_remove_layer(layer_name)
+                else:
+                    self.plugin.rpc.call("askrene-remove-layer", {"layer": layer_name})
             except Exception as e:
                 self.log(
                     f"[router-v3] failed to remove exclude layer {layer_name}: {e}",
