@@ -311,3 +311,138 @@ def test_execute_pair_retry_does_not_loop_infinitely():
     assert executor.execute.call_count == 2
     # Exactly 1 price_pair call for the retry
     assert mock_router.price_pair.call_count == 1
+
+
+def test_execute_pair_retry_merges_remembered_excludes_with_new_failure():
+    """Cross-cycle remembered excludes should be merged into retry re-pricing."""
+    from modules.rebalance_router_v2 import RouteResult
+
+    engine, mock_router = _make_engine_with_mocked_router()
+    pair = _make_pair()
+
+    engine._routing_memory.ban_channel("stale-hop/0", ttl_seconds=300)
+
+    first_fail = _make_execution_result(
+        success=False,
+        error="retriable_failure: WIRE_FEE_INSUFFICIENT",
+        excluded=["934667x311x8/1"],
+    )
+    second_fail = _make_execution_result(
+        success=False,
+        error="retriable_failure: WIRE_TEMPORARY_CHANNEL_FAILURE",
+        excluded=["222x2x0/1"],
+    )
+
+    executor = MagicMock()
+    executor.execute.side_effect = [first_fail, second_fail]
+
+    mock_router.price_pair.return_value = RouteResult(
+        success=True,
+        route_cost_sats=7,
+        final_hop_fee_ppm=100,
+        hops=2,
+        route=[
+            {
+                "id": "03" + "a" * 64,
+                "channel": "100x1x0",
+                "amount_msat": 1007000,
+                "delay": 100,
+            },
+            {
+                "id": "03" + "u" * 64,
+                "channel": "200x2x0",
+                "amount_msat": 1000000,
+                "delay": 40,
+            },
+        ],
+    )
+
+    result = engine._execute_pair(pair, executor)
+
+    assert result.success is False
+    call_kwargs = mock_router.price_pair.call_args.kwargs
+    assert set(call_kwargs["exclude"]) == {"934667x311x8/1", "stale-hop/0"}
+
+
+def test_find_candidates_passes_remembered_excludes_to_initial_pricing(monkeypatch):
+    """Initial pair pricing should include transient excludes learned earlier."""
+    from types import SimpleNamespace
+
+    from modules.rebalance_router_v2 import RouteResult
+
+    engine, mock_router = _make_engine_with_mocked_router()
+    engine.router_v2 = mock_router
+
+    pair = _make_pair()
+    engine._routing_memory.ban_channel("934667x311x8/1", ttl_seconds=300)
+
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=500,
+        )
+    )
+
+    class FakePlanner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def plan(self, snapshot):
+            return SimpleNamespace(selected=[pair], skipped=[])
+
+    mock_router.price_pair.return_value = RouteResult(
+        success=True,
+        route_cost_sats=7,
+        final_hop_fee_ppm=100,
+        hops=2,
+        route=[
+            {
+                "id": "03" + "a" * 64,
+                "channel": "100x1x0",
+                "amount_msat": 1007000,
+                "delay": 100,
+            },
+            {
+                "id": "03" + "u" * 64,
+                "channel": "200x2x0",
+                "amount_msat": 1000000,
+                "delay": 40,
+            },
+        ],
+    )
+
+    monkeypatch.setattr("modules.rebalance_engine_v2.RebalancePlanner", FakePlanner)
+
+    candidates = engine.find_candidates()
+
+    assert candidates == [pair]
+    assert mock_router.price_pair.call_args.kwargs["exclude"] == ["934667x311x8/1"]
+
+
+def test_run_cycle_records_failed_excludes_for_future_cycles(monkeypatch):
+    """A failed execution should populate transient excludes for the next cycle."""
+    engine, _ = _make_engine_with_mocked_router()
+    pair = _make_pair()
+    engine._cycle_router = None
+
+    failed = _make_execution_result(
+        success=False,
+        error="retriable_failure: WIRE_FEE_INSUFFICIENT",
+        excluded=["934667x311x8/1"],
+    )
+
+    class FakeExecutor:
+        def __init__(self, plugin, database):
+            pass
+
+        def execute(self, **kwargs):
+            return failed
+
+    engine.find_candidates = MagicMock(return_value=[pair])
+    monkeypatch.setattr("modules.rebalance_engine_v2.RebalanceExecutor", FakeExecutor)
+
+    result = engine.run_cycle()
+
+    assert len(result.executions) == 1
+    assert engine._routing_memory.current_excludes() == ["934667x311x8/1"]

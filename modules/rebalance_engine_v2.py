@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .rebalance_audit_v2 import RebalanceAudit
 from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
+from .rebalance_memory import RebalanceRoutingMemory
 from .rebalance_planner_v2 import RebalancePlanner
 from .rebalance_router_v2 import RebalanceRouter
 from .rebalance_router_v3 import RebalanceRouterV3, _parse_layer_names
@@ -55,6 +56,10 @@ class RebalanceEngine:
         self._pool = ThreadPoolExecutor(
             max_workers=3, thread_name_prefix="rebal-v2"
         )
+        # Cross-cycle transient route memory. Keeps short-lived directional
+        # channel excludes learned from execution failures so future cycles
+        # don't immediately rediscover the same bad remote hop.
+        self._routing_memory = RebalanceRoutingMemory()
         # Pair-level futility tracker: {(src_scid, dst_scid): [failure_ts, ...]}.
         # A pair that fails _futility_threshold times within _futility_window_sec
         # is skipped from subsequent cycles until the stale entries decay out
@@ -293,6 +298,7 @@ class RebalanceEngine:
                     source_peer_id=pair.source_peer_id,
                     dest_peer_id=pair.dest_peer_id,
                     amount_sats=pair.amount_sats,
+                    exclude=self._routing_memory.current_excludes() or None,
                 )
                 if route_result.success:
                     pair.route_cost_sats = route_result.route_cost_sats
@@ -383,6 +389,26 @@ class RebalanceEngine:
         """Clear any failure history for this pair (success resets the counter)."""
         self._pair_failures.pop((source_channel_id, dest_channel_id), None)
 
+    @staticmethod
+    def _merge_excludes(*exclude_lists: Optional[List[str]]) -> List[str]:
+        """Merge exclude lists while preserving first-seen order."""
+        merged: List[str] = []
+        for exclude_list in exclude_lists:
+            if not exclude_list:
+                continue
+            for entry in exclude_list:
+                if entry and entry not in merged:
+                    merged.append(entry)
+        return merged
+
+    def _remember_execution_excludes(self, exec_result: "ExecutionResult") -> None:
+        """Store failed directional channels in transient routing memory."""
+        if exec_result.success or not exec_result.excluded_channels:
+            return
+        ttl_seconds = max(60, int(self._futility_window_sec))
+        for entry in exec_result.excluded_channels:
+            self._routing_memory.ban_channel(entry, ttl_seconds=ttl_seconds)
+
     def _probability_adjusted_budget(
         self, pair_budget_sats: int, probability_ppm: int
     ) -> int:
@@ -459,6 +485,11 @@ class RebalanceEngine:
 
         retry_result = self._attempt_retry_with_exclude(pair, executor, exec_result)
         if retry_result is not None:
+            if not retry_result.success:
+                retry_result.excluded_channels = self._merge_excludes(
+                    exec_result.excluded_channels,
+                    retry_result.excluded_channels,
+                )
             return retry_result
         return exec_result
 
@@ -487,9 +518,13 @@ class RebalanceEngine:
         if router is None:
             return None
 
+        merged_excludes = self._merge_excludes(
+            original_failure.excluded_channels,
+            self._routing_memory.current_excludes(),
+        )
         self._log(
             f"Retrying {pair.source_channel_id}->{pair.dest_channel_id} with "
-            f"exclude={original_failure.excluded_channels}",
+            f"exclude={merged_excludes}",
             level="info",
         )
         try:
@@ -499,7 +534,7 @@ class RebalanceEngine:
                 source_peer_id=pair.source_peer_id,
                 dest_peer_id=pair.dest_peer_id,
                 amount_sats=pair.amount_sats,
-                exclude=list(original_failure.excluded_channels),
+                exclude=merged_excludes,
             )
         except Exception as e:
             self._log(
@@ -602,6 +637,7 @@ class RebalanceEngine:
                                 pair.source_channel_id, pair.dest_channel_id
                             )
                         else:
+                            self._remember_execution_excludes(exec_result)
                             self._record_pair_failure(
                                 pair.source_channel_id, pair.dest_channel_id
                             )
