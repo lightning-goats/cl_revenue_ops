@@ -211,6 +211,34 @@ class TestMarginalRoi30d:
         assert result.rebalance_cost_30d_sats == 300
         assert result.marginal_profit_30d_sats == 500  # 800 - 300
 
+    def test_analyze_channel_rounds_negative_30d_delta_toward_zero(self):
+        """A -1msat 30d net should not become a full -1 sat loss."""
+        analyzer = _make_analyzer()
+
+        channel_info = {
+            "peer_id": "02" + "a" * 64,
+            "capacity": 2_000_000,
+            "funding_txid": "abc123",
+            "opener": "local",
+            "open_timestamp": int(time.time()) - 86400 * 30,
+        }
+        analyzer._get_channel_costs = MagicMock(return_value=_make_costs())
+        analyzer._get_channel_revenue = MagicMock(return_value=_make_revenue())
+        analyzer._get_last_routing_time = MagicMock(return_value=int(time.time()) - 3600)
+        analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0, "last_success_time": 0,
+        }
+        analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 999,
+            'total_contribution_sats': 1,
+            'rebalance_cost_sats': 1,
+        }
+
+        result = analyzer.analyze_channel("111x222x0", channel_info=channel_info)
+
+        assert result is not None
+        assert result.marginal_profit_30d_sats == 0
+
 
 # ============================================================
 # Fix 4: Zombie False-Positive Guard

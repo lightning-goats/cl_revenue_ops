@@ -2884,8 +2884,8 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                 "inactive": []
             }
             total_profit = 0
-            total_revenue = 0
-            total_contribution = 0
+            total_revenue_msat = 0
+            total_contribution_msat = 0
             total_costs = 0
 
             for ch_id, result in all_results.items():
@@ -2926,9 +2926,12 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                 summary[result.classification.value].append(channel_summary)
                 flow_profiles[flow_profile].append(ch_id)
                 total_profit += result.net_profit_sats
-                total_revenue += result.revenue.fees_earned_sats
-                total_contribution += result.revenue.total_contribution_sats
+                total_revenue_msat += result.revenue.fees_earned_msat
+                total_contribution_msat += result.revenue.total_contribution_msat
                 total_costs += result.costs.total_cost_sats
+
+            total_revenue = -(-total_revenue_msat // 1000)
+            total_contribution = -(-total_contribution_msat // 1000)
 
             return {
                 "summary": {

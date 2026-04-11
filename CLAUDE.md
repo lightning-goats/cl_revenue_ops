@@ -29,7 +29,7 @@ No build system - this is a CLN plugin deployed by copying `cl-revenue-ops.py` a
 ```
 cl-revenue-ops (Execution Layer - "The CFO")
     ↓
-sling (Rebalancing Engine - required)
+Native RebalanceExecutor (getroutes + sendpay)
     ↓
 Core Lightning
 ```
@@ -66,6 +66,7 @@ Core Lightning
 - Only rebalance if `Expected_Revenue > Rebalance_Cost`
 - Volume-weighted inventory targets
 - Futility circuit breaker (10 failures → stop)
+- Native execution path uses CLN `getroutes` + `sendpay` through `RebalanceExecutor`; `sling` is no longer required for live rebalancing
 
 **Kalman Flow Estimation** (in `flow_analysis.py`):
 - State vector: [flow_ratio, velocity] with 2x2 covariance matrix
@@ -73,6 +74,24 @@ Core Lightning
 - State bounding: Clamps flow_ratio to [-1, 1], velocity to [-0.5, 0.5]
 - Covariance PD enforcement: Ensures positive-definite via eigenvalue correction
 - Persisted to `kalman_state` DB table for restart survival
+
+### Msat Accounting Rules
+
+- Internal routing revenue and profitability math are msat-native.
+- Successful rebalances persist `actual_fee_msat` in `rebalance_history` and `cost_msat` in `rebalance_costs`; legacy sat columns remain compatibility mirrors.
+- Revenue, balances, and capacity floor to sats at reporting boundaries.
+- Costs and budgets ceil to sats at reporting boundaries.
+- Signed net deltas round toward zero, not floor-away-from-zero.
+
+### Profitability Snapshot Contract
+
+`modules/profitability_analyzer.py` publishes the datastore key `["revenue", "profitability-summary"]` for `cl-hive`.
+
+Canonical per-channel fields:
+- Identity: `channel_id`, `peer_id`
+- Classification: `class`, `roi_pct`, `days_open`, `role`, `fee_multiplier`
+- Msat values: `fees_earned_msat`, `sourced_fee_contribution_msat`, `total_contribution_msat`, `volume_routed_msat`, `sourced_volume_msat`, `open_cost_msat`, `rebalance_cost_msat`, `net_pnl_msat`
+- Counters: `forward_count`, `sourced_forward_count`, `total_forward_count`
 
 ### Key Patterns
 
@@ -111,10 +130,12 @@ Core Lightning
 ## Dependencies
 
 ### Required
-- **sling plugin**: Async rebalancing engine - REQUIRED for rebalancing to work
 - **Core Lightning**: v23.05+
 - **Python 3.10+**
 - **pyln-client**: >=24.0
+
+### Built In
+- **Native rebalancer**: `RebalanceExecutor` uses CLN `getroutes` + `sendpay`; no external rebalance plugin is required
 
 ### Recommended
 - **bookkeeper plugin**: For accurate on-chain cost tracking

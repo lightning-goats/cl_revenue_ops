@@ -7,11 +7,15 @@ Verifies:
 3. Datastore failures don't crash analysis (fire-and-forget)
 """
 
+import ast
 import json
 import os
 import sys
 import time
 import pytest
+import traceback
+from pathlib import Path
+from typing import Any, Dict, Optional
 from unittest.mock import MagicMock, patch, call
 
 # Mock pyln.client before importing modules
@@ -173,6 +177,117 @@ class TestPushProfitabilitySummary:
         assert ch["role"] in [r.value for r in ChannelRole]
         assert "fee_multiplier" in ch
         assert isinstance(ch["fee_multiplier"], float)
+
+    def test_payload_includes_msat_fields_for_cross_plugin_contract(self):
+        """The datastore snapshot should expose msat-native fields for cl-hive."""
+        analyzer, plugin, _, _ = _make_analyzer()
+        analyzer._cache_timestamp = int(time.time())
+
+        analyzer._push_profitability_summary({"100x1x0": _make_profitability()})
+
+        payload = analyzer.data_service.datastore_push.call_args[0][1]
+        ch = payload["channels"]["100x1x0"]
+        assert ch["peer_id"] == "02abc"
+        assert ch["fees_earned_msat"] == 6_000_000
+        assert ch["sourced_fee_contribution_msat"] == 4_000_000
+        assert ch["total_contribution_msat"] == 6_000_000
+        assert ch["volume_routed_msat"] == 1_000_000_000
+        assert ch["sourced_volume_msat"] == 800_000_000
+        assert ch["open_cost_msat"] == 1_000_000
+        assert ch["rebalance_cost_msat"] == 500_000
+
+
+def _load_revenue_profitability():
+    """Load revenue_profitability() from cl-revenue-ops.py without importing the full plugin."""
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "cl-revenue-ops.py",
+    )
+    tree = ast.parse(Path(path).read_text())
+
+    class _PluginStub:
+        def method(self, *_args, **_kwargs):
+            return lambda fn: fn
+
+    ns = {
+        "plugin": _PluginStub(),
+        "Plugin": MagicMock,
+        "Optional": Optional,
+        "Dict": Dict,
+        "Any": Any,
+        "traceback": traceback,
+    }
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "revenue_profitability":
+            exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), ns)
+            return ns["revenue_profitability"], ns
+    raise AssertionError("revenue_profitability not found")
+
+
+class TestRevenueProfitabilitySummaryAggregation:
+    def test_summary_aggregates_msat_before_converting(self):
+        """Sub-sat per-channel fees should be summed in msat before sat conversion."""
+        revenue_profitability, ns = _load_revenue_profitability()
+
+        tiny_results = {
+            "100x1x0": ChannelProfitability(
+                channel_id="100x1x0",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                costs=ChannelCosts(
+                    channel_id="100x1x0",
+                    peer_id="02" + "a" * 64,
+                    open_cost_sats=0,
+                    rebalance_cost_sats=0,
+                ),
+                revenue=ChannelRevenue(
+                    channel_id="100x1x0",
+                    fees_earned_msat=1,
+                    volume_routed_msat=10_000,
+                    forward_count=1,
+                ),
+                net_profit_sats=0,
+                roi_percent=0.0,
+                classification=ProfitabilityClass.PROFITABLE,
+                cost_per_sat_routed=0.0,
+                fee_per_sat_routed=0.0,
+                days_open=1,
+                last_routed=int(time.time()),
+            ),
+            "200x2x0": ChannelProfitability(
+                channel_id="200x2x0",
+                peer_id="02" + "b" * 64,
+                capacity_sats=1_000_000,
+                costs=ChannelCosts(
+                    channel_id="200x2x0",
+                    peer_id="02" + "b" * 64,
+                    open_cost_sats=0,
+                    rebalance_cost_sats=0,
+                ),
+                revenue=ChannelRevenue(
+                    channel_id="200x2x0",
+                    fees_earned_msat=1,
+                    volume_routed_msat=10_000,
+                    forward_count=1,
+                ),
+                net_profit_sats=0,
+                roi_percent=0.0,
+                classification=ProfitabilityClass.PROFITABLE,
+                cost_per_sat_routed=0.0,
+                fee_per_sat_routed=0.0,
+                days_open=1,
+                last_routed=int(time.time()),
+            ),
+        }
+
+        analyzer = MagicMock()
+        analyzer.analyze_all_channels.return_value = tiny_results
+        ns["profitability_analyzer"] = analyzer
+
+        result = revenue_profitability(MagicMock(), channel_id=None)
+
+        assert result["summary"]["total_revenue_sats"] == 1
+        assert result["summary"]["total_contribution_sats"] == 1
 
     def test_multiple_channels(self):
         """All channels appear in the payload."""

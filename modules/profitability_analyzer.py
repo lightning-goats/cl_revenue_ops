@@ -26,7 +26,14 @@ import threading
 
 from pyln.client import Plugin, RpcError
 
-from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base, MSAT_PER_SAT
+from .utils import (
+    parse_msat as _shared_parse_msat,
+    base_to_sats_floor,
+    base_to_sats_ceil,
+    base_delta_to_sats_toward_zero,
+    sats_to_base,
+    MSAT_PER_SAT,
+)
 
 
 class BookkeeperCache:
@@ -589,6 +596,8 @@ class ChannelProfitabilityAnalyzer:
         channels = {}
         for ch_id, p in results.items():
             channels[ch_id] = {
+                "channel_id": ch_id,
+                "peer_id": p.peer_id,
                 "class": p.classification.value,
                 "net_profit_sats": p.net_profit_sats,
                 "roi_pct": round(p.roi_percent, 2),
@@ -599,9 +608,17 @@ class ChannelProfitabilityAnalyzer:
                 "forward_count": p.revenue.forward_count,
                 "sourced_forward_count": p.revenue.sourced_forward_count,
                 "total_forward_count": p.revenue.total_forward_count,
+                "fees_earned_msat": p.revenue.fees_earned_msat,
                 "fees_earned_sats": p.revenue.fees_earned_sats,
+                "volume_routed_msat": p.revenue.volume_routed_msat,
+                "sourced_volume_msat": p.revenue.sourced_volume_msat,
+                "sourced_fee_contribution_msat": p.revenue.sourced_fee_contribution_msat,
                 "sourced_fee_contribution_sats": p.revenue.sourced_fee_contribution_sats,
+                "total_contribution_msat": p.revenue.total_contribution_msat,
                 "total_contribution_sats": p.revenue.total_contribution_sats,
+                "open_cost_msat": sats_to_base(p.costs.open_cost_sats),
+                "rebalance_cost_msat": sats_to_base(p.costs.rebalance_cost_sats),
+                "net_pnl_msat": p.revenue.total_contribution_msat - sats_to_base(p.costs.total_cost_sats),
             }
 
         payload = {
@@ -696,8 +713,13 @@ class ChannelProfitabilityAnalyzer:
             pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days=30)
             contribution_30d_msat = pnl_30d.get('total_contribution_msat', 0)
             rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
-            rebalance_cost_30d_msat = sats_to_base(rebalance_cost_30d)
-            marginal_profit_30d = base_to_sats_floor(contribution_30d_msat - rebalance_cost_30d_msat)
+            rebalance_cost_30d_msat = int(
+                pnl_30d.get('rebalance_cost_msat')
+                or sats_to_base(rebalance_cost_30d)
+            )
+            marginal_profit_30d = base_delta_to_sats_toward_zero(
+                contribution_30d_msat - rebalance_cost_30d_msat
+            )
 
             # Classify
             classification = self._classify_channel(
@@ -922,8 +944,9 @@ class ChannelProfitabilityAnalyzer:
         
         return True, f"{profitability.classification.value} (ROI={profitability.roi_percent:.1f}%)"
     
-    def record_rebalance_cost(self, channel_id: str, peer_id: str, 
-                              cost_sats: int, amount_sats: int):
+    def record_rebalance_cost(self, channel_id: str, peer_id: str,
+                              cost_sats: int, amount_sats: int,
+                              cost_msat: Optional[int] = None):
         """
         Record a rebalance cost for a channel.
         
@@ -939,6 +962,7 @@ class ChannelProfitabilityAnalyzer:
             channel_id=channel_id,
             peer_id=peer_id,
             cost_sats=cost_sats,
+            cost_msat=cost_msat,
             amount_sats=amount_sats,
             timestamp=int(time.time())
         )

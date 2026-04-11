@@ -86,6 +86,13 @@ def base_to_sats_floor(base: int) -> int:
     return base // BASE_UNITS_PER_SAT
 
 
+def base_delta_to_sats_toward_zero(base: int) -> int:
+    """Convert signed base-unit deltas to sats, rounding toward zero."""
+    if base >= 0:
+        return base // BASE_UNITS_PER_SAT
+    return -((-base) // BASE_UNITS_PER_SAT)
+
+
 def sats_to_base(sats: int) -> int:
     """Convert sats to base units (msat today)."""
     return sats * BASE_UNITS_PER_SAT
@@ -102,4 +109,4 @@ parse_base_unit = parse_msat
 msat_to_sats_ceil = base_to_sats_ceil
 msat_to_sats_floor = base_to_sats_floor
 sats_to_msat = sats_to_base
-
+msat_delta_to_sats_toward_zero = base_delta_to_sats_toward_zero

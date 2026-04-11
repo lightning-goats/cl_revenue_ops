@@ -22,8 +22,22 @@ Key concepts:
 - **Fleet revenue** sums exit fees only across all channels — no double-counting of inbound sourcing.
 - **Inbound gateways** (channels that primarily source traffic for the fleet) receive enhanced protection from closure and are never misclassified as stagnant or zombie based on exit-side metrics alone.
 - **Classification** uses total forward count (exit + sourced) for ZOMBIE, STAGNANT, and fleet member protection decisions.
+- **Rebalance fee persistence** is msat-native: successful automatic, coordinated, manual, and diagnostic rebalances persist `actual_fee_msat` in `rebalance_history` and `cost_msat` in `rebalance_costs`, with sat fields derived once at write time for compatibility.
+- **Conversion rules** are explicit at reporting boundaries: revenue and balances floor to sats, costs and budgets ceil to sats, and signed net deltas round toward zero so `-1msat` does not become a fabricated `-1sat` loss.
 
 Use `revenue-profitability` to see per-channel analysis including sourced metrics, flow profiles, and total contribution.
+
+### Profitability Snapshot Contract
+
+`cl-revenue-ops` publishes the canonical profitability snapshot for `cl-hive` to CLN datastore key `["revenue", "profitability-summary"]`.
+
+Payload shape:
+- Top level: `timestamp`, `channels`
+- Per channel: `channel_id`, `peer_id`, `class`, `roi_pct`, `days_open`, `role`, `fee_multiplier`
+- Per channel msat fields: `fees_earned_msat`, `sourced_fee_contribution_msat`, `total_contribution_msat`, `volume_routed_msat`, `sourced_volume_msat`, `open_cost_msat`, `rebalance_cost_msat`, `net_pnl_msat`
+- Per channel counters: `forward_count`, `sourced_forward_count`, `total_forward_count`
+
+`revenue-profitability` remains available as an RPC surface, but the datastore snapshot is the canonical cross-plugin contract and is the path `cl-hive` should prefer.
 
 ## Channel Opening Intelligence
 

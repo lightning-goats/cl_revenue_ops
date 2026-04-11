@@ -22,7 +22,13 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
-from .utils import normalize_scid, base_to_sats_floor, base_to_sats_ceil, sats_to_base
+from .utils import (
+    normalize_scid,
+    base_to_sats_floor,
+    base_to_sats_ceil,
+    base_delta_to_sats_toward_zero,
+    sats_to_base,
+)
 
 
 # Size bucket labels matching fee_controller.SIZE_BUCKET_LABELS
@@ -570,6 +576,7 @@ class Database:
                 amount_sats INTEGER NOT NULL,
                 max_fee_sats INTEGER NOT NULL,
                 actual_fee_sats INTEGER,
+                actual_fee_msat INTEGER,
                 expected_profit_sats INTEGER NOT NULL,
                 actual_profit_sats INTEGER,
                 status TEXT NOT NULL,  -- 'pending', 'success', 'failed'
@@ -615,6 +622,7 @@ class Database:
                 channel_id TEXT NOT NULL,
                 peer_id TEXT NOT NULL,
                 cost_sats INTEGER NOT NULL,
+                cost_msat INTEGER,
                 amount_sats INTEGER NOT NULL,
                 timestamp INTEGER NOT NULL
             )
@@ -1028,6 +1036,18 @@ class Database:
         try:
             conn.execute("ALTER TABLE rebalance_history ADD COLUMN bleeder_status TEXT")
             self.plugin.log("Added bleeder_status column to rebalance_history")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        try:
+            conn.execute("ALTER TABLE rebalance_history ADD COLUMN actual_fee_msat INTEGER")
+            self.plugin.log("Added actual_fee_msat column to rebalance_history")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        try:
+            conn.execute("ALTER TABLE rebalance_costs ADD COLUMN cost_msat INTEGER")
+            self.plugin.log("Added cost_msat column to rebalance_costs")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
@@ -1879,17 +1899,24 @@ class Database:
     
     def update_rebalance_result(self, rebalance_id: int, status: str,
                                 actual_fee_sats: Optional[int] = None,
+                                actual_fee_msat: Optional[int] = None,
                                 actual_profit_sats: Optional[int] = None,
                                 error_message: Optional[str] = None):
         """Update a rebalance record with the result."""
         conn = self._get_connection()
+        fee_msat = int(actual_fee_msat) if actual_fee_msat is not None else None
+        fee_sats = int(actual_fee_sats) if actual_fee_sats is not None else None
+        if fee_msat is None and fee_sats is not None:
+            fee_msat = sats_to_base(fee_sats)
+        if fee_sats is None and fee_msat is not None:
+            fee_sats = base_to_sats_ceil(fee_msat)
         
         conn.execute("""
             UPDATE rebalance_history
-            SET status = ?, actual_fee_sats = ?, actual_profit_sats = ?,
+            SET status = ?, actual_fee_sats = ?, actual_fee_msat = ?, actual_profit_sats = ?,
                 error_message = ?, timestamp = ?
             WHERE id = ?
-        """, (status, actual_fee_sats, actual_profit_sats, error_message,
+        """, (status, fee_sats, fee_msat, actual_profit_sats, error_message,
               int(time.time()), rebalance_id))
     
     def get_recent_rebalances(self, limit: int = 10) -> List[Dict[str, Any]]:
@@ -2012,13 +2039,21 @@ class Database:
             Total fees spent in sats (0 if none)
         """
         conn = self._get_connection()
-        row = conn.execute("""
-            SELECT COALESCE(SUM(cost_sats), 0) as total_fees
-            FROM rebalance_costs
-            WHERE timestamp >= ?
-        """, (since_timestamp,)).fetchone()
-        
-        return row['total_fees'] if row else 0
+        try:
+            row = conn.execute("""
+                SELECT COALESCE(SUM(COALESCE(cost_msat, cost_sats * 1000)), 0) as total_fees_msat
+                FROM rebalance_costs
+                WHERE timestamp >= ?
+            """, (since_timestamp,)).fetchone()
+        except sqlite3.OperationalError:
+            row = conn.execute("""
+                SELECT COALESCE(SUM(cost_sats * 1000), 0) as total_fees_msat
+                FROM rebalance_costs
+                WHERE timestamp >= ?
+            """, (since_timestamp,)).fetchone()
+
+        total_fees_msat = int(row['total_fees_msat'] or 0) if row else 0
+        return base_to_sats_ceil(total_fees_msat)
     
     def get_total_routing_revenue(self, since_timestamp: int) -> int:
         """
@@ -2217,21 +2252,29 @@ class Database:
         # rebalance_history is pruned to 90 days by cleanup_old_data(), but
         # rebalance_costs is never pruned and serves as the source of truth
         # for lifetime cost accounting. This matters for channels open > 90 days.
-        cost_row = conn.execute("""
-            SELECT COALESCE(SUM(cost_sats), 0) as cost_sats
-            FROM rebalance_costs
-            WHERE channel_id = ? AND timestamp >= ?
-        """, (channel_id, since)).fetchone()
+        try:
+            cost_row = conn.execute("""
+                SELECT COALESCE(SUM(COALESCE(cost_msat, cost_sats * 1000)), 0) as cost_msat
+                FROM rebalance_costs
+                WHERE channel_id = ? AND timestamp >= ?
+            """, (channel_id, since)).fetchone()
+        except sqlite3.OperationalError:
+            cost_row = conn.execute("""
+                SELECT COALESCE(SUM(cost_sats * 1000), 0) as cost_msat
+                FROM rebalance_costs
+                WHERE channel_id = ? AND timestamp >= ?
+            """, (channel_id, since)).fetchone()
 
         revenue_msat = int(rev_row['revenue_msat'] or 0) if rev_row else 0
-        cost_sats = cost_row['cost_sats'] if cost_row else 0
-        cost_msat = sats_to_base(cost_sats)
+        cost_msat = int(cost_row['cost_msat'] or 0) if cost_row else 0
+        cost_sats = base_to_sats_ceil(cost_msat)
         forward_count = rev_row['forward_count'] if rev_row else 0
 
         return {
             'channel_id': channel_id,
             'window_days': window_days,
             'revenue_msat': revenue_msat,
+            'rebalance_cost_msat': cost_msat,
             'rebalance_cost_sats': cost_sats,
             'net_pnl_msat': revenue_msat - cost_msat,
             'forward_count': forward_count
@@ -2348,7 +2391,8 @@ class Database:
         sourced_fee_msat = inbound['sourced_fee_contribution_msat']
         total_contribution_msat = max(revenue_msat, sourced_fee_msat)
         rebalance_cost_sats = direct_pnl['rebalance_cost_sats']
-        rebalance_cost_msat = sats_to_base(rebalance_cost_sats)
+        rebalance_cost_msat = int(direct_pnl.get('rebalance_cost_msat') or 0)
+        net_pnl_msat = total_contribution_msat - rebalance_cost_msat
 
         return {
             'channel_id': channel_id,
@@ -2362,12 +2406,13 @@ class Database:
             'sourced_forward_count': inbound['sourced_forward_count'],
             # Combined metrics — msat native
             'total_contribution_msat': total_contribution_msat,
+            'rebalance_cost_msat': rebalance_cost_msat,
             'rebalance_cost_sats': rebalance_cost_sats,
-            'net_pnl_msat': total_contribution_msat - rebalance_cost_msat,
+            'net_pnl_msat': net_pnl_msat,
             # Sats conversions for reporting (ceiling for fees)
             'direct_revenue_sats': base_to_sats_ceil(revenue_msat),
             'total_contribution_sats': base_to_sats_ceil(total_contribution_msat),
-            'net_pnl_sats': base_to_sats_floor(total_contribution_msat - rebalance_cost_msat),
+            'net_pnl_sats': base_delta_to_sats_toward_zero(net_pnl_msat),
             'sourced_fee_contribution_sats': base_to_sats_ceil(sourced_fee_msat),
             'sourced_volume_sats': base_to_sats_floor(inbound['sourced_volume_msat']),
             # Legacy fields for backward compatibility
@@ -3182,21 +3227,36 @@ class Database:
         placeholders = ','.join('?' * len(channel_ids))
         
         # Get rebalances to these channels
-        # Note: actual_fee_sats is stored in sats, convert to msat for fee_paid_msat
-        rows = conn.execute(f"""
-            SELECT
-                to_channel,
-                amount_sats,
-                max_fee_sats,
-                COALESCE(actual_fee_sats, 0) * 1000 as fee_paid_msat,
-                amount_sats * 1000 as amount_msat,
-                status,
-                timestamp
-            FROM rebalance_history
-            WHERE to_channel IN ({placeholders})
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (*channel_ids, limit)).fetchall()
+        try:
+            rows = conn.execute(f"""
+                SELECT
+                    to_channel,
+                    amount_sats,
+                    max_fee_sats,
+                    COALESCE(actual_fee_msat, COALESCE(actual_fee_sats, 0) * 1000) as fee_paid_msat,
+                    amount_sats * 1000 as amount_msat,
+                    status,
+                    timestamp
+                FROM rebalance_history
+                WHERE to_channel IN ({placeholders})
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """, (*channel_ids, limit)).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(f"""
+                SELECT
+                    to_channel,
+                    amount_sats,
+                    max_fee_sats,
+                    COALESCE(actual_fee_sats, 0) * 1000 as fee_paid_msat,
+                    amount_sats * 1000 as amount_msat,
+                    status,
+                    timestamp
+                FROM rebalance_history
+                WHERE to_channel IN ({placeholders})
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """, (*channel_ids, limit)).fetchall()
         
         return [dict(row) for row in rows]
 
@@ -3237,32 +3297,46 @@ class Database:
         placeholders = ','.join('?' * len(channel_ids))
 
         # Get successful rebalances with fee data
-        rows = conn.execute(f"""
-            SELECT
-                amount_sats,
-                actual_fee_sats,
-                (actual_fee_sats * 1000000) / NULLIF(amount_sats, 0) as fee_ppm
-            FROM rebalance_history
-            WHERE to_channel IN ({placeholders})
-              AND status = 'success'
-              AND actual_fee_sats IS NOT NULL
-              AND actual_fee_sats > 0
-              AND amount_sats > 0
-              AND timestamp >= ?
-            ORDER BY timestamp DESC
-        """, (*channel_ids, since)).fetchall()
+        try:
+            rows = conn.execute(f"""
+                SELECT
+                    amount_sats,
+                    COALESCE(actual_fee_msat, actual_fee_sats * 1000) as actual_fee_msat,
+                    (COALESCE(actual_fee_msat, actual_fee_sats * 1000) * 1000) / NULLIF(amount_sats, 0) as fee_ppm
+                FROM rebalance_history
+                WHERE to_channel IN ({placeholders})
+                  AND status = 'success'
+                  AND COALESCE(actual_fee_msat, actual_fee_sats * 1000) > 0
+                  AND amount_sats > 0
+                  AND timestamp >= ?
+                ORDER BY timestamp DESC
+            """, (*channel_ids, since)).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(f"""
+                SELECT
+                    amount_sats,
+                    actual_fee_sats * 1000 as actual_fee_msat,
+                    (actual_fee_sats * 1000000) / NULLIF(amount_sats, 0) as fee_ppm
+                FROM rebalance_history
+                WHERE to_channel IN ({placeholders})
+                  AND status = 'success'
+                  AND actual_fee_sats > 0
+                  AND amount_sats > 0
+                  AND timestamp >= ?
+                ORDER BY timestamp DESC
+            """, (*channel_ids, since)).fetchall()
 
         if len(rows) < min_samples:
             return None
 
         # Calculate weighted average (by volume)
-        total_fees = sum(row['actual_fee_sats'] for row in rows)
+        total_fees_msat = sum(int(row['actual_fee_msat'] or 0) for row in rows)
         total_volume = sum(row['amount_sats'] for row in rows)
 
         if total_volume == 0:
             return None
 
-        avg_fee_ppm = (total_fees * 1_000_000) // total_volume
+        avg_fee_ppm = (total_fees_msat * 1000) // total_volume
 
         # Calculate median (more robust to outliers)
         fee_ppms = sorted([row['fee_ppm'] for row in rows if row['fee_ppm'] is not None])
@@ -3938,25 +4012,39 @@ class Database:
         return dict(row) if row else None
     
     def record_rebalance_cost(self, channel_id: str, peer_id: str,
-                              cost_sats: int, amount_sats: int,
+                              cost_sats: Optional[int] = None, amount_sats: int = 0,
+                              cost_msat: Optional[int] = None,
                               timestamp: Optional[int] = None):
         """Record a rebalance cost for a channel."""
         conn = self._get_connection()
+        persisted_cost_msat = int(cost_msat) if cost_msat is not None else None
+        persisted_cost_sats = int(cost_sats) if cost_sats is not None else None
+        if persisted_cost_msat is None:
+            persisted_cost_msat = sats_to_base(persisted_cost_sats or 0)
+        if persisted_cost_sats is None:
+            persisted_cost_sats = base_to_sats_ceil(persisted_cost_msat)
         conn.execute("""
             INSERT INTO rebalance_costs 
-            (channel_id, peer_id, cost_sats, amount_sats, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        """, (channel_id, peer_id, cost_sats, amount_sats,
+            (channel_id, peer_id, cost_sats, cost_msat, amount_sats, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (channel_id, peer_id, persisted_cost_sats, persisted_cost_msat, amount_sats,
               timestamp or int(time.time())))
 
     def get_channel_rebalance_costs(self, channel_id: str) -> int:
         """Get total rebalance costs for a channel."""
         conn = self._get_connection()
-        row = conn.execute(
-            "SELECT COALESCE(SUM(cost_sats), 0) as total FROM rebalance_costs WHERE channel_id = ?",
-            (channel_id,)
-        ).fetchone()
-        return row["total"] if row else 0
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(COALESCE(cost_msat, cost_sats * 1000)), 0) as total_msat FROM rebalance_costs WHERE channel_id = ?",
+                (channel_id,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(cost_sats * 1000), 0) as total_msat FROM rebalance_costs WHERE channel_id = ?",
+                (channel_id,)
+            ).fetchone()
+        total_msat = int(row["total_msat"] or 0) if row else 0
+        return base_to_sats_ceil(total_msat)
     
     def get_channel_cost_history(self, channel_id: str) -> List[Dict[str, Any]]:
         """Get detailed cost history for a channel."""

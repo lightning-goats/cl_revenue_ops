@@ -2105,6 +2105,36 @@ class EVRebalancer:
 
         return {}
 
+    def _record_successful_rebalance_fee(
+        self,
+        rebalance_id: int,
+        *,
+        status: str,
+        channel_id: str,
+        peer_id: str,
+        amount_sats: int,
+        fee_msat: int,
+    ) -> int:
+        """Persist successful rebalance fees in both history and cost ledgers."""
+        persisted_fee_msat = max(0, int(fee_msat or 0))
+        persisted_fee_sats = base_to_sats_ceil(persisted_fee_msat)
+        self.database.update_rebalance_result(
+            rebalance_id,
+            status,
+            actual_fee_sats=persisted_fee_sats,
+            actual_fee_msat=persisted_fee_msat,
+        )
+        if persisted_fee_msat > 0:
+            self.database.record_rebalance_cost(
+                channel_id=channel_id,
+                peer_id=peer_id,
+                cost_sats=persisted_fee_sats,
+                cost_msat=persisted_fee_msat,
+                amount_sats=amount_sats,
+                timestamp=int(time.time()),
+            )
+        return persisted_fee_sats
+
     def execute_rebalance(self, candidate: RebalanceCandidate, enforce_budget: bool = True, **kwargs) -> Dict[str, Any]:
         """
         Execute a rebalance for the given candidate.
@@ -2334,7 +2364,14 @@ class EVRebalancer:
                         try:
                             exec_result = self.rebalance_executor.execute(candidate)
                             if exec_result.success:
-                                actual_fee_sats = base_to_sats_ceil(exec_result.fee_msat)
+                                actual_fee_sats = self._record_successful_rebalance_fee(
+                                    rebalance_id,
+                                    status='completed',
+                                    channel_id=candidate.to_channel,
+                                    peer_id=candidate.to_peer_id,
+                                    amount_sats=candidate.amount_sats,
+                                    fee_msat=exec_result.fee_msat,
+                                )
                                 res = {
                                     "success": True,
                                     "actual_fee_sats": actual_fee_sats,
@@ -2344,11 +2381,6 @@ class EVRebalancer:
                                         f"{exec_result.parts} parts, {exec_result.attempts} attempts)"
                                     ),
                                 }
-                                if rebalance_id:
-                                    self.database.update_rebalance_result(
-                                        rebalance_id, 'completed',
-                                        actual_fee_sats=actual_fee_sats,
-                                    )
                                 self.database.reset_failure_count(candidate.to_channel)
                                 self._report_coordination_outcome(
                                     candidate,
@@ -2424,7 +2456,14 @@ class EVRebalancer:
                     try:
                         exec_result = self.rebalance_executor.execute(candidate)
                         if exec_result.success:
-                            actual_fee_sats = base_to_sats_ceil(exec_result.fee_msat)
+                            actual_fee_sats = self._record_successful_rebalance_fee(
+                                rebalance_id,
+                                status='completed',
+                                channel_id=candidate.to_channel,
+                                peer_id=candidate.to_peer_id,
+                                amount_sats=candidate.amount_sats,
+                                fee_msat=exec_result.fee_msat,
+                            )
                             res = {
                                 "success": True,
                                 "actual_fee_sats": actual_fee_sats,
@@ -2434,11 +2473,6 @@ class EVRebalancer:
                                     f"{exec_result.parts} parts, {exec_result.attempts} attempts)"
                                 ),
                             }
-                            if rebalance_id:
-                                self.database.update_rebalance_result(
-                                    rebalance_id, 'completed',
-                                    actual_fee_sats=actual_fee_sats,
-                                )
                             # Success resets failure count so channel re-enters rotation
                             self.database.reset_failure_count(candidate.to_channel)
                         else:
@@ -2678,7 +2712,14 @@ class EVRebalancer:
             if self.rebalance_executor:
                 exec_result = self.rebalance_executor.execute(candidate)
                 if exec_result.success:
-                    self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=base_to_sats_ceil(exec_result.fee_msat))
+                    self._record_successful_rebalance_fee(
+                        rebalance_id,
+                        status='success',
+                        channel_id=channel_id,
+                        peer_id=dest_info.get('peer_id', ''),
+                        amount_sats=shock_amount,
+                        fee_msat=exec_result.fee_msat,
+                    )
                 else:
                     self.database.update_rebalance_result(
                         rebalance_id, 'failed',
@@ -2787,19 +2828,14 @@ class EVRebalancer:
         exec_result = self.rebalance_executor.execute(cand)
 
         if exec_result.success:
-            fee_sats = base_to_sats_ceil(exec_result.fee_msat)
-            self.database.update_rebalance_result(rebalance_id, 'success', actual_fee_sats=fee_sats)
-            if fee_sats and fee_sats > 0:
-                try:
-                    self.database.record_rebalance_cost(
-                        channel_id=to_channel,
-                        peer_id=t_info.get("peer_id", ""),
-                        cost_sats=int(fee_sats),
-                        amount_sats=amount_sats,
-                        timestamp=int(time.time())
-                    )
-                except Exception as e:
-                    self.plugin.log(f"Failed to record rebalance cost for {to_channel}: {e}", level='debug')
+            fee_sats = self._record_successful_rebalance_fee(
+                rebalance_id,
+                status='success',
+                channel_id=to_channel,
+                peer_id=t_info.get("peer_id", ""),
+                amount_sats=amount_sats,
+                fee_msat=exec_result.fee_msat,
+            )
             result = {"success": True, "message": "completed", "actual_fee_sats": fee_sats}
         else:
             self.database.update_rebalance_result(

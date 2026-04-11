@@ -165,6 +165,49 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
         mock_database.reserve_budget.assert_called_once()
         mock_database.release_budget_reservation.assert_called_once_with('456')
 
+    def test_execute_rebalance_success_records_cost_row_with_msat_precision(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+        from modules.rebalance_executor import RebalanceResult
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.data_service = MagicMock()
+        r.data_service.invalidate = MagicMock()
+        r.data_service.datastore_push.return_value = True
+        r._check_capital_controls = MagicMock(return_value=True)
+        r._get_peer_connection_status = MagicMock(return_value={})
+        r._calculate_turnover_rate = MagicMock(return_value=0.05)
+        r.rebalance_executor = MagicMock()
+        r.rebalance_executor.execute.return_value = RebalanceResult(
+            success=True,
+            fee_msat=1501,
+            fee_ppm=30,
+            hops=3,
+            route_type="network",
+            attempts=1,
+            parts=1,
+        )
+
+        mock_database.record_rebalance = MagicMock(return_value=457)
+        mock_database.update_rebalance_result = MagicMock()
+        mock_database.reserve_budget = MagicMock(return_value=(True, 9999))
+        mock_database.release_budget_reservation = MagicMock(return_value=True)
+        mock_database.record_rebalance_cost = MagicMock()
+        mock_database.reset_failure_count = MagicMock()
+
+        cand = _candidate()
+        res = r.execute_rebalance(cand, enforce_budget=True)
+
+        assert res["success"] is True
+        mock_database.record_rebalance_cost.assert_called_once()
+        call_kwargs = mock_database.record_rebalance_cost.call_args.kwargs
+        assert call_kwargs["channel_id"] == cand.to_channel
+        assert call_kwargs["peer_id"] == cand.to_peer_id
+        assert call_kwargs["cost_msat"] == 1501
+        assert call_kwargs["cost_sats"] == 2
+        assert call_kwargs["amount_sats"] == cand.amount_sats
+
 
 class TestCoordinatedRebalanceReporting:
     def _mock_coordination_rpc(self, mock_plugin, intent_response=None):
@@ -1136,5 +1179,4 @@ class TestCapexAwareSourceSelection:
         )
         assert len(result) == 2
         assert result[0][0] == "200x2x0"  # 99% local ranked first
-
 
