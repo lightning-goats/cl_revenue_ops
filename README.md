@@ -106,6 +106,14 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-hive-hints-status` | Diagnostic: hive hints coverage and freshness |
 | `revenue-planner-candidate-sources` | Diagnostic: candidate pipeline strategy breakdown |
 
+## Hive Hints
+
+`cl_revenue_ops` consumes fleet hints only through `modules/hive_hints.py` (`HiveHintAdapter`).
+
+- Transport order is datastore first: read CLN datastore key `["hive", "hints"]`, then fall back to `hive-export-hints` only if the datastore payload is missing, stale, or invalid.
+- Missing or malformed per-peer hint entries degrade to neutral local behavior; they do not bypass fee, rebalance, planner, or policy safety rails.
+- `revenue-hive-hints-status` reports freshness and signal coverage for the currently cached snapshot.
+
 ## More Detail
 
 - Minimal config example: [config/cl-revenue-ops.conf.minimal](config/cl-revenue-ops.conf.minimal)

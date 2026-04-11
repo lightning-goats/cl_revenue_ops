@@ -149,7 +149,8 @@ cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a s
 **Enable:** `revenue-ops-hive-hints-enabled = true` (enabled by default)
 
 **How it works:**
-- Polls `hive-export-hints` RPC once per fee cycle
+- Reads CLN datastore key `["hive", "hints"]` once per fee cycle
+- Falls back to `hive-export-hints` only when the datastore payload is missing, stale, or invalid
 - Caches snapshot with TTL (default 900s, override with `revenue-ops-hive-hints-ttl`)
 - Exposes bounded bias lookups consumed by fee controller, rebalancer, and capacity planner
 
@@ -169,7 +170,9 @@ cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a s
 - `traffic_confidence` → weights all biases (0.0-1.0)
 - `peer_quality_score` → rebalance bias (±5%)
 - `rebalance_preference` → rebalance bias (sink +5%, source -5%)
+- `fleet_fee_median` → fee prior seed for DTS
 - `channel_open_hint` → capacity planner scoring (±30%)
+- `closure_recommended` / `closure_reason` → closure pressure in capacity planning
 
 ## Safety Constraints
 

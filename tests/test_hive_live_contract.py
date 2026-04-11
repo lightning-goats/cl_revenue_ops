@@ -40,6 +40,18 @@ def _build_adapter(snapshot: dict) -> HiveHintAdapter:
     return adapter
 
 
+def _build_adapter_from_datastore(snapshot: dict) -> HiveHintAdapter:
+    plugin = MagicMock()
+    plugin.rpc.call.side_effect = AssertionError("direct RPC should not be used for fresh datastore snapshot")
+    adapter = HiveHintAdapter(plugin, ttl_override=0)
+    adapter.data_service = MagicMock()
+    adapter.data_service.list_datastore.return_value = {
+        "datastore": [{"string": json.dumps(snapshot, sort_keys=True)}]
+    }
+    adapter.poll()
+    return adapter
+
+
 @pytest.fixture(scope="module")
 def live_snapshot() -> dict:
     if not (CL_HIVE_PATH / "modules" / "rpc_commands.py").exists():
@@ -68,10 +80,10 @@ def live_snapshot() -> dict:
 
 
         class Metric:
-            def __init__(self, peer_id, flow_direction, volume_routed_sats):
+            def __init__(self, peer_id, flow_direction, volume_routed_msat):
                 self.peer_id = peer_id
                 self.flow_direction = flow_direction
-                self.volume_routed_sats = volume_routed_sats
+                self.volume_routed_msat = volume_routed_msat
 
 
         def zero_confidence_result(peer_id):
@@ -188,4 +200,12 @@ class TestLiveHiveContract:
         adapter = _build_adapter(live_snapshot)
 
         assert adapter.get_corridor_role(PEER_SECONDARY) == "secondary"
+        assert adapter.get_fleet_fee_prior(PEER_SECONDARY) == 900
+
+    def test_live_snapshot_also_parses_via_datastore_transport(self, live_snapshot):
+        adapter = _build_adapter_from_datastore(live_snapshot)
+        hints = adapter._snapshot["hints"]
+
+        assert hints[PEER_QUALITY]["peer_quality_score"] == 0.81
+        assert hints[PEER_REBAL]["rebalance_preference"] == "sink"
         assert adapter.get_fleet_fee_prior(PEER_SECONDARY) == 900

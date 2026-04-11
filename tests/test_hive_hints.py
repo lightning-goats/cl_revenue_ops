@@ -125,6 +125,66 @@ class TestPolling:
         adapter.poll()
         assert adapter._snapshot is None
 
+    def test_poll_falls_back_to_rpc_when_datastore_snapshot_is_stale(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.data_service = MagicMock()
+        adapter.data_service.list_datastore.return_value = {
+            "datastore": [
+                {
+                    "string": (
+                        '{"generated_at": 1, "ttl_seconds": 900, '
+                        '"hints": {"02stale": {"member": true}}}'
+                    )
+                }
+            ]
+        }
+        live_snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02fresh": {
+                    "member": True,
+                    "traffic_confidence": 0.5,
+                    "corridor_role": "owner",
+                }
+            },
+        }
+        mock_plugin.rpc.call.return_value = live_snapshot
+
+        adapter.poll()
+
+        assert adapter._snapshot == live_snapshot
+        assert adapter.is_hive_member("02fresh") is True
+        assert adapter.is_hive_member("02stale") is False
+
+    def test_poll_falls_back_to_rpc_when_datastore_snapshot_schema_is_invalid(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.data_service = MagicMock()
+        adapter.data_service.list_datastore.return_value = {
+            "datastore": [
+                {
+                    "string": '{"generated_at": 123, "ttl_seconds": 900, "hints": "bad"}'
+                }
+            ]
+        }
+        live_snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02fresh": {
+                    "member": True,
+                    "traffic_confidence": 0.5,
+                    "corridor_role": "owner",
+                }
+            },
+        }
+        mock_plugin.rpc.call.return_value = live_snapshot
+
+        adapter.poll()
+
+        assert adapter._snapshot == live_snapshot
+        assert adapter.is_hive_member("02fresh") is True
+
 
 class TestTTL:
     def test_fresh_snapshot(self, mock_plugin):
@@ -396,6 +456,36 @@ class TestDiagnostics:
         assert status["snapshot_fresh"] is True
         assert status["hints_count"] == 2
         assert "snapshot_age_seconds" in status
+
+    def test_malformed_peer_entries_are_sanitized_to_empty_dicts(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02good": {
+                    "member": True,
+                    "corridor_role": "owner",
+                    "traffic_confidence": 0.5,
+                    "channel_open_hint": {
+                        "open_preference": "open",
+                        "topology_confidence": 0.7,
+                    },
+                },
+                "02bad": "not-a-dict",
+            },
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+
+        adapter.poll()
+
+        assert adapter._snapshot["hints"]["02bad"] == {}
+        assert adapter.get_fee_bias("02bad") == 1.0
+        assert adapter.get_rebalance_bias("02bad") == 1.0
+        assert adapter.is_hive_member("02bad") is False
+        assert adapter.get_channel_open_hint("02bad") == {}
+        assert adapter.get_status()["hints_count"] == 2
+        assert adapter.get_open_candidates() == [("02good", {"open_preference": "open", "topology_confidence": 0.7})]
 
 
 class TestCorridorRole:

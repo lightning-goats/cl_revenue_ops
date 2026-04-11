@@ -1,12 +1,13 @@
 """
-Hive Hints adapter -- sole integration boundary with cl_hive.
+Hive hints adapter -- sole integration boundary with cl_hive.
 
-Polls a local cl_hive RPC for a compact hint snapshot, validates and
-caches it with TTL, and exposes bounded multiplicative bias factors
-for the fee controller and rebalancer.
+Prefers the local CLN datastore key ["hive", "hints"] for a compact
+hint snapshot, falls back to the live hive-export-hints RPC when the
+datastore payload is missing, stale, or invalid, then validates and
+caches the snapshot with TTL.
 
-If hints are missing, stale, invalid, or the RPC fails, all lookups
-silently return 1.0 (neutral / no effect).
+If hints are missing, stale, invalid, or both transports fail, all
+lookups silently return 1.0 (neutral / no effect).
 """
 
 import time
@@ -26,7 +27,7 @@ CORRIDOR_SECONDARY_UTILIZATION_WEIGHT = 0.05
 
 
 class HiveHintAdapter:
-    """Adapter that polls cl_hive for fleet hints and exposes bounded bias lookups."""
+    """Adapter that reads cl_hive fleet hints and exposes bounded bias lookups."""
 
     VALID_CORRIDOR_ROLES = {"owner", "secondary", "contested", "none"}
 
@@ -63,19 +64,24 @@ class HiveHintAdapter:
         except Exception:
             pass
 
-        # Priority 2: Fall back to cross-plugin RPC if datastore empty
-        if raw is None:
+        candidate = self._validate_and_normalize_snapshot(raw)
+        if candidate is None or not self._snapshot_is_fresh(candidate):
             try:
                 raw = self._plugin.rpc.call("hive-export-hints")
             except Exception as e:
                 self._plugin.log(f"HIVE_HINTS: poll failed: {e}", level='debug')
                 return
+            candidate = self._validate_and_normalize_snapshot(raw)
 
-        if not self._validate_snapshot(raw):
+        if candidate is None:
             self._plugin.log("HIVE_HINTS: invalid snapshot schema, ignoring", level='debug')
             return
 
-        self._snapshot = raw
+        if not self._snapshot_is_fresh(candidate):
+            self._plugin.log("HIVE_HINTS: stale snapshot, ignoring", level='debug')
+            return
+
+        self._snapshot = candidate
         self._snapshot_fetched_at = int(time.time())
 
     @staticmethod
@@ -88,22 +94,44 @@ class HiveHintAdapter:
             return False
         return True
 
+    @staticmethod
+    def _normalize_hint_map(hints) -> dict:
+        if not isinstance(hints, dict):
+            return {}
+        normalized = {}
+        for peer_id, hint in hints.items():
+            normalized[peer_id] = dict(hint) if isinstance(hint, dict) else {}
+        return normalized
+
+    def _validate_and_normalize_snapshot(self, raw) -> dict | None:
+        if not self._validate_snapshot(raw):
+            return None
+        snapshot = dict(raw)
+        snapshot["hints"] = self._normalize_hint_map(raw.get("hints"))
+        return snapshot
+
     # ------------------------------------------------------------------
     # Freshness
     # ------------------------------------------------------------------
 
-    def _effective_ttl(self) -> int:
+    def _effective_ttl_for(self, snapshot: dict | None) -> int:
         if self._ttl_override > 0:
             return self._ttl_override
-        if self._snapshot and isinstance(self._snapshot.get("ttl_seconds"), (int, float)):
-            return int(self._snapshot["ttl_seconds"])
+        if snapshot and isinstance(snapshot.get("ttl_seconds"), (int, float)):
+            return int(snapshot["ttl_seconds"])
         return 900
 
-    def is_fresh(self) -> bool:
-        if self._snapshot is None:
+    def _effective_ttl(self) -> int:
+        return self._effective_ttl_for(self._snapshot)
+
+    def _snapshot_is_fresh(self, snapshot: dict | None) -> bool:
+        if snapshot is None:
             return False
-        age = int(time.time()) - int(self._snapshot.get("generated_at", 0))
-        return age <= self._effective_ttl()
+        age = int(time.time()) - int(snapshot.get("generated_at", 0))
+        return age <= self._effective_ttl_for(snapshot)
+
+    def is_fresh(self) -> bool:
+        return self._snapshot_is_fresh(self._snapshot)
 
     # ------------------------------------------------------------------
     # Peer hint lookup
@@ -113,7 +141,8 @@ class HiveHintAdapter:
         if not self.is_fresh():
             return {}
         hints = self._snapshot.get("hints", {})
-        return hints.get(peer_id, {})
+        hint = hints.get(peer_id, {})
+        return hint if isinstance(hint, dict) else {}
 
     @staticmethod
     def _normalize_str_list(values) -> list:
