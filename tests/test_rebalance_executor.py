@@ -122,6 +122,23 @@ class TestRouteConversion:
         assert route[2] == {"channel": "300x1x0", "id": "our_id",
                             "amount_msat": 500000, "delay": 18}
 
+    def test_converts_getroutes_to_sendpay_uses_configured_invoice_final_cltv(self):
+        plugin = MagicMock()
+        plugin.rpc.listconfigs.return_value = {
+            "configs": {"cltv-final": {"value_int": 21}}
+        }
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        path = [
+            {"short_channel_id_dir": "100x1x0/1", "next_node_id": "node_a",
+             "amount_msat": 501000, "delay": 42},
+            {"short_channel_id_dir": "200x1x0/0", "next_node_id": "node_b",
+             "amount_msat": 500000, "delay": 24},
+        ]
+
+        route = executor._getroutes_to_sendpay(path, "300x1x0", "our_id", 500000)
+
+        assert route[-1]["delay"] == 21
+
 
 class TestRouteTypeSelection:
     def test_fleet_when_hive_route_hops(self):
@@ -203,6 +220,9 @@ class TestExecuteSuccess:
             "payment_hash": "hash123", "payment_secret": "secret123",
             "bolt11": "lnbc5u1..."
         }
+        plugin.rpc.listconfigs.return_value = {
+            "configs": {"cltv-final": {"value_int": 21}}
+        }
         plugin.rpc.getroute.return_value = {
             "route": [
                 {"id": "dest_peer_abc", "channel": "300x1x0", "direction": 1, "amount_msat": 500000000, "delay": 24}
@@ -232,7 +252,7 @@ class TestExecuteSuccess:
 
         assert result.success is True
         assert plugin.rpc.getroute.call_args.kwargs["riskfactor"] == 0
-        assert plugin.rpc.getroute.call_args.kwargs["cltv"] == 24
+        assert plugin.rpc.getroute.call_args.kwargs["cltv"] == 27
         assert plugin.rpc.getroute.call_args.kwargs["fromid"] == "source_peer_abc"
 
     def test_first_hop_uses_first_return_hop_policy(self):
@@ -322,6 +342,9 @@ class TestExecuteSuccess:
             "payment_hash": "hash123", "payment_secret": "secret123",
             "bolt11": "lnbc5u1..."
         }
+        plugin.rpc.listconfigs.return_value = {
+            "configs": {"cltv-final": {"value_int": 21}}
+        }
 
         def listpeerchannels_side_effect(peer_id=None):
             if peer_id == "dest_peer_abc":
@@ -352,7 +375,7 @@ class TestExecuteSuccess:
             if method == "getroutes":
                 # Verify getroutes receives return hop fee-adjusted amount and CLTV
                 assert params["amount_msat"] == 500_051_000  # 500M + 1000 base + (500M * 100 / 1M)
-                assert params["final_cltv"] == 30  # 18 + 12 cltv_delta
+                assert params["final_cltv"] == 33  # 21 + 12 cltv_delta
                 assert params["maxparts"] == 1
                 assert "auto.no_mpp_support" in params["layers"]
                 return {
@@ -401,7 +424,7 @@ class TestExecuteSuccess:
         assert sendpay_route[-1]["id"] == "our_id"
         assert sendpay_route[-1]["channel"] == "200x1x0"
         assert sendpay_route[-1]["amount_msat"] == 500_000_000
-        assert sendpay_route[-1]["delay"] == 18
+        assert sendpay_route[-1]["delay"] == 21
 
 
 class TestExecuteFailure:
@@ -498,6 +521,53 @@ class TestExecuteFailure:
 
         # delinvoice should be called for cleanup
         plugin.rpc.delinvoice.assert_called_once()
+
+    def test_waitsendpay_timeout_leaves_payment_pending_and_skips_cleanup(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "hash123",
+            "payment_secret": "secret123",
+            "bolt11": "lnbc5u1...",
+        }
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "200x1x0",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        },
+                    },
+                }
+            ]
+        }
+        plugin.rpc.getroute.return_value = {
+            "route": [
+                {
+                    "id": "dest_peer_abc",
+                    "channel": "300x1x0",
+                    "direction": 1,
+                    "amount_msat": 500_000_000,
+                    "delay": 24,
+                },
+            ]
+        }
+        plugin.rpc.waitsendpay.side_effect = FakeRpcError(
+            error={"code": 200, "message": "Timed out while waiting"}
+        )
+
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock())
+        result = executor.execute(MockCandidate(hive_route_hops=0))
+
+        assert result.success is False
+        assert result.error == "sendpay_error: payment_pending_timeout"
+        assert result.attempts == 1
+        plugin.rpc.delpay.assert_not_called()
+        plugin.rpc.delinvoice.assert_not_called()
+        plugin.rpc.getroute.assert_called_once()
 
 
 class TestStableFailureReasonMapping:
@@ -869,6 +939,109 @@ class TestHiveEqualizationRouteValidation:
 
         with pytest.raises(ValueError, match="fleet_source_mismatch"):
             executor._compute_fleet_route(job, MockCandidate(hive_route_hops=2), "our_id")
+
+    def test_compute_fleet_route_uses_exclude_layer_instead_of_getroutes_exclude_param(self):
+        plugin = MagicMock()
+        plugin.rpc.listconfigs.return_value = {
+            "configs": {"cltv-final": {"value_int": 18}}
+        }
+        excluded_node = "02" + "ab" * 32
+
+        def listpeerchannels_side_effect(peer_id=None):
+            if peer_id == "dest_peer_abc":
+                return {
+                    "channels": [
+                        {
+                            "short_channel_id": "200x1x0",
+                            "updates": {
+                                "remote": {
+                                    "fee_base_msat": 0,
+                                    "fee_proportional_millionths": 0,
+                                    "cltv_expiry_delta": 6,
+                                },
+                            },
+                        },
+                    ]
+                }
+            return {
+                "channels": [
+                    {
+                        "short_channel_id": "100x1x0",
+                        "peer_id": "source_peer_abc",
+                    }
+                ]
+            }
+
+        plugin.rpc.listpeerchannels.side_effect = listpeerchannels_side_effect
+
+        def call_side_effect(method, params=None):
+            if method == "askrene-listlayers":
+                return {"layers": [{"layer": "hive-fleet"}]}
+            if method == "getroutes":
+                assert "exclude" not in params
+                exclude_layers = [
+                    name for name in params["layers"]
+                    if name.startswith("rebalance-exclude-")
+                ]
+                assert len(exclude_layers) == 1
+                return {
+                    "routes": [{
+                        "path": [
+                            {
+                                "short_channel_id_dir": "100x1x0/1",
+                                "next_node_id": "dest_peer_abc",
+                                "amount_msat": 500_000_000,
+                                "delay": 24,
+                            },
+                        ],
+                    }],
+                }
+            return {}
+
+        plugin.rpc.call.side_effect = call_side_effect
+        hive_router = MagicMock()
+        hive_router.is_hive_member.return_value = True
+        executor = RebalanceExecutor(plugin, MagicMock(), MagicMock(), hive_router=hive_router)
+
+        job = RebalanceJob(
+            job_id="job-1",
+            channel_id="200x1x0",
+            peer_id="dest_peer_abc",
+            amount_msat=500_000_000,
+            max_fee_msat=100_000,
+            route_type="fleet",
+        )
+
+        executor._compute_fleet_route(
+            job,
+            MockCandidate(hive_route_hops=2),
+            "our_id",
+            excludes=["934667x311x8/0", "222x2x2", excluded_node],
+        )
+
+        update_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c.args and c.args[0] == "askrene-update-channel"
+        ]
+        scid_dirs = {c.args[1]["short_channel_id_dir"] for c in update_calls}
+        assert scid_dirs == {
+            "934667x311x8/0",
+            "222x2x2/0",
+            "222x2x2/1",
+        }
+
+        disable_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c.args and c.args[0] == "askrene-disable-node"
+        ]
+        assert len(disable_calls) == 1
+        assert disable_calls[0].args[1]["node"] == excluded_node
+
+        remove_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c.args and c.args[0] == "askrene-remove-layer"
+        ]
+        assert len(remove_calls) == 1
 
     def test_fleet_retry_after_send_failure_stays_on_fleet_path(self):
         plugin = MagicMock()

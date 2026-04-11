@@ -38,6 +38,7 @@ class TestExecutorSuccess:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
         plugin.rpc.waitsendpay.return_value = {
             "amount_sent_msat": 50_005_000,
@@ -54,7 +55,13 @@ class TestExecutorSuccess:
         assert result.success is True
         assert result.fee_sats == 5
         assert result.attempts == 1
-        plugin.rpc.sendpay.assert_called_once()
+        plugin.rpc.sendpay.assert_called_once_with(
+            route=_make_route(),
+            payment_hash="abc123",
+            amount_msat=50_000_000,
+            bolt11="lnbc...",
+            payment_secret="secret123",
+        )
         plugin.rpc.waitsendpay.assert_called_once()
 
     def test_cleanup_deletes_paid_invoice(self):
@@ -62,6 +69,7 @@ class TestExecutorSuccess:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
         plugin.rpc.waitsendpay.return_value = {
             "amount_sent_msat": 50_005_000,
@@ -86,6 +94,7 @@ class TestExecutorBudgetCheck:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
 
         result = executor.execute(
@@ -105,6 +114,7 @@ class TestExecutorBudgetCheck:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
         plugin.rpc.waitsendpay.return_value = {
             "amount_sent_msat": 50_005_000,
@@ -158,6 +168,7 @@ class TestExecutorFailures:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
         plugin.rpc.sendpay.side_effect = Exception("sendpay failed")
 
@@ -177,6 +188,7 @@ class TestExecutorFailures:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
 
         class RPCError(Exception):
@@ -208,6 +220,7 @@ class TestExecutorFailures:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
 
         class RPCError(Exception):
@@ -245,6 +258,7 @@ class TestExecutorFailures:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
 
         class RPCError(Exception):
@@ -277,6 +291,7 @@ class TestExecutorFailures:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
 
         class RPCError(Exception):
@@ -311,6 +326,7 @@ class TestExecutorFailures:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
 
         plugin.rpc.waitsendpay.side_effect = Exception("socket timeout")
@@ -337,6 +353,7 @@ class TestExecutorFailures:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
 
         class RPCError(Exception):
@@ -372,6 +389,7 @@ class TestExecutorFailures:
         plugin.rpc.invoice.return_value = {
             "payment_hash": "abc123",
             "bolt11": "lnbc...",
+            "payment_secret": "secret123",
         }
 
         class RPCError(Exception):
@@ -403,6 +421,39 @@ class TestExecutorFailures:
         assert "erring_channel" in line
         assert "failcodename" in line
         assert "erring_index" in line
+
+    def test_waitsendpay_timeout_leaves_payment_pending_and_skips_cleanup(self):
+        """CLN error 200 means the payment is still pending, not definitively failed."""
+        executor, plugin = _make_executor()
+        plugin.rpc.invoice.return_value = {
+            "payment_hash": "abc123",
+            "bolt11": "lnbc...",
+            "payment_secret": "secret123",
+        }
+
+        class RPCError(Exception):
+            def __init__(self):
+                self.error = {
+                    "code": 200,
+                    "message": "Timed out before the payment could complete",
+                }
+
+        plugin.rpc.waitsendpay.side_effect = RPCError()
+
+        result = executor.execute(
+            route=_make_route(),
+            amount_sats=50_000,
+            source_channel_id="111x1x0",
+            dest_channel_id="222x2x0",
+            max_fee_sats=10,
+        )
+
+        assert result.success is False
+        assert result.error == "payment_pending_timeout"
+        assert result.excluded_channels == []
+        assert result.payment_pending is True
+        plugin.rpc.delpay.assert_not_called()
+        plugin.rpc.delinvoice.assert_not_called()
 
     def test_extract_error_data_only_accepts_dict_data_field(self):
         """Regression guard: _extract_error_data used to return err.get('data', {})

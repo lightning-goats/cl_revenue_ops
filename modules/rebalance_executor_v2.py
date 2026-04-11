@@ -25,6 +25,7 @@ class ExecutionResult:
     amount_sats: int = 0
     error: str = ""
     excluded_channels: List[str] = field(default_factory=list)
+    payment_pending: bool = False
 
 
 # Timeout and retry constants
@@ -99,6 +100,7 @@ class RebalanceExecutor:
             )
             payment_hash = inv["payment_hash"]
             bolt11 = inv.get("bolt11", "")
+            payment_secret = inv.get("payment_secret", "")
         except Exception as e:
             result.error = f"invoice_error: {e}"
             self._log(result.error, level="warn")
@@ -110,6 +112,7 @@ class RebalanceExecutor:
                 amount_msat=amount_msat,
                 payment_hash=payment_hash,
                 bolt11=bolt11,
+                payment_secret=payment_secret,
                 label=label,
                 max_fee_sats=max_fee_sats,
                 result=result,
@@ -123,6 +126,7 @@ class RebalanceExecutor:
         amount_msat: int,
         payment_hash: str,
         bolt11: str,
+        payment_secret: str,
         label: str,
         max_fee_sats: int,
         result: ExecutionResult,
@@ -152,7 +156,9 @@ class RebalanceExecutor:
             self.plugin.rpc.sendpay(
                 route=route,
                 payment_hash=payment_hash,
+                amount_msat=amount_msat,
                 bolt11=bolt11,
+                payment_secret=payment_secret,
             )
         except Exception as e:
             result.error = f"sendpay_error: {e}"
@@ -184,6 +190,17 @@ class RebalanceExecutor:
             # turned out to hide a completely opaque failure, and adding
             # this diagnostic is the first step to figuring out why.
             self._log_executor_failure(e)
+
+            error_dict = getattr(e, "error", {})
+            error_code = error_dict.get("code") if isinstance(error_dict, dict) else None
+            if error_code == 200:
+                result.error = "payment_pending_timeout"
+                result.payment_pending = True
+                self._log(
+                    "waitsendpay timed out with payment still pending",
+                    level="info",
+                )
+                return result
 
             error_data = self._extract_error_data(e)
             erring_channel = error_data.get("erring_channel")
@@ -292,6 +309,8 @@ class RebalanceExecutor:
     ) -> None:
         """Clean up invoice and failed payment records."""
         try:
+            if result.payment_pending:
+                return
             if payment_hash and not result.success:
                 try:
                     self.plugin.rpc.delpay(

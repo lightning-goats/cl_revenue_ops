@@ -229,6 +229,8 @@ class RebalanceRouterV3:
 
         route_amount_msat = (amount_sats + final_hop_fee_sats) * 1000
         layers = list(self.found_layers)
+        if "auto.no_mpp_support" not in layers:
+            layers.append("auto.no_mpp_support")
         if exclude:
             with self._exclude_layer(exclude) as exc_layer:
                 if exc_layer is not None:

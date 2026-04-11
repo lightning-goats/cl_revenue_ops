@@ -13,9 +13,10 @@ import secrets
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 from modules.rebalance_memory import RebalanceRoutingMemory
 from modules.utils import base_to_sats_floor, base_to_sats_ceil, sats_to_base
@@ -84,6 +85,7 @@ class RebalanceExecutor:
     INVOICE_EXPIRY = 300
     CHANNEL_BAN_TTL = 300
     FIRST_HOP_BAN_TTL = 60
+    _exclude_layer_counter = 0
 
     def __init__(self, plugin, config, database, hive_router=None):
         self.plugin = plugin
@@ -197,6 +199,110 @@ class RebalanceExecutor:
             pass
         return layers
 
+    def _get_invoice_final_cltv(self) -> int:
+        """Read CLN's configured invoice final CLTV delta, defaulting to 18."""
+        try:
+            if self.data_service:
+                configs = self.data_service.get_configs()
+            else:
+                configs = self.plugin.rpc.listconfigs()
+            cltv_final = configs.get("configs", {}).get("cltv-final", {})
+            if isinstance(cltv_final, dict):
+                value = cltv_final.get("value_int")
+                if isinstance(value, int) and value > 0:
+                    return value
+                value = cltv_final.get("value_str")
+                if isinstance(value, str) and value.isdigit():
+                    parsed = int(value)
+                    if parsed > 0:
+                        return parsed
+        except Exception:
+            pass
+        return 18
+
+    @staticmethod
+    def _is_node_exclude(entry: str) -> bool:
+        """Return True when an exclude token names a node rather than a channel."""
+        return "/" not in entry and "x" not in entry and ":" not in entry
+
+    @contextmanager
+    def _exclude_layer(self, excludes: List[str]) -> Iterator[Optional[str]]:
+        """Apply getroutes excludes via a throwaway askrene layer.
+
+        `getroutes` does not accept the `exclude` parameter on current CLN.
+        Model retry bans using supported askrene layer mutations instead.
+        """
+        if not excludes:
+            yield None
+            return
+
+        type(self)._exclude_layer_counter += 1
+        layer_name = (
+            f"rebalance-exclude-{int(time.time())}-{type(self)._exclude_layer_counter}"
+        )
+
+        try:
+            if self.data_service:
+                self.data_service.askrene_create_layer(layer_name)
+            else:
+                self.plugin.rpc.call("askrene-create-layer", {"layer": layer_name})
+            for entry in excludes:
+                normalized = str(entry or "").strip().replace(":", "x")
+                if not normalized:
+                    continue
+                if self._is_node_exclude(normalized):
+                    self.plugin.rpc.call(
+                        "askrene-disable-node",
+                        {"layer": layer_name, "node": normalized},
+                    )
+                    continue
+                if "/" in normalized:
+                    if self.data_service:
+                        self.data_service.askrene_update_channel(
+                            layer_name,
+                            normalized,
+                            enabled=False,
+                        )
+                    else:
+                        self.plugin.rpc.call(
+                            "askrene-update-channel",
+                            {
+                                "layer": layer_name,
+                                "short_channel_id_dir": normalized,
+                                "enabled": False,
+                            },
+                        )
+                    continue
+                for direction in (0, 1):
+                    scid_dir = f"{normalized}/{direction}"
+                    if self.data_service:
+                        self.data_service.askrene_update_channel(
+                            layer_name,
+                            scid_dir,
+                            enabled=False,
+                        )
+                    else:
+                        self.plugin.rpc.call(
+                            "askrene-update-channel",
+                            {
+                                "layer": layer_name,
+                                "short_channel_id_dir": scid_dir,
+                                "enabled": False,
+                            },
+                        )
+            yield layer_name
+        finally:
+            try:
+                if self.data_service:
+                    self.data_service.askrene_remove_layer(layer_name)
+                else:
+                    self.plugin.rpc.call("askrene-remove-layer", {"layer": layer_name})
+            except Exception as e:
+                self._log(
+                    f"failed to remove exclude layer {layer_name}: {e}",
+                    level="warn",
+                )
+
     def _validate_pure_hive_path(self, path: List[Dict]) -> None:
         """Reject fleet paths that leave the hive-only route set."""
         if self.hive_router is None:
@@ -238,7 +344,7 @@ class RebalanceExecutor:
             "channel": dest_channel.replace(":", "x"),
             "id": our_id,
             "amount_msat": amount_msat,
-            "delay": 18,
+            "delay": self._get_invoice_final_cltv(),
         })
         return route
 
@@ -295,7 +401,7 @@ class RebalanceExecutor:
                 pass
 
         required_amount_msat = amount_msat + base_msat + (amount_msat * fee_ppm) // 1_000_000
-        required_cltv = 18 + cltv_delta
+        required_cltv = self._get_invoice_final_cltv() + cltv_delta
         return required_amount_msat, required_cltv
 
     def _fleet_local_excludes(self, our_id: str, selected_source_scid: str) -> List[str]:
@@ -571,7 +677,8 @@ class RebalanceExecutor:
 
         source_fee_msat = source_base_msat + (forward_amount * source_fee_ppm) // 1_000_000
         first_hop_amount = forward_amount + source_fee_msat
-        first_hop_delay = route[0].get("delay", 18) + source_cltv_delta
+        invoice_final_cltv = self._get_invoice_final_cltv()
+        first_hop_delay = route[0].get("delay", required_cltv) + source_cltv_delta
         first_hop_direction = 1 if our_id > source_peer else 0
 
         first_hop = {
@@ -586,7 +693,7 @@ class RebalanceExecutor:
             "id": our_id,
             "channel": candidate.to_channel.replace(":", "x"),
             "amount_msat": job.amount_msat,
-            "delay": 18,
+            "delay": invoice_final_cltv,
             "style": "tlv",
         }
         full_route = [first_hop] + route + [final_hop]
@@ -738,30 +845,35 @@ class RebalanceExecutor:
             + self._fleet_local_excludes(our_id, selected_source_scid)
         ))
 
-        params = {
-            "source": our_id,
-            "destination": candidate.to_peer_id,
-            "amount_msat": required_amount_msat,
-            "layers": layers,
-            "maxfee_msat": fleet_maxfee,
-            "final_cltv": required_cltv,
-            "maxparts": 1,
-        }
-        if merged_excludes:
-            params["exclude"] = merged_excludes
-        # SAFETY: TOCTOU race on layer names can crash askrene (lesson 504).
-        # Catch and retry with auto-only layers.
-        try:
-            if self.data_service:
-                result = self.data_service.get_routes(**params)
-            else:
-                result = self.plugin.rpc.call("getroutes", params)
-        except Exception:
-            params["layers"] = ["auto.localchans", "auto.no_mpp_support"]
-            if self.data_service:
-                result = self.data_service.get_routes(**params)
-            else:
-                result = self.plugin.rpc.call("getroutes", params)
+        with self._exclude_layer(merged_excludes) as exclude_layer:
+            active_layers = list(layers)
+            if exclude_layer is not None:
+                active_layers.append(exclude_layer)
+            params = {
+                "source": our_id,
+                "destination": candidate.to_peer_id,
+                "amount_msat": required_amount_msat,
+                "layers": active_layers,
+                "maxfee_msat": fleet_maxfee,
+                "final_cltv": required_cltv,
+                "maxparts": 1,
+            }
+            # SAFETY: TOCTOU race on layer names can crash askrene (lesson 504).
+            # Catch and retry with auto-only layers, preserving exclude bans.
+            try:
+                if self.data_service:
+                    result = self.data_service.get_routes(**params)
+                else:
+                    result = self.plugin.rpc.call("getroutes", params)
+            except Exception:
+                fallback_layers = ["auto.localchans", "auto.no_mpp_support"]
+                if exclude_layer is not None:
+                    fallback_layers.append(exclude_layer)
+                params["layers"] = fallback_layers
+                if self.data_service:
+                    result = self.data_service.get_routes(**params)
+                else:
+                    result = self.plugin.rpc.call("getroutes", params)
 
         routes = result.get("routes", [])
         if not routes:
@@ -998,6 +1110,27 @@ class RebalanceExecutor:
 
             except Exception as e:
                 failure = self._parse_failure(e)
+                if failure.get("code") == 200:
+                    last_error = "sendpay_error: payment_pending_timeout"
+                    job.attempts.append({
+                        "attempt": attempt,
+                        "error": last_error,
+                        "timestamp": int(time.time()),
+                    })
+                    result = RebalanceResult(
+                        success=False,
+                        route_type=route_type,
+                        attempts=attempt,
+                        error=last_error,
+                    )
+                    job.state = JobState.FAILED
+                    job.result = result
+                    self._log(
+                        f"Job {job.job_id}: waitsendpay timed out but payment is still pending",
+                        level="warn",
+                    )
+                    return result
+
                 last_error = f"sendpay_error: {e}"
                 final_hop_temp_failure = (
                     route_type == "fleet"

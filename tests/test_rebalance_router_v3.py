@@ -311,6 +311,7 @@ def test_price_pair_calls_getroutes_with_expected_args():
     assert kwargs["destination"] == DST_PEER
     assert kwargs["amount_msat"] == 100 * 1000
     assert "hive-fleet" in kwargs["layers"]
+    assert "auto.no_mpp_support" in kwargs["layers"]
     # 2 middle hops + 1 first hop (us -> peer_A) + 1 final hop (peer_B -> us) = 4
     assert result.hops == 4
     assert result.route[0]["channel"] == "100x1x0"
