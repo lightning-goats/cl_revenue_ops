@@ -288,11 +288,10 @@ class HiveRouter:
 
         try:
             # Build layer list from what actually exists.
-            # auto.sourcefree IS included here because discover_route() is for
-            # fee ESTIMATION (EV analysis, inbound cost), not sendpay execution.
-            # The executor's _get_layers() correctly excludes auto.sourcefree
-            # for the actual sendpay route construction.
-            layers = ["auto.localchans", "auto.sourcefree", "auto.no_mpp_support"]
+            # Never include auto.sourcefree: CLN v25.12.1 can abort inside
+            # askrene.apply_layers on that auto-layer combination, and the
+            # shared HiveRouter is used from background estimation paths.
+            layers = ["auto.localchans", "auto.no_mpp_support"]
             try:
                 existing = self.data_service.get_askrene_layers() if self.data_service else self.plugin.rpc.call("askrene-listlayers", {})
                 existing_names = {l.get("layer") for l in existing.get("layers", [])}
@@ -320,7 +319,7 @@ class HiveRouter:
                 result = self.data_service.get_routes(**getroutes_params) if self.data_service else self.plugin.rpc.call("getroutes", getroutes_params)
             except Exception:
                 # Layer may have been removed — retry with only auto layers
-                getroutes_params["layers"] = ["auto.localchans", "auto.sourcefree", "auto.no_mpp_support"]
+                getroutes_params["layers"] = ["auto.localchans", "auto.no_mpp_support"]
                 result = self.data_service.get_routes(**getroutes_params) if self.data_service else self.plugin.rpc.call("getroutes", getroutes_params)
 
             routes = result.get("routes", [])

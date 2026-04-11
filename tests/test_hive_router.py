@@ -117,7 +117,7 @@ class TestHiveRouterDiscover:
         assert route.fee_ppm == 2000  # (501000-500000)*1e6/500000 = 2000
         assert route.probability_ppm == 850000
 
-    def test_discover_requests_single_path_solution(self):
+    def test_discover_avoids_auto_sourcefree_crash_vector(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
 
@@ -151,7 +151,7 @@ class TestHiveRouterDiscover:
         ][0]
         params = getroutes_call[0][1]
         assert "auto.localchans" in params["layers"]
-        assert "auto.sourcefree" in params["layers"]
+        assert "auto.sourcefree" not in params["layers"]
         assert "auto.no_mpp_support" in params["layers"]
         assert params["maxparts"] == 1
         assert params["final_cltv"] == 18
