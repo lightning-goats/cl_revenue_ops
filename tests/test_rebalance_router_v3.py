@@ -147,6 +147,7 @@ def test_translate_hop_direction_0():
         "direction": 0,
         "amount_msat": 1000343,
         "delay": 106,
+        "style": "tlv",
     }
 
 
@@ -250,6 +251,9 @@ def _make_plugin_with_listchannels_fee(fee_ppm: int = 0, cltv: int = 40):
     plugin = MagicMock()
     plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
     plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
     plugin.rpc.listchannels.return_value = {
         "channels": [{
             "source": DST_PEER,
@@ -343,6 +347,51 @@ def test_price_pair_picks_cheapest_when_multiple_routes():
     )
     assert result.success is True
     assert result.route_cost_sats <= 1  # cheapest middle was 100 msat fee -> rounds to 1 sat
+
+
+def test_price_pair_uses_invoice_cltv_and_explicit_synthetic_hops():
+    plugin = _make_plugin_with_listchannels_fee(fee_ppm=0, cltv=40)
+    plugin.rpc.getroutes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000,
+            "final_cltv": 58,
+            "path": [
+                {
+                    "short_channel_id_dir": "111x1x1/0",
+                    "next_node_id": "03" + "x" * 64,
+                    "amount_msat": 100100,
+                    "delay": 124,
+                },
+                {
+                    "short_channel_id_dir": "222x2x2/0",
+                    "next_node_id": DST_PEER,
+                    "amount_msat": 100000,
+                    "delay": 58,
+                },
+            ],
+        }],
+    }
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+
+    assert result.success is True
+    kwargs = plugin.rpc.getroutes.call_args.kwargs
+    assert kwargs["final_cltv"] == 58
+    assert result.route[0]["direction"] == 0
+    assert result.route[0]["delay"] == 124
+    assert result.route[0]["style"] == "tlv"
+    assert result.route[-1]["direction"] == 1
+    assert result.route[-1]["delay"] == 18
+    assert result.route[-1]["style"] == "tlv"
 
 
 def test_price_pair_returns_failure_on_empty_routes():

@@ -91,6 +91,7 @@ def _translate_getroutes_hop_to_sendpay(hop: Dict[str, Any]) -> Dict[str, Any]:
         "direction": int(direction),
         "amount_msat": _parse_msat(hop["amount_msat"]),
         "delay": int(hop["delay"]),
+        "style": "tlv",
     }
 
 
@@ -220,6 +221,8 @@ class RebalanceRouterV3:
                 error=f"cannot determine final-hop fee for peer {dest_peer_id}",
             )
         dest_cltv = self._v2_helpers._get_dest_channel_cltv(dest_peer_id)
+        invoice_final_cltv = self._v2_helpers._get_invoice_final_cltv()
+        required_final_cltv = dest_cltv + invoice_final_cltv
         final_hop_fee_sats = self._v2_helpers._compute_final_hop_fee_sats(
             amount_sats, final_hop_fee_ppm
         )
@@ -238,7 +241,8 @@ class RebalanceRouterV3:
                     amount_sats=amount_sats,
                     route_amount_msat=route_amount_msat,
                     final_hop_fee_ppm=final_hop_fee_ppm,
-                    dest_cltv=dest_cltv,
+                    invoice_final_cltv=invoice_final_cltv,
+                    required_final_cltv=required_final_cltv,
                     layers=layers,
                 )
         return self._price_pair_inner(
@@ -249,7 +253,8 @@ class RebalanceRouterV3:
             amount_sats=amount_sats,
             route_amount_msat=route_amount_msat,
             final_hop_fee_ppm=final_hop_fee_ppm,
-            dest_cltv=dest_cltv,
+            invoice_final_cltv=invoice_final_cltv,
+            required_final_cltv=required_final_cltv,
             layers=layers,
         )
 
@@ -263,7 +268,8 @@ class RebalanceRouterV3:
         amount_sats: int,
         route_amount_msat: int,
         final_hop_fee_ppm: int,
-        dest_cltv: int,
+        invoice_final_cltv: int,
+        required_final_cltv: int,
         layers: List[str],
     ) -> RouteResult:
         try:
@@ -273,7 +279,7 @@ class RebalanceRouterV3:
                 amount_msat=route_amount_msat,
                 layers=layers,
                 maxfee_msat=route_amount_msat,
-                final_cltv=dest_cltv,
+                final_cltv=required_final_cltv,
             )
         except Exception as e:
             reason, detail = _translate_getroutes_error(str(e))
@@ -314,20 +320,28 @@ class RebalanceRouterV3:
         ) * 1000
 
         first_hop_delay = (
-            middle_sendpay[0]["delay"] if middle_sendpay else 0
-        ) + dest_cltv
+            middle_sendpay[0]["delay"] if middle_sendpay else required_final_cltv
+        )
 
         first_hop = {
             "id": source_peer_id,
             "channel": source_channel_id,
+            "direction": self._v2_helpers._channel_direction(
+                self.our_node_id, source_peer_id
+            ),
             "amount_msat": total_forward_msat,
             "delay": first_hop_delay,
+            "style": "tlv",
         }
         final_hop = {
             "id": self.our_node_id,
             "channel": dest_channel_id,
+            "direction": self._v2_helpers._channel_direction(
+                dest_peer_id, self.our_node_id
+            ),
             "amount_msat": amount_sats * 1000,
-            "delay": 0,
+            "delay": invoice_final_cltv,
+            "style": "tlv",
         }
 
         full_route = [first_hop] + middle_sendpay + [final_hop]

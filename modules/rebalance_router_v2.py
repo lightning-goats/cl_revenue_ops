@@ -51,6 +51,7 @@ class RebalanceRouter:
     def __init__(self, plugin: Any, our_node_id: str) -> None:
         self.plugin = plugin
         self.our_node_id = our_node_id
+        self._invoice_final_cltv: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -155,6 +156,35 @@ class RebalanceRouter:
             pass
         return 40  # safe default
 
+    def _get_invoice_final_cltv(self) -> int:
+        """Return the node's invoice final CLTV requirement.
+
+        The executor creates a self-invoice without an explicit ``cltv=``
+        override, so route construction must honor the node's configured
+        ``cltv-final`` value rather than assuming sendpay's low-level
+        default. Cache this forever; it is effectively static for the
+        lifetime of the plugin process.
+        """
+        if self._invoice_final_cltv is not None:
+            return self._invoice_final_cltv
+        try:
+            result = self.plugin.rpc.listconfigs()
+            configs = result.get("configs", {})
+            cltv_cfg = configs.get("cltv-final", {})
+            value = cltv_cfg.get("value_int")
+            if value is not None:
+                self._invoice_final_cltv = int(value)
+                return self._invoice_final_cltv
+        except Exception as e:
+            self._log(f"listconfigs cltv-final lookup failed: {e}")
+        self._invoice_final_cltv = 18
+        return self._invoice_final_cltv
+
+    @staticmethod
+    def _channel_direction(start_node_id: str, end_node_id: str) -> int:
+        """Return CLN's channel direction bit for a traversed edge."""
+        return 1 if start_node_id > end_node_id else 0
+
     def price_pair(
         self,
         source_channel_id: str,
@@ -193,6 +223,9 @@ class RebalanceRouter:
         final_hop_fee_sats = self._compute_final_hop_fee_sats(
             amount_sats, final_hop_fee_ppm
         )
+        dest_cltv = self._get_dest_channel_cltv(dest_peer_id)
+        invoice_final_cltv = self._get_invoice_final_cltv()
+        required_final_cltv = dest_cltv + invoice_final_cltv
 
         # Step 2: getroute for the middle path (source_peer → dest_peer)
         # If source and dest are the same peer (direct channel pair), skip getroute
@@ -207,6 +240,7 @@ class RebalanceRouter:
                     "amount_msat": route_amount_msat,
                     "riskfactor": 10,
                     "fromid": source_peer_id,
+                    "cltv": required_final_cltv,
                 }
                 if exclude:
                     getroute_kwargs["exclude"] = exclude
@@ -230,30 +264,33 @@ class RebalanceRouter:
 
         # Step 3: Build the full circular route
         # First hop: us → source_peer via source_channel.
-        # getroute's middle_route[0].delay already accounts for cumulative
-        # CLTV through the middle path. We add dest peer's CLTV for the
-        # final hop (dest_peer → us) which getroute doesn't know about.
-        # We do NOT add our own source channel CLTV — the sender doesn't
-        # need its own forwarding delta.
+        # getroute's middle route already carries the cumulative CLTV needed
+        # for the dest peer to forward back to our invoice. For direct pairs
+        # there is no middle path, so the first peer must receive exactly the
+        # return-hop requirement: invoice final CLTV + dest-channel delta.
         total_forward_msat = (amount_sats + final_hop_fee_sats + middle_fee_sats) * 1000
-        dest_cltv = self._get_dest_channel_cltv(dest_peer_id)
         first_hop_delay = (
-            (middle_route[0].get("delay", 0) if middle_route else 0)
-            + dest_cltv
+            int(middle_route[0].get("delay", 0) or 0)
+            if middle_route
+            else required_final_cltv
         )
         first_hop = {
             "id": source_peer_id,
             "channel": source_channel_id,
+            "direction": self._channel_direction(self.our_node_id, source_peer_id),
             "amount_msat": total_forward_msat,
             "delay": first_hop_delay,
+            "style": "tlv",
         }
 
         # Final hop: dest_peer → us via dest_channel
         final_hop = {
             "id": self.our_node_id,
             "channel": dest_channel_id,
+            "direction": self._channel_direction(dest_peer_id, self.our_node_id),
             "amount_msat": amount_sats * 1000,
-            "delay": 0,
+            "delay": invoice_final_cltv,
+            "style": "tlv",
         }
 
         full_route = [first_hop] + middle_route + [final_hop]

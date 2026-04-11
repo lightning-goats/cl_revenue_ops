@@ -21,6 +21,7 @@ def _make_plugin(
     getroute=None,
     getroute_error=None,
     listpeerchannels_error=None,
+    listconfigs=None,
 ):
     """Build a mock plugin with configurable RPC responses.
 
@@ -44,6 +45,9 @@ def _make_plugin(
 
     plugin.rpc.listpeerchannels.side_effect = _listpeerchannels
     plugin.rpc.listchannels.return_value = list_channels or {"channels": []}
+    plugin.rpc.listconfigs.return_value = listconfigs or {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
 
     if getroute_error:
         plugin.rpc.getroute.side_effect = getroute_error
@@ -214,6 +218,41 @@ class TestFullRoute:
         assert result.route[-1]["id"] == OUR_ID
         assert result.route[-1]["channel"] == DEST_SCID
         assert result.route[-1]["amount_msat"] == AMOUNT_SATS * 1000
+
+    def test_route_uses_invoice_cltv_and_explicit_directions(self):
+        """Synthetic hops must match the sendpay contract used by the executor."""
+        middle_route = [{
+            "id": DEST_PEER,
+            "channel": "300x1x0",
+            "direction": 0,
+            "style": "tlv",
+            "amount_msat": 50_010_000,
+            "delay": 58,
+        }]
+        plugin = _make_plugin(
+            peer_channels_by_id={
+                DEST_PEER: _dest_peer_channels(fee_ppm=200, cltv=40),
+                SOURCE_PEER: _source_peer_channels(cltv=18),
+            },
+            getroute={"route": middle_route},
+            listconfigs={"configs": {"cltv-final": {"value_int": 18}}},
+        )
+        router = RebalanceRouter(plugin, OUR_ID)
+
+        result = router.price_pair(
+            SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
+        )
+
+        assert result.success is True
+        plugin.rpc.getroute.assert_called_once()
+        kwargs = plugin.rpc.getroute.call_args.kwargs
+        assert kwargs["cltv"] == 58
+        assert result.route[0]["direction"] == 0
+        assert result.route[0]["delay"] == 58
+        assert result.route[0]["style"] == "tlv"
+        assert result.route[-1]["direction"] == 1
+        assert result.route[-1]["delay"] == 18
+        assert result.route[-1]["style"] == "tlv"
 
 
 class TestExcludePassthrough:
