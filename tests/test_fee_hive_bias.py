@@ -72,6 +72,18 @@ class TestFeeHiveBias:
         bias = fc._get_hive_fee_bias("02aabb")
         assert 0.9 <= bias <= 1.1
 
+    def test_hive_exploration_multiplier_uses_fee_elasticity(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        adapter = MagicMock()
+        adapter.get_centrality.return_value = 0.05
+        adapter.get_corridor_role.return_value = "owner"
+        adapter.get_fee_elasticity.return_value = 0.25
+        fc.hive_hints = adapter
+
+        multiplier = fc._get_hive_exploration_multiplier("02aabb")
+
+        assert multiplier > 1.5
+
 
 class TestMemberZeroFee:
     def test_hive_member_gets_zero_ppm(self, mock_plugin, mock_config, mock_database):

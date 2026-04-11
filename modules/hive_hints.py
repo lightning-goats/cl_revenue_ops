@@ -330,7 +330,12 @@ class HiveHintAdapter:
         return []
 
     def get_drain_direction(self, peer_id: str) -> str:
-        """Return drain direction: inbound_heavy|outbound_heavy|balanced."""
+        """Return drain direction for askrene/diagnostic consumers.
+
+        The active fee controller intentionally does not use this directly;
+        directional pressure is applied through cl-hive's askrene traffic
+        layers to avoid double-counting the same signal.
+        """
         hint = self._get_peer_hint(peer_id)
         val = hint.get("drain_direction")
         if val in ("inbound_heavy", "outbound_heavy", "balanced"):

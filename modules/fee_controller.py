@@ -1713,6 +1713,34 @@ class FeeController:
         except Exception:
             return 1.0
 
+    def _get_hive_exploration_multiplier(self, peer_id: str) -> float:
+        """Return bounded DTS variance multiplier from hive intelligence."""
+        if self.hive_hints is None:
+            return 1.0
+
+        multiplier = 1.0
+
+        try:
+            centrality = self.hive_hints.get_centrality(peer_id)
+            corridor_role = self.hive_hints.get_corridor_role(peer_id)
+            if centrality > 0.03 and corridor_role == "owner":
+                multiplier *= 1.5
+        except Exception:
+            pass
+
+        try:
+            elasticity = self.hive_hints.get_fee_elasticity(peer_id)
+            if isinstance(elasticity, (int, float)) and math.isfinite(float(elasticity)):
+                elasticity = abs(float(elasticity))
+                if 0 < elasticity < 0.75:
+                    multiplier *= 1.15
+                elif elasticity > 1.5:
+                    multiplier *= 0.9
+        except Exception:
+            pass
+
+        return max(0.75, min(2.0, multiplier))
+
     def _get_temporal_fee_adjustment(self, peer_id: str) -> float:
         """Return temporal fee multiplier (0.9-1.1) based on traffic patterns.
 
@@ -3870,21 +3898,16 @@ class FeeController:
             # DTS: Sample Fee from posterior
             # =====================================================================
 
-            # Centrality-based DTS exploration boost: high-centrality corridor
-            # owners may have higher fee optima.  Widen the posterior variance
-            # to encourage exploration of higher fees on structurally important peers.
-            if self.hive_hints:
+            exploration_multiplier = self._get_hive_exploration_multiplier(peer_id)
+            if exploration_multiplier != 1.0:
                 try:
-                    centrality = self.hive_hints.get_centrality(peer_id)
-                    corridor_role = self.hive_hints.get_corridor_role(peer_id)
-                    if centrality > 0.03 and corridor_role == "owner":
-                        if hasattr(ts_state.thompson, 'scale_variance'):
-                            ts_state.thompson.scale_variance(1.5)
-                        self.plugin.log(
-                            f"DTS EXPLORE BOOST: {peer_id[:12]}... "
-                            f"(centrality={centrality:.4f}, role={corridor_role})",
-                            level='debug'
-                        )
+                    if hasattr(ts_state.thompson, 'scale_variance'):
+                        ts_state.thompson.scale_variance(exploration_multiplier)
+                    self.plugin.log(
+                        f"DTS EXPLORE MULTIPLIER: {peer_id[:12]}... "
+                        f"(multiplier={exploration_multiplier:.2f})",
+                        level='debug'
+                    )
                 except Exception:
                     pass  # Thompson impl may not support scale_variance; graceful degradation
 
@@ -5244,4 +5267,3 @@ class FeeController:
                 state.posterior_std = float(max(state.MIN_STD, (1.0 / total_precision) ** 0.5))
         except Exception:
             pass
-

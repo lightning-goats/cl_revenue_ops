@@ -185,7 +185,7 @@ def _match_entry(pair: Any, entries: Iterable[dict]) -> dict:
 
     for entry in entries:
         entry_amount = _entry_amount_sats(entry)
-        if entry_amount > 0 and pair_amount > 0 and entry_amount != pair_amount:
+        if entry_amount > 0 and pair_amount > 0 and pair_amount > entry_amount:
             continue
         if pair_segments and pair_segments & _entry_segments(entry):
             return _entry_view(entry)

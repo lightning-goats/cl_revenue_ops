@@ -31,6 +31,10 @@ class PairCandidate:
     score: float = 0.0
     source_local_ratio: float = 0.0
     dest_local_ratio: float = 0.0
+    reason_code: str = "ev_positive"
+    coordination_hint_type: str = ""
+    coordination_hint_id: str = ""
+    coordination_rank_bonus: float = 0.0
     route_decision: Optional[RouteDecision] = None
 
 

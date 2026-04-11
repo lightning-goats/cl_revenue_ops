@@ -173,7 +173,8 @@ cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a s
 - Reads CLN datastore key `["hive", "hints"]` once per fee cycle
 - Falls back to `hive-export-hints` only when the datastore payload is missing, stale, or invalid
 - Caches snapshot with TTL (default 900s, override with `revenue-ops-hive-hints-ttl`)
-- Exposes bounded bias lookups consumed by fee controller, rebalancer, and capacity planner
+- Exposes bounded bias lookups consumed by fee controller, rebalancer, shared `HiveRouter`, and capacity planner
+- The fee loop refreshes the shared `HiveRouter` from the same snapshot each cycle (`refresh_layer()`, `refresh_fleet_balances()`, `clear_route_cache()`) so fleet-aware inbound pricing and Boltz scoring are not startup-stale
 
 **Bias bounds (hard-coded, not configurable):**
 - Fee: ±10% max (`get_fee_bias()`)
@@ -192,9 +193,13 @@ cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a s
 - `peer_quality_score` → rebalance bias (±5%)
 - `rebalance_preference` → rebalance bias (sink +5%, source -5%)
 - `fleet_fee_median` → fee prior seed for DTS
+- `fee_elasticity` → bounded DTS exploration-variance multiplier
 - `channel_open_hint` → capacity planner scoring (±30%)
+- `reputation_score` / `corridor_utilization_bias` → bounded capacity-planner open scoring
 - `closure_recommended` / `closure_reason` → closure pressure in capacity planning
-- `rebalance_recommendations` / `rebalance_campaigns` → route-policy classification and ordering for the active rebalance engine. Matching accepts peer IDs, local SCIDs, and route segments, and may honor `route_policy`, `allow_market_fallback`, `prefer_hive_on_tie`, and `priority_score`.
+- `rebalance_recommendations` / `rebalance_campaigns` → coordination overlay inputs before pair selection and route-policy classification in the active rebalance engine. Matching accepts peer IDs, local SCIDs, and route segments, and may honor `route_policy`, `allow_market_fallback`, `prefer_hive_on_tie`, and `priority_score`.
+- `route_segment_leases` → coordinated-pair suppression when another fleet member currently owns the overlapping segment
+- `drain_direction` → exported for askrene/diagnostic use only; fee logic intentionally does not apply it directly
 
 **Active hive-route policy:**
 - `hive_only` → require the active hive-route pricer and live `hive-*` / `revenue-*` askrene layers for the full circular route

@@ -1936,6 +1936,26 @@ class TestGraphDiscoveryAndScoring:
         expected = base_score * (51 / 62) * 1.5
         assert abs(result - expected) < 0.01
 
+    def test_score_candidate_uses_hive_reputation_and_corridor_bias(self):
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+
+        prof_analyzer.database.get_peer_reputation.return_value = None
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
+            'count': 0, 'marginal_roi_proxy': 0,
+        }
+        prof_analyzer.database.get_peer_uptime_percent.return_value = 99.0
+
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+        planner.hive_hints = MagicMock()
+        planner.hive_hints.get_channel_open_hint.return_value = {}
+        planner.hive_hints.get_corridor_utilization_bias.return_value = 1.1
+        planner.hive_hints.get_reputation_score.return_value = 80
+
+        result = planner._score_candidate("peer_abc", 1.0)
+
+        assert result > 1.15
+
     # --- _update_candidate_pool tests ---
 
     def test_update_candidate_pool_persists(self):

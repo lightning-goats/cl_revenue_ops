@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .rebalance_audit_v2 import RebalanceAudit
+from .rebalance_coordination_overlay import (
+    build_coordination_overlay,
+    merge_coordination_pairs,
+)
 from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
 from .rebalance_hive_router import RebalanceHiveRouter
 from .rebalance_memory import RebalanceRoutingMemory
@@ -321,6 +325,23 @@ class RebalanceEngine:
         )
 
         plan = planner.plan(snapshot)
+        overlay = build_coordination_overlay(
+            snapshot,
+            hive_hints=self._hive_hints,
+            our_node_id=self._get_our_id() or "",
+            target_band_low=planner.target_band_low,
+            target_band_high=planner.target_band_high,
+            max_chunk_sats=planner.max_chunk_sats,
+        )
+        plan.skipped.extend(overlay.skipped)
+        planner_max_pairs = getattr(planner, "max_pairs", 10)
+        if not isinstance(planner_max_pairs, int) or planner_max_pairs <= 0:
+            planner_max_pairs = 10
+        plan.selected = merge_coordination_pairs(
+            plan,
+            overlay.selected,
+            max_pairs=planner_max_pairs,
+        )
         for pair in plan.selected:
             self._route_decision_for_pair(pair)
         priority_rank = {

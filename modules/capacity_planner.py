@@ -1728,6 +1728,11 @@ class CapacityPlanner:
             except Exception:
                 pass
 
+            try:
+                score *= self._get_hive_open_score_multiplier(peer_id)
+            except Exception:
+                pass
+
         # Inbound fee penalty: expensive-to-rebalance peers are less valuable
         try:
             inbound_data = self.profitability.database.get_historical_inbound_fee_ppm(peer_id)
@@ -1772,6 +1777,31 @@ class CapacityPlanner:
                 score *= 0.9
 
         return score
+
+    def _get_hive_open_score_multiplier(self, peer_id: str) -> float:
+        """Return bounded open-candidate multiplier from hive routing intelligence."""
+        if self.hive_hints is None:
+            return 1.0
+
+        multiplier = 1.0
+
+        try:
+            multiplier *= max(
+                0.9,
+                min(1.1, float(self.hive_hints.get_corridor_utilization_bias(peer_id))),
+            )
+        except Exception:
+            pass
+
+        try:
+            reputation = self.hive_hints.get_reputation_score(peer_id)
+            if isinstance(reputation, (int, float)):
+                reputation = max(0.0, min(100.0, float(reputation)))
+                multiplier *= 1.0 + (((reputation - 50.0) / 50.0) * 0.1)
+        except Exception:
+            pass
+
+        return max(0.75, min(1.25, multiplier))
 
     def _update_candidate_pool(self, candidates: List[Dict]):
         """Persist scored candidates to database."""

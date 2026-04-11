@@ -126,8 +126,14 @@ lightning-cli revenue-config set daily_budget_sats 10000
 
 - Transport order is datastore first: read CLN datastore key `["hive", "hints"]`, then fall back to `hive-export-hints` only if the datastore payload is missing, stale, or invalid.
 - Missing or malformed per-peer hint entries degrade to neutral local behavior; they do not bypass fee, rebalance, planner, or policy safety rails.
+- Once per fee cycle, `cl_revenue_ops` polls the hint snapshot and refreshes the shared `HiveRouter` (`hive-fleet` layer detection, fleet balance cache, route cache clear) so inbound-fee estimation and Boltz topology scoring see live fleet state instead of a startup-only snapshot.
 - Rebalance candidates are classified before pricing as `hive_only`, `hybrid`, or `market_only`. `hive_only` uses the active hive-route pricer with live `hive-*` and `revenue-*` askrene layers, `hybrid` compares that fleet-aware route against the configured market router, and `market_only` stays on the configured router only.
-- Coordination hints may steer that classification and candidate ordering through `rebalance_recommendations` / `rebalance_campaigns`. Matching accepts peer IDs, local SCIDs, or route segments, and honors optional metadata such as `route_policy`, `allow_market_fallback`, `prefer_hive_on_tie`, and `priority_score`.
+- Coordination hints now seed candidate generation before the active pair cap is applied. `rebalance_recommendations` / `rebalance_campaigns` can materialize coordinated pairs from peer IDs, local SCIDs, or route segments, and may steer policy via `route_policy`, `allow_market_fallback`, `prefer_hive_on_tie`, and `priority_score`.
+- `route_segment_leases` are honored during that overlay stage: overlapping foreign leases suppress the candidate with an explicit `lease_conflict` audit reason, while our own leases are allowed through.
+- Additional live hint consumers:
+  - `fee_elasticity` slightly widens or narrows DTS exploration variance
+  - `reputation_score` and `corridor_utilization_bias` modestly bias capacity-planner open scoring
+  - `drain_direction` remains askrene/diagnostic only; the fee controller intentionally does not apply it directly
 - `revenue-hive-hints-status` reports freshness and signal coverage for the currently cached snapshot.
 
 ## More Detail
