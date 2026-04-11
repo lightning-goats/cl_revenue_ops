@@ -1,6 +1,7 @@
 """Tests for the rebalance engine delegation and integration."""
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -113,3 +114,131 @@ def test_rebalancer_reports_failed_execution(mock_plugin, mock_database):
     summary = r.get_last_decision_summary()
     assert summary["action"] == "rebalance"
     assert "0/1" in summary["reason"]
+
+
+def test_active_engine_uses_hive_router_for_hive_only_pairs(mock_plugin, mock_database):
+    """HIVE_ONLY candidates should not be priced by the market router."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_route_policy import RoutePolicy
+
+    cfg = Config(dry_run=True, rebalance_router="v2")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v2 = MagicMock(name="market_router")
+    engine._hive_router = MagicMock(name="hive_router")
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+
+    hive_only_candidate = SimpleNamespace(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        score=1.0,
+        route_decision=SimpleNamespace(
+            policy=RoutePolicy.HIVE_ONLY,
+            allow_market_fallback=False,
+            reason="hive_equalization",
+        ),
+        route_cost_sats=None,
+        route=None,
+    )
+
+    route_result = SimpleNamespace(
+        success=True,
+        route_cost_sats=1,
+        route=[],
+        probability_ppm=0,
+        error="",
+    )
+    engine.router_v2.price_pair.return_value = route_result
+    engine._hive_router.price_pair.return_value = route_result
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner = planner_cls.return_value
+        planner.plan.return_value = SimpleNamespace(
+            selected=[hive_only_candidate],
+            skipped=[],
+        )
+
+        engine.find_candidates()
+
+    engine._hive_router.price_pair.assert_called_once()
+    engine.router_v2.price_pair.assert_not_called()
+
+
+def test_active_engine_does_not_silently_market_route_hive_only_without_hive_router(
+    mock_plugin, mock_database
+):
+    """Strict hive-only decisions must fail closed when no hive router exists."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_route_policy import RoutePolicy
+
+    cfg = Config(dry_run=True, rebalance_router="v2")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v2 = MagicMock(name="market_router")
+    engine._hive_router = None
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+
+    strict_candidate = SimpleNamespace(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        score=1.0,
+        route_decision=SimpleNamespace(
+            policy=RoutePolicy.HIVE_ONLY,
+            allow_market_fallback=False,
+            reason="hive_equalization",
+            priority_score=0.0,
+        ),
+        route_cost_sats=None,
+        route=None,
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner = planner_cls.return_value
+        planner.plan.return_value = SimpleNamespace(
+            selected=[strict_candidate],
+            skipped=[],
+        )
+
+        selected = engine.find_candidates()
+
+    assert selected == []
+    engine.router_v2.price_pair.assert_not_called()

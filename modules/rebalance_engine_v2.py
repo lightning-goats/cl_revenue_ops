@@ -13,9 +13,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .rebalance_audit_v2 import RebalanceAudit
 from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
+from .rebalance_hive_router import RebalanceHiveRouter
 from .rebalance_memory import RebalanceRoutingMemory
 from .rebalance_planner_v2 import RebalancePlanner
-from .rebalance_router_v2 import RebalanceRouter
+from .rebalance_route_policy import RoutePolicy, RoutePriority, decide_route_policy
+from .rebalance_router_v2 import RebalanceRouter, RouteResult
 from .rebalance_router_v3 import RebalanceRouterV3, _parse_layer_names
 from .rebalance_state_v2 import StateSnapshot, build_state_snapshot
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
@@ -44,6 +46,7 @@ class RebalanceEngine:
         profitability: Any = None,
         hive_hints: Any = None,
         data_service: Any = None,
+        hive_router: Any = None,
     ):
         self.plugin = plugin
         self.config = config
@@ -52,6 +55,10 @@ class RebalanceEngine:
         self._profitability = profitability
         self._hive_hints = hive_hints
         self._data_service = data_service
+        self._legacy_hive_router = hive_router
+        self._hive_router = (
+            hive_router if hasattr(hive_router, "price_pair") else None
+        )
 
         self._our_id: Optional[str] = None
         self._audit = RebalanceAudit(plugin)
@@ -78,6 +85,14 @@ class RebalanceEngine:
         self.router_v2 = RebalanceRouter(
             plugin, our_id, data_service=self._data_service
         )
+        if self._hive_router is None and self._hive_hints is not None:
+            self._hive_router = RebalanceHiveRouter(
+                plugin=plugin,
+                our_node_id=our_id,
+                hive_hints=self._hive_hints,
+                data_service=self._data_service,
+                log=self._log,
+            )
 
         # Build v3 router iff askrene is available. Missing askrene means
         # standalone fallback: the active router stays on v2 regardless of
@@ -306,18 +321,30 @@ class RebalanceEngine:
         )
 
         plan = planner.plan(snapshot)
+        for pair in plan.selected:
+            self._route_decision_for_pair(pair)
+        priority_rank = {
+            RoutePriority.COORDINATED: 0,
+            RoutePriority.HIVE_EQUALIZATION: 1,
+            RoutePriority.EV_POSITIVE: 2,
+            RoutePriority.BACKGROUND: 3,
+        }
+        plan.selected.sort(
+            key=lambda pair: (
+                priority_rank.get(getattr(getattr(pair, "route_decision", None), "priority", RoutePriority.EV_POSITIVE), 99),
+                -float(getattr(getattr(pair, "route_decision", None), "priority_score", 0.0) or 0.0),
+                -float(getattr(pair, "score", 0.0) or 0.0),
+            )
+        )
 
         # Route-price selected pairs using the cycle's captured router
         if plan.selected:
             router = self._cycle_router
             priced = []
             for pair in plan.selected:
-                route_result = router.price_pair(
-                    source_channel_id=pair.source_channel_id,
-                    dest_channel_id=pair.dest_channel_id,
-                    source_peer_id=pair.source_peer_id,
-                    dest_peer_id=pair.dest_peer_id,
-                    amount_sats=pair.amount_sats,
+                route_result, route_label = self._route_pair(
+                    pair=pair,
+                    router=router,
                     exclude=self._routing_memory.current_excludes() or None,
                 )
                 if route_result.success:
@@ -335,7 +362,7 @@ class RebalanceEngine:
                             pair.amount_sats,
                             route_result.route_cost_sats,
                             pair.score,
-                            router=router_tag,
+                            router=route_label,
                         )
                     else:
                         plan.skipped.append(SkipRecord(
@@ -354,7 +381,7 @@ class RebalanceEngine:
                         channel_id=pair.dest_channel_id,
                         reason="no_route",
                         value_class="valuable",
-                        detail=route_result.error,
+                    detail=route_result.error,
                     ))
 
             plan.selected = priced
@@ -379,6 +406,81 @@ class RebalanceEngine:
         )
 
         return plan.selected
+
+    def _route_decision_for_pair(self, pair: PairCandidate):
+        decision = getattr(pair, "route_decision", None)
+        if decision is not None:
+            return decision
+        decision = decide_route_policy(
+            pair,
+            reason_code=getattr(pair, "reason_code", "") or "ev_positive",
+            hive_hints=self._hive_hints,
+        )
+        pair.route_decision = decision
+        return decision
+
+    @staticmethod
+    def _market_price_pair(router: Any, pair: PairCandidate, exclude: Optional[List[str]]):
+        return router.price_pair(
+            source_channel_id=pair.source_channel_id,
+            dest_channel_id=pair.dest_channel_id,
+            source_peer_id=pair.source_peer_id,
+            dest_peer_id=pair.dest_peer_id,
+            amount_sats=pair.amount_sats,
+            exclude=exclude,
+        )
+
+    @staticmethod
+    def _route_error(error: str) -> RouteResult:
+        return RouteResult(success=False, error=error)
+
+    def _hybrid_choice(self, hive_result: Any, market_result: Any, decision: Any):
+        if getattr(hive_result, "success", False) and not getattr(market_result, "success", False):
+            return hive_result, "hive"
+        if getattr(market_result, "success", False) and not getattr(hive_result, "success", False):
+            return market_result, "market"
+        if not getattr(hive_result, "success", False) and not getattr(market_result, "success", False):
+            return market_result, "market"
+        hive_cost = int(getattr(hive_result, "route_cost_sats", 0) or 0)
+        market_cost = int(getattr(market_result, "route_cost_sats", 0) or 0)
+        if hive_cost < market_cost:
+            return hive_result, "hive"
+        if market_cost < hive_cost:
+            return market_result, "market"
+        if bool(getattr(decision, "prefer_hive_on_tie", True)):
+            return hive_result, "hive"
+        return market_result, "market"
+
+    def _route_pair(
+        self,
+        *,
+        pair: PairCandidate,
+        router: Any,
+        exclude: Optional[List[str]],
+    ):
+        decision = self._route_decision_for_pair(pair)
+        hive_router = self._hive_router if hasattr(self._hive_router, "price_pair") else None
+        if decision.policy is RoutePolicy.HIVE_ONLY:
+            if hive_router is None:
+                if decision.allow_market_fallback:
+                    return self._market_price_pair(router, pair, exclude), (
+                        "v3" if router is self.router_v3 else "v2"
+                    )
+                return self._route_error("hive_router_unavailable"), "hive"
+            hive_result = hive_router.price_pair(pair, decision, exclude=exclude)
+            if getattr(hive_result, "success", False) or not decision.allow_market_fallback:
+                return hive_result, "hive"
+            market_result = self._market_price_pair(router, pair, exclude)
+            if getattr(market_result, "success", False):
+                return market_result, "market"
+            return hive_result, "hive"
+        if decision.policy is RoutePolicy.HYBRID and hive_router is not None:
+            hive_result = hive_router.price_pair(pair, decision, exclude=exclude)
+            market_result = self._market_price_pair(router, pair, exclude)
+            return self._hybrid_choice(hive_result, market_result, decision)
+        return self._market_price_pair(router, pair, exclude), (
+            "v3" if router is self.router_v3 else "v2"
+        )
 
     def _prune_pair_failures(self, key: Tuple[str, str]) -> List[float]:
         """Drop failure timestamps older than the futility window and return survivors."""
@@ -450,6 +552,8 @@ class RebalanceEngine:
         unroutable (see Phase B test on nexus-01, 2026-04-10).
         """
         bonus_rate = getattr(self.config, "capex_probability_budget_bonus", 0.0)
+        if not isinstance(bonus_rate, (int, float)):
+            bonus_rate = 0.0
         if bonus_rate <= 0.0 or probability_ppm <= 0:
             return pair_budget_sats
         clamped = min(1.0, max(0.0, probability_ppm / 1_000_000.0))

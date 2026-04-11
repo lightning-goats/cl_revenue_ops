@@ -1593,6 +1593,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             profitability=profitability_analyzer,
             hive_hints=hive_hints,
             data_service=data_service,
+            hive_router=hive_router,
         )
         rebalancer.data_service = data_service
         plugin.log("RebalanceEngine initialized")

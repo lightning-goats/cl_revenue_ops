@@ -1,0 +1,216 @@
+"""Tests for the active-engine hive route pricer."""
+
+from unittest.mock import MagicMock
+
+from modules.rebalance_route_policy import RouteDecision, RoutePolicy, RoutePriority
+from modules.rebalance_types_v2 import PairCandidate
+
+
+OUR_ID = "03" + "f" * 64
+SRC_PEER = "02" + "a" * 64
+MID_PEER = "02" + "b" * 64
+DST_PEER = "02" + "c" * 64
+
+
+class FakeHiveHints:
+    def __init__(self, members):
+        self._members = set(members)
+
+    def is_hive_member(self, peer_id: str) -> bool:
+        return peer_id in self._members
+
+
+def _pair() -> PairCandidate:
+    return PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100_000,
+        pair_budget_sats=100,
+    )
+
+
+def _route_decision(policy: RoutePolicy) -> RouteDecision:
+    return RouteDecision(
+        policy=policy,
+        priority=RoutePriority.COORDINATED,
+        reason="coordinated_rebalance",
+        allow_market_fallback=policy is not RoutePolicy.HIVE_ONLY,
+    )
+
+
+def test_hive_router_uses_all_live_hive_and_revenue_layers():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    data_service.get_askrene_layers.return_value = {"layers": [
+        {"layer": "hive-fleet"},
+        {"layer": "hive-reputation"},
+        {"layer": "hive-corridors"},
+        {"layer": "hive-traffic"},
+        {"layer": "revenue-local"},
+    ]}
+    data_service.get_peer_channels.side_effect = lambda peer_id=None: (
+        {
+            "channels": [{
+                "short_channel_id": "100x1x0",
+                "peer_id": SRC_PEER,
+                "state": "CHANNELD_NORMAL",
+            }]
+        }
+        if peer_id is None
+        else {
+            "channels": [{
+                "short_channel_id": "200x1x0",
+                "peer_id": DST_PEER,
+                "updates": {"remote": {
+                    "fee_base_msat": 0,
+                    "fee_proportional_millionths": 0,
+                    "cltv_expiry_delta": 6,
+                }},
+            }]
+        }
+    )
+    data_service.get_configs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000000,
+            "path": [
+                {
+                    "short_channel_id_dir": "100x1x0/0",
+                    "next_node_id": MID_PEER,
+                    "amount_msat": 100000000,
+                    "delay": 24,
+                },
+                {
+                    "short_channel_id_dir": "300x1x0/0",
+                    "next_node_id": DST_PEER,
+                    "amount_msat": 100000000,
+                    "delay": 18,
+                },
+            ],
+        }],
+    }
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, MID_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    result = router.price_pair(_pair(), _route_decision(RoutePolicy.HIVE_ONLY))
+
+    assert result.success is True
+    assert data_service.get_routes.call_args.kwargs["layers"] == [
+        "auto.localchans",
+        "hive-fleet",
+        "hive-reputation",
+        "hive-corridors",
+        "hive-traffic",
+        "revenue-local",
+        "auto.no_mpp_support",
+    ]
+
+
+def test_hive_router_rejects_non_hive_intermediate_for_hive_only():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    data_service.get_askrene_layers.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    data_service.get_peer_channels.side_effect = lambda peer_id=None: (
+        {"channels": [{"short_channel_id": "100x1x0", "peer_id": SRC_PEER, "state": "CHANNELD_NORMAL"}]}
+        if peer_id is None
+        else {"channels": [{
+            "short_channel_id": "200x1x0",
+            "peer_id": DST_PEER,
+            "updates": {"remote": {"fee_base_msat": 0, "fee_proportional_millionths": 0, "cltv_expiry_delta": 6}},
+        }]}
+    )
+    data_service.get_configs.return_value = {"configs": {"cltv-final": {"value_int": 18}}}
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000000,
+            "path": [
+                {
+                    "short_channel_id_dir": "100x1x0/0",
+                    "next_node_id": MID_PEER,
+                    "amount_msat": 100000000,
+                    "delay": 24,
+                },
+                {
+                    "short_channel_id_dir": "300x1x0/0",
+                    "next_node_id": DST_PEER,
+                    "amount_msat": 100000000,
+                    "delay": 18,
+                },
+            ],
+        }],
+    }
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    result = router.price_pair(_pair(), _route_decision(RoutePolicy.HIVE_ONLY))
+
+    assert result.success is False
+    assert "non_hive_intermediate" in result.error
+
+
+def test_hive_router_returns_no_fleet_route_when_hybrid_path_has_no_hive_hops():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    data_service.get_askrene_layers.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    data_service.get_peer_channels.side_effect = lambda peer_id=None: (
+        {"channels": [{"short_channel_id": "100x1x0", "peer_id": SRC_PEER, "state": "CHANNELD_NORMAL"}]}
+        if peer_id is None
+        else {"channels": [{
+            "short_channel_id": "200x1x0",
+            "peer_id": DST_PEER,
+            "updates": {"remote": {"fee_base_msat": 0, "fee_proportional_millionths": 0, "cltv_expiry_delta": 6}},
+        }]}
+    )
+    data_service.get_configs.return_value = {"configs": {"cltv-final": {"value_int": 18}}}
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000000,
+            "path": [{
+                "short_channel_id_dir": "100x1x0/0",
+                "next_node_id": DST_PEER,
+                "amount_msat": 100000000,
+                "delay": 18,
+            }],
+        }],
+    }
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    result = router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+
+    assert result.success is False
+    assert "no_fleet_route" in result.error

@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .rebalance_route_policy import RouteDecision
+
 
 @dataclass
 class PairCandidate:
@@ -29,6 +31,7 @@ class PairCandidate:
     score: float = 0.0
     source_local_ratio: float = 0.0
     dest_local_ratio: float = 0.0
+    route_decision: Optional[RouteDecision] = None
 
 
 @dataclass

@@ -126,6 +126,8 @@ lightning-cli revenue-config set daily_budget_sats 10000
 
 - Transport order is datastore first: read CLN datastore key `["hive", "hints"]`, then fall back to `hive-export-hints` only if the datastore payload is missing, stale, or invalid.
 - Missing or malformed per-peer hint entries degrade to neutral local behavior; they do not bypass fee, rebalance, planner, or policy safety rails.
+- Rebalance candidates are classified before pricing as `hive_only`, `hybrid`, or `market_only`. `hive_only` uses the active hive-route pricer with live `hive-*` and `revenue-*` askrene layers, `hybrid` compares that fleet-aware route against the configured market router, and `market_only` stays on the configured router only.
+- Coordination hints may steer that classification and candidate ordering through `rebalance_recommendations` / `rebalance_campaigns`. Matching accepts peer IDs, local SCIDs, or route segments, and honors optional metadata such as `route_policy`, `allow_market_fallback`, `prefer_hive_on_tie`, and `priority_score`.
 - `revenue-hive-hints-status` reports freshness and signal coverage for the currently cached snapshot.
 
 ## More Detail

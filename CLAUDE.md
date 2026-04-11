@@ -194,6 +194,12 @@ cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a s
 - `fleet_fee_median` → fee prior seed for DTS
 - `channel_open_hint` → capacity planner scoring (±30%)
 - `closure_recommended` / `closure_reason` → closure pressure in capacity planning
+- `rebalance_recommendations` / `rebalance_campaigns` → route-policy classification and ordering for the active rebalance engine. Matching accepts peer IDs, local SCIDs, and route segments, and may honor `route_policy`, `allow_market_fallback`, `prefer_hive_on_tie`, and `priority_score`.
+
+**Active hive-route policy:**
+- `hive_only` → require the active hive-route pricer and live `hive-*` / `revenue-*` askrene layers for the full circular route
+- `hybrid` → compare the hive-route pricer against the configured market router and choose the cheaper executable route
+- `market_only` → use the configured market router only
 
 ## Safety Constraints
 

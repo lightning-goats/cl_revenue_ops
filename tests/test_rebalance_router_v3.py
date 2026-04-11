@@ -664,7 +664,7 @@ def test_v3_router_prefers_data_service_for_routes_and_policy_reads():
     )
 
     assert result.success is True
-    data_service.get_askrene_layers.assert_called_once_with()
+    assert data_service.get_askrene_layers.call_count == 2
     data_service.get_routes.assert_called_once()
     plugin.rpc.call.assert_not_called()
     plugin.rpc.getroutes.assert_not_called()
