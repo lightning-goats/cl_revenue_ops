@@ -59,6 +59,39 @@ def _listpeerchannels_payload(
     }
 
 
+def _listpeerchannels_current_payload(
+    channel_id: str,
+    peer_id: str,
+    fee_ppm: int = 100,
+    full_channel_id: str = "",
+    minimum_htlc_out_msat: Union[int, str] = 0,
+    maximum_htlc_out_msat: Union[int, str] = 0,
+):
+    return {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "short_channel_id": channel_id,
+                "channel_id": full_channel_id or ("11" * 32),
+                "peer_id": peer_id,
+                "spendable_msat": 500_000_000,
+                "receivable_msat": 500_000_000,
+                "total_msat": 1_000_000_000,
+                "minimum_htlc_out_msat": minimum_htlc_out_msat,
+                "maximum_htlc_out_msat": maximum_htlc_out_msat,
+                "updates": {
+                    "local": {
+                        "fee_base_msat": 0,
+                        "fee_proportional_millionths": fee_ppm,
+                        "htlc_minimum_msat": minimum_htlc_out_msat,
+                        "htlc_maximum_msat": maximum_htlc_out_msat,
+                    }
+                }
+            }
+        ]
+    }
+
+
 def _fee_strategy_state_dict():
     # Minimal dict for _get_cycle_state fee strategy loaders.
     return {
@@ -100,6 +133,31 @@ class TestChannelInfoShaping:
             fee_ppm=100,
             htlc_minimum_msat=advertised_htlc_minimum_msat,
             htlc_maximum_msat=advertised_htlc_maximum_msat,
+        )
+
+        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
+        channel_info = fc._get_channels_info()[channel_id]
+
+        assert channel_info["htlc_minimum_msat"] == 42_000
+        assert channel_info["htlc_min_msat"] == 42_000
+        assert channel_info["htlc_maximum_msat"] == 21_000_000
+        assert channel_info["htlc_max_msat"] == 21_000_000
+
+    def test_get_channels_info_reads_current_listpeerchannels_htlc_fields(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_current_payload(
+            channel_id,
+            peer_id,
+            fee_ppm=100,
+            minimum_htlc_out_msat="42000msat",
+            maximum_htlc_out_msat="21000000msat",
         )
 
         fc = FeeController(mock_plugin, cfg, mock_database)
@@ -162,6 +220,82 @@ class TestSetChannelFeeLimits:
 
         assert _setchannel_kwargs(mock_plugin)["feeppm"] == 1
 
+    def test_set_channel_fee_normalizes_colon_scid(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
+        mock_plugin.rpc.setchannel = MagicMock()
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
+
+        result = fc.set_channel_fee("123:456:0", 125, manual=True)
+
+        assert result["success"] is True
+        assert _setchannel_kwargs(mock_plugin)["id"] == channel_id
+
+    def test_set_channel_fee_resolves_full_channel_id_to_scid(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        channel_id = "123x456x0"
+        full_channel_id = "ad" * 32
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_current_payload(
+            channel_id,
+            peer_id,
+            fee_ppm=100,
+            full_channel_id=full_channel_id,
+        )
+        mock_plugin.rpc.setchannel = MagicMock()
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
+
+        result = fc.set_channel_fee(full_channel_id, 125, manual=True)
+
+        assert result["success"] is True
+        assert _setchannel_kwargs(mock_plugin)["id"] == channel_id
+
+    def test_set_channel_fee_rejects_ambiguous_peer_id(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        peer_id = "02" + "a" * 64
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                _listpeerchannels_payload("123x456x0", peer_id, fee_ppm=100)["channels"][0],
+                _listpeerchannels_payload("123x456x1", peer_id, fee_ppm=110)["channels"][0],
+            ]
+        }
+        mock_plugin.rpc.setchannel = MagicMock()
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
+
+        result = fc.set_channel_fee(peer_id, 125, manual=True)
+
+        assert result["success"] is False
+        assert "active channels" in result["message"]
+        mock_plugin.rpc.setchannel.assert_not_called()
+
 class TestSetChannelFeeHtlcMin:
     def _make_controller(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -194,6 +328,25 @@ class TestSetChannelFeeHtlcMin:
         fc.set_channel_fee("123x456x0", 125, manual=True, htlcmin_msat=42_000)
 
         assert _setchannel_kwargs(mock_plugin)["htlcmin"] == "42000msat"
+
+    def test_set_channel_fee_surfaces_applied_htlc_bounds_and_warnings(self, mock_plugin, mock_database):
+        fc = self._make_controller(mock_plugin, mock_database)
+        mock_plugin.rpc.setchannel.return_value = {
+            "channels": [{
+                "short_channel_id": "123x456x0",
+                "fee_proportional_millionths": 125,
+                "minimum_htlc_out_msat": "50000msat",
+                "maximum_htlc_out_msat": "21000000msat",
+                "warning_htlcmin_too_low": "peer floor applied",
+            }]
+        }
+
+        result = fc.set_channel_fee("123x456x0", 125, manual=True, htlcmin_msat=42_000)
+
+        assert result["success"] is True
+        assert result["applied_htlcmin_msat"] == 50_000
+        assert result["applied_htlcmax_msat"] == 21_000_000
+        assert result["warnings"]["warning_htlcmin_too_low"] == "peer floor applied"
 
 
 class TestDynamicHtlcMinPersistence:
@@ -520,12 +673,12 @@ class TestSetInitialFee:
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
-        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_current_payload(
             channel_id,
             peer_id,
             fee_ppm=0,
-            htlc_minimum_msat="42000msat",
-            htlc_maximum_msat="21000000msat",
+            minimum_htlc_out_msat="42000msat",
+            maximum_htlc_out_msat="21000000msat",
         )
 
         fc = self._make_controller(mock_plugin, mock_database)

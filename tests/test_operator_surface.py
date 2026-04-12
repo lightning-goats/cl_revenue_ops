@@ -306,6 +306,29 @@ def test_revenue_config_no_args_returns_public_config_dict():
     assert result["config"]["daily_budget_sats"] == 1200
 
 
+def test_revenue_set_fee_accepts_full_channel_id_hash():
+    mod = load_plugin_module()
+    mod.fee_controller = MagicMock()
+    mod.fee_controller.set_channel_fee.return_value = {
+        "success": True,
+        "channel_id": "123x456x0",
+        "fee_ppm": 125,
+    }
+    mod.config = Config(min_fee_ppm=10, max_fee_ppm=5000)
+    mod.force_rate_limiter = MagicMock()
+
+    full_channel_id = "ad" * 32
+    result = mod.revenue_set_fee(mod.plugin, full_channel_id, 125)
+
+    assert result["status"] == "success"
+    mod.fee_controller.set_channel_fee.assert_called_once_with(
+        full_channel_id,
+        125,
+        manual=True,
+        enforce_limits=True,
+    )
+
+
 def test_revenue_analyze_normalizes_colon_scid_before_flow_analysis():
     mod = load_plugin_module()
     mod.flow_analyzer = MagicMock()

@@ -65,7 +65,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from .database import Database
 from .policy_manager import PolicyManager, FeeStrategy, PeerPolicy
-from .utils import parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
+from .utils import normalize_scid, parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -4408,6 +4408,121 @@ class FeeController:
         """Handle policy changes (placeholder for future use)."""
         pass
 
+    @staticmethod
+    def _extract_local_htlc_bounds(
+        channel: Dict[str, Any],
+        local_updates: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, int]:
+        """Read local HTLC bounds from current and legacy CLN payload shapes."""
+        local_updates = local_updates or {}
+
+        def _first_present_msat(*candidates: Tuple[Optional[Dict[str, Any]], str]) -> int:
+            for container, key in candidates:
+                if container is not None and key in container:
+                    return parse_msat(container.get(key))
+            return 0
+
+        htlc_minimum_msat = _first_present_msat(
+            (local_updates, "htlc_minimum_msat"),
+            (channel, "minimum_htlc_out_msat"),
+            (channel, "htlc_minimum_msat"),
+            (channel, "htlc_min_msat"),
+        )
+        htlc_maximum_msat = _first_present_msat(
+            (local_updates, "htlc_maximum_msat"),
+            (channel, "maximum_htlc_out_msat"),
+            (channel, "htlc_maximum_msat"),
+            (channel, "htlc_max_msat"),
+        )
+        return htlc_minimum_msat, htlc_maximum_msat
+
+    @staticmethod
+    def _extract_setchannel_effective_values(
+        rpc_result: Any,
+        channel_id: str,
+    ) -> Tuple[Optional[int], Optional[int], Optional[int], Dict[str, str]]:
+        """Return actual applied fee/HTLC values and warnings from setchannel."""
+        if not isinstance(rpc_result, dict):
+            return None, None, None, {}
+
+        result_channels = rpc_result.get("channels")
+        if not isinstance(result_channels, list) or not result_channels:
+            return None, None, None, {}
+
+        normalized_channel_id = normalize_scid(channel_id)
+        applied = None
+        for candidate in result_channels:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_scid = normalize_scid(candidate.get("short_channel_id"))
+            candidate_cid = normalize_scid(candidate.get("channel_id"))
+            if normalized_channel_id in (candidate_scid, candidate_cid):
+                applied = candidate
+                break
+        if applied is None and len(result_channels) == 1 and isinstance(result_channels[0], dict):
+            applied = result_channels[0]
+        if applied is None:
+            return None, None, None, {}
+
+        applied_fee_ppm = applied.get("fee_proportional_millionths")
+        if applied_fee_ppm is not None:
+            applied_fee_ppm = int(applied_fee_ppm)
+
+        applied_htlcmin_msat = None
+        if "minimum_htlc_out_msat" in applied:
+            applied_htlcmin_msat = parse_msat(applied.get("minimum_htlc_out_msat"))
+
+        applied_htlcmax_msat = None
+        if "maximum_htlc_out_msat" in applied:
+            applied_htlcmax_msat = parse_msat(applied.get("maximum_htlc_out_msat"))
+
+        warnings: Dict[str, str] = {}
+        for key in ("warning_htlcmin_too_low", "warning_htlcmax_too_high"):
+            if key in applied:
+                warnings[key] = str(applied[key])
+
+        return applied_fee_ppm, applied_htlcmin_msat, applied_htlcmax_msat, warnings
+
+    @staticmethod
+    def _resolve_channel_reference(
+        channel_ref: str,
+        channels: Dict[str, Dict[str, Any]],
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+        """Resolve SCIDs, full channel IDs, and unique peer IDs to canonical SCIDs."""
+        normalized_ref = normalize_scid(channel_ref)
+        if normalized_ref in channels:
+            return normalized_ref, channels[normalized_ref], None
+        if channel_ref in channels:
+            return channel_ref, channels[channel_ref], None
+
+        peer_matches: List[Tuple[str, Dict[str, Any]]] = []
+        channel_matches: List[Tuple[str, Dict[str, Any]]] = []
+
+        for canonical_id, channel_info in channels.items():
+            short_channel_id = normalize_scid(channel_info.get("short_channel_id"))
+            full_channel_id = normalize_scid(channel_info.get("full_channel_id"))
+            peer_id = channel_info.get("peer_id", "")
+
+            if normalized_ref and normalized_ref in (short_channel_id, full_channel_id):
+                channel_matches.append((canonical_id, channel_info))
+            if channel_ref and channel_ref == peer_id:
+                peer_matches.append((canonical_id, channel_info))
+
+        if len(channel_matches) == 1:
+            return channel_matches[0][0], channel_matches[0][1], None
+        if len(channel_matches) > 1:
+            return None, None, f"Channel reference {channel_ref} is ambiguous"
+
+        if len(peer_matches) == 1:
+            return peer_matches[0][0], peer_matches[0][1], None
+        if len(peer_matches) > 1:
+            return None, None, (
+                f"Peer {channel_ref} has {len(peer_matches)} active channels; "
+                "specify a short_channel_id"
+            )
+
+        return None, None, f"Channel {channel_ref} not found"
+
     def set_channel_fee(self, channel_id: str, fee_ppm: int,
                        reason: str = "manual", manual: bool = False,
                        reason_code: Optional[str] = None,
@@ -4487,9 +4602,22 @@ class FeeController:
 
         try:
             # Get channel info to find peer ID and current fee
+            resolved_channel_id = normalize_scid(channel_id)
             if channel_info is None:
                 channels = self._get_channels_info()
-                channel_info = channels.get(channel_id)
+                resolved_channel_id, channel_info, error_message = self._resolve_channel_reference(
+                    channel_id, channels
+                )
+                if channel_info is None:
+                    result["message"] = error_message or f"Channel {channel_id} not found"
+                    return result
+            else:
+                resolved_channel_id = normalize_scid(
+                    channel_info.get("short_channel_id")
+                    or channel_info.get("channel_id")
+                    or channel_id
+                )
+            result["channel_id"] = resolved_channel_id
 
             if not channel_info:
                 result["message"] = f"Channel {channel_id} not found"
@@ -4507,7 +4635,7 @@ class FeeController:
             
             # Use setchannel command
             rpc_params = {
-                "id": channel_id,
+                "id": resolved_channel_id,
                 "feebase": self.config.base_fee_msat,
                 "feeppm": fee_ppm
             }
@@ -4516,7 +4644,22 @@ class FeeController:
             if htlcmax_msat is not None:
                 rpc_params["htlcmax"] = f"{htlcmax_msat}msat"
 
-            self.data_service.set_channel(**rpc_params)
+            rpc_result = self.data_service.set_channel(**rpc_params)
+            (
+                applied_fee_ppm,
+                applied_htlcmin_msat,
+                applied_htlcmax_msat,
+                rpc_warnings,
+            ) = self._extract_setchannel_effective_values(rpc_result, resolved_channel_id)
+            if applied_fee_ppm is not None:
+                fee_ppm = applied_fee_ppm
+                result["fee_ppm"] = applied_fee_ppm
+            if applied_htlcmin_msat is not None:
+                result["applied_htlcmin_msat"] = applied_htlcmin_msat
+            if applied_htlcmax_msat is not None:
+                result["applied_htlcmax_msat"] = applied_htlcmax_msat
+            if rpc_warnings:
+                result["warnings"] = rpc_warnings
 
 
             # M-13: Removed per-channel sleep+verify+retry loop from hot path.
@@ -4670,10 +4813,13 @@ class FeeController:
             fee_base = fee_base_val if fee_base_val is not None else target_ch.get('fee_base_msat', 0)
             fee_ppm_val = local_updates.get('fee_proportional_millionths')
             fee_ppm = fee_ppm_val if fee_ppm_val is not None else target_ch.get('fee_proportional_millionths', 0)
-            htlc_minimum_msat = parse_msat(target_ch.get('htlc_minimum_msat', 0))
-            htlc_maximum_msat = parse_msat(target_ch.get('htlc_maximum_msat', 0))
+            htlc_minimum_msat, htlc_maximum_msat = self._extract_local_htlc_bounds(
+                target_ch, local_updates
+            )
             channel_info = {
                 'channel_id': scid,
+                'short_channel_id': normalize_scid(target_ch.get('short_channel_id', '')),
+                'full_channel_id': target_ch.get('channel_id', ''),
                 'peer_id': peer_id,
                 'capacity': base_to_sats_floor(int(total_msat)) if total_msat else 0,
                 'spendable_msat': spendable_msat,
@@ -5179,8 +5325,10 @@ class FeeController:
                 if channel.get("state") != "CHANNELD_NORMAL":
                     continue
                 
-                channel_id = channel.get("short_channel_id") or channel.get("channel_id")
-                if channel_id:
+                short_channel_id = normalize_scid(channel.get("short_channel_id"))
+                full_channel_id = channel.get("channel_id")
+                canonical_channel_id = short_channel_id or full_channel_id
+                if canonical_channel_id:
                     # Get balance info — use parse_msat for CLN string values like "1000msat"
                     spendable_msat = parse_msat(channel.get("spendable_msat", 0))
                     receivable_msat = parse_msat(channel.get("receivable_msat", 0))
@@ -5198,11 +5346,14 @@ class FeeController:
                     fee_base = fee_base_val if fee_base_val is not None else channel.get("fee_base_msat", 0)
                     fee_ppm_val = local_updates.get("fee_proportional_millionths")
                     fee_ppm = fee_ppm_val if fee_ppm_val is not None else channel.get("fee_proportional_millionths", 0)
-                    htlc_minimum_msat = parse_msat(channel.get("htlc_minimum_msat", 0))
-                    htlc_maximum_msat = parse_msat(channel.get("htlc_maximum_msat", 0))
+                    htlc_minimum_msat, htlc_maximum_msat = self._extract_local_htlc_bounds(
+                        channel, local_updates
+                    )
 
-                    channels[channel_id] = {
-                        "channel_id": channel_id,
+                    channels[canonical_channel_id] = {
+                        "channel_id": canonical_channel_id,
+                        "short_channel_id": short_channel_id,
+                        "full_channel_id": full_channel_id,
                         "peer_id": channel.get("peer_id", ""),
                         "capacity": base_to_sats_floor(int(total_msat)) if total_msat else 0,
                         "spendable_msat": spendable_msat,

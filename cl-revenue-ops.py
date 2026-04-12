@@ -2746,8 +2746,12 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
     except (ValueError, TypeError):
         return {"status": "error", "error": "fee_ppm must be an integer"}
 
-    # SCID or PeerID format check
-    if not (re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id) or len(channel_id) == 66):
+    # SCID, full channel_id, or peer ID format check
+    if not (
+        re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id)
+        or re.match(r'^[0-9a-fA-F]{64}$', channel_id)
+        or re.match(r'^[0-9a-fA-F]{66}$', channel_id)
+    ):
         return {"status": "error", "error": "Invalid channel_id or node_id format"}
 
     # 2. Force Gates
@@ -2761,7 +2765,8 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
     try:
         result = fee_controller.set_channel_fee(channel_id, fee_ppm, manual=True, enforce_limits=(not force))
         applied_fee = result.get("fee_ppm", fee_ppm)
-        return {"status": "success", "channel": channel_id, "new_fee_ppm": applied_fee, **result}
+        resolved_channel = result.get("channel_id", channel_id)
+        return {"status": "success", "channel": resolved_channel, "new_fee_ppm": applied_fee, **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
