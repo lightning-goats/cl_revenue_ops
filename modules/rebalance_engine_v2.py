@@ -83,6 +83,15 @@ class RebalanceEngine:
         self._pair_failures: Dict[Tuple[str, str], List[float]] = {}
         self._futility_threshold: int = 3
         self._futility_window_sec: float = 1800.0  # 30 minutes
+        self._pair_failure_cooldowns: Dict[str, int] = {
+            "temporary_channel_failure": 1800,
+            "fee_insufficient": 7200,
+            "incorrect_cltv_expiry": 7200,
+            "permanent_failure": 21600,
+            "payment_pending_timeout": 900,
+            "local_execution_failed": 1800,
+            "other_retriable": 1800,
+        }
 
         # Build v2 router unconditionally — no RPC dependency at construction.
         our_id = self._get_our_id() or ""
@@ -366,6 +375,22 @@ class RebalanceEngine:
             router = self._cycle_router
             priced = []
             for pair in plan.selected:
+                cooldown = self._get_persisted_pair_cooldown(
+                    pair.source_channel_id, pair.dest_channel_id
+                )
+                if cooldown is not None:
+                    plan.skipped.append(SkipRecord(
+                        channel_id=pair.dest_channel_id,
+                        reason="pair_cooldown",
+                        value_class="valuable",
+                        detail=(
+                            f"src={pair.source_channel_id} "
+                            f"kind={cooldown['failure_kind']} "
+                            f"count={cooldown['failure_count']} "
+                            f"cooldown_until={cooldown['cooldown_until']}"
+                        ),
+                    ))
+                    continue
                 route_result, route_label = self._route_pair(
                     pair=pair,
                     router=router,
@@ -520,6 +545,24 @@ class RebalanceEngine:
                 self._pair_failures.pop(key, None)
         return fresh
 
+    def _get_persisted_pair_cooldown(
+        self, source_channel_id: str, dest_channel_id: str
+    ) -> Optional[Dict[str, Any]]:
+        if self.database is None:
+            return None
+        getter = getattr(self.database, "get_pair_rebalance_cooldown", None)
+        if getter is None:
+            return None
+        try:
+            cooldown = getter(source_channel_id, dest_channel_id)
+            return cooldown if isinstance(cooldown, dict) else None
+        except Exception as e:
+            self._log(
+                f"Pair cooldown lookup failed for {source_channel_id}->{dest_channel_id}: {e}",
+                level="warn",
+            )
+            return None
+
     def _is_pair_in_futility(self, source_channel_id: str, dest_channel_id: str) -> bool:
         """Return True if this pair has hit the failure threshold in the window."""
         key = (source_channel_id, dest_channel_id)
@@ -534,6 +577,60 @@ class RebalanceEngine:
     def _record_pair_success(self, source_channel_id: str, dest_channel_id: str) -> None:
         """Clear any failure history for this pair (success resets the counter)."""
         self._pair_failures.pop((source_channel_id, dest_channel_id), None)
+
+    def _classify_failure_kind(self, exec_result: ExecutionResult) -> str:
+        error = str(getattr(exec_result, "error", "") or "").lower()
+        if "temporary_channel_failure" in error:
+            return "temporary_channel_failure"
+        if "fee_insufficient" in error:
+            return "fee_insufficient"
+        if "incorrect_cltv_expiry" in error:
+            return "incorrect_cltv_expiry"
+        if "permanent_failure" in error:
+            return "permanent_failure"
+        if "payment_pending_timeout" in error:
+            return "payment_pending_timeout"
+        if "local_execution_failed" in error:
+            return "local_execution_failed"
+        return "other_retriable"
+
+    def _persist_pair_failure(self, pair: PairCandidate, exec_result: ExecutionResult) -> None:
+        if self.database is None:
+            return
+        recorder = getattr(self.database, "record_pair_rebalance_failure", None)
+        if recorder is None:
+            return
+        failure_kind = self._classify_failure_kind(exec_result)
+        cooldown_seconds = self._pair_failure_cooldowns.get(
+            failure_kind,
+            self._pair_failure_cooldowns["other_retriable"],
+        )
+        try:
+            recorder(
+                pair.source_channel_id,
+                pair.dest_channel_id,
+                failure_kind,
+                cooldown_seconds=cooldown_seconds,
+            )
+        except Exception as e:
+            self._log(
+                f"Persist pair failure failed for {pair.source_channel_id}->{pair.dest_channel_id}: {e}",
+                level="warn",
+            )
+
+    def _clear_persisted_pair_failure(self, pair: PairCandidate) -> None:
+        if self.database is None:
+            return
+        clearer = getattr(self.database, "clear_pair_rebalance_failure", None)
+        if clearer is None:
+            return
+        try:
+            clearer(pair.source_channel_id, pair.dest_channel_id)
+        except Exception as e:
+            self._log(
+                f"Clear pair failure failed for {pair.source_channel_id}->{pair.dest_channel_id}: {e}",
+                level="warn",
+            )
 
     @staticmethod
     def _merge_excludes(*exclude_lists: Optional[List[str]]) -> List[str]:
@@ -784,11 +881,13 @@ class RebalanceEngine:
                             self._record_pair_success(
                                 pair.source_channel_id, pair.dest_channel_id
                             )
+                            self._clear_persisted_pair_failure(pair)
                         else:
                             self._remember_execution_excludes(exec_result)
                             self._record_pair_failure(
                                 pair.source_channel_id, pair.dest_channel_id
                             )
+                            self._persist_pair_failure(pair, exec_result)
                     else:
                         # _execute_pair returned None (no route stored on the pair) — count as failure
                         self._record_pair_failure(

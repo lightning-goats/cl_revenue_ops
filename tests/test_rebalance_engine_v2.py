@@ -1,5 +1,6 @@
 """Tests for the rebalance engine delegation and integration."""
 
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,21 @@ def _make_cycle_result(candidates=None, executions=None):
     cr.candidates = candidates or []
     cr.executions = executions or []
     return cr
+
+
+def _make_engine(plugin, database):
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(dry_run=True, rebalance_router="v2")
+    plugin.rpc.getinfo.return_value = {"id": "03" + "u" * 64}
+    plugin.rpc.call.return_value = {"layers": []}
+    plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    plugin.rpc.listchannels.return_value = {"channels": []}
+    plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    return RebalanceEngine(plugin=plugin, config=cfg, database=database)
 
 
 def test_rebalancer_calls_engine_run_cycle(mock_plugin, mock_database):
@@ -328,3 +344,115 @@ def test_engine_merges_coordination_pairs_before_pair_cap(
 
     assert selected == [coordinated_pair]
     engine._hive_router.price_pair.assert_called_once()
+
+
+def test_engine_skips_pairs_with_persisted_cooldown_before_pricing(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    mock_database.get_pair_rebalance_cooldown.return_value = {
+        "source_channel_id": "100x1x0",
+        "dest_channel_id": "200x1x0",
+        "failure_kind": "temporary_channel_failure",
+        "failure_count": 2,
+        "cooldown_until": int(time.time()) + 1800,
+    }
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+    engine._routing_memory.current_excludes = MagicMock(return_value=[])
+    engine._audit = MagicMock()
+    engine.router_v2 = MagicMock()
+
+    pair = SimpleNamespace(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        score=1.0,
+        route_decision=None,
+        reason_code="ev_positive",
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner = planner_cls.return_value
+        planner.plan.return_value = SimpleNamespace(selected=[pair], skipped=[])
+
+        selected = engine.find_candidates()
+
+    assert selected == []
+    engine.router_v2.price_pair.assert_not_called()
+    assert any(
+        call.kwargs.get("reason") == "pair_cooldown" or call.args[1] == "pair_cooldown"
+        for call in engine._audit.log_skip.call_args_list
+    )
+
+
+def test_engine_records_persistent_pair_failure_after_failed_execution(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_executor_v2 import ExecutionResult
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.find_candidates = MagicMock(
+        return_value=[
+            SimpleNamespace(
+                source_channel_id="100x1x0",
+                dest_channel_id="200x1x0",
+                amount_sats=50_000,
+                pair_budget_sats=10_000,
+            )
+        ]
+    )
+    engine._execute_pair = MagicMock(
+        return_value=ExecutionResult(
+            success=False,
+            error="retriable_failure: WIRE_TEMPORARY_CHANNEL_FAILURE",
+            excluded_channels=["300x1x0/0"],
+        )
+    )
+
+    engine.run_cycle()
+
+    mock_database.record_pair_rebalance_failure.assert_called_once()
+    args, kwargs = mock_database.record_pair_rebalance_failure.call_args
+    assert args[:3] == ("100x1x0", "200x1x0", "temporary_channel_failure")
+    assert kwargs["cooldown_seconds"] > 0
+
+
+def test_engine_clears_persisted_pair_failure_after_success(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_executor_v2 import ExecutionResult
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.find_candidates = MagicMock(
+        return_value=[
+            SimpleNamespace(
+                source_channel_id="100x1x0",
+                dest_channel_id="200x1x0",
+                amount_sats=50_000,
+                pair_budget_sats=10_000,
+            )
+        ]
+    )
+    engine._execute_pair = MagicMock(
+        return_value=ExecutionResult(success=True, fee_msat=1000, fee_sats=1)
+    )
+
+    engine.run_cycle()
+
+    mock_database.clear_pair_rebalance_failure.assert_called_once_with(
+        "100x1x0", "200x1x0"
+    )

@@ -640,6 +640,21 @@ class Database:
                 last_error_type TEXT NOT NULL DEFAULT ''
             )
         """)
+
+        # Pair failure tracking for cross-cycle rebalance cooldowns.
+        # Unlike hop-level retry memory, this survives plugin restarts and
+        # suppresses source/dest pairs that are repeatedly failing live.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pair_rebalance_failures (
+                source_channel_id TEXT NOT NULL,
+                dest_channel_id TEXT NOT NULL,
+                failure_kind TEXT NOT NULL DEFAULT '',
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_failure_at INTEGER NOT NULL DEFAULT 0,
+                cooldown_until INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (source_channel_id, dest_channel_id)
+            )
+        """)
         
         # Peer reputation tracking for routing success rates
         # Used to evaluate peer reliability for traffic intelligence
@@ -761,6 +776,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_time ON mempool_fee_history(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_history_time ON rebalance_history(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_history_to_channel ON rebalance_history(to_channel, timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pair_rebalance_failures_cooldown ON pair_rebalance_failures(cooldown_until)")
         
         # Composite index for get_volume_since optimization (TODO #17)
         # Fee Controller queries by out_channel + timestamp every 30min
@@ -1964,6 +1980,114 @@ class Database:
         if row and row['last_time']:
             return row['last_time']
         return None
+
+    def get_pair_rebalance_cooldown(
+        self,
+        source_channel_id: str,
+        dest_channel_id: str,
+        now: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return active cooldown state for a rebalance pair, if any."""
+        if not self._validate_channel_id(source_channel_id):
+            return None
+        if not self._validate_channel_id(dest_channel_id):
+            return None
+
+        conn = self._get_connection()
+        current_time = int(time.time()) if now is None else int(now)
+        row = conn.execute(
+            """
+            SELECT source_channel_id, dest_channel_id, failure_kind,
+                   failure_count, last_failure_at, cooldown_until
+            FROM pair_rebalance_failures
+            WHERE source_channel_id = ? AND dest_channel_id = ?
+              AND cooldown_until > ?
+            """,
+            (source_channel_id, dest_channel_id, current_time),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_pair_rebalance_failure(
+        self,
+        source_channel_id: str,
+        dest_channel_id: str,
+        failure_kind: str,
+        cooldown_seconds: int,
+        now: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Persist/update cooldown state for a failed rebalance pair."""
+        if not self._validate_channel_id(source_channel_id):
+            raise ValueError("invalid source_channel_id")
+        if not self._validate_channel_id(dest_channel_id):
+            raise ValueError("invalid dest_channel_id")
+
+        conn = self._get_connection()
+        current_time = int(time.time()) if now is None else int(now)
+        base_cooldown = max(1, int(cooldown_seconds))
+        normalized_kind = str(failure_kind or "other_retriable").strip() or "other_retriable"
+
+        existing = conn.execute(
+            """
+            SELECT failure_count
+            FROM pair_rebalance_failures
+            WHERE source_channel_id = ? AND dest_channel_id = ?
+            """,
+            (source_channel_id, dest_channel_id),
+        ).fetchone()
+        failure_count = int(existing["failure_count"]) + 1 if existing else 1
+        backoff_multiplier = min(max(failure_count, 1), 6)
+        cooldown_until = current_time + (base_cooldown * backoff_multiplier)
+
+        conn.execute(
+            """
+            INSERT INTO pair_rebalance_failures
+                (source_channel_id, dest_channel_id, failure_kind,
+                 failure_count, last_failure_at, cooldown_until)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_channel_id, dest_channel_id) DO UPDATE SET
+                failure_kind = excluded.failure_kind,
+                failure_count = excluded.failure_count,
+                last_failure_at = excluded.last_failure_at,
+                cooldown_until = excluded.cooldown_until
+            """,
+            (
+                source_channel_id,
+                dest_channel_id,
+                normalized_kind,
+                failure_count,
+                current_time,
+                cooldown_until,
+            ),
+        )
+        return {
+            "source_channel_id": source_channel_id,
+            "dest_channel_id": dest_channel_id,
+            "failure_kind": normalized_kind,
+            "failure_count": failure_count,
+            "last_failure_at": current_time,
+            "cooldown_until": cooldown_until,
+        }
+
+    def clear_pair_rebalance_failure(
+        self,
+        source_channel_id: str,
+        dest_channel_id: str,
+    ) -> bool:
+        """Clear persisted cooldown state for a rebalance pair."""
+        if not self._validate_channel_id(source_channel_id):
+            return False
+        if not self._validate_channel_id(dest_channel_id):
+            return False
+
+        conn = self._get_connection()
+        cursor = conn.execute(
+            """
+            DELETE FROM pair_rebalance_failures
+            WHERE source_channel_id = ? AND dest_channel_id = ?
+            """,
+            (source_channel_id, dest_channel_id),
+        )
+        return cursor.rowcount > 0
 
     def get_last_rebalance_cost(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Get the most recent completed rebalance cost for a channel.

@@ -1,0 +1,71 @@
+import os
+
+from unittest.mock import MagicMock
+
+from modules.database import Database
+
+
+class TestPairRebalanceCooldown:
+    def _make_db(self, tmp_path):
+        db_path = os.path.join(tmp_path, "test_pair_cooldown.db")
+        plugin = MagicMock()
+        db = Database(db_path, plugin)
+        db.initialize()
+        return db
+
+    def test_record_pair_failure_persists_active_cooldown(self, tmp_path):
+        db = self._make_db(tmp_path)
+
+        row = db.record_pair_rebalance_failure(
+            "111x1x0",
+            "222x1x0",
+            "temporary_channel_failure",
+            cooldown_seconds=1800,
+            now=1_000,
+        )
+
+        assert row["failure_kind"] == "temporary_channel_failure"
+        assert row["failure_count"] == 1
+        assert row["cooldown_until"] == 2_800
+
+        fetched = db.get_pair_rebalance_cooldown("111x1x0", "222x1x0", now=1_500)
+        assert fetched is not None
+        assert fetched["failure_kind"] == "temporary_channel_failure"
+        assert fetched["failure_count"] == 1
+        assert fetched["cooldown_until"] == 2_800
+
+    def test_repeated_pair_failures_extend_cooldown(self, tmp_path):
+        db = self._make_db(tmp_path)
+
+        first = db.record_pair_rebalance_failure(
+            "111x1x0",
+            "222x1x0",
+            "temporary_channel_failure",
+            cooldown_seconds=600,
+            now=1_000,
+        )
+        second = db.record_pair_rebalance_failure(
+            "111x1x0",
+            "222x1x0",
+            "temporary_channel_failure",
+            cooldown_seconds=600,
+            now=1_100,
+        )
+
+        assert first["failure_count"] == 1
+        assert second["failure_count"] == 2
+        assert second["cooldown_until"] > first["cooldown_until"]
+
+    def test_clear_pair_failure_removes_cooldown(self, tmp_path):
+        db = self._make_db(tmp_path)
+
+        db.record_pair_rebalance_failure(
+            "111x1x0",
+            "222x1x0",
+            "temporary_channel_failure",
+            cooldown_seconds=600,
+            now=1_000,
+        )
+
+        assert db.clear_pair_rebalance_failure("111x1x0", "222x1x0") is True
+        assert db.get_pair_rebalance_cooldown("111x1x0", "222x1x0", now=1_100) is None
