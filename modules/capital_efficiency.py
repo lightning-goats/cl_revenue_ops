@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from statistics import median
 from typing import Dict
 
+from .utils import normalize_scid
+
 
 @dataclass
 class ChannelEfficiency:
@@ -51,7 +53,15 @@ class CapitalEfficiencyAnalyzer:
         """Build a fleet snapshot from current profitability and flow data."""
         profitability = self._profitability.analyze_all_channels() or {}
         flow = self._flow.analyze_all_channels() or {}
-        stages = self._database.get_dead_capital_stages() if self._database else {}
+        try:
+            raw_stages = self._database.get_dead_capital_stages() if self._database else {}
+        except Exception:
+            raw_stages = {}
+        stages = {
+            normalize_scid(channel_id): value
+            for channel_id, value in (raw_stages or {}).items()
+            if normalize_scid(channel_id)
+        }
 
         channel_ids = list(profitability.keys())
         rpsd_by_channel = {
@@ -77,7 +87,8 @@ class CapitalEfficiencyAnalyzer:
 
         for channel_id in channel_ids:
             prof = profitability[channel_id]
-            flow_metrics = flow.get(channel_id)
+            normalized_channel_id = normalize_scid(channel_id)
+            flow_metrics = flow.get(channel_id) or flow.get(normalized_channel_id)
             is_dead_capital = self._is_dead_capital(
                 prof=prof,
                 flow_metrics=flow_metrics,
@@ -95,7 +106,7 @@ class CapitalEfficiencyAnalyzer:
                 efficiency_rank=ranks[channel_id],
                 forward_velocity=forward_count / max(flow_window_days, 1),
                 is_dead_capital=is_dead_capital,
-                dead_capital_stage=str(stages.get(channel_id, {}).get("stage", "none")),
+                dead_capital_stage=str(stages.get(normalized_channel_id, {}).get("stage", "none")),
             )
 
         return snapshot
@@ -107,11 +118,13 @@ class CapitalEfficiencyAnalyzer:
             return 0.0
 
         revenue = getattr(profitability, "revenue", None)
-        fees_earned_sats = getattr(revenue, "fees_earned_sats", None)
-        if fees_earned_sats is None:
-            fees_earned_msat = int(getattr(revenue, "fees_earned_msat", 0) or 0)
-            fees_earned_sats = fees_earned_msat / 1000
-        return float(fees_earned_sats) / capacity_sats * 1_000_000
+        fees_earned_msat = getattr(revenue, "fees_earned_msat", None)
+        if fees_earned_msat is None:
+            fees_earned_sats = float(getattr(revenue, "fees_earned_sats", 0) or 0)
+            fees_earned_msat = int(fees_earned_sats * 1000)
+        else:
+            fees_earned_msat = int(fees_earned_msat or 0)
+        return float(fees_earned_msat) * 1000.0 / capacity_sats
 
     def _calculate_percentile_ranks(self, rpsd_by_channel: Dict[str, float]) -> Dict[str, float]:
         """Map each channel to a 0..1 percentile rank by RPSD."""
@@ -124,10 +137,19 @@ class CapitalEfficiencyAnalyzer:
             return {channel_id: 1.0}
 
         denominator = len(sorted_pairs) - 1
-        return {
-            channel_id: index / denominator
-            for index, (channel_id, _value) in enumerate(sorted_pairs)
-        }
+        ranks: Dict[str, float] = {}
+        index = 0
+        while index < len(sorted_pairs):
+            end = index
+            value = sorted_pairs[index][1]
+            while end + 1 < len(sorted_pairs) and sorted_pairs[end + 1][1] == value:
+                end += 1
+            avg_rank = ((index + end) / 2) / denominator
+            for tied_index in range(index, end + 1):
+                channel_id, _ = sorted_pairs[tied_index]
+                ranks[channel_id] = avg_rank
+            index = end + 1
+        return ranks
 
     def _is_dead_capital(self, prof, flow_metrics, grace_days: int) -> bool:
         """Classify dead capital conservatively from flow and age."""

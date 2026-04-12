@@ -2,6 +2,7 @@
 
 import os
 import sys
+import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -14,6 +15,7 @@ sys.modules.setdefault("pyln.client", mock_pyln)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.capital_efficiency import CapitalEfficiencyAnalyzer
+from modules.profitability_analyzer import ChannelRevenue
 
 
 def _make_profitability(
@@ -143,6 +145,65 @@ class TestCapitalEfficiencyAnalyzer:
             "100x1x0": _make_flow("100x1x0", "peer-a", 2_000_000, 0, 0),
         }
         analyzer = _make_analyzer(profitability, flow)
+
+        fleet = analyzer.analyze()
+
+        assert fleet.channel_efficiencies["100x1x0"].dead_capital_stage == "none"
+
+    def test_rpsd_uses_msat_precision_not_ceiling_sat_boundary(self):
+        analyzer = _make_analyzer({}, {})
+        prof = SimpleNamespace(
+            capacity_sats=1_000_000,
+            revenue=ChannelRevenue(
+                channel_id="100x1x0",
+                fees_earned_msat=1,
+                volume_routed_msat=0,
+                forward_count=0,
+            ),
+        )
+
+        assert analyzer._calculate_rpsd(prof) == pytest.approx(0.001)
+
+    def test_equal_rpsd_channels_share_same_percentile_rank(self):
+        profitability = {
+            "100x1x0": _make_profitability("100x1x0", "peer-a", 1_000_000, 100, 30),
+            "100x2x0": _make_profitability("100x2x0", "peer-b", 1_000_000, 100, 30),
+            "100x3x0": _make_profitability("100x3x0", "peer-c", 1_000_000, 0, 30),
+        }
+        flow = {
+            "100x1x0": _make_flow("100x1x0", "peer-a", 1_000_000, 5, 100_000),
+            "100x2x0": _make_flow("100x2x0", "peer-b", 1_000_000, 5, 100_000),
+            "100x3x0": _make_flow("100x3x0", "peer-c", 1_000_000, 0, 0),
+        }
+        analyzer = _make_analyzer(profitability, flow)
+
+        fleet = analyzer.analyze()
+
+        assert fleet.channel_efficiencies["100x1x0"].efficiency_rank == pytest.approx(0.75)
+        assert fleet.channel_efficiencies["100x2x0"].efficiency_rank == pytest.approx(0.75)
+
+    def test_stage_lookup_normalizes_scid_keys(self):
+        profitability = {
+            "100:1:0": _make_profitability("100:1:0", "peer-a", 2_000_000, 0, 30),
+        }
+        flow = {
+            "100x1x0": _make_flow("100x1x0", "peer-a", 2_000_000, 0, 0),
+        }
+        analyzer = _make_analyzer(profitability, flow, stages={"100x1x0": {"stage": "fee_reduction", "entered_at": 123}})
+
+        fleet = analyzer.analyze()
+
+        assert fleet.channel_efficiencies["100:1:0"].dead_capital_stage == "fee_reduction"
+
+    def test_stage_lookup_degrades_cleanly_on_db_failure(self):
+        profitability = {
+            "100x1x0": _make_profitability("100x1x0", "peer-a", 2_000_000, 0, 30),
+        }
+        flow = {
+            "100x1x0": _make_flow("100x1x0", "peer-a", 2_000_000, 0, 0),
+        }
+        analyzer = _make_analyzer(profitability, flow)
+        analyzer._database.get_dead_capital_stages.side_effect = RuntimeError("db unavailable")
 
         fleet = analyzer.analyze()
 
