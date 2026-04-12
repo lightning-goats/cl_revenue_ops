@@ -1975,38 +1975,45 @@ class ChannelProfitabilityAnalyzer:
             On-chain fee in sats, or None if not found or invalid
         """
         try:
-            # Bookkeeper account names use reversed txid bytes
-            # e.g., txid 9e14b256... becomes account 940fec8a...
-            reversed_txid = self._reverse_txid(funding_txid)
-            
-            # Query bookkeeper for this account's events
-            result = self.data_service.bkpr_list_account_events(reversed_txid) if self.data_service else self.plugin.rpc.call(
+            # Query bookkeeper by payment_id, which maps directly to the funding txid.
+            result = self.data_service.bkpr_list_account_events(payment_id=funding_txid) if self.data_service else self.plugin.rpc.call(
                 "bkpr-listaccountevents",
-                {"account": reversed_txid}
+                {"payment_id": funding_txid}
             )
             
             events = result.get("events", [])
             
-            # Sum ALL onchain_fee events for this txid (credits - debits)
-            total_credit_msat = 0
-            total_debit_msat = 0
-            found_events = False
+            # Prefer channel-account events over wallet fallback.
+            # Track both channel-account and wallet totals for this txid.
+            channel_credit_msat = 0
+            channel_debit_msat = 0
+            wallet_credit_msat = 0
+            wallet_debit_msat = 0
+            found_channel_account_event = False
+            found_wallet_event = False
             
             for event in events:
                 if (event.get("type") == "onchain_fee" and 
                     event.get("txid") == funding_txid):
-                    found_events = True
-                    total_credit_msat += self._parse_msat(event.get("credit_msat", 0))
-                    total_debit_msat += self._parse_msat(event.get("debit_msat", 0))
+                    credit_msat = self._parse_msat(event.get("credit_msat", 0))
+                    debit_msat = self._parse_msat(event.get("debit_msat", 0))
+                    if event.get("account") == "wallet":
+                        found_wallet_event = True
+                        wallet_credit_msat += credit_msat
+                        wallet_debit_msat += debit_msat
+                    else:
+                        found_channel_account_event = True
+                        channel_credit_msat += credit_msat
+                        channel_debit_msat += debit_msat
             
-            if found_events:
-                # Net fee = credits - debits
-                net_fee_msat = total_credit_msat - total_debit_msat
+            if found_channel_account_event:
+                # Net fee = debits - credits for channel-account perspective.
+                net_fee_msat = channel_debit_msat - channel_credit_msat
                 fee_sats = base_to_sats_floor(net_fee_msat)
                 
                 self.plugin.log(
                     f"Bookkeeper fee calculation for {funding_txid}: "
-                    f"credits={total_credit_msat}msat, debits={total_debit_msat}msat, "
+                    f"debits={channel_debit_msat}msat, credits={channel_credit_msat}msat, "
                     f"net={fee_sats}sats",
                     level='debug'
                 )
@@ -2030,26 +2037,7 @@ class ChannelProfitabilityAnalyzer:
                 
                 return fee_sats
             
-            # Alternative: check wallet account for the same txid
-            # This catches cases where we opened the channel
-            wallet_result = self.data_service.bkpr_list_account_events("wallet") if self.data_service else self.plugin.rpc.call(
-                "bkpr-listaccountevents",
-                {"account": "wallet"}
-            )
-            
-            wallet_events = wallet_result.get("events", [])
-            wallet_credit_msat = 0
-            wallet_debit_msat = 0
-            wallet_found = False
-            
-            for event in wallet_events:
-                if (event.get("type") == "onchain_fee" and
-                    event.get("txid") == funding_txid):
-                    wallet_found = True
-                    wallet_credit_msat += self._parse_msat(event.get("credit_msat", 0))
-                    wallet_debit_msat += self._parse_msat(event.get("debit_msat", 0))
-            
-            if wallet_found:
+            if found_wallet_event:
                 # For wallet, the fee we paid is typically debits - credits
                 # (opposite of channel account perspective)
                 net_fee_msat = wallet_debit_msat - wallet_credit_msat
@@ -2177,27 +2165,6 @@ class ChannelProfitabilityAnalyzer:
             return False
         
         return True
-    
-    def _reverse_txid(self, txid: str) -> str:
-        """
-        Reverse a transaction ID (byte-swap).
-        
-        Bitcoin txids are displayed in reverse byte order.
-        Bookkeeper uses the reversed form as account names.
-        
-        Args:
-            txid: Transaction ID in standard display format
-            
-        Returns:
-            Reversed txid (bytes swapped)
-        """
-        # Convert hex string to bytes, reverse, convert back
-        try:
-            txid_bytes = bytes.fromhex(txid)
-            reversed_bytes = txid_bytes[::-1]
-            return reversed_bytes.hex()
-        except (ValueError, AttributeError):
-            return txid
     
     def _get_all_revenue_data(self) -> Dict[str, ChannelRevenue]:
         """

@@ -603,3 +603,45 @@ class TestCapacityDivisionGuards:
         assert result is not None
         assert result.cost_per_sat_routed == 0.0
         assert result.fee_per_sat_routed == 0.0
+
+
+# ============================================================
+# Task 3: Legacy bkpr-listaccountevents fallback
+# ============================================================
+
+class TestBookkeeperFallbackPaymentId:
+    def test_open_cost_uses_payment_id_and_prefers_channel_account(self):
+        """Legacy bookkeeper fallback should query by payment_id and prefer channel-account fees."""
+        analyzer = _make_analyzer()
+        funding_txid = "abcd" * 16
+
+        data_service = MagicMock()
+        data_service.bkpr_list_account_events.return_value = {
+            "events": [
+                {
+                    "type": "onchain_fee",
+                    "txid": funding_txid,
+                    "credit_msat": "0msat",
+                    "debit_msat": "500000msat",
+                },
+                {
+                    "type": "onchain_fee",
+                    "txid": funding_txid,
+                    "credit_msat": "0msat",
+                    "debit_msat": "600000msat",
+                },
+                {
+                    "type": "onchain_fee",
+                    "txid": "other-txid",
+                    "credit_msat": "0msat",
+                    "debit_msat": "900000msat",
+                },
+            ]
+        }
+        analyzer.data_service = data_service
+
+        fee = analyzer._get_open_cost_from_bookkeeper(funding_txid, capacity_sats=2_000_000)
+
+        assert fee == 1100
+        data_service.bkpr_list_account_events.assert_any_call(payment_id=funding_txid)
+        data_service.bkpr_list_account_events.assert_called_once()
