@@ -74,6 +74,14 @@ def _load_policy_surface_module():
     return mod
 
 
+def _load_report_surface_module():
+    mod = load_plugin_module()
+    mod.policy_manager = MagicMock()
+    mod.profitability_analyzer = MagicMock()
+    mod.database = MagicMock()
+    return mod
+
+
 def _default_plugin_options(mod):
     return {
         name: registration["default"]
@@ -357,6 +365,35 @@ def test_revenue_policy_no_args_returns_policy_list():
     result = mod.revenue_policy(mod.plugin)
 
     assert "policies" in result or result.get("count", 0) == 0
+
+
+def test_revenue_report_peer_returns_aggregated_profitability_and_all_flow_states():
+    mod = _load_report_surface_module()
+    peer_id = "02" + "a" * 64
+    mod.policy_manager.get_policy.return_value = SimpleNamespace(
+        to_dict=lambda: {"peer_id": peer_id, "strategy": "dynamic"}
+    )
+    mod.profitability_analyzer.get_profitability_by_peer.return_value = {
+        "peer_id": peer_id,
+        "channel_count": 2,
+        "aggregate": {"net_profit_sats": 5},
+        "channels": [{"channel_id": "100x1x0"}, {"channel_id": "200x2x0"}],
+    }
+    mod.database.get_all_channel_states.return_value = [
+        {"peer_id": peer_id, "channel_id": "200x2x0", "state": "sink"},
+        {"peer_id": peer_id, "channel_id": "100x1x0", "state": "source"},
+        {"peer_id": "02" + "b" * 64, "channel_id": "300x3x0", "state": "balanced"},
+    ]
+
+    result = mod.revenue_report(mod.plugin, "peer", peer_id=peer_id)
+
+    assert result["type"] == "peer"
+    assert result["profitability"]["channel_count"] == 2
+    assert [state["channel_id"] for state in result["flow_states"]] == [
+        "100x1x0",
+        "200x2x0",
+    ]
+    assert result["flow_state"] is None
 
 
 def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():

@@ -2967,13 +2967,13 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
                 }
                 summary[result.classification.value].append(channel_summary)
                 flow_profiles[flow_profile].append(ch_id)
-                total_profit += result.net_profit_sats
                 total_revenue_msat += result.revenue.fees_earned_msat
                 total_contribution_msat += result.revenue.total_contribution_msat
                 total_costs += result.costs.total_cost_sats
 
             total_revenue = -(-total_revenue_msat // 1000)
             total_contribution = -(-total_contribution_msat // 1000)
+            total_profit = total_revenue - total_costs
 
             return {
                 "summary": {
@@ -3446,21 +3446,22 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
             if profitability_analyzer:
                 prof_data = profitability_analyzer.get_profitability_by_peer(peer_id)
             
-            # Get flow state
-            flow_state = None
+            # Get per-channel flow states for this peer.
+            flow_states = []
             if database:
                 states = database.get_all_channel_states()
-                for s in states:
-                    if s.get("peer_id") == peer_id:
-                        flow_state = s
-                        break
+                flow_states = sorted(
+                    [s for s in states if s.get("peer_id") == peer_id],
+                    key=lambda state: state.get("channel_id") or state.get("short_channel_id") or "",
+                )
             
             return {
                 "type": "peer",
                 "peer_id": peer_id,
                 "policy": policy.to_dict(),
-                "profitability": prof_data.to_dict() if prof_data else None,
-                "flow_state": flow_state
+                "profitability": prof_data,
+                "flow_state": flow_states[0] if len(flow_states) == 1 else None,
+                "flow_states": flow_states,
             }
         
         elif report_type == "policies":

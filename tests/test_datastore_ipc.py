@@ -289,6 +289,77 @@ class TestRevenueProfitabilitySummaryAggregation:
         assert result["summary"]["total_revenue_sats"] == 1
         assert result["summary"]["total_contribution_sats"] == 1
 
+    def test_summary_profit_and_roi_use_real_revenue_not_channel_valuation(self):
+        """Fleet profit/ROI must use exit fees earned, not per-channel valuation."""
+        revenue_profitability, ns = _load_revenue_profitability()
+
+        results = {
+            "100x1x0": ChannelProfitability(
+                channel_id="100x1x0",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                costs=ChannelCosts(
+                    channel_id="100x1x0",
+                    peer_id="02" + "a" * 64,
+                    open_cost_sats=5,
+                    rebalance_cost_sats=0,
+                ),
+                revenue=ChannelRevenue(
+                    channel_id="100x1x0",
+                    fees_earned_msat=10_000,
+                    volume_routed_msat=10_000,
+                    forward_count=1,
+                    sourced_fee_contribution_msat=100_000,
+                    sourced_forward_count=1,
+                ),
+                net_profit_sats=95,
+                roi_percent=1900.0,
+                classification=ProfitabilityClass.PROFITABLE,
+                cost_per_sat_routed=0.0,
+                fee_per_sat_routed=0.0,
+                days_open=1,
+                last_routed=int(time.time()),
+            ),
+            "200x2x0": ChannelProfitability(
+                channel_id="200x2x0",
+                peer_id="02" + "b" * 64,
+                capacity_sats=1_000_000,
+                costs=ChannelCosts(
+                    channel_id="200x2x0",
+                    peer_id="02" + "b" * 64,
+                    open_cost_sats=5,
+                    rebalance_cost_sats=0,
+                ),
+                revenue=ChannelRevenue(
+                    channel_id="200x2x0",
+                    fees_earned_msat=10_000,
+                    volume_routed_msat=10_000,
+                    forward_count=1,
+                    sourced_fee_contribution_msat=100_000,
+                    sourced_forward_count=1,
+                ),
+                net_profit_sats=95,
+                roi_percent=1900.0,
+                classification=ProfitabilityClass.PROFITABLE,
+                cost_per_sat_routed=0.0,
+                fee_per_sat_routed=0.0,
+                days_open=1,
+                last_routed=int(time.time()),
+            ),
+        }
+
+        analyzer = MagicMock()
+        analyzer.analyze_all_channels.return_value = results
+        ns["profitability_analyzer"] = analyzer
+
+        result = revenue_profitability(MagicMock(), channel_id=None)
+
+        assert result["summary"]["total_revenue_sats"] == 20
+        assert result["summary"]["total_contribution_sats"] == 200
+        assert result["summary"]["total_costs_sats"] == 10
+        assert result["summary"]["total_profit_sats"] == 10
+        assert result["summary"]["overall_roi_pct"] == 100.0
+
     def test_multiple_channels(self):
         """All channels appear in the payload."""
         analyzer, plugin, _, _ = _make_analyzer()

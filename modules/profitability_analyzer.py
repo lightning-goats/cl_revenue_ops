@@ -793,26 +793,70 @@ class ChannelProfitabilityAnalyzer:
 
         return self._profitability_cache.get(channel_id)
 
-    def get_profitability_by_peer(self, peer_id: str) -> Optional[ChannelProfitability]:
+    def get_profitability_by_peer(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """
-        Get profitability data for a peer's channel (uses cache if fresh).
-
-        Looks up by peer_id since the cache is keyed by short_channel_id.
-        If a peer has multiple channels, returns the first match.
+        Get aggregated profitability data for all channels with a peer.
 
         Args:
             peer_id: Peer node ID to look up
 
         Returns:
-            ChannelProfitability or None
+            Peer profitability summary dict or None
         """
         if (int(time.time()) - self._cache_timestamp) > self._cache_ttl:
             self.analyze_all_channels()
 
-        for prof in self._profitability_cache.values():
-            if prof.peer_id == peer_id:
-                return prof
-        return None
+        peer_channels = sorted(
+            [prof for prof in self._profitability_cache.values() if prof.peer_id == peer_id],
+            key=lambda prof: prof.channel_id,
+        )
+        if not peer_channels:
+            return None
+
+        total_cost_sats = sum(prof.costs.total_cost_sats for prof in peer_channels)
+        total_revenue_msat = sum(prof.revenue.fees_earned_msat for prof in peer_channels)
+        total_contribution_msat = sum(prof.revenue.total_contribution_msat for prof in peer_channels)
+        total_volume_routed_sats = sum(prof.revenue.volume_routed_sats for prof in peer_channels)
+        total_sourced_volume_sats = sum(prof.revenue.sourced_volume_sats for prof in peer_channels)
+        total_forward_count = sum(prof.revenue.forward_count for prof in peer_channels)
+        total_sourced_forward_count = sum(prof.revenue.sourced_forward_count for prof in peer_channels)
+        total_revenue_sats = base_to_sats_ceil(total_revenue_msat) if total_revenue_msat > 0 else 0
+        total_contribution_sats = (
+            base_to_sats_ceil(total_contribution_msat) if total_contribution_msat > 0 else 0
+        )
+        net_profit_sats = total_revenue_sats - total_cost_sats
+        overall_roi_percent = (
+            round((net_profit_sats / total_cost_sats) * 100, 2)
+            if total_cost_sats > 0
+            else 0.0
+        )
+
+        classifications: Dict[str, int] = {}
+        roles: Dict[str, int] = {}
+        for prof in peer_channels:
+            cls = prof.classification.value
+            classifications[cls] = classifications.get(cls, 0) + 1
+            role = prof.channel_role.value
+            roles[role] = roles.get(role, 0) + 1
+
+        return {
+            "peer_id": peer_id,
+            "channel_count": len(peer_channels),
+            "aggregate": {
+                "total_cost_sats": total_cost_sats,
+                "total_revenue_sats": total_revenue_sats,
+                "total_contribution_sats": total_contribution_sats,
+                "net_profit_sats": net_profit_sats,
+                "overall_roi_percent": overall_roi_percent,
+                "total_volume_routed_sats": total_volume_routed_sats,
+                "total_sourced_volume_sats": total_sourced_volume_sats,
+                "total_forward_count": total_forward_count,
+                "total_sourced_forward_count": total_sourced_forward_count,
+                "classifications": classifications,
+                "role_distribution": roles,
+            },
+            "channels": [prof.to_dict() for prof in peer_channels],
+        }
     
     def get_fee_multiplier(self, channel_id: str) -> float:
         """
@@ -1102,7 +1146,8 @@ class ChannelProfitabilityAnalyzer:
             self.analyze_all_channels()
 
         total_costs = 0
-        total_revenue = 0
+        total_revenue_msat = 0
+        total_contribution_msat = 0
         total_volume = 0
         total_sourced_volume = 0
         total_sourced_contribution = 0
@@ -1111,7 +1156,8 @@ class ChannelProfitabilityAnalyzer:
 
         for p in self._profitability_cache.values():
             total_costs += p.costs.total_cost_sats
-            total_revenue += p.revenue.total_contribution_sats
+            total_revenue_msat += p.revenue.fees_earned_msat
+            total_contribution_msat += p.revenue.total_contribution_msat
             total_volume += p.revenue.volume_routed_sats
             total_sourced_volume += p.revenue.sourced_volume_sats
             total_sourced_contribution += p.revenue.sourced_fee_contribution_sats
@@ -1123,6 +1169,10 @@ class ChannelProfitabilityAnalyzer:
             role = p.channel_role.value
             role_distribution[role] = role_distribution.get(role, 0) + 1
 
+        total_revenue = base_to_sats_ceil(total_revenue_msat) if total_revenue_msat > 0 else 0
+        total_contribution = (
+            base_to_sats_ceil(total_contribution_msat) if total_contribution_msat > 0 else 0
+        )
         net_profit = total_revenue - total_costs
         overall_roi = (net_profit / total_costs * 100) if total_costs > 0 else 0
 
@@ -1130,6 +1180,7 @@ class ChannelProfitabilityAnalyzer:
             "total_channels": len(self._profitability_cache),
             "total_cost_sats": total_costs,
             "total_revenue_sats": total_revenue,
+            "total_contribution_sats": total_contribution,
             "net_profit_sats": net_profit,
             "overall_roi_percent": round(overall_roi, 2),
             "total_volume_routed_sats": total_volume,
@@ -1954,18 +2005,12 @@ class ChannelProfitabilityAnalyzer:
         """
         Query bookkeeper for actual on-chain fee paid for channel open.
         
-        Bookkeeper tracks onchain_fee events per txid as a SERIES of adjustments.
-        The total fee is the Sum of Credits minus Sum of Debits for a given TXID.
-        
-        This is critical for batch transactions where bookkeeper may:
-        1. Credit the total batch fee to one account
-        2. Issue debits to redistribute the fee across all accounts in the batch
-        
-        For example, a batch open might show:
-        - credit_msat: 833,443,000 (initial attribution)
-        - debit_msat: 416,721,000 (redistribution to another channel)
-        - debit_msat: 416,656,000 (redistribution to another channel)
-        - Net: 66,000 msat = 66 sats (actual fee for this channel)
+        Bookkeeper tracks onchain_fee events per txid as a series of adjustments.
+        The total fee paid by the node is the sum of debits minus credits for the
+        matching payment_id/txid.
+
+        This is critical for batch transactions where bookkeeper may emit multiple
+        onchain_fee rows for a single funding transaction.
         
         Args:
             funding_txid: The funding transaction ID
@@ -2038,8 +2083,7 @@ class ChannelProfitabilityAnalyzer:
                 return fee_sats
             
             if found_wallet_event:
-                # For wallet, the fee we paid is typically debits - credits
-                # (opposite of channel account perspective)
+                # Wallet events are also node-expense rows, so use debits - credits.
                 net_fee_msat = wallet_debit_msat - wallet_credit_msat
                 fee_sats = base_to_sats_floor(net_fee_msat)
                 

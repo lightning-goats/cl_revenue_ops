@@ -317,11 +317,14 @@ class DataService:
         """Inspect bookkeeper account."""
         return self._plugin.rpc.call("bkpr-inspect", {"account": account})
 
-    def bkpr_list_account_events(self, account: str = None) -> Dict:
+    def bkpr_list_account_events(self, account: str = None,
+                                 payment_id: str = None) -> Dict:
         """List bookkeeper account events."""
         params = {}
         if account:
             params["account"] = account
+        if payment_id:
+            params["payment_id"] = payment_id
         return self._plugin.rpc.call("bkpr-listaccountevents", params)
 
     # --- Askrene mutation operations ---

@@ -309,6 +309,20 @@ class TestLongTier:
 class TestNeverCachedTier:
     """Transactional operations — always pass through, invalidate relevant caches."""
 
+    def test_bkpr_list_account_events_supports_payment_id(self):
+        from modules.data_service import DataService
+        plugin = _make_mock_plugin()
+        plugin.rpc.call.return_value = {"events": []}
+        ds = DataService(plugin)
+
+        result = ds.bkpr_list_account_events(payment_id="ab" * 32)
+
+        assert result == {"events": []}
+        plugin.rpc.call.assert_called_once_with(
+            "bkpr-listaccountevents",
+            {"payment_id": "ab" * 32},
+        )
+
     def test_set_channel_passes_through(self):
         from modules.data_service import DataService
         plugin = _make_mock_plugin()

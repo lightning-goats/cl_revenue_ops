@@ -645,3 +645,147 @@ class TestBookkeeperFallbackPaymentId:
         assert fee == 1100
         data_service.bkpr_list_account_events.assert_any_call(payment_id=funding_txid)
         data_service.bkpr_list_account_events.assert_called_once()
+
+
+class TestAggregateProfitabilitySummaries:
+    def test_get_summary_uses_real_revenue_for_profit_and_roi(self):
+        """Analyzer-wide summary must use earned fees, not per-channel valuation."""
+        analyzer = _make_analyzer()
+        analyzer._cache_timestamp = int(time.time())
+        analyzer._profitability_cache = {
+            "100x1x0": ChannelProfitability(
+                channel_id="100x1x0",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                costs=ChannelCosts(
+                    channel_id="100x1x0",
+                    peer_id="02" + "a" * 64,
+                    open_cost_sats=5,
+                    rebalance_cost_sats=0,
+                ),
+                revenue=ChannelRevenue(
+                    channel_id="100x1x0",
+                    fees_earned_msat=10_000,
+                    volume_routed_msat=1_000_000,
+                    forward_count=20,
+                    sourced_fee_contribution_msat=100_000,
+                    sourced_forward_count=5,
+                ),
+                net_profit_sats=95,
+                roi_percent=1900.0,
+                classification=ProfitabilityClass.PROFITABLE,
+                cost_per_sat_routed=0.0,
+                fee_per_sat_routed=0.0,
+                days_open=10,
+                last_routed=int(time.time()),
+            ),
+            "200x2x0": ChannelProfitability(
+                channel_id="200x2x0",
+                peer_id="02" + "b" * 64,
+                capacity_sats=1_000_000,
+                costs=ChannelCosts(
+                    channel_id="200x2x0",
+                    peer_id="02" + "b" * 64,
+                    open_cost_sats=5,
+                    rebalance_cost_sats=0,
+                ),
+                revenue=ChannelRevenue(
+                    channel_id="200x2x0",
+                    fees_earned_msat=10_000,
+                    volume_routed_msat=1_000_000,
+                    forward_count=20,
+                    sourced_fee_contribution_msat=100_000,
+                    sourced_forward_count=5,
+                ),
+                net_profit_sats=95,
+                roi_percent=1900.0,
+                classification=ProfitabilityClass.PROFITABLE,
+                cost_per_sat_routed=0.0,
+                fee_per_sat_routed=0.0,
+                days_open=10,
+                last_routed=int(time.time()),
+            ),
+        }
+
+        analyzer.get_zombie_channels = MagicMock(return_value=[])
+
+        summary = analyzer.get_summary()
+
+        assert summary["total_revenue_sats"] == 20
+        assert summary["total_contribution_sats"] == 200
+        assert summary["total_cost_sats"] == 10
+        assert summary["net_profit_sats"] == 10
+        assert summary["overall_roi_percent"] == 100.0
+
+    def test_get_profitability_by_peer_aggregates_all_channels(self):
+        """Peer profitability should aggregate matching channels, not return the first hit."""
+        analyzer = _make_analyzer()
+        analyzer._cache_timestamp = int(time.time())
+        analyzer._profitability_cache = {
+            "200x2x0": ChannelProfitability(
+                channel_id="200x2x0",
+                peer_id="02" + "c" * 64,
+                capacity_sats=2_000_000,
+                costs=ChannelCosts(
+                    channel_id="200x2x0",
+                    peer_id="02" + "c" * 64,
+                    open_cost_sats=5,
+                    rebalance_cost_sats=2,
+                ),
+                revenue=ChannelRevenue(
+                    channel_id="200x2x0",
+                    fees_earned_msat=9_000,
+                    volume_routed_msat=2_000_000,
+                    forward_count=12,
+                    sourced_fee_contribution_msat=4_000,
+                    sourced_forward_count=2,
+                ),
+                net_profit_sats=2,
+                roi_percent=28.57,
+                classification=ProfitabilityClass.PROFITABLE,
+                cost_per_sat_routed=0.0,
+                fee_per_sat_routed=0.0,
+                days_open=30,
+                last_routed=int(time.time()),
+            ),
+            "100x1x0": ChannelProfitability(
+                channel_id="100x1x0",
+                peer_id="02" + "c" * 64,
+                capacity_sats=2_000_000,
+                costs=ChannelCosts(
+                    channel_id="100x1x0",
+                    peer_id="02" + "c" * 64,
+                    open_cost_sats=3,
+                    rebalance_cost_sats=0,
+                ),
+                revenue=ChannelRevenue(
+                    channel_id="100x1x0",
+                    fees_earned_msat=6_000,
+                    volume_routed_msat=1_000_000,
+                    forward_count=15,
+                    sourced_fee_contribution_msat=8_000,
+                    sourced_forward_count=3,
+                ),
+                net_profit_sats=5,
+                roi_percent=166.67,
+                classification=ProfitabilityClass.PROFITABLE,
+                cost_per_sat_routed=0.0,
+                fee_per_sat_routed=0.0,
+                days_open=10,
+                last_routed=int(time.time()),
+            ),
+        }
+
+        peer_summary = analyzer.get_profitability_by_peer("02" + "c" * 64)
+
+        assert peer_summary is not None
+        assert peer_summary["peer_id"] == "02" + "c" * 64
+        assert peer_summary["channel_count"] == 2
+        assert [ch["channel_id"] for ch in peer_summary["channels"]] == [
+            "100x1x0",
+            "200x2x0",
+        ]
+        assert peer_summary["aggregate"]["total_cost_sats"] == 10
+        assert peer_summary["aggregate"]["total_revenue_sats"] == 15
+        assert peer_summary["aggregate"]["total_contribution_sats"] == 17
+        assert peer_summary["aggregate"]["net_profit_sats"] == 5
