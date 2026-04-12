@@ -316,11 +316,14 @@ class RebalanceEngine:
             return []
 
         cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
+        target_band_low = getattr(cfg, 'low_liquidity_threshold', 0.35)
+        target_band_high = getattr(cfg, 'high_liquidity_threshold', 0.65)
+        max_chunk_sats = getattr(cfg, 'rebalance_max_amount', 2_000_000)
 
         planner = RebalancePlanner(
-            target_band_low=getattr(cfg, 'low_liquidity_threshold', 0.35),
-            target_band_high=getattr(cfg, 'high_liquidity_threshold', 0.65),
-            max_chunk_sats=getattr(cfg, 'rebalance_max_amount', 2_000_000),
+            target_band_low=target_band_low,
+            target_band_high=target_band_high,
+            max_chunk_sats=max_chunk_sats,
             max_pairs=10,
         )
 
@@ -329,9 +332,9 @@ class RebalanceEngine:
             snapshot,
             hive_hints=self._hive_hints,
             our_node_id=self._get_our_id() or "",
-            target_band_low=planner.target_band_low,
-            target_band_high=planner.target_band_high,
-            max_chunk_sats=planner.max_chunk_sats,
+            target_band_low=target_band_low,
+            target_band_high=target_band_high,
+            max_chunk_sats=max_chunk_sats,
         )
         plan.skipped.extend(overlay.skipped)
         planner_max_pairs = getattr(planner, "max_pairs", 10)
