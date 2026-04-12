@@ -32,6 +32,16 @@ def _make_engine(channels=None, capex_budgets=None):
         ]
 
     plugin.rpc.listpeerchannels.return_value = {"channels": channels}
+    plugin.rpc.listchannels.return_value = {
+        "channels": [{
+            "source": channels[0]["peer_id"],
+            "destination": "02" + "dd" * 32,
+            "short_channel_id": "333x3x0",
+            "fee_per_millionth": 0,
+            "base_fee_millisatoshi": 0,
+            "delay": 12,
+        }],
+    }
 
     config = MagicMock(spec=[])  # empty spec prevents auto-attribute creation
     config.low_liquidity_threshold = 0.35

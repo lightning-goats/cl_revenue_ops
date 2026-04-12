@@ -69,6 +69,15 @@ class RebalanceRouter:
         except Exception:
             pass
 
+    @staticmethod
+    def _parse_msat_value(value: Any) -> int:
+        """Normalize CLN msat fields that may be ints or ``"123msat"`` strings."""
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            value = value.rstrip("msat")
+        return int(value)
+
     def _get_final_hop_fee_ppm(self, dest_peer_id: str) -> Optional[int]:
         """Get the actual inbound fee the dest peer charges us.
 
@@ -133,6 +142,47 @@ class RebalanceRouter:
             first_hop_msat = int(first_hop_msat.rstrip("msat"))
         delivery_msat = amount_sats * 1000
         return max(0, math.ceil((first_hop_msat - delivery_msat) / 1000))
+
+    def _get_first_middle_hop_policy(
+        self,
+        source_peer_id: str,
+        first_middle_hop: Dict[str, Any],
+    ) -> Optional[Dict[str, int]]:
+        """Return the source peer's forwarding policy for the first middle edge."""
+        channel_id = first_middle_hop.get("channel")
+        next_node_id = first_middle_hop.get("id")
+        if not channel_id or not next_node_id:
+            return None
+
+        try:
+            if self.data_service is not None:
+                result = self.data_service.get_channels(short_channel_id=channel_id)
+            else:
+                result = self.plugin.rpc.listchannels(short_channel_id=channel_id)
+            for ch in result.get("channels", []):
+                if (
+                    ch.get("short_channel_id") != channel_id
+                    or ch.get("source") != source_peer_id
+                    or ch.get("destination") != next_node_id
+                ):
+                    continue
+                fee_ppm = ch.get("fee_per_millionth")
+                delay = ch.get("delay")
+                if fee_ppm is None or delay is None:
+                    continue
+                return {
+                    "fee_ppm": int(fee_ppm),
+                    "fee_base_msat": self._parse_msat_value(
+                        ch.get("base_fee_millisatoshi")
+                    ),
+                    "cltv_delta": int(delay),
+                }
+        except Exception as e:
+            self._log(
+                f"listchannels first-middle policy lookup failed for {channel_id}: {e}"
+            )
+
+        return None
 
     # ------------------------------------------------------------------
     # Public API
@@ -251,7 +301,6 @@ class RebalanceRouter:
         # Step 2: getroute for the middle path (source_peer → dest_peer)
         # If source and dest are the same peer (direct channel pair), skip getroute
         middle_route: List[Dict[str, Any]] = []
-        middle_fee_sats = 0
 
         if source_peer_id != dest_peer_id:
             route_amount_msat = (amount_sats + final_hop_fee_sats) * 1000
@@ -282,22 +331,41 @@ class RebalanceRouter:
                     success=False,
                     error="getroute returned empty route",
                 )
-            middle_fee_sats = self._route_fee_sats(
-                middle_route, amount_sats + final_hop_fee_sats
-            )
 
         # Step 3: Build the full circular route
         # First hop: us → source_peer via source_channel.
-        # getroute's middle route already carries the cumulative CLTV needed
-        # for the dest peer to forward back to our invoice. For direct pairs
-        # there is no middle path, so the first peer must receive exactly the
-        # return-hop requirement: invoice final CLTV + dest-channel delta.
-        total_forward_msat = (amount_sats + final_hop_fee_sats + middle_fee_sats) * 1000
-        first_hop_delay = (
-            int(middle_route[0].get("delay", 0) or 0)
-            if middle_route
-            else required_final_cltv
-        )
+        # getroute's first middle hop is what the source peer must deliver to
+        # the next node. Our prepended first hop must therefore add the source
+        # peer's fee and CLTV delta for that first forwarded edge.
+        if middle_route:
+            first_middle_hop = middle_route[0]
+            first_middle_policy = self._get_first_middle_hop_policy(
+                source_peer_id, first_middle_hop
+            )
+            if first_middle_policy is None:
+                return RouteResult(
+                    success=False,
+                    error=(
+                        "cannot determine source peer forwarding policy for "
+                        f"{first_middle_hop.get('channel')}"
+                    ),
+                )
+            middle_forward_msat = self._parse_msat_value(
+                first_middle_hop.get("amount_msat")
+            )
+            first_middle_fee_msat = (
+                int(first_middle_policy["fee_base_msat"])
+                + math.ceil(
+                    middle_forward_msat * int(first_middle_policy["fee_ppm"]) / 1_000_000
+                )
+            )
+            total_forward_msat = middle_forward_msat + first_middle_fee_msat
+            first_hop_delay = int(first_middle_hop.get("delay", 0) or 0) + int(
+                first_middle_policy["cltv_delta"]
+            )
+        else:
+            total_forward_msat = (amount_sats + final_hop_fee_sats) * 1000
+            first_hop_delay = required_final_cltv
         first_hop = {
             "id": source_peer_id,
             "channel": source_channel_id,
@@ -318,7 +386,10 @@ class RebalanceRouter:
         }
 
         full_route = [first_hop] + middle_route + [final_hop]
-        total_cost_sats = middle_fee_sats + final_hop_fee_sats
+        total_cost_sats = max(
+            0,
+            math.ceil((total_forward_msat - (amount_sats * 1000)) / 1000),
+        )
 
         return RouteResult(
             success=True,

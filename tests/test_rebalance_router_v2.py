@@ -90,6 +90,28 @@ def _source_peer_channels(fee_ppm=0, cltv=18):
     }
 
 
+def _middle_edge_channels(
+    next_node_id,
+    fee_ppm=0,
+    fee_base_msat=0,
+    delay=12,
+    channel_id="300x1x0",
+    extra_channels=None,
+):
+    """listchannels payload containing the source peer's first forwarded edge."""
+    channels = [{
+        "source": SOURCE_PEER,
+        "destination": next_node_id,
+        "short_channel_id": channel_id,
+        "base_fee_millisatoshi": fee_base_msat,
+        "fee_per_millionth": fee_ppm,
+        "delay": delay,
+    }]
+    if extra_channels:
+        channels.extend(extra_channels)
+    return {"channels": channels}
+
+
 class TestFinalHopFeeFromListpeerchannels:
     def test_router_gets_actual_final_hop_fee_from_listpeerchannels(self):
         """Uses listpeerchannels(peer_id=dest_peer_id) for fee lookup."""
@@ -104,6 +126,7 @@ class TestFinalHopFeeFromListpeerchannels:
                 DEST_PEER: _dest_peer_channels(fee_ppm=275),
                 SOURCE_PEER: _source_peer_channels(),
             },
+            list_channels=_middle_edge_channels(DEST_PEER),
             getroute={"route": middle_route},
         )
         router = RebalanceRouter(plugin, OUR_ID)
@@ -121,7 +144,7 @@ class TestFinalHopFeeFromListpeerchannels:
         calls = plugin.rpc.listpeerchannels.call_args_list
         dest_call = [c for c in calls if c.kwargs.get("peer_id") == DEST_PEER]
         assert len(dest_call) >= 1
-        plugin.rpc.listchannels.assert_not_called()
+        plugin.rpc.listchannels.assert_called_with(short_channel_id="300x1x0")
 
     def test_router_does_not_call_listpeerchannels_with_legacy_id_kwarg(self):
         """Regression test: earlier versions passed id= which raised
@@ -132,6 +155,7 @@ class TestFinalHopFeeFromListpeerchannels:
                 DEST_PEER: _dest_peer_channels(fee_ppm=275),
                 SOURCE_PEER: _source_peer_channels(),
             },
+            list_channels=_middle_edge_channels(DEST_PEER),
             getroute={"route": [{
                 "id": DEST_PEER,
                 "channel": "300x1x0",
@@ -156,12 +180,16 @@ class TestFallbackToListchannels:
     def test_router_falls_back_to_listchannels_when_no_peer_updates(self):
         bare_peer = {"channels": [{"short_channel_id": DEST_SCID, "peer_id": DEST_PEER}]}
         list_channels = {
-            "channels": [{
-                "source": DEST_PEER,
-                "destination": OUR_ID,
-                "short_channel_id": DEST_SCID,
-                "fee_per_millionth": 500,
-            }],
+            "channels": _middle_edge_channels(
+                DEST_PEER,
+                extra_channels=[{
+                    "source": DEST_PEER,
+                    "destination": OUR_ID,
+                    "short_channel_id": DEST_SCID,
+                    "fee_per_millionth": 500,
+                    "delay": 40,
+                }],
+            )["channels"],
         }
         middle_route = [{
             "id": DEST_PEER,
@@ -185,7 +213,8 @@ class TestFallbackToListchannels:
 
         assert result.success is True
         assert result.final_hop_fee_ppm == 500
-        plugin.rpc.listchannels.assert_called_once_with(source=DEST_PEER)
+        assert call(source=DEST_PEER) in plugin.rpc.listchannels.call_args_list
+        assert call(short_channel_id="300x1x0") in plugin.rpc.listchannels.call_args_list
 
 
 class TestFullRoute:
@@ -202,6 +231,7 @@ class TestFullRoute:
                 DEST_PEER: _dest_peer_channels(fee_ppm=200, cltv=40),
                 SOURCE_PEER: _source_peer_channels(cltv=18),
             },
+            list_channels=_middle_edge_channels(middle_route[0]["id"]),
             getroute={"route": middle_route},
         )
         router = RebalanceRouter(plugin, OUR_ID)
@@ -234,6 +264,7 @@ class TestFullRoute:
                 DEST_PEER: _dest_peer_channels(fee_ppm=200, cltv=40),
                 SOURCE_PEER: _source_peer_channels(cltv=18),
             },
+            list_channels=_middle_edge_channels(DEST_PEER),
             getroute={"route": middle_route},
             listconfigs={"configs": {"cltv-final": {"value_int": 18}}},
         )
@@ -248,11 +279,91 @@ class TestFullRoute:
         kwargs = plugin.rpc.getroute.call_args.kwargs
         assert kwargs["cltv"] == 58
         assert result.route[0]["direction"] == 0
-        assert result.route[0]["delay"] == 58
+        assert result.route[0]["delay"] == 70
         assert result.route[0]["style"] == "tlv"
         assert result.route[-1]["direction"] == 1
         assert result.route[-1]["delay"] == 18
         assert result.route[-1]["style"] == "tlv"
+
+    def test_first_hop_amount_includes_fee_for_first_middle_edge(self):
+        """The prepended first hop must fund the source peer's outgoing fee."""
+        middle_route = [{
+            "id": "03" + "cc" * 32,
+            "channel": "300x1x0",
+            "direction": 0,
+            "style": "tlv",
+            "amount_msat": 50_015_750,
+            "delay": 58,
+        }]
+        plugin = _make_plugin(
+            peer_channels_by_id={
+                DEST_PEER: _dest_peer_channels(fee_ppm=275, cltv=40),
+                SOURCE_PEER: _source_peer_channels(cltv=18),
+            },
+            list_channels={
+                "channels": [{
+                    "source": SOURCE_PEER,
+                    "destination": middle_route[0]["id"],
+                    "short_channel_id": "300x1x0",
+                    "direction": 0,
+                    "base_fee_millisatoshi": 5000,
+                    "fee_per_millionth": 100,
+                    "delay": 12,
+                }],
+            },
+            getroute={"route": middle_route},
+            listconfigs={"configs": {"cltv-final": {"value_int": 18}}},
+        )
+        router = RebalanceRouter(plugin, OUR_ID)
+
+        result = router.price_pair(
+            SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
+        )
+
+        assert result.success is True
+        # ceil(50_015_750 * 100 / 1_000_000) + 5000 = 10_002 msat
+        assert result.route[0]["amount_msat"] == 50_025_752
+        assert result.route_cost_sats == 26
+        plugin.rpc.listchannels.assert_called_with(short_channel_id="300x1x0")
+
+    def test_first_hop_delay_includes_cltv_delta_for_first_middle_edge(self):
+        """The prepended first hop must give the source peer its forwarding delta."""
+        next_hop = "03" + "cc" * 32
+        middle_route = [{
+            "id": next_hop,
+            "channel": "300x1x0",
+            "direction": 0,
+            "style": "tlv",
+            "amount_msat": 50_015_750,
+            "delay": 58,
+        }]
+        plugin = _make_plugin(
+            peer_channels_by_id={
+                DEST_PEER: _dest_peer_channels(fee_ppm=275, cltv=40),
+                SOURCE_PEER: _source_peer_channels(cltv=18),
+            },
+            list_channels={
+                "channels": [{
+                    "source": SOURCE_PEER,
+                    "destination": next_hop,
+                    "short_channel_id": "300x1x0",
+                    "direction": 0,
+                    "base_fee_millisatoshi": 0,
+                    "fee_per_millionth": 0,
+                    "delay": 12,
+                }],
+            },
+            getroute={"route": middle_route},
+            listconfigs={"configs": {"cltv-final": {"value_int": 18}}},
+        )
+        router = RebalanceRouter(plugin, OUR_ID)
+
+        result = router.price_pair(
+            SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
+        )
+
+        assert result.success is True
+        assert result.route[0]["delay"] == 70
 
 
 class TestExcludePassthrough:
@@ -268,6 +379,7 @@ class TestExcludePassthrough:
                 DEST_PEER: _dest_peer_channels(fee_ppm=100),
                 SOURCE_PEER: _source_peer_channels(),
             },
+            list_channels=_middle_edge_channels(DEST_PEER),
             getroute={"route": middle_route},
         )
         router = RebalanceRouter(plugin, OUR_ID)
@@ -329,6 +441,7 @@ class TestZeroFeePeer:
                 DEST_PEER: _dest_peer_channels(fee_ppm=0),
                 SOURCE_PEER: _source_peer_channels(),
             },
+            list_channels=_middle_edge_channels(DEST_PEER, delay=0),
             getroute={"route": middle_route},
         )
         router = RebalanceRouter(plugin, OUR_ID)
@@ -361,7 +474,13 @@ class TestDataServiceRouting:
             return {"channels": []}
 
         data_service.get_peer_channels.side_effect = _get_peer_channels
-        data_service.get_channels.return_value = {"channels": []}
+        data_service.get_channels.side_effect = (
+            lambda source=None, destination=None, short_channel_id=None: (
+                _middle_edge_channels(DEST_PEER)
+                if short_channel_id == "300x1x0"
+                else {"channels": []}
+            )
+        )
         data_service.get_configs.return_value = {
             "configs": {"cltv-final": {"value_int": 18}}
         }
