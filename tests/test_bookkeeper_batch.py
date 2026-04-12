@@ -125,6 +125,20 @@ class TestBookkeeperCache:
         # Channel-account presence should win, even though net fee is 0.
         assert cache.get_open_cost_by_txid(txid) == 0
 
+    def test_multiple_channel_accounts_same_txid_are_summed(self):
+        """Distinct channel-account rows for the same txid are aggregated deterministically."""
+        txid = "cafe" * 16
+        events = [
+            _onchain_fee_event("channel:111x1x0", txid, credit_msat="0msat", debit_msat="300000msat"),
+            _onchain_fee_event("channel:222x2x0", txid, credit_msat="0msat", debit_msat="200000msat"),
+            _onchain_fee_event("wallet", txid, credit_msat="0msat", debit_msat="900000msat"),
+        ]
+        rpc = _make_rpc(events)
+        cache = BookkeeperCache(rpc)
+
+        # 300000 + 200000 = 500000 msat → 500 sats, and wallet fallback must stay suppressed.
+        assert cache.get_open_cost_by_txid(txid) == 500
+
     def test_unknown_txid_returns_none(self):
         """Missing txid returns None."""
         events = [

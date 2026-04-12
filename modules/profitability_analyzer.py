@@ -85,16 +85,33 @@ class BookkeeperCache:
             else:
                 account_fees[key] = {"credit": credit, "debit": debit}
 
+        channel_fees_by_txid: dict = {}
         for (account, txid), totals in account_fees.items():
             if account == "wallet":
-                net_msat = totals["debit"] - totals["credit"]
-                if net_msat > 0:
-                    self._wallet_fees[txid] = base_to_sats_floor(net_msat)
+                wallet_totals = channel_fees_by_txid.setdefault(("wallet", txid), {"credit": 0, "debit": 0})
+                wallet_totals["credit"] += totals["credit"]
+                wallet_totals["debit"] += totals["debit"]
             else:
                 self._channel_account_txids.add(txid)
-                net_msat = totals["debit"] - totals["credit"]
-                if txid not in self._onchain_fees and net_msat > 0:
-                    self._onchain_fees[txid] = base_to_sats_floor(net_msat)
+                channel_totals = channel_fees_by_txid.setdefault(txid, {"credit": 0, "debit": 0})
+                channel_totals["credit"] += totals["credit"]
+                channel_totals["debit"] += totals["debit"]
+
+        for txid in self._channel_account_txids:
+            totals = channel_fees_by_txid.get(txid, {"credit": 0, "debit": 0})
+            net_msat = totals["debit"] - totals["credit"]
+            if net_msat > 0:
+                self._onchain_fees[txid] = base_to_sats_floor(net_msat)
+
+        for key, totals in channel_fees_by_txid.items():
+            if not isinstance(key, tuple) or key[0] != "wallet":
+                continue
+            txid = key[1]
+            if txid in self._channel_account_txids:
+                continue
+            net_msat = totals["debit"] - totals["credit"]
+            if net_msat > 0:
+                self._wallet_fees[txid] = base_to_sats_floor(net_msat)
 
     def get_open_cost_by_txid(self, funding_txid: str) -> int | None:
         """Look up the on-chain fee for a funding transaction.
