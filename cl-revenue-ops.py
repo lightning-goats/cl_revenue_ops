@@ -2607,6 +2607,7 @@ def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[st
         return {"error": f"Invalid channel format: {channel_id}. Use SCID format (e.g., 123x456x789)."}
 
     if channel_id:
+        channel_id = normalize_scid(channel_id)
         result = flow_analyzer.analyze_channel(channel_id)
         return {"channel": channel_id, "analysis": result.to_dict() if result else None}
     else:

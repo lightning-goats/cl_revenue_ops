@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple
 from pyln.client import Plugin, RpcError
-from .utils import parse_msat, base_to_sats_floor
+from .utils import normalize_scid, parse_msat, base_to_sats_floor
 
 try:
     import numpy as np
@@ -1695,10 +1695,11 @@ class FlowAnalyzer:
     
     def _get_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Get info for a specific channel."""
+        normalized_channel_id = normalize_scid(channel_id)
         channels = self._get_channels()
         for channel in channels:
-            scid = channel.get("short_channel_id") or channel.get("channel_id")
-            if scid == channel_id:
+            scid = normalize_scid(channel.get("short_channel_id") or channel.get("channel_id"))
+            if scid == normalized_channel_id:
                 return channel
         return None
     

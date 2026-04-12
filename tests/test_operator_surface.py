@@ -298,6 +298,39 @@ def test_revenue_config_no_args_returns_public_config_dict():
     assert result["config"]["daily_budget_sats"] == 1200
 
 
+def test_revenue_analyze_normalizes_colon_scid_before_flow_analysis():
+    mod = load_plugin_module()
+    mod.flow_analyzer = MagicMock()
+    mod.flow_analyzer.analyze_channel.return_value = SimpleNamespace(
+        to_dict=lambda: {"channel_id": "100x1x0"}
+    )
+
+    result = mod.revenue_analyze(mod.plugin, "100:1:0")
+
+    mod.flow_analyzer.analyze_channel.assert_called_once_with("100x1x0")
+    assert result["channel"] == "100x1x0"
+
+
+def test_flow_analyzer_get_channel_matches_colon_form_scid():
+    from modules.flow_analysis import FlowAnalyzer
+
+    analyzer = FlowAnalyzer(MagicMock(), MagicMock(), MagicMock())
+    analyzer._get_channels = MagicMock(
+        return_value=[
+            {
+                "short_channel_id": "100x1x0",
+                "channel_id": "100x1x0",
+                "peer_id": "02" + "a" * 64,
+            }
+        ]
+    )
+
+    channel = analyzer._get_channel("100:1:0")
+
+    assert channel is not None
+    assert channel["short_channel_id"] == "100x1x0"
+
+
 def test_revenue_config_swallows_unknown_kwargs_from_wrapped_form_body():
     """Some HTTP clients form-encode a JSON body and end up dispatching the
     method with a single unrecognized key like
