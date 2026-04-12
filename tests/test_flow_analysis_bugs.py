@@ -263,6 +263,91 @@ class TestAnalyzeChannelKalmanReclassification:
         assert result.state != ChannelState.SOURCE
 
 
+class TestKalmanReclassificationObservationMode:
+    """Kalman reclassification should distinguish predict-only and observed updates."""
+
+    def _make_analyzer(self):
+        from modules.flow_analysis import FlowAnalyzer
+
+        plugin = MagicMock()
+        config = MagicMock()
+        config.source_threshold = 0.5
+        config.sink_threshold = -0.5
+        config.flow_window_days = 7
+        config.htlc_congestion_threshold = 0.8
+        database = MagicMock()
+        database.get_channel_state.return_value = None
+        database.get_kalman_state.return_value = None
+        database.get_daily_flow_buckets.return_value = {}
+        return FlowAnalyzer(plugin, config, database)
+
+    def test_predict_only_when_no_raw_entries(self):
+        """No raw entries should make _apply_kalman_filter run in predict-only mode."""
+        from modules.flow_analysis import ChannelState, FlowMetrics
+
+        analyzer = self._make_analyzer()
+        metrics = FlowMetrics(
+            channel_id="100x1x0",
+            peer_id="02" + "b" * 64,
+            sats_in=0,
+            sats_out=0,
+            capacity=10_000_000,
+            flow_ratio=0.0,
+            state=ChannelState.UNKNOWN,
+            daily_volume=0,
+            confidence=0.42,
+            is_congested=False,
+        )
+
+        with patch.object(analyzer, '_compute_raw_kalman_observation', return_value=(0.0, 0)), \
+             patch.object(analyzer, '_apply_kalman_filter', return_value=(0.0, 0.0, 0.1, False, 0)) as mock_apply:
+            analyzer._apply_kalman_reclassification(
+                metrics=metrics,
+                channel_id="100x1x0",
+                capacity=10_000_000,
+                our_balance=5_000_000,
+                channel_daily=[],
+                raw_entries=[],
+                last_forward_ts=0,
+            )
+
+        mock_apply.assert_called_once()
+        assert mock_apply.call_args.kwargs["has_observation"] is False
+
+    def test_observation_mode_when_raw_entries_exist(self):
+        """Raw entries should keep _apply_kalman_filter in observed-update mode."""
+        from modules.flow_analysis import ChannelState, FlowMetrics
+
+        analyzer = self._make_analyzer()
+        metrics = FlowMetrics(
+            channel_id="100x1x0",
+            peer_id="02" + "b" * 64,
+            sats_in=0,
+            sats_out=0,
+            capacity=10_000_000,
+            flow_ratio=0.0,
+            state=ChannelState.UNKNOWN,
+            daily_volume=0,
+            confidence=0.42,
+            is_congested=False,
+        )
+
+        with patch.object(analyzer, '_compute_raw_kalman_observation', return_value=(0.25, 3)), \
+             patch.object(analyzer, '_apply_kalman_filter', return_value=(0.1, 0.0, 0.1, False, 3)) as mock_apply:
+            analyzer._apply_kalman_reclassification(
+                metrics=metrics,
+                channel_id="100x1x0",
+                capacity=10_000_000,
+                our_balance=5_000_000,
+                channel_daily=[],
+                raw_entries=[{"amount_msat": "1000msat"}],
+                last_forward_ts=int(time.time()) - 3600,
+            )
+
+        mock_apply.assert_called_once()
+        assert mock_apply.call_args.kwargs["has_observation"] is True
+
+
 class TestRemoveClosedChannelDataCleanup:
     """
     Bug: remove_closed_channel_data() didn't clean up kalman_state

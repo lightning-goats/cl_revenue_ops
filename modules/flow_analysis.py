@@ -643,9 +643,8 @@ class FlowAnalyzer:
        - Otherwise: BALANCED
 
     Known Limitations (documented, not bugs):
-    - C-1: has_observation=True unconditionally in Kalman — design tradeoff: setting False
-      for idle channels would cause the filter to converge to 0.0, losing state. True keeps
-      the prediction step active so idle channels decay naturally via process noise.
+    - C-1: Kalman updates use predict-only mode when there is no raw observation, so idle
+      channels are not forced toward 0.0 by synthetic measurements.
     - I-2: analyze_all_channels is not re-entrant — single-threaded timer mitigates; the
       _analyze_all_running flag prevents redundant DB writes from concurrent calls.
     - I-4: Hourly observations are time-correlated — inherent in the hourly-update/24h-window
@@ -914,13 +913,15 @@ class FlowAnalyzer:
             else metrics.confidence
         )
 
+        has_observation = raw_count > 0
+
         kalman_ratio, kalman_velocity, kalman_uncertainty, regime_change, obs_count = \
             self._apply_kalman_filter(
                 channel_id=channel_id,
                 observed_ratio=raw_observation,
                 confidence=kalman_confidence,
                 daily_buckets=channel_daily,
-                has_observation=True,
+                has_observation=has_observation,
             )
         metrics.kalman_flow_ratio = kalman_ratio
         metrics.kalman_velocity = kalman_velocity
@@ -1701,4 +1702,3 @@ class FlowAnalyzer:
                 return channel
         return None
     
-
