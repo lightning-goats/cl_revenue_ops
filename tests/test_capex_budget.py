@@ -65,6 +65,7 @@ def _make_engine(
     bleeders=None,
     spend_by_channel=None,
     rebalance_cost_by_channel=None,
+    spend_summary=None,
     hive_hints=None,
     capital_efficiency=None,
     reserve_deficit=0,
@@ -88,6 +89,10 @@ def _make_engine(
     mock_db = MagicMock()
     mock_db.get_confirmed_onchain_sats.return_value = 1_000_000 - reserve_deficit
     mock_db.get_channel_rebalance_success_rate.return_value = None
+    mock_db.get_spend_ledger_summary.return_value = spend_summary or {
+        "spent_by_category": {},
+        "reserved_by_category": {},
+    }
 
     cfg = Config()
     if config_overrides:
@@ -503,6 +508,29 @@ class TestFleetExplorationBudget:
         alloc = engine.compute_allocations()
         assert alloc.fleet_exploration_budget_sats == 0
 
+    def test_exploration_budget_reduced_by_open_spend_and_reservations(self):
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=500_000,
+                    fees_earned_msat=500_000,
+                    total_forward_count=50,
+                ),
+                "200x1x0": _make_mock_profitability(
+                    contribution_msat=300_000,
+                    fees_earned_msat=300_000,
+                    total_forward_count=30,
+                    channel_id="200x1x0",
+                ),
+            },
+            spend_summary={
+                "spent_by_category": {"channel_open": 30},
+                "reserved_by_category": {"channel_open": 25},
+            },
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.fleet_exploration_budget_sats == 25
+
 
 class TestTacticalBudget:
     """Tactical budget for Boltz treasury."""
@@ -546,6 +574,24 @@ class TestTacticalBudget:
         engine = _make_engine(reserve_deficit=0)
         alloc = engine.compute_allocations()
         assert alloc.tactical_budget_sats == 0
+
+    def test_tactical_budget_reduced_by_boltz_spend_and_reservations(self):
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=10_000_000,
+                    fees_earned_msat=10_000_000,
+                    total_forward_count=100,
+                ),
+            },
+            reserve_deficit=500,
+            spend_summary={
+                "spent_by_category": {"boltz": 120},
+                "reserved_by_category": {"boltz": 80},
+            },
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.tactical_budget_sats == 300
 
 
 class TestPriorityClass:

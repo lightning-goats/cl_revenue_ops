@@ -371,10 +371,10 @@ class CapacityPlanner:
             if self._capex_engine:
                 exploration_budget_sats = self._capex_engine.get_fleet_exploration_budget()
             max_opens = cfg.planner_max_opens_per_cycle
-            exploration_budget_ok = exploration_budget_sats >= estimated_open_cost
-            if not exploration_budget_ok and self._capex_engine:
+            remaining_exploration_budget_sats = exploration_budget_sats
+            if remaining_exploration_budget_sats < estimated_open_cost and self._capex_engine:
                 self.plugin.log(
-                    f"PLANNER: Exploration budget {exploration_budget_sats} sats "
+                    f"PLANNER: Exploration budget {remaining_exploration_budget_sats} sats "
                     f"< open cost {estimated_open_cost} sats — skipping opens",
                     level='info',
                 )
@@ -387,9 +387,9 @@ class CapacityPlanner:
                 peer_id = candidate["peer_id"]
 
                 # Exploration budget: check remaining budget covers the next open
-                if self._capex_engine and not exploration_budget_ok:
+                if self._capex_engine and remaining_exploration_budget_sats < estimated_open_cost:
                     summary["skipped_reasons"].append(
-                        f"Exploration budget: {exploration_budget_sats} < open cost {estimated_open_cost}"
+                        f"Exploration budget: {remaining_exploration_budget_sats} < open cost {estimated_open_cost}"
                     )
                     break  # No point checking more candidates
 
@@ -441,6 +441,10 @@ class CapacityPlanner:
                 if status in ("completed", "dry_run"):
                     opens_this_cycle += 1
                     available_sats = max(0, available_sats - channel_size)
+                    if self._capex_engine:
+                        remaining_exploration_budget_sats = max(
+                            0, remaining_exploration_budget_sats - estimated_open_cost
+                        )
 
         # 6. Update candidate pool
         self._update_candidate_pool(candidates if fee_ok else [])

@@ -184,6 +184,18 @@ class CapexBudgetEngine:
         tactical_msat = min(reserve_deficit_msat, int(total_fleet_contribution_msat * cfg.capex_tactical_rate))
         tactical_msat = max(0, tactical_msat)
 
+        spend_summary = self._get_spend_ledger_summary(window_days=30)
+        exploration_msat = self._apply_category_spend_remaining(
+            budget_msat=exploration_msat,
+            summary=spend_summary,
+            category="channel_open",
+        )
+        tactical_msat = self._apply_category_spend_remaining(
+            budget_msat=tactical_msat,
+            summary=spend_summary,
+            category="boltz",
+        )
+
         # Global envelope enforcement (msat)
         total_channel_budgets_msat = sum(b.budget_msat for b in channel_budgets.values())
         raw_total_msat = total_channel_budgets_msat + exploration_msat + tactical_msat
@@ -464,3 +476,26 @@ class CapexBudgetEngine:
             return self._database.get_total_capex_by_channel(window_days)
         except Exception:
             return {}
+
+    def _get_spend_ledger_summary(self, window_days: int = 30) -> Dict[str, Dict[str, int]]:
+        """Get generic spend ledger totals for the requested rolling window."""
+        try:
+            return self._database.get_spend_ledger_summary(window_hours=window_days * 24)
+        except Exception:
+            return {"spent_by_category": {}, "reserved_by_category": {}}
+
+    def _apply_category_spend_remaining(
+        self,
+        *,
+        budget_msat: int,
+        summary: Dict[str, Dict[str, int]],
+        category: str,
+    ) -> int:
+        """Subtract spent and reserved sats for one category from a nominal msat budget."""
+        spent_by_category = summary.get("spent_by_category", {}) or {}
+        reserved_by_category = summary.get("reserved_by_category", {}) or {}
+        consumed_sats = int(spent_by_category.get(category, 0) or 0) + int(
+            reserved_by_category.get(category, 0) or 0
+        )
+        remaining_msat = budget_msat - (consumed_sats * MSAT_PER_SAT)
+        return max(0, remaining_msat)

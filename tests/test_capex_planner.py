@@ -169,6 +169,32 @@ class TestExplorationBudgetGate:
         exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
         assert len(exploration_skips) == 0
 
+    def test_multiple_opens_consume_remaining_exploration_budget(self):
+        """A single cycle must not spend the same exploration budget on multiple opens."""
+        planner = self._make_planner_for_cycle(exploration_budget=8000)
+
+        planner._discover_peers = MagicMock(return_value=[
+            {"peer_id": "02" + "a" * 64, "score": 100, "reason": "test"},
+            {"peer_id": "02" + "b" * 64, "score": 90, "reason": "test"},
+        ])
+
+        planner.plugin.rpc.listfunds.return_value = {
+            "outputs": [{"amount_msat": 10_000_000_000, "status": "confirmed"}],
+            "channels": [],
+        }
+        planner.plugin.rpc.listpeerchannels.return_value = {"channels": []}
+
+        planner._size_channel = MagicMock(return_value=1_000_000)
+        planner._calculate_open_ev = MagicMock(return_value=100)
+        planner._check_safety_guards = MagicMock(return_value=(True, "ok"))
+        planner._execute_open = MagicMock(return_value={"status": "dry_run", "action_id": 1})
+
+        summary = planner.execute_cycle()
+
+        assert len(summary["opens"]) == 1
+        exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
+        assert len(exploration_skips) >= 1
+
 
 class TestCloseCostRecording:
     """Close costs recorded in spend_events like open costs."""
