@@ -35,9 +35,18 @@ def test_non_empty_table_with_meaningful_gap_uses_bounded_overlap_start():
 
 
 def test_very_recent_last_forward_ts_returns_none():
-    last_forward_ts = NOW - 30 * 60
+    last_forward_ts = NOW - 2 * 60
 
     assert _compute_start(last_forward_ts, 7) is None
+
+
+def test_sub_hour_restart_gap_triggers_bounded_backfill():
+    # A short restart gap should still backfill rather than relying on event replay.
+    last_forward_ts = NOW - 10 * 60
+
+    start = _compute_start(last_forward_ts, 7)
+
+    assert start == last_forward_ts - 86400
 
 
 def test_startup_hydration_uses_helper_window_for_empty_table():

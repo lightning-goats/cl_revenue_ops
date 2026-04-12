@@ -151,6 +151,7 @@ class ForceRateLimiter:
 
 # Global rate limiter for force operations (10 calls per 60 seconds)
 force_rate_limiter = ForceRateLimiter(max_calls=10, window_seconds=60)
+FORWARD_HYDRATION_EVENT_JITTER_SECONDS = 300
 
 
 def _compute_forward_hydration_start(
@@ -171,7 +172,7 @@ def _compute_forward_hydration_start(
 
     last_forward_ts = int(last_forward_ts)
     gap_seconds = max(0, current_time - last_forward_ts)
-    if gap_seconds <= 3600:
+    if gap_seconds <= FORWARD_HYDRATION_EVENT_JITTER_SECONDS:
         return None
 
     hydration_floor = current_time - (max(flow_window_days + 1, 15) * 86400)
