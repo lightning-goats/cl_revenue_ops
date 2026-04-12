@@ -152,6 +152,32 @@ class ForceRateLimiter:
 # Global rate limiter for force operations (10 calls per 60 seconds)
 force_rate_limiter = ForceRateLimiter(max_calls=10, window_seconds=60)
 
+
+def _compute_forward_hydration_start(
+    last_forward_ts: Optional[int],
+    flow_window_days: int,
+    now: Optional[int] = None,
+) -> Optional[int]:
+    """Compute a bounded startup backfill start time for the forwards table.
+
+    Empty tables get a full warm start so flow analysis has enough history.
+    Non-empty tables only get a bounded overlap backfill when the last stored
+    forward is stale enough to justify one.
+    """
+    current_time = int(time.time()) if now is None else int(now)
+
+    if last_forward_ts is None:
+        return current_time - (max(flow_window_days, 14) * 86400)
+
+    last_forward_ts = int(last_forward_ts)
+    gap_seconds = max(0, current_time - last_forward_ts)
+    if gap_seconds <= 3600:
+        return None
+
+    hydration_floor = current_time - (max(flow_window_days + 1, 15) * 86400)
+    overlap_start = last_forward_ts - 86400
+    return max(overlap_start, hydration_floor)
+
 # Initialize the plugin
 plugin = Plugin()
 
@@ -1382,22 +1408,20 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # FORWARDS TABLE HYDRATION (TODO #19: Double-Dip Fix)
     # =========================================================================
     # The forwards table is populated in real-time by forward_event hook.
-    # Startup hydration is skipped — the hook catches up naturally.
-    # Only hydrate on first-ever startup (empty table).
+    # Startup hydration backfills empty tables and bounded overlap gaps.
     # =========================================================================
     try:
         last_forward_ts = database.get_latest_forward_timestamp()
         now = int(time.time())
 
-        if last_forward_ts is None:
-            # First-ever startup: hydrate recent history so flow analysis has data
-            hydrate_days = max(config.flow_window_days, 14)
-            start_time = now - (hydrate_days * 86400)
-            plugin.log(f"Forwards table empty. Hydrating last {hydrate_days} days of forwards...")
-        else:
-            # Table has data — forward_event hook keeps it current.
-            # Skip the expensive listforwards RPC at startup.
-            start_time = None
+        start_time = _compute_forward_hydration_start(
+            last_forward_ts,
+            config.flow_window_days,
+            now,
+        )
+
+        if start_time is None:
+            # Table is current enough — forward_event hook keeps it current.
             gap_hours = (now - last_forward_ts) / 3600
             if gap_hours > 1:
                 plugin.log(
@@ -1405,6 +1429,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     f"forward_event hook will catch up naturally",
                     level='debug'
                 )
+        elif last_forward_ts is None:
+            hydrate_days = max(config.flow_window_days, 14)
+            plugin.log(f"Forwards table empty. Hydrating last {hydrate_days} days of forwards...")
+        else:
+            gap_hours = (now - last_forward_ts) / 3600
+            overlap_days = max(config.flow_window_days + 1, 15)
+            plugin.log(
+                f"Forwards table has {gap_hours:.1f}h gap — "
+                f"hydrating bounded overlap window capped at {overlap_days} days",
+                level='debug'
+            )
 
         if start_time is not None:
             # Fetch from RPC - this is the ONLY listforwards call we make.
