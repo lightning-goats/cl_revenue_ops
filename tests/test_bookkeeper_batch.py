@@ -61,13 +61,13 @@ class TestBookkeeperCache:
         """Single consolidated onchain_fee event retrievable by txid."""
         txid = "aabb" * 16
         events = [
-            _onchain_fee_event("channel:123x1x0", txid, credit_msat="450000msat", debit_msat="0msat"),
+            _onchain_fee_event("channel:123x1x0", txid, credit_msat="0msat", debit_msat="450000msat"),
         ]
         rpc = _make_rpc(events)
         cache = BookkeeperCache(rpc)
 
         assert cache.available is True
-        # credit - debit = 450000 msat → 450 sats
+        # debit - credit = 450000 msat → 450 sats
         assert cache.get_open_cost_by_txid(txid) == 450
 
     def test_wallet_fallback_when_channel_account_missing(self):
@@ -87,15 +87,28 @@ class TestBookkeeperCache:
         """Channel-account fee takes priority over wallet perspective."""
         txid = "eeff" * 16
         events = [
-            _onchain_fee_event("channel:456x2x0", txid, credit_msat="500000msat", debit_msat="0msat"),
+            _onchain_fee_event("channel:456x2x0", txid, credit_msat="0msat", debit_msat="500000msat"),
             _onchain_fee_event("wallet", txid, credit_msat="0msat", debit_msat="600000msat"),
         ]
         rpc = _make_rpc(events)
         cache = BookkeeperCache(rpc)
 
-        # Channel-account: credit - debit = 500000 → 500 sats
+        # Channel-account: debit - credit = 500000 → 500 sats
         # Wallet: debit - credit = 600000 → 600 sats
         # Channel-account should win
+        assert cache.get_open_cost_by_txid(txid) == 500
+
+    def test_channel_account_netting_debit_minus_credit(self):
+        """Multiple onchain_fee updates for a channel account are netted correctly."""
+        txid = "abcd" * 16
+        events = [
+            _onchain_fee_event("channel:789x3x0", txid, credit_msat="0msat", debit_msat="700000msat"),
+            _onchain_fee_event("channel:789x3x0", txid, credit_msat="200000msat", debit_msat="0msat"),
+        ]
+        rpc = _make_rpc(events)
+        cache = BookkeeperCache(rpc)
+
+        # debit - credit = 500000 msat → 500 sats
         assert cache.get_open_cost_by_txid(txid) == 500
 
     def test_unknown_txid_returns_none(self):

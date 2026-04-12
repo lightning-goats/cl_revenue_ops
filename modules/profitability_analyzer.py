@@ -90,7 +90,7 @@ class BookkeeperCache:
                 if net_msat > 0:
                     self._wallet_fees[txid] = base_to_sats_floor(net_msat)
             else:
-                net_msat = totals["credit"] - totals["debit"]
+                net_msat = totals["debit"] - totals["credit"]
                 if txid not in self._onchain_fees and net_msat > 0:
                     self._onchain_fees[txid] = base_to_sats_floor(net_msat)
 
