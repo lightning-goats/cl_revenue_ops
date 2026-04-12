@@ -1468,7 +1468,8 @@ class CapacityPlanner:
             pid = c["peer_id"]
             if pid not in seen or c["score"] > seen[pid]["score"]:
                 seen[pid] = c
-        return list(seen.values())[:10]
+        ranked = sorted(seen.values(), key=lambda c: c["score"], reverse=True)
+        return ranked[:10]
 
     def _discover_from_hive(self) -> List[Dict]:
         """Strategy 4: Propose peers where cl_hive recommends channel opening."""
@@ -2366,14 +2367,8 @@ class CapacityPlanner:
             if retry_amount and retry_amount > amount_sats and retry_amount <= cfg.planner_max_channel_sats:
                 # Check if we can afford the retry
                 try:
-                    funds = self.data_service.get_funds() if self.data_service else self.plugin.rpc.listfunds()
-                    onchain = sum(
-                        base_to_sats_floor(parse_msat(o.get("amount_msat", 0)))
-                        for o in funds.get("outputs", [])
-                        if o.get("status") == "confirmed"
-                    )
-                    reserve = int(onchain * getattr(cfg, 'planner_reserve_pct', 0.20))
-                    if onchain - reserve >= retry_amount:
+                    reserve_ok, _ = self._check_reserve(cfg, retry_amount)
+                    if reserve_ok:
                         self.plugin.log(
                             f"Retrying channel open to {peer_id[:16]}... at peer minimum "
                             f"{retry_amount} sats (was {amount_sats})",

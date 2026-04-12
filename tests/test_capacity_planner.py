@@ -1420,6 +1420,57 @@ class TestPeerDiscovery:
             f"neighbor_for_route_peer_{index}" for index in range(6)
         }
 
+    def test_discover_from_route_pairs_keeps_highest_scored_ten_candidates(self):
+        """Strategy 5 should retain the ten best-scored neighbors, not first-seen ones."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
+
+        def listchannels_side_effect(source):
+            index = int(source.rsplit("_", 1)[1])
+            high_score = index >= 10
+            return {
+                "channels": [
+                    {
+                        "source": source,
+                        "destination": f"neighbor_for_{source}",
+                        "amount_msat": "6000000000msat" if high_score else "2000000000msat",
+                        "fee_per_millionth": 100 if high_score else 300,
+                    }
+                ]
+            }
+
+        plugin.rpc.listchannels.side_effect = listchannels_side_effect
+
+        prof_analyzer = MagicMock()
+        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
+
+        all_profitability = {}
+        route_rows = []
+        for index in range(12):
+            scid = f"{index + 1}x1x0"
+            peer_id = f"route_peer_{index}"
+            prof = MagicMock()
+            prof.peer_id = peer_id
+            prof.channel_id = scid
+            prof.scid = scid
+            all_profitability[scid] = prof
+            route_rows.append({
+                "in_channel": scid,
+                "out_channel": f"{index + 1}x1x1",
+                "total_fee_msat": 10_000,
+                "forward_count": 5,
+            })
+
+        prof_analyzer.database.get_top_route_pairs.return_value = route_rows
+
+        candidates = planner._discover_from_route_pairs(all_profitability)
+
+        assert len(candidates) == 10
+        candidate_ids = {c["peer_id"] for c in candidates}
+        assert "neighbor_for_route_peer_10" in candidate_ids
+        assert "neighbor_for_route_peer_11" in candidate_ids
+        assert len([pid for pid in candidate_ids if "neighbor_for_route_peer_" in pid]) == 10
+
     def test_discover_peers_deduplicates_by_peer_id(self):
         """Orchestrator deduplicates candidates, keeping highest score."""
         plugin = MagicMock()
@@ -2747,6 +2798,8 @@ def _make_open_cfg(planner_dry_run=False):
     """Create a mock config for channel open tests."""
     cfg = MagicMock()
     cfg.planner_dry_run = planner_dry_run
+    cfg.min_wallet_reserve = 500000
+    cfg.planner_max_channel_sats = 10_000_000
     return cfg
 
 
@@ -2933,6 +2986,26 @@ class TestChannelOpen:
         result = planner._execute_open("peer1", 2000000, cfg, "test")
         assert result["status"] == "completed"
         assert result["action_id"] is None
+
+    def test_retry_respects_min_wallet_reserve(self):
+        """Peer-min retry should use the same reserve rule as the planner guard rails."""
+        planner, db = _make_open_planner()
+        cfg = _make_open_cfg()
+        cfg.min_wallet_reserve = 800000
+        planner.plugin.rpc.listfunds.return_value = {
+            "outputs": [
+                {"status": "confirmed", "amount_msat": "2700000000msat"},
+            ]
+        }
+        planner.plugin.rpc.call.side_effect = [
+            Exception("below min chan size of 0.0205 BTC"),
+            {"channel_id": "retryx1x0"},
+        ]
+
+        result = planner._execute_open("peer1", 2000000, cfg, "test")
+
+        assert result["status"] == "failed"
+        assert planner.plugin.rpc.call.call_count == 1
 
     def test_dry_run_no_budget_reservation(self):
         """Dry run does not reserve budget."""
