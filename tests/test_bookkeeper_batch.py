@@ -111,6 +111,20 @@ class TestBookkeeperCache:
         # debit - credit = 500000 msat → 500 sats
         assert cache.get_open_cost_by_txid(txid) == 500
 
+    def test_zero_net_channel_account_suppresses_wallet_fallback(self):
+        """A channel-account onchain_fee entry should block wallet fallback even when net zero."""
+        txid = "beef" * 16
+        events = [
+            _onchain_fee_event("channel:999x9x0", txid, credit_msat="400000msat", debit_msat="0msat"),
+            _onchain_fee_event("channel:999x9x0", txid, credit_msat="0msat", debit_msat="400000msat"),
+            _onchain_fee_event("wallet", txid, credit_msat="0msat", debit_msat="600000msat"),
+        ]
+        rpc = _make_rpc(events)
+        cache = BookkeeperCache(rpc)
+
+        # Channel-account presence should win, even though net fee is 0.
+        assert cache.get_open_cost_by_txid(txid) == 0
+
     def test_unknown_txid_returns_none(self):
         """Missing txid returns None."""
         events = [

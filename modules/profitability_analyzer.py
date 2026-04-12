@@ -53,6 +53,7 @@ class BookkeeperCache:
         """
         self._onchain_fees: dict = {}      # txid → net_fee_sats
         self._wallet_fees: dict = {}       # txid → net_fee_sats (wallet perspective)
+        self._channel_account_txids: set = set()
         self._fetch_ok = False
 
         try:
@@ -90,6 +91,7 @@ class BookkeeperCache:
                 if net_msat > 0:
                     self._wallet_fees[txid] = base_to_sats_floor(net_msat)
             else:
+                self._channel_account_txids.add(txid)
                 net_msat = totals["debit"] - totals["credit"]
                 if txid not in self._onchain_fees and net_msat > 0:
                     self._onchain_fees[txid] = base_to_sats_floor(net_msat)
@@ -107,6 +109,8 @@ class BookkeeperCache:
         fee = self._onchain_fees.get(funding_txid)
         if fee is not None:
             return fee
+        if funding_txid in self._channel_account_txids:
+            return 0
         return self._wallet_fees.get(funding_txid)
 
     @property
