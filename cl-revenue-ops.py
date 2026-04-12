@@ -1409,6 +1409,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # =========================================================================
     # The forwards table is populated in real-time by forward_event hook.
     # Startup hydration backfills empty tables and bounded overlap gaps.
+    # The RPC fetch itself is still an unfiltered settled-forward listforwards
+    # call; the "bounded" part is the local insert window below.
     # =========================================================================
     try:
         last_forward_ts = database.get_latest_forward_timestamp()
@@ -1443,16 +1445,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
         if start_time is not None:
             # Fetch from RPC - this is the ONLY listforwards call we make.
-            # EH-12: Limit to recent forwards to avoid unbounded memory usage on large nodes.
-            # CLN v23.08+ supports index-based pagination; fall back to full fetch if unavailable.
             # CLN's listforwards `start` param expects a created_index (sequential
-            # counter), NOT a Unix timestamp.  Passing a timestamp silently returns
-            # zero results on any node with < 1.7 billion forwards.  Use unfiltered
-            # fetch and rely on the post-filter at received_time > start_time below.
-            # M-7 FIX: Cap hydration window to prevent unbounded memory on high-volume nodes.
-            max_hydration_days = max(config.flow_window_days + 1, 15)
-            hydration_floor = now - (max_hydration_days * 86400)
-            start_time = max(start_time, hydration_floor)
+            # counter), NOT a Unix timestamp. Passing a timestamp silently returns
+            # zero results on nodes with a small forward history, so we use the
+            # full settled-forward fetch and bound only the local insert window.
+            #
+            # Empty-table warm starts already use the helper's exact window.
+            # Apply the extra-day overlap floor only when we have a non-empty
+            # table and want to backfill a stale gap.
+            if last_forward_ts is not None:
+                max_hydration_days = max(config.flow_window_days + 1, 15)
+                hydration_floor = now - (max_hydration_days * 86400)
+                start_time = max(start_time, hydration_floor)
             try:
                 result = data_service.get_forwards(status="settled")
             except Exception as e:
