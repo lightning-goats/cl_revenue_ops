@@ -1,65 +1,289 @@
-"""Rebalance executor v2 — single execution model, no fleet/network split.
+"""Rebalance executor v2 — sling-backed execution.
 
-Executes a priced circular route using:
-  invoice → sendpay → waitsendpay → cleanup
+Executes a selected rebalance intent by:
+  sling-once -> poll sling-stats -> optional sling-stop on timeout
 
-Retries on route failures with exclude lists. Does not switch between
-separate fleet and network execution models.
+The v2 engine still prices pairs locally, but the executor no longer
+constructs or executes circular routes itself.
 """
 
 from __future__ import annotations
 
-import secrets
+import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
 @dataclass
 class ExecutionResult:
-    """Result of a v2 rebalance execution attempt."""
+    """Result of a rebalance execution attempt."""
 
     success: bool = False
     attempts: int = 0
     fee_sats: int = 0
     fee_msat: int = 0
     amount_sats: int = 0
+    fee_ppm: int = 0
+    hops: int = 0
+    route_type: str = "sling"
+    parts: int = 1
     error: str = ""
     excluded_channels: List[str] = field(default_factory=list)
     payment_pending: bool = False
 
 
-# Timeout and retry constants
-SENDPAY_TIMEOUT = 60
-INVOICE_EXPIRY = 300
-# The executor does not re-route on failure — the orchestrator handles
-# retry-with-exclude at a higher level. One attempt per route.
-MAX_ATTEMPTS = 1
+SLING_POLL_INTERVAL_SEC = 0.5
+SLING_STATUS_TIMEOUT_S = 30.0
+SLING_STOP_WAIT_SEC = 5.0
+
+RUNNING_STATES = {"Starting", "Rebalancing", "Stopping", "NotStarted"}
+SLING_FAILURE_STATES = {
+    "Error",
+    "NoRoutes",
+    "NoCheapRoute",
+    "NoCandidates",
+    "PeerBad",
+    "Stopped",
+}
 
 
 class RebalanceExecutor:
-    """Execute rebalance routes using standard CLN RPCs.
+    """Execute rebalance intents through the sling plugin only."""
 
-    No fleet/network distinction — one code path for all routes.
-    """
+    @staticmethod
+    def stable_failure_reason(error: Optional[str]) -> str:
+        """Map executor-local errors to stable coordination reasons."""
+        normalized = str(error or "").strip().lower()
+        if not normalized:
+            return "local_execution_failed"
+        if normalized == "route_over_budget" or normalized.startswith("route_over_budget:"):
+            return "route_segment_exhausted"
+        if normalized == "sling_unavailable":
+            return "local_execution_failed"
+        if normalized.startswith("sling_preflight_error:") or normalized.startswith("sling_error:"):
+            return "local_execution_failed"
+        if normalized.startswith("sling_timeout"):
+            return "executor_timeout"
+        if normalized.startswith("retriable_failure:"):
+            if any(
+                token in normalized
+                for token in ("temporary_channel_failure", "fee_insufficient")
+            ):
+                return "shared_conflict_changed"
+            if "incorrect_cltv_expiry" in normalized:
+                return "shared_conflict_changed"
+            return "local_execution_failed"
+        if normalized == "payment_pending_timeout":
+            return "executor_timeout"
+        return "local_execution_failed"
 
     def __init__(self, plugin, database=None):
         self.plugin = plugin
         self.database = database
-        self._our_id: Optional[str] = None
+        self.observe_timeout_sec = SLING_STATUS_TIMEOUT_S
+        self._timeout_from_config_loaded = False
+        self.poll_interval_sec = SLING_POLL_INTERVAL_SEC
+        self.stop_wait_sec = SLING_STOP_WAIT_SEC
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
             self.plugin.log(f"[ExecutorV2] {msg}", level=level)
 
-    def _get_our_id(self) -> Optional[str]:
-        if self._our_id:
-            return self._our_id
+    def is_available(self) -> bool:
+        """Return True iff the sling RPC surface is currently loaded."""
         try:
-            info = self.plugin.rpc.getinfo()
-            self._our_id = info["id"]
-        except Exception:
-            pass
-        return self._our_id
+            self.plugin.rpc.call("sling-stats", {"json": True})
+            return True
+        except Exception as exc:
+            self._log(f"sling unavailable: {exc}", level="debug")
+            return False
+
+    @staticmethod
+    def _maxppm_for_budget(amount_sats: int, max_fee_sats: int) -> int:
+        if amount_sats <= 0:
+            return 0
+        return max(0, (max_fee_sats * 1_000_000) // amount_sats)
+
+    def _load_observe_timeout_sec(self) -> float:
+        """Use sling-timeoutpay when CLN exposes it, otherwise keep a safe fallback."""
+        try:
+            configs = self.plugin.rpc.call("listconfigs", {})
+        except Exception as exc:
+            self._log(f"listconfigs failed for sling-timeoutpay: {exc}", level="debug")
+            return SLING_STATUS_TIMEOUT_S
+
+        timeout_config = {}
+        if isinstance(configs, dict):
+            timeout_config = (
+                (configs.get("configs") or {}).get("sling-timeoutpay")
+                or configs.get("sling-timeoutpay")
+                or {}
+            )
+
+        raw_value = None
+        if isinstance(timeout_config, dict):
+            raw_value = timeout_config.get("value_int")
+            if raw_value is None:
+                raw_value = timeout_config.get("value_str")
+
+        try:
+            timeout_s = float(raw_value)
+        except (TypeError, ValueError):
+            return SLING_STATUS_TIMEOUT_S
+        return timeout_s if timeout_s > 0 else SLING_STATUS_TIMEOUT_S
+
+    def _ensure_observe_timeout_sec(self) -> None:
+        if self._timeout_from_config_loaded:
+            return
+        self.observe_timeout_sec = self._load_observe_timeout_sec()
+        self._timeout_from_config_loaded = True
+
+    @staticmethod
+    def _parse_statuses(row: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(row, dict):
+            return []
+        statuses = row.get("status") or []
+        parsed: List[str] = []
+        for item in statuses:
+            text = str(item)
+            if ":" in text:
+                parsed.append(text.split(":", 1)[1])
+            elif text:
+                parsed.append(text)
+        return parsed
+
+    def _sling_row(self, scid: str) -> Optional[Dict[str, Any]]:
+        try:
+            rows = self.plugin.rpc.call("sling-stats", {"json": True})
+        except Exception as exc:
+            self._log(f"sling-stats row lookup failed for {scid}: {exc}", level="warn")
+            return None
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("scid", "")) == scid:
+                return row
+        return None
+
+    def _scid_stats(self, scid: str) -> Dict[str, Any]:
+        try:
+            result = self.plugin.rpc.call("sling-stats", {"scid": scid, "json": True})
+            return result if isinstance(result, dict) else {}
+        except Exception as exc:
+            self._log(f"sling-stats detail lookup failed for {scid}: {exc}", level="warn")
+            return {}
+
+    def _stop_once_job(self, scid: str) -> None:
+        try:
+            self.plugin.rpc.call("sling-stop", {"scid": scid})
+        except Exception as exc:
+            self._log(f"sling-stop failed for {scid}: {exc}", level="warn")
+
+    @staticmethod
+    def _success_delta(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, int]:
+        before_s = before.get("successes_in_time_window") or {}
+        after_s = after.get("successes_in_time_window") or {}
+        return {
+            "amount_sats": max(
+                0,
+                int(after_s.get("total_amount_sats", 0) or 0)
+                - int(before_s.get("total_amount_sats", 0) or 0),
+            ),
+            "spent_sats": max(
+                0,
+                int(after_s.get("total_spent_sats", 0) or 0)
+                - int(before_s.get("total_spent_sats", 0) or 0),
+            ),
+            "rebalances": max(
+                0,
+                int(after_s.get("total_rebalances", 0) or 0)
+                - int(before_s.get("total_rebalances", 0) or 0),
+            ),
+        }
+
+    @staticmethod
+    def _failure_reason(before: Dict[str, Any], after: Dict[str, Any]) -> str:
+        before_f = before.get("failures_in_time_window") or {}
+        after_f = after.get("failures_in_time_window") or {}
+        before_counts = {
+            str(item.get("failure_reason", "")): int(item.get("failure_count", 0) or 0)
+            for item in (before_f.get("top_5_failure_reasons") or [])
+            if item.get("failure_reason")
+        }
+        best_reason = ""
+        best_delta = 0
+        for item in after_f.get("top_5_failure_reasons") or []:
+            reason = str(item.get("failure_reason", "") or "")
+            count = int(item.get("failure_count", 0) or 0)
+            delta = count - before_counts.get(reason, 0)
+            if delta > best_delta:
+                best_delta = delta
+                best_reason = reason
+        return best_reason
+
+    def _wait_for_terminal_state(
+        self,
+        dest_channel_id: str,
+        amount_sats: int,
+        baseline_stats: Dict[str, Any],
+        result: ExecutionResult,
+    ) -> ExecutionResult:
+        deadline = time.monotonic() + self.observe_timeout_sec
+
+        while time.monotonic() < deadline:
+            row = self._sling_row(dest_channel_id)
+            statuses = self._parse_statuses(row)
+
+            if "Balanced" in statuses:
+                after_stats = self._scid_stats(dest_channel_id)
+                delta = self._success_delta(baseline_stats, after_stats)
+                fee_sats = delta["spent_sats"]
+                moved_sats = delta["amount_sats"] or amount_sats
+                result.success = True
+                result.amount_sats = moved_sats
+                result.fee_sats = fee_sats
+                result.fee_msat = fee_sats * 1000
+                if moved_sats > 0:
+                    result.fee_ppm = math.ceil(
+                        result.fee_msat * 1_000_000 / (moved_sats * 1000)
+                    )
+                self._log(
+                    f"Sling success: {moved_sats} sats to {dest_channel_id}, fee {fee_sats} sats"
+                )
+                return result
+
+            for status in statuses:
+                if status in SLING_FAILURE_STATES:
+                    after_stats = self._scid_stats(dest_channel_id)
+                    failure_reason = self._failure_reason(baseline_stats, after_stats)
+                    result.amount_sats = amount_sats
+                    result.error = (
+                        f"retriable_failure: {failure_reason}"
+                        if failure_reason
+                        else f"retriable_failure: {status}"
+                    )
+                    self._log(f"Sling failed for {dest_channel_id}: {result.error}", level="info")
+                    return result
+
+            time.sleep(self.poll_interval_sec)
+
+        self._stop_once_job(dest_channel_id)
+        self._scid_stats(dest_channel_id)
+        result.amount_sats = amount_sats
+        result.error = "sling_timeout"
+        self._log(f"Sling failed for {dest_channel_id}: {result.error}", level="info")
+        return result
+
+    @staticmethod
+    def _is_unknown_command(exc: Exception) -> bool:
+        err = getattr(exc, "error", {})
+        if isinstance(err, dict):
+            code = err.get("code")
+            msg = str(err.get("message", "") or "")
+            if code == -32601 or "Unknown command" in msg:
+                return True
+        return "Unknown command" in str(exc)
 
     def execute(
         self,
@@ -69,262 +293,49 @@ class RebalanceExecutor:
         dest_channel_id: str,
         max_fee_sats: int,
     ) -> ExecutionResult:
-        """Execute a circular rebalance using invoice + sendpay + waitsendpay.
+        """Execute a rebalance through sling-once and observe completion."""
+        del route
+        self._ensure_observe_timeout_sec()
 
-        Args:
-            route: List of hop dicts from getroute (already priced).
-            amount_sats: Amount to rebalance.
-            source_channel_id: Channel to drain (first hop).
-            dest_channel_id: Channel to fill (last hop back to us).
-            max_fee_sats: Maximum fee budget in sats.
+        result = ExecutionResult(
+            amount_sats=amount_sats,
+            route_type="sling",
+            hops=0,
+            parts=1,
+            attempts=1,
+        )
+        if amount_sats <= 0:
+            result.error = "invalid_amount"
+            return result
 
-        Returns:
-            ExecutionResult with success/failure details.
-        """
-        our_id = self._get_our_id()
-        if not our_id:
-            return ExecutionResult(error="no_node_id")
+        baseline_stats = self._scid_stats(dest_channel_id)
+        payload = {
+            "scid": dest_channel_id,
+            "direction": "pull",
+            "amount": amount_sats,
+            "onceamount": amount_sats,
+            "maxppm": self._maxppm_for_budget(amount_sats, max_fee_sats),
+            "candidates": [source_channel_id],
+        }
 
-        amount_msat = amount_sats * 1000
-        result = ExecutionResult(amount_sats=amount_sats)
-
-        # Create self-paying invoice
-        label = f"rebal-v2-{secrets.token_hex(8)}"
-        payment_hash = None
         try:
-            inv = self.plugin.rpc.invoice(
-                amount_msat=amount_msat,
-                label=label,
-                description="rebalance-v2",
-                expiry=INVOICE_EXPIRY,
-            )
-            payment_hash = inv["payment_hash"]
-            bolt11 = inv.get("bolt11", "")
-            payment_secret = inv.get("payment_secret", "")
-        except Exception as e:
-            result.error = f"invoice_error: {e}"
+            response = self.plugin.rpc.call("sling-once", payload)
+        except Exception as exc:
+            if self._is_unknown_command(exc):
+                result.error = "sling_unavailable"
+                return result
+            result.error = f"sling_preflight_error: {exc}"
             self._log(result.error, level="warn")
             return result
 
-        try:
-            return self._execute_with_retries(
-                route=route,
-                amount_msat=amount_msat,
-                payment_hash=payment_hash,
-                bolt11=bolt11,
-                payment_secret=payment_secret,
-                label=label,
-                max_fee_sats=max_fee_sats,
-                result=result,
-            )
-        finally:
-            self._cleanup(label, payment_hash, result)
-
-    def _execute_with_retries(
-        self,
-        route: List[Dict[str, Any]],
-        amount_msat: int,
-        payment_hash: str,
-        bolt11: str,
-        payment_secret: str,
-        label: str,
-        max_fee_sats: int,
-        result: ExecutionResult,
-    ) -> ExecutionResult:
-        """Execute a single sendpay attempt on the given route.
-
-        The executor does not re-route — on failure it records the erring
-        channel in excluded_channels and returns. The orchestrator can
-        re-price with excludes at a higher level.
-        """
-        result.attempts = 1
-
-        # Validate route fee before sending
-        if route:
-            route_fee_msat = route[0].get("amount_msat", amount_msat) - amount_msat
-            route_fee_sats = (route_fee_msat + 999) // 1000
-            if route_fee_sats > max_fee_sats:
-                result.error = (
-                    f"route_over_budget: {route_fee_sats} sats exceeds "
-                    f"budget {max_fee_sats} sats"
-                )
-                self._log(result.error, level="info")
-                return result
-
-        # Send
-        try:
-            self.plugin.rpc.sendpay(
-                route=route,
-                payment_hash=payment_hash,
-                amount_msat=amount_msat,
-                bolt11=bolt11,
-                payment_secret=payment_secret,
-            )
-        except Exception as e:
-            result.error = f"sendpay_error: {e}"
-            self._log(f"sendpay failed: {e}", level="warn")
+        if not isinstance(response, dict) or response.get("result") != "started":
+            result.error = f"sling_preflight_error: unexpected response {response!r}"
+            self._log(result.error, level="warn")
             return result
 
-        # Wait
-        try:
-            wait_result = self.plugin.rpc.waitsendpay(
-                payment_hash=payment_hash,
-                timeout=SENDPAY_TIMEOUT,
-            )
-            fee_msat = wait_result.get("amount_sent_msat", amount_msat) - amount_msat
-            result.success = True
-            result.fee_msat = fee_msat
-            result.fee_sats = (fee_msat + 999) // 1000
-            self._log(
-                f"Success: {result.amount_sats} sats, fee {result.fee_sats} sats"
-            )
-            return result
-
-        except Exception as e:
-            # Full-fidelity diagnostic log BEFORE structured extraction, so we
-            # never lose information when the exception shape is unexpected.
-            # This replaces the old 'Failed:  erring_channel=None' log that
-            # masked any non-conforming failure mode (timeouts, non-RpcError
-            # exceptions, missing error.data fields). See Phase B Task 3
-            # investigation on nexus-01 2026-04-10: the blank-failcode log
-            # turned out to hide a completely opaque failure, and adding
-            # this diagnostic is the first step to figuring out why.
-            self._log_executor_failure(e)
-
-            error_dict = getattr(e, "error", {})
-            error_code = error_dict.get("code") if isinstance(error_dict, dict) else None
-            if error_code == 200:
-                result.error = "payment_pending_timeout"
-                result.payment_pending = True
-                self._log(
-                    "waitsendpay timed out with payment still pending",
-                    level="info",
-                )
-                return result
-
-            error_data = self._extract_error_data(e)
-            erring_channel = error_data.get("erring_channel")
-            erring_direction = error_data.get("erring_direction")
-            failcode = error_data.get("failcodename", "")
-
-            # Combine channel + direction into CLN's canonical exclude
-            # format (``scid/dir``). Both getroute and askrene's update-channel
-            # reject bare SCIDs:
-            #   "exclude: should be short_channel_id_dir or node_id: invalid token"
-            # (observed live on nexus-01 2026-04-10 18:54Z during the first
-            # engine retry attempt). When direction is missing from the
-            # error data, fall back to the bare SCID — a future call that
-            # needs directional precision can expand both dirs.
-            excluded_entry: Optional[str] = None
-            if erring_channel:
-                if erring_direction is not None:
-                    excluded_entry = f"{erring_channel}/{int(erring_direction)}"
-                else:
-                    excluded_entry = str(erring_channel)
-
-            self._log(
-                f"Failed: {failcode} erring_channel={excluded_entry}",
-                level="info",
-            )
-
-            if excluded_entry:
-                result.excluded_channels = [excluded_entry]
-
-            if failcode in (
-                "WIRE_PERMANENT_CHANNEL_FAILURE",
-                "WIRE_UNKNOWN_NEXT_PEER",
-                "WIRE_CHANNEL_DISABLED",
-            ):
-                result.error = f"permanent_failure: {failcode}"
-            else:
-                result.error = f"retriable_failure: {failcode}"
-
-        return result
-
-    def _log_executor_failure(self, exc: Exception) -> None:
-        """Emit a full diagnostic dump of a sendpay/waitsendpay failure.
-
-        Captures exception type, repr, whether it has an .error attribute,
-        the shape of that .error (dict vs str), the top-level keys, and the
-        keys of .error.data if present. This produces one machine-grep'able
-        line per failure so operators can diagnose cases the structured
-        extractor misses without re-running with strace.
-        """
-        exc_type = type(exc).__name__
-        exc_repr = repr(exc)
-        err_attr = getattr(exc, "error", None)
-
-        if err_attr is None:
-            self._log(
-                f"EXECUTOR_FAIL_DIAG type={exc_type} has_error_attr=no "
-                f"repr={exc_repr}",
-                level="warn",
-            )
-            return
-
-        if isinstance(err_attr, dict):
-            top_keys = sorted(err_attr.keys())
-            data = err_attr.get("data")
-            data_keys = (
-                sorted(data.keys()) if isinstance(data, dict) else None
-            )
-            message = err_attr.get("message", "")
-            code = err_attr.get("code")
-            self._log(
-                f"EXECUTOR_FAIL_DIAG type={exc_type} "
-                f"err_code={code} err_message={message!r} "
-                f"err_keys={top_keys} data_keys={data_keys} "
-                f"err_dict={err_attr!r}",
-                level="warn",
-            )
-            return
-
-        self._log(
-            f"EXECUTOR_FAIL_DIAG type={exc_type} err_attr_type={type(err_attr).__name__} "
-            f"err_attr={err_attr!r} repr={exc_repr}",
-            level="warn",
+        return self._wait_for_terminal_state(
+            dest_channel_id=dest_channel_id,
+            amount_sats=amount_sats,
+            baseline_stats=baseline_stats,
+            result=result,
         )
-
-    def _extract_error_data(self, error: Exception) -> Dict[str, Any]:
-        """Extract structured error data from RPC exception.
-
-        Returns error.error['data'] as a dict if the exception is an
-        RpcError with a nested 'data' dict. Returns {} for any other
-        shape — the full diagnostic is logged separately by
-        _log_executor_failure so nothing is silently discarded.
-        """
-        if hasattr(error, "error"):
-            err = error.error
-            if isinstance(err, dict):
-                data = err.get("data")
-                if isinstance(data, dict):
-                    return data
-        return {}
-
-    def _cleanup(
-        self,
-        label: str,
-        payment_hash: Optional[str],
-        result: ExecutionResult,
-    ) -> None:
-        """Clean up invoice and failed payment records."""
-        try:
-            if result.payment_pending:
-                return
-            if payment_hash and not result.success:
-                try:
-                    self.plugin.rpc.delpay(
-                        payment_hash=payment_hash,
-                        status="failed",
-                    )
-                except Exception:
-                    pass
-            try:
-                self.plugin.rpc.delinvoice(
-                    label=label,
-                    status="unpaid" if not result.success else "paid",
-                )
-            except Exception:
-                pass
-        except Exception:
-            pass

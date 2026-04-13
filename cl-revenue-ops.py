@@ -808,6 +808,36 @@ plugin.add_option(
     dynamic=True
 )
 plugin.add_option(
+    name='revenue-ops-sling-candidates-min-age',
+    default='144',
+    description='Internal sling hygiene: minimum candidate age in blocks before rebalance use (default: 144)'
+)
+plugin.add_option(
+    name='revenue-ops-sling-stats-delete-failures-age',
+    default='30',
+    description='Internal sling hygiene: retention window for sling failure stats in days (default: 30)'
+)
+plugin.add_option(
+    name='revenue-ops-sling-stats-delete-successes-age',
+    default='30',
+    description='Internal sling hygiene: retention window for sling success stats in days (default: 30)'
+)
+plugin.add_option(
+    name='revenue-ops-sling-maxhops',
+    default='8',
+    description='Internal sling hygiene: maximum hops for sling path search (default: 8)'
+)
+plugin.add_option(
+    name='revenue-ops-sling-depleteuptopercent',
+    default='0.2',
+    description='Internal sling hygiene: depletion guard percent for sling candidate sourcing (default: 0.2)'
+)
+plugin.add_option(
+    name='revenue-ops-sling-depleteuptoamount',
+    default='2000000000',
+    description='Internal sling hygiene: depletion guard amount in sats for sling candidate sourcing (default: 2000000000)'
+)
+plugin.add_option(
     name='revenue-ops-hive-hints-enabled',
     default='true',
     description='Enable bounded fee/rebalance bias from cl_hive fleet hints (default: true)'
@@ -1155,6 +1185,46 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
+def _apply_sling_startup_hygiene(rpc: Any, cfg: Config, plugin: Plugin) -> None:
+    """Apply the subset of sling runtime knobs owned by this plugin."""
+    desired = (
+        ("sling-stats-delete-failures-age", cfg.sling_stats_delete_failures_age),
+        ("sling-stats-delete-successes-age", cfg.sling_stats_delete_successes_age),
+        ("sling-candidates-min-age", cfg.sling_candidates_min_age),
+        ("sling-maxhops", cfg.sling_maxhops),
+        ("sling-depleteuptopercent", cfg.sling_depleteuptopercent),
+        ("sling-depleteuptoamount", cfg.sling_depleteuptoamount),
+    )
+    try:
+        all_configs = rpc.listconfigs()
+        configs = (all_configs or {}).get("configs", {}) if isinstance(all_configs, dict) else {}
+    except Exception as e:
+        plugin.log(f"Skipping sling startup hygiene: could not inspect config surface: {e}", level='debug')
+        return
+
+    supported = {opt for opt, _ in desired if opt in configs}
+    if not supported:
+        plugin.log(
+            "Skipping sling startup hygiene: sling config keys are not exposed on this node",
+            level='info',
+        )
+        return
+
+    applied = []
+    for opt, val in desired:
+        if opt not in supported:
+            continue
+        try:
+            rpc.setconfig(config=opt, val=val)
+            applied.append(f"{opt}={val}")
+        except Exception as e:
+            plugin.log(f"Sling startup hygiene failed for {opt}={val}: {e}", level='warn')
+    if applied:
+        plugin.log(
+            "Applied sling runtime hygiene: " + ", ".join(applied),
+            level='info',
+        )
+
 
 @plugin.init()
 def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin, **kwargs):
@@ -1298,6 +1368,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
         planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
+        sling_candidates_min_age=_safe_int_opt('revenue-ops-sling-candidates-min-age', '144'),
+        sling_stats_delete_failures_age=_safe_int_opt('revenue-ops-sling-stats-delete-failures-age', '30'),
+        sling_stats_delete_successes_age=_safe_int_opt('revenue-ops-sling-stats-delete-successes-age', '30'),
+        sling_maxhops=_safe_int_opt('revenue-ops-sling-maxhops', '8'),
+        sling_depleteuptopercent=_safe_float_opt('revenue-ops-sling-depleteuptopercent', '0.2'),
+        sling_depleteuptoamount=_safe_int_opt('revenue-ops-sling-depleteuptoamount', '2000000000'),
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
         hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
         rebalance_router=str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower(),
@@ -1367,7 +1443,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             
         active_plugins = [p.get("name", "").lower() for p in plugins_result.get("plugins", [])]
         
-        plugin.log("Rebalancing uses native RebalanceExecutor (getroutes+sendpay)")
+        plugin.log("Rebalancing uses RebalanceEngineV2 with sling-backed execution")
 
         # Check for bookkeeper plugin
         bookkeeper_found = any("bookkeeper" in name for name in active_plugins)
@@ -1404,6 +1480,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log(f"Config override: {w}", level='warn')
     except Exception as e:
         plugin.log(f"Warning: Could not load config overrides: {e}", level='warn')
+
+    _apply_sling_startup_hygiene(safe_plugin.rpc, config, plugin)
     
     # =========================================================================
     # FORWARDS TABLE HYDRATION (TODO #19: Double-Dip Fix)

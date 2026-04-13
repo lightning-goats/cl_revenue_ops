@@ -3,8 +3,8 @@ EV-Based Rebalancer module for cl-revenue-ops
 
 Automatic rebalance cycles delegate to RebalanceEngineV2 via
 find_rebalance_candidates(). Manual rebalance RPCs (manual_rebalance,
-execute_rebalance) still run through the in-module RebalanceExecutor
-path until a follow-up spec ports them to v2.
+execute_rebalance) run through the shared RebalanceEngineV2 sling-backed
+execution path.
 
 JobManager is a stripped stub that retains only source-failure tracking
 (used by the v1 manual paths) and no-op properties referenced by
@@ -23,9 +23,9 @@ from pyln.client import Plugin, RpcError
 
 from .config import Config, ConfigSnapshot
 from .database import Database
+from .rebalance_executor_v2 import RebalanceExecutor as RebalanceExecutorV2
 from .rebalance_state_v2 import build_state_snapshot as build_state_snapshot_v2
 from .policy_manager import PolicyManager
-from .rebalance_executor import RebalanceExecutor
 from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
 if TYPE_CHECKING:
@@ -124,7 +124,7 @@ class RebalanceCandidate:
     source_candidate_peer_ids: List[str] = field(default_factory=list)
 
     # Hive route discovery: if askrene found a cheap fleet route, store hop count
-    # for RebalanceExecutor fleet-aware routing.
+    # for RebalanceEngineV2 fleet-aware routing.
     hive_route_hops: int = 0
     # True if destination peer is a hive member — enables zero-fee return hop
     dest_is_hive_member: bool = False
@@ -268,7 +268,7 @@ class EVRebalancer:
 
     This class acts as the "Strategist" - it calculates EV and determines
     IF and HOW MUCH to rebalance. The actual execution is delegated to
-    RebalanceExecutor.
+    RebalanceEngineV2, which prices pairs locally and executes via sling.
 
     Thread Safety (I-13, I-14, S-9):
     The rebalance cycle runs single-threaded on a timer. Candidate evaluation,
@@ -327,7 +327,6 @@ class EVRebalancer:
         # Hive hints adapter (injected by main plugin; None = disabled)
         self.hive_hints = None
         self._hive_router = None  # HiveRouter for fleet route discovery
-        self.rebalance_executor = None  # RebalanceExecutor (safe explicit-route executor)
         self.data_service = None  # Unified data service (injected by main plugin)
 
 
@@ -340,6 +339,12 @@ class EVRebalancer:
         self._hive_router = value
         # Propagate to job_manager so _handle_job_* methods can call unreserve
         self.job_manager.hive_router = value
+
+    def _execute_candidate_v2(self, candidate: RebalanceCandidate):
+        """Execute one candidate through the shared v2 engine."""
+        if self.rebalance_engine_v2 is None:
+            raise RuntimeError("no rebalance engine available")
+        return self.rebalance_engine_v2.execute_candidate(candidate)
 
     def _set_last_decision_summary(
         self,
@@ -2139,9 +2144,10 @@ class EVRebalancer:
         """
         Execute a rebalance for the given candidate.
 
-        Uses RebalanceExecutor for all live rebalances.
-        Fleet intelligence still influences planning, but execution uses the
-        safe explicit-route path for both fleet-planned and network-planned jobs.
+        Uses RebalanceEngineV2 for all live rebalances.
+        Fleet intelligence still influences planning, but execution flows
+        through the router-v2 plus sling path for both fleet-planned and
+        network-planned jobs.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         with self._pending_lock:
@@ -2329,10 +2335,7 @@ class EVRebalancer:
                         self._pending.pop(candidate.to_channel, None)
                     return result
 
-            # RebalanceExecutor: safe explicit-route execution for all rebalances.
-            # Fleet planning still uses hive intelligence before execution.
-            # Network routes use revenue-* layers (best available paths).
-            if self.rebalance_executor:
+            if self.rebalance_engine_v2:
                 if self._is_coordinated_candidate(candidate):
                     coordination_context = self._report_coordination_intent(candidate)
                     intent_status = str(
@@ -2362,7 +2365,7 @@ class EVRebalancer:
                         )
                         coordination_started = True
                         try:
-                            exec_result = self.rebalance_executor.execute(candidate)
+                            exec_result = self._execute_candidate_v2(candidate)
                             if exec_result.success:
                                 actual_fee_sats = self._record_successful_rebalance_fee(
                                     rebalance_id,
@@ -2395,12 +2398,12 @@ class EVRebalancer:
                                 )
                             else:
                                 error_str = exec_result.error or "no_routes"
-                                stable_error = RebalanceExecutor.stable_failure_reason(error_str)
+                                stable_error = RebalanceExecutorV2.stable_failure_reason(error_str)
                                 res = {
                                     "success": False,
                                     "error": stable_error,
                                     "message": (
-                                        f"RebalanceExecutor: {error_str} "
+                                        f"RebalanceEngineV2: {error_str} "
                                         f"({exec_result.attempts} attempts, "
                                         f"type={exec_result.route_type})"
                                     ),
@@ -2454,7 +2457,7 @@ class EVRebalancer:
                             )
                 else:
                     try:
-                        exec_result = self.rebalance_executor.execute(candidate)
+                        exec_result = self._execute_candidate_v2(candidate)
                         if exec_result.success:
                             actual_fee_sats = self._record_successful_rebalance_fee(
                                 rebalance_id,
@@ -2481,7 +2484,7 @@ class EVRebalancer:
                                 "success": False,
                                 "error": error_str,
                                 "message": (
-                                    f"RebalanceExecutor: {error_str} "
+                                    f"RebalanceEngineV2: {error_str} "
                                     f"({exec_result.attempts} attempts, "
                                     f"type={exec_result.route_type})"
                                 ),
@@ -2517,8 +2520,11 @@ class EVRebalancer:
                         except Exception:
                             pass
             else:
-                # No executor available — cannot rebalance
-                stable_error = "local_policy_block" if self._is_coordinated_candidate(candidate) else "no_rebalance_executor"
+                stable_error = (
+                    "local_policy_block"
+                    if self._is_coordinated_candidate(candidate)
+                    else "no_rebalance_engine"
+                )
                 res = {"success": False, "error": stable_error}
                 if self._is_coordinated_candidate(candidate):
                     self._report_coordination_outcome(
@@ -2526,7 +2532,7 @@ class EVRebalancer:
                         None,
                         status="declined",
                         reason=stable_error,
-                        details={"error": "no_rebalance_executor"},
+                        details={"error": "no_rebalance_engine"},
                     )
 
             if res.get("success"):
@@ -2698,7 +2704,7 @@ class EVRebalancer:
                     "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
                 }
 
-            # Record in database (execute_once bypasses normal job flow)
+            # Record in database (direct sling execution bypasses normal job flow)
             rebalance_id = self.database.record_rebalance(
                 from_channel=best_source_id,
                 to_channel=channel_id,
@@ -2709,8 +2715,8 @@ class EVRebalancer:
                 reason_code='defibrillator'
             )
 
-            if self.rebalance_executor:
-                exec_result = self.rebalance_executor.execute(candidate)
+            if self.rebalance_engine_v2:
+                exec_result = self._execute_candidate_v2(candidate)
                 if exec_result.success:
                     self._record_successful_rebalance_fee(
                         rebalance_id,
@@ -2727,7 +2733,7 @@ class EVRebalancer:
                     )
                 shock_ok = exec_result.success
             else:
-                self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no executor available")
+                self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no rebalance engine available")
                 shock_ok = False
 
             return {
@@ -2809,7 +2815,7 @@ class EVRebalancer:
             dest_turnover_rate=0.0,
             source_turnover_rate=0.0
         )
-        # Manual rebalances use execute_once (blocking sling-once) and bypass budget reservations.
+        # Manual rebalances use direct sling execution and bypass budget reservations.
         # Fees are still recorded in history and will reduce budget available for automated runs.
         rebalance_id = self.database.record_rebalance(
             from_channel=from_channel,
@@ -2821,11 +2827,11 @@ class EVRebalancer:
             reason_code='manual'
         )
 
-        if not self.rebalance_executor:
-            self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no executor available")
-            return {"success": False, "error": "no executor available"}
+        if not self.rebalance_engine_v2:
+            self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no rebalance engine available")
+            return {"success": False, "error": "no rebalance engine available"}
 
-        exec_result = self.rebalance_executor.execute(cand)
+        exec_result = self._execute_candidate_v2(cand)
 
         if exec_result.success:
             fee_sats = self._record_successful_rebalance_fee(

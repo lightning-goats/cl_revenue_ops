@@ -143,6 +143,13 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Hive Hints
     'hive_hints_enabled': bool,
     'hive_hints_ttl_seconds': int,
+    # Internal sling runtime hygiene
+    'sling_candidates_min_age': int,
+    'sling_stats_delete_failures_age': int,
+    'sling_stats_delete_successes_age': int,
+    'sling_maxhops': int,
+    'sling_depleteuptopercent': float,
+    'sling_depleteuptoamount': int,
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': float,
     'capex_bootstrap_bps': int,
@@ -236,6 +243,13 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_peer_uptime_pct': (0.0, 100.0),
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
     'hive_hints_ttl_seconds': (60, 7200),
+    # Internal sling runtime hygiene
+    'sling_candidates_min_age': (0, 3650),
+    'sling_stats_delete_failures_age': (1, 3650),
+    'sling_stats_delete_successes_age': (1, 3650),
+    'sling_maxhops': (1, 20),
+    'sling_depleteuptopercent': (0.0, 1.0),
+    'sling_depleteuptoamount': (0, 10_000_000_000),
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': (0.0, 1.0),
     'capex_bootstrap_bps': (0, 100),
@@ -416,6 +430,13 @@ class Config:
     # Hive Hints integration
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
+    # Internal sling runtime hygiene
+    sling_candidates_min_age: int = 144
+    sling_stats_delete_failures_age: int = 30
+    sling_stats_delete_successes_age: int = 30
+    sling_maxhops: int = 8
+    sling_depleteuptopercent: float = 0.2
+    sling_depleteuptoamount: int = 2_000_000_000
 
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50       # Fraction of channel contribution for all capex
@@ -802,6 +823,13 @@ class ConfigSnapshot:
     # Hive Hints
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0
+    # Internal sling runtime hygiene
+    sling_candidates_min_age: int = 144
+    sling_stats_delete_failures_age: int = 30
+    sling_stats_delete_successes_age: int = 30
+    sling_maxhops: int = 8
+    sling_depleteuptopercent: float = 0.2
+    sling_depleteuptoamount: int = 2_000_000_000
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50
     capex_bootstrap_bps: int = 10

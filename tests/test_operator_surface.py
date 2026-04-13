@@ -29,6 +29,8 @@ def test_internal_knobs_are_not_public():
     assert "enable_vegas_reflex" not in cfg.public_runtime_keys()
     assert "thompson_prior_std_fee" not in cfg.public_runtime_keys()
     assert "sling_target_sink" not in cfg.public_runtime_keys()
+    assert "sling_candidates_min_age" not in cfg.public_runtime_keys()
+    assert "sling_maxhops" not in cfg.public_runtime_keys()
 
 
 def test_public_runtime_dict_returns_only_public_keys():
@@ -53,6 +55,8 @@ def test_runtime_key_classification_distinguishes_public_deprecated_and_internal
 
     assert cfg.classify_runtime_key("paused") == "public"
     assert cfg.classify_runtime_key("enable_vegas_reflex") == "internal"
+    assert cfg.classify_runtime_key("sling_candidates_min_age") == "internal"
+    assert cfg.classify_runtime_key("sling_stats_delete_failures_age") == "internal"
     assert cfg.classify_runtime_key("dry_run") == "internal"
 
 
@@ -90,7 +94,14 @@ def _default_plugin_options(mod):
     }
 
 
-def _run_init_with_stubbed_dependencies(mod, monkeypatch, option_overrides=None):
+def _run_init_with_stubbed_dependencies(
+    mod,
+    monkeypatch,
+    option_overrides=None,
+    db_overrides=None,
+    rpc_mutator=None,
+    listconfigs_payload=None,
+):
     mod.shutdown_event.clear()
 
     options = _default_plugin_options(mod)
@@ -104,19 +115,32 @@ def _run_init_with_stubbed_dependencies(mod, monkeypatch, option_overrides=None)
     fake_db.bulk_insert_forwards.return_value = 0
     fake_db.has_recent_connection_history.return_value = False
     fake_db.record_connection_event.return_value = None
-    fake_db.get_all_config_overrides.return_value = {}
-    fake_db.get_config_version.return_value = 0
+    fake_db.get_all_config_overrides.return_value = db_overrides or {}
+    fake_db.get_config_version.return_value = 1 if db_overrides else 0
 
     fake_rpc = MagicMock()
     fake_rpc.plugin.return_value = {"plugins": []}
     fake_rpc.listplugins.return_value = {"plugins": []}
     fake_rpc.listforwards.return_value = {"forwards": []}
     fake_rpc.listpeers.return_value = {"peers": []}
+    fake_rpc.listconfigs.return_value = listconfigs_payload or {
+        "configs": {
+            "sling-stats-delete-failures-age": {},
+            "sling-stats-delete-successes-age": {},
+            "sling-candidates-min-age": {},
+            "sling-maxhops": {},
+            "sling-depleteuptopercent": {},
+            "sling-depleteuptoamount": {},
+        }
+    }
+    if rpc_mutator is not None:
+        rpc_mutator(fake_rpc)
 
     fake_proxy = MagicMock()
     fake_proxy.rpc = fake_rpc
     fake_proxy._executor = MagicMock()
     fake_proxy._async_executor = MagicMock()
+    mod._test_fake_rpc = fake_rpc
 
     class DummyThread:
         def __init__(self, *args, **kwargs):
@@ -192,6 +216,16 @@ def test_planner_cycle_limits_are_parsed_during_init(monkeypatch):
 
     assert cfg.planner_max_opens_per_cycle == 3
     assert cfg.planner_max_closes_per_cycle == 2
+
+
+def test_init_logs_sling_backed_rebalancing(monkeypatch):
+    mod = load_plugin_module()
+    _run_init_with_stubbed_dependencies(mod, monkeypatch)
+
+    messages = [call.args[0] for call in mod.plugin.log.call_args_list if call.args]
+
+    assert any("sling" in message.lower() for message in messages)
+    assert not any("getroute + sendpay" in message for message in messages)
 
 
 def test_revenue_config_list_mutable_returns_public_controls_only():

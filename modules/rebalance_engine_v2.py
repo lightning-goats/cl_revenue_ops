@@ -18,7 +18,6 @@ from .rebalance_coordination_overlay import (
 )
 from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
 from .rebalance_hive_router import RebalanceHiveRouter
-from .rebalance_memory import RebalanceRoutingMemory
 from .rebalance_planner_v2 import RebalancePlanner
 from .rebalance_route_policy import RoutePolicy, RoutePriority, decide_route_policy
 from .rebalance_router_v2 import RebalanceRouter, RouteResult
@@ -69,10 +68,6 @@ class RebalanceEngine:
         self._pool = ThreadPoolExecutor(
             max_workers=3, thread_name_prefix="rebal-v2"
         )
-        # Cross-cycle transient route memory. Keeps short-lived directional
-        # channel excludes learned from execution failures so future cycles
-        # don't immediately rediscover the same bad remote hop.
-        self._routing_memory = RebalanceRoutingMemory()
         # Pair-level futility tracker: {(src_scid, dst_scid): [failure_ts, ...]}.
         # A pair that fails _futility_threshold times within _futility_window_sec
         # is skipped from subsequent cycles until the stale entries decay out
@@ -394,7 +389,7 @@ class RebalanceEngine:
                 route_result, route_label = self._route_pair(
                     pair=pair,
                     router=router,
-                    exclude=self._routing_memory.current_excludes() or None,
+                    exclude=None,
                 )
                 if route_result.success:
                     pair.route_cost_sats = route_result.route_cost_sats
@@ -426,12 +421,24 @@ class RebalanceEngine:
                             ),
                         ))
                 else:
-                    plan.skipped.append(SkipRecord(
-                        channel_id=pair.dest_channel_id,
+                    self._audit.log_skip(
+                        pair.dest_channel_id,
                         reason="no_route",
                         value_class="valuable",
-                    detail=route_result.error,
-                    ))
+                        remaining_budget_sats=pair.pair_budget_sats,
+                        detail=route_result.error,
+                        router=route_label,
+                    )
+                    decision = self._route_decision_for_pair(pair)
+                    strict_hive_only = (
+                        decision.policy is RoutePolicy.HIVE_ONLY
+                        and not decision.allow_market_fallback
+                    )
+                    if strict_hive_only:
+                        continue
+                    pair.route = None
+                    pair.route_cost_sats = pair.pair_budget_sats
+                    priced.append(pair)
 
             plan.selected = priced
 
@@ -632,35 +639,15 @@ class RebalanceEngine:
                 level="warn",
             )
 
-    @staticmethod
-    def _merge_excludes(*exclude_lists: Optional[List[str]]) -> List[str]:
-        """Merge exclude lists while preserving first-seen order."""
-        merged: List[str] = []
-        for exclude_list in exclude_lists:
-            if not exclude_list:
-                continue
-            for entry in exclude_list:
-                if entry and entry not in merged:
-                    merged.append(entry)
-        return merged
-
-    def _remember_execution_excludes(self, exec_result: "ExecutionResult") -> None:
-        """Store failed directional channels in transient routing memory."""
-        if exec_result.success or not exec_result.excluded_channels:
-            return
-        ttl_seconds = max(60, int(self._futility_window_sec))
-        for entry in exec_result.excluded_channels:
-            self._routing_memory.ban_channel(entry, ttl_seconds=ttl_seconds)
-
     def _probability_adjusted_budget(
         self, pair_budget_sats: int, probability_ppm: int
     ) -> int:
         """Relax the raw pair budget by a probability-weighted bonus.
 
         Returns the base pair_budget_sats unchanged when either the config
-        bonus rate is 0 (default) or the router reported no probability
-        (v2/getroute does this). With a positive bonus rate and non-zero
-        probability, the effective budget is:
+        bonus rate is 0 (default) or the router reported no probability.
+        With a positive bonus rate and non-zero probability, the effective
+        budget is:
 
             pair_budget * (1 + clamp(probability_ppm, 0, 1_000_000) / 1_000_000 * bonus)
 
@@ -668,9 +655,8 @@ class RebalanceEngine:
             effective = pair_budget * (1 + 0.982339 * 0.25)
                       = pair_budget * 1.2456
 
-        The intent is to unlock v3/askrene's high-probability-but-pricier
-        routes on topologies where v2/getroute's cheap paths are actually
-        unroutable (see Phase B test on nexus-01, 2026-04-10).
+        The intent is to unlock higher-probability-but-pricier routes when
+        the configured router can score route probability.
         """
         bonus_rate = getattr(self.config, "capex_probability_budget_bonus", 0.0)
         if not isinstance(bonus_rate, (int, float)):
@@ -688,140 +674,86 @@ class RebalanceEngine:
     ) -> Optional[ExecutionResult]:
         """Execute a single pair in a worker thread.
 
-        On retriable failure with an erring channel, re-prices the pair
-        with the failing channel excluded and attempts one retry. Covers
-        the common stale-gossip WIRE_FEE_INSUFFICIENT case where the
-        first attempt picks an intermediate whose real fee is higher
-        than gossip shows — the retry picks a different path that
-        bypasses the failing hop.
-
-        Only one retry per call, by design: unbounded retry would cascade
-        exclude layers and waste budget on repeatedly-failing topology.
+        Sling-backed execution does not require a stored local route snapshot.
+        If one is present it is ignored by the executor; if it is absent we
+        still execute the selected pair directly.
         """
-        if not pair.route:
-            self._log(
-                f"No route stored for {pair.source_channel_id}->"
-                f"{pair.dest_channel_id}, skipping",
-                level="info",
-            )
-            return None
-
-        exec_result = executor.execute(
-            route=pair.route,
+        return executor.execute(
+            route=pair.route or [],
             amount_sats=pair.amount_sats,
             source_channel_id=pair.source_channel_id,
             dest_channel_id=pair.dest_channel_id,
             max_fee_sats=pair.pair_budget_sats,
         )
 
-        if exec_result.success:
-            self._log(
-                f"Rebalanced {pair.amount_sats} sats "
-                f"{pair.source_channel_id}->{pair.dest_channel_id} "
-                f"fee={exec_result.fee_sats} sats"
-            )
-            return exec_result
+    def execute_candidate(self, candidate: Any) -> ExecutionResult:
+        """Price and execute one explicit candidate on the v2 stack."""
+        source_channel_id = str(getattr(candidate, "from_channel", "") or "")
+        dest_channel_id = str(getattr(candidate, "to_channel", "") or "")
+        source_peer_id = str(getattr(candidate, "from_peer_id", "") or "")
+        dest_peer_id = str(getattr(candidate, "to_peer_id", "") or "")
+        amount_sats = int(getattr(candidate, "amount_sats", 0) or 0)
+        max_fee_sats = int(getattr(candidate, "max_budget_sats", 0) or 0)
 
-        # Retry on retriable failures that identified a specific bad hop.
-        # Permanent failures (channel disabled, unknown peer) can't be
-        # usefully retried with an exclude — the pair is dead for this cycle.
-        if not self._should_retry_with_exclude(exec_result):
-            return exec_result
+        if not source_channel_id or not dest_channel_id:
+            return ExecutionResult(success=False, error="invalid_channel_ids")
+        if not source_peer_id or not dest_peer_id:
+            return ExecutionResult(success=False, error="missing_peer_ids")
+        if amount_sats <= 0:
+            return ExecutionResult(success=False, error="invalid_amount")
 
-        retry_result = self._attempt_retry_with_exclude(pair, executor, exec_result)
-        if retry_result is not None:
-            if not retry_result.success:
-                retry_result.excluded_channels = self._merge_excludes(
-                    exec_result.excluded_channels,
-                    retry_result.excluded_channels,
-                )
-            return retry_result
-        return exec_result
-
-    @staticmethod
-    def _should_retry_with_exclude(exec_result: "ExecutionResult") -> bool:
-        """Return True iff the executor failure is retriable AND it identified
-        at least one excluded channel we can try to route around."""
-        error = exec_result.error or ""
-        if "retriable_failure" not in error:
-            return False
-        return bool(exec_result.excluded_channels)
-
-    def _attempt_retry_with_exclude(
-        self,
-        pair: PairCandidate,
-        executor: RebalanceExecutor,
-        original_failure: "ExecutionResult",
-    ) -> Optional["ExecutionResult"]:
-        """Re-price the pair with the failing channel excluded, execute once.
-
-        Returns the retry ExecutionResult on actual retry (success or fail),
-        or None if the retry was abandoned (no route / over budget / no
-        router available). Caller treats None as "stick with original_failure".
-        """
-        router = getattr(self, "_cycle_router", None)
-        if router is None:
-            return None
-
-        merged_excludes = self._merge_excludes(
-            original_failure.excluded_channels,
-            self._routing_memory.current_excludes(),
+        self._cycle_router = self._active_router()
+        pair = PairCandidate(
+            source_channel_id=source_channel_id,
+            dest_channel_id=dest_channel_id,
+            source_peer_id=source_peer_id,
+            dest_peer_id=dest_peer_id,
+            amount_sats=amount_sats,
+            pair_budget_sats=max_fee_sats,
+            route_cost_sats=max_fee_sats,
+            route=None,
+            reason_code=str(getattr(candidate, "reason_code", "") or "manual"),
         )
-        self._log(
-            f"Retrying {pair.source_channel_id}->{pair.dest_channel_id} with "
-            f"exclude={merged_excludes}",
-            level="info",
-        )
+        pair.route_decision = getattr(candidate, "route_decision", None)
+
         try:
-            new_route = router.price_pair(
-                source_channel_id=pair.source_channel_id,
-                dest_channel_id=pair.dest_channel_id,
-                source_peer_id=pair.source_peer_id,
-                dest_peer_id=pair.dest_peer_id,
-                amount_sats=pair.amount_sats,
-                exclude=merged_excludes,
+            route_result, route_label = self._route_pair(
+                pair=pair,
+                router=self._cycle_router,
+                exclude=None,
             )
         except Exception as e:
             self._log(
-                f"Retry re-price raised {type(e).__name__}: {e}", level="warn"
-            )
-            return None
-
-        if not new_route.success:
-            self._log(
-                f"Retry re-price returned no route: {new_route.error}",
+                f"Manual route pricing failed for {source_channel_id}->{dest_channel_id}: {e}",
                 level="info",
             )
-            return None
+            route_result = None
+            route_label = "v3" if self._cycle_router is self.router_v3 else "v2"
+        else:
+            if route_result.success:
+                pair.route_cost_sats = route_result.route_cost_sats
+                pair.route = route_result.route
+            else:
+                self._log(
+                    f"Manual route pricing failed for {source_channel_id}->{dest_channel_id}: "
+                    f"{route_result.error or 'no_route'} ({route_label})",
+                    level="info",
+                )
 
-        effective_budget = self._probability_adjusted_budget(
-            pair.pair_budget_sats,
-            getattr(new_route, "probability_ppm", 0),
+        decision = self._route_decision_for_pair(pair)
+        strict_hive_only = (
+            decision.policy is RoutePolicy.HIVE_ONLY and not decision.allow_market_fallback
         )
-        if new_route.route_cost_sats > effective_budget:
-            self._log(
-                f"Retry re-price over budget: route_cost={new_route.route_cost_sats} "
-                f"effective_budget={effective_budget}",
-                level="info",
+        if route_result is not None and not route_result.success and strict_hive_only:
+            return ExecutionResult(
+                success=False,
+                error=route_result.error or "hive_route_unavailable",
+                amount_sats=amount_sats,
+                route_type="sling",
             )
-            return None
 
-        pair.route = new_route.route
-        pair.route_cost_sats = new_route.route_cost_sats
-
-        retry_result = executor.execute(
-            route=pair.route,
-            amount_sats=pair.amount_sats,
-            source_channel_id=pair.source_channel_id,
-            dest_channel_id=pair.dest_channel_id,
-            max_fee_sats=pair.pair_budget_sats,
-        )
-        if retry_result.success:
-            self._log(
-                f"Retry succeeded: {pair.source_channel_id}->"
-                f"{pair.dest_channel_id} fee={retry_result.fee_sats} sats"
-            )
-        return retry_result
+        executor = RebalanceExecutor(self.plugin, self.database)
+        return self._execute_pair(pair, executor)
 
     def run_cycle(self) -> CycleResult:
         """Live execution: find candidates (already priced), execute concurrently.
@@ -862,6 +794,15 @@ class RebalanceEngine:
             return result
 
         executor = RebalanceExecutor(self.plugin, self.database)
+        if not executor.is_available():
+            for pair in live_candidates:
+                self._audit.log_skip(
+                    channel_id=pair.dest_channel_id,
+                    reason="sling_unavailable",
+                    value_class="valuable",
+                    detail="sling-once RPC not loaded",
+                )
+            return result
 
         # Submit the surviving candidates to the thread pool
         futures: Dict[Future, PairCandidate] = {}
@@ -883,7 +824,6 @@ class RebalanceEngine:
                             )
                             self._clear_persisted_pair_failure(pair)
                         else:
-                            self._remember_execution_excludes(exec_result)
                             self._record_pair_failure(
                                 pair.source_channel_id, pair.dest_channel_id
                             )

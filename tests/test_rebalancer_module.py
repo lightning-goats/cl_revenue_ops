@@ -151,7 +151,7 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
-        # rebalance_executor is None by default, so execute_rebalance will fail
+        # rebalance_engine_v2 is None by default, so execute_rebalance will fail
 
         mock_database.record_rebalance = MagicMock(return_value=456)
         mock_database.update_rebalance_result = MagicMock()
@@ -168,7 +168,7 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
     def test_execute_rebalance_success_records_cost_row_with_msat_precision(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
-        from modules.rebalance_executor import RebalanceResult
+        from modules.rebalance_executor_v2 import ExecutionResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -178,13 +178,13 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
         r._check_capital_controls = MagicMock(return_value=True)
         r._get_peer_connection_status = MagicMock(return_value={})
         r._calculate_turnover_rate = MagicMock(return_value=0.05)
-        r.rebalance_executor = MagicMock()
-        r.rebalance_executor.execute.return_value = RebalanceResult(
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
             success=True,
             fee_msat=1501,
             fee_ppm=30,
             hops=3,
-            route_type="network",
+            route_type="sling",
             attempts=1,
             parts=1,
         )
@@ -237,7 +237,7 @@ class TestCoordinatedRebalanceReporting:
     ):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer, RebalanceReasonCode
-        from modules.rebalance_executor import RebalanceResult
+        from modules.rebalance_executor_v2 import ExecutionResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -248,13 +248,13 @@ class TestCoordinatedRebalanceReporting:
         r._get_peer_connection_status = MagicMock(return_value={})
         r._calculate_turnover_rate = MagicMock(return_value=0.05)
         r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
-        r.rebalance_executor = MagicMock()
-        r.rebalance_executor.execute.return_value = RebalanceResult(
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
             success=True,
             fee_msat=2500,
             fee_ppm=50,
             hops=3,
-            route_type="fleet",
+            route_type="sling",
             attempts=1,
             parts=1,
         )
@@ -296,7 +296,7 @@ class TestCoordinatedRebalanceReporting:
     ):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer, RebalanceReasonCode
-        from modules.rebalance_executor import RebalanceResult
+        from modules.rebalance_executor_v2 import ExecutionResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -307,12 +307,12 @@ class TestCoordinatedRebalanceReporting:
         r._get_peer_connection_status = MagicMock(return_value={})
         r._calculate_turnover_rate = MagicMock(return_value=0.05)
         r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
-        r.rebalance_executor = MagicMock()
-        r.rebalance_executor.execute.return_value = RebalanceResult(
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
             success=False,
-            route_type="fleet",
+            route_type="sling",
             attempts=2,
-            error="sendpay_error: no_route_back",
+            error="retriable_failure: WIRE_TEMPORARY_CHANNEL_FAILURE",
         )
 
         mock_database.record_rebalance = MagicMock(return_value=322)
@@ -336,12 +336,12 @@ class TestCoordinatedRebalanceReporting:
         result = r.execute_rebalance(candidate, enforce_budget=True)
 
         assert result["success"] is False
-        assert result["error"] == "no_viable_hive_path"
+        assert result["error"] == "shared_conflict_changed"
         assert len(intent_calls) == 1
         assert len(outcome_calls) == 2
         assert outcome_calls[0]["status"] == "started"
         assert outcome_calls[1]["status"] == "failed"
-        assert outcome_calls[1]["reason"] == "no_viable_hive_path"
+        assert outcome_calls[1]["reason"] == "shared_conflict_changed"
 
     def test_execute_rebalance_declines_without_executor(
         self, mock_plugin, mock_database
@@ -358,7 +358,7 @@ class TestCoordinatedRebalanceReporting:
         r._get_peer_connection_status = MagicMock(return_value={})
         r._calculate_turnover_rate = MagicMock(return_value=0.05)
         r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
-        r.rebalance_executor = None
+        r.rebalance_engine_v2 = None
 
         mock_database.record_rebalance = MagicMock(return_value=323)
         mock_database.update_rebalance_result = MagicMock()
@@ -402,7 +402,7 @@ class TestCoordinatedRebalanceReporting:
         r._get_peer_connection_status = MagicMock(return_value={})
         r._calculate_turnover_rate = MagicMock(return_value=0.05)
         r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
-        r.rebalance_executor = MagicMock()
+        r.rebalance_engine_v2 = MagicMock()
 
         mock_database.record_rebalance = MagicMock(return_value=324)
         mock_database.update_rebalance_result = MagicMock()
@@ -444,7 +444,7 @@ class TestCoordinatedRebalanceReporting:
         r._get_peer_connection_status = MagicMock(return_value={})
         r._calculate_turnover_rate = MagicMock(return_value=0.05)
         r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
-        r.rebalance_executor = MagicMock()
+        r.rebalance_engine_v2 = MagicMock()
 
         mock_database.record_rebalance = MagicMock(return_value=325)
         mock_database.update_rebalance_result = MagicMock()
@@ -478,7 +478,7 @@ class TestCoordinatedRebalanceReporting:
 
         assert result["success"] is False
         assert result["error"] == "local_execution_failed"
-        r.rebalance_executor.execute.assert_not_called()
+        r.rebalance_engine_v2.execute_candidate.assert_not_called()
         assert len(outcome_calls) == 1
         assert outcome_calls[0]["status"] == "declined"
         assert outcome_calls[0]["reason"] == "local_execution_failed"
@@ -610,12 +610,12 @@ class TestPushCandidateDetection:
 
 
 class TestExecuteOnceDiagnostic:
-    """Diagnostic rebalance uses rebalance_executor.execute()."""
+    """Diagnostic rebalance uses the v2 execution stack."""
 
-    def test_diagnostic_uses_rebalance_executor(self, mock_plugin, mock_database):
+    def test_diagnostic_uses_v2_engine(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
-        from modules.rebalance_executor import RebalanceResult
+        from modules.rebalance_executor_v2 import ExecutionResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -631,19 +631,22 @@ class TestExecuteOnceDiagnostic:
         mock_database.record_rebalance = MagicMock(return_value=99)
         mock_database.update_rebalance_result = MagicMock()
 
-        mock_executor = MagicMock()
-        mock_executor.execute.return_value = RebalanceResult(success=True, fee_msat=5000)
-        r.rebalance_executor = mock_executor
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
+            success=True,
+            fee_msat=5000,
+            fee_sats=5,
+        )
 
         result = r.diagnostic_rebalance(channel_id)
 
-        mock_executor.execute.assert_called_once()
+        r.rebalance_engine_v2.execute_candidate.assert_called_once()
         assert result["success"] is True
 
     def test_diagnostic_records_in_database(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
-        from modules.rebalance_executor import RebalanceResult
+        from modules.rebalance_executor_v2 import ExecutionResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -658,9 +661,11 @@ class TestExecuteOnceDiagnostic:
         mock_database.record_rebalance = MagicMock(return_value=99)
         mock_database.update_rebalance_result = MagicMock()
 
-        mock_executor = MagicMock()
-        mock_executor.execute.return_value = RebalanceResult(success=False, error="no route")
-        r.rebalance_executor = mock_executor
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
+            success=False,
+            error="no route",
+        )
 
         r.diagnostic_rebalance(channel_id)
 
@@ -669,12 +674,12 @@ class TestExecuteOnceDiagnostic:
 
 
 class TestExecuteOnceManual:
-    """Manual rebalance uses rebalance_executor.execute()."""
+    """Manual rebalance uses the v2 execution stack."""
 
-    def test_manual_uses_rebalance_executor(self, mock_plugin, mock_database):
+    def test_manual_uses_v2_engine(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
-        from modules.rebalance_executor import RebalanceResult
+        from modules.rebalance_executor_v2 import ExecutionResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -691,19 +696,22 @@ class TestExecuteOnceManual:
         mock_database.record_rebalance = MagicMock(return_value=55)
         mock_database.update_rebalance_result = MagicMock()
 
-        mock_executor = MagicMock()
-        mock_executor.execute.return_value = RebalanceResult(success=True, fee_msat=5000)
-        r.rebalance_executor = mock_executor
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
+            success=True,
+            fee_msat=5000,
+            fee_sats=5,
+        )
 
         result = r.manual_rebalance(from_ch, to_ch, 100_000, max_fee_sats=50)
 
-        mock_executor.execute.assert_called_once()
+        r.rebalance_engine_v2.execute_candidate.assert_called_once()
         assert result["success"] is True
 
     def test_manual_handles_failure(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
-        from modules.rebalance_executor import RebalanceResult
+        from modules.rebalance_executor_v2 import ExecutionResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -720,9 +728,11 @@ class TestExecuteOnceManual:
         mock_database.record_rebalance = MagicMock(return_value=55)
         mock_database.update_rebalance_result = MagicMock()
 
-        mock_executor = MagicMock()
-        mock_executor.execute.return_value = RebalanceResult(success=False, error="no route found")
-        r.rebalance_executor = mock_executor
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
+            success=False,
+            error="no route found",
+        )
 
         result = r.manual_rebalance(from_ch, to_ch, 100_000, max_fee_sats=50)
 
@@ -1179,4 +1189,3 @@ class TestCapexAwareSourceSelection:
         )
         assert len(result) == 2
         assert result[0][0] == "200x2x0"  # 99% local ranked first
-

@@ -604,29 +604,90 @@ class TestSuccessRateAdjustedFloor:
 class TestStartupHygiene:
     """Test sling startup hygiene: setconfig calls for stats retention."""
 
-    def test_setconfig_called_for_sling_hygiene(self, mock_plugin):
-        """Verify setconfig is called 3 times with correct opts/vals during init."""
-        # The startup hygiene is in cl-revenue-ops.py init(), not a module.
-        # We test the pattern: 3 setconfig calls with specific opts.
+    def test_setconfig_called_for_sling_hygiene(self, monkeypatch):
+        """Verify init applies the owned sling runtime hygiene values."""
+        from tests.plugin_test_utils import load_plugin_module
+        from tests.test_operator_surface import _run_init_with_stubbed_dependencies
+
+        mod = load_plugin_module()
+        _run_init_with_stubbed_dependencies(mod, monkeypatch)
+
         expected_configs = [
             ("sling-stats-delete-failures-age", 30),
             ("sling-stats-delete-successes-age", 30),
             ("sling-candidates-min-age", 144),
+            ("sling-maxhops", 8),
+            ("sling-depleteuptopercent", 0.2),
+            ("sling-depleteuptoamount", 2_000_000_000),
+        ]
+        actual_configs = [
+            (call.kwargs.get("config"), call.kwargs.get("val"))
+            for call in mod._test_fake_rpc.setconfig.call_args_list
         ]
 
-        # Simulate the hygiene loop
-        for opt, val in expected_configs:
-            try:
-                mock_plugin.rpc.setconfig(config=opt, val=val)
-            except Exception:
-                pass
+        assert actual_configs == expected_configs
 
-        # Verify all 3 calls were made
-        assert mock_plugin.rpc.setconfig.call_count == 3
+    def test_setconfig_uses_loaded_sling_overrides(self, monkeypatch):
+        """Persisted overrides must drive the applied sling hygiene values."""
+        from tests.plugin_test_utils import load_plugin_module
+        from tests.test_operator_surface import _run_init_with_stubbed_dependencies
 
-        calls = mock_plugin.rpc.setconfig.call_args_list
-        for i, (opt, val) in enumerate(expected_configs):
-            assert calls[i].kwargs.get("config") == opt or calls[i][1].get("config") == opt
+        mod = load_plugin_module()
+        _run_init_with_stubbed_dependencies(
+            mod,
+            monkeypatch,
+            db_overrides={
+                "sling_candidates_min_age": "288",
+                "sling_maxhops": "6",
+                "sling_depleteuptopercent": "0.4",
+            },
+        )
+
+        actual_configs = [
+            (call.kwargs.get("config"), call.kwargs.get("val"))
+            for call in mod._test_fake_rpc.setconfig.call_args_list
+        ]
+
+        assert ("sling-candidates-min-age", 288) in actual_configs
+        assert ("sling-maxhops", 6) in actual_configs
+        assert ("sling-depleteuptopercent", 0.4) in actual_configs
+
+    def test_setconfig_failure_logs_warning_without_aborting_init(self, monkeypatch):
+        """Setconfig failures should warn and allow init to finish."""
+        from tests.plugin_test_utils import load_plugin_module
+        from tests.test_operator_surface import _run_init_with_stubbed_dependencies
+
+        mod = load_plugin_module()
+
+        def _rpc_mutator(fake_rpc):
+            fake_rpc.setconfig.side_effect = Exception("boom")
+
+        cfg = _run_init_with_stubbed_dependencies(
+            mod,
+            monkeypatch,
+            rpc_mutator=_rpc_mutator,
+        )
+
+        assert cfg is mod.config
+        messages = [call.args[0] for call in mod.plugin.log.call_args_list if call.args]
+        assert any("Sling startup hygiene failed" in message for message in messages)
+
+    def test_init_skips_sling_hygiene_when_node_exposes_no_sling_keys(self, monkeypatch):
+        """Nodes without sling config should skip hygiene quietly instead of warning per key."""
+        from tests.plugin_test_utils import load_plugin_module
+        from tests.test_operator_surface import _run_init_with_stubbed_dependencies
+
+        mod = load_plugin_module()
+        _run_init_with_stubbed_dependencies(
+            mod,
+            monkeypatch,
+            listconfigs_payload={"configs": {}},
+        )
+
+        assert mod._test_fake_rpc.setconfig.call_count == 0
+        messages = [call.args[0] for call in mod.plugin.log.call_args_list if call.args]
+        assert any("Skipping sling startup hygiene" in message for message in messages)
+        assert not any("Sling startup hygiene failed" in message for message in messages)
 
 
 class TestAuditRound8Regressions:
