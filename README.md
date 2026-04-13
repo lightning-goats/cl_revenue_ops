@@ -5,13 +5,23 @@
 ## What Operators Need To Know
 
 - This is the executor. It owns local fee execution and rebalance execution.
+- Live rebalances on this branch execute through `RebalanceEngineV2` and `sling`; route discovery can still use the configured `v3`/askrene or `v2` router path.
 - The normal runtime controls are `paused`, `daily_budget_sats`, `min_fee_ppm`, and `max_fee_ppm`.
 - The primary operator surfaces are `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug`.
 - The normal workflow is decision explainability first, knob tuning second.
 - Auto fee bands are enabled by default. Manual policy bands are fallback only when an auto band is not yet available.
+- `sling` must be installed and loaded for live rebalances. If `sling-once` is unavailable, rebalance execution is skipped.
+- `revenue-ops-sling-*` options are internal startup-hygiene overrides, not normal runtime knobs exposed through `revenue-config`.
 - `revenue-policy list|get|find|changes` are diagnostic surfaces. Write actions such as `set` and `delete` remain internal or debug workflows, not the normal operator path.
 - Planner closes are recommendation-only by default.
 - To allow live close RPCs, set `revenue-ops-planner-execute-closes=true` and `revenue-ops-planner-max-closes-per-cycle` to a positive value.
+
+## Sling Integration
+
+- Route selection remains branch-specific: `rebalance_router=v3` keeps askrene and hive-layer path discovery, while `v2` keeps the legacy local router.
+- Regardless of router choice, live execution is `sling-once` plus `sling-stats` observation; the older internal `sendpay` rebalance executor path is no longer used on this branch.
+- At startup, `cl-revenue-ops` applies the subset of `sling-*` runtime hygiene it owns when those CLN config keys are exposed: stats retention, candidate age, max hops, and depletion guards.
+- The mirrored `revenue-ops-sling-*` plugin options exist so operators can pin those defaults in `lightningd` config without making them part of the normal runtime control surface.
 
 ## Profitability Analysis
 
@@ -59,7 +69,13 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 ## Architecture
 
 ```text
-cl-revenue-ops (local execution layer)
+pair selection / fee decisions
+    ↓
+configured router (v3 askrene+hive or v2 local)
+    ↓
+RebalanceEngineV2
+    ↓
+sling-once / sling-stats
     ↓
 Core Lightning
 ```
@@ -70,6 +86,7 @@ Core Lightning
 
 - Core Lightning `v23.05+`
 - Python `3.10+`
+- `sling` plugin: required for live rebalance execution
 - bookkeeper plugin: recommended for cleaner P&L and cost accounting
 
 ### Start The Plugin
@@ -80,6 +97,7 @@ git clone https://github.com/lightning-goats/cl_revenue_ops.git
 cd cl_revenue_ops
 pip install -r requirements.txt
 chmod +x cl-revenue-ops.py
+# Ensure the sling plugin is already installed and loaded by lightningd.
 lightning-cli plugin start "$(pwd)/cl-revenue-ops.py"
 ```
 
