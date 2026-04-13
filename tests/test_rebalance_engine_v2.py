@@ -19,9 +19,9 @@ def _make_engine(plugin, database):
     from modules.config import Config
     from modules.rebalance_engine_v2 import RebalanceEngine
 
-    cfg = Config(dry_run=True, rebalance_router="v2")
+    cfg = Config(dry_run=True, rebalance_router="v3")
     plugin.rpc.getinfo.return_value = {"id": "03" + "u" * 64}
-    plugin.rpc.call.return_value = {"layers": []}
+    plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
     plugin.rpc.listpeerchannels.return_value = {"channels": []}
     plugin.rpc.listchannels.return_value = {"channels": []}
     plugin.rpc.listconfigs.return_value = {
@@ -132,13 +132,13 @@ def test_rebalancer_reports_failed_execution(mock_plugin, mock_database):
     assert "0/1" in summary["reason"]
 
 
-def test_active_engine_uses_hive_router_for_hive_only_pairs(mock_plugin, mock_database):
-    """HIVE_ONLY candidates should not be priced by the market router."""
+def test_active_engine_honors_hive_only_pairs(mock_plugin, mock_database):
+    """Strict hive-only candidates must be priced through the hive router."""
     from modules.config import Config
     from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_route_policy import RoutePolicy
 
-    cfg = Config(dry_run=True, rebalance_router="v2")
+    cfg = Config(dry_run=True, rebalance_router="v3")
     mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
     mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
     mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
@@ -148,7 +148,7 @@ def test_active_engine_uses_hive_router_for_hive_only_pairs(mock_plugin, mock_da
     }
 
     engine = RebalanceEngine(mock_plugin, cfg, mock_database)
-    engine.router_v2 = MagicMock(name="market_router")
+    engine.router_v3 = MagicMock(name="market_router")
     engine._hive_router = MagicMock(name="hive_router")
     engine._audit = MagicMock()
     engine._audit.log_pick = MagicMock()
@@ -186,7 +186,6 @@ def test_active_engine_uses_hive_router_for_hive_only_pairs(mock_plugin, mock_da
         probability_ppm=0,
         error="",
     )
-    engine.router_v2.price_pair.return_value = route_result
     engine._hive_router.price_pair.return_value = route_result
 
     with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
@@ -196,20 +195,19 @@ def test_active_engine_uses_hive_router_for_hive_only_pairs(mock_plugin, mock_da
             skipped=[],
         )
 
-        engine.find_candidates()
+        selected = engine.find_candidates()
 
+    assert selected == [hive_only_candidate]
     engine._hive_router.price_pair.assert_called_once()
-    engine.router_v2.price_pair.assert_not_called()
+    engine.router_v3.price_pair.assert_not_called()
 
 
 def test_engine_execute_candidate_uses_router_and_executor(mock_plugin, mock_database):
-    from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_executor_v2 import ExecutionResult
 
     engine = _make_engine(mock_plugin, mock_database)
-    engine._cycle_router = engine.router_v2
-    engine.router_v2 = MagicMock()
-    engine.router_v2.price_pair.return_value = SimpleNamespace(
+    engine.router_v3 = MagicMock()
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
         success=True,
         route_cost_sats=3,
         route=[
@@ -240,20 +238,67 @@ def test_engine_execute_candidate_uses_router_and_executor(mock_plugin, mock_dat
     result = engine.execute_candidate(candidate)
 
     assert result.success is True
-    engine.router_v2.price_pair.assert_called_once()
+    engine.router_v3.price_pair.assert_called_once()
     engine._execute_pair.assert_called_once()
+
+
+def test_engine_execute_candidate_fails_closed_when_router_unavailable(
+    mock_plugin, mock_database
+):
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = None
+    engine._execute_pair = MagicMock()
+
+    candidate = SimpleNamespace(
+        from_channel="100x1x0",
+        to_channel="200x1x0",
+        from_peer_id="02" + "b" * 64,
+        to_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        max_budget_sats=10,
+        reason_code="manual",
+    )
+
+    result = engine.execute_candidate(candidate)
+
+    assert result.success is False
+    assert result.error == "router_unavailable"
+    engine._execute_pair.assert_not_called()
+
+
+def test_engine_execute_candidate_fails_closed_when_route_pricing_raises(
+    mock_plugin, mock_database
+):
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock()
+    engine.router_v3.price_pair.side_effect = RuntimeError("askrene offline")
+    engine._execute_pair = MagicMock()
+
+    candidate = SimpleNamespace(
+        from_channel="100x1x0",
+        to_channel="200x1x0",
+        from_peer_id="02" + "b" * 64,
+        to_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        max_budget_sats=10,
+        reason_code="manual",
+    )
+
+    result = engine.execute_candidate(candidate)
+
+    assert result.success is False
+    assert result.error.startswith("route_pricing_failed:")
+    engine._execute_pair.assert_not_called()
 
 
 def test_engine_execute_candidate_continues_when_local_route_pricing_fails(
     mock_plugin, mock_database
 ):
-    from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_executor_v2 import ExecutionResult
 
     engine = _make_engine(mock_plugin, mock_database)
-    engine._cycle_router = engine.router_v2
-    engine.router_v2 = MagicMock()
-    engine.router_v2.price_pair.return_value = SimpleNamespace(
+    engine.router_v3 = MagicMock()
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
         success=False,
         route_cost_sats=0,
         route=[],
@@ -278,22 +323,20 @@ def test_engine_execute_candidate_continues_when_local_route_pricing_fails(
 
     assert result.success is True
     assert result.route_type == "sling"
-    engine.router_v2.price_pair.assert_called_once()
-    assert engine.router_v2.price_pair.call_args.kwargs["exclude"] is None
+    engine.router_v3.price_pair.assert_called_once()
+    assert engine.router_v3.price_pair.call_args.kwargs["exclude"] is None
     engine._execute_pair.assert_called_once()
 
 
 def test_engine_execute_candidate_exports_failure_snapshot(mock_plugin, mock_database):
-    from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_executor_v2 import ExecutionResult
     from modules.sling_segment_observations import SlingSegmentObservationStore
 
     engine = _make_engine(mock_plugin, mock_database)
     engine._data_service = MagicMock()
     engine._segment_observation_store = SlingSegmentObservationStore()
-    engine._cycle_router = engine.router_v2
-    engine.router_v2 = MagicMock()
-    engine.router_v2.price_pair.return_value = SimpleNamespace(
+    engine.router_v3 = MagicMock()
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
         success=True,
         route_cost_sats=3,
         route=[{"channel": "100x1x0", "id": "02" + "b" * 64}],
@@ -374,79 +417,24 @@ def test_engine_applies_segment_score_bias_to_pair_score(mock_plugin, mock_datab
     assert pair.score > 100.0
 
 
-def test_active_engine_does_not_silently_market_route_hive_only_without_hive_router(
-    mock_plugin, mock_database
-):
-    """Strict hive-only decisions must fail closed when no hive router exists."""
-    from modules.config import Config
-    from modules.rebalance_engine_v2 import RebalanceEngine
-    from modules.rebalance_route_policy import RoutePolicy
-
-    cfg = Config(dry_run=True, rebalance_router="v2")
-    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
-    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
-
-    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
-    engine.router_v2 = MagicMock(name="market_router")
-    engine._hive_router = None
-    engine._audit = MagicMock()
-    engine._audit.log_pick = MagicMock()
-    engine._audit.log_skip = MagicMock()
-    engine._audit.log_cycle_summary = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=SimpleNamespace(
-            channels=[object()],
-            valuable_channel_count=1,
-            total_remaining_budget_sats=10_000,
-        )
-    )
-
-    strict_candidate = SimpleNamespace(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x2x0",
-        source_peer_id="03" + "b" * 64,
-        dest_peer_id="03" + "c" * 64,
-        amount_sats=50_000,
-        pair_budget_sats=10_000,
-        score=1.0,
-        route_decision=SimpleNamespace(
-            policy=RoutePolicy.HIVE_ONLY,
-            allow_market_fallback=False,
-            reason="hive_equalization",
-            priority_score=0.0,
-        ),
-        route_cost_sats=None,
-        route=None,
-    )
-
-    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
-        planner = planner_cls.return_value
-        planner.plan.return_value = SimpleNamespace(
-            selected=[strict_candidate],
-            skipped=[],
-        )
-
-        selected = engine.find_candidates()
-
-    assert selected == []
-    engine.router_v2.price_pair.assert_not_called()
-
-
 def test_engine_merges_coordination_pairs_before_pair_cap(
     mock_plugin, mock_database
 ):
     from modules.config import Config
-    from modules.rebalance_route_policy import RouteDecision, RoutePolicy, RoutePriority
+    from modules.rebalance_route_policy import (
+        RouteDecision,
+        RoutePolicy,
+        RoutePriority,
+    )
     from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_types_v2 import PairCandidate, PlanResult
 
-    cfg = Config(dry_run=True, rebalance_router="v2")
+    cfg = Config(dry_run=True, rebalance_router="v3")
     mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
     mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
 
     engine = RebalanceEngine(mock_plugin, cfg, mock_database)
-    engine.router_v2 = MagicMock(name="market_router")
-    engine._hive_router = MagicMock(name="hive_router")
+    engine.router_v3 = MagicMock(name="market_router")
     engine._audit = MagicMock()
     engine._audit.log_pick = MagicMock()
     engine._audit.log_skip = MagicMock()
@@ -481,10 +469,10 @@ def test_engine_merges_coordination_pairs_before_pair_cap(
         coordination_hint_id="rec-1",
         coordination_rank_bonus=90.0,
         route_decision=RouteDecision(
-            policy=RoutePolicy.HIVE_ONLY,
+            policy=RoutePolicy.HYBRID,
             priority=RoutePriority.COORDINATED,
             reason="coordinated_rebalance",
-            allow_market_fallback=False,
+            allow_market_fallback=True,
             hint_id="rec-1",
             hint_type="recommendation",
             priority_score=90.0,
@@ -498,8 +486,7 @@ def test_engine_merges_coordination_pairs_before_pair_cap(
         probability_ppm=0,
         error="",
     )
-    engine.router_v2.price_pair.return_value = route_result
-    engine._hive_router.price_pair.return_value = route_result
+    engine.router_v3.price_pair.return_value = route_result
 
     with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls, patch(
         "modules.rebalance_engine_v2.build_coordination_overlay"
@@ -515,7 +502,7 @@ def test_engine_merges_coordination_pairs_before_pair_cap(
         selected = engine.find_candidates()
 
     assert selected == [coordinated_pair]
-    engine._hive_router.price_pair.assert_called_once()
+    engine.router_v3.price_pair.assert_called_once()
 
 
 def test_engine_skips_pairs_with_persisted_cooldown_before_pricing(
@@ -540,7 +527,7 @@ def test_engine_skips_pairs_with_persisted_cooldown_before_pricing(
         )
     )
     engine._audit = MagicMock()
-    engine.router_v2 = MagicMock()
+    engine.router_v3 = MagicMock()
 
     pair = SimpleNamespace(
         source_channel_id="100x1x0",
@@ -561,7 +548,7 @@ def test_engine_skips_pairs_with_persisted_cooldown_before_pricing(
         selected = engine.find_candidates()
 
     assert selected == []
-    engine.router_v2.price_pair.assert_not_called()
+    engine.router_v3.price_pair.assert_not_called()
     assert any(
         call.kwargs.get("reason") == "pair_cooldown" or call.args[1] == "pair_cooldown"
         for call in engine._audit.log_skip.call_args_list
@@ -645,8 +632,8 @@ def test_engine_signals_local_route_pricing_failure_without_blocking_selection(
         route=None,
     )
 
-    engine.router_v2 = MagicMock()
-    engine.router_v2.price_pair.return_value = SimpleNamespace(
+    engine.router_v3 = MagicMock()
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
         success=False,
         route_cost_sats=0,
         route=[],
@@ -662,8 +649,8 @@ def test_engine_signals_local_route_pricing_failure_without_blocking_selection(
     assert selected == [pair]
     assert pair.route is None
     assert pair.route_cost_sats == pair.pair_budget_sats
-    engine.router_v2.price_pair.assert_called_once()
-    assert engine.router_v2.price_pair.call_args.kwargs["exclude"] is None
+    engine.router_v3.price_pair.assert_called_once()
+    assert engine.router_v3.price_pair.call_args.kwargs["exclude"] is None
     engine._audit.log_pick.assert_not_called()
     engine._audit.log_skip.assert_called_once()
     assert engine._audit.log_skip.call_args.kwargs["reason"] == "no_route"
@@ -740,7 +727,6 @@ def test_engine_records_persistent_pair_failure_after_failed_execution(
 def test_engine_failed_sling_execution_returns_original_failure_without_retry(
     mock_plugin, mock_database
 ):
-    from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_executor_v2 import ExecutionResult
     from modules.rebalance_types_v2 import PairCandidate
 
@@ -771,7 +757,6 @@ def test_engine_failed_sling_execution_returns_original_failure_without_retry(
 def test_engine_clears_persisted_pair_failure_after_success(
     mock_plugin, mock_database
 ):
-    from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_executor_v2 import ExecutionResult
 
     engine = _make_engine(mock_plugin, mock_database)

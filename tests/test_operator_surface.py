@@ -284,6 +284,21 @@ def test_revenue_rebalance_debug_reports_segment_hint_influence():
     assert result["hive_hints"]["segment_scores"][0]["short_channel_id"] == "123x1x0"
 
 
+def test_hive_hint_plugin_options_are_registered():
+    mod = load_plugin_module()
+
+    assert mod.plugin.options["revenue-ops-hive-hints-enabled"]["default"] == "true"
+    assert mod.plugin.options["revenue-ops-hive-hints-ttl"]["default"] == "0"
+
+
+def test_askrene_layer_option_defaults_to_hive_fleet_bias():
+    mod = load_plugin_module()
+
+    assert mod.plugin.options["revenue-ops-askrene-layers"]["default"] == "hive-fleet"
+    assert "askrene getroutes" in mod.plugin.options["revenue-ops-rebalance-router"]["description"]
+    assert "cl-hive bias" in mod.plugin.options["revenue-ops-askrene-layers"]["description"]
+
+
 def test_revenue_config_list_mutable_returns_public_controls_only():
     mod = _load_operator_surface_module()
 
@@ -584,6 +599,8 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "capex_probability_budget_bonus": 0.0,
     }
     assert "config" not in result
+    assert "hive_hints" not in result
+    assert "hive" not in result
 
 
 @pytest.mark.parametrize(
@@ -617,7 +634,7 @@ def test_revenue_policy_list_remains_available_for_transition_diagnostics():
     assert result["count"] == 1
 
 
-def test_readme_examples_no_longer_advertise_internal_knob_tuning():
+def test_readme_examples_describe_current_hive_surfaces():
     readme = Path("README.md").read_text()
 
     assert "paused" in readme
@@ -627,6 +644,17 @@ def test_readme_examples_no_longer_advertise_internal_knob_tuning():
     assert "decision explainability" in readme
     assert "revenue-config set enable_vegas_reflex false" not in readme
     assert "lightning-cli revenue-policy set" not in readme
+    assert "cl-hive" in readme
+    assert "hive-hints" in readme
+    assert "hive (fleet intelligence)" in readme
+    assert "revenue-hive-hints-status" in readme
+
+
+def test_claude_docs_describe_current_hive_hint_surface():
+    claude = Path("CLAUDE.md").read_text()
+
+    assert "cl-hive" in claude
+    assert "hive-hints" in claude
 
 
 def test_readme_states_planner_closes_are_recommendation_only_by_default():

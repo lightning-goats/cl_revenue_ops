@@ -19,13 +19,13 @@ def test_rebalance_router_in_field_type_map():
     assert CONFIG_FIELD_TYPES.get("askrene_layers") is str
 
 
-def test_rebalance_router_enum_values_v2_v3():
+def test_rebalance_router_enum_values_v3_only():
     from modules.config import STRING_ENUM_VALID_VALUES
     valid = STRING_ENUM_VALID_VALUES.get("rebalance_router")
     assert valid is not None
-    assert "v2" in valid
     assert "v3" in valid
     assert "v4" not in valid
+    assert "v2" not in valid
 
 
 def test_snapshot_copies_new_fields():
@@ -36,3 +36,14 @@ def test_snapshot_copies_new_fields():
     snap = cfg.snapshot()
     assert snap.rebalance_router == "v3"
     assert snap.askrene_layers == "hive-fleet,hive-reputation"
+
+
+def test_config_rejects_legacy_v2_router():
+    from modules.config import Config
+
+    try:
+        Config(rebalance_router="v2")
+    except ValueError as exc:
+        assert "only supports 'v3'" in str(exc)
+    else:  # pragma: no cover - defensive guard
+        raise AssertionError("Config unexpectedly accepted rebalance_router='v2'")

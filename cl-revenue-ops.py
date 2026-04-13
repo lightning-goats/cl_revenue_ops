@@ -58,10 +58,10 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
-# v2.3.0: Native Rebalance Executor + Fleet Routing Hardening
+# v2.3.0: Native Rebalance Executor + Askrene Routing Hardening
 #   - Native getroute+sendpay executor replaces sling for all rebalances
-#   - Fleet routing via getroutes with askrene layers (hive-fleet, revenue-*)
-#   - Askrene crash vector hardening (auto.sourcefree, TOCTOU layer race)
+#   - Fleet routing via getroutes with askrene layers
+#   - Askrene crash vector hardening (TOCTOU layer race)
 #   - Return hop fee accounting in fleet EV (no more askrene-fiction budgets)
 #   - Rebalance routing memory (transient bans + constraints across retries)
 #   - Fleet-first with network fallback retry strategy
@@ -849,17 +849,15 @@ plugin.add_option(
     description='Override hint snapshot TTL in seconds; 0 = use snapshot value (default: 0)'
 )
 
-
 def _on_rebalance_router_change(plugin_: Plugin, option_name: str, new_value: Any) -> None:
     """Validate + log a runtime rebalance-router flip triggered by setconfig.
 
-    Raises ValueError (surfaced to the setconfig caller) on invalid values or
-    when v3 is requested but askrene is unavailable. Also mirrors the new
-    value into the live Config object so the engine picks it up next cycle.
+    Only the askrene-backed v3 router is supported. The option remains as a
+    compatibility shim so stale operator config can be surfaced cleanly.
     """
-    if new_value not in ("v2", "v3"):
+    if new_value != "v3":
         raise ValueError(
-            f"rebalance-router must be 'v2' or 'v3', got {new_value!r}"
+            f"rebalance-router only supports 'v3'; legacy 'v2' routing was removed (got {new_value!r})"
         )
     r = globals().get("rebalancer")
     eng = getattr(r, "rebalance_engine_v2", None) if r is not None else None
@@ -867,15 +865,15 @@ def _on_rebalance_router_change(plugin_: Plugin, option_name: str, new_value: An
         raise ValueError(
             "rebalance engine not initialized; cannot change router"
         )
-    if new_value == "v3" and getattr(eng, "router_v3", None) is None:
+    if getattr(eng, "router_v3", None) is None:
         raise ValueError(
-            "askrene unavailable on this node; cannot switch to v3"
+            "askrene unavailable on this node; v3 router cannot be enabled"
         )
     cfg = globals().get("config")
     if cfg is not None:
-        cfg.rebalance_router = new_value
+        cfg.rebalance_router = "v3"
     plugin_.log(
-        f"rebalance-router switched to {new_value} "
+        "rebalance-router pinned to v3 "
         f"(takes effect at next cycle boundary)",
         level="info",
     )
@@ -884,9 +882,9 @@ def _on_rebalance_router_change(plugin_: Plugin, option_name: str, new_value: An
 plugin.add_option(
     name='revenue-ops-rebalance-router',
     default='v3',
-    description="Rebalance route discovery: 'v3' (askrene getroutes + cl-hive layers, default) or 'v2' (legacy getroute). "
-                "v3 requires CLN v24.11+ with the askrene plugin loaded; otherwise the engine falls back to v2. "
-                "Runtime-switchable via 'lightning-cli -k setconfig config=revenue-ops-rebalance-router val=v2'.",
+    description="Rebalance route discovery: 'v3' (askrene getroutes, required). "
+                "Legacy 'v2' getroute routing has been removed. "
+                "This option remains only as a compatibility shim and only accepts 'v3'.",
     opt_type='string',
     dynamic=True,
     on_change=_on_rebalance_router_change,
@@ -1377,9 +1375,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         sling_depleteuptoamount=_safe_int_opt('revenue-ops-sling-depleteuptoamount', '2000000000'),
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
         hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
-        rebalance_router=str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower(),
+        rebalance_router='v3',
         askrene_layers=str(options.get('revenue-ops-askrene-layers', 'hive-fleet') or 'hive-fleet'),
     )
+    configured_router = str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower()
+    if configured_router != 'v3':
+        plugin.log(
+            f"Configuration requested rebalance-router={configured_router!r}; forcing 'v3' because legacy routing was removed",
+            level='warn',
+        )
     try:
         config_fields = {f.name for f in dataclasses.fields(Config)}
     except Exception as e:
@@ -1683,6 +1687,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if capacity_planner is not None:
         capacity_planner.set_capital_efficiency(capital_efficiency)
         capacity_planner.set_capex_engine(capex_engine)
+        capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
+        capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
     if boltz_manager is not None:
         boltz_manager.set_capex_engine(capex_engine)
 
@@ -2122,8 +2128,8 @@ def run_fee_adjustment():
         adjustments = fee_controller.adjust_all_fees()
         plugin.log(f"Fee adjustment complete: {len(adjustments)} channels adjusted")
 
-        # Push status + profitability to datastore for cl-hive Bridge
-        # (eliminates cross-plugin revenue-status/revenue-profitability RPCs)
+        # Push status + profitability to datastore for external consumers.
+        # This keeps local reporting cheap and consistent.
         try:
             import json as _json
             status_data = {
@@ -2139,7 +2145,7 @@ def run_fee_adjustment():
             if data_service:
                 data_service.datastore_push(["revenue", "status"], status_data)
 
-            # Push fee bounds for cl-hive fee intelligence
+            # Push fee bounds for external consumers that read the datastore snapshot.
             cfg_snap = config.snapshot() if config else None
             if cfg_snap and data_service:
                 data_service.datastore_push(["revenue", "fee-bounds"], {
@@ -2163,7 +2169,7 @@ def run_fee_adjustment():
 
 
 def _push_dashboard_to_datastore() -> None:
-    """Push 30-day dashboard snapshot to datastore for cl-hive."""
+    """Push 30-day dashboard snapshot to datastore."""
     global safe_plugin, profitability_analyzer, database, data_service
     if safe_plugin is None or profitability_analyzer is None or database is None:
         return
@@ -2253,7 +2259,6 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
         "channel_states": channel_states,
         "recent_fee_changes": fee_history,
         "recent_rebalances": rebalance_history,
-        "hive_hints": hive_hints.get_status() if hive_hints else {"snapshot_fresh": False, "hints_count": 0},
     }
 
 
@@ -2712,7 +2717,6 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         })
         result["summary"]["total"] += 1
 
-    result["hive_hints"] = hive_hints.get_status() if hive_hints else {"snapshot_fresh": False, "hints_count": 0}
     return result
 
 
@@ -2796,28 +2800,6 @@ def planner_candidate_sources(plugin: Plugin):
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
     return capacity_planner.get_candidate_sources()
-
-
-@plugin.method("revenue-hive-hints-status")
-def revenue_hive_hints_status(plugin: Plugin):
-    """Show HiveHintAdapter status: freshness, snapshot age, hint count, and signal coverage."""
-    if hive_hints is None:
-        return {"error": "Hive hints not enabled"}
-    status = hive_hints.get_status()
-    # Add signal coverage stats
-    if hive_hints._snapshot and isinstance(hive_hints._snapshot.get("hints"), dict):
-        hints = hive_hints._snapshot["hints"]
-        has_traffic = sum(1 for h in hints.values() if h.get("traffic_confidence", 0) > 0)
-        has_quality = sum(1 for h in hints.values() if h.get("peer_quality_score") is not None)
-        has_corridor = sum(1 for h in hints.values() if h.get("corridor_role", "none") != "none")
-        has_open_hint = sum(1 for h in hints.values() if isinstance(h.get("channel_open_hint"), dict))
-        status["signal_coverage"] = {
-            "traffic_confidence_gt_0": has_traffic,
-            "peer_quality_score": has_quality,
-            "corridor_role_non_none": has_corridor,
-            "channel_open_hint": has_open_hint,
-        }
-    return status
 
 
 @plugin.method("revenue-planner-candidates")
@@ -4044,16 +4026,7 @@ def revenue_health(plugin: Plugin) -> Dict[str, Any]:
         except Exception as e:
             result["planner"] = {"error": str(e)}
 
-    # --- 8. Hive fleet ---
-    if hive_hints:
-        try:
-            result["hive"] = hive_hints.get_status()
-        except Exception:
-            result["hive"] = {"snapshot_fresh": False}
-    else:
-        result["hive"] = {"enabled": False}
-
-    # --- 9. Route pairs (top 5 revenue routes) ---
+    # --- 8. Route pairs (top 5 revenue routes) ---
     if database:
         try:
             pairs = database.get_top_route_pairs(days=7, min_forwards=2, limit=5)
@@ -5998,14 +5971,6 @@ def _build_boltz_balance_plan(
             # 3+ attempts with 0% success in last 7 days = rebalancer can't do it
             if rebal_success.get("total", 0) >= 3 and rebal_success.get("success_rate", 1.0) == 0.0:
                 rebalance_impossible = True
-
-        # Hive hints: rebalance preference and peer quality (via bounded bias)
-        hive_rebal_bias = 1.0
-        if hive_hints is not None:
-            try:
-                hive_rebal_bias = hive_hints.get_rebalance_bias(peer_id)
-            except Exception:
-                pass
 
         # Predicted depletion hours from Kalman velocity
         predicted_depletion_hours = None

@@ -264,7 +264,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 # Valid values for string enum fields
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
     'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
-    'rebalance_router': ('v2', 'v3'),
+    'rebalance_router': ('v3',),
 }
 
 
@@ -374,7 +374,7 @@ class Config:
     askrene_max_age_sec: int = 900            # Max constraint age (seconds) to consider fresh
 
     # V3 rebalance router (askrene getroutes + cl-hive layers)
-    rebalance_router: str = 'v3'              # 'v3' (askrene getroutes, default) or 'v2' (getroute legacy)
+    rebalance_router: str = 'v3'              # only 'v3' is supported
     askrene_layers: str = 'hive-fleet'        # CSV of layers to pass to v3 router's getroutes calls
 
     # Safety flags
@@ -437,7 +437,6 @@ class Config:
     sling_maxhops: int = 8
     sling_depleteuptopercent: float = 0.2
     sling_depleteuptoamount: int = 2_000_000_000
-
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50       # Fraction of channel contribution for all capex
     capex_bootstrap_bps: int = 10               # Bootstrap: basis points of capacity per 30d
@@ -466,6 +465,12 @@ class Config:
                 "hive_equalization_low_pct must be less than "
                 "hive_equalization_high_pct"
             )
+        router = str(self.rebalance_router or "v3").lower()
+        if router not in STRING_ENUM_VALID_VALUES["rebalance_router"]:
+            raise ValueError(
+                "rebalance_router only supports 'v3'; legacy 'v2' routing was removed"
+            )
+        self.rebalance_router = router
     
     def snapshot(self) -> 'ConfigSnapshot':
         """

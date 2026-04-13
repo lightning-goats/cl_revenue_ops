@@ -22,7 +22,7 @@ from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
 from .rebalance_hive_router import RebalanceHiveRouter
 from .rebalance_planner_v2 import RebalancePlanner
 from .rebalance_route_policy import RoutePolicy, RoutePriority, decide_route_policy
-from .rebalance_router_v2 import RebalanceRouter, RouteResult
+from .rebalance_router_v2 import RouteResult
 from .rebalance_router_v3 import RebalanceRouterV3, _parse_layer_names
 from .rebalance_state_v2 import StateSnapshot, build_state_snapshot
 from .sling_segment_observations import SlingSegmentObservationStore
@@ -62,7 +62,6 @@ class RebalanceEngine:
         self._profitability = profitability
         self._hive_hints = hive_hints
         self._data_service = data_service
-        self._legacy_hive_router = hive_router
         self._hive_router = (
             hive_router if hasattr(hive_router, "price_pair") else None
         )
@@ -93,23 +92,10 @@ class RebalanceEngine:
             "other_retriable": 1800,
         }
 
-        # Build v2 router unconditionally — no RPC dependency at construction.
         our_id = self._get_our_id() or ""
-        self.router_v2 = RebalanceRouter(
-            plugin, our_id, data_service=self._data_service
-        )
-        if self._hive_router is None and self._hive_hints is not None:
-            self._hive_router = RebalanceHiveRouter(
-                plugin=plugin,
-                our_node_id=our_id,
-                hive_hints=self._hive_hints,
-                data_service=self._data_service,
-                log=self._log,
-            )
 
-        # Build v3 router iff askrene is available. Missing askrene means
-        # standalone fallback: the active router stays on v2 regardless of
-        # config.rebalance_router.
+        # Build v3 router iff askrene is available. Missing askrene now means
+        # fail-closed: legacy getroute routing has been removed.
         self.router_v3: Optional[RebalanceRouterV3] = None
         if self._probe_askrene():
             layer_names = _parse_layer_names(
@@ -124,8 +110,16 @@ class RebalanceEngine:
             )
             # Clean any orphan exclude layers from a previous crashed cycle.
             self._sweep_orphan_exclude_layers()
+            if self._hive_router is None and self._hive_hints is not None:
+                self._hive_router = RebalanceHiveRouter(
+                    plugin=plugin,
+                    our_node_id=our_id,
+                    hive_hints=self._hive_hints,
+                    data_service=self._data_service,
+                    log=self._log,
+                )
 
-        self._cycle_router: Any = self._active_router()
+        self._cycle_router: Optional[Any] = self._active_router()
 
     def _probe_askrene(self) -> bool:
         """One-shot probe: does this CLN instance have askrene loaded?"""
@@ -138,16 +132,9 @@ class RebalanceEngine:
         except Exception:
             return False
 
-    def _active_router(self) -> Any:
-        """Return the router currently configured for dispatch.
-
-        Reads config.rebalance_router each call so setconfig can hot-switch
-        between cycles. Falls back to v2 if v3 is requested but unavailable.
-        """
-        want = getattr(self.config, "rebalance_router", "v2")
-        if want == "v3" and self.router_v3 is not None:
-            return self.router_v3
-        return self.router_v2
+    def _active_router(self) -> Optional[Any]:
+        """Return the active router currently configured for dispatch."""
+        return self.router_v3
 
     def _sweep_orphan_exclude_layers(self) -> int:
         """Remove leftover rebalance-exclude-* layers from previous crashed cycles.
@@ -317,7 +304,13 @@ class RebalanceEngine:
         config flips do not split a cycle across two routers.
         """
         self._cycle_router = self._active_router()
-        router_tag = "v3" if self._cycle_router is self.router_v3 else "v2"
+        if self._cycle_router is None:
+            self._log(
+                "askrene unavailable; v3 router is required for rebalancing",
+                level="warn",
+            )
+            return []
+        router_tag = "v3"
 
         snapshot = self._build_snapshot()
         if not snapshot or not snapshot.channels:
@@ -436,11 +429,7 @@ class RebalanceEngine:
                         router=route_label,
                     )
                     decision = self._route_decision_for_pair(pair)
-                    strict_hive_only = (
-                        decision.policy is RoutePolicy.HIVE_ONLY
-                        and not decision.allow_market_fallback
-                    )
-                    if strict_hive_only:
+                    if self._fail_closed_on_route_failure(decision):
                         continue
                     pair.route = None
                     pair.route_cost_sats = pair.pair_budget_sats
@@ -525,6 +514,13 @@ class RebalanceEngine:
             return hive_result, "hive"
         return market_result, "market"
 
+    @staticmethod
+    def _fail_closed_on_route_failure(decision: Any) -> bool:
+        policy = getattr(decision, "policy", None)
+        if policy not in (RoutePolicy.HIVE_ONLY, RoutePolicy.HYBRID):
+            return False
+        return not bool(getattr(decision, "allow_market_fallback", True))
+
     def _route_pair(
         self,
         *,
@@ -533,28 +529,36 @@ class RebalanceEngine:
         exclude: Optional[List[str]],
     ):
         decision = self._route_decision_for_pair(pair)
-        hive_router = self._hive_router if hasattr(self._hive_router, "price_pair") else None
-        if decision.policy is RoutePolicy.HIVE_ONLY:
-            if hive_router is None:
-                if decision.allow_market_fallback:
-                    return self._market_price_pair(router, pair, exclude), (
-                        "v3" if router is self.router_v3 else "v2"
-                    )
+        if decision.policy is RoutePolicy.MARKET_ONLY:
+            return self._market_price_pair(router, pair, exclude), "market"
+
+        hive_router = self._hive_router
+        if hive_router is None:
+            if self._fail_closed_on_route_failure(decision):
                 return self._route_error("hive_router_unavailable"), "hive"
-            hive_result = hive_router.price_pair(pair, decision, exclude=exclude)
-            if getattr(hive_result, "success", False) or not decision.allow_market_fallback:
+            return self._market_price_pair(router, pair, exclude), "market"
+
+        try:
+            hive_result = hive_router.price_pair(
+                pair,
+                decision,
+                exclude=exclude,
+            )
+        except Exception as e:
+            hive_result = self._route_error(f"hive_route_error: {e}")
+
+        if decision.policy is RoutePolicy.HIVE_ONLY:
+            if getattr(hive_result, "success", False) or self._fail_closed_on_route_failure(decision):
                 return hive_result, "hive"
-            market_result = self._market_price_pair(router, pair, exclude)
-            if getattr(market_result, "success", False):
-                return market_result, "market"
-            return hive_result, "hive"
-        if decision.policy is RoutePolicy.HYBRID and hive_router is not None:
-            hive_result = hive_router.price_pair(pair, decision, exclude=exclude)
-            market_result = self._market_price_pair(router, pair, exclude)
+            return self._market_price_pair(router, pair, exclude), "market"
+
+        market_result = self._market_price_pair(router, pair, exclude)
+        if decision.policy is RoutePolicy.HYBRID:
+            if not getattr(hive_result, "success", False) and self._fail_closed_on_route_failure(decision):
+                return hive_result, "hive"
             return self._hybrid_choice(hive_result, market_result, decision)
-        return self._market_price_pair(router, pair, exclude), (
-            "v3" if router is self.router_v3 else "v2"
-        )
+
+        return market_result, "market"
 
     def _prune_pair_failures(self, key: Tuple[str, str]) -> List[float]:
         """Drop failure timestamps older than the futility window and return survivors."""
@@ -685,6 +689,31 @@ class RebalanceEngine:
         bonus_fraction = clamped * bonus_rate
         return int(pair_budget_sats * (1.0 + bonus_fraction))
 
+    def _execution_kwargs(self, pair: PairCandidate) -> Dict[str, Any]:
+        router_kind = "v3" if self._cycle_router is self.router_v3 else "v2"
+        decision = self._route_decision_for_pair(pair)
+        return {
+            "route": pair.route or [],
+            "amount_sats": pair.amount_sats,
+            "source_channel_id": pair.source_channel_id,
+            "dest_channel_id": pair.dest_channel_id,
+            "max_fee_sats": pair.pair_budget_sats,
+            "observation_store": self._segment_observation_store,
+            "observation_context": {
+                "short_channel_id": pair.dest_channel_id,
+                "direction": self._segment_observation_direction(pair.dest_peer_id),
+                "source_channel_id": pair.source_channel_id,
+                "dest_channel_id": pair.dest_channel_id,
+                "route_policy": getattr(
+                    decision.policy, "value", str(decision.policy)
+                ),
+                "router_kind": router_kind,
+                "correlation_id": (
+                    f"{pair.source_channel_id}->{pair.dest_channel_id}:{int(time.time())}"
+                ),
+            },
+        }
+
     def _execute_pair(
         self,
         pair: PairCandidate,
@@ -696,27 +725,7 @@ class RebalanceEngine:
         If one is present it is ignored by the executor; if it is absent we
         still execute the selected pair directly.
         """
-        router_kind = "v3" if self._cycle_router is self.router_v3 else "v2"
-        decision = self._route_decision_for_pair(pair)
-        result = executor.execute(
-            route=pair.route or [],
-            amount_sats=pair.amount_sats,
-            source_channel_id=pair.source_channel_id,
-            dest_channel_id=pair.dest_channel_id,
-            max_fee_sats=pair.pair_budget_sats,
-            observation_store=self._segment_observation_store,
-            observation_context={
-                "short_channel_id": pair.dest_channel_id,
-                "direction": self._segment_observation_direction(pair.dest_peer_id),
-                "source_channel_id": pair.source_channel_id,
-                "dest_channel_id": pair.dest_channel_id,
-                "route_policy": getattr(decision.policy, "value", str(decision.policy)),
-                "router_kind": router_kind,
-                "correlation_id": (
-                    f"{pair.source_channel_id}->{pair.dest_channel_id}:{int(time.time())}"
-                ),
-            },
-        )
+        result = executor.execute(**self._execution_kwargs(pair))
         if result is not None and not result.success:
             self._push_segment_observation_snapshot()
         return result
@@ -775,6 +784,13 @@ class RebalanceEngine:
             return ExecutionResult(success=False, error="invalid_amount")
 
         self._cycle_router = self._active_router()
+        if self._cycle_router is None:
+            return ExecutionResult(
+                success=False,
+                error="router_unavailable",
+                amount_sats=amount_sats,
+                route_type="sling",
+            )
         pair = PairCandidate(
             source_channel_id=source_channel_id,
             dest_channel_id=dest_channel_id,
@@ -799,8 +815,12 @@ class RebalanceEngine:
                 f"Manual route pricing failed for {source_channel_id}->{dest_channel_id}: {e}",
                 level="info",
             )
-            route_result = None
-            route_label = "v3" if self._cycle_router is self.router_v3 else "v2"
+            return ExecutionResult(
+                success=False,
+                error=f"route_pricing_failed: {e}",
+                amount_sats=amount_sats,
+                route_type="sling",
+            )
         else:
             if route_result.success:
                 pair.route_cost_sats = route_result.route_cost_sats
@@ -813,10 +833,7 @@ class RebalanceEngine:
                 )
 
         decision = self._route_decision_for_pair(pair)
-        strict_hive_only = (
-            decision.policy is RoutePolicy.HIVE_ONLY and not decision.allow_market_fallback
-        )
-        if route_result is not None and not route_result.success and strict_hive_only:
+        if route_result is not None and not route_result.success and self._fail_closed_on_route_failure(decision):
             return ExecutionResult(
                 success=False,
                 error=route_result.error or "hive_route_unavailable",
