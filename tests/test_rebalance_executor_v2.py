@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from modules.rebalance_executor_v2 import RebalanceExecutor
+from modules.sling_segment_observations import SlingSegmentObservationStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,3 +82,53 @@ class TestLegacyExecutionSurfaceRemoved:
         )
         for token in forbidden:
             assert token not in source
+
+
+def test_executor_failure_records_segment_observation():
+    executor, plugin = _make_executor()
+    store = SlingSegmentObservationStore()
+
+    executor._ensure_observe_timeout_sec = MagicMock()
+    executor._scid_stats = MagicMock(
+        side_effect=[
+            {"failures_in_time_window": {"top_5_failure_reasons": []}},
+            {
+                "failures_in_time_window": {
+                    "top_5_failure_reasons": [
+                        {
+                            "failure_reason": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+                            "failure_count": 1,
+                        }
+                    ]
+                }
+            },
+        ]
+    )
+    executor._sling_row = MagicMock(
+        return_value={"scid": "200x2x0", "status": ["1:NoRoutes"]}
+    )
+    plugin.rpc.call.return_value = {"result": "started"}
+
+    result = executor.execute(
+        route=[],
+        amount_sats=420_000,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        max_fee_sats=100,
+        observation_store=store,
+        observation_context={
+            "short_channel_id": "200x2x0",
+            "direction": 1,
+            "source_channel_id": "100x1x0",
+            "dest_channel_id": "200x2x0",
+            "route_policy": "hybrid",
+            "router_kind": "v3",
+            "correlation_id": "corr-1",
+        },
+    )
+
+    assert result.success is False
+    exported = store.export_snapshot(observer_member_id="02" + "a" * 64)
+    assert exported["segment_observations"]
+    assert exported["segment_observations"][0]["short_channel_id"] == "200x2x0"
+    assert exported["segment_observations"][0]["failure_class"] == "liquidity"

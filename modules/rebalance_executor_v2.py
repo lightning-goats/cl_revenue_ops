@@ -78,9 +78,10 @@ class RebalanceExecutor:
             return "executor_timeout"
         return "local_execution_failed"
 
-    def __init__(self, plugin, database=None):
+    def __init__(self, plugin, database=None, observation_store=None):
         self.plugin = plugin
         self.database = database
+        self.observation_store = observation_store
         self.observe_timeout_sec = SLING_STATUS_TIMEOUT_S
         self._timeout_from_config_loaded = False
         self.poll_interval_sec = SLING_POLL_INTERVAL_SEC
@@ -285,6 +286,84 @@ class RebalanceExecutor:
                 return True
         return "Unknown command" in str(exc)
 
+    @staticmethod
+    def _failure_class(error: str) -> str:
+        normalized = str(error or "").strip().lower()
+        if not normalized:
+            return "unknown"
+        if "fee_insufficient" in normalized or "nocheaproute" in normalized:
+            return "fee"
+        if "timeout" in normalized:
+            return "timeout"
+        if (
+            normalized.startswith("retriable_failure:")
+            or "temporary_channel_failure" in normalized
+            or "incorrect_cltv_expiry" in normalized
+            or "noroutes" in normalized
+            or "nocandidates" in normalized
+        ):
+            return "liquidity"
+        return "unknown"
+
+    @staticmethod
+    def _failure_confidence(error: str) -> float:
+        failure_class = RebalanceExecutor._failure_class(error)
+        if failure_class == "liquidity":
+            return 0.8
+        if failure_class == "fee":
+            return 0.75
+        if failure_class == "timeout":
+            return 0.6
+        return 0.5
+
+    def _record_failure_observation(
+        self,
+        *,
+        result: ExecutionResult,
+        amount_sats: int,
+        observation_store=None,
+        observation_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        store = observation_store or self.observation_store
+        if store is None or not observation_context or result.success:
+            return
+
+        error = str(result.error or "").strip()
+        normalized = error.lower()
+        if not (
+            normalized.startswith("retriable_failure:")
+            or normalized == "sling_timeout"
+        ):
+            return
+
+        try:
+            store.record_failure(
+                short_channel_id=str(
+                    observation_context.get("short_channel_id", "")
+                ).strip(),
+                direction=int(observation_context.get("direction", -1)),
+                amount_sats=int(amount_sats),
+                failure_class=self._failure_class(error),
+                confidence=self._failure_confidence(error),
+                source_channel_id=str(
+                    observation_context.get("source_channel_id", "")
+                ).strip(),
+                dest_channel_id=str(
+                    observation_context.get("dest_channel_id", "")
+                ).strip(),
+                route_policy=str(
+                    observation_context.get("route_policy", "")
+                ).strip(),
+                router_kind=str(
+                    observation_context.get("router_kind", "")
+                ).strip(),
+                correlation_id=str(
+                    observation_context.get("correlation_id", "")
+                ).strip(),
+            )
+        except Exception as exc:
+            self._log(f"failed to record segment observation: {exc}", level="debug")
+
     def execute(
         self,
         route: List[Dict[str, Any]],
@@ -292,6 +371,8 @@ class RebalanceExecutor:
         source_channel_id: str,
         dest_channel_id: str,
         max_fee_sats: int,
+        observation_store=None,
+        observation_context: Optional[Dict[str, Any]] = None,
     ) -> ExecutionResult:
         """Execute a rebalance through sling-once and observe completion."""
         del route
@@ -333,9 +414,16 @@ class RebalanceExecutor:
             self._log(result.error, level="warn")
             return result
 
-        return self._wait_for_terminal_state(
+        result = self._wait_for_terminal_state(
             dest_channel_id=dest_channel_id,
             amount_sats=amount_sats,
             baseline_stats=baseline_stats,
             result=result,
         )
+        self._record_failure_observation(
+            result=result,
+            amount_sats=amount_sats,
+            observation_store=observation_store,
+            observation_context=observation_context,
+        )
+        return result

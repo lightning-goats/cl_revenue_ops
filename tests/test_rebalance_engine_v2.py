@@ -283,6 +283,67 @@ def test_engine_execute_candidate_continues_when_local_route_pricing_fails(
     engine._execute_pair.assert_called_once()
 
 
+def test_engine_execute_candidate_exports_failure_snapshot(mock_plugin, mock_database):
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.sling_segment_observations import SlingSegmentObservationStore
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._data_service = MagicMock()
+    engine._segment_observation_store = SlingSegmentObservationStore()
+    engine._cycle_router = engine.router_v2
+    engine.router_v2 = MagicMock()
+    engine.router_v2.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=3,
+        route=[{"channel": "100x1x0", "id": "02" + "b" * 64}],
+        probability_ppm=0,
+        error="",
+    )
+
+    candidate = SimpleNamespace(
+        from_channel="100x1x0",
+        to_channel="200x2x0",
+        from_peer_id="02" + "b" * 64,
+        to_peer_id="02" + "c" * 64,
+        amount_sats=420_000,
+        max_budget_sats=100,
+        reason_code="manual",
+    )
+
+    class FakeExecutor:
+        def __init__(self, plugin, database, observation_store=None):
+            self._store = observation_store
+
+        def execute(self, **kwargs):
+            self._store.record_failure(
+                short_channel_id="200x2x0",
+                direction=1,
+                amount_sats=kwargs["amount_sats"],
+                failure_class="liquidity",
+                confidence=0.8,
+                source_channel_id=kwargs["source_channel_id"],
+                dest_channel_id=kwargs["dest_channel_id"],
+                route_policy="network",
+                router_kind="v2",
+                correlation_id="corr-1",
+            )
+            return ExecutionResult(
+                success=False,
+                amount_sats=kwargs["amount_sats"],
+                error="retriable_failure: WIRE_TEMPORARY_CHANNEL_FAILURE",
+            )
+
+    with patch("modules.rebalance_engine_v2.RebalanceExecutor", FakeExecutor):
+        result = engine.execute_candidate(candidate)
+
+    assert result.success is False
+    engine._data_service.datastore_push.assert_called_once()
+    key, snapshot = engine._data_service.datastore_push.call_args.args
+    assert key == ["revenue", "segment-observations"]
+    assert snapshot["segment_observations"][0]["short_channel_id"] == "200x2x0"
+
+
 def test_active_engine_does_not_silently_market_route_hive_only_without_hive_router(
     mock_plugin, mock_database
 ):

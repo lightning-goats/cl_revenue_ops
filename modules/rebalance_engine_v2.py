@@ -6,6 +6,7 @@ Single entry point: find_candidates() for dry-run, run_cycle() for live.
 
 from __future__ import annotations
 
+import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from .rebalance_route_policy import RoutePolicy, RoutePriority, decide_route_pol
 from .rebalance_router_v2 import RebalanceRouter, RouteResult
 from .rebalance_router_v3 import RebalanceRouterV3, _parse_layer_names
 from .rebalance_state_v2 import StateSnapshot, build_state_snapshot
+from .sling_segment_observations import SlingSegmentObservationStore
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
 
 
@@ -50,6 +52,7 @@ class RebalanceEngine:
         hive_hints: Any = None,
         data_service: Any = None,
         hive_router: Any = None,
+        segment_observation_store: Any = None,
     ):
         self.plugin = plugin
         self.config = config
@@ -62,6 +65,7 @@ class RebalanceEngine:
         self._hive_router = (
             hive_router if hasattr(hive_router, "price_pair") else None
         )
+        self._segment_observation_store = segment_observation_store
 
         self._our_id: Optional[str] = None
         self._audit = RebalanceAudit(plugin)
@@ -678,13 +682,67 @@ class RebalanceEngine:
         If one is present it is ignored by the executor; if it is absent we
         still execute the selected pair directly.
         """
-        return executor.execute(
+        router_kind = "v3" if self._cycle_router is self.router_v3 else "v2"
+        decision = self._route_decision_for_pair(pair)
+        result = executor.execute(
             route=pair.route or [],
             amount_sats=pair.amount_sats,
             source_channel_id=pair.source_channel_id,
             dest_channel_id=pair.dest_channel_id,
             max_fee_sats=pair.pair_budget_sats,
+            observation_store=self._segment_observation_store,
+            observation_context={
+                "short_channel_id": pair.dest_channel_id,
+                "direction": self._segment_observation_direction(pair.dest_peer_id),
+                "source_channel_id": pair.source_channel_id,
+                "dest_channel_id": pair.dest_channel_id,
+                "route_policy": getattr(decision.policy, "value", str(decision.policy)),
+                "router_kind": router_kind,
+                "correlation_id": (
+                    f"{pair.source_channel_id}->{pair.dest_channel_id}:{int(time.time())}"
+                ),
+            },
         )
+        if result is not None and not result.success:
+            self._push_segment_observation_snapshot()
+        return result
+
+    def _segment_observation_direction(self, peer_id: str) -> int:
+        """Return the directional edge for inbound-to-local liquidity on dest channel."""
+        our_id = self._get_our_id() or ""
+        if not our_id or not peer_id:
+            return 0
+        local_direction = 0 if our_id < peer_id else 1
+        return 1 - local_direction
+
+    def _push_segment_observation_snapshot(self) -> bool:
+        store = self._segment_observation_store
+        observer_member_id = self._get_our_id() or ""
+        if store is None or not observer_member_id:
+            return False
+
+        snapshot = store.export_snapshot(observer_member_id=observer_member_id)
+        if not snapshot.get("segment_observations"):
+            return False
+
+        if self._data_service is not None and hasattr(self._data_service, "datastore_push"):
+            return bool(
+                self._data_service.datastore_push(
+                    SlingSegmentObservationStore.DATASTORE_KEY,
+                    snapshot,
+                )
+            )
+
+        try:
+            self.plugin.rpc.datastore(
+                key=SlingSegmentObservationStore.DATASTORE_KEY,
+                string=json.dumps(snapshot),
+                mode="create-or-replace",
+            )
+            return True
+        except Exception as exc:
+            self._log(f"segment observation export failed: {exc}", level="debug")
+            return False
 
     def execute_candidate(self, candidate: Any) -> ExecutionResult:
         """Price and execute one explicit candidate on the v2 stack."""
@@ -752,7 +810,11 @@ class RebalanceEngine:
                 route_type="sling",
             )
 
-        executor = RebalanceExecutor(self.plugin, self.database)
+        executor = RebalanceExecutor(
+            self.plugin,
+            self.database,
+            observation_store=self._segment_observation_store,
+        )
         return self._execute_pair(pair, executor)
 
     def run_cycle(self) -> CycleResult:
@@ -793,7 +855,11 @@ class RebalanceEngine:
         if not live_candidates:
             return result
 
-        executor = RebalanceExecutor(self.plugin, self.database)
+        executor = RebalanceExecutor(
+            self.plugin,
+            self.database,
+            observation_store=self._segment_observation_store,
+        )
         if not executor.is_available():
             for pair in live_candidates:
                 self._audit.log_skip(

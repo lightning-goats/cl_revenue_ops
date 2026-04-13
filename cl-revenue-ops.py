@@ -51,6 +51,7 @@ from modules.policy_manager import (
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.capex_budget import CapexBudgetEngine
 from modules.capital_efficiency import CapitalEfficiencyAnalyzer
+from modules.sling_segment_observations import SlingSegmentObservationStore
 from modules.utils import normalize_scid, parse_msat
 
 
@@ -1702,6 +1703,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Rebalance engine: unified actual-fee pipeline
     from modules.rebalance_engine_v2 import RebalanceEngine
+    segment_observation_store = SlingSegmentObservationStore()
     if rebalancer is not None:
         rebalancer.rebalance_engine_v2 = RebalanceEngine(
             plugin=safe_plugin,
@@ -1712,6 +1714,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             hive_hints=hive_hints,
             data_service=data_service,
             hive_router=hive_router,
+            segment_observation_store=segment_observation_store,
         )
         rebalancer.data_service = data_service
         plugin.log("RebalanceEngine initialized")
