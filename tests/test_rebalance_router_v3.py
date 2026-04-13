@@ -65,6 +65,59 @@ def test_v3_router_records_found_and_missing_layers():
     assert "hive-reputation" in log_text
 
 
+def test_v3_router_includes_live_observed_liquidity_layer_when_present():
+    plugin = MagicMock()
+    data_service = MagicMock()
+    data_service.get_askrene_layers.return_value = {
+        "layers": [
+            {"layer": "hive-fleet"},
+            {"layer": "hive-observed-liquidity"},
+        ]
+    }
+    data_service.get_peer_channels.return_value = {"channels": []}
+    data_service.get_configs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    data_service.get_channels.return_value = {
+        "channels": [
+            {
+                "source": DST_PEER,
+                "destination": OUR_ID,
+                "short_channel_id": "200x1x0",
+                "fee_per_millionth": 0,
+                "delay": 40,
+            }
+        ]
+    }
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [
+            {
+                "probability_ppm": 990000,
+                "amount_msat": 100000000,
+                "path": _clean_middle_path_peer_A_to_peer_B(),
+            }
+        ],
+    }
+
+    router = _make_v3_router(
+        plugin,
+        layer_names=("hive-fleet",),
+        data_service=data_service,
+    )
+
+    result = router.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100_000,
+    )
+
+    assert result.success is True
+    assert "hive-observed-liquidity" in data_service.get_routes.call_args.kwargs["layers"]
+
+
 def test_v3_router_handles_askrene_listlayers_failure():
     """If askrene-listlayers raises, router constructs with empty found_layers."""
     from modules.rebalance_router_v3 import RebalanceRouterV3

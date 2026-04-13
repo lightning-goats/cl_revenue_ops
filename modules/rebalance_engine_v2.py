@@ -16,6 +16,7 @@ from .rebalance_audit_v2 import RebalanceAudit
 from .rebalance_coordination_overlay import (
     build_coordination_overlay,
     merge_coordination_pairs,
+    pair_segment_bias_multiplier,
 )
 from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
 from .rebalance_hive_router import RebalanceHiveRouter
@@ -355,6 +356,7 @@ class RebalanceEngine:
         )
         for pair in plan.selected:
             self._route_decision_for_pair(pair)
+            self._apply_segment_score_bias(pair)
         priority_rank = {
             RoutePriority.COORDINATED: 0,
             RoutePriority.HIVE_EQUALIZATION: 1,
@@ -478,6 +480,18 @@ class RebalanceEngine:
         )
         pair.route_decision = decision
         return decision
+
+    def _apply_segment_score_bias(self, pair: PairCandidate) -> None:
+        """Apply bounded fleet segment utility bias to pair scoring."""
+        hive_hints = self._hive_hints
+        if hive_hints is None:
+            return
+        multiplier = pair_segment_bias_multiplier(
+            pair,
+            hive_hints,
+            self._get_our_id() or "",
+        )
+        pair.score = float(getattr(pair, "score", 0.0) or 0.0) * multiplier
 
     @staticmethod
     def _market_price_pair(router: Any, pair: PairCandidate, exclude: Optional[List[str]]):

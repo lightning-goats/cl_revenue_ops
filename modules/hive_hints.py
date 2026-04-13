@@ -24,6 +24,16 @@ REBAL_PREFERENCE_WEIGHT = 0.05  # rebalance_preference: +/-5%
 REBAL_QUALITY_WEIGHT = 0.05    # peer_quality_score: +/-5%
 CORRIDOR_OWNER_UTILIZATION_WEIGHT = 0.10
 CORRIDOR_SECONDARY_UTILIZATION_WEIGHT = 0.05
+SEGMENT_BUCKETS = (
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+)
 
 
 class HiveHintAdapter:
@@ -425,6 +435,85 @@ class HiveHintAdapter:
         campaign["status"] = status
         return campaign
 
+    def _validate_segment_observation(self, raw) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        try:
+            observation = {
+                "observation_id": str(raw.get("observation_id", "")).strip(),
+                "observer_member_id": str(raw.get("observer_member_id", "")).strip(),
+                "short_channel_id": str(raw.get("short_channel_id", "")).strip(),
+                "direction": int(raw.get("direction")),
+                "amount_bucket_sats": int(raw.get("amount_bucket_sats", 0)),
+                "outcome": str(raw.get("outcome", "")).strip(),
+                "failure_class": str(raw.get("failure_class", "")).strip(),
+                "confidence": float(raw.get("confidence", 0.0)),
+                "observed_at": int(raw.get("observed_at", 0)),
+                "source_channel_id": str(raw.get("source_channel_id", "")).strip(),
+                "dest_channel_id": str(raw.get("dest_channel_id", "")).strip(),
+                "route_policy": str(raw.get("route_policy", "")).strip(),
+                "router_kind": str(raw.get("router_kind", "")).strip(),
+                "correlation_id": str(raw.get("correlation_id", "")).strip(),
+            }
+        except (TypeError, ValueError):
+            return None
+        if (
+            not observation["observation_id"]
+            or not observation["short_channel_id"]
+            or observation["direction"] not in (0, 1)
+            or observation["amount_bucket_sats"] <= 0
+            or observation["observed_at"] <= 0
+        ):
+            return None
+        observation["outcome"] = "failure"
+        observation["confidence"] = max(0.0, min(1.0, observation["confidence"]))
+        return observation
+
+    def _validate_segment_score(self, raw) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        try:
+            score = {
+                "short_channel_id": str(raw.get("short_channel_id", "")).strip(),
+                "direction": int(raw.get("direction")),
+                "amount_bucket_sats": int(raw.get("amount_bucket_sats", 0)),
+                "success_score": float(raw.get("success_score", 0.0)),
+                "failure_score": float(raw.get("failure_score", 0.0)),
+                "net_utility": float(raw.get("net_utility", 0.0)),
+                "confidence": float(raw.get("confidence", 0.0)),
+                "observer_count": int(raw.get("observer_count", 0)),
+                "last_observed_at": int(raw.get("last_observed_at", 0)),
+            }
+        except (TypeError, ValueError):
+            return None
+        if (
+            not score["short_channel_id"]
+            or score["direction"] not in (0, 1)
+            or score["amount_bucket_sats"] <= 0
+            or score["last_observed_at"] <= 0
+        ):
+            return None
+        score["success_score"] = max(0.0, min(1.0, score["success_score"]))
+        score["failure_score"] = max(0.0, min(1.0, score["failure_score"]))
+        score["confidence"] = max(0.0, min(1.0, score["confidence"]))
+        score["net_utility"] = max(-1.0, min(1.0, score["net_utility"]))
+        return score
+
+    @staticmethod
+    def _segment_bucket(amount_sats: int) -> int:
+        try:
+            amount = int(amount_sats)
+        except (TypeError, ValueError):
+            return 0
+        if amount <= 0:
+            return 0
+        bucket = SEGMENT_BUCKETS[0]
+        for candidate in SEGMENT_BUCKETS:
+            if amount < candidate:
+                break
+            bucket = candidate
+        return bucket
+
     def get_route_segment_leases(self) -> list[dict]:
         """Return validated route-segment leases or [] if unavailable/stale."""
         return self._get_section_entries(
@@ -445,6 +534,67 @@ class HiveHintAdapter:
             "rebalance_campaigns",
             self._validate_rebalance_campaign,
         )
+
+    def get_segment_observations(self) -> list[dict]:
+        """Return validated segment observations or [] if unavailable/stale."""
+        return self._get_section_entries(
+            "segment_observations",
+            self._validate_segment_observation,
+        )
+
+    def get_segment_scores(self) -> list[dict]:
+        """Return validated segment scores or [] if unavailable/stale."""
+        return self._get_section_entries(
+            "segment_scores",
+            self._validate_segment_score,
+        )
+
+    def get_segment_score(
+        self,
+        short_channel_id: str,
+        direction: int,
+        amount_sats: int | None = None,
+    ) -> dict:
+        """Return the best matching score for a directed channel segment."""
+        normalized_scid = str(short_channel_id or "").strip().replace(":", "x")
+        if not normalized_scid or direction not in (0, 1):
+            return {}
+
+        matches = [
+            entry
+            for entry in self.get_segment_scores()
+            if entry["short_channel_id"].replace(":", "x") == normalized_scid
+            and int(entry["direction"]) == int(direction)
+        ]
+        if not matches:
+            return {}
+
+        bucket = self._segment_bucket(amount_sats or 0)
+        if bucket > 0:
+            exact = [
+                entry for entry in matches if entry["amount_bucket_sats"] == bucket
+            ]
+            if exact:
+                matches = exact
+            else:
+                bounded = [
+                    entry for entry in matches if entry["amount_bucket_sats"] <= bucket
+                ]
+                if bounded:
+                    max_bucket = max(entry["amount_bucket_sats"] for entry in bounded)
+                    matches = [
+                        entry
+                        for entry in bounded
+                        if entry["amount_bucket_sats"] == max_bucket
+                    ]
+
+        matches.sort(
+            key=lambda entry: (
+                -float(entry.get("confidence", 0.0) or 0.0),
+                -int(entry.get("last_observed_at", 0) or 0),
+            )
+        )
+        return dict(matches[0])
 
     # ------------------------------------------------------------------
     # Channel-open hints

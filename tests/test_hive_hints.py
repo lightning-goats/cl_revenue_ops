@@ -289,6 +289,54 @@ class TestCoordinationSections:
         assert adapter.get_rebalance_bias("02ddeeff") < 1.0
 
 
+class TestSegmentSections:
+    def test_valid_snapshot_exposes_segment_sections(self, mock_plugin):
+        snapshot = dict(VALID_SNAPSHOT)
+        snapshot["generated_at"] = int(time.time())
+        snapshot["segment_observations"] = [
+            {
+                "observation_id": "obs-1",
+                "observer_member_id": "m1",
+                "short_channel_id": "123x1x0",
+                "direction": 1,
+                "amount_bucket_sats": 250_000,
+                "outcome": "failure",
+                "failure_class": "liquidity",
+                "confidence": 0.8,
+                "observed_at": int(time.time()),
+                "source_channel_id": "100x1x0",
+                "dest_channel_id": "123x1x0",
+                "route_policy": "hybrid",
+                "router_kind": "v3",
+                "correlation_id": "corr-1",
+            }
+        ]
+        snapshot["segment_scores"] = [
+            {
+                "short_channel_id": "123x1x0",
+                "direction": 1,
+                "amount_bucket_sats": 250_000,
+                "success_score": 0.0,
+                "failure_score": 0.8,
+                "net_utility": -0.8,
+                "confidence": 0.8,
+                "observer_count": 1,
+                "last_observed_at": int(time.time()),
+            }
+        ]
+        mock_plugin.rpc.call.return_value = snapshot
+
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_segment_observations()[0]["short_channel_id"] == "123x1x0"
+        assert adapter.get_segment_scores()[0]["short_channel_id"] == "123x1x0"
+        assert (
+            adapter.get_segment_score("123x1x0", 1, amount_sats=420_000)["amount_bucket_sats"]
+            == 250_000
+        )
+
+
 class TestFeeBias:
     def test_owner_corridor_biases_up(self, mock_plugin):
         snapshot = dict(VALID_SNAPSHOT)

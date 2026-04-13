@@ -344,6 +344,36 @@ def test_engine_execute_candidate_exports_failure_snapshot(mock_plugin, mock_dat
     assert snapshot["segment_observations"][0]["short_channel_id"] == "200x2x0"
 
 
+def test_engine_applies_segment_score_bias_to_pair_score(mock_plugin, mock_database):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._our_id = "01" + "0" * 64
+
+    class SegmentAwareHints:
+        def get_segment_score(self, short_channel_id, direction, amount_sats=None):
+            if short_channel_id == "100x1x0" and direction == 0:
+                return {"net_utility": 0.8, "confidence": 0.8}
+            if short_channel_id == "200x1x0" and direction == 1:
+                return {"net_utility": 0.8, "confidence": 0.8}
+            return {}
+
+    engine._hive_hints = SegmentAwareHints()
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=250_000,
+        pair_budget_sats=100,
+        score=100.0,
+    )
+
+    engine._apply_segment_score_bias(pair)
+
+    assert pair.score > 100.0
+
+
 def test_active_engine_does_not_silently_market_route_hive_only_without_hive_router(
     mock_plugin, mock_database
 ):

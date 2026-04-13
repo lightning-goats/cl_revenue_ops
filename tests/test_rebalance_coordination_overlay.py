@@ -48,6 +48,9 @@ class FakeHiveHints:
     def get_route_segment_leases(self):
         return list(self._leases)
 
+    def get_segment_score(self, short_channel_id, direction, amount_sats=None):
+        return {}
+
 
 def _coordinated_pair():
     return PairCandidate(
@@ -162,3 +165,39 @@ def test_overlay_keeps_pair_when_overlapping_lease_is_ours():
     )
 
     assert len(result.selected) == 1
+
+
+def test_overlay_applies_segment_score_bias_to_coordinated_pair():
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    class SegmentAwareHiveHints(FakeHiveHints):
+        def get_segment_score(self, short_channel_id, direction, amount_sats=None):
+            if short_channel_id == "100x1x0" and direction == 0:
+                return {"net_utility": 0.8, "confidence": 0.8}
+            if short_channel_id == "200x1x0" and direction == 1:
+                return {"net_utility": 0.8, "confidence": 0.8}
+            return {}
+
+    snapshot = _make_snapshot()
+    hints = SegmentAwareHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-1",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+                "route_policy": "hive_only",
+                "priority_score": 90.0,
+                "allow_market_fallback": False,
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot,
+        hive_hints=hints,
+        our_node_id="01" + "0" * 64,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].score > 250_000

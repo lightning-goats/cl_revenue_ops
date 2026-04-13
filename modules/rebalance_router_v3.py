@@ -39,6 +39,9 @@ def _parse_layer_names(csv: str) -> List[str]:
     return [name.strip() for name in csv.split(",") if name.strip()]
 
 
+OBSERVED_LIQUIDITY_LAYER = "hive-observed-liquidity"
+
+
 def _parse_msat(v: Any) -> int:
     """Parse an amount_msat field that may be int, str like '1000msat', or None."""
     if v is None:
@@ -194,11 +197,18 @@ class RebalanceRouterV3:
             return []
 
         live_names = [layer.get("layer", "") for layer in result.get("layers", [])]
-        found = [name for name in self.layer_names if name in live_names]
-        missing = [name for name in self.layer_names if name not in live_names]
+        requested = list(self.layer_names)
+        if (
+            OBSERVED_LIQUIDITY_LAYER in live_names
+            and OBSERVED_LIQUIDITY_LAYER not in requested
+        ):
+            requested.append(OBSERVED_LIQUIDITY_LAYER)
+
+        found = [name for name in requested if name in live_names]
+        missing = [name for name in requested if name not in live_names]
 
         msg = (
-            f"[router-v3] requested layers={self.layer_names} found={found}"
+            f"[router-v3] requested layers={requested} found={found}"
         )
         if missing:
             msg += f" missing={missing}"

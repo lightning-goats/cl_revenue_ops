@@ -16,6 +16,48 @@ from .rebalance_state_v2 import ChannelState, StateSnapshot
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
 
 
+def _local_direction(our_node_id: str, peer_id: str) -> int:
+    return 0 if str(our_node_id or "") < str(peer_id or "") else 1
+
+
+def pair_segment_bias_multiplier(
+    pair: PairCandidate,
+    hive_hints: Any,
+    our_node_id: str,
+) -> float:
+    """Return a bounded multiplier from promoted segment utility hints."""
+    getter = getattr(hive_hints, "get_segment_score", None)
+    if not callable(getter):
+        return 1.0
+
+    utilities = []
+    source_direction = _local_direction(our_node_id, pair.source_peer_id)
+    dest_direction = 1 - _local_direction(our_node_id, pair.dest_peer_id)
+    for short_channel_id, direction in (
+        (pair.source_channel_id, source_direction),
+        (pair.dest_channel_id, dest_direction),
+    ):
+        try:
+            score = getter(short_channel_id, direction, amount_sats=pair.amount_sats) or {}
+        except Exception:
+            score = {}
+        if not isinstance(score, dict):
+            continue
+        try:
+            net_utility = float(score.get("net_utility", 0.0) or 0.0)
+            confidence = float(score.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        utilities.append(max(-1.0, min(1.0, net_utility)) * max(0.0, min(1.0, confidence)))
+
+    if not utilities:
+        return 1.0
+
+    average_utility = sum(utilities) / len(utilities)
+    bias = max(-0.12, min(0.12, average_utility * 0.10))
+    return 1.0 + bias
+
+
 def _channel_excess_sats(channel: ChannelState, target_band_high: float) -> int:
     return max(0, int((channel.local_ratio - target_band_high) * channel.capacity_sats))
 
@@ -93,6 +135,7 @@ def _build_pair_from_entry(
     hint_type: str,
     snapshot: StateSnapshot,
     hive_hints: Any,
+    our_node_id: str,
     target_band_low: float,
     target_band_high: float,
     max_chunk_sats: int,
@@ -176,6 +219,7 @@ def _build_pair_from_entry(
         reason_code=pair.reason_code,
         hive_hints=hive_hints,
     )
+    pair.score *= pair_segment_bias_multiplier(pair, hive_hints, our_node_id)
     return pair, None
 
 
@@ -253,6 +297,7 @@ def build_coordination_overlay(
             hint_type=hint_type,
             snapshot=snapshot,
             hive_hints=hive_hints,
+            our_node_id=our_node_id,
             target_band_low=target_band_low,
             target_band_high=target_band_high,
             max_chunk_sats=max_chunk_sats,
