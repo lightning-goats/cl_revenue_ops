@@ -185,11 +185,17 @@ class CapexBudgetEngine:
         tactical_msat = max(0, tactical_msat)
 
         spend_summary = self._get_spend_ledger_summary(window_days=30)
-        exploration_msat = self._apply_category_spend_remaining(
-            budget_msat=exploration_msat,
-            summary=spend_summary,
-            category="channel_open",
-        )
+        if total_fleet_contribution_msat > 0:
+            exploration_msat = self._apply_category_spend_remaining(
+                budget_msat=exploration_msat,
+                summary=spend_summary,
+                category="channel_open",
+            )
+        else:
+            exploration_msat = self._get_bootstrap_wallet_exploration_budget_msat(
+                cfg=cfg,
+                summary=spend_summary,
+            )
         tactical_msat = self._apply_category_spend_remaining(
             budget_msat=tactical_msat,
             summary=spend_summary,
@@ -463,12 +469,29 @@ class CapexBudgetEngine:
 
     def _get_reserve_deficit(self, cfg) -> int:
         """Get on-chain reserve deficit in sats."""
+        onchain = self._get_confirmed_onchain_sats()
+        deficit = max(0, cfg.min_wallet_reserve - onchain)
+        return deficit
+
+    def _get_confirmed_onchain_sats(self) -> int:
+        """Get confirmed on-chain balance in sats."""
         try:
-            onchain = self._database.get_confirmed_onchain_sats()
-            deficit = max(0, cfg.min_wallet_reserve - onchain)
-            return deficit
+            return int(self._database.get_confirmed_onchain_sats() or 0)
         except Exception:
             return 0
+
+    def _get_bootstrap_wallet_exploration_budget_msat(self, cfg, summary) -> int:
+        """Use wallet excess for bootstrap opens when the fleet has no fee revenue yet.
+
+        This path is intentionally wallet-backed rather than spend-ledger-backed:
+        confirmed on-chain balance already reflects prior open fees, so subtracting
+        historical spend again would double-count. We only remove active reservations.
+        """
+        onchain_sats = self._get_confirmed_onchain_sats()
+        wallet_excess_sats = max(0, onchain_sats - cfg.min_wallet_reserve)
+        reserved_by_category = summary.get("reserved_by_category", {}) or {}
+        reserved_open_sats = int(reserved_by_category.get("channel_open", 0) or 0)
+        return max(0, wallet_excess_sats - reserved_open_sats) * MSAT_PER_SAT
 
     def _get_total_capex_by_channel(self, window_days: int = 30) -> Dict[str, int]:
         """Get total capex per channel from rebalance_costs + spend_events."""

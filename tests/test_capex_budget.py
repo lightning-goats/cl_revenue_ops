@@ -69,6 +69,7 @@ def _make_engine(
     hive_hints=None,
     capital_efficiency=None,
     reserve_deficit=0,
+    confirmed_onchain_sats=None,
     config_overrides=None,
 ):
     """Create a CapexBudgetEngine with mocked dependencies."""
@@ -87,7 +88,9 @@ def _make_engine(
         mock_profitability.get_bleeder_status.side_effect = _get_bleeder
 
     mock_db = MagicMock()
-    mock_db.get_confirmed_onchain_sats.return_value = 1_000_000 - reserve_deficit
+    if confirmed_onchain_sats is None:
+        confirmed_onchain_sats = 1_000_000 - reserve_deficit
+    mock_db.get_confirmed_onchain_sats.return_value = confirmed_onchain_sats
     mock_db.get_channel_rebalance_success_rate.return_value = None
     mock_db.get_spend_ledger_summary.return_value = spend_summary or {
         "spent_by_category": {},
@@ -503,10 +506,43 @@ class TestFleetExplorationBudget:
         # Exploration = 800_000 * 0.10 = 80_000 msat = 80 sats
         assert alloc.fleet_exploration_budget_sats == 80
 
-    def test_zero_revenue_zero_exploration(self):
+    def test_zero_revenue_zero_exploration_without_wallet_excess(self):
         engine = _make_engine()
         alloc = engine.compute_allocations()
         assert alloc.fleet_exploration_budget_sats == 0
+
+    def test_zero_revenue_uses_wallet_excess_for_bootstrap_exploration(self):
+        engine = _make_engine(
+            confirmed_onchain_sats=1_250_000,
+            config_overrides={"daily_budget_sats": 0, "weekly_budget_sats": 0},
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.fleet_exploration_budget_sats == 250_000
+
+    def test_zero_revenue_bootstrap_exploration_subtracts_open_reservations_only(self):
+        engine = _make_engine(
+            confirmed_onchain_sats=1_010_000,
+            spend_summary={
+                "spent_by_category": {"channel_open": 4_000},
+                "reserved_by_category": {"channel_open": 3_000},
+            },
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.fleet_exploration_budget_sats == 7_000
+
+    def test_revenue_funded_exploration_ignores_wallet_bootstrap_path(self):
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=500_000,
+                    fees_earned_msat=500_000,
+                    total_forward_count=50,
+                ),
+            },
+            confirmed_onchain_sats=1_250_000,
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.fleet_exploration_budget_sats == 50
 
     def test_exploration_budget_reduced_by_open_spend_and_reservations(self):
         engine = _make_engine(
