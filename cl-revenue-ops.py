@@ -2287,6 +2287,38 @@ def revenue_rebalance_debug(
     if rebalancer is None:
         return {"error": "Rebalancer not initialized"}
 
+    def _filtered_segment_scores() -> List[Dict[str, Any]]:
+        if hive_hints is None:
+            return []
+        getter = getattr(hive_hints, "get_segment_scores", None)
+        if not callable(getter):
+            return []
+        try:
+            raw_scores = getter() or []
+        except Exception:
+            return []
+
+        scores: List[Dict[str, Any]] = []
+        for raw in raw_scores:
+            if not isinstance(raw, dict):
+                continue
+            short_channel_id = str(raw.get("short_channel_id") or "").strip()
+            if filter_channel_id and short_channel_id != filter_channel_id:
+                continue
+            scores.append(dict(raw))
+        scores.sort(
+            key=lambda entry: (
+                -abs(float(entry.get("net_utility", 0.0) or 0.0))
+                * float(entry.get("confidence", 0.0) or 0.0),
+                -float(entry.get("confidence", 0.0) or 0.0),
+                str(entry.get("short_channel_id") or ""),
+                int(entry.get("direction", 0) or 0),
+            )
+        )
+        if max_candidates > 0:
+            return scores[:max_candidates]
+        return scores[:20]
+
     filter_channel_id = str(channel_id or "").strip()
     filter_peer_id = str(peer_id or "").strip().lower()
     summary_only = bool(summary_only)
@@ -2571,7 +2603,18 @@ def revenue_rebalance_debug(
     except Exception as e:
         result["channels"]["error"] = str(e)
 
-    result["hive_hints"] = hive_hints.get_status() if hive_hints else {"snapshot_fresh": False, "hints_count": 0}
+    hive_status = (
+        hive_hints.get_status()
+        if hive_hints
+        else {"snapshot_fresh": False, "hints_count": 0}
+    )
+    if not isinstance(hive_status, dict):
+        hive_status = {"snapshot_fresh": False, "hints_count": 0}
+    segment_scores = _filtered_segment_scores()
+    hive_status["segment_scores_count"] = len(segment_scores)
+    if not summary_only:
+        hive_status["segment_scores"] = segment_scores
+    result["hive_hints"] = hive_status
     return result
 
 

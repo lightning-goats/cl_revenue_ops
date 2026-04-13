@@ -228,6 +228,62 @@ def test_init_logs_sling_backed_rebalancing(monkeypatch):
     assert not any("getroute + sendpay" in message for message in messages)
 
 
+def test_revenue_rebalance_debug_reports_segment_hint_influence():
+    mod = load_plugin_module()
+    mod.config = Config()
+    mod.data_service = MagicMock()
+    mod.data_service.get_funds.return_value = {"outputs": [], "channels": []}
+    mod.database = MagicMock()
+    mod.database.get_daily_rebalance_spend.return_value = {
+        "total_spent_sats": 0,
+        "total_reserved_sats": 0,
+        "stale_reservations": 0,
+        "job_count": 0,
+        "success_count": 0,
+        "success_rate": 0.0,
+    }
+    mod.database.get_all_channel_states.return_value = []
+    mod._total_cost_budget_status = MagicMock(
+        return_value={
+            "effective_budget_sats": 1000,
+            "remaining_sats": 1000,
+            "actual_spent_by_category": {},
+            "reserved_by_category": {},
+        }
+    )
+    mod._boltz_liquidity_cost_components = MagicMock(
+        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
+    )
+    mod.rebalancer = SimpleNamespace(
+        _get_channels_with_balances=lambda: {},
+        job_manager=SimpleNamespace(active_channels=set()),
+    )
+    mod.hive_hints = MagicMock()
+    mod.hive_hints.get_status.return_value = {
+        "snapshot_fresh": True,
+        "snapshot_age_seconds": 10,
+        "hints_count": 2,
+    }
+    mod.hive_hints.get_segment_scores.return_value = [
+        {
+            "short_channel_id": "123x1x0",
+            "direction": 1,
+            "amount_bucket_sats": 250_000,
+            "success_score": 0.0,
+            "failure_score": 0.7,
+            "net_utility": -0.7,
+            "confidence": 0.8,
+            "observer_count": 2,
+            "last_observed_at": 1_700_000_000,
+        }
+    ]
+
+    result = mod.revenue_rebalance_debug(mod.plugin)
+
+    assert result["hive_hints"]["segment_scores_count"] == 1
+    assert result["hive_hints"]["segment_scores"][0]["short_channel_id"] == "123x1x0"
+
+
 def test_revenue_config_list_mutable_returns_public_controls_only():
     mod = _load_operator_surface_module()
 
