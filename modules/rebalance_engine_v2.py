@@ -21,7 +21,12 @@ from .rebalance_coordination_overlay import (
 from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
 from .rebalance_hive_router import RebalanceHiveRouter
 from .rebalance_planner_v2 import RebalancePlanner
-from .rebalance_route_policy import RoutePolicy, RoutePriority, decide_route_policy
+from .rebalance_route_policy import (
+    RouteDecision,
+    RoutePolicy,
+    RoutePriority,
+    decide_route_policy,
+)
 from .rebalance_router_v2 import RouteResult
 from .rebalance_router_v3 import RebalanceRouterV3, _parse_layer_names
 from .rebalance_state_v2 import StateSnapshot, build_state_snapshot
@@ -62,6 +67,9 @@ class RebalanceEngine:
         self._profitability = profitability
         self._hive_hints = hive_hints
         self._data_service = data_service
+        self._membership_router = (
+            hive_router if hasattr(hive_router, "is_hive_member") else None
+        )
         self._hive_router = (
             hive_router if hasattr(hive_router, "price_pair") else None
         )
@@ -250,11 +258,8 @@ class RebalanceEngine:
 
             # Hive membership check
             is_hive = False
-            if self._hive_hints:
-                try:
-                    is_hive = self._hive_hints.is_hive_member(peer_id)
-                except Exception:
-                    pass
+            if peer_id:
+                is_hive = self._is_hive_member(peer_id)
 
             # Profitability check
             is_profitable = False
@@ -295,6 +300,134 @@ class RebalanceEngine:
             })
 
         return build_state_snapshot(normalized, capex_allocations)
+
+    def _is_hive_member(self, peer_id: str) -> bool:
+        if not peer_id:
+            return False
+        if self._membership_router is not None:
+            try:
+                return bool(self._membership_router.is_hive_member(peer_id))
+            except Exception:
+                pass
+        if self._hive_hints is not None:
+            try:
+                return bool(self._hive_hints.is_hive_member(peer_id))
+            except Exception:
+                pass
+        return False
+
+    def _hive_equalization_overlay(
+        self,
+        snapshot: StateSnapshot,
+        cfg: Any,
+        *,
+        max_chunk_sats: int,
+    ) -> PlanResult:
+        result = PlanResult()
+        if not bool(getattr(cfg, "hive_equalization_enabled", True)):
+            return result
+
+        max_candidates = int(
+            getattr(cfg, "hive_equalization_max_candidates_per_cycle", 1) or 0
+        )
+        if max_candidates <= 0:
+            return result
+
+        low_pct = float(
+            getattr(cfg, "hive_equalization_low_pct", 0.35) or 0.35
+        )
+        high_pct = float(
+            getattr(cfg, "hive_equalization_high_pct", 0.65) or 0.65
+        )
+        cooldown_hours = int(
+            getattr(cfg, "hive_equalization_cooldown_hours", 48) or 0
+        )
+        cooldown_secs = max(0, cooldown_hours * 3600)
+        now = int(time.time())
+
+        hive_high = []
+        hive_low = []
+        for channel in snapshot.channels:
+            if channel.value_class != "hive":
+                continue
+            if channel.local_ratio > high_pct:
+                hive_high.append(channel)
+            elif channel.local_ratio < low_pct:
+                if cooldown_secs > 0 and self.database is not None:
+                    try:
+                        last_ts = self.database.get_last_rebalance_time(
+                            channel.channel_id,
+                            reason_code="hive_equalization",
+                        )
+                    except Exception:
+                        last_ts = None
+                    if last_ts and (now - int(last_ts)) < cooldown_secs:
+                        result.skipped.append(
+                            SkipRecord(
+                                channel_id=channel.channel_id,
+                                reason="hive_equalization_cooldown",
+                                value_class="hive",
+                                detail=f"cooldown_until={int(last_ts) + cooldown_secs}",
+                            )
+                        )
+                        continue
+                hive_low.append(channel)
+
+        candidate_pairs: List[PairCandidate] = []
+        for source in hive_high:
+            source_excess = max(
+                0,
+                int((source.local_ratio - high_pct) * source.capacity_sats),
+            )
+            if source_excess <= 0:
+                continue
+            for dest in hive_low:
+                if source.channel_id == dest.channel_id or source.peer_id == dest.peer_id:
+                    continue
+                dest_need = max(
+                    0,
+                    int((low_pct - dest.local_ratio) * dest.capacity_sats),
+                )
+                amount_sats = min(source_excess, dest_need, max_chunk_sats)
+                if amount_sats <= 0:
+                    continue
+                candidate_pairs.append(
+                    PairCandidate(
+                        source_channel_id=source.channel_id,
+                        dest_channel_id=dest.channel_id,
+                        source_peer_id=source.peer_id,
+                        dest_peer_id=dest.peer_id,
+                        amount_sats=amount_sats,
+                        pair_budget_sats=0,
+                        score=float(source_excess + dest_need),
+                        source_local_ratio=source.local_ratio,
+                        dest_local_ratio=dest.local_ratio,
+                        reason_code="hive_equalization",
+                        route_decision=RouteDecision(
+                            policy=RoutePolicy.HIVE_ONLY,
+                            priority=RoutePriority.HIVE_EQUALIZATION,
+                            reason="hive_equalization",
+                            allow_market_fallback=False,
+                        ),
+                    )
+                )
+
+        candidate_pairs.sort(
+            key=lambda pair: (-float(pair.score or 0.0), -int(pair.amount_sats or 0))
+        )
+
+        used_sources: set[str] = set()
+        used_dests: set[str] = set()
+        for pair in candidate_pairs:
+            if len(result.selected) >= max_candidates:
+                break
+            if pair.source_channel_id in used_sources or pair.dest_channel_id in used_dests:
+                continue
+            used_sources.add(pair.source_channel_id)
+            used_dests.add(pair.dest_channel_id)
+            result.selected.append(pair)
+
+        return result
 
     def find_candidates(self) -> List[PairCandidate]:
         """Dry-run: build snapshot, plan, and return candidates without executing.
@@ -347,6 +480,25 @@ class RebalanceEngine:
             overlay.selected,
             max_pairs=planner_max_pairs,
         )
+        if not plan.selected:
+            hive_equalization = self._hive_equalization_overlay(
+                snapshot,
+                cfg,
+                max_chunk_sats=max_chunk_sats,
+            )
+            if hive_equalization.selected:
+                selected_channels = {
+                    channel_id
+                    for pair in hive_equalization.selected
+                    for channel_id in (pair.source_channel_id, pair.dest_channel_id)
+                }
+                plan.skipped = [
+                    skip
+                    for skip in plan.skipped
+                    if skip.channel_id not in selected_channels
+                ]
+            plan.selected = hive_equalization.selected
+            plan.skipped.extend(hive_equalization.skipped)
         for pair in plan.selected:
             self._route_decision_for_pair(pair)
             self._apply_segment_score_bias(pair)

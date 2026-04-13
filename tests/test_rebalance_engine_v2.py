@@ -202,6 +202,106 @@ def test_active_engine_honors_hive_only_pairs(mock_plugin, mock_database):
     engine.router_v3.price_pair.assert_not_called()
 
 
+def test_engine_build_snapshot_uses_membership_router_for_hive_value_class(
+    mock_plugin, mock_database
+):
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    membership_router = MagicMock()
+    membership_router.is_hive_member.return_value = True
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "b" * 64,
+                "short_channel_id": "100x1x0",
+                "total_msat": "2000000msat",
+                "our_amount_msat": "1000000msat",
+                "updates": {
+                    "remote": {"fee_proportional_millionths": 123}
+                },
+            }
+        ]
+    }
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(
+        mock_plugin,
+        cfg,
+        mock_database,
+        hive_router=membership_router,
+    )
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot is not None
+    assert snapshot.channels[0].value_class == "hive"
+    assert snapshot.channels[0].is_valuable is True
+    membership_router.is_hive_member.assert_called_once()
+
+
+def test_engine_falls_back_to_hive_equalization_when_hive_channels_have_no_budget(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_state_v2 import build_state_snapshot
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._hive_router = MagicMock(name="hive_router")
+    engine._hive_router.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=0,
+        route=[{"channel": "fleet"}],
+        probability_ppm=0,
+        error="",
+    )
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=build_state_snapshot(
+            [
+                {
+                    "channel_id": "100x1x0",
+                    "peer_id": "02" + "1" * 64,
+                    "capacity_sats": 1_000_000,
+                    "local_sats": 900_000,
+                    "is_hive_member": True,
+                },
+                {
+                    "channel_id": "200x1x0",
+                    "peer_id": "02" + "2" * 64,
+                    "capacity_sats": 1_000_000,
+                    "local_sats": 100_000,
+                    "is_hive_member": True,
+                },
+            ],
+            {},
+        )
+    )
+
+    selected = engine.find_candidates()
+
+    assert len(selected) == 1
+    assert selected[0].reason_code == "hive_equalization"
+    assert selected[0].pair_budget_sats == 0
+    engine._hive_router.price_pair.assert_called_once()
+    engine.router_v3.price_pair.assert_not_called()
+    assert not any(
+        call.kwargs.get("reason") == "no_budget"
+        or (len(call.args) > 1 and call.args[1] == "no_budget")
+        for call in engine._audit.log_skip.call_args_list
+    )
+
+
 def test_engine_execute_candidate_uses_router_and_executor(mock_plugin, mock_database):
     from modules.rebalance_executor_v2 import ExecutionResult
 
