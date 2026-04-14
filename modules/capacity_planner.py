@@ -80,6 +80,10 @@ class CapacityPlanner:
         """Inject the capital-efficiency analyzer."""
         self._capital_efficiency = analyzer
 
+    def set_rebalancer(self, rebalancer) -> None:
+        """Inject the rebalance engine used for diagnostic shocks."""
+        self.rebalancer = rebalancer
+
     def get_boltz_coordination(self) -> Dict[str, Any]:
         """Return signals for Boltz planner coordination.
 
@@ -152,6 +156,15 @@ class CapacityPlanner:
         if not getattr(cfg, "planner_execute_closes", False):
             return False
         return getattr(cfg, "planner_max_closes_per_cycle", 1) > 0
+
+    def _defibrillation_limit(self, cfg) -> int:
+        """Return the per-cycle diagnostic rebalance limit."""
+        raw_limit = getattr(cfg, "planner_max_defibrillations_per_cycle", None)
+        if isinstance(raw_limit, bool):
+            return int(raw_limit)
+        if isinstance(raw_limit, (int, float)):
+            return max(0, int(raw_limit))
+        return 1
 
     def _init_cycle_cache(self):
         """Clear per-cycle caches. Node info is fetched lazily via _get_cached_node()."""
@@ -240,6 +253,7 @@ class CapacityPlanner:
 
         summary = {
             "opens": [],
+            "defibrillations": [],
             "closes": [],
             "skipped_reasons": [],
         }
@@ -264,7 +278,36 @@ class CapacityPlanner:
         }
         self._last_cycle_ts = int(time.time())
 
-        # 4. Close worst losers (up to max_closes_per_cycle)
+        # 4. Defibrillate stagnant losers (bounded; budget/capex enforced in rebalancer)
+        defibrillations_this_cycle = 0
+        defibrillation_limit = self._defibrillation_limit(cfg)
+        defibrillate = [l for l in losers if l.get("action") == "DEFIBRILLATE"]
+        sorted_defibrillate = sorted(defibrillate, key=lambda x: x.get("marginal_roi", 0))
+        for loser in sorted_defibrillate:
+            if defibrillations_this_cycle >= defibrillation_limit:
+                break
+
+            scid = loser.get("scid")
+            peer_id = loser.get("peer_id")
+
+            cooldown_ok, cooldown_reason = self._check_cooldown(peer_id)
+            if not cooldown_ok:
+                summary["skipped_reasons"].append(
+                    f"Defibrillation cooldown for {scid}: {cooldown_reason}"
+                )
+                continue
+
+            result = self._execute_defibrillation(scid, peer_id, cfg, loser.get("reason", ""))
+            summary["defibrillations"].append({
+                "scid": scid,
+                "peer_id": peer_id,
+                "reason": loser.get("reason", ""),
+                "action_id": result.get("action_id"),
+                "status": result.get("status", "unknown"),
+            })
+            defibrillations_this_cycle += 1
+
+        # 5. Close worst losers (up to max_closes_per_cycle)
         close_execution_enabled = self._close_execution_enabled(cfg)
         closes_this_cycle = 0
         configured_close_limit = getattr(cfg, "planner_max_closes_per_cycle", 0)
@@ -316,7 +359,7 @@ class CapacityPlanner:
             })
             closes_this_cycle += 1
 
-        # 5. Check portfolio balance before opening
+        # 6. Check portfolio balance before opening
         portfolio_state = "healthy"
         try:
             peer_channels = (self.data_service.get_peer_channels() if self.data_service else self.plugin.rpc.listpeerchannels()).get("channels", [])
@@ -328,7 +371,7 @@ class CapacityPlanner:
         except Exception as e:
             self.plugin.log(f"Portfolio balance check failed: {e}", level='debug')
 
-        # 6. Discover and open channels (up to max_opens_per_cycle)
+        # 7. Discover and open channels (up to max_opens_per_cycle)
         candidates = []
         # Reset funding coordination before evaluating opens
         self._last_funding_deficit_sats = 0
@@ -446,10 +489,10 @@ class CapacityPlanner:
                             0, remaining_exploration_budget_sats - estimated_open_cost
                         )
 
-        # 6. Update candidate pool
+        # 8. Update candidate pool
         self._update_candidate_pool(candidates if fee_ok else [])
 
-        # 8. Evaluate recycling opportunities (works even when blocked)
+        # 9. Evaluate recycling opportunities (works even when blocked)
         if candidates and losers:
             recycle_plan = self._evaluate_recycle_opportunities(losers, candidates, cfg)
             if recycle_plan:
@@ -2437,6 +2480,86 @@ class CapacityPlanner:
             return False, "Policy unavailable"
 
         return True, "Close allowed"
+
+    def _execute_defibrillation(self, channel_id: str, peer_id: str, cfg, reason: str = "") -> Dict[str, Any]:
+        """Run a bounded diagnostic rebalance through the rebalancer."""
+        db = self.profitability.database if self.profitability else None
+        action_id = None
+        if db:
+            try:
+                action_id = db.record_planner_action(
+                    action_type="defibrillate",
+                    peer_id=peer_id,
+                    channel_id=channel_id,
+                    amount_sats=50_000,
+                    estimated_cost_sats=100,
+                    reason=reason,
+                )
+            except Exception as e:
+                self.plugin.log(f"Failed to record defibrillation action: {e}", level='warn')
+
+        if cfg.planner_dry_run:
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="dry_run")
+                except Exception:
+                    pass
+            self.plugin.log(
+                f"[DRY RUN] Would defibrillate {channel_id} "
+                f"(peer: {peer_id[:16]}..., reason: {reason})",
+                level='info',
+            )
+            return {
+                "action_id": action_id,
+                "status": "dry_run",
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+            }
+
+        if not self.rebalancer or not hasattr(self.rebalancer, "diagnostic_rebalance"):
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="failed")
+                except Exception:
+                    pass
+            return {
+                "action_id": action_id,
+                "status": "failed",
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "error": "rebalancer unavailable",
+            }
+
+        try:
+            result = self.rebalancer.diagnostic_rebalance(channel_id)
+            success = bool(result.get("success")) if isinstance(result, dict) else False
+            status = "completed" if success else "failed"
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status=status)
+                except Exception:
+                    pass
+            return {
+                "action_id": action_id,
+                "status": status,
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "message": result.get("message", "") if isinstance(result, dict) else "",
+            }
+        except Exception as e:
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="failed")
+                except Exception:
+                    pass
+            self.plugin.log(f"Defibrillation failed for {channel_id}: {e}", level='warn')
+            return {
+                "action_id": action_id,
+                "status": "failed",
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "error": str(e),
+            }
 
     def _execute_close(self, channel_id: str, peer_id: str, cfg, reason: str = "") -> Dict:
         """Close a channel: record action, gate on dry_run/recommendation mode, stop rebalancer, call close RPC."""

@@ -3333,6 +3333,7 @@ class TestDirectClose:
 def _make_cycle_cfg(planner_enabled=True, planner_max_opens_per_cycle=2,
                     planner_max_closes_per_cycle=2, planner_dry_run=False,
                     planner_execute_closes=False,
+                    planner_max_defibrillations_per_cycle=1,
                     planner_max_fee_rate_sat_vb=50.0, min_wallet_reserve=500000,
                     planner_min_channel_sats=500000, planner_max_channel_sats=10000000):
     """Create a mock config snapshot for execute_cycle tests."""
@@ -3342,6 +3343,7 @@ def _make_cycle_cfg(planner_enabled=True, planner_max_opens_per_cycle=2,
     cfg.planner_max_closes_per_cycle = planner_max_closes_per_cycle
     cfg.planner_dry_run = planner_dry_run
     cfg.planner_execute_closes = planner_execute_closes
+    cfg.planner_max_defibrillations_per_cycle = planner_max_defibrillations_per_cycle
     cfg.planner_max_fee_rate_sat_vb = planner_max_fee_rate_sat_vb
     cfg.min_wallet_reserve = min_wallet_reserve
     cfg.planner_min_channel_sats = planner_min_channel_sats
@@ -3442,13 +3444,92 @@ class TestExecuteCycle:
         result = planner.execute_cycle(cfg)
 
         assert "opens" in result
+        assert "defibrillations" in result
         assert "closes" in result
         assert "skipped_reasons" in result
         assert "timestamp" in result
         assert isinstance(result["opens"], list)
+        assert isinstance(result["defibrillations"], list)
         assert isinstance(result["closes"], list)
         assert isinstance(result["skipped_reasons"], list)
         assert isinstance(result["timestamp"], int)
+
+    def test_execute_cycle_runs_one_defibrillation_before_close(self):
+        """Defibrillation runs before closes and only once per cycle."""
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        planner._identify_winners = MagicMock(return_value=[])
+        planner._identify_losers = MagicMock(return_value=[
+            {
+                "scid": "100x1x0",
+                "peer_id": "02" + "a" * 64,
+                "reason": "STAGNANT",
+                "action": "DEFIBRILLATE",
+                "marginal_roi": -10.0,
+            },
+            {
+                "scid": "200x1x0",
+                "peer_id": "03" + "b" * 64,
+                "reason": "ZOMBIE",
+                "action": "CLOSE",
+                "marginal_roi": -90.0,
+            },
+            {
+                "scid": "300x1x0",
+                "peer_id": "02" + "c" * 64,
+                "reason": "STAGNANT",
+                "action": "DEFIBRILLATE",
+                "marginal_roi": -20.0,
+            },
+        ])
+
+        order = []
+        planner.rebalancer = MagicMock()
+        planner.rebalancer.diagnostic_rebalance.side_effect = lambda scid: order.append(f"defib:{scid}") or {
+            "success": True,
+            "message": "shock completed",
+        }
+        planner._execute_close = MagicMock(side_effect=lambda scid, peer_id, cfg, reason: order.append(f"close:{scid}") or {
+            "action_id": 9,
+            "status": "completed",
+        })
+
+        cfg = _make_cycle_cfg(planner_execute_closes=True, planner_max_closes_per_cycle=1)
+
+        result = planner.execute_cycle(cfg)
+
+        assert order == ["defib:300x1x0", "close:200x1x0"]
+        assert len(result["defibrillations"]) == 1
+        assert result["defibrillations"][0]["scid"] == "300x1x0"
+        assert result["defibrillations"][0]["status"] == "completed"
+        assert len(result["closes"]) == 1
+        assert result["closes"][0]["scid"] == "200x1x0"
+
+    def test_execute_cycle_defibrillation_respects_cooldown(self):
+        """Defibrillation should reuse planner cooldown checks."""
+        scid = "100x200x0"
+        peer_id = "02" + "d" * 64
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        planner._identify_winners = MagicMock(return_value=[])
+        planner._identify_losers = MagicMock(return_value=[
+            {
+                "scid": scid,
+                "peer_id": peer_id,
+                "reason": "STAGNANT",
+                "action": "DEFIBRILLATE",
+                "marginal_roi": -20.0,
+            }
+        ])
+        planner.rebalancer = MagicMock()
+
+        prof.database.get_recent_planner_actions.return_value = [
+            {"peer_id": peer_id, "action": "defibrillate", "timestamp": int(time.time())},
+        ]
+
+        result = planner.execute_cycle(_make_cycle_cfg())
+
+        assert result["defibrillations"] == []
+        assert any("cooldown" in reason.lower() for reason in result["skipped_reasons"])
+        planner.rebalancer.diagnostic_rebalance.assert_not_called()
 
     def test_execute_cycle_opens_best_candidate(self):
         """Cycle opens channel to highest-scoring candidate when guards pass."""

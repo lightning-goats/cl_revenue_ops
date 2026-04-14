@@ -218,6 +218,63 @@ def test_planner_cycle_limits_are_parsed_during_init(monkeypatch):
     assert cfg.planner_max_closes_per_cycle == 2
 
 
+def test_init_wires_rebalancer_back_into_capacity_planner(monkeypatch):
+    mod = load_plugin_module()
+    mod.shutdown_event.clear()
+
+    options = _default_plugin_options(mod)
+    fake_db = MagicMock()
+    fake_db.initialize.return_value = None
+    fake_db.cleanup_stale_reservations.return_value = 0
+    fake_db.get_latest_forward_timestamp.return_value = None
+    fake_db.bulk_insert_forwards.return_value = 0
+    fake_db.has_recent_connection_history.return_value = False
+    fake_db.record_connection_event.return_value = None
+    fake_db.get_all_config_overrides.return_value = {}
+    fake_db.get_config_version.return_value = 0
+
+    fake_rpc = MagicMock()
+    fake_rpc.plugin.return_value = {"plugins": []}
+    fake_rpc.listplugins.return_value = {"plugins": []}
+    fake_rpc.listforwards.return_value = {"forwards": []}
+    fake_rpc.listpeers.return_value = {"peers": []}
+    fake_rpc.listconfigs.return_value = {"configs": {}}
+
+    fake_proxy = MagicMock()
+    fake_proxy.rpc = fake_rpc
+    fake_proxy._executor = MagicMock()
+    fake_proxy._async_executor = MagicMock()
+
+    planner_mock = MagicMock()
+    planner_mock.rebalancer = None
+    rebalancer_mock = MagicMock(
+        set_profitability_analyzer=MagicMock(),
+        set_capacity_planner=MagicMock(),
+    )
+
+    class DummyThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(mod, "ThreadSafePluginProxy", lambda plugin: fake_proxy)
+    monkeypatch.setattr(mod, "Database", lambda *args, **kwargs: fake_db)
+    monkeypatch.setattr(mod, "PolicyManager", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "ChannelProfitabilityAnalyzer", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "FlowAnalyzer", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "CapacityPlanner", lambda *args, **kwargs: planner_mock)
+    monkeypatch.setattr(mod, "FeeController", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(mod, "EVRebalancer", lambda *args, **kwargs: rebalancer_mock)
+    monkeypatch.setattr(mod, "BoltzCliManager", lambda *args, **kwargs: MagicMock(enabled=False))
+    monkeypatch.setattr(mod.threading, "Thread", DummyThread)
+
+    mod.init(options, {}, mod.plugin)
+
+    assert planner_mock.rebalancer is rebalancer_mock
+
+
 def test_init_logs_sling_backed_rebalancing(monkeypatch):
     mod = load_plugin_module()
     _run_init_with_stubbed_dependencies(mod, monkeypatch)
