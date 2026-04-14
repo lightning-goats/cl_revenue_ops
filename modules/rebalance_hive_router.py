@@ -141,6 +141,10 @@ class RebalanceHiveRouter:
             layers.append("auto.no_mpp_support")
         return layers
 
+    @staticmethod
+    def _is_unknown_layer_error(exc: Exception) -> bool:
+        return "unknown layer" in str(exc).lower()
+
     def _invoice_final_cltv(self) -> int:
         try:
             configs = self._get_configs().get("configs", {})
@@ -268,18 +272,30 @@ class RebalanceHiveRouter:
 
         try:
             with self._exclude_layer(merged_excludes) as exclude_layer:
+                route_kwargs = {
+                    "source": self.our_node_id,
+                    "destination": pair.dest_peer_id,
+                    "amount_msat": required_amount_msat,
+                    "maxfee_msat": max_fee_msat,
+                    "final_cltv": required_cltv,
+                    "maxparts": 1,
+                }
                 active_layers = list(layers)
                 if exclude_layer is not None:
                     active_layers.append(exclude_layer)
-                result = self._get_routes(
-                    source=self.our_node_id,
-                    destination=pair.dest_peer_id,
-                    amount_msat=required_amount_msat,
-                    layers=active_layers,
-                    maxfee_msat=max_fee_msat,
-                    final_cltv=required_cltv,
-                    maxparts=1,
-                )
+                route_kwargs["layers"] = active_layers
+                try:
+                    result = self._get_routes(**route_kwargs)
+                except Exception as e:
+                    if not self._is_unknown_layer_error(e):
+                        raise
+                    refreshed_layers = self._current_layers()
+                    if exclude_layer is not None:
+                        refreshed_layers.append(exclude_layer)
+                    if refreshed_layers == active_layers:
+                        raise
+                    route_kwargs["layers"] = refreshed_layers
+                    result = self._get_routes(**route_kwargs)
         except Exception as e:
             return RouteResult(success=False, error=f"no_fleet_route: {e}")
 
