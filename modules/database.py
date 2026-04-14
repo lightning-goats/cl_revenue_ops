@@ -387,6 +387,23 @@ class Database:
             finally:
                 self._local.conn = None
 
+    def get_confirmed_onchain_sats(self) -> int:
+        """Return confirmed on-chain wallet outputs in sats from CLN listfunds."""
+        try:
+            lf = self.plugin.rpc.listfunds()
+        except Exception as e:
+            self.plugin.log(f"Database: listfunds failed for onchain balance: {e}", level='debug')
+            return 0
+
+        outputs = lf.get("outputs", []) if isinstance(lf, dict) else []
+        total_sats = 0
+        for output in outputs:
+            if str(output.get("status") or "") != "confirmed":
+                continue
+            amount_msat = output.get("amount_msat", 0)
+            total_sats += base_to_sats_floor(amount_msat)
+        return int(total_sats)
+
     # =========================================================================
     # Security: Input Validation Constants and Methods (Accounting v2.0)
     # =========================================================================

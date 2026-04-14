@@ -58,6 +58,7 @@ from modules.capex_budget import (
     MSAT_PER_SAT,
 )
 from modules.capital_efficiency import ChannelEfficiency, FleetEfficiency
+from modules.database import Database
 
 
 def _make_engine(
@@ -140,6 +141,24 @@ class TestEngineConstruction:
         assert isinstance(alloc.fleet_exploration_budget_sats, int)
         assert isinstance(alloc.tactical_budget_sats, int)
         assert alloc.priority_class in ("defensive", "preservation", "operational", "growth")
+
+
+class TestDatabaseOnchainBalance:
+    """Database adapter exposes confirmed onchain balance for capex budgeting."""
+
+    def test_get_confirmed_onchain_sats_sums_confirmed_outputs(self):
+        plugin = MagicMock()
+        plugin.rpc.listfunds.return_value = {
+            "outputs": [
+                {"status": "confirmed", "amount_msat": 2_000_000_000},
+                {"status": "confirmed", "amount_msat": 3_500_000_000},
+                {"status": "unconfirmed", "amount_msat": 9_000_000_000},
+            ]
+        }
+
+        db = Database(":memory:", plugin)
+
+        assert db.get_confirmed_onchain_sats() == 5_500_000
 
 
 def _make_mock_profitability(
