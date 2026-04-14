@@ -68,9 +68,14 @@ class HiveHintAdapter:
             ds = self.data_service.list_datastore(["hive", "hints"]) if self.data_service else self._plugin.rpc.listdatastore(key=["hive", "hints"])
             entries = ds.get("datastore", [])
             if entries:
-                data_str = entries[0].get("string", "")
+                entry = entries[0]
+                data_str = entry.get("string", "")
                 if data_str:
                     raw = _json.loads(data_str)
+                else:
+                    data_hex = entry.get("hex", "")
+                    if data_hex:
+                        raw = _json.loads(bytes.fromhex(data_hex).decode())
         except Exception:
             pass
 

@@ -1,5 +1,6 @@
 """Tests for hive_hints adapter module."""
 
+import json
 import time
 import pytest
 from unittest.mock import MagicMock
@@ -184,6 +185,34 @@ class TestPolling:
 
         assert adapter._snapshot == live_snapshot
         assert adapter.is_hive_member("02fresh") is True
+
+    def test_poll_reads_hex_encoded_datastore_snapshot_without_rpc_fallback(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.data_service = MagicMock()
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02fresh": {
+                    "member": True,
+                    "traffic_confidence": 0.5,
+                    "corridor_role": "owner",
+                }
+            },
+        }
+        adapter.data_service.list_datastore.return_value = {
+            "datastore": [
+                {
+                    "hex": json.dumps(snapshot).encode().hex()
+                }
+            ]
+        }
+
+        adapter.poll()
+
+        assert adapter._snapshot == snapshot
+        assert adapter.is_hive_member("02fresh") is True
+        mock_plugin.rpc.call.assert_not_called()
 
 
 class TestTTL:
