@@ -46,6 +46,14 @@ class RebalanceHiveRouter:
     """Price full-path hive routes for active-engine rebalancing."""
 
     _exclude_counter = 0
+    ROUTE_LAYER_NAMES = {
+        "revenue-local",
+        "hive-observed-liquidity",
+        "hive-traffic",
+        "hive-corridors",
+        "hive-reputation",
+        "hive-fleet",
+    }
 
     def __init__(
         self,
@@ -133,7 +141,7 @@ class RebalanceHiveRouter:
             existing = self._get_askrene_layers()
             for layer in existing.get("layers", []):
                 name = str(layer.get("layer") or "")
-                if name.startswith("hive-") or name.startswith("revenue-"):
+                if name in self.ROUTE_LAYER_NAMES:
                     layers.append(name)
         except Exception:
             pass

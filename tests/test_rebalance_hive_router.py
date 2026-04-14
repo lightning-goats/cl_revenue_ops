@@ -120,6 +120,73 @@ def test_hive_router_uses_all_live_hive_and_revenue_layers():
     ]
 
 
+def test_hive_router_excludes_expansion_test_layers_from_live_routes():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    data_service.get_askrene_layers.return_value = {"layers": [
+        {"layer": "hive-expansion-test-should-not-route"},
+        {"layer": "hive-fleet"},
+        {"layer": "revenue-local"},
+    ]}
+    data_service.get_peer_channels.side_effect = lambda peer_id=None: (
+        {
+            "channels": [{
+                "short_channel_id": "100x1x0",
+                "peer_id": SRC_PEER,
+                "state": "CHANNELD_NORMAL",
+            }]
+        }
+        if peer_id is None
+        else {
+            "channels": [{
+                "short_channel_id": "200x1x0",
+                "peer_id": DST_PEER,
+                "updates": {"remote": {
+                    "fee_base_msat": 0,
+                    "fee_proportional_millionths": 0,
+                    "cltv_expiry_delta": 6,
+                }},
+            }]
+        }
+    )
+    data_service.get_configs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000000,
+            "path": [{
+                "short_channel_id_dir": "100x1x0/0",
+                "next_node_id": DST_PEER,
+                "amount_msat": 100000000,
+                "delay": 18,
+            }],
+        }],
+    }
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    result = router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+
+    assert result.success is True
+    assert data_service.get_routes.call_args.kwargs["layers"] == [
+        "auto.localchans",
+        "hive-fleet",
+        "revenue-local",
+        "auto.no_mpp_support",
+    ]
+
+
 def test_hive_router_rejects_non_hive_intermediate_for_hive_only():
     from modules.rebalance_hive_router import RebalanceHiveRouter
 
@@ -224,18 +291,13 @@ def test_hive_router_retries_once_when_expansion_layers_rotate():
     data_service.get_askrene_layers.side_effect = [
         {
             "layers": [
-                {"layer": "hive-expansion-test-old-a"},
-                {"layer": "hive-expansion-test-old-b"},
                 {"layer": "hive-fleet"},
                 {"layer": "revenue-local"},
             ]
         },
         {
             "layers": [
-                {"layer": "hive-expansion-test-new-a"},
-                {"layer": "hive-expansion-test-new-b"},
                 {"layer": "hive-fleet"},
-                {"layer": "revenue-local"},
             ]
         },
     ]
@@ -279,6 +341,5 @@ def test_hive_router_retries_once_when_expansion_layers_rotate():
     assert result.success is True
     first_layers = data_service.get_routes.call_args_list[0].kwargs["layers"]
     second_layers = data_service.get_routes.call_args_list[1].kwargs["layers"]
-    assert "hive-expansion-test-old-a" in first_layers
-    assert "hive-expansion-test-new-a" in second_layers
-    assert "hive-expansion-test-old-a" not in second_layers
+    assert "revenue-local" in first_layers
+    assert "revenue-local" not in second_layers
