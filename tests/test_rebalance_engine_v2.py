@@ -302,6 +302,64 @@ def test_engine_falls_back_to_hive_equalization_when_hive_channels_have_no_budge
     )
 
 
+def test_hive_equalization_prefers_direct_same_peer_pair_when_scores_tie(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_state_v2 import build_state_snapshot
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._hive_router = MagicMock(name="hive_router")
+    engine._hive_router.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=0,
+        route=[{"channel": "fleet"}],
+        probability_ppm=0,
+        error="",
+    )
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=build_state_snapshot(
+            [
+                {
+                    "channel_id": "100x1x0",
+                    "peer_id": "02" + "1" * 64,
+                    "capacity_sats": 1_000_000,
+                    "local_sats": 900_000,
+                    "is_hive_member": True,
+                },
+                {
+                    "channel_id": "100x2x0",
+                    "peer_id": "02" + "2" * 64,
+                    "capacity_sats": 1_000_000,
+                    "local_sats": 900_000,
+                    "is_hive_member": True,
+                },
+                {
+                    "channel_id": "200x1x0",
+                    "peer_id": "02" + "2" * 64,
+                    "capacity_sats": 1_000_000,
+                    "local_sats": 100_000,
+                    "is_hive_member": True,
+                },
+            ],
+            {},
+        )
+    )
+
+    selected = engine.find_candidates()
+
+    assert len(selected) == 1
+    assert selected[0].reason_code == "hive_equalization"
+    assert selected[0].source_channel_id == "100x2x0"
+    assert selected[0].dest_channel_id == "200x1x0"
+    engine._hive_router.price_pair.assert_called_once()
+    engine.router_v3.price_pair.assert_not_called()
+
+
 def test_engine_execute_candidate_uses_router_and_executor(mock_plugin, mock_database):
     from modules.rebalance_executor_v2 import ExecutionResult
 

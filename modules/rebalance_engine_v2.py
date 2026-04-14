@@ -382,7 +382,7 @@ class RebalanceEngine:
             if source_excess <= 0:
                 continue
             for dest in hive_low:
-                if source.channel_id == dest.channel_id or source.peer_id == dest.peer_id:
+                if source.channel_id == dest.channel_id:
                     continue
                 dest_need = max(
                     0,
@@ -413,7 +413,11 @@ class RebalanceEngine:
                 )
 
         candidate_pairs.sort(
-            key=lambda pair: (-float(pair.score or 0.0), -int(pair.amount_sats or 0))
+            key=lambda pair: (
+                -float(pair.score or 0.0),
+                0 if pair.source_peer_id == pair.dest_peer_id else 1,
+                -int(pair.amount_sats or 0),
+            )
         )
 
         used_sources: set[str] = set()
