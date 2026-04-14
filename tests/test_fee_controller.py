@@ -615,7 +615,7 @@ class TestStartupHygiene:
         expected_configs = [
             ("sling-stats-delete-failures-age", 30),
             ("sling-stats-delete-successes-age", 30),
-            ("sling-candidates-min-age", 144),
+            ("sling-candidates-min-age", 0),
             ("sling-maxhops", 8),
             ("sling-depleteuptopercent", 0.2),
             ("sling-depleteuptoamount", 2_000_000_000),

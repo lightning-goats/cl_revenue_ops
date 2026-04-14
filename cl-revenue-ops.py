@@ -811,8 +811,8 @@ plugin.add_option(
 )
 plugin.add_option(
     name='revenue-ops-sling-candidates-min-age',
-    default='144',
-    description='Internal sling hygiene: minimum candidate age in blocks before rebalance use (default: 144)'
+    default='0',
+    description='Internal sling hygiene: minimum candidate age in days before rebalance use; 0 allows fresh channels (default: 0)'
 )
 plugin.add_option(
     name='revenue-ops-sling-stats-delete-failures-age',
@@ -1368,7 +1368,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
         planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
-        sling_candidates_min_age=_safe_int_opt('revenue-ops-sling-candidates-min-age', '144'),
+        sling_candidates_min_age=_safe_int_opt('revenue-ops-sling-candidates-min-age', '0'),
         sling_stats_delete_failures_age=_safe_int_opt('revenue-ops-sling-stats-delete-failures-age', '30'),
         sling_stats_delete_successes_age=_safe_int_opt('revenue-ops-sling-stats-delete-successes-age', '30'),
         sling_maxhops=_safe_int_opt('revenue-ops-sling-maxhops', '8'),

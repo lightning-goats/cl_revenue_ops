@@ -431,7 +431,7 @@ class Config:
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
     # Internal sling runtime hygiene
-    sling_candidates_min_age: int = 144
+    sling_candidates_min_age: int = 0
     sling_stats_delete_failures_age: int = 30
     sling_stats_delete_successes_age: int = 30
     sling_maxhops: int = 8
@@ -829,7 +829,7 @@ class ConfigSnapshot:
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0
     # Internal sling runtime hygiene
-    sling_candidates_min_age: int = 144
+    sling_candidates_min_age: int = 0
     sling_stats_delete_failures_age: int = 30
     sling_stats_delete_successes_age: int = 30
     sling_maxhops: int = 8
