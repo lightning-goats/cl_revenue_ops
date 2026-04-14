@@ -40,6 +40,7 @@ from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
 from modules.hive_hints import HiveHintAdapter
 from modules.hive_router import HiveRouter
+from modules.hive_runtime import refresh_hive_runtime
 from modules.policy_manager import (
     PolicyManager,
     FeeStrategy,
@@ -1837,6 +1838,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
         
         while not shutdown_event.is_set():
+            try:
+                refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
+            except Exception:
+                pass  # fail-open
             try:
                 plugin.log("Running scheduled rebalance check...")
                 run_rebalance_check()
