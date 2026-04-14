@@ -248,7 +248,7 @@ class TestPolling:
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
         adapter.data_service = MagicMock()
         snapshot = {
-            "generated_at": int(time.time()) - 5000,
+            "generated_at": int(time.time()) - 25000,
             "ttl_seconds": 900,
             "hints": {
                 "02ancient": {

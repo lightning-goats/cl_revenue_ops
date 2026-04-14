@@ -40,8 +40,8 @@ class HiveHintAdapter:
     """Adapter that reads cl_hive fleet hints and exposes bounded bias lookups."""
 
     VALID_CORRIDOR_ROLES = {"owner", "secondary", "contested", "none"}
-    STALE_FALLBACK_MIN_SECONDS = 3600
-    STALE_FALLBACK_TTL_MULTIPLIER = 4
+    STALE_FALLBACK_MIN_SECONDS = 6 * 3600
+    STALE_FALLBACK_TTL_MULTIPLIER = 24
 
     def __init__(self, plugin, ttl_override: int = 0):
         self._plugin = plugin
