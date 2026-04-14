@@ -1049,8 +1049,8 @@ class PolicyManager:
         - tag='corridor_owner' for identification
 
         Fleet members get:
-        - strategy=HIVE (0-fee fleet policy)
-        - rebalance_mode=ENABLED
+        - no stored fee policy
+        - dedicated hint-driven 0-fee handling in the fee controller
 
         Only applies to peers without explicit manual policies.
         Returns count of policies applied.
@@ -1078,16 +1078,12 @@ class PolicyManager:
                 corridor_role = self.hive_hints.get_corridor_role(peer_id)
 
                 if is_member:
-                    # Fleet members: STATIC 0-fee policy
-                    if not (current.tags and "auto_fleet" in current.tags):
-                        self.set_policy(
-                            peer_id,
-                            strategy=FeeStrategy.STATIC.value,
-                            fee_ppm_target=0,
-                            rebalance_mode=RebalanceMode.ENABLED.value,
-                            tags=["corridor_owner", "auto_fleet"],
-                        )
-                        applied += 1
+                    # Fleet members use the dedicated hint-driven 0-PPM path.
+                    # Remove legacy auto_fleet policies so min-fee clamps do not
+                    # override the controller's enforce_limits=False handling.
+                    if current.tags and "auto_fleet" in current.tags:
+                        if self.delete_policy(peer_id):
+                            applied += 1
                 elif corridor_role == "owner":
                     # Corridor owners: DYNAMIC + protected
                     if not (current.tags and "corridor_owner" in current.tags):

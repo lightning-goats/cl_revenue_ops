@@ -214,6 +214,73 @@ class TestPolicyChangesAPI:
         assert "updated_at" in d
 
 
+class TestCorridorAutoPolicies:
+    """Test corridor-aware automatic policy behavior."""
+
+    def test_hive_member_does_not_create_static_zero_fee_policy(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """Hive members should use the hint-driven zero-fee path without stored static policy."""
+        pm = PolicyManager(mock_database, mock_plugin)
+        peer_id = sample_peer_ids[0]
+
+        pm.hive_hints = MagicMock()
+        pm.hive_hints.is_hive_member.return_value = True
+        pm.hive_hints.get_corridor_role.return_value = "owner"
+        pm.data_service = MagicMock()
+        pm.data_service.get_peer_channels.return_value = {
+            "channels": [{"peer_id": peer_id, "state": "CHANNELD_NORMAL"}]
+        }
+
+        applied = pm.apply_corridor_policies()
+
+        policy = pm.get_policy(peer_id)
+        assert applied == 0
+        assert policy.peer_id == peer_id
+        assert policy.strategy == FeeStrategy.DYNAMIC
+        assert policy.rebalance_mode == RebalanceMode.ENABLED
+        assert policy.fee_ppm_target is None
+        assert policy.tags == []
+        mock_database.set_policy.assert_not_called()
+
+    def test_hive_member_deletes_legacy_auto_fleet_policy(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """Legacy auto_fleet static policies are removed once a peer is recognized as a Hive member."""
+        pm = PolicyManager(mock_database, mock_plugin)
+        peer_id = sample_peer_ids[0]
+        mock_database.delete_policy.return_value = True
+
+        pm.set_policy(
+            peer_id,
+            strategy="static",
+            fee_ppm_target=0,
+            rebalance_mode="enabled",
+            tags=["corridor_owner", "auto_fleet"],
+        )
+        mock_database.set_policy.reset_mock()
+
+        pm.hive_hints = MagicMock()
+        pm.hive_hints.is_hive_member.return_value = True
+        pm.hive_hints.get_corridor_role.return_value = "owner"
+        pm.data_service = MagicMock()
+        pm.data_service.get_peer_channels.return_value = {
+            "channels": [{"peer_id": peer_id, "state": "CHANNELD_NORMAL"}]
+        }
+
+        applied = pm.apply_corridor_policies()
+
+        policy = pm.get_policy(peer_id)
+        assert applied == 1
+        assert policy.peer_id == peer_id
+        assert policy.strategy == FeeStrategy.DYNAMIC
+        assert policy.rebalance_mode == RebalanceMode.ENABLED
+        assert policy.fee_ppm_target is None
+        assert policy.tags == []
+        mock_database.delete_policy.assert_called_once_with(peer_id)
+        mock_database.set_policy.assert_not_called()
+
+
 class TestRateLimiting:
     """Test policy change rate limiting."""
 
