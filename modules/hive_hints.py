@@ -40,12 +40,15 @@ class HiveHintAdapter:
     """Adapter that reads cl_hive fleet hints and exposes bounded bias lookups."""
 
     VALID_CORRIDOR_ROLES = {"owner", "secondary", "contested", "none"}
+    STALE_FALLBACK_MIN_SECONDS = 3600
+    STALE_FALLBACK_TTL_MULTIPLIER = 4
 
     def __init__(self, plugin, ttl_override: int = 0):
         self._plugin = plugin
         self._ttl_override = ttl_override
         self._snapshot = None
         self._snapshot_fetched_at = 0
+        self._using_stale_fallback = False
         self.data_service = None
 
     # ------------------------------------------------------------------
@@ -80,24 +83,44 @@ class HiveHintAdapter:
             pass
 
         candidate = self._validate_and_normalize_snapshot(raw)
-        if candidate is None or not self._snapshot_is_fresh(candidate):
+        stale_candidate = (
+            candidate
+            if candidate is not None and not self._snapshot_is_fresh(candidate)
+            else None
+        )
+        if candidate is None or stale_candidate is not None:
             try:
                 raw = self._plugin.rpc.call("hive-export-hints")
             except Exception as e:
                 self._plugin.log(f"HIVE_HINTS: poll failed: {e}", level='debug')
+                if stale_candidate is not None and self._snapshot_is_recent_enough_for_fallback(stale_candidate):
+                    self._snapshot = stale_candidate
+                    self._snapshot_fetched_at = int(time.time())
+                    self._using_stale_fallback = True
                 return
             candidate = self._validate_and_normalize_snapshot(raw)
 
         if candidate is None:
+            if stale_candidate is not None and self._snapshot_is_recent_enough_for_fallback(stale_candidate):
+                self._snapshot = stale_candidate
+                self._snapshot_fetched_at = int(time.time())
+                self._using_stale_fallback = True
+                return
             self._plugin.log("HIVE_HINTS: invalid snapshot schema, ignoring", level='debug')
             return
 
         if not self._snapshot_is_fresh(candidate):
+            if stale_candidate is not None and self._snapshot_is_recent_enough_for_fallback(stale_candidate):
+                self._snapshot = stale_candidate
+                self._snapshot_fetched_at = int(time.time())
+                self._using_stale_fallback = True
+                return
             self._plugin.log("HIVE_HINTS: stale snapshot, ignoring", level='debug')
             return
 
         self._snapshot = candidate
         self._snapshot_fetched_at = int(time.time())
+        self._using_stale_fallback = False
 
     @staticmethod
     def _validate_snapshot(raw) -> bool:
@@ -148,12 +171,25 @@ class HiveHintAdapter:
     def is_fresh(self) -> bool:
         return self._snapshot_is_fresh(self._snapshot)
 
+    def _snapshot_is_recent_enough_for_fallback(self, snapshot: dict | None) -> bool:
+        if snapshot is None:
+            return False
+        age = int(time.time()) - int(snapshot.get("generated_at", 0))
+        max_age = max(
+            self.STALE_FALLBACK_MIN_SECONDS,
+            self._effective_ttl_for(snapshot) * self.STALE_FALLBACK_TTL_MULTIPLIER,
+        )
+        return age <= max_age
+
+    def is_usable(self) -> bool:
+        return self.is_fresh() or self._using_stale_fallback
+
     # ------------------------------------------------------------------
     # Peer hint lookup
     # ------------------------------------------------------------------
 
     def _get_peer_hint(self, peer_id: str) -> dict:
-        if not self.is_fresh():
+        if not self.is_usable():
             return {}
         hints = self._snapshot.get("hints", {})
         hint = hints.get(peer_id, {})
@@ -196,7 +232,7 @@ class HiveHintAdapter:
         return normalized
 
     def _get_section_entries(self, section_name: str, validator) -> list:
-        if not self.is_fresh():
+        if not self.is_usable():
             return []
         section = self._snapshot.get(section_name, [])
         if not isinstance(section, list):
@@ -694,6 +730,8 @@ class HiveHintAdapter:
         hints = self._snapshot.get("hints", {})
         return {
             "snapshot_fresh": self.is_fresh(),
+            "snapshot_usable": self.is_usable(),
+            "stale_fallback": self._using_stale_fallback,
             "snapshot_age_seconds": age,
             "hints_count": len(hints),
         }

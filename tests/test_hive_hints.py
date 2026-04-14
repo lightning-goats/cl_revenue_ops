@@ -214,6 +214,60 @@ class TestPolling:
         assert adapter.is_hive_member("02fresh") is True
         mock_plugin.rpc.call.assert_not_called()
 
+    def test_poll_uses_recent_stale_datastore_snapshot_when_rpc_refresh_fails(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.data_service = MagicMock()
+        snapshot = {
+            "generated_at": int(time.time()) - 2000,
+            "ttl_seconds": 900,
+            "hints": {
+                "02stale": {
+                    "member": True,
+                    "traffic_confidence": 0.5,
+                    "corridor_role": "owner",
+                }
+            },
+        }
+        adapter.data_service.list_datastore.return_value = {
+            "datastore": [{"string": json.dumps(snapshot)}]
+        }
+        mock_plugin.rpc.call.side_effect = Exception("timeout")
+
+        adapter.poll()
+
+        assert adapter._snapshot == snapshot
+        assert adapter.is_fresh() is False
+        assert adapter.is_usable() is True
+        assert adapter.is_hive_member("02stale") is True
+        status = adapter.get_status()
+        assert status["snapshot_fresh"] is False
+        assert status["snapshot_usable"] is True
+        assert status["stale_fallback"] is True
+
+    def test_poll_ignores_ancient_stale_datastore_snapshot_when_rpc_refresh_fails(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.data_service = MagicMock()
+        snapshot = {
+            "generated_at": int(time.time()) - 5000,
+            "ttl_seconds": 900,
+            "hints": {
+                "02ancient": {
+                    "member": True,
+                    "traffic_confidence": 0.5,
+                    "corridor_role": "owner",
+                }
+            },
+        }
+        adapter.data_service.list_datastore.return_value = {
+            "datastore": [{"string": json.dumps(snapshot)}]
+        }
+        mock_plugin.rpc.call.side_effect = Exception("timeout")
+
+        adapter.poll()
+
+        assert adapter._snapshot is None
+        assert adapter.is_usable() is False
+
 
 class TestTTL:
     def test_fresh_snapshot(self, mock_plugin):
