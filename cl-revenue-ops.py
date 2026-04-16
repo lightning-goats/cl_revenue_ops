@@ -59,6 +59,9 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.4.1: Release Metadata Alignment
+#   - Patch release so the published tag contains the declared plugin version
+#   - Keeps repo version metadata aligned with GitHub release state
 # v2.4.0: Sling Mainline + Fleet Equalization
 #   - Sling rebalancer stack ported to main
 #   - Promoted segment hints consumed in the v3 rebalancer
@@ -69,7 +72,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.4.0"
+PLUGIN_VERSION = "2.4.1"
 
 
 # =============================================================================
