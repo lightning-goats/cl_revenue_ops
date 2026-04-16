@@ -602,33 +602,23 @@ class TestSuccessRateAdjustedFloor:
 
 
 class TestStartupHygiene:
-    """Test sling startup hygiene: setconfig calls for stats retention."""
+    """Test sling startup hygiene: inspect-only restart-safe behavior."""
 
-    def test_setconfig_called_for_sling_hygiene(self, monkeypatch):
-        """Verify init applies the owned sling runtime hygiene values."""
+    def test_startup_hygiene_logs_restart_safe_drift_without_setconfig(self, monkeypatch):
+        """Verify init does not persist unsafe sling-* overrides via setconfig."""
         from tests.plugin_test_utils import load_plugin_module
         from tests.test_operator_surface import _run_init_with_stubbed_dependencies
 
         mod = load_plugin_module()
         _run_init_with_stubbed_dependencies(mod, monkeypatch)
 
-        expected_configs = [
-            ("sling-stats-delete-failures-age", 30),
-            ("sling-stats-delete-successes-age", 30),
-            ("sling-candidates-min-age", 0),
-            ("sling-maxhops", 8),
-            ("sling-depleteuptopercent", 0.2),
-            ("sling-depleteuptoamount", 2_000_000_000),
-        ]
-        actual_configs = [
-            (call.kwargs.get("config"), call.kwargs.get("val"))
-            for call in mod._test_fake_rpc.setconfig.call_args_list
-        ]
+        assert mod._test_fake_rpc.setconfig.call_count == 0
+        messages = [call.args[0] for call in mod.plugin.log.call_args_list if call.args]
+        assert any("Skipping unsafe sling startup hygiene persistence" in message for message in messages)
+        assert any("sling-maxhops=<unknown>->8" in message for message in messages)
 
-        assert actual_configs == expected_configs
-
-    def test_setconfig_uses_loaded_sling_overrides(self, monkeypatch):
-        """Persisted overrides must drive the applied sling hygiene values."""
+    def test_startup_hygiene_surfaces_loaded_override_drift(self, monkeypatch):
+        """Loaded mirrored overrides should appear in the drift log."""
         from tests.plugin_test_utils import load_plugin_module
         from tests.test_operator_surface import _run_init_with_stubbed_dependencies
 
@@ -643,34 +633,37 @@ class TestStartupHygiene:
             },
         )
 
-        actual_configs = [
-            (call.kwargs.get("config"), call.kwargs.get("val"))
-            for call in mod._test_fake_rpc.setconfig.call_args_list
-        ]
+        assert mod._test_fake_rpc.setconfig.call_count == 0
+        messages = [call.args[0] for call in mod.plugin.log.call_args_list if call.args]
+        assert any("sling-candidates-min-age=<unknown>->288" in message for message in messages)
+        assert any("sling-maxhops=<unknown>->6" in message for message in messages)
+        assert any("sling-depleteuptopercent=<unknown>->0.4" in message for message in messages)
 
-        assert ("sling-candidates-min-age", 288) in actual_configs
-        assert ("sling-maxhops", 6) in actual_configs
-        assert ("sling-depleteuptopercent", 0.4) in actual_configs
-
-    def test_setconfig_failure_logs_warning_without_aborting_init(self, monkeypatch):
-        """Setconfig failures should warn and allow init to finish."""
+    def test_startup_hygiene_reports_already_aligned_values(self, monkeypatch):
+        """Aligned sling config should log info and avoid drift warnings."""
         from tests.plugin_test_utils import load_plugin_module
         from tests.test_operator_surface import _run_init_with_stubbed_dependencies
 
         mod = load_plugin_module()
-
-        def _rpc_mutator(fake_rpc):
-            fake_rpc.setconfig.side_effect = Exception("boom")
-
         cfg = _run_init_with_stubbed_dependencies(
             mod,
             monkeypatch,
-            rpc_mutator=_rpc_mutator,
+            listconfigs_payload={
+                "configs": {
+                    "sling-stats-delete-failures-age": {"value_int": 30},
+                    "sling-stats-delete-successes-age": {"value_int": 30},
+                    "sling-candidates-min-age": {"value_int": 0},
+                    "sling-maxhops": {"value_int": 8},
+                    "sling-depleteuptopercent": {"value_str": "0.2"},
+                    "sling-depleteuptoamount": {"value_int": 2_000_000_000},
+                }
+            },
         )
 
         assert cfg is mod.config
         messages = [call.args[0] for call in mod.plugin.log.call_args_list if call.args]
-        assert any("Sling startup hygiene failed" in message for message in messages)
+        assert any("Sling runtime hygiene already satisfied" in message for message in messages)
+        assert not any("Skipping unsafe sling startup hygiene persistence" in message for message in messages)
 
     def test_init_skips_sling_hygiene_when_node_exposes_no_sling_keys(self, monkeypatch):
         """Nodes without sling config should skip hygiene quietly instead of warning per key."""
@@ -687,7 +680,7 @@ class TestStartupHygiene:
         assert mod._test_fake_rpc.setconfig.call_count == 0
         messages = [call.args[0] for call in mod.plugin.log.call_args_list if call.args]
         assert any("Skipping sling startup hygiene" in message for message in messages)
-        assert not any("Sling startup hygiene failed" in message for message in messages)
+        assert not any("Skipping unsafe sling startup hygiene persistence" in message for message in messages)
 
 
 class TestAuditRound8Regressions:
