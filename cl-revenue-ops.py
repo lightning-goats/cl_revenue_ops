@@ -59,18 +59,17 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
-# v2.3.0: Native Rebalance Executor + Askrene Routing Hardening
-#   - Native getroute+sendpay executor replaces sling for all rebalances
-#   - Fleet routing via getroutes with askrene layers
-#   - Askrene crash vector hardening (TOCTOU layer race)
-#   - Return hop fee accounting in fleet EV (no more askrene-fiction budgets)
-#   - Rebalance routing memory (transient bans + constraints across retries)
-#   - Fleet-first with network fallback retry strategy
-#   - Thread-safe RebalanceRoutingMemory for concurrent executor workers
+# v2.4.0: Sling Mainline + Fleet Equalization
+#   - Sling rebalancer stack ported to main
+#   - Promoted segment hints consumed in the v3 rebalancer
+#   - Hive equalization restored and expanded with hint-driven 0ppm paths
+#   - Pair cooldown persistence across restarts
+#   - Capex bootstrap and budget accounting hardening
+#   - Askrene layer refresh and stale-hint recovery improvements
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.3.0"
+PLUGIN_VERSION = "2.4.0"
 
 
 # =============================================================================
