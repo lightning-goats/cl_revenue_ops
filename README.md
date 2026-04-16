@@ -20,8 +20,8 @@
 
 - Route selection remains branch-specific: `rebalance_router=v3` keeps askrene and hive-layer path discovery, while `v2` keeps the legacy local router.
 - Regardless of router choice, live execution is `sling-once` plus `sling-stats` observation; the older internal `sendpay` rebalance executor path is no longer used on this branch.
-- At startup, `cl-revenue-ops` applies the subset of `sling-*` runtime hygiene it owns when those CLN config keys are exposed: stats retention, candidate age, max hops, and depletion guards.
-- The mirrored `revenue-ops-sling-*` plugin options exist so operators can pin those defaults in `lightningd` config without making them part of the normal runtime control surface.
+- At startup, `cl-revenue-ops` inspects the subset of `sling-*` runtime hygiene it owns and logs drift. It does not auto-apply those values via `setconfig` in dynamic-load CLN environments, because persisted plugin-owned `sling-*` keys can break restart.
+- The mirrored `revenue-ops-sling-*` plugin options remain internal defaults for diagnostics and drift reporting. If you need non-default live `sling-*` values, set the actual `sling-*` options directly in the node configuration that owns sling.
 
 ## Profitability Analysis
 

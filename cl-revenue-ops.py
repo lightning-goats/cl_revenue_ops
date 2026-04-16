@@ -1186,7 +1186,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
 # INITIALIZATION
 # =============================================================================
 def _apply_sling_startup_hygiene(rpc: Any, cfg: Config, plugin: Plugin) -> None:
-    """Apply the subset of sling runtime knobs owned by this plugin."""
+    """Inspect the subset of sling runtime knobs owned by this plugin."""
     desired = (
         ("sling-stats-delete-failures-age", cfg.sling_stats_delete_failures_age),
         ("sling-stats-delete-successes-age", cfg.sling_stats_delete_successes_age),
@@ -1202,7 +1202,7 @@ def _apply_sling_startup_hygiene(rpc: Any, cfg: Config, plugin: Plugin) -> None:
         plugin.log(f"Skipping sling startup hygiene: could not inspect config surface: {e}", level='debug')
         return
 
-    supported = {opt for opt, _ in desired if opt in configs}
+    supported = {opt: configs.get(opt, {}) for opt, _ in desired if opt in configs}
     if not supported:
         plugin.log(
             "Skipping sling startup hygiene: sling config keys are not exposed on this node",
@@ -1210,18 +1210,43 @@ def _apply_sling_startup_hygiene(rpc: Any, cfg: Config, plugin: Plugin) -> None:
         )
         return
 
-    applied = []
+    def _entry_value(entry: Any) -> Any:
+        if not isinstance(entry, dict):
+            return None
+        for field_name in ("value_bool", "value_int", "value_msat", "value_str"):
+            if field_name in entry:
+                return entry.get(field_name)
+        return None
+
+    def _serialize(value: Any) -> str:
+        if isinstance(value, bool):
+            return str(value).lower()
+        return str(value)
+
+    drift = []
+    aligned = []
     for opt, val in desired:
         if opt not in supported:
             continue
-        try:
-            rpc.setconfig(config=opt, val=val)
-            applied.append(f"{opt}={val}")
-        except Exception as e:
-            plugin.log(f"Sling startup hygiene failed for {opt}={val}: {e}", level='warn')
-    if applied:
+        current_value = _entry_value(supported[opt])
+        desired_value = _serialize(val)
+        current_serialized = _serialize(current_value) if current_value is not None else "<unknown>"
+        if current_value is not None and current_serialized == desired_value:
+            aligned.append(f"{opt}={desired_value}")
+        else:
+            drift.append(f"{opt}={current_serialized}->{desired_value}")
+
+    if drift:
         plugin.log(
-            "Applied sling runtime hygiene: " + ", ".join(applied),
+            "Skipping unsafe sling startup hygiene persistence: "
+            "dynamic-load CLN restarts reject persisted plugin-owned sling-* keys. "
+            "Inspect and set sling defaults directly if you need non-default values. "
+            "Drift: " + ", ".join(drift),
+            level='warn',
+        )
+    elif aligned:
+        plugin.log(
+            "Sling runtime hygiene already satisfied by current node config: " + ", ".join(aligned),
             level='info',
         )
 
