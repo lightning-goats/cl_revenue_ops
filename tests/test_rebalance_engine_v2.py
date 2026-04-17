@@ -912,6 +912,126 @@ def test_engine_failed_sling_execution_returns_original_failure_without_retry(
     executor.execute.assert_called_once()
 
 
+# Stage 2D Defect 3 regression tests: the v2 engine used to leave
+# rebalance_history empty on auto cycles, making revenue-status show
+# rebalance_decision.action='rebalance' alongside recent_rebalances=[].
+
+
+def test_engine_execute_pair_records_pending_then_success_in_rebalance_history(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.record_rebalance.return_value = 77
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        reason_code="ev_positive",
+        route=None,
+    )
+    executor = MagicMock()
+    executor.execute.return_value = ExecutionResult(
+        success=True,
+        amount_sats=50_000,
+        fee_sats=3,
+        fee_msat=3_000,
+    )
+
+    engine._execute_pair(pair, executor)
+
+    mock_database.record_rebalance.assert_called_once()
+    rkwargs = mock_database.record_rebalance.call_args.kwargs
+    assert rkwargs["from_channel"] == "100x1x0"
+    assert rkwargs["to_channel"] == "200x1x0"
+    assert rkwargs["amount_sats"] == 50_000
+    assert rkwargs["max_fee_sats"] == 10_000
+    assert rkwargs["status"] == "pending"
+    assert rkwargs["reason_code"] == "ev_positive"
+
+    mock_database.update_rebalance_result.assert_called_once()
+    uargs, ukwargs = mock_database.update_rebalance_result.call_args
+    assert uargs[0] == 77
+    assert uargs[1] == "success"
+    assert ukwargs.get("actual_fee_sats") == 3
+    assert ukwargs.get("actual_fee_msat") == 3_000
+
+
+def test_engine_execute_pair_records_failed_result_on_executor_failure(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.record_rebalance.return_value = 42
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=10_000,
+        pair_budget_sats=2_000,
+        reason_code="ev_positive",
+        route=None,
+    )
+    executor = MagicMock()
+    executor.execute.return_value = ExecutionResult(
+        success=False,
+        error="sling_preflight_error: no sling",
+    )
+
+    engine._execute_pair(pair, executor)
+
+    mock_database.record_rebalance.assert_called_once()
+    mock_database.update_rebalance_result.assert_called_once()
+    uargs, ukwargs = mock_database.update_rebalance_result.call_args
+    assert uargs[0] == 42
+    assert uargs[1] == "failed"
+    assert "sling_preflight_error" in (ukwargs.get("error_message") or "")
+
+
+def test_engine_execute_pair_survives_db_record_failure(
+    mock_plugin, mock_database
+):
+    """Bookkeeping must never prevent execution. If record_rebalance raises,
+    the engine still runs the executor and returns the result."""
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.record_rebalance.side_effect = RuntimeError("db unavailable")
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        reason_code="ev_positive",
+        route=None,
+    )
+    executor = MagicMock()
+    success = ExecutionResult(success=True, amount_sats=50_000, fee_sats=5)
+    executor.execute.return_value = success
+
+    result = engine._execute_pair(pair, executor)
+
+    assert result is success
+    executor.execute.assert_called_once()
+    # update_rebalance_result is guarded: when there is no rebalance_id it must
+    # not be called, otherwise the engine would crash on a DB outage.
+    mock_database.update_rebalance_result.assert_not_called()
+
+
 def test_engine_clears_persisted_pair_failure_after_success(
     mock_plugin, mock_database
 ):

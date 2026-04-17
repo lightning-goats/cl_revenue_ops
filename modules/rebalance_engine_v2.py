@@ -881,10 +881,84 @@ class RebalanceEngine:
         If one is present it is ignored by the executor; if it is absent we
         still execute the selected pair directly.
         """
+        # Stage 2D Defect 3 fix: the v2 engine used to leave ``rebalance_history``
+        # empty on automatic cycles, which made ``revenue-status.rebalance_decision.
+        # action == 'rebalance'`` reachable alongside ``recent_rebalances == []``.
+        # Legacy ``execute_rebalance`` already records to the DB; we mirror that
+        # behavior here so the summary and the history agree.
+        rebalance_id: Optional[int] = self._record_rebalance_pending(pair)
         result = executor.execute(**self._execution_kwargs(pair))
+        self._record_rebalance_result(rebalance_id, result)
         if result is not None and not result.success:
             self._push_segment_observation_snapshot()
         return result
+
+    def _record_rebalance_pending(self, pair: PairCandidate) -> Optional[int]:
+        """Insert a 'pending' row into rebalance_history for this pair.
+
+        Returns the row id, or ``None`` if the DB is unavailable or the insert
+        fails. Failure must not prevent execution — the engine still runs even
+        if bookkeeping breaks.
+        """
+        if self.database is None:
+            return None
+        try:
+            return int(
+                self.database.record_rebalance(
+                    from_channel=pair.source_channel_id,
+                    to_channel=pair.dest_channel_id,
+                    amount_sats=int(pair.amount_sats),
+                    max_fee_sats=int(pair.pair_budget_sats or 0),
+                    expected_profit_sats=0,
+                    status="pending",
+                    rebalance_type="normal",
+                    reason_code=pair.reason_code or "ev_positive",
+                )
+            )
+        except Exception as exc:
+            self._log(
+                f"record_rebalance_pending failed for "
+                f"{pair.source_channel_id}->{pair.dest_channel_id}: {exc}",
+                level="debug",
+            )
+            return None
+
+    def _record_rebalance_result(
+        self,
+        rebalance_id: Optional[int],
+        result: Optional[ExecutionResult],
+    ) -> None:
+        """Update the rebalance_history row with the terminal status."""
+        if rebalance_id is None or self.database is None:
+            return
+        try:
+            if result is None:
+                self.database.update_rebalance_result(
+                    rebalance_id,
+                    "failed",
+                    error_message="executor_returned_none",
+                )
+                return
+            if result.success:
+                self.database.update_rebalance_result(
+                    rebalance_id,
+                    "success",
+                    actual_fee_sats=int(getattr(result, "fee_sats", 0) or 0),
+                    actual_fee_msat=int(getattr(result, "fee_msat", 0) or 0),
+                )
+            else:
+                self.database.update_rebalance_result(
+                    rebalance_id,
+                    "failed",
+                    actual_fee_sats=int(getattr(result, "fee_sats", 0) or 0),
+                    actual_fee_msat=int(getattr(result, "fee_msat", 0) or 0),
+                    error_message=str(getattr(result, "error", "") or ""),
+                )
+        except Exception as exc:
+            self._log(
+                f"update_rebalance_result failed for id={rebalance_id}: {exc}",
+                level="debug",
+            )
 
     def _segment_observation_direction(self, peer_id: str) -> int:
         """Return the directional edge for inbound-to-local liquidity on dest channel."""
