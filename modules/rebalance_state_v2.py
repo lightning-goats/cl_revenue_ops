@@ -41,6 +41,14 @@ class ChannelState:
     is_valuable: bool
     remaining_budget_sats: int
     cooldown_active: bool
+    # Phase 1.1: role-specific eligibility surfaced for diagnostics. Phase 2
+    # consumes these to let neutral channels still serve as drain sources.
+    source_eligible: bool = True
+    dest_eligible: bool = True
+    source_reason: str = ""
+    dest_reason: str = ""
+    dest_urgency: float = 0.0
+    source_drain_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -149,9 +157,53 @@ def _value_class(channel: ChannelInput, remaining_budget_sats: int = 0) -> str:
     return "neutral"
 
 
+# Default band used when callers don't pass explicit thresholds. Mirrors the
+# planner defaults so role metadata stays consistent without coupling modules.
+_DEFAULT_TARGET_BAND_LOW = 0.35
+_DEFAULT_TARGET_BAND_HIGH = 0.65
+
+
+def _role_eligibility(
+    *,
+    is_valuable: bool,
+    cooldown_active: bool,
+    remaining_budget_sats: int,
+) -> Tuple[bool, str]:
+    """Phase 1.1 role gate: same gates the legacy planner already applied.
+
+    Phase 2 will diverge source vs destination semantics; this just describes
+    today's behavior in role-aware language so the operator surface can name
+    the actual blocker."""
+    if not is_valuable:
+        return False, "not_valuable"
+    if cooldown_active:
+        return False, "cooldown"
+    if remaining_budget_sats <= 0:
+        return False, "no_budget"
+    return True, ""
+
+
+def _drain_score(local_ratio: float, target_band_high: float) -> float:
+    headroom = max(0.0, 1.0 - target_band_high)
+    if headroom <= 0.0:
+        return 0.0
+    excess = max(0.0, local_ratio - target_band_high)
+    return round(min(1.0, excess / headroom), 6)
+
+
+def _refill_urgency(local_ratio: float, target_band_low: float) -> float:
+    if target_band_low <= 0.0:
+        return 0.0
+    deficit = max(0.0, target_band_low - local_ratio)
+    return round(min(1.0, deficit / target_band_low), 6)
+
+
 def build_state_snapshot(
     channels: Iterable[Any],
     capex_allocations: Any,
+    *,
+    target_band_low: float = _DEFAULT_TARGET_BAND_LOW,
+    target_band_high: float = _DEFAULT_TARGET_BAND_HIGH,
 ) -> StateSnapshot:
     """Build a normalized, immutable v2 state snapshot."""
 
@@ -172,6 +224,13 @@ def build_state_snapshot(
         remaining_budget_sats = max(0, budget_by_channel.get(channel.channel_id, 0))
         value_class = _value_class(channel, remaining_budget_sats)
         is_valuable = value_class != "neutral"
+        cooldown_active = bool(channel.cooldown_active)
+        source_eligible, source_reason = _role_eligibility(
+            is_valuable=is_valuable,
+            cooldown_active=cooldown_active,
+            remaining_budget_sats=remaining_budget_sats,
+        )
+        dest_eligible, dest_reason = source_eligible, source_reason
 
         normalized_channels.append(
             ChannelState(
@@ -183,7 +242,13 @@ def build_state_snapshot(
                 value_class=value_class,
                 is_valuable=is_valuable,
                 remaining_budget_sats=remaining_budget_sats,
-                cooldown_active=bool(channel.cooldown_active),
+                cooldown_active=cooldown_active,
+                source_eligible=source_eligible,
+                dest_eligible=dest_eligible,
+                source_reason=source_reason,
+                dest_reason=dest_reason,
+                dest_urgency=_refill_urgency(local_ratio, target_band_low),
+                source_drain_score=_drain_score(local_ratio, target_band_high),
             )
         )
         total_capacity_sats += capacity_sats

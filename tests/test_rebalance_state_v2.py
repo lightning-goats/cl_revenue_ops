@@ -88,6 +88,71 @@ def test_build_state_snapshot_normalizes_mapping_booleans_and_budget_defaults():
     assert state.channels[0].cooldown_active is False
 
 
+def test_build_state_snapshot_emits_role_eligibility_metadata():
+    """Phase 1.1: per-channel state must expose source vs destination eligibility
+    so the planner and operator surface can separate "would never drain from this"
+    from "would never refill into this"."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "111x1x0": ChannelCapexBudget(channel_id="111x1x0", budget_msat=1_000_000),
+            "333x3x0": ChannelCapexBudget(channel_id="333x3x0", budget_msat=1_000_000),
+        }
+    )
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(  # over-local, profitable, not in cooldown -> drainable + refillable
+                channel_id="111x1x0",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                local_sats=900_000,
+                is_profitable=True,
+                is_active=True,
+            ),
+            ChannelInput(  # neutral over-remote, no budget -> not refill-eligible
+                channel_id="222x2x0",
+                peer_id="02" + "b" * 64,
+                capacity_sats=1_000_000,
+                local_sats=100_000,
+            ),
+            ChannelInput(  # depleted profitable but cooldown active -> source not eligible
+                channel_id="333x3x0",
+                peer_id="02" + "c" * 64,
+                capacity_sats=1_000_000,
+                local_sats=66_000,
+                is_profitable=True,
+                cooldown_active=True,
+            ),
+        ],
+        allocations,
+    )
+
+    drainable, neutral, depleted = state.channels
+
+    assert drainable.source_eligible is True
+    assert drainable.dest_eligible is True
+    assert drainable.source_reason == ""
+    assert drainable.dest_reason == ""
+    assert drainable.source_drain_score > 0.0  # well above the high band
+    assert drainable.dest_urgency == 0.0       # not depleted
+
+    assert neutral.source_eligible is False
+    assert neutral.dest_eligible is False
+    assert neutral.source_reason == "not_valuable"
+    assert neutral.dest_reason == "not_valuable"
+    assert neutral.dest_urgency > 0.0          # well below the low band
+    assert neutral.source_drain_score == 0.0   # not over-local
+
+    assert depleted.source_eligible is False
+    assert depleted.dest_eligible is False
+    assert depleted.source_reason == "cooldown"
+    assert depleted.dest_reason == "cooldown"
+    assert depleted.dest_urgency > 0.5         # severely depleted
+
+
 def test_rebalancer_build_state_v2_delegates_to_builder(mock_plugin, mock_database):
     from modules.config import Config
     import modules.rebalancer as rebalancer_module
