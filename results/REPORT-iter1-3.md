@@ -90,7 +90,7 @@ Goal: prove Iter1-3 actually produces successful rebalances under the same sling
 
 - The sling executor that previously emitted only `NoRoutes` errors (every Iter1-3 capture) **now executes a real circular rebalance** the moment the lab topology permits one. Iter1-3 was not removing a working code path; it was unblocking an executor that the topology was starving.
 - Phase 1.2's `dest_blocked_by_cooldown` hold-reason bucket fires on the very next cycle after a successful rebalance — operator surface gains the specific reason instead of the generic `no_rebalance_candidates`.
-- The `revenue-rebalance` manual entry point and the auto-cycle reach the same execution path. Both wrote `success` rows to `rebalance_history`; sling-stats confirms only ONE on-chain execution occurred (the second history row is an accounting duplicate, pre-existing and out of scope here).
+- The `revenue-rebalance` manual entry point writes a `manual` history row and then calls `_execute_pair`, which writes a second `normal/ev_positive` row through `_record_rebalance_pending`. Both rows show `status=success`. Sling-stats confirms only ONE on-chain execution occurred. **Verified pre-existing**: `_record_rebalance_pending` was introduced in `428c419` ("fix(rebalance_engine_v2): record auto-cycle rebalances to history (Defect 3)") which is the base commit on `main` — predates Iter1. The dup-write is a real accounting bug (would inflate ROI for any manual rebalance) but is out of scope for the post-Polar remediation; deserves a separate follow-up on a future branch.
 - Iter3's `no_route` skip behavior would have correctly suppressed the dead-end edge sources; the planner instead picked `fleet-r4` (80.4% local on r1's side, viable middle path) once one was available.
 
 ### Captures
