@@ -163,17 +163,25 @@ _DEFAULT_TARGET_BAND_LOW = 0.35
 _DEFAULT_TARGET_BAND_HIGH = 0.65
 
 
-def _role_eligibility(
+def _source_eligibility(*, cooldown_active: bool) -> Tuple[bool, str]:
+    """Phase 2.2 source gate: a channel is drainable if it is not protected
+    by recent source-side safety. Value class and capex budget do not apply
+    -- a neutral over-local channel is the right inventory to drain."""
+    if cooldown_active:
+        return False, "cooldown"
+    return True, ""
+
+
+def _destination_eligibility(
     *,
     is_valuable: bool,
     cooldown_active: bool,
     remaining_budget_sats: int,
 ) -> Tuple[bool, str]:
-    """Phase 1.1 role gate: same gates the legacy planner already applied.
-
-    Phase 2 will diverge source vs destination semantics; this just describes
-    today's behavior in role-aware language so the operator surface can name
-    the actual blocker."""
+    """Phase 2.1 destination gate: a refill destination must be a value
+    channel (hive/profitable/active/funded), have remaining capex budget,
+    and not be in cooldown. This stays conservative -- destinations
+    authorize spend, sources do not."""
     if not is_valuable:
         return False, "not_valuable"
     if cooldown_active:
@@ -225,12 +233,14 @@ def build_state_snapshot(
         value_class = _value_class(channel, remaining_budget_sats)
         is_valuable = value_class != "neutral"
         cooldown_active = bool(channel.cooldown_active)
-        source_eligible, source_reason = _role_eligibility(
+        source_eligible, source_reason = _source_eligibility(
+            cooldown_active=cooldown_active,
+        )
+        dest_eligible, dest_reason = _destination_eligibility(
             is_valuable=is_valuable,
             cooldown_active=cooldown_active,
             remaining_budget_sats=remaining_budget_sats,
         )
-        dest_eligible, dest_reason = source_eligible, source_reason
 
         normalized_channels.append(
             ChannelState(

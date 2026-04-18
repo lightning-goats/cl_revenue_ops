@@ -15,6 +15,18 @@ def _ch(
     remaining_budget_sats=500,
     cooldown_active=False,
 ):
+    # Mirror the Phase 2 role-aware eligibility derived in build_state_snapshot
+    # so planner unit tests describe the same semantics as the live snapshot.
+    source_eligible = not cooldown_active
+    source_reason = "" if source_eligible else "cooldown"
+    if not is_valuable:
+        dest_eligible, dest_reason = False, "not_valuable"
+    elif cooldown_active:
+        dest_eligible, dest_reason = False, "cooldown"
+    elif remaining_budget_sats <= 0:
+        dest_eligible, dest_reason = False, "no_budget"
+    else:
+        dest_eligible, dest_reason = True, ""
     return ChannelState(
         channel_id=channel_id,
         peer_id=peer_id,
@@ -25,6 +37,10 @@ def _ch(
         is_valuable=is_valuable,
         remaining_budget_sats=remaining_budget_sats,
         cooldown_active=cooldown_active,
+        source_eligible=source_eligible,
+        dest_eligible=dest_eligible,
+        source_reason=source_reason,
+        dest_reason=dest_reason,
     )
 
 
@@ -80,9 +96,10 @@ class TestPairGeneration:
 
 
 class TestSkipReasons:
-    def test_skips_non_valuable_channels(self):
+    def test_destination_skipped_when_not_valuable(self):
+        """Phase 2: an over-remote neutral channel still cannot be a destination."""
         planner = RebalancePlanner()
-        ch = _ch(channel_id="neutral", local_ratio=0.90,
+        ch = _ch(channel_id="neutral_dest", local_ratio=0.10,
                  value_class="neutral", is_valuable=False)
         snap = _snap(ch)
 
@@ -90,6 +107,22 @@ class TestSkipReasons:
 
         assert len(result.selected) == 0
         assert any(s.reason == "not_valuable" for s in result.skipped)
+
+    def test_over_local_neutral_is_eligible_source(self):
+        """Phase 2 unstick: an over-local neutral channel is a valid drain
+        source. It does not get skipped as not_valuable -- it becomes a source
+        that no_partner only when no eligible destination exists."""
+        planner = RebalancePlanner()
+        ch = _ch(channel_id="neutral_src", local_ratio=0.90,
+                 value_class="neutral", is_valuable=False)
+        snap = _snap(ch)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 0
+        skipped_for_src = [s for s in result.skipped if s.channel_id == "neutral_src"]
+        assert len(skipped_for_src) == 1
+        assert skipped_for_src[0].reason == "no_partner"
 
     def test_skips_inside_band_channels(self):
         planner = RebalancePlanner()
@@ -101,7 +134,7 @@ class TestSkipReasons:
         assert len(result.selected) == 0
         assert any(s.reason == "inside_band" for s in result.skipped)
 
-    def test_skips_cooldown_channels(self):
+    def test_over_local_in_cooldown_skipped_as_protected_source(self):
         planner = RebalancePlanner()
         ch = _ch(channel_id="cooling", local_ratio=0.90, cooldown_active=True)
         snap = _snap(ch)
@@ -111,9 +144,22 @@ class TestSkipReasons:
         assert len(result.selected) == 0
         assert any(s.reason == "cooldown" for s in result.skipped)
 
-    def test_skips_no_budget_channels(self):
+    def test_over_local_no_budget_is_eligible_source(self):
+        """Phase 2: sources do not consume capex budget. An over-local channel
+        with zero budget can still drain into a funded depleted destination."""
         planner = RebalancePlanner()
-        ch = _ch(channel_id="broke", local_ratio=0.90, remaining_budget_sats=0)
+        ch = _ch(channel_id="broke_src", local_ratio=0.90, remaining_budget_sats=0)
+        snap = _snap(ch)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 0
+        skipped_for_src = [s for s in result.skipped if s.channel_id == "broke_src"]
+        assert skipped_for_src[0].reason == "no_partner"
+
+    def test_destination_skipped_when_no_budget(self):
+        planner = RebalancePlanner()
+        ch = _ch(channel_id="broke_dest", local_ratio=0.10, remaining_budget_sats=0)
         snap = _snap(ch)
 
         result = planner.plan(snap)

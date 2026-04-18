@@ -89,17 +89,30 @@ class RebalancePlanner:
         over_remote: List[ChannelState] = []
         skipped: List[SkipRecord] = []
 
-        # Phase 1: classify every channel
+        # Phase 1: classify by band first, then apply role-specific eligibility.
+        # Phase 2 of the post-Polar remediation: a neutral over-local channel is
+        # a valid drain source even though it can never be a refill destination.
         for ch in snapshot.channels:
-            skip = self._check_skip(ch)
-            if skip is not None:
-                skipped.append(skip)
-                continue
-
             if ch.local_ratio > self.target_band_high:
-                over_local.append(ch)
+                if ch.source_eligible:
+                    over_local.append(ch)
+                else:
+                    skipped.append(SkipRecord(
+                        channel_id=ch.channel_id,
+                        reason=ch.source_reason or "source_ineligible",
+                        value_class=ch.value_class,
+                        remaining_budget_sats=ch.remaining_budget_sats,
+                    ))
             elif ch.local_ratio < self.target_band_low:
-                over_remote.append(ch)
+                if ch.dest_eligible:
+                    over_remote.append(ch)
+                else:
+                    skipped.append(SkipRecord(
+                        channel_id=ch.channel_id,
+                        reason=ch.dest_reason or "dest_ineligible",
+                        value_class=ch.value_class,
+                        remaining_budget_sats=ch.remaining_budget_sats,
+                    ))
             else:
                 skipped.append(SkipRecord(
                     channel_id=ch.channel_id,
@@ -164,31 +177,6 @@ class RebalancePlanner:
                 ))
 
         return PlanResult(selected=candidates, skipped=skipped)
-
-    def _check_skip(self, ch: ChannelState):
-        """Return a SkipRecord if the channel should be skipped pre-pairing."""
-        if not ch.is_valuable:
-            return SkipRecord(
-                channel_id=ch.channel_id,
-                reason="not_valuable",
-                value_class=ch.value_class,
-                remaining_budget_sats=ch.remaining_budget_sats,
-            )
-        if ch.cooldown_active:
-            return SkipRecord(
-                channel_id=ch.channel_id,
-                reason="cooldown",
-                value_class=ch.value_class,
-                remaining_budget_sats=ch.remaining_budget_sats,
-            )
-        if ch.remaining_budget_sats <= 0:
-            return SkipRecord(
-                channel_id=ch.channel_id,
-                reason="no_budget",
-                value_class=ch.value_class,
-                remaining_budget_sats=0,
-            )
-        return None
 
     def _generate_pairs(
         self,

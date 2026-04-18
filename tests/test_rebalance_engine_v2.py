@@ -392,19 +392,29 @@ def test_polar_s2_pairless_failure_names_source_rejected_neutral(
     )
     engine._build_snapshot = MagicMock(return_value=snapshot)
 
+    # Phase 2 turns this from a pairless hold into a valid pair: the over-local
+    # neutral sources are no longer rejected as not_valuable. A pair forms with
+    # the funded depleted destination.
+    engine.router_v3 = MagicMock(name="market_router")
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=False, route_cost_sats=None, route=None, probability_ppm=0,
+        error="route_pricer_stubbed",
+    )
+
     selected = engine.find_candidates()
     debug = engine.get_last_cycle_debug()
 
-    assert selected == []
-    assert debug["summary"]["considered_pairs"] == 0
+    assert debug["summary"]["considered_pairs"] >= 1
     diagnostics = debug["hold_diagnostics"]
-    assert diagnostics["source_rejected_neutral"] == 2
-    # depleted destination is funded and not in cooldown -> no dest blocker;
-    # plan.skipped still records its no_partner reason for the operator.
-    skip_reasons = {row["channel_id"]: row["reason"] for row in debug["skipped"]}
-    assert skip_reasons.get("159x1x0") == "no_partner"
-    assert skip_reasons.get("243x1x0") == "not_valuable"
-    assert skip_reasons.get("255x1x0") == "not_valuable"
+    assert diagnostics["source_rejected_neutral"] == 0
+    considered_sources = {
+        c["source_channel_id"] for c in debug["considered_candidates"]
+    }
+    considered_dests = {
+        c["dest_channel_id"] for c in debug["considered_candidates"]
+    }
+    assert considered_sources & {"243x1x0", "255x1x0"}
+    assert "159x1x0" in considered_dests
 
 
 def test_polar_s9_pairless_failure_names_dest_cooldown_and_neutral_sources(
@@ -456,6 +466,9 @@ def test_polar_s9_pairless_failure_names_dest_cooldown_and_neutral_sources(
     )
     engine._build_snapshot = MagicMock(return_value=snapshot)
 
+    # Phase 2: sources are eligible but the depleted destination is still
+    # cooldown-blocked, so no pair forms. Phase 3 will let drift override
+    # blanket cooldown for severely depleted destinations.
     selected = engine.find_candidates()
     debug = engine.get_last_cycle_debug()
 
@@ -463,7 +476,11 @@ def test_polar_s9_pairless_failure_names_dest_cooldown_and_neutral_sources(
     assert debug["summary"]["considered_pairs"] == 0
     diagnostics = debug["hold_diagnostics"]
     assert diagnostics["dest_blocked_by_cooldown"] == 1
-    assert diagnostics["source_rejected_neutral"] == 2
+    # Sources are no longer rejected as neutral -- they hit no_partner instead.
+    assert diagnostics["source_rejected_neutral"] == 0
+    skip_reasons = {row["channel_id"]: row["reason"] for row in debug["skipped"]}
+    assert skip_reasons.get("200x2x0") == "no_partner"
+    assert skip_reasons.get("201x2x0") == "no_partner"
 
 
 def test_get_last_cycle_debug_emits_pairless_hold_diagnostics(
