@@ -267,6 +267,55 @@ class TestScoring:
         assert len(result.selected) == 1
         assert result.selected[0].source_channel_id == "cheap_src"
 
+    def test_polar_s2_shape_forms_a_pair(self):
+        """Phase 2.4 regression: S2 had a depleted profitable destination plus
+        two extreme over-local neutral channels. Phase 2 must let one of those
+        neutrals serve as the drain source so a pair forms."""
+        planner = RebalancePlanner()
+        depleted = _ch(channel_id="159x1x0", peer_id="02" + "1" * 64,
+                       local_ratio=0.10, value_class="profitable",
+                       remaining_budget_sats=1000)
+        neutral_a = _ch(channel_id="243x1x0", peer_id="02" + "2" * 64,
+                        local_ratio=0.95, value_class="neutral",
+                        is_valuable=False, remaining_budget_sats=0)
+        neutral_b = _ch(channel_id="255x1x0", peer_id="02" + "3" * 64,
+                        local_ratio=0.95, value_class="neutral",
+                        is_valuable=False, remaining_budget_sats=0)
+        snap = _snap(depleted, neutral_a, neutral_b)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        pair = result.selected[0]
+        assert pair.source_channel_id in {"243x1x0", "255x1x0"}
+        assert pair.dest_channel_id == "159x1x0"
+
+    def test_polar_s9_shape_recognizes_neutral_sources(self):
+        """Phase 2.4 regression: S9 had two 100%-local neutral channels and a
+        cooldown-blocked depleted destination. Sources must be eligible (no
+        source_rejected_neutral); the cooldown blocker stays for Phase 3."""
+        planner = RebalancePlanner()
+        cooldown_dest = _ch(channel_id="123x1x0", peer_id="02" + "9" * 64,
+                            local_ratio=0.066, value_class="profitable",
+                            remaining_budget_sats=1000, cooldown_active=True)
+        neutral_a = _ch(channel_id="200x2x0", peer_id="02" + "8" * 64,
+                        local_ratio=1.0, value_class="neutral",
+                        is_valuable=False, remaining_budget_sats=0)
+        neutral_b = _ch(channel_id="201x2x0", peer_id="02" + "7" * 64,
+                        local_ratio=1.0, value_class="neutral",
+                        is_valuable=False, remaining_budget_sats=0)
+        snap = _snap(cooldown_dest, neutral_a, neutral_b)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 0  # cooldown-blocked destination
+        skipped = {s.channel_id: s.reason for s in result.skipped}
+        # Neutral sources are eligible -- they hit no_partner because the
+        # only depleted destination is in cooldown.
+        assert skipped.get("200x2x0") == "no_partner"
+        assert skipped.get("201x2x0") == "no_partner"
+        assert skipped.get("123x1x0") == "cooldown"
+
     def test_more_drained_source_wins_when_value_and_return_tied(self):
         """Phase 2.3: explicit drain preference -- a more over-local source is
         preferred even at the same value class and same return cost."""
