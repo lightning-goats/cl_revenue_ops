@@ -625,6 +625,53 @@ def test_polar_s7_oscillation_does_not_unblock_cooldown(
     assert diagnostics["source_inside_band"] == 1
 
 
+def test_engine_layer_preserves_route_success_fee_and_penalty_terms(
+    mock_plugin, mock_database
+):
+    """Phase 4.2: route success probability and pair-cost penalties enter
+    the final score in the engine, not the planner. Verify the engine's
+    final_score = p_success*future_value - expected_fee - source_opp_cost
+    - failure_penalty - capital_risk_penalty contract holds."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=100,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=750_000,
+        route_cost_sats=10,
+        effective_budget_sats=100,
+        route_status="priced",
+    )
+
+    assert decomp["p_success"] == 0.75
+    assert decomp["expected_fee"] > 0.0
+    expected = round(
+        decomp["p_success"] * decomp["expected_future_value"]
+        - decomp["expected_fee"]
+        - decomp["source_opportunity_cost"]
+        - decomp["failure_penalty"]
+        - decomp["capital_risk_penalty"],
+        6,
+    )
+    assert decomp["final_score"] == expected
+
+
 def test_engine_build_snapshot_uses_membership_router_for_hive_value_class(
     mock_plugin, mock_database
 ):
