@@ -488,6 +488,24 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-rebalance-emergency-local-ratio',
+    default='0.10',
+    description='Local ratio below which a destination bypasses the channel-level rebalance cooldown (Phase 3, default: 0.10; 0 disables)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-drift-override-ratio',
+    default='0.30',
+    description='Drift since last successful rebalance that bypasses the cooldown (Phase 3, default: 0.30; 0 disables)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-hold-margin',
+    default='0.0',
+    description='Minimum final_score a priced pair must clear or it is rejected as below_hold_margin (Phase 4, default: 0.0)'
+)
+
+plugin.add_option(
     name='revenue-ops-flow-window-days',
     default='7',
     description='Number of days to analyze for flow calculation (default: 7)'
@@ -1369,6 +1387,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
+        rebalance_emergency_local_ratio=_safe_float_opt(
+            'revenue-ops-rebalance-emergency-local-ratio', '0.10'
+        ),
+        rebalance_drift_override_ratio=_safe_float_opt(
+            'revenue-ops-rebalance-drift-override-ratio', '0.30'
+        ),
+        rebalance_hold_margin=_safe_float_opt(
+            'revenue-ops-rebalance-hold-margin', '0.0'
+        ),
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
