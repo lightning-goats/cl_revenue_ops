@@ -1,0 +1,14 @@
+{
+  "leases_count": 1,
+  "recommendations_count": 1,
+  "overlay_selected_count": 1,
+  "overlay_skipped_count": 0,
+  "overlay_selected": [
+    {
+      "source_scid": "255x1x0",
+      "sink_scid": "147x1x0",
+      "coordination_hint_id": "pathB-rec-cln-edge-02-to-r3"
+    }
+  ],
+  "overlay_skipped": []
+}

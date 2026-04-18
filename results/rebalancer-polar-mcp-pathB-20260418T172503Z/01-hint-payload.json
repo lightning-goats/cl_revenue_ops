@@ -1,0 +1,26 @@
+{
+  "generated_at": 1776533213,
+  "ttl_seconds": 900,
+  "version": "path-b-validation-1",
+  "hints": {},
+  "rebalance_recommendations": [
+    {
+      "recommendation_id": "pathB-rec-cln-edge-02-to-r3",
+      "source_scid": "255x1x0",
+      "sink_scid": "147x1x0",
+      "source_peer_id": "0296fa349c28bffc05eba2259b60046d57c06a8111688d2d6deaf427492412dd30",
+      "destination_peer_id": "02ff464397db796dc7976b61dcd1841ed9782b2d6a6c1318482cd76770458a575b",
+      "amount_sats": 400000,
+      "max_fee_sats": 400,
+      "route_segments": [],
+      "route_policy": "market_only",
+      "allow_market_fallback": true,
+      "priority_score": 1.0,
+      "prefer_hive_on_tie": false
+    }
+  ],
+  "rebalance_campaigns": [],
+  "route_segment_leases": [],
+  "segment_observations": [],
+  "segment_scores": []
+}

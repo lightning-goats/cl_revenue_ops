@@ -104,3 +104,48 @@ Goal: prove Iter1-3 actually produces successful rebalances under the same sling
 - `05-sling-stats-dest.json` — sling-stats for dest scid 123x1x0
 - `06-post-state.json` — fleet state after rebalance
 - `07-r1-debug-post.json` — post-rebalance planner debug
+
+## Path B hive-hints validation addendum (2026-04-18 17:25 UTC)
+
+Goal: prove the existing `HiveHintAdapter` → `build_coordination_overlay` → `merge_coordination_pairs` wiring consumes a synthetic hive-hints payload end-to-end without code changes. The plumbing existed before this branch; Path B's job is just to exercise it under live Polar with traceable artifacts.
+
+### Procedure
+
+1. Construct a synthetic hint payload with one `rebalance_recommendation` (source_scid=255x1x0, sink_scid=147x1x0, peer ids matched, priority_score=1.0, route_policy=market_only).
+2. Inject into CLN datastore key `["hive","hints"]` on `fleet-r4` via `lightning-cli datastore` (hex mode, since the JSON contains structural characters).
+3. Spawn an in-container Python test that instantiates `HiveHintAdapter` against the live `lightning-rpc`, polls, and dumps the recommendation list.
+4. Build a synthetic state snapshot (channel inputs hand-built to match r4's actual topology + non-zero `channel_budgets`) and run `build_coordination_overlay`. Assert one selected pair with `coordination_hint_id` echoed.
+5. Re-inject the same payload with an additional `route_segment_lease` whose segment matches the pair's `(source_peer_id, dest_peer_id)` endpoints. Re-run overlay. Assert the pair is suppressed with `reason=lease_conflict, detail=lease_id=...`.
+6. Delete the datastore key, restoring lab to its pre-Path-B state.
+
+### Results
+
+| Test | Captured artifact | Outcome |
+|------|-------------------|---------|
+| 1. Adapter polls injected payload | `03-adapter-poll.json` | `is_fresh=true`, snapshot keys: `[generated_at, hints, rebalance_*, route_segment_leases, segment_*, ttl_seconds, version]`, recommendation parsed verbatim with `recommendation_id="pathB-rec-cln-edge-02-to-r3"` |
+| 2. Overlay rejects when budget=0 | `04-overlay-build.json` | `coordination_unavailable, detail=hint_id=pathB-rec-cln-edge-02-to-r3 missing_viable_endpoint` — safety rail working (channels lack remaining_budget under live capex) |
+| 3. Overlay accepts when budget present | `05-overlay-positive.json` | 1 selected pair: `source_scid=255x1x0`, `sink_scid=147x1x0`, `coordination_hint_id=pathB-rec-cln-edge-02-to-r3`, `priority=COORDINATED`, `policy=MARKET_ONLY`, `reason_code=coordinated_rebalance` |
+| 4. Lease that does NOT match pair endpoints | `06-overlay-with-lease.json` | Pair still selected (lease segment was non-overlapping; `_pair_segments` only matches the pair's own (source_scid, sink_scid) and (source_peer, dest_peer) tuples — no false-positive suppression) |
+| 5. Lease that matches pair endpoints | `07-overlay-with-matched-lease.json` | Pair suppressed with `reason=lease_conflict, detail=lease_id=pathB-lease-block-our-pair` |
+
+### What this proves
+
+- The cl-hive `["hive","hints"]` datastore contract is the wire format `HiveHintAdapter` actually consumes in production. The runbook's HV1-HV4 hint phases will produce real payloads of the same shape.
+- All three coordination contracts surface end-to-end on a live node: **recommendation pickup, viability rail (budget/cooldown), and lease suppression** — each with operator-visible audit trail (`coordination_hint_id`, `coordination_unavailable` skip, `lease_conflict` skip).
+- Lease matching is endpoint-precise: a lease segment that doesn't share an endpoint with the pair does not suppress, ruling out false-positive coordination conflicts in production.
+- The overlay's coordinated pair carries `priority=COORDINATED` and `reason_code=coordinated_rebalance`, ranking ahead of EV-positive picks in `merge_coordination_pairs`'s priority sort. Phase A's Phase 1.2 hold-reason mapping treats this stage transparently.
+
+### Lab state
+
+Post-validation, the datastore key `["hive","hints"]` was deleted on `fleet-r4` to return the lab to its pre-Path-B state. Path A's preconditioned channels (r1→r2 at 23.4%, r1→r4 at 67.1%) were not touched by Path B — Path B is a read-only validation of the hint-consumption surface.
+
+### Captures
+
+`results/rebalancer-polar-mcp-pathB-20260418T172503Z/`
+- `00-r3-debug-before-hint.json`, `00-r4-debug-before-hint.json` — pre-hint planner state
+- `01-hint-payload.json` — the synthetic hive-hints payload injected
+- `03-adapter-poll.json` — `HiveHintAdapter.poll()` output (proves payload reaches the adapter)
+- `04-overlay-build.json` — overlay output with live capex (budget=0, safety-rail skip)
+- `05-overlay-positive.json` — overlay output with synthetic budgets (1 pair selected, COORDINATED priority)
+- `06-overlay-with-lease.json` — overlay output with non-overlapping lease (no suppression)
+- `07-overlay-with-matched-lease.json` — overlay output with overlapping lease (suppression with lease_conflict reason)
