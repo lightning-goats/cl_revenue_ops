@@ -562,6 +562,23 @@ def test_get_last_cycle_debug_emits_pairless_hold_diagnostics(
     assert diagnostics["source_inside_band"] == 1
 
 
+def test_sling_noroutes_classified_as_transient_failure(mock_plugin, mock_database):
+    """Iter2: sling reports 'NoRoutes' as a routing-layer transient (often
+    gossip-convergence or short liquidity dip). Should map to the short-cooldown
+    transient bucket, not the catch-all other_retriable."""
+    from modules.rebalance_engine_v2 import ExecutionResult
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    for err in (
+        "retriable_failure: NoRoutes",
+        "retriable_failure: no_routes",
+        "no route to destination",
+    ):
+        result = ExecutionResult(error=err)
+        assert engine._classify_failure_kind(result) == "temporary_channel_failure"
+
+
 def test_first_transient_failure_uses_short_cooldown(mock_plugin, mock_database):
     """Iter2: temporary_channel_failure base cooldown is 300s (5 min) on a
     first failure. Sling classifies these as retriable and the prior 1800s

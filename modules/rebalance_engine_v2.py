@@ -1215,6 +1215,12 @@ class RebalanceEngine:
         error = str(getattr(exec_result, "error", "") or "").lower()
         if "temporary_channel_failure" in error:
             return "temporary_channel_failure"
+        # Iter2: sling reports "NoRoutes" as a transient routing failure
+        # (gossip not converged, peer-side liquidity not visible, brief
+        # capacity dip). Treat it the same as temporary_channel_failure for
+        # cooldown purposes -- short base cooldown with fast escalation.
+        if "noroutes" in error or "no_routes" in error or "no route" in error:
+            return "temporary_channel_failure"
         if "fee_insufficient" in error:
             return "fee_insufficient"
         if "incorrect_cltv_expiry" in error:
