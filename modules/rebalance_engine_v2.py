@@ -932,12 +932,14 @@ class RebalanceEngine:
                                     route_status="below_hold_margin",
                                 )
                             self._audit.log_skip(
-                                pair.dest_channel_id,
+                                channel_id=pair.dest_channel_id,
                                 reason="below_hold_margin",
                                 value_class="valuable",
+                                remaining_budget_sats=pair.pair_budget_sats,
                                 detail=(
                                     f"score={final_score:.4f} margin={hold_margin:.4f}"
                                 ),
+                                router=router_tag,
                             )
                             plan.skipped.append(SkipRecord(
                                 channel_id=pair.dest_channel_id,
@@ -1046,10 +1048,10 @@ class RebalanceEngine:
         # Audit all skips
         for skip in plan.skipped:
             self._audit.log_skip(
-                skip.channel_id,
-                skip.reason,
-                skip.value_class,
-                skip.remaining_budget_sats,
+                channel_id=skip.channel_id,
+                reason=skip.reason,
+                value_class=skip.value_class,
+                remaining_budget_sats=skip.remaining_budget_sats,
                 detail=skip.detail or "",
                 router=router_tag,
             )
@@ -1604,10 +1606,12 @@ class RebalanceEngine:
                     channel_id=pair.dest_channel_id,
                     reason="pair_futility",
                     value_class="valuable",
+                    remaining_budget_sats=int(getattr(pair, "pair_budget_sats", 0) or 0),
                     detail=(
                         f"src={pair.source_channel_id} "
                         f"failures={len(fresh)} in window {int(self._futility_window_sec)}s"
                     ),
+                    router="v3",
                 )
                 continue
             live_candidates.append(pair)
@@ -1637,7 +1641,9 @@ class RebalanceEngine:
                     channel_id=pair.dest_channel_id,
                     reason="sling_unavailable",
                     value_class="valuable",
+                    remaining_budget_sats=int(getattr(pair, "pair_budget_sats", 0) or 0),
                     detail="sling-once RPC not loaded",
+                    router="v3",
                 )
             result.candidates = []
             self._cache_cycle_result(result)

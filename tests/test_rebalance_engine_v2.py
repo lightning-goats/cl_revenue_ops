@@ -1693,10 +1693,12 @@ def test_engine_signals_local_route_pricing_failure_without_blocking_selection(
     engine.router_v3.price_pair.assert_called_once()
     assert engine.router_v3.price_pair.call_args.kwargs["exclude"] is None
     engine._audit.log_pick.assert_not_called()
-    log_skip_calls = [c.args for c in engine._audit.log_skip.call_args_list]
-    assert any(args and args[1] == "no_route" for args in log_skip_calls), (
-        f"expected a no_route skip; got {log_skip_calls}"
-    )
+    log_skip_calls = engine._audit.log_skip.call_args_list
+    assert any(
+        c.kwargs.get("reason") == "no_route"
+        or (len(c.args) > 1 and c.args[1] == "no_route")
+        for c in log_skip_calls
+    ), f"expected a no_route skip; got {log_skip_calls}"
 
 
 def test_engine_run_cycle_skips_when_sling_unavailable(mock_plugin, mock_database):
