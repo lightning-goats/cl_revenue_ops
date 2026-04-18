@@ -390,6 +390,20 @@ class RebalanceExecutor:
             return result
 
         baseline_stats = self._scid_stats(dest_channel_id)
+
+        # Iter2: proactively stop any stale sling-once job for this scid.
+        # sling rejects new sling-once with "already a job for that scid running"
+        # if a prior cycle's job is still flagged active. sling-stop is
+        # idempotent (returns stopped_count=0 when nothing to stop) so it's
+        # always safe to call.
+        try:
+            self.plugin.rpc.call("sling-stop", [dest_channel_id])
+        except Exception as exc:
+            self._log(
+                f"sling-stop precheck failed for {dest_channel_id}: {exc}",
+                level="debug",
+            )
+
         payload = {
             "scid": dest_channel_id,
             "direction": "pull",

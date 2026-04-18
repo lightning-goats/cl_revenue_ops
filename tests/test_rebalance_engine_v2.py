@@ -562,6 +562,20 @@ def test_get_last_cycle_debug_emits_pairless_hold_diagnostics(
     assert diagnostics["source_inside_band"] == 1
 
 
+def test_first_transient_failure_uses_short_cooldown(mock_plugin, mock_database):
+    """Iter2: temporary_channel_failure base cooldown is 300s (5 min) on a
+    first failure. Sling classifies these as retriable and the prior 1800s
+    base was too aggressive -- it kept good pairs out of contention for
+    half an hour after a single transient route failure."""
+    engine = _make_engine(mock_plugin, mock_database)
+
+    assert engine._pair_failure_cooldowns["temporary_channel_failure"] == 300
+    # Persistent failures still get the long quarantine.
+    assert engine._pair_failure_cooldowns["permanent_failure"] >= 21600
+    # Retriable buckets stay below the temporary-then-escalation threshold.
+    assert engine._pair_failure_cooldowns["other_retriable"] <= 1800
+
+
 def test_polar_s7_oscillation_does_not_unblock_cooldown(
     mock_plugin, mock_database
 ):

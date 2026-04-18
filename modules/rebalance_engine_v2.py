@@ -92,14 +92,19 @@ class RebalanceEngine:
         self._pair_failures: Dict[Tuple[str, str], List[float]] = {}
         self._futility_threshold: int = 3
         self._futility_window_sec: float = 1800.0  # 30 minutes
+        # Iter2: lower base cooldown for the most common transient failure
+        # (no_route / temporary_channel_failure). The previous 1800s on a
+        # FIRST sling failure was excessive -- sling itself classifies these
+        # as retriable. Backoff multiplier in record_pair_rebalance_failure
+        # already escalates repeated failures (×failure_count up to ×6).
         self._pair_failure_cooldowns: Dict[str, int] = {
-            "temporary_channel_failure": 1800,
-            "fee_insufficient": 7200,
-            "incorrect_cltv_expiry": 7200,
-            "permanent_failure": 21600,
-            "payment_pending_timeout": 900,
-            "local_execution_failed": 1800,
-            "other_retriable": 1800,
+            "temporary_channel_failure": 300,    # 5 min on first failure
+            "fee_insufficient": 1800,            # 30 min (rare; usually persistent)
+            "incorrect_cltv_expiry": 3600,       # 1 hour (CLN config alignment)
+            "permanent_failure": 21600,          # 6 hours
+            "payment_pending_timeout": 600,      # 10 min
+            "local_execution_failed": 600,       # 10 min
+            "other_retriable": 600,              # 10 min
         }
 
         our_id = self._get_our_id() or ""
