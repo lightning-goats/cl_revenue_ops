@@ -552,9 +552,13 @@ class RebalanceEngine:
             # let the destination role bypass the cooldown gate.
             cooldown_override = False
             if cooldown and self.database is not None:
-                drift_threshold = float(
-                    getattr(cfg, "rebalance_drift_override_ratio", 0.30) or 0.0
+                drift_threshold_raw = getattr(
+                    cfg, "rebalance_drift_override_ratio", 0.30
                 )
+                if isinstance(drift_threshold_raw, (int, float)):
+                    drift_threshold = float(drift_threshold_raw)
+                else:
+                    drift_threshold = 0.0
                 if drift_threshold > 0.0 and capacity_sats > 0:
                     try:
                         anchor = self.database.get_last_post_rebalance_state(scid)
@@ -579,11 +583,15 @@ class RebalanceEngine:
                 "cooldown_override": cooldown_override,
             })
 
-        target_band_low = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
-        target_band_high = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
-        target_emergency_low = float(
-            getattr(cfg, "rebalance_emergency_local_ratio", 0.10) or 0.0
-        )
+        def _coerce_float(name: str, default: float) -> float:
+            value = getattr(cfg, name, default)
+            if isinstance(value, (int, float)):
+                return float(value) if value else float(default if default else 0.0)
+            return float(default)
+
+        target_band_low = _coerce_float("low_liquidity_threshold", 0.35)
+        target_band_high = _coerce_float("high_liquidity_threshold", 0.65)
+        target_emergency_low = _coerce_float("rebalance_emergency_local_ratio", 0.10)
         return build_state_snapshot(
             normalized,
             capex_allocations,
@@ -886,9 +894,11 @@ class RebalanceEngine:
                         # whose final_score does not clear the configured
                         # hold margin is rejected with an explicit reason
                         # rather than silently picked.
-                        hold_margin = float(
-                            getattr(cfg, "rebalance_hold_margin", 0.0) or 0.0
-                        )
+                        hold_margin_raw = getattr(cfg, "rebalance_hold_margin", 0.0)
+                        if isinstance(hold_margin_raw, (int, float)):
+                            hold_margin = float(hold_margin_raw)
+                        else:
+                            hold_margin = 0.0
                         decomp = pair.score_decomposition or {}
                         final_score = float(decomp.get("final_score", 0.0) or 0.0)
                         if hold_margin > 0.0 and final_score <= hold_margin:

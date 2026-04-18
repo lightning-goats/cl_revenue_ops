@@ -625,6 +625,69 @@ def test_polar_s7_oscillation_does_not_unblock_cooldown(
     assert diagnostics["source_inside_band"] == 1
 
 
+def test_top_level_hold_reason_maps_specific_blocker_from_engine(
+    mock_plugin, mock_database
+):
+    """Phase 1 (deferred completion): when the engine returns no candidates,
+    the rebalancer's last_decision.reason must surface the most specific
+    blocker (e.g. dest_blocked_by_cooldown, source_rejected_neutral,
+    below_hold_margin) instead of the coarse no_rebalance_candidates."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import CycleResult
+    from modules.rebalance_state_v2 import ChannelState, StateSnapshot
+    from modules.rebalancer import EVRebalancer
+
+    cfg = Config(dry_run=True)
+    mock_database.cleanup_stale_reservations.return_value = 0
+    rebalancer = EVRebalancer(mock_plugin, cfg, mock_database)
+    rebalancer._check_capital_controls = MagicMock(return_value=True)
+
+    snapshot = StateSnapshot(
+        channels=(
+            ChannelState(
+                channel_id="100x1x0",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                local_ratio=0.07,
+                actual_inbound_fee_ppm=0,
+                value_class="profitable",
+                is_valuable=True,
+                remaining_budget_sats=1000,
+                cooldown_active=True,
+                source_eligible=False,
+                dest_eligible=False,
+                source_reason="cooldown",
+                dest_reason="cooldown",
+            ),
+        ),
+        valuable_channel_count=1,
+    )
+    cycle_result = CycleResult(snapshot=snapshot)
+    engine = MagicMock()
+    engine.run_cycle.return_value = cycle_result
+    engine.get_last_cycle_debug.return_value = {
+        "summary": {"considered_pairs": 0, "selected_pairs": 0},
+        "hold_diagnostics": {
+            "dest_blocked_by_cooldown": 1,
+            "dest_not_funded": 0,
+            "source_rejected_neutral": 0,
+            "source_protected": 0,
+            "source_inside_band": 0,
+        },
+        "considered_candidates": [],
+        "selected_candidates": [],
+        "skipped": [],
+        "executions": [],
+    }
+    rebalancer.rebalance_engine_v2 = engine
+
+    rebalancer.find_rebalance_candidates()
+
+    summary = rebalancer.get_last_decision_summary()
+    assert summary["action"] == "hold"
+    assert summary["reason"] == "dest_blocked_by_cooldown"
+
+
 def test_polar_s9_strong_refill_beats_hold_margin(mock_plugin, mock_database):
     """Phase 4.4 ordering: a Polar S9-shaped strong refill candidate (severely
     depleted dest, high-drain neutral source, cheap route) clears a modest

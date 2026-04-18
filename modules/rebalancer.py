@@ -369,6 +369,42 @@ class EVRebalancer:
     def get_last_decision_summary(self) -> Dict[str, Any]:
         return dict(self._last_decision_summary)
 
+    def _derive_hold_reason(self, engine: Any) -> str:
+        """Map the engine's last-cycle debug into a specific hold reason.
+
+        Priority order:
+        1. Pair-level rejection on a considered candidate (route_over_budget,
+           below_hold_margin, no_route, pair_cooldown, sling_unavailable,
+           pair_futility) -- a pair did form but failed downstream.
+        2. Channel-level hold from hold_diagnostics -- no pair could form.
+        3. Fallback: no_rebalance_candidates.
+        """
+        if engine is None or not hasattr(engine, "get_last_cycle_debug"):
+            return "no_rebalance_candidates"
+        try:
+            debug = engine.get_last_cycle_debug()
+        except Exception:
+            return "no_rebalance_candidates"
+
+        for candidate in debug.get("considered_candidates", []) or []:
+            decomp = candidate.get("score_decomposition") or {}
+            reason = decomp.get("rejection_reason")
+            if reason:
+                return str(reason)
+
+        diagnostics = debug.get("hold_diagnostics") or {}
+        priority = (
+            "dest_blocked_by_cooldown",
+            "dest_not_funded",
+            "source_rejected_neutral",
+            "source_protected",
+            "source_inside_band",
+        )
+        for bucket in priority:
+            if int(diagnostics.get(bucket, 0) or 0) > 0:
+                return bucket
+        return "no_rebalance_candidates"
+
     def get_boltz_coordination(self) -> Dict[str, Any]:
         """Return rebalancer exhaustion state for Boltz integration.
 
@@ -1207,9 +1243,14 @@ class EVRebalancer:
                     budget_blocked=False,
                 )
             else:
+                # Phase 1 deferred completion: surface the most specific
+                # blocker from the engine's last_cycle debug so operators
+                # can act on the hold instead of seeing only the coarse
+                # no_rebalance_candidates.
+                hold_reason = self._derive_hold_reason(engine)
                 self._set_last_decision_summary(
                     action="hold",
-                    reason="no_rebalance_candidates",
+                    reason=hold_reason,
                     dominant_input="rebalance_engine",
                     safety_block=False,
                     budget_blocked=False,
