@@ -625,6 +625,69 @@ def test_polar_s7_oscillation_does_not_unblock_cooldown(
     assert diagnostics["source_inside_band"] == 1
 
 
+def test_pair_below_hold_margin_is_rejected_with_explicit_reason(
+    mock_plugin, mock_database
+):
+    """Phase 4.3: do_nothing becomes a hard gate. A priced pair whose
+    final_score does not clear the configured hold margin must be rejected
+    with rejection_reason='below_hold_margin', not silently picked."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    cfg = Config(dry_run=True, rebalance_router="v3", rebalance_hold_margin=0.50)
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+
+    weak_pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=100,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=0.10,  # weak planner score -> won't clear 0.50 hold margin
+        source_local_ratio=0.70,
+        dest_local_ratio=0.30,
+    )
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True, route_cost_sats=2, route=[{"channel": "300x3x0"}],
+        probability_ppm=600_000, error="",
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.return_value = SimpleNamespace(
+            selected=[weak_pair], skipped=[]
+        )
+        selected = engine.find_candidates()
+
+    assert selected == []  # gate keeps the weak pair out
+    debug = engine.get_last_cycle_debug()
+    skipped_reasons = {row["channel_id"]: row["reason"] for row in debug["skipped"]}
+    assert skipped_reasons.get("200x2x0") == "below_hold_margin"
+
+
 def test_engine_layer_preserves_route_success_fee_and_penalty_terms(
     mock_plugin, mock_database
 ):

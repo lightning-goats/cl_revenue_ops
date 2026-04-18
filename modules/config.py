@@ -89,6 +89,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_cooldown_hours': int,
     'rebalance_emergency_local_ratio': float,
     'rebalance_drift_override_ratio': float,
+    'rebalance_hold_margin': float,
     'hive_equalization_enabled': bool,
     'hive_equalization_low_pct': float,
     'hive_equalization_high_pct': float,
@@ -226,6 +227,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_cooldown_hours': (1, 168),
     'rebalance_emergency_local_ratio': (0.0, 1.0),
     'rebalance_drift_override_ratio': (0.0, 1.0),
+    'rebalance_hold_margin': (0.0, 1.0),
     'hive_equalization_low_pct': (0.0, 1.0),
     'hive_equalization_high_pct': (0.0, 1.0),
     'hive_equalization_cooldown_hours': (1, 168),
@@ -339,6 +341,11 @@ class Config:
     # has dropped by at least this much since the last successful rebalance,
     # the cooldown gate is bypassed. Set to 0 to disable.
     rebalance_drift_override_ratio: float = 0.30
+    # Phase 4.3 do_nothing hold gate: priced pairs with engine final_score
+    # at or below this margin are rejected with reason='below_hold_margin'.
+    # 0 leaves the legacy "any positive score" behavior. Use a small positive
+    # value to require pairs to clear a meaningful EV bar before executing.
+    rebalance_hold_margin: float = 0.0
     hive_equalization_enabled: bool = True  # Fallback pure-hive inventory equalization
     hive_equalization_low_pct: float = 0.35  # Lower bound for hive balance band
     hive_equalization_high_pct: float = 0.65  # Upper bound for hive balance band
@@ -750,6 +757,7 @@ class ConfigSnapshot:
     rebalance_cooldown_hours: int
     rebalance_emergency_local_ratio: float
     rebalance_drift_override_ratio: float
+    rebalance_hold_margin: float
     hive_equalization_enabled: bool
     hive_equalization_low_pct: float
     hive_equalization_high_pct: float

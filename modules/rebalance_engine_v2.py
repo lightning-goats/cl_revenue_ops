@@ -882,6 +882,52 @@ class RebalanceEngine:
                             route_status="priced",
                         )
                     if route_result.route_cost_sats <= effective_budget:
+                        # Phase 4.3: do_nothing hard gate. A priced pair
+                        # whose final_score does not clear the configured
+                        # hold margin is rejected with an explicit reason
+                        # rather than silently picked.
+                        hold_margin = float(
+                            getattr(cfg, "rebalance_hold_margin", 0.0) or 0.0
+                        )
+                        decomp = pair.score_decomposition or {}
+                        final_score = float(decomp.get("final_score", 0.0) or 0.0)
+                        if hold_margin > 0.0 and final_score <= hold_margin:
+                            self._update_pair_score_decomposition(
+                                pair,
+                                probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                                route_cost_sats=route_result.route_cost_sats,
+                                effective_budget_sats=effective_budget,
+                                rejection_reason="below_hold_margin",
+                                route_status="below_hold_margin",
+                            )
+                            if debug_pair is not None:
+                                self._update_pair_score_decomposition(
+                                    debug_pair,
+                                    probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                                    route_cost_sats=route_result.route_cost_sats,
+                                    effective_budget_sats=effective_budget,
+                                    rejection_reason="below_hold_margin",
+                                    route_status="below_hold_margin",
+                                )
+                            self._audit.log_skip(
+                                pair.dest_channel_id,
+                                reason="below_hold_margin",
+                                value_class="valuable",
+                                detail=(
+                                    f"score={final_score:.4f} margin={hold_margin:.4f}"
+                                ),
+                            )
+                            plan.skipped.append(SkipRecord(
+                                channel_id=pair.dest_channel_id,
+                                reason="below_hold_margin",
+                                value_class="valuable",
+                                detail=(
+                                    f"src={pair.source_channel_id} "
+                                    f"score={final_score:.4f} "
+                                    f"margin={hold_margin:.4f}"
+                                ),
+                            ))
+                            continue
                         priced.append(pair)
                         self._audit.log_pick(
                             pair.source_channel_id,
