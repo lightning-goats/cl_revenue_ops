@@ -67,3 +67,40 @@ The remaining work is high-value but lab-bounded: Iter1-3 wrung the obvious bugs
 
 - Per-node debug captures: `results/rebalancer-polar-mcp-iter{1,2,3}-*/fleet-r{1..4}_revenue_rebalance_debug.json`
 - Earlier full-system capture: `results/rebalancer-polar-mcp-20260418T064240-0600/`
+
+## Path A green-path addendum (2026-04-18 17:11 UTC)
+
+Goal: prove Iter1-3 actually produces successful rebalances under the same sling-once executor that previously emitted only `NoRoutes` errors. The problem was lab topology: every `fleet→edge` channel was 100% local on the fleet side, so middle paths through the edges were structurally dead. Solution: precondition by paying `fleet-r1 → fleet-r2` directly (single hop, 2.5 MM sats) to drain `r1→r2` from 93.4% → 10% local, opening up the fleet ring as a viable middle path back through `r4 → r3 → r2 → r1`.
+
+### Procedure
+
+| Step | Detail |
+|------|--------|
+| 1. Pre-state snapshot | `00-pre-state.json` — confirms r1→r2 at 93.4%, edges all 100% sink |
+| 2. Preconditioning invoice | `pay_invoice` r2 → r1, 2.5 MM sats, single hop. r1→r2 drops to 10% |
+| 3. Post-precondition state | `01-after-precondition.json` |
+| 4. Manual rebalance | `revenue-rebalance from=159x1x0 (r1→r4) to=123x1x0 (r1→r2) amount=400000` |
+| 5. Result | `03-manual-rebalance.json`: `{"status":"success","actual_fee_sats":15}` |
+| 6. DB confirmation | `04-rebalance-history.json`: `status=success, actual_fee_msat=15000, reason_code=ev_positive` |
+| 7. sling-stats | `05-sling-stats-dest.json`: `total_rebalances=1, total_amount_sats=400000, hop_count=3, partner=fleet-r4` |
+| 8. Post-state | `06-post-state.json`: r1→r4 80.4% → 67.1%, r1→r2 10% → 23.4%, fleet ring redistributed |
+| 9. Post-cycle planner debug | `07-r1-debug-post.json`: `last_decision.reason=dest_blocked_by_cooldown` (Phase 1.2 hold reason mapping working live) |
+
+### What this proves
+
+- The sling executor that previously emitted only `NoRoutes` errors (every Iter1-3 capture) **now executes a real circular rebalance** the moment the lab topology permits one. Iter1-3 was not removing a working code path; it was unblocking an executor that the topology was starving.
+- Phase 1.2's `dest_blocked_by_cooldown` hold-reason bucket fires on the very next cycle after a successful rebalance — operator surface gains the specific reason instead of the generic `no_rebalance_candidates`.
+- The `revenue-rebalance` manual entry point and the auto-cycle reach the same execution path. Both wrote `success` rows to `rebalance_history`; sling-stats confirms only ONE on-chain execution occurred (the second history row is an accounting duplicate, pre-existing and out of scope here).
+- Iter3's `no_route` skip behavior would have correctly suppressed the dead-end edge sources; the planner instead picked `fleet-r4` (80.4% local on r1's side, viable middle path) once one was available.
+
+### Captures
+
+`results/rebalancer-polar-mcp-pathA-20260418T170623Z/`
+- `00-pre-state.json` — full topology snapshot
+- `01-after-precondition.json` — fleet state after preconditioning invoice
+- `02-r1-debug-after-precondition.json` — pre-rebalance planner debug
+- `03-manual-rebalance.json` — manual rebalance RPC response
+- `04-rebalance-history.json` — DB rows for the rebalance
+- `05-sling-stats-dest.json` — sling-stats for dest scid 123x1x0
+- `06-post-state.json` — fleet state after rebalance
+- `07-r1-debug-post.json` — post-rebalance planner debug
