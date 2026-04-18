@@ -759,12 +759,19 @@ class RebalanceEngine:
         target_band_low = getattr(cfg, 'low_liquidity_threshold', 0.35)
         target_band_high = getattr(cfg, 'high_liquidity_threshold', 0.65)
         max_chunk_sats = getattr(cfg, 'rebalance_max_amount', 2_000_000)
+        pair_fee_cap_ppm_raw = getattr(cfg, 'pair_fee_cap_ppm', 0)
+        pair_fee_cap_ppm = (
+            int(pair_fee_cap_ppm_raw)
+            if isinstance(pair_fee_cap_ppm_raw, (int, float))
+            else 0
+        )
 
         planner = RebalancePlanner(
             target_band_low=target_band_low,
             target_band_high=target_band_high,
             max_chunk_sats=max_chunk_sats,
             max_pairs=10,
+            pair_fee_cap_ppm=pair_fee_cap_ppm,
         )
 
         plan = planner.plan(snapshot)

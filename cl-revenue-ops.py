@@ -506,6 +506,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-pair-fee-cap-ppm',
+    default='1000',
+    description='Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples per-rebalance fee from capex bootstrap (Iter1, default: 1000 = 0.1% of amount; 0 disables)'
+)
+
+plugin.add_option(
     name='revenue-ops-flow-window-days',
     default='7',
     description='Number of days to analyze for flow calculation (default: 7)'
@@ -1395,6 +1401,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         ),
         rebalance_hold_margin=_safe_float_opt(
             'revenue-ops-rebalance-hold-margin', '0.0'
+        ),
+        pair_fee_cap_ppm=_safe_int_opt(
+            'revenue-ops-pair-fee-cap-ppm', '1000'
         ),
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),

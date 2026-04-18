@@ -1,5 +1,7 @@
 """Tests for the v2 rebalance planner."""
 
+import pytest
+
 from modules.rebalance_planner_v2 import RebalancePlanner
 from modules.rebalance_state_v2 import ChannelState, StateSnapshot
 
@@ -95,6 +97,55 @@ class TestPairGeneration:
 
         # Float arithmetic may be off by 1 sat from int truncation
         assert abs(result.selected[0].amount_sats - 125_000) <= 1
+
+    def test_pair_budget_uses_fee_cap_ppm_when_capex_too_low(self):
+        """Iter1: capex bootstrap budget (e.g. 200 sats) is meant for channel
+        opens, not per-rebalance fees. The planner should layer a fee cap
+        derived from the rebalance amount on top, so a small capex channel
+        can still pay enough route fee for sling to find a path."""
+        planner = RebalancePlanner(pair_fee_cap_ppm=1000)  # 0.1% of amount
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.90, remaining_budget_sats=0)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, remaining_budget_sats=200)
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        # amount = min((0.90-0.65)*1M, (0.35-0.10)*1M, max_chunk) = 250k sats
+        # fee_cap = ceil(250000 * 1000 / 1_000_000) = 250 sats
+        # pair_budget should be max(capex=200, fee_cap=250) = 250
+        pair = result.selected[0]
+        assert pair.amount_sats == pytest.approx(250_000, abs=1)
+        assert pair.pair_budget_sats == 250
+
+    def test_pair_budget_keeps_capex_when_higher_than_fee_cap(self):
+        """Iter1: when the channel's earned capex budget exceeds the
+        fee-cap-on-amount, keep using the earned budget."""
+        planner = RebalancePlanner(pair_fee_cap_ppm=1000)
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.90, remaining_budget_sats=0)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, remaining_budget_sats=5000)
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        # fee_cap = 250 sats, capex = 5000 -> use 5000
+        assert result.selected[0].pair_budget_sats == 5000
+
+    def test_pair_budget_zero_fee_cap_keeps_legacy_capex_only_behavior(self):
+        """Iter1 backwards-compat: pair_fee_cap_ppm=0 disables the fee cap
+        and reverts to the Phase 5 destination-led capex-only behavior."""
+        planner = RebalancePlanner(pair_fee_cap_ppm=0)
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.90, remaining_budget_sats=0)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, remaining_budget_sats=200)
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+        assert result.selected[0].pair_budget_sats == 200
 
     def test_source_safety_controls_survive_destination_led_budget(self):
         """Phase 5.3: even though source budget no longer gates pair spend,

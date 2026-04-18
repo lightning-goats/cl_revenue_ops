@@ -86,11 +86,17 @@ class RebalancePlanner:
         target_band_high: float = 0.65,
         max_chunk_sats: int = 2_000_000,
         max_pairs: int = 10,
+        pair_fee_cap_ppm: int = 0,
     ):
         self.target_band_low = target_band_low
         self.target_band_high = target_band_high
         self.max_chunk_sats = max_chunk_sats
         self.max_pairs = max_pairs
+        # Iter1: rebalance fee budget per pair = max(dest_capex_budget,
+        # ceil(amount * pair_fee_cap_ppm / 1_000_000)). Decouples per-rebalance
+        # fee envelope from capex bootstrap (which is meant for channel
+        # opens, not routing fees). 0 disables and keeps legacy behavior.
+        self.pair_fee_cap_ppm = max(0, int(pair_fee_cap_ppm))
 
     def plan(self, snapshot: StateSnapshot) -> PlanResult:
         """Classify channels, generate pairs, score and select."""
@@ -216,7 +222,15 @@ class RebalancePlanner:
                 # Phase 5.1+5.2: destination authorizes spend. The source's
                 # remaining capex budget never enters pair_budget -- we are
                 # not opening a channel to the source, just draining it.
+                # Iter1: layer a fee-cap-on-amount on top of the capex
+                # budget so a small bootstrap channel can still pay enough
+                # routing fee to find a path.
                 pair_budget = dest.remaining_budget_sats
+                if self.pair_fee_cap_ppm > 0 and amount > 0:
+                    fee_cap_from_amount = (
+                        amount * self.pair_fee_cap_ppm + 999_999
+                    ) // 1_000_000
+                    pair_budget = max(pair_budget, fee_cap_from_amount)
 
                 # Phase 4.1: explicit additive role-aware planner score.
                 # Each term carries a clear meaning instead of a single
