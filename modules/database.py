@@ -1078,6 +1078,15 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Phase 3.3: post-rebalance local ratio anchor for drift detection.
+        try:
+            conn.execute(
+                "ALTER TABLE rebalance_history ADD COLUMN post_local_ratio REAL"
+            )
+            self.plugin.log("Added post_local_ratio column to rebalance_history")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         try:
             conn.execute("ALTER TABLE rebalance_costs ADD COLUMN cost_msat INTEGER")
             self.plugin.log("Added cost_msat column to rebalance_costs")
@@ -1934,8 +1943,14 @@ class Database:
                                 actual_fee_sats: Optional[int] = None,
                                 actual_fee_msat: Optional[int] = None,
                                 actual_profit_sats: Optional[int] = None,
-                                error_message: Optional[str] = None):
-        """Update a rebalance record with the result."""
+                                error_message: Optional[str] = None,
+                                post_local_ratio: Optional[float] = None):
+        """Update a rebalance record with the result.
+
+        Phase 3.3: post_local_ratio captures the destination's local ratio
+        immediately after a successful rebalance so the engine can detect
+        drift since that anchor and apply the cooldown override.
+        """
         conn = self._get_connection()
         fee_msat = int(actual_fee_msat) if actual_fee_msat is not None else None
         fee_sats = int(actual_fee_sats) if actual_fee_sats is not None else None
@@ -1943,14 +1958,45 @@ class Database:
             fee_msat = sats_to_base(fee_sats)
         if fee_sats is None and fee_msat is not None:
             fee_sats = base_to_sats_ceil(fee_msat)
-        
+        anchor_ratio = (
+            max(0.0, min(1.0, float(post_local_ratio)))
+            if post_local_ratio is not None
+            else None
+        )
         conn.execute("""
             UPDATE rebalance_history
             SET status = ?, actual_fee_sats = ?, actual_fee_msat = ?, actual_profit_sats = ?,
-                error_message = ?, timestamp = ?
+                error_message = ?, timestamp = ?,
+                post_local_ratio = COALESCE(?, post_local_ratio)
             WHERE id = ?
         """, (status, fee_sats, fee_msat, actual_profit_sats, error_message,
-              int(time.time()), rebalance_id))
+              int(time.time()), anchor_ratio, rebalance_id))
+
+    def get_last_post_rebalance_state(
+        self, channel_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent successful rebalance anchor for a channel.
+
+        Phase 3.3: returns the channel's local ratio after the last successful
+        rebalance plus the rebalance amount and timestamp. The engine uses
+        this to compute drift since the last successful refill and decide
+        whether to override the channel-level cooldown.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            """
+            SELECT timestamp, post_local_ratio, amount_sats
+            FROM rebalance_history
+            WHERE to_channel = ? AND status = 'success'
+                  AND post_local_ratio IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (channel_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
     
     def get_recent_rebalances(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent rebalance attempts."""

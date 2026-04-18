@@ -488,6 +488,36 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-rebalance-emergency-local-ratio',
+    default='0.10',
+    description='Local ratio below which a destination bypasses the channel-level rebalance cooldown (Phase 3, default: 0.10; 0 disables)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-drift-override-ratio',
+    default='0.30',
+    description='Drift since last successful rebalance that bypasses the cooldown (Phase 3, default: 0.30; 0 disables)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-hold-margin',
+    default='0.0',
+    description='Minimum final_score a priced pair must clear or it is rejected as below_hold_margin (Phase 4, default: 0.0)'
+)
+
+plugin.add_option(
+    name='revenue-ops-pair-fee-cap-ppm',
+    default='1000',
+    description='Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples per-rebalance fee from capex bootstrap (Iter1, default: 1000 = 0.1% of amount; 0 disables)'
+)
+
+plugin.add_option(
+    name='revenue-ops-allow-router-fallback',
+    default='false',
+    description='When true, MARKET_ONLY/HYBRID pairs whose router cannot find a route are still submitted to sling unpriced (legacy fallback_unpriced). Default false; flip true only if production askrene is more pessimistic than sling (Iter3 escape valve).'
+)
+
+plugin.add_option(
     name='revenue-ops-flow-window-days',
     default='7',
     description='Number of days to analyze for flow calculation (default: 7)'
@@ -1369,6 +1399,21 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
+        rebalance_emergency_local_ratio=_safe_float_opt(
+            'revenue-ops-rebalance-emergency-local-ratio', '0.10'
+        ),
+        rebalance_drift_override_ratio=_safe_float_opt(
+            'revenue-ops-rebalance-drift-override-ratio', '0.30'
+        ),
+        rebalance_hold_margin=_safe_float_opt(
+            'revenue-ops-rebalance-hold-margin', '0.0'
+        ),
+        pair_fee_cap_ppm=_safe_int_opt(
+            'revenue-ops-pair-fee-cap-ppm', '1000'
+        ),
+        allow_router_fallback=options.get(
+            'revenue-ops-allow-router-fallback', 'false'
+        ).lower() == 'true',
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
@@ -2393,7 +2438,13 @@ def revenue_rebalance_debug(
                 "active_jobs": 0,
             }
         },
-        "rejection_reasons": []
+        "rejection_reasons": [],
+        "last_decision": (
+            rebalancer.get_last_decision_summary()
+            if hasattr(rebalancer, "get_last_decision_summary")
+            else {}
+        ),
+        "last_cycle": {},
     }
 
     cfg = config.snapshot()
@@ -2655,6 +2706,16 @@ def revenue_rebalance_debug(
     if not summary_only:
         hive_status["segment_scores"] = segment_scores
     result["hive_hints"] = hive_status
+
+    engine = getattr(rebalancer, "rebalance_engine_v2", None)
+    if engine is not None and hasattr(engine, "get_last_cycle_debug"):
+        try:
+            cycle_limit = max_candidates if max_candidates > 0 else 10
+            result["last_cycle"] = engine.get_last_cycle_debug(
+                max_candidates=cycle_limit,
+            )
+        except Exception as e:
+            result["last_cycle"] = {"error": str(e)}
     return result
 
 

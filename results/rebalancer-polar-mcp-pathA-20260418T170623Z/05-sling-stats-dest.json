@@ -1,0 +1,23 @@
+{
+   "failures_in_time_window": null,
+   "successes_in_time_window": {
+      "feeppm_90th_percentile": 40,
+      "feeppm_max": 40,
+      "feeppm_median": 40,
+      "feeppm_min": 40,
+      "feeppm_weighted_avg": 40,
+      "most_common_hop_count": 3,
+      "time_of_last_rebalance": "2026-04-18 17:11:23",
+      "time_window_days": "30",
+      "top_5_channel_partners": [
+         {
+            "alias": "fleet-r4",
+            "sats": 400000,
+            "scid": "159x1x0"
+         }
+      ],
+      "total_amount_sats": 400000,
+      "total_rebalances": 1,
+      "total_spent_sats": 15
+   }
+}

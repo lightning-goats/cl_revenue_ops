@@ -87,6 +87,11 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_max_amount': int,
     'rebalance_min_amount': int,
     'rebalance_cooldown_hours': int,
+    'rebalance_emergency_local_ratio': float,
+    'rebalance_drift_override_ratio': float,
+    'rebalance_hold_margin': float,
+    'pair_fee_cap_ppm': int,
+    'allow_router_fallback': bool,
     'hive_equalization_enabled': bool,
     'hive_equalization_low_pct': float,
     'hive_equalization_high_pct': float,
@@ -222,6 +227,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hot_channel_protection_profit_budget_pct': (0.0, 1.0),
     'inbound_fee_estimate_ppm': (0, 5000),
     'rebalance_cooldown_hours': (1, 168),
+    'rebalance_emergency_local_ratio': (0.0, 1.0),
+    'rebalance_drift_override_ratio': (0.0, 1.0),
+    'rebalance_hold_margin': (0.0, 1.0),
+    'pair_fee_cap_ppm': (0, 100000),
     'hive_equalization_low_pct': (0.0, 1.0),
     'hive_equalization_high_pct': (0.0, 1.0),
     'hive_equalization_cooldown_hours': (1, 168),
@@ -327,6 +336,33 @@ class Config:
     low_liquidity_threshold: float = 0.3  # Below 30% = low outbound
     high_liquidity_threshold: float = 0.7 # Above 70% = high outbound
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
+    # Phase 3 drift override: a destination below this local ratio is still
+    # refill-eligible even when the channel-level cooldown is active. Set to
+    # 0 to disable the override and keep the strict cooldown gate.
+    rebalance_emergency_local_ratio: float = 0.10
+    # Phase 3.3 anchor-state drift override: when a destination's local ratio
+    # has dropped by at least this much since the last successful rebalance,
+    # the cooldown gate is bypassed. Set to 0 to disable.
+    rebalance_drift_override_ratio: float = 0.30
+    # Phase 4.3 do_nothing hold gate: priced pairs with engine final_score
+    # at or below this margin are rejected with reason='below_hold_margin'.
+    # 0 leaves the legacy "any positive score" behavior. Use a small positive
+    # value to require pairs to clear a meaningful EV bar before executing.
+    rebalance_hold_margin: float = 0.0
+    # Iter1 pair fee budget: layered on top of the destination's capex
+    # bootstrap budget so a small/new channel can still pay enough route
+    # fee for sling to find a path. pair_budget_sats =
+    #   max(dest.remaining_capex_sats, ceil(amount * pair_fee_cap_ppm / 1M)).
+    # Default 1000 ppm = 0.1% of rebalance amount. 0 disables the layer
+    # and keeps the Phase 5 capex-only behavior.
+    pair_fee_cap_ppm: int = 1000
+    # Iter3 escape valve: when True, MARKET_ONLY pairs whose router cannot
+    # find a route are still submitted to sling (legacy fallback_unpriced
+    # behavior). The Polar lab proved sling uses the same pathfinder as
+    # askrene so this is wasted work; default False. Flip True only if a
+    # production node sees askrene reject routes that sling could actually
+    # find -- e.g. unusual gossip lag or askrene layer misconfiguration.
+    allow_router_fallback: bool = False
     hive_equalization_enabled: bool = True  # Fallback pure-hive inventory equalization
     hive_equalization_low_pct: float = 0.35  # Lower bound for hive balance band
     hive_equalization_high_pct: float = 0.65  # Upper bound for hive balance band
@@ -736,6 +772,11 @@ class ConfigSnapshot:
     low_liquidity_threshold: float
     high_liquidity_threshold: float
     rebalance_cooldown_hours: int
+    rebalance_emergency_local_ratio: float
+    rebalance_drift_override_ratio: float
+    rebalance_hold_margin: float
+    pair_fee_cap_ppm: int
+    allow_router_fallback: bool
     hive_equalization_enabled: bool
     hive_equalization_low_pct: float
     hive_equalization_high_pct: float

@@ -1,5 +1,7 @@
 """Tests for the v2 rebalance planner."""
 
+import pytest
+
 from modules.rebalance_planner_v2 import RebalancePlanner
 from modules.rebalance_state_v2 import ChannelState, StateSnapshot
 
@@ -15,6 +17,30 @@ def _ch(
     remaining_budget_sats=500,
     cooldown_active=False,
 ):
+    # Mirror the Phase 2 role-aware eligibility derived in build_state_snapshot
+    # so planner unit tests describe the same semantics as the live snapshot.
+    source_eligible = not cooldown_active
+    source_reason = "" if source_eligible else "cooldown"
+    if not is_valuable:
+        dest_eligible, dest_reason = False, "not_valuable"
+    elif cooldown_active:
+        dest_eligible, dest_reason = False, "cooldown"
+    elif remaining_budget_sats <= 0:
+        dest_eligible, dest_reason = False, "no_budget"
+    else:
+        dest_eligible, dest_reason = True, ""
+    # Mirror build_state_snapshot's drain/urgency math against default bands.
+    drain_headroom = max(0.0, 1.0 - 0.65)
+    drain_excess = max(0.0, local_ratio - 0.65)
+    source_drain_score = (
+        round(min(1.0, drain_excess / drain_headroom), 6) if drain_headroom > 0 else 0.0
+    )
+    urgency_band = 0.35
+    dest_urgency = (
+        round(min(1.0, max(0.0, urgency_band - local_ratio) / urgency_band), 6)
+        if urgency_band > 0
+        else 0.0
+    )
     return ChannelState(
         channel_id=channel_id,
         peer_id=peer_id,
@@ -25,6 +51,12 @@ def _ch(
         is_valuable=is_valuable,
         remaining_budget_sats=remaining_budget_sats,
         cooldown_active=cooldown_active,
+        source_eligible=source_eligible,
+        dest_eligible=dest_eligible,
+        source_reason=source_reason,
+        dest_reason=dest_reason,
+        dest_urgency=dest_urgency,
+        source_drain_score=source_drain_score,
     )
 
 
@@ -66,23 +98,102 @@ class TestPairGeneration:
         # Float arithmetic may be off by 1 sat from int truncation
         assert abs(result.selected[0].amount_sats - 125_000) <= 1
 
-    def test_uses_max_budget_from_either_channel(self):
+    def test_pair_budget_uses_fee_cap_ppm_when_capex_too_low(self):
+        """Iter1: capex bootstrap budget (e.g. 200 sats) is meant for channel
+        opens, not per-rebalance fees. The planner should layer a fee cap
+        derived from the rebalance amount on top, so a small capex channel
+        can still pay enough route fee for sling to find a path."""
+        planner = RebalancePlanner(pair_fee_cap_ppm=1000)  # 0.1% of amount
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.90, remaining_budget_sats=0)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, remaining_budget_sats=200)
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        # amount = min((0.90-0.65)*1M, (0.35-0.10)*1M, max_chunk) = 250k sats
+        # fee_cap = ceil(250000 * 1000 / 1_000_000) = 250 sats
+        # pair_budget should be max(capex=200, fee_cap=250) = 250
+        pair = result.selected[0]
+        assert pair.amount_sats == pytest.approx(250_000, abs=1)
+        assert pair.pair_budget_sats == 250
+
+    def test_pair_budget_keeps_capex_when_higher_than_fee_cap(self):
+        """Iter1: when the channel's earned capex budget exceeds the
+        fee-cap-on-amount, keep using the earned budget."""
+        planner = RebalancePlanner(pair_fee_cap_ppm=1000)
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.90, remaining_budget_sats=0)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, remaining_budget_sats=5000)
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        # fee_cap = 250 sats, capex = 5000 -> use 5000
+        assert result.selected[0].pair_budget_sats == 5000
+
+    def test_pair_budget_zero_fee_cap_keeps_legacy_capex_only_behavior(self):
+        """Iter1 backwards-compat: pair_fee_cap_ppm=0 disables the fee cap
+        and reverts to the Phase 5 destination-led capex-only behavior."""
+        planner = RebalancePlanner(pair_fee_cap_ppm=0)
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.90, remaining_budget_sats=0)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, remaining_budget_sats=200)
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+        assert result.selected[0].pair_budget_sats == 200
+
+    def test_source_safety_controls_survive_destination_led_budget(self):
+        """Phase 5.3: even though source budget no longer gates pair spend,
+        source-side safety controls (cooldown protection, opportunity-cost
+        signals via the score) still apply to prevent re-draining a
+        recovering source or burning a hot channel."""
+        planner = RebalancePlanner()
+        # Cooldown-protected over-local source -> still ineligible.
+        protected = _ch(channel_id="protected", peer_id="02" + "aa" * 32,
+                        local_ratio=0.92, value_class="active",
+                        cooldown_active=True, remaining_budget_sats=10_000)
+        # Funded depleted dest -> would otherwise be a happy refill target.
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, value_class="profitable",
+                   remaining_budget_sats=2000)
+        snap = _snap(protected, dest)
+
+        result = planner.plan(snap)
+
+        assert result.selected == []
+        skipped = {s.channel_id: s.reason for s in result.skipped}
+        # Source still cooldown-protected -- destination-led budget does
+        # not bypass source-side safety.
+        assert skipped.get("protected") == "cooldown"
+        assert skipped.get("dest") == "no_partner"
+
+    def test_destination_budget_authorizes_pair_spend(self):
+        """Phase 5.1+5.2: the destination's remaining capex budget alone
+        authorizes pair spend. Source budget does not enter pair_budget --
+        we are not opening a channel to the source, we are draining it."""
         planner = RebalancePlanner()
         src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
-                  local_ratio=0.90, remaining_budget_sats=100)
+                  local_ratio=0.90, remaining_budget_sats=5000)
         dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
                    local_ratio=0.10, remaining_budget_sats=500)
         snap = _snap(src, dest)
 
         result = planner.plan(snap)
 
+        # Destination budget caps spend even when source has more.
         assert result.selected[0].pair_budget_sats == 500
 
 
 class TestSkipReasons:
-    def test_skips_non_valuable_channels(self):
+    def test_destination_skipped_when_not_valuable(self):
+        """Phase 2: an over-remote neutral channel still cannot be a destination."""
         planner = RebalancePlanner()
-        ch = _ch(channel_id="neutral", local_ratio=0.90,
+        ch = _ch(channel_id="neutral_dest", local_ratio=0.10,
                  value_class="neutral", is_valuable=False)
         snap = _snap(ch)
 
@@ -90,6 +201,22 @@ class TestSkipReasons:
 
         assert len(result.selected) == 0
         assert any(s.reason == "not_valuable" for s in result.skipped)
+
+    def test_over_local_neutral_is_eligible_source(self):
+        """Phase 2 unstick: an over-local neutral channel is a valid drain
+        source. It does not get skipped as not_valuable -- it becomes a source
+        that no_partner only when no eligible destination exists."""
+        planner = RebalancePlanner()
+        ch = _ch(channel_id="neutral_src", local_ratio=0.90,
+                 value_class="neutral", is_valuable=False)
+        snap = _snap(ch)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 0
+        skipped_for_src = [s for s in result.skipped if s.channel_id == "neutral_src"]
+        assert len(skipped_for_src) == 1
+        assert skipped_for_src[0].reason == "no_partner"
 
     def test_skips_inside_band_channels(self):
         planner = RebalancePlanner()
@@ -101,7 +228,7 @@ class TestSkipReasons:
         assert len(result.selected) == 0
         assert any(s.reason == "inside_band" for s in result.skipped)
 
-    def test_skips_cooldown_channels(self):
+    def test_over_local_in_cooldown_skipped_as_protected_source(self):
         planner = RebalancePlanner()
         ch = _ch(channel_id="cooling", local_ratio=0.90, cooldown_active=True)
         snap = _snap(ch)
@@ -111,9 +238,22 @@ class TestSkipReasons:
         assert len(result.selected) == 0
         assert any(s.reason == "cooldown" for s in result.skipped)
 
-    def test_skips_no_budget_channels(self):
+    def test_over_local_no_budget_is_eligible_source(self):
+        """Phase 2: sources do not consume capex budget. An over-local channel
+        with zero budget can still drain into a funded depleted destination."""
         planner = RebalancePlanner()
-        ch = _ch(channel_id="broke", local_ratio=0.90, remaining_budget_sats=0)
+        ch = _ch(channel_id="broke_src", local_ratio=0.90, remaining_budget_sats=0)
+        snap = _snap(ch)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 0
+        skipped_for_src = [s for s in result.skipped if s.channel_id == "broke_src"]
+        assert skipped_for_src[0].reason == "no_partner"
+
+    def test_destination_skipped_when_no_budget(self):
+        planner = RebalancePlanner()
+        ch = _ch(channel_id="broke_dest", local_ratio=0.10, remaining_budget_sats=0)
         snap = _snap(ch)
 
         result = planner.plan(snap)
@@ -185,16 +325,165 @@ class TestScoring:
         # Hive source should win due to higher value score
         assert result.selected[0].source_channel_id == "hive_src"
 
-    def test_score_is_value_times_imbalance(self):
+    def test_score_is_strictly_positive_for_valid_pair(self):
+        """Phase 4: the additive role-aware score is always positive for a
+        well-formed candidate, but its magnitude depends on urgency/drain
+        rather than the legacy value*imbalance product."""
         planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
         src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
-                  local_ratio=0.85, value_class="profitable")  # value=2, imbalance=0.20
+                  local_ratio=0.85, value_class="profitable")
         dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
-                   local_ratio=0.10, value_class="active")  # value=1, imbalance=0.25
+                   local_ratio=0.10, value_class="active")
         snap = _snap(src, dest)
 
         result = planner.plan(snap)
 
         pair = result.selected[0]
-        # max(2, 1) = 2, avg(0.20, 0.25) = 0.225, score = 0.45
-        assert abs(pair.score - 0.45) < 0.001
+        assert pair.score > 0.0
+
+    def test_cheaper_return_source_wins_when_other_terms_equal(self):
+        """Phase 2.3: when two sources have the same value class and the same
+        local ratio, the one offering a cheaper inbound return path should win
+        because it lowers expected circular route cost."""
+        planner = RebalancePlanner()
+        # Order with expensive first to prove insertion order doesn't decide.
+        expensive = _ch(channel_id="expensive_src", peer_id="02" + "bb" * 32,
+                        local_ratio=0.90, value_class="active",
+                        actual_inbound_fee_ppm=5_000)
+        cheap = _ch(channel_id="cheap_src", peer_id="02" + "aa" * 32,
+                    local_ratio=0.90, value_class="active",
+                    actual_inbound_fee_ppm=10)
+        dest = _ch(channel_id="dest", peer_id="02" + "cc" * 32, local_ratio=0.10)
+        snap = _snap(expensive, cheap, dest)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        assert result.selected[0].source_channel_id == "cheap_src"
+
+    def test_polar_s2_shape_forms_a_pair(self):
+        """Phase 2.4 regression: S2 had a depleted profitable destination plus
+        two extreme over-local neutral channels. Phase 2 must let one of those
+        neutrals serve as the drain source so a pair forms."""
+        planner = RebalancePlanner()
+        depleted = _ch(channel_id="159x1x0", peer_id="02" + "1" * 64,
+                       local_ratio=0.10, value_class="profitable",
+                       remaining_budget_sats=1000)
+        neutral_a = _ch(channel_id="243x1x0", peer_id="02" + "2" * 64,
+                        local_ratio=0.95, value_class="neutral",
+                        is_valuable=False, remaining_budget_sats=0)
+        neutral_b = _ch(channel_id="255x1x0", peer_id="02" + "3" * 64,
+                        local_ratio=0.95, value_class="neutral",
+                        is_valuable=False, remaining_budget_sats=0)
+        snap = _snap(depleted, neutral_a, neutral_b)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        pair = result.selected[0]
+        assert pair.source_channel_id in {"243x1x0", "255x1x0"}
+        assert pair.dest_channel_id == "159x1x0"
+
+    def test_polar_s9_shape_recognizes_neutral_sources(self):
+        """Phase 2.4 regression: S9 had two 100%-local neutral channels and a
+        cooldown-blocked depleted destination. Sources must be eligible (no
+        source_rejected_neutral); the cooldown blocker stays for Phase 3."""
+        planner = RebalancePlanner()
+        cooldown_dest = _ch(channel_id="123x1x0", peer_id="02" + "9" * 64,
+                            local_ratio=0.066, value_class="profitable",
+                            remaining_budget_sats=1000, cooldown_active=True)
+        neutral_a = _ch(channel_id="200x2x0", peer_id="02" + "8" * 64,
+                        local_ratio=1.0, value_class="neutral",
+                        is_valuable=False, remaining_budget_sats=0)
+        neutral_b = _ch(channel_id="201x2x0", peer_id="02" + "7" * 64,
+                        local_ratio=1.0, value_class="neutral",
+                        is_valuable=False, remaining_budget_sats=0)
+        snap = _snap(cooldown_dest, neutral_a, neutral_b)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 0  # cooldown-blocked destination
+        skipped = {s.channel_id: s.reason for s in result.skipped}
+        # Neutral sources are eligible -- they hit no_partner because the
+        # only depleted destination is in cooldown.
+        assert skipped.get("200x2x0") == "no_partner"
+        assert skipped.get("201x2x0") == "no_partner"
+        assert skipped.get("123x1x0") == "cooldown"
+
+    def test_additive_score_decomposition_exposes_role_terms(self):
+        """Phase 4.1: planner pairs carry an explicit additive decomposition
+        with explicit destination urgency, source drain, dest value, and
+        cheap-return terms. The summed terms equal the pair score."""
+        planner = RebalancePlanner()
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.95, value_class="active",
+                  actual_inbound_fee_ppm=200)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.05, value_class="profitable")
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+        pair = result.selected[0]
+        decomp = pair.score_decomposition
+
+        # The additive role-aware terms must be exposed by name.
+        for term in (
+            "dest_urgency_term",
+            "source_drain_term",
+            "dest_value_term",
+            "cheap_return_term",
+        ):
+            assert term in decomp["inputs"], f"missing term {term}"
+            assert decomp["inputs"][term] >= 0.0
+
+        # Score equals the sum of the additive terms (within float tolerance).
+        expected = (
+            decomp["inputs"]["dest_urgency_term"]
+            + decomp["inputs"]["source_drain_term"]
+            + decomp["inputs"]["dest_value_term"]
+            + decomp["inputs"]["cheap_return_term"]
+        )
+        assert abs(pair.score - expected) < 1e-6
+
+    def test_destination_drives_value_term_not_source(self):
+        """Phase 4.1: under the additive model the destination's value class
+        drives the value term -- a hive source paired with an active dest
+        should NOT outrank an active source paired with a hive dest."""
+        planner = RebalancePlanner()
+        # Pair A: hive source -> active dest. Source value should not beat dest.
+        hive_src = _ch(channel_id="hive_src", peer_id="02" + "aa" * 32,
+                       local_ratio=0.85, value_class="hive",
+                       actual_inbound_fee_ppm=100)
+        active_dest = _ch(channel_id="active_dest", peer_id="02" + "bb" * 32,
+                          local_ratio=0.15, value_class="active")
+        # Pair B: active source -> hive dest.
+        active_src = _ch(channel_id="active_src", peer_id="02" + "cc" * 32,
+                         local_ratio=0.85, value_class="active",
+                         actual_inbound_fee_ppm=100)
+        hive_dest = _ch(channel_id="hive_dest", peer_id="02" + "dd" * 32,
+                        local_ratio=0.15, value_class="hive")
+        snap = _snap(hive_src, active_dest, active_src, hive_dest)
+
+        result = planner.plan(snap)
+
+        # Highest-scoring pair should have the hive *destination*.
+        sorted_pairs = sorted(result.selected, key=lambda p: p.score, reverse=True)
+        assert sorted_pairs[0].dest_channel_id == "hive_dest"
+
+    def test_more_drained_source_wins_when_value_and_return_tied(self):
+        """Phase 2.3: explicit drain preference -- a more over-local source is
+        preferred even at the same value class and same return cost."""
+        planner = RebalancePlanner()
+        very_full = _ch(channel_id="very_full", peer_id="02" + "aa" * 32,
+                        local_ratio=0.95, value_class="active",
+                        actual_inbound_fee_ppm=100)
+        slightly = _ch(channel_id="slightly_full", peer_id="02" + "bb" * 32,
+                       local_ratio=0.70, value_class="active",
+                       actual_inbound_fee_ppm=100)
+        dest = _ch(channel_id="dest", peer_id="02" + "cc" * 32, local_ratio=0.10)
+        snap = _snap(very_full, slightly, dest)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        assert result.selected[0].source_channel_id == "very_full"

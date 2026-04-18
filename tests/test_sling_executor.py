@@ -98,6 +98,9 @@ class TestSlingExecutorMapping:
             [
                 call("listconfigs", {}),
                 call("sling-stats", {"scid": DEST_SCID, "json": True}),
+                # Iter2: proactive sling-stop precedes sling-once so a stale
+                # job from a prior cycle cannot block the new attempt.
+                call("sling-stop", [DEST_SCID]),
                 call(
                     "sling-once",
                     {
@@ -136,6 +139,8 @@ class TestSlingExecutorMapping:
         assert plugin.rpc.call.call_args_list == [
             call("listconfigs", {}),
             call("sling-stats", {"scid": DEST_SCID, "json": True}),
+            # Iter2: proactive sling-stop precedes sling-once.
+            call("sling-stop", [DEST_SCID]),
             call(
                 "sling-once",
                 {

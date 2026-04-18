@@ -24,6 +24,59 @@ _VALUE_SCORES = {
 }
 
 
+def _bootstrap_score_decomposition(
+    *,
+    value_score: int,
+    imbalance_score: float,
+    pair_score: float,
+    amount_sats: int,
+    pair_budget_sats: int,
+    source_local_ratio: float,
+    dest_local_ratio: float,
+    dest_urgency_term: float = 0.0,
+    source_drain_term: float = 0.0,
+    dest_value_term: float = 0.0,
+    cheap_return_term: float = 0.0,
+) -> dict:
+    """Return the initial explicit score breakdown for a planned pair.
+
+    Phase 4.1 exposes the additive role-aware terms (dest_urgency,
+    source_drain, dest_value, cheap_return) alongside the legacy
+    value_score/imbalance_score diagnostics. The engine layers route
+    success and fee on top via _build_score_decomposition.
+    """
+    p_success = 0.5
+    expected_future_value = round(float(pair_score), 6)
+    final_score = round(p_success * expected_future_value, 6)
+    return {
+        "model_version": "v2-bootstrap-explainability",
+        "score_units": "planner_score_minus_budget_share",
+        "stage": "planner_pre_route",
+        "p_success": p_success,
+        "expected_future_value": expected_future_value,
+        "expected_fee": 0.0,
+        "source_opportunity_cost": 0.0,
+        "failure_penalty": 0.0,
+        "capital_risk_penalty": 0.0,
+        "do_nothing_score": 0.0,
+        "final_score": final_score,
+        "beats_do_nothing": final_score > 0.0,
+        "rejection_reason": "",
+        "inputs": {
+            "value_score": int(value_score),
+            "imbalance_score": round(float(imbalance_score), 6),
+            "amount_sats": int(amount_sats),
+            "pair_budget_sats": int(pair_budget_sats),
+            "source_local_ratio": round(float(source_local_ratio), 6),
+            "dest_local_ratio": round(float(dest_local_ratio), 6),
+            "dest_urgency_term": round(float(dest_urgency_term), 6),
+            "source_drain_term": round(float(source_drain_term), 6),
+            "dest_value_term": round(float(dest_value_term), 6),
+            "cheap_return_term": round(float(cheap_return_term), 6),
+        },
+    }
+
+
 class RebalancePlanner:
     """Pair-based rebalance planner using actual fees and budgets."""
 
@@ -33,11 +86,17 @@ class RebalancePlanner:
         target_band_high: float = 0.65,
         max_chunk_sats: int = 2_000_000,
         max_pairs: int = 10,
+        pair_fee_cap_ppm: int = 0,
     ):
         self.target_band_low = target_band_low
         self.target_band_high = target_band_high
         self.max_chunk_sats = max_chunk_sats
         self.max_pairs = max_pairs
+        # Iter1: rebalance fee budget per pair = max(dest_capex_budget,
+        # ceil(amount * pair_fee_cap_ppm / 1_000_000)). Decouples per-rebalance
+        # fee envelope from capex bootstrap (which is meant for channel
+        # opens, not routing fees). 0 disables and keeps legacy behavior.
+        self.pair_fee_cap_ppm = max(0, int(pair_fee_cap_ppm))
 
     def plan(self, snapshot: StateSnapshot) -> PlanResult:
         """Classify channels, generate pairs, score and select."""
@@ -45,17 +104,30 @@ class RebalancePlanner:
         over_remote: List[ChannelState] = []
         skipped: List[SkipRecord] = []
 
-        # Phase 1: classify every channel
+        # Phase 1: classify by band first, then apply role-specific eligibility.
+        # Phase 2 of the post-Polar remediation: a neutral over-local channel is
+        # a valid drain source even though it can never be a refill destination.
         for ch in snapshot.channels:
-            skip = self._check_skip(ch)
-            if skip is not None:
-                skipped.append(skip)
-                continue
-
             if ch.local_ratio > self.target_band_high:
-                over_local.append(ch)
+                if ch.source_eligible:
+                    over_local.append(ch)
+                else:
+                    skipped.append(SkipRecord(
+                        channel_id=ch.channel_id,
+                        reason=ch.source_reason or "source_ineligible",
+                        value_class=ch.value_class,
+                        remaining_budget_sats=ch.remaining_budget_sats,
+                    ))
             elif ch.local_ratio < self.target_band_low:
-                over_remote.append(ch)
+                if ch.dest_eligible:
+                    over_remote.append(ch)
+                else:
+                    skipped.append(SkipRecord(
+                        channel_id=ch.channel_id,
+                        reason=ch.dest_reason or "dest_ineligible",
+                        value_class=ch.value_class,
+                        remaining_budget_sats=ch.remaining_budget_sats,
+                    ))
             else:
                 skipped.append(SkipRecord(
                     channel_id=ch.channel_id,
@@ -121,31 +193,6 @@ class RebalancePlanner:
 
         return PlanResult(selected=candidates, skipped=skipped)
 
-    def _check_skip(self, ch: ChannelState):
-        """Return a SkipRecord if the channel should be skipped pre-pairing."""
-        if not ch.is_valuable:
-            return SkipRecord(
-                channel_id=ch.channel_id,
-                reason="not_valuable",
-                value_class=ch.value_class,
-                remaining_budget_sats=ch.remaining_budget_sats,
-            )
-        if ch.cooldown_active:
-            return SkipRecord(
-                channel_id=ch.channel_id,
-                reason="cooldown",
-                value_class=ch.value_class,
-                remaining_budget_sats=ch.remaining_budget_sats,
-            )
-        if ch.remaining_budget_sats <= 0:
-            return SkipRecord(
-                channel_id=ch.channel_id,
-                reason="no_budget",
-                value_class=ch.value_class,
-                remaining_budget_sats=0,
-            )
-        return None
-
     def _generate_pairs(
         self,
         over_local: List[ChannelState],
@@ -172,18 +219,59 @@ class RebalancePlanner:
                 if amount <= 0:
                     continue
 
-                pair_budget = max(src.remaining_budget_sats, dest.remaining_budget_sats)
+                # Phase 5.1+5.2: destination authorizes spend. The source's
+                # remaining capex budget never enters pair_budget -- we are
+                # not opening a channel to the source, just draining it.
+                # Iter1: layer a fee-cap-on-amount on top of the capex
+                # budget so a small bootstrap channel can still pay enough
+                # routing fee to find a path.
+                pair_budget = dest.remaining_budget_sats
+                if self.pair_fee_cap_ppm > 0 and amount > 0:
+                    fee_cap_from_amount = (
+                        amount * self.pair_fee_cap_ppm + 999_999
+                    ) // 1_000_000
+                    pair_budget = max(pair_budget, fee_cap_from_amount)
 
-                # Score: value * imbalance
+                # Phase 4.1: explicit additive role-aware planner score.
+                # Each term carries a clear meaning instead of a single
+                # value*imbalance scalar.
                 src_value = _VALUE_SCORES.get(src.value_class, 0)
                 dest_value = _VALUE_SCORES.get(dest.value_class, 0)
-                value_score = max(src_value, dest_value)
 
+                # Destination value drives the investment decision. Phase 5
+                # makes this fully destination-led; Phase 4 already stops
+                # mixing source and destination value classes.
+                dest_value_term = float(dest_value) * 0.20
+
+                # Refill urgency -- how badly the destination needs sats.
+                dest_urgency_term = float(dest.dest_urgency or 0.0) * 0.30
+
+                # Drain benefit -- how stagnant/overfull the source is.
+                source_drain_term = float(src.source_drain_score or 0.0) * 0.20
+
+                # Cheap-return bonus -- low inbound fee shortens the circular
+                # route cost. Capped so it can't dominate the urgency term.
+                inbound_fee_ppm = max(0, int(src.actual_inbound_fee_ppm or 0))
+                cheap_return_term = max(
+                    0.0, (5_000 - min(5_000, inbound_fee_ppm)) / 50_000.0
+                )
+
+                # Imbalance retained as derived diagnostic, not a scoring
+                # input -- urgency + drain already encode it.
                 src_imbalance = max(0.0, src.local_ratio - self.target_band_high)
                 dest_imbalance = max(0.0, self.target_band_low - dest.local_ratio)
                 imbalance_score = (src_imbalance + dest_imbalance) / 2.0
 
-                score = value_score * imbalance_score
+                score = (
+                    dest_urgency_term
+                    + source_drain_term
+                    + dest_value_term
+                    + cheap_return_term
+                )
+
+                # Backwards-compat: keep value_score reference for callers and
+                # tests that still inspect it via the bootstrap decomposition.
+                value_score = dest_value
 
                 pairs.append(PairCandidate(
                     source_channel_id=src.channel_id,
@@ -192,9 +280,26 @@ class RebalancePlanner:
                     dest_peer_id=dest.peer_id,
                     amount_sats=amount,
                     pair_budget_sats=pair_budget,
+                    source_capacity_sats=src.capacity_sats,
+                    dest_capacity_sats=dest.capacity_sats,
+                    source_value_class=src.value_class,
+                    dest_value_class=dest.value_class,
                     score=score,
                     source_local_ratio=src.local_ratio,
                     dest_local_ratio=dest.local_ratio,
+                    score_decomposition=_bootstrap_score_decomposition(
+                        value_score=value_score,
+                        imbalance_score=imbalance_score,
+                        pair_score=score,
+                        amount_sats=amount,
+                        pair_budget_sats=pair_budget,
+                        source_local_ratio=src.local_ratio,
+                        dest_local_ratio=dest.local_ratio,
+                        dest_urgency_term=dest_urgency_term,
+                        source_drain_term=source_drain_term,
+                        dest_value_term=dest_value_term,
+                        cheap_return_term=cheap_return_term,
+                    ),
                 ))
 
         return pairs

@@ -341,6 +341,95 @@ def test_revenue_rebalance_debug_reports_segment_hint_influence():
     assert result["hive_hints"]["segment_scores"][0]["short_channel_id"] == "123x1x0"
 
 
+def test_revenue_rebalance_debug_includes_last_cycle_score_breakdown():
+    mod = load_plugin_module()
+    mod.config = Config()
+    mod.data_service = MagicMock()
+    mod.data_service.get_funds.return_value = {"outputs": [], "channels": []}
+    mod.database = MagicMock()
+    mod.database.get_daily_rebalance_spend.return_value = {
+        "total_spent_sats": 0,
+        "total_reserved_sats": 0,
+        "stale_reservations": 0,
+        "job_count": 0,
+        "success_count": 0,
+        "success_rate": 0.0,
+    }
+    mod.database.get_all_channel_states.return_value = []
+    mod._total_cost_budget_status = MagicMock(
+        return_value={
+            "effective_budget_sats": 1000,
+            "remaining_sats": 1000,
+            "actual_spent_by_category": {},
+            "reserved_by_category": {},
+        }
+    )
+    mod._boltz_liquidity_cost_components = MagicMock(
+        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
+    )
+    engine_debug = {
+        "summary": {
+            "considered_pairs": 1,
+            "selected_pairs": 0,
+            "skipped_pairs": 1,
+            "execution_count": 0,
+            "execution_success_count": 0,
+            "valuable_channel_count": 2,
+            "total_remaining_budget_sats": 1000,
+        },
+        "considered_candidates": [
+            {
+                "source_channel_id": "100x1x0",
+                "dest_channel_id": "200x2x0",
+                "score_decomposition": {
+                    "p_success": 0.6,
+                    "expected_future_value": 1.0,
+                    "expected_fee": 1.0,
+                    "source_opportunity_cost": 0.1,
+                    "failure_penalty": 0.0,
+                    "capital_risk_penalty": 1.0,
+                    "final_score": -1.5,
+                    "beats_do_nothing": False,
+                    "rejection_reason": "route_over_budget",
+                },
+            }
+        ],
+        "selected_candidates": [],
+        "skipped": [],
+        "executions": [],
+    }
+    mod.rebalancer = SimpleNamespace(
+        _get_channels_with_balances=lambda: {},
+        job_manager=SimpleNamespace(active_channels=set()),
+        get_last_decision_summary=lambda: {
+            "action": "hold",
+            "reason": "no_rebalance_candidates",
+            "dominant_input": "rebalance_engine",
+            "safety_block": False,
+            "budget_blocked": False,
+        },
+        rebalance_engine_v2=SimpleNamespace(
+            get_last_cycle_debug=lambda max_candidates=10: engine_debug
+        ),
+    )
+    mod.hive_hints = MagicMock()
+    mod.hive_hints.get_status.return_value = {
+        "snapshot_fresh": True,
+        "snapshot_age_seconds": 5,
+        "hints_count": 0,
+    }
+    mod.hive_hints.get_segment_scores.return_value = []
+
+    result = mod.revenue_rebalance_debug(mod.plugin)
+
+    assert result["last_decision"]["reason"] == "no_rebalance_candidates"
+    assert result["last_cycle"]["summary"]["considered_pairs"] == 1
+    assert (
+        result["last_cycle"]["considered_candidates"][0]["score_decomposition"]["rejection_reason"]
+        == "route_over_budget"
+    )
+
+
 def test_hive_hint_plugin_options_are_registered():
     mod = load_plugin_module()
 

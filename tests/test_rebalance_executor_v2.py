@@ -19,6 +19,38 @@ def _make_executor(rpc_call_side_effect=None):
     return executor, plugin
 
 
+class TestSlingJobCleanup:
+    def test_executor_proactively_stops_existing_sling_job_for_dest(self):
+        """Iter2: a stale sling-once job for the same scid blocks a new
+        attempt with 'There is already a job for that scid running'. The
+        executor must call sling-stop scid before sling-once so a previous
+        cycle's failure can't permanently block the next attempt."""
+        executor, plugin = _make_executor()
+        # sling-stop succeeds (returns stopped_count), sling-once succeeds.
+        plugin.rpc.call.side_effect = [
+            {"stopped_count": 1},   # sling-stop
+            {"result": "started"},  # sling-once
+            {"sling-timeoutpay": {"value_int": 30}},  # listconfigs probe
+        ]
+        executor._wait_for_terminal_state = MagicMock(
+            return_value=MagicMock(success=True, error="", route_type="sling")
+        )
+        executor._scid_stats = MagicMock(return_value={"failure_count": 0})
+
+        executor.execute(
+            route=[],
+            amount_sats=100_000,
+            source_channel_id="100x1x0",
+            dest_channel_id="200x2x0",
+            max_fee_sats=100,
+        )
+
+        calls = [c.args[0] for c in plugin.rpc.call.call_args_list]
+        assert "sling-stop" in calls, f"sling-stop never called: {calls}"
+        assert calls.index("sling-stop") < calls.index("sling-once"), \
+            "sling-stop must precede sling-once"
+
+
 class TestStableFailureReason:
     def test_route_over_budget_maps_to_route_segment_exhausted(self):
         assert (

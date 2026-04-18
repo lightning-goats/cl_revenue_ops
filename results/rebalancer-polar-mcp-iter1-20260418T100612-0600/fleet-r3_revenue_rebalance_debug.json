@@ -1,0 +1,192 @@
+{
+   "executor_available": true,
+   "dry_run": false,
+   "filters": {
+      "channel_id": null,
+      "peer_id": null,
+      "summary_only": false,
+      "include_hot_markers": true,
+      "max_candidates": null
+   },
+   "capital_controls": {
+      "onchain_sats": 6999535,
+      "channel_sats": 7200965,
+      "total_liquid_sats": 14200500,
+      "wallet_reserve_sats": 1000000,
+      "reserve_ok": true,
+      "daily_budget_sats": 5000,
+      "budget_mode": "fixed",
+      "budget_window_hours": 24,
+      "budget_floor_sats": 5000,
+      "daily_spent_sats": 0,
+      "daily_reserved_sats": 0,
+      "boltz_spent_sats": 0,
+      "boltz_reserved_sats": 0,
+      "total_liquidity_spent_sats": 0,
+      "total_liquidity_reserved_sats": 0,
+      "total_liquidity_breakdown": {
+         "actual_spent_by_category": {
+            "rebalance": 0,
+            "boltz": 0,
+            "open": 0,
+            "close": 0,
+            "ledger": 0
+         },
+         "reserved_by_category": {
+            "rebalance": 0,
+            "boltz": 0,
+            "ledger": 0
+         }
+      },
+      "stale_reservations": 0,
+      "budget_remaining_sats": 5000,
+      "budget_ok": true,
+      "job_count": 1,
+      "success_count": 1,
+      "success_rate": 100.0
+   },
+   "thresholds": {
+      "low_liquidity_threshold": 0.3,
+      "high_liquidity_threshold": 0.7,
+      "rebalance_min_profit_sats": 10
+   },
+   "channels": {
+      "depleted": [],
+      "source": [
+         {
+            "scid": "231x1x0",
+            "peer": "0296fa349c28bffc",
+            "local_pct": 100.0,
+            "fee_ppm": 15,
+            "flow_state": "sink",
+            "effective_low_liquidity_threshold_pct": 30.0,
+            "hot_channel_protection": false,
+            "hot_channel_protection_enabled": true,
+            "hot_channel_protection_reason": "not_source",
+            "hot_channel_protection_score": 0.0,
+            "hot_channel_protection_peer_override": false,
+            "hot_channel_protection_peer_depletion_trigger_pct": null,
+            "profit_budget_override_sats": 0,
+            "hot_recommended_cooldown_hours": null,
+            "hot_chunk_multiplier": null,
+            "reason": "high local balance"
+         },
+         {
+            "scid": "147x1x0",
+            "peer": "0238a0bc3336d452",
+            "local_pct": 73.3,
+            "fee_ppm": 19,
+            "flow_state": "balanced",
+            "effective_low_liquidity_threshold_pct": 30.0,
+            "hot_channel_protection": false,
+            "hot_channel_protection_enabled": true,
+            "hot_channel_protection_reason": "not_source",
+            "hot_channel_protection_score": 0.0,
+            "hot_channel_protection_peer_override": false,
+            "hot_channel_protection_peer_depletion_trigger_pct": null,
+            "profit_budget_override_sats": 0,
+            "hot_recommended_cooldown_hours": null,
+            "hot_chunk_multiplier": null,
+            "reason": "high local balance"
+         },
+         {
+            "scid": "219x1x0",
+            "peer": "031a54f3ea046603",
+            "local_pct": 100.0,
+            "fee_ppm": 92,
+            "flow_state": "sink",
+            "effective_low_liquidity_threshold_pct": 30.0,
+            "hot_channel_protection": false,
+            "hot_channel_protection_enabled": true,
+            "hot_channel_protection_reason": "not_source",
+            "hot_channel_protection_score": 0.0,
+            "hot_channel_protection_peer_override": false,
+            "hot_channel_protection_peer_depletion_trigger_pct": null,
+            "profit_budget_override_sats": 0,
+            "hot_recommended_cooldown_hours": null,
+            "hot_chunk_multiplier": null,
+            "reason": "high local balance"
+         }
+      ],
+      "active_jobs": [],
+      "counts": {
+         "considered": 4,
+         "depleted": 0,
+         "source": 3,
+         "active_jobs": 0
+      },
+      "truncated": {
+         "depleted": 0,
+         "source": 0,
+         "active_jobs": 0
+      }
+   },
+   "rejection_reasons": [
+      "No depleted channels (none below 30.0% local balance)"
+   ],
+   "last_decision": {
+      "action": "hold",
+      "reason": "source_inside_band",
+      "dominant_input": "rebalance_engine",
+      "safety_block": false,
+      "budget_blocked": false
+   },
+   "last_cycle": {
+      "summary": {
+         "considered_pairs": 0,
+         "selected_pairs": 0,
+         "skipped_pairs": 4,
+         "execution_count": 0,
+         "execution_success_count": 0,
+         "valuable_channel_count": 2,
+         "total_remaining_budget_sats": 550
+      },
+      "hold_diagnostics": {
+         "dest_blocked_by_cooldown": 0,
+         "dest_not_funded": 0,
+         "source_rejected_neutral": 0,
+         "source_protected": 0,
+         "source_inside_band": 1
+      },
+      "considered_candidates": [],
+      "selected_candidates": [],
+      "skipped": [
+         {
+            "channel_id": "135x1x0",
+            "reason": "inside_band",
+            "value_class": "profitable",
+            "remaining_budget_sats": 300,
+            "detail": ""
+         },
+         {
+            "channel_id": "231x1x0",
+            "reason": "no_partner",
+            "value_class": "neutral",
+            "remaining_budget_sats": 0,
+            "detail": "no over-remote channels available"
+         },
+         {
+            "channel_id": "147x1x0",
+            "reason": "no_partner",
+            "value_class": "profitable",
+            "remaining_budget_sats": 250,
+            "detail": "no over-remote channels available"
+         },
+         {
+            "channel_id": "219x1x0",
+            "reason": "no_partner",
+            "value_class": "neutral",
+            "remaining_budget_sats": 0,
+            "detail": "no over-remote channels available"
+         }
+      ],
+      "executions": []
+   },
+   "hive_hints": {
+      "snapshot_fresh": false,
+      "snapshot_age_seconds": null,
+      "hints_count": 0,
+      "segment_scores_count": 0,
+      "segment_scores": []
+   }
+}

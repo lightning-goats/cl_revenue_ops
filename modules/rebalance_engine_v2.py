@@ -6,6 +6,7 @@ Single entry point: find_candidates() for dry-run, run_cycle() for live.
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError, as_completed
@@ -38,6 +39,7 @@ from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
 class CycleResult:
     """Full result of a v2 rebalance cycle."""
 
+    considered_candidates: List[PairCandidate] = field(default_factory=list)
     candidates: List[PairCandidate] = field(default_factory=list)
     executions: List[ExecutionResult] = field(default_factory=list)
     audit_records: List[SkipRecord] = field(default_factory=list)
@@ -90,14 +92,19 @@ class RebalanceEngine:
         self._pair_failures: Dict[Tuple[str, str], List[float]] = {}
         self._futility_threshold: int = 3
         self._futility_window_sec: float = 1800.0  # 30 minutes
+        # Iter2: lower base cooldown for the most common transient failure
+        # (no_route / temporary_channel_failure). The previous 1800s on a
+        # FIRST sling failure was excessive -- sling itself classifies these
+        # as retriable. Backoff multiplier in record_pair_rebalance_failure
+        # already escalates repeated failures (×failure_count up to ×6).
         self._pair_failure_cooldowns: Dict[str, int] = {
-            "temporary_channel_failure": 1800,
-            "fee_insufficient": 7200,
-            "incorrect_cltv_expiry": 7200,
-            "permanent_failure": 21600,
-            "payment_pending_timeout": 900,
-            "local_execution_failed": 1800,
-            "other_retriable": 1800,
+            "temporary_channel_failure": 300,    # 5 min on first failure
+            "fee_insufficient": 1800,            # 30 min (rare; usually persistent)
+            "incorrect_cltv_expiry": 3600,       # 1 hour (CLN config alignment)
+            "permanent_failure": 21600,          # 6 hours
+            "payment_pending_timeout": 600,      # 10 min
+            "local_execution_failed": 600,       # 10 min
+            "other_retriable": 600,              # 10 min
         }
 
         our_id = self._get_our_id() or ""
@@ -128,6 +135,7 @@ class RebalanceEngine:
                 )
 
         self._cycle_router: Optional[Any] = self._active_router()
+        self._last_cycle_result: CycleResult = CycleResult()
 
     def _probe_askrene(self) -> bool:
         """One-shot probe: does this CLN instance have askrene loaded?"""
@@ -186,6 +194,262 @@ class RebalanceEngine:
     def shutdown(self) -> None:
         """Release thread pool resources."""
         self._pool.shutdown(wait=False)
+
+    def _cache_cycle_result(self, result: CycleResult) -> None:
+        self._last_cycle_result = result
+
+    @staticmethod
+    def _pair_key(pair: PairCandidate) -> Tuple[str, str]:
+        return (str(pair.source_channel_id), str(pair.dest_channel_id))
+
+    def _failure_penalty(self, pair: PairCandidate) -> float:
+        fresh = self._prune_pair_failures(self._pair_key(pair))
+        return round(min(1.0, len(fresh) * 0.25), 6)
+
+    def _build_score_decomposition(
+        self,
+        pair: PairCandidate,
+        *,
+        probability_ppm: int = 0,
+        route_cost_sats: Optional[int] = None,
+        effective_budget_sats: Optional[int] = None,
+        rejection_reason: str = "",
+        route_status: str = "unpriced",
+    ) -> Dict[str, Any]:
+        """Build an explicit, operator-visible score breakdown.
+
+        This is the first refactor step from the brief: expose the current
+        decision model clearly before replacing it with a stronger empirical EV
+        model. The values are normalized planner/debug units, not a final
+        sat-denominated economics model.
+        """
+        cfg = self.config if not hasattr(self.config, "snapshot") else self.config.snapshot()
+        high_threshold = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
+        low_threshold = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
+
+        source_capacity = int(getattr(pair, "source_capacity_sats", 0) or 0)
+        dest_capacity = int(getattr(pair, "dest_capacity_sats", 0) or 0)
+        amount_sats = int(getattr(pair, "amount_sats", 0) or 0)
+        source_post_ratio = float(getattr(pair, "source_local_ratio", 0.0) or 0.0)
+        dest_post_ratio = float(getattr(pair, "dest_local_ratio", 0.0) or 0.0)
+        if source_capacity > 0:
+            source_post_ratio -= amount_sats / max(1, source_capacity)
+        if dest_capacity > 0:
+            dest_post_ratio += amount_sats / max(1, dest_capacity)
+
+        source_excess_before = max(0.0, float(getattr(pair, "source_local_ratio", 0.0) or 0.0) - high_threshold)
+        source_excess_after = max(0.0, source_post_ratio - high_threshold)
+        source_opportunity_cost = 0.0
+        if source_excess_before > 0.0:
+            source_opportunity_cost = min(
+                0.25,
+                max(0.0, source_excess_before - source_excess_after) / source_excess_before * 0.25,
+            )
+
+        if probability_ppm > 0:
+            p_success = min(0.99, max(0.05, probability_ppm / 1_000_000.0))
+        elif rejection_reason == "no_route":
+            p_success = 0.05
+        elif route_status == "fallback_unpriced":
+            p_success = 0.25
+        else:
+            p_success = 0.5
+
+        expected_fee_sats = int(route_cost_sats or 0)
+        raw_budget_sats = int(getattr(pair, "pair_budget_sats", 0) or 0)
+        effective_budget = int(
+            effective_budget_sats
+            if effective_budget_sats is not None
+            else (raw_budget_sats or 0)
+        )
+        expected_fee = 0.0
+        capital_risk_penalty = 0.0
+        if effective_budget > 0 and expected_fee_sats > 0:
+            expected_fee = min(1.0, expected_fee_sats / effective_budget)
+        if raw_budget_sats > 0 and expected_fee_sats > 0:
+            capital_risk_penalty = min(1.0, expected_fee_sats / raw_budget_sats)
+
+        failure_penalty = self._failure_penalty(pair)
+        expected_future_value = round(float(getattr(pair, "score", 0.0) or 0.0), 6)
+        final_score = round(
+            p_success * expected_future_value
+            - expected_fee
+            - source_opportunity_cost
+            - failure_penalty
+            - capital_risk_penalty,
+            6,
+        )
+        beats_do_nothing = bool(not rejection_reason and final_score > 0.0)
+
+        return {
+            "model_version": "v2-bootstrap-explainability",
+            "score_units": "planner_score_minus_budget_share",
+            "stage": route_status,
+            "p_success": round(p_success, 6),
+            "expected_future_value": expected_future_value,
+            "expected_fee": round(expected_fee, 6),
+            "source_opportunity_cost": round(source_opportunity_cost, 6),
+            "failure_penalty": round(failure_penalty, 6),
+            "capital_risk_penalty": round(capital_risk_penalty, 6),
+            "do_nothing_score": 0.0,
+            "final_score": final_score,
+            "beats_do_nothing": beats_do_nothing,
+            "rejection_reason": rejection_reason,
+            "inputs": {
+                "reason_code": str(getattr(pair, "reason_code", "") or ""),
+                "route_policy": getattr(
+                    getattr(getattr(pair, "route_decision", None), "policy", None),
+                    "value",
+                    None,
+                ),
+                "probability_ppm": int(probability_ppm or 0),
+                "expected_fee_sats": expected_fee_sats,
+                "pair_budget_sats": raw_budget_sats,
+                "effective_budget_sats": effective_budget,
+                "source_local_ratio": round(float(getattr(pair, "source_local_ratio", 0.0) or 0.0), 6),
+                "dest_local_ratio": round(float(getattr(pair, "dest_local_ratio", 0.0) or 0.0), 6),
+                "source_post_ratio": round(source_post_ratio, 6),
+                "dest_post_ratio": round(dest_post_ratio, 6),
+                "target_band_low": round(low_threshold, 6),
+                "target_band_high": round(high_threshold, 6),
+                "source_value_class": str(getattr(pair, "source_value_class", "") or ""),
+                "dest_value_class": str(getattr(pair, "dest_value_class", "") or ""),
+            },
+        }
+
+    def _update_pair_score_decomposition(
+        self,
+        pair: PairCandidate,
+        *,
+        probability_ppm: int = 0,
+        route_cost_sats: Optional[int] = None,
+        effective_budget_sats: Optional[int] = None,
+        rejection_reason: str = "",
+        route_status: str = "unpriced",
+    ) -> None:
+        pair.rejection_reason = rejection_reason
+        pair.score_decomposition = self._build_score_decomposition(
+            pair,
+            probability_ppm=probability_ppm,
+            route_cost_sats=route_cost_sats,
+            effective_budget_sats=effective_budget_sats,
+            rejection_reason=rejection_reason,
+            route_status=route_status,
+        )
+
+    def _serialize_pair_candidate(self, pair: PairCandidate) -> Dict[str, Any]:
+        return {
+            "source_channel_id": pair.source_channel_id,
+            "dest_channel_id": pair.dest_channel_id,
+            "source_peer_id": pair.source_peer_id,
+            "dest_peer_id": pair.dest_peer_id,
+            "amount_sats": int(pair.amount_sats or 0),
+            "pair_budget_sats": int(pair.pair_budget_sats or 0),
+            "route_cost_sats": (
+                int(pair.route_cost_sats) if pair.route_cost_sats is not None else None
+            ),
+            "score": round(float(pair.score or 0.0), 6),
+            "source_local_ratio": round(float(pair.source_local_ratio or 0.0), 6),
+            "dest_local_ratio": round(float(pair.dest_local_ratio or 0.0), 6),
+            "reason_code": pair.reason_code,
+            "route_policy": getattr(
+                getattr(getattr(pair, "route_decision", None), "policy", None),
+                "value",
+                None,
+            ),
+            "rejection_reason": pair.rejection_reason or None,
+            "score_decomposition": copy.deepcopy(pair.score_decomposition or {}),
+        }
+
+    def _hold_diagnostics(self, snapshot: Optional[Any]) -> Dict[str, int]:
+        """Phase 1.2: bucket per-channel state so an operator can tell why
+        zero pairs formed without re-deriving it from raw skip rows."""
+        buckets = {
+            "dest_blocked_by_cooldown": 0,
+            "dest_not_funded": 0,
+            "source_rejected_neutral": 0,
+            "source_protected": 0,
+            "source_inside_band": 0,
+        }
+        channels = getattr(snapshot, "channels", None) or ()
+        if not channels:
+            return buckets
+
+        cfg = self.config if not hasattr(self.config, "snapshot") else self.config.snapshot()
+        low = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
+        high = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
+
+        for ch in channels:
+            local_ratio = float(getattr(ch, "local_ratio", 0.0) or 0.0)
+            source_reason = str(getattr(ch, "source_reason", "") or "")
+            dest_reason = str(getattr(ch, "dest_reason", "") or "")
+            if local_ratio < low:
+                if dest_reason == "cooldown":
+                    buckets["dest_blocked_by_cooldown"] += 1
+                elif dest_reason == "no_budget":
+                    buckets["dest_not_funded"] += 1
+            elif local_ratio > high:
+                if source_reason == "not_valuable":
+                    buckets["source_rejected_neutral"] += 1
+                elif source_reason == "cooldown":
+                    buckets["source_protected"] += 1
+            else:
+                buckets["source_inside_band"] += 1
+        return buckets
+
+    def get_last_cycle_debug(self, max_candidates: int = 10) -> Dict[str, Any]:
+        result = self._last_cycle_result or CycleResult()
+        limit = max(0, int(max_candidates or 0))
+
+        def _limit(items: List[Any]) -> List[Any]:
+            if limit <= 0:
+                return items
+            return items[:limit]
+
+        executions: List[Dict[str, Any]] = []
+        for item in _limit(list(result.executions)):
+            executions.append({
+                "success": bool(getattr(item, "success", False)),
+                "error": getattr(item, "error", "") or "",
+                "fee_sats": int(getattr(item, "fee_sats", 0) or 0),
+                "fee_msat": int(getattr(item, "fee_msat", 0) or 0),
+                "attempts": int(getattr(item, "attempts", 0) or 0),
+                "route_type": getattr(item, "route_type", "") or "",
+            })
+
+        skipped: List[Dict[str, Any]] = []
+        for item in _limit(list(getattr(result.plan, "skipped", []) or [])):
+            skipped.append({
+                "channel_id": item.channel_id,
+                "reason": item.reason,
+                "value_class": item.value_class,
+                "remaining_budget_sats": int(item.remaining_budget_sats or 0),
+                "detail": item.detail or "",
+            })
+
+        considered = list(getattr(result, "considered_candidates", []) or [])
+        selected = list(getattr(result, "candidates", []) or [])
+        snapshot = getattr(result, "snapshot", None)
+        return {
+            "summary": {
+                "considered_pairs": len(considered),
+                "selected_pairs": len(selected),
+                "skipped_pairs": len(getattr(result.plan, "skipped", []) or []),
+                "execution_count": len(result.executions),
+                "execution_success_count": sum(1 for item in result.executions if getattr(item, "success", False)),
+                "valuable_channel_count": int(getattr(snapshot, "valuable_channel_count", 0) or 0),
+                "total_remaining_budget_sats": int(getattr(snapshot, "total_remaining_budget_sats", 0) or 0),
+            },
+            "hold_diagnostics": self._hold_diagnostics(snapshot),
+            "considered_candidates": [
+                self._serialize_pair_candidate(pair) for pair in _limit(considered)
+            ],
+            "selected_candidates": [
+                self._serialize_pair_candidate(pair) for pair in _limit(selected)
+            ],
+            "skipped": skipped,
+            "executions": executions,
+        }
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -287,6 +551,30 @@ class RebalanceEngine:
                 except Exception:
                     pass
 
+            # Phase 3.3: drift override using anchor state from the last
+            # successful rebalance. If the channel has dropped materially
+            # below the post-rebalance local ratio, treat it as drifted and
+            # let the destination role bypass the cooldown gate.
+            cooldown_override = False
+            if cooldown and self.database is not None:
+                drift_threshold_raw = getattr(
+                    cfg, "rebalance_drift_override_ratio", 0.30
+                )
+                if isinstance(drift_threshold_raw, (int, float)):
+                    drift_threshold = float(drift_threshold_raw)
+                else:
+                    drift_threshold = 0.0
+                if drift_threshold > 0.0 and capacity_sats > 0:
+                    try:
+                        anchor = self.database.get_last_post_rebalance_state(scid)
+                    except Exception:
+                        anchor = None
+                    if anchor and anchor.get("post_local_ratio") is not None:
+                        current_ratio = local_sats / capacity_sats
+                        anchor_ratio = float(anchor["post_local_ratio"])
+                        if anchor_ratio - current_ratio >= drift_threshold:
+                            cooldown_override = True
+
             normalized.append({
                 "channel_id": scid,
                 "peer_id": peer_id,
@@ -297,9 +585,25 @@ class RebalanceEngine:
                 "is_profitable": is_profitable,
                 "is_active": is_active,
                 "cooldown_active": cooldown,
+                "cooldown_override": cooldown_override,
             })
 
-        return build_state_snapshot(normalized, capex_allocations)
+        def _coerce_float(name: str, default: float) -> float:
+            value = getattr(cfg, name, default)
+            if isinstance(value, (int, float)):
+                return float(value) if value else float(default if default else 0.0)
+            return float(default)
+
+        target_band_low = _coerce_float("low_liquidity_threshold", 0.35)
+        target_band_high = _coerce_float("high_liquidity_threshold", 0.65)
+        target_emergency_low = _coerce_float("rebalance_emergency_local_ratio", 0.10)
+        return build_state_snapshot(
+            normalized,
+            capex_allocations,
+            target_band_low=target_band_low,
+            target_band_high=target_band_high,
+            target_emergency_low=target_emergency_low,
+        )
 
     def _is_hive_member(self, peer_id: str) -> bool:
         if not peer_id:
@@ -446,24 +750,33 @@ class RebalanceEngine:
                 "askrene unavailable; v3 router is required for rebalancing",
                 level="warn",
             )
+            self._cache_cycle_result(CycleResult())
             return []
         router_tag = "v3"
 
         snapshot = self._build_snapshot()
         if not snapshot or not snapshot.channels:
             self._log("No channels in snapshot")
+            self._cache_cycle_result(CycleResult(snapshot=snapshot))
             return []
 
         cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
         target_band_low = getattr(cfg, 'low_liquidity_threshold', 0.35)
         target_band_high = getattr(cfg, 'high_liquidity_threshold', 0.65)
         max_chunk_sats = getattr(cfg, 'rebalance_max_amount', 2_000_000)
+        pair_fee_cap_ppm_raw = getattr(cfg, 'pair_fee_cap_ppm', 0)
+        pair_fee_cap_ppm = (
+            int(pair_fee_cap_ppm_raw)
+            if isinstance(pair_fee_cap_ppm_raw, (int, float))
+            else 0
+        )
 
         planner = RebalancePlanner(
             target_band_low=target_band_low,
             target_band_high=target_band_high,
             max_chunk_sats=max_chunk_sats,
             max_pairs=10,
+            pair_fee_cap_ppm=pair_fee_cap_ppm,
         )
 
         plan = planner.plan(snapshot)
@@ -506,6 +819,7 @@ class RebalanceEngine:
         for pair in plan.selected:
             self._route_decision_for_pair(pair)
             self._apply_segment_score_bias(pair)
+            self._update_pair_score_decomposition(pair, route_status="planned")
         priority_rank = {
             RoutePriority.COORDINATED: 0,
             RoutePriority.HIVE_EQUALIZATION: 1,
@@ -519,16 +833,33 @@ class RebalanceEngine:
                 -float(getattr(pair, "score", 0.0) or 0.0),
             )
         )
+        considered_candidates = [copy.deepcopy(pair) for pair in plan.selected]
+        considered_lookup = {
+            self._pair_key(pair): pair for pair in considered_candidates
+        }
 
         # Route-price selected pairs using the cycle's captured router
         if plan.selected:
             router = self._cycle_router
             priced = []
             for pair in plan.selected:
+                pair_key = self._pair_key(pair)
+                debug_pair = considered_lookup.get(pair_key)
                 cooldown = self._get_persisted_pair_cooldown(
                     pair.source_channel_id, pair.dest_channel_id
                 )
                 if cooldown is not None:
+                    self._update_pair_score_decomposition(
+                        pair,
+                        rejection_reason="pair_cooldown",
+                        route_status="pair_cooldown",
+                    )
+                    if debug_pair is not None:
+                        self._update_pair_score_decomposition(
+                            debug_pair,
+                            rejection_reason="pair_cooldown",
+                            route_status="pair_cooldown",
+                        )
                     plan.skipped.append(SkipRecord(
                         channel_id=pair.dest_channel_id,
                         reason="pair_cooldown",
@@ -553,7 +884,74 @@ class RebalanceEngine:
                         pair.pair_budget_sats,
                         getattr(route_result, "probability_ppm", 0),
                     )
+                    self._update_pair_score_decomposition(
+                        pair,
+                        probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                        route_cost_sats=route_result.route_cost_sats,
+                        effective_budget_sats=effective_budget,
+                        route_status="priced",
+                    )
+                    if debug_pair is not None:
+                        debug_pair.route_cost_sats = route_result.route_cost_sats
+                        debug_pair.route = route_result.route
+                        self._update_pair_score_decomposition(
+                            debug_pair,
+                            probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                            route_cost_sats=route_result.route_cost_sats,
+                            effective_budget_sats=effective_budget,
+                            route_status="priced",
+                        )
                     if route_result.route_cost_sats <= effective_budget:
+                        # Phase 4.3: do_nothing hard gate. A priced pair
+                        # whose final_score does not clear the configured
+                        # hold margin is rejected with an explicit reason
+                        # rather than silently picked.
+                        hold_margin_raw = getattr(cfg, "rebalance_hold_margin", 0.0)
+                        if isinstance(hold_margin_raw, (int, float)):
+                            hold_margin = float(hold_margin_raw)
+                        else:
+                            hold_margin = 0.0
+                        decomp = pair.score_decomposition or {}
+                        final_score = float(decomp.get("final_score", 0.0) or 0.0)
+                        if hold_margin > 0.0 and final_score <= hold_margin:
+                            self._update_pair_score_decomposition(
+                                pair,
+                                probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                                route_cost_sats=route_result.route_cost_sats,
+                                effective_budget_sats=effective_budget,
+                                rejection_reason="below_hold_margin",
+                                route_status="below_hold_margin",
+                            )
+                            if debug_pair is not None:
+                                self._update_pair_score_decomposition(
+                                    debug_pair,
+                                    probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                                    route_cost_sats=route_result.route_cost_sats,
+                                    effective_budget_sats=effective_budget,
+                                    rejection_reason="below_hold_margin",
+                                    route_status="below_hold_margin",
+                                )
+                            self._audit.log_skip(
+                                channel_id=pair.dest_channel_id,
+                                reason="below_hold_margin",
+                                value_class="valuable",
+                                remaining_budget_sats=pair.pair_budget_sats,
+                                detail=(
+                                    f"score={final_score:.4f} margin={hold_margin:.4f}"
+                                ),
+                                router=router_tag,
+                            )
+                            plan.skipped.append(SkipRecord(
+                                channel_id=pair.dest_channel_id,
+                                reason="below_hold_margin",
+                                value_class="valuable",
+                                detail=(
+                                    f"src={pair.source_channel_id} "
+                                    f"score={final_score:.4f} "
+                                    f"margin={hold_margin:.4f}"
+                                ),
+                            ))
+                            continue
                         priced.append(pair)
                         self._audit.log_pick(
                             pair.source_channel_id,
@@ -564,6 +962,23 @@ class RebalanceEngine:
                             router=route_label,
                         )
                     else:
+                        self._update_pair_score_decomposition(
+                            pair,
+                            probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                            route_cost_sats=route_result.route_cost_sats,
+                            effective_budget_sats=effective_budget,
+                            rejection_reason="route_over_budget",
+                            route_status="route_over_budget",
+                        )
+                        if debug_pair is not None:
+                            self._update_pair_score_decomposition(
+                                debug_pair,
+                                probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                                route_cost_sats=route_result.route_cost_sats,
+                                effective_budget_sats=effective_budget,
+                                rejection_reason="route_over_budget",
+                                route_status="route_over_budget",
+                            )
                         plan.skipped.append(SkipRecord(
                             channel_id=pair.dest_channel_id,
                             reason="route_over_budget",
@@ -576,30 +991,67 @@ class RebalanceEngine:
                             ),
                         ))
                 else:
-                    self._audit.log_skip(
-                        pair.dest_channel_id,
+                    # Iter3: when askrene reports no route, sling uses the
+                    # same pathfinder so it would also fail. Skip with
+                    # reason='no_route' instead of submitting unpriced.
+                    # Defensive escape valve: allow_router_fallback=True
+                    # restores the legacy fallback_unpriced submit path
+                    # for non-fail-closed policies. Default is False.
+                    decision = self._route_decision_for_pair(pair)
+                    fail_closed = self._fail_closed_on_route_failure(decision)
+                    allow_fallback_raw = getattr(cfg, "allow_router_fallback", False)
+                    allow_fallback = (
+                        bool(allow_fallback_raw) and not fail_closed
+                    )
+                    if allow_fallback:
+                        pair.route = None
+                        pair.route_cost_sats = pair.pair_budget_sats
+                        self._update_pair_score_decomposition(
+                            pair,
+                            route_cost_sats=pair.pair_budget_sats,
+                            effective_budget_sats=pair.pair_budget_sats,
+                            route_status="fallback_unpriced",
+                        )
+                        if debug_pair is not None:
+                            debug_pair.route = None
+                            debug_pair.route_cost_sats = pair.pair_budget_sats
+                            self._update_pair_score_decomposition(
+                                debug_pair,
+                                route_cost_sats=pair.pair_budget_sats,
+                                effective_budget_sats=pair.pair_budget_sats,
+                                route_status="fallback_unpriced",
+                            )
+                        priced.append(pair)
+                        continue
+                    self._update_pair_score_decomposition(
+                        pair,
+                        rejection_reason="no_route",
+                        route_status="no_route",
+                    )
+                    if debug_pair is not None:
+                        self._update_pair_score_decomposition(
+                            debug_pair,
+                            rejection_reason="no_route",
+                            route_status="no_route",
+                        )
+                    plan.skipped.append(SkipRecord(
+                        channel_id=pair.dest_channel_id,
                         reason="no_route",
                         value_class="valuable",
                         remaining_budget_sats=pair.pair_budget_sats,
-                        detail=route_result.error,
-                        router=route_label,
-                    )
-                    decision = self._route_decision_for_pair(pair)
-                    if self._fail_closed_on_route_failure(decision):
-                        continue
-                    pair.route = None
-                    pair.route_cost_sats = pair.pair_budget_sats
-                    priced.append(pair)
+                        detail=str(route_result.error or "router_no_route"),
+                    ))
+                    continue
 
             plan.selected = priced
 
         # Audit all skips
         for skip in plan.skipped:
             self._audit.log_skip(
-                skip.channel_id,
-                skip.reason,
-                skip.value_class,
-                skip.remaining_budget_sats,
+                channel_id=skip.channel_id,
+                reason=skip.reason,
+                value_class=skip.value_class,
+                remaining_budget_sats=skip.remaining_budget_sats,
                 detail=skip.detail or "",
                 router=router_tag,
             )
@@ -610,6 +1062,15 @@ class RebalanceEngine:
             total_valuable=snapshot.valuable_channel_count,
             total_channels=len(snapshot.channels),
             total_budget_sats=snapshot.total_remaining_budget_sats,
+        )
+        self._cache_cycle_result(
+            CycleResult(
+                considered_candidates=considered_candidates,
+                candidates=list(plan.selected),
+                audit_records=list(plan.skipped),
+                snapshot=snapshot,
+                plan=plan,
+            )
         )
 
         return plan.selected
@@ -767,6 +1228,12 @@ class RebalanceEngine:
         error = str(getattr(exec_result, "error", "") or "").lower()
         if "temporary_channel_failure" in error:
             return "temporary_channel_failure"
+        # Iter2: sling reports "NoRoutes" as a transient routing failure
+        # (gossip not converged, peer-side liquidity not visible, brief
+        # capacity dip). Treat it the same as temporary_channel_failure for
+        # cooldown purposes -- short base cooldown with fast escalation.
+        if "noroutes" in error or "no_routes" in error or "no route" in error:
+            return "temporary_channel_failure"
         if "fee_insufficient" in error:
             return "fee_insufficient"
         if "incorrect_cltv_expiry" in error:
@@ -888,7 +1355,7 @@ class RebalanceEngine:
         # behavior here so the summary and the history agree.
         rebalance_id: Optional[int] = self._record_rebalance_pending(pair)
         result = executor.execute(**self._execution_kwargs(pair))
-        self._record_rebalance_result(rebalance_id, result)
+        self._record_rebalance_result(rebalance_id, result, pair=pair)
         if result is not None and not result.success:
             self._push_segment_observation_snapshot()
         return result
@@ -927,6 +1394,8 @@ class RebalanceEngine:
         self,
         rebalance_id: Optional[int],
         result: Optional[ExecutionResult],
+        *,
+        pair: Optional[PairCandidate] = None,
     ) -> None:
         """Update the rebalance_history row with the terminal status."""
         if rebalance_id is None or self.database is None:
@@ -940,11 +1409,25 @@ class RebalanceEngine:
                 )
                 return
             if result.success:
+                # Phase 3.3: persist the destination's post-rebalance local
+                # ratio anchor. After a successful refill the dest gains the
+                # rebalance amount, so we project from the pre-rebalance
+                # local_ratio and amount_sats. Capacity is taken from the pair.
+                post_local_ratio = None
+                if pair is not None:
+                    capacity = int(getattr(pair, "dest_capacity_sats", 0) or 0)
+                    amount = int(getattr(pair, "amount_sats", 0) or 0)
+                    pre_ratio = float(getattr(pair, "dest_local_ratio", 0.0) or 0.0)
+                    if capacity > 0:
+                        post_local_ratio = max(
+                            0.0, min(1.0, pre_ratio + amount / capacity)
+                        )
                 self.database.update_rebalance_result(
                     rebalance_id,
                     "success",
                     actual_fee_sats=int(getattr(result, "fee_sats", 0) or 0),
                     actual_fee_msat=int(getattr(result, "fee_msat", 0) or 0),
+                    post_local_ratio=post_local_ratio,
                 )
             else:
                 self.database.update_rebalance_result(
@@ -1084,12 +1567,21 @@ class RebalanceEngine:
         Filters out pairs in futility state before submitting to the executor,
         and records success/failure in the pair tracker for the next cycle.
         """
-        result = CycleResult()
-
         candidates = self.find_candidates()
-        result.candidates = candidates
+        planned = self._last_cycle_result or CycleResult()
+        result = CycleResult(
+            considered_candidates=list(getattr(planned, "considered_candidates", []) or []),
+            candidates=list(candidates or []),
+            audit_records=list(getattr(planned, "audit_records", []) or []),
+            snapshot=getattr(planned, "snapshot", None),
+            plan=getattr(planned, "plan", None),
+        )
+        considered_lookup = {
+            self._pair_key(pair): pair for pair in result.considered_candidates
+        }
 
         if not candidates:
+            self._cache_cycle_result(result)
             return result
 
         # Pair-level futility filter: skip pairs that failed too many times in
@@ -1098,6 +1590,15 @@ class RebalanceEngine:
         live_candidates: List[PairCandidate] = []
         for pair in candidates:
             if self._is_pair_in_futility(pair.source_channel_id, pair.dest_channel_id):
+                debug_pair = considered_lookup.get(self._pair_key(pair))
+                if debug_pair is not None:
+                    self._update_pair_score_decomposition(
+                        debug_pair,
+                        route_cost_sats=debug_pair.route_cost_sats,
+                        effective_budget_sats=int(getattr(debug_pair, "pair_budget_sats", 0) or 0),
+                        rejection_reason="pair_futility",
+                        route_status="pair_futility",
+                    )
                 fresh = self._pair_failures.get(
                     (pair.source_channel_id, pair.dest_channel_id), []
                 )
@@ -1105,15 +1606,19 @@ class RebalanceEngine:
                     channel_id=pair.dest_channel_id,
                     reason="pair_futility",
                     value_class="valuable",
+                    remaining_budget_sats=int(getattr(pair, "pair_budget_sats", 0) or 0),
                     detail=(
                         f"src={pair.source_channel_id} "
                         f"failures={len(fresh)} in window {int(self._futility_window_sec)}s"
                     ),
+                    router="v3",
                 )
                 continue
             live_candidates.append(pair)
 
+        result.candidates = list(live_candidates)
         if not live_candidates:
+            self._cache_cycle_result(result)
             return result
 
         executor = RebalanceExecutor(
@@ -1123,12 +1628,25 @@ class RebalanceEngine:
         )
         if not executor.is_available():
             for pair in live_candidates:
+                debug_pair = considered_lookup.get(self._pair_key(pair))
+                if debug_pair is not None:
+                    self._update_pair_score_decomposition(
+                        debug_pair,
+                        route_cost_sats=debug_pair.route_cost_sats,
+                        effective_budget_sats=int(getattr(debug_pair, "pair_budget_sats", 0) or 0),
+                        rejection_reason="sling_unavailable",
+                        route_status="sling_unavailable",
+                    )
                 self._audit.log_skip(
                     channel_id=pair.dest_channel_id,
                     reason="sling_unavailable",
                     value_class="valuable",
+                    remaining_budget_sats=int(getattr(pair, "pair_budget_sats", 0) or 0),
                     detail="sling-once RPC not loaded",
+                    router="v3",
                 )
+            result.candidates = []
+            self._cache_cycle_result(result)
             return result
 
         # Submit the surviving candidates to the thread pool
@@ -1176,4 +1694,5 @@ class RebalanceEngine:
                 level="warn",
             )
 
+        self._cache_cycle_result(result)
         return result
