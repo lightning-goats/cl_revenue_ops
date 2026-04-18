@@ -96,16 +96,45 @@ class TestPairGeneration:
         # Float arithmetic may be off by 1 sat from int truncation
         assert abs(result.selected[0].amount_sats - 125_000) <= 1
 
-    def test_uses_max_budget_from_either_channel(self):
+    def test_source_safety_controls_survive_destination_led_budget(self):
+        """Phase 5.3: even though source budget no longer gates pair spend,
+        source-side safety controls (cooldown protection, opportunity-cost
+        signals via the score) still apply to prevent re-draining a
+        recovering source or burning a hot channel."""
+        planner = RebalancePlanner()
+        # Cooldown-protected over-local source -> still ineligible.
+        protected = _ch(channel_id="protected", peer_id="02" + "aa" * 32,
+                        local_ratio=0.92, value_class="active",
+                        cooldown_active=True, remaining_budget_sats=10_000)
+        # Funded depleted dest -> would otherwise be a happy refill target.
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, value_class="profitable",
+                   remaining_budget_sats=2000)
+        snap = _snap(protected, dest)
+
+        result = planner.plan(snap)
+
+        assert result.selected == []
+        skipped = {s.channel_id: s.reason for s in result.skipped}
+        # Source still cooldown-protected -- destination-led budget does
+        # not bypass source-side safety.
+        assert skipped.get("protected") == "cooldown"
+        assert skipped.get("dest") == "no_partner"
+
+    def test_destination_budget_authorizes_pair_spend(self):
+        """Phase 5.1+5.2: the destination's remaining capex budget alone
+        authorizes pair spend. Source budget does not enter pair_budget --
+        we are not opening a channel to the source, we are draining it."""
         planner = RebalancePlanner()
         src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
-                  local_ratio=0.90, remaining_budget_sats=100)
+                  local_ratio=0.90, remaining_budget_sats=5000)
         dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
                    local_ratio=0.10, remaining_budget_sats=500)
         snap = _snap(src, dest)
 
         result = planner.plan(snap)
 
+        # Destination budget caps spend even when source has more.
         assert result.selected[0].pair_budget_sats == 500
 
 

@@ -213,7 +213,10 @@ class RebalancePlanner:
                 if amount <= 0:
                     continue
 
-                pair_budget = max(src.remaining_budget_sats, dest.remaining_budget_sats)
+                # Phase 5.1+5.2: destination authorizes spend. The source's
+                # remaining capex budget never enters pair_budget -- we are
+                # not opening a channel to the source, just draining it.
+                pair_budget = dest.remaining_budget_sats
 
                 # Phase 4.1: explicit additive role-aware planner score.
                 # Each term carries a clear meaning instead of a single
