@@ -350,6 +350,42 @@ def test_explicit_cooldown_override_input_overrides_dest_cooldown():
     assert channel.dest_reason == ""
 
 
+def test_polar_s7_tiny_oscillation_does_not_trigger_drift_override():
+    """Phase 3.4 anti-churn: a channel that wandered slightly below its
+    post-rebalance anchor should still respect the cooldown. The override is
+    for severe drift, not noise."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "777x7x0": ChannelCapexBudget(channel_id="777x7x0", budget_msat=1_000_000),
+        }
+    )
+    state = build_state_snapshot(
+        [
+            # Healthy mid-band channel in cooldown after a recent rebalance.
+            # Override should NOT fire -- emergency_low is far away (0.45 vs 0.10),
+            # and cooldown_override flag is False (no anchor-based drift either).
+            ChannelInput(
+                channel_id="777x7x0",
+                peer_id="02" + "7" * 64,
+                capacity_sats=1_000_000,
+                local_sats=450_000,
+                is_profitable=True,
+                cooldown_active=True,
+                cooldown_override=False,
+            ),
+        ],
+        allocations,
+        target_emergency_low=0.10,
+    )
+
+    channel = state.channels[0]
+    assert channel.dest_eligible is False
+    assert channel.dest_reason == "cooldown"
+
+
 def test_rebalancer_build_state_v2_delegates_to_builder(mock_plugin, mock_database):
     from modules.config import Config
     import modules.rebalancer as rebalancer_module

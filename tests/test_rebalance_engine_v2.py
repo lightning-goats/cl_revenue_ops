@@ -562,6 +562,69 @@ def test_get_last_cycle_debug_emits_pairless_hold_diagnostics(
     assert diagnostics["source_inside_band"] == 1
 
 
+def test_polar_s7_oscillation_does_not_unblock_cooldown(
+    mock_plugin, mock_database
+):
+    """Phase 3.4 regression: a small drift below the post-rebalance anchor
+    must NOT trigger the cooldown override. The S7 capital-burn trap depends
+    on the rebalancer staying conservative under tiny oscillation."""
+    import time as _time
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+
+    # Simulate the engine's drift-override path with stubbed database calls.
+    mock_database.get_last_rebalance_time.return_value = int(_time.time()) - 600
+    mock_database.get_last_post_rebalance_state.return_value = {
+        "timestamp": int(_time.time()) - 600,
+        "post_local_ratio": 0.50,
+        "amount_sats": 200_000,
+    }
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "777x7x0": ChannelCapexBudget(channel_id="777x7x0", budget_msat=1_000_000),
+        }
+    )
+    snapshot = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="777x7x0",
+                peer_id="02" + "7" * 64,
+                capacity_sats=1_000_000,
+                local_sats=450_000,  # only 5% drift from the 50% anchor
+                is_profitable=True,
+                cooldown_active=True,
+                cooldown_override=False,
+            ),
+            # Add an over-local source so a pair would form if dest unblocked
+            ChannelInput(
+                channel_id="800x8x0",
+                peer_id="02" + "8" * 64,
+                capacity_sats=1_000_000,
+                local_sats=950_000,
+            ),
+        ],
+        allocations,
+        target_emergency_low=0.10,
+    )
+    engine._build_snapshot = MagicMock(return_value=snapshot)
+
+    selected = engine.find_candidates()
+    debug = engine.get_last_cycle_debug()
+
+    assert selected == []
+    assert debug["summary"]["considered_pairs"] == 0
+    diagnostics = debug["hold_diagnostics"]
+    # Channel sits between low and high band -> inside_band, not depleted.
+    assert diagnostics["source_inside_band"] == 1
+
+
 def test_engine_build_snapshot_uses_membership_router_for_hive_value_class(
     mock_plugin, mock_database
 ):
