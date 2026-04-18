@@ -231,7 +231,7 @@ class TestScoring:
         # Hive source should win due to higher value score
         assert result.selected[0].source_channel_id == "hive_src"
 
-    def test_score_is_value_times_imbalance(self):
+    def test_score_includes_value_and_imbalance(self):
         planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
         src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
                   local_ratio=0.85, value_class="profitable")  # value=2, imbalance=0.20
@@ -242,5 +242,45 @@ class TestScoring:
         result = planner.plan(snap)
 
         pair = result.selected[0]
-        # max(2, 1) = 2, avg(0.20, 0.25) = 0.225, score = 0.45
-        assert abs(pair.score - 0.45) < 0.001
+        # value*imbalance baseline (0.45) plus a small additive drain term
+        # introduced in Phase 2.3 -- score is bounded but no longer exact 0.45.
+        assert pair.score >= 0.45
+        assert pair.score < 0.60
+
+    def test_cheaper_return_source_wins_when_other_terms_equal(self):
+        """Phase 2.3: when two sources have the same value class and the same
+        local ratio, the one offering a cheaper inbound return path should win
+        because it lowers expected circular route cost."""
+        planner = RebalancePlanner()
+        # Order with expensive first to prove insertion order doesn't decide.
+        expensive = _ch(channel_id="expensive_src", peer_id="02" + "bb" * 32,
+                        local_ratio=0.90, value_class="active",
+                        actual_inbound_fee_ppm=5_000)
+        cheap = _ch(channel_id="cheap_src", peer_id="02" + "aa" * 32,
+                    local_ratio=0.90, value_class="active",
+                    actual_inbound_fee_ppm=10)
+        dest = _ch(channel_id="dest", peer_id="02" + "cc" * 32, local_ratio=0.10)
+        snap = _snap(expensive, cheap, dest)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        assert result.selected[0].source_channel_id == "cheap_src"
+
+    def test_more_drained_source_wins_when_value_and_return_tied(self):
+        """Phase 2.3: explicit drain preference -- a more over-local source is
+        preferred even at the same value class and same return cost."""
+        planner = RebalancePlanner()
+        very_full = _ch(channel_id="very_full", peer_id="02" + "aa" * 32,
+                        local_ratio=0.95, value_class="active",
+                        actual_inbound_fee_ppm=100)
+        slightly = _ch(channel_id="slightly_full", peer_id="02" + "bb" * 32,
+                       local_ratio=0.70, value_class="active",
+                       actual_inbound_fee_ppm=100)
+        dest = _ch(channel_id="dest", peer_id="02" + "cc" * 32, local_ratio=0.10)
+        snap = _snap(very_full, slightly, dest)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        assert result.selected[0].source_channel_id == "very_full"

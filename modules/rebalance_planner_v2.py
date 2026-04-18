@@ -206,7 +206,7 @@ class RebalancePlanner:
 
                 pair_budget = max(src.remaining_budget_sats, dest.remaining_budget_sats)
 
-                # Score: value * imbalance
+                # Score: value * imbalance + Phase 2.3 source-side terms
                 src_value = _VALUE_SCORES.get(src.value_class, 0)
                 dest_value = _VALUE_SCORES.get(dest.value_class, 0)
                 value_score = max(src_value, dest_value)
@@ -215,7 +215,21 @@ class RebalancePlanner:
                 dest_imbalance = max(0.0, self.target_band_low - dest.local_ratio)
                 imbalance_score = (src_imbalance + dest_imbalance) / 2.0
 
-                score = value_score * imbalance_score
+                # Phase 2.3: explicit source-side preference. The drain term
+                # nudges the planner toward stagnant overfull channels, and
+                # the cheap-return term prefers low-fee inbound paths so the
+                # circular route is cheaper to settle. Both terms are small
+                # additive nudges -- Phase 4 replaces this with the additive
+                # role-aware utility model.
+                drain_bonus = float(src.source_drain_score or 0.0) * 0.10
+                inbound_fee_ppm = max(0, int(src.actual_inbound_fee_ppm or 0))
+                cheap_return_bonus = max(0.0, (5_000 - min(5_000, inbound_fee_ppm)) / 50_000.0)
+
+                score = (
+                    value_score * imbalance_score
+                    + drain_bonus
+                    + cheap_return_bonus
+                )
 
                 pairs.append(PairCandidate(
                     source_channel_id=src.channel_id,
