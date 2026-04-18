@@ -989,6 +989,38 @@ class RebalanceEngine:
                             ),
                         ))
                 else:
+                    # Iter3: when askrene reports no route, sling uses the
+                    # same pathfinder so it would also fail. Skip with
+                    # reason='no_route' instead of submitting unpriced.
+                    # Defensive escape valve: allow_router_fallback=True
+                    # restores the legacy fallback_unpriced submit path
+                    # for non-fail-closed policies. Default is False.
+                    decision = self._route_decision_for_pair(pair)
+                    fail_closed = self._fail_closed_on_route_failure(decision)
+                    allow_fallback_raw = getattr(cfg, "allow_router_fallback", False)
+                    allow_fallback = (
+                        bool(allow_fallback_raw) and not fail_closed
+                    )
+                    if allow_fallback:
+                        pair.route = None
+                        pair.route_cost_sats = pair.pair_budget_sats
+                        self._update_pair_score_decomposition(
+                            pair,
+                            route_cost_sats=pair.pair_budget_sats,
+                            effective_budget_sats=pair.pair_budget_sats,
+                            route_status="fallback_unpriced",
+                        )
+                        if debug_pair is not None:
+                            debug_pair.route = None
+                            debug_pair.route_cost_sats = pair.pair_budget_sats
+                            self._update_pair_score_decomposition(
+                                debug_pair,
+                                route_cost_sats=pair.pair_budget_sats,
+                                effective_budget_sats=pair.pair_budget_sats,
+                                route_status="fallback_unpriced",
+                            )
+                        priced.append(pair)
+                        continue
                     self._update_pair_score_decomposition(
                         pair,
                         rejection_reason="no_route",
@@ -1000,13 +1032,6 @@ class RebalanceEngine:
                             rejection_reason="no_route",
                             route_status="no_route",
                         )
-                    # Iter3: surface no_route to the operator skip list and
-                    # do NOT fall through to sling. sling uses the same
-                    # underlying pathfinder, so it would also fail and only
-                    # add a spurious pair_cooldown entry. The legacy
-                    # fallback_unpriced submit-anyway behavior is removed.
-                    # The skip is logged via the unified plan.skipped loop
-                    # below, so no inline _audit.log_skip is needed here.
                     plan.skipped.append(SkipRecord(
                         channel_id=pair.dest_channel_id,
                         reason="no_route",

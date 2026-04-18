@@ -642,6 +642,77 @@ def test_no_route_pairs_no_longer_fall_through_to_sling(
     assert skipped_reasons.get("200x2x0") == "no_route"
 
 
+def test_allow_router_fallback_restores_unpriced_submit(
+    mock_plugin, mock_database
+):
+    """Defensive escape valve: if production askrene rejects routes that
+    sling can actually find (e.g. unusual gossip lag or askrene layer
+    misconfiguration), the operator can flip allow_router_fallback=True
+    to restore the legacy fallback_unpriced submit-to-sling behavior for
+    MARKET_ONLY pairs. Default is False (Iter3 skip-with-no_route)."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    cfg = Config(
+        dry_run=True,
+        rebalance_router="v3",
+        allow_router_fallback=True,
+    )
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()], valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=500,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=1.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+    )
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=False, route_cost_sats=None, route=None,
+        probability_ppm=0, error="no_route_found",
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.return_value = SimpleNamespace(
+            selected=[pair], skipped=[]
+        )
+        selected = engine.find_candidates()
+
+    assert selected == [pair], (
+        "with allow_router_fallback=True the pair should be submitted "
+        f"to sling unpriced; got selected={selected}"
+    )
+    decomp = pair.score_decomposition or {}
+    assert decomp.get("stage") == "fallback_unpriced", (
+        f"expected stage=fallback_unpriced, got {decomp}"
+    )
+
+
 def test_first_transient_failure_uses_short_cooldown(mock_plugin, mock_database):
     """Iter2: temporary_channel_failure base cooldown is 300s (5 min) on a
     first failure. Sling classifies these as retriable and the prior 1800s

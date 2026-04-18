@@ -512,6 +512,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-allow-router-fallback',
+    default='false',
+    description='When true, MARKET_ONLY/HYBRID pairs whose router cannot find a route are still submitted to sling unpriced (legacy fallback_unpriced). Default false; flip true only if production askrene is more pessimistic than sling (Iter3 escape valve).'
+)
+
+plugin.add_option(
     name='revenue-ops-flow-window-days',
     default='7',
     description='Number of days to analyze for flow calculation (default: 7)'
@@ -1405,6 +1411,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         pair_fee_cap_ppm=_safe_int_opt(
             'revenue-ops-pair-fee-cap-ppm', '1000'
         ),
+        allow_router_fallback=options.get(
+            'revenue-ops-allow-router-fallback', 'false'
+        ).lower() == 'true',
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),

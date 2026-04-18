@@ -91,6 +91,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_drift_override_ratio': float,
     'rebalance_hold_margin': float,
     'pair_fee_cap_ppm': int,
+    'allow_router_fallback': bool,
     'hive_equalization_enabled': bool,
     'hive_equalization_low_pct': float,
     'hive_equalization_high_pct': float,
@@ -355,6 +356,13 @@ class Config:
     # Default 1000 ppm = 0.1% of rebalance amount. 0 disables the layer
     # and keeps the Phase 5 capex-only behavior.
     pair_fee_cap_ppm: int = 1000
+    # Iter3 escape valve: when True, MARKET_ONLY pairs whose router cannot
+    # find a route are still submitted to sling (legacy fallback_unpriced
+    # behavior). The Polar lab proved sling uses the same pathfinder as
+    # askrene so this is wasted work; default False. Flip True only if a
+    # production node sees askrene reject routes that sling could actually
+    # find -- e.g. unusual gossip lag or askrene layer misconfiguration.
+    allow_router_fallback: bool = False
     hive_equalization_enabled: bool = True  # Fallback pure-hive inventory equalization
     hive_equalization_low_pct: float = 0.35  # Lower bound for hive balance band
     hive_equalization_high_pct: float = 0.65  # Upper bound for hive balance band
@@ -768,6 +776,7 @@ class ConfigSnapshot:
     rebalance_drift_override_ratio: float
     rebalance_hold_margin: float
     pair_fee_cap_ppm: int
+    allow_router_fallback: bool
     hive_equalization_enabled: bool
     hive_equalization_low_pct: float
     hive_equalization_high_pct: float
