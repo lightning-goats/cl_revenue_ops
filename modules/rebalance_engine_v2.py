@@ -546,6 +546,26 @@ class RebalanceEngine:
                 except Exception:
                     pass
 
+            # Phase 3.3: drift override using anchor state from the last
+            # successful rebalance. If the channel has dropped materially
+            # below the post-rebalance local ratio, treat it as drifted and
+            # let the destination role bypass the cooldown gate.
+            cooldown_override = False
+            if cooldown and self.database is not None:
+                drift_threshold = float(
+                    getattr(cfg, "rebalance_drift_override_ratio", 0.30) or 0.0
+                )
+                if drift_threshold > 0.0 and capacity_sats > 0:
+                    try:
+                        anchor = self.database.get_last_post_rebalance_state(scid)
+                    except Exception:
+                        anchor = None
+                    if anchor and anchor.get("post_local_ratio") is not None:
+                        current_ratio = local_sats / capacity_sats
+                        anchor_ratio = float(anchor["post_local_ratio"])
+                        if anchor_ratio - current_ratio >= drift_threshold:
+                            cooldown_override = True
+
             normalized.append({
                 "channel_id": scid,
                 "peer_id": peer_id,
@@ -556,6 +576,7 @@ class RebalanceEngine:
                 "is_profitable": is_profitable,
                 "is_active": is_active,
                 "cooldown_active": cooldown,
+                "cooldown_override": cooldown_override,
             })
 
         target_band_low = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
@@ -1247,7 +1268,7 @@ class RebalanceEngine:
         # behavior here so the summary and the history agree.
         rebalance_id: Optional[int] = self._record_rebalance_pending(pair)
         result = executor.execute(**self._execution_kwargs(pair))
-        self._record_rebalance_result(rebalance_id, result)
+        self._record_rebalance_result(rebalance_id, result, pair=pair)
         if result is not None and not result.success:
             self._push_segment_observation_snapshot()
         return result
@@ -1286,6 +1307,8 @@ class RebalanceEngine:
         self,
         rebalance_id: Optional[int],
         result: Optional[ExecutionResult],
+        *,
+        pair: Optional[PairCandidate] = None,
     ) -> None:
         """Update the rebalance_history row with the terminal status."""
         if rebalance_id is None or self.database is None:
@@ -1299,11 +1322,25 @@ class RebalanceEngine:
                 )
                 return
             if result.success:
+                # Phase 3.3: persist the destination's post-rebalance local
+                # ratio anchor. After a successful refill the dest gains the
+                # rebalance amount, so we project from the pre-rebalance
+                # local_ratio and amount_sats. Capacity is taken from the pair.
+                post_local_ratio = None
+                if pair is not None:
+                    capacity = int(getattr(pair, "dest_capacity_sats", 0) or 0)
+                    amount = int(getattr(pair, "amount_sats", 0) or 0)
+                    pre_ratio = float(getattr(pair, "dest_local_ratio", 0.0) or 0.0)
+                    if capacity > 0:
+                        post_local_ratio = max(
+                            0.0, min(1.0, pre_ratio + amount / capacity)
+                        )
                 self.database.update_rebalance_result(
                     rebalance_id,
                     "success",
                     actual_fee_sats=int(getattr(result, "fee_sats", 0) or 0),
                     actual_fee_msat=int(getattr(result, "fee_msat", 0) or 0),
+                    post_local_ratio=post_local_ratio,
                 )
             else:
                 self.database.update_rebalance_result(

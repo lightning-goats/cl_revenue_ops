@@ -316,6 +316,40 @@ def test_emergency_override_does_not_relax_source_cooldown():
     assert channel.source_reason == "cooldown"
 
 
+def test_explicit_cooldown_override_input_overrides_dest_cooldown():
+    """Phase 3.3: when the engine has computed a drift override from anchor
+    state, it can pass cooldown_override=True on the channel input. The
+    state builder honors that even when the channel is above the emergency
+    threshold."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "100x1x0": ChannelCapexBudget(channel_id="100x1x0", budget_msat=1_000_000),
+        }
+    )
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="100x1x0",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                local_sats=200_000,         # 20% local -- above emergency floor
+                is_profitable=True,
+                cooldown_active=True,
+                cooldown_override=True,     # engine computed drift override
+            ),
+        ],
+        allocations,
+        target_emergency_low=0.10,
+    )
+
+    channel = state.channels[0]
+    assert channel.dest_eligible is True
+    assert channel.dest_reason == ""
+
+
 def test_rebalancer_build_state_v2_delegates_to_builder(mock_plugin, mock_database):
     from modules.config import Config
     import modules.rebalancer as rebalancer_module

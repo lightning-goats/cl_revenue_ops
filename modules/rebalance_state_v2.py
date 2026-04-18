@@ -26,6 +26,10 @@ class ChannelInput:
     is_profitable: bool = False
     is_active: bool = False
     cooldown_active: bool = False
+    # Phase 3.3: caller-supplied drift override (e.g. computed by the engine
+    # from rebalance-history anchor state). When True the destination cooldown
+    # gate is skipped regardless of local_ratio vs target_emergency_low.
+    cooldown_override: bool = False
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,7 @@ def _normalize_channel_input(value: Any) -> ChannelInput:
             is_profitable=_as_bool(value.get("is_profitable", False)),
             is_active=_as_bool(value.get("is_active", False)),
             cooldown_active=_as_bool(value.get("cooldown_active", False)),
+            cooldown_override=_as_bool(value.get("cooldown_override", False)),
         )
     raise TypeError(f"Unsupported channel input type: {type(value)!r}")
 
@@ -244,10 +249,14 @@ def build_state_snapshot(
         value_class = _value_class(channel, remaining_budget_sats)
         is_valuable = value_class != "neutral"
         cooldown_active = bool(channel.cooldown_active)
-        cooldown_override = (
+        emergency_override = (
             cooldown_active
             and target_emergency_low > 0.0
             and local_ratio < target_emergency_low
+        )
+        cooldown_override = (
+            cooldown_active
+            and (bool(channel.cooldown_override) or emergency_override)
         )
         source_eligible, source_reason = _source_eligibility(
             cooldown_active=cooldown_active,

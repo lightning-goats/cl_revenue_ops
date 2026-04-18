@@ -56,6 +56,31 @@ class TestPairRebalanceCooldown:
         assert second["failure_count"] == 2
         assert second["cooldown_until"] > first["cooldown_until"]
 
+    def test_anchor_state_round_trip_for_drift_override(self, tmp_path):
+        """Phase 3.3: the database tracks post-rebalance local ratio so the
+        engine can detect drift since the last successful rebalance."""
+        db = self._make_db(tmp_path)
+
+        rebalance_id = db.record_rebalance(
+            from_channel="111x1x0",
+            to_channel="222x2x0",
+            amount_sats=500_000,
+            max_fee_sats=100,
+            expected_profit_sats=50,
+            reason_code="manual_test",
+        )
+        db.update_rebalance_result(
+            rebalance_id,
+            status="success",
+            actual_fee_sats=80,
+            post_local_ratio=0.55,
+        )
+
+        anchor = db.get_last_post_rebalance_state("222x2x0")
+        assert anchor is not None
+        assert abs(anchor["post_local_ratio"] - 0.55) < 1e-6
+        assert anchor["amount_sats"] == 500_000
+
     def test_clear_pair_failure_removes_cooldown(self, tmp_path):
         db = self._make_db(tmp_path)
 
