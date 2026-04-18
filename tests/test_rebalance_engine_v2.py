@@ -342,6 +342,130 @@ def test_engine_debug_keeps_route_over_budget_candidate_in_considered_pairs(
     assert decomposition["beats_do_nothing"] is False
 
 
+def test_polar_s2_pairless_failure_names_source_rejected_neutral(
+    mock_plugin, mock_database
+):
+    """Phase 1.4 regression: Polar S2 (fleet-r4) ended with one profitable
+    depleted channel and two extreme over-local channels but considered_pairs=0.
+    revenue-rebalance-debug.last_cycle must explain that the over-local sources
+    were discarded as neutral, not silently report no_rebalance_candidates."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "159x1x0": ChannelCapexBudget(channel_id="159x1x0", budget_msat=1_000_000),
+        }
+    )
+    snapshot = build_state_snapshot(
+        [
+            # depleted profitable -> dest-eligible but no eligible sources to pair with
+            ChannelInput(
+                channel_id="159x1x0",
+                peer_id="02" + "1" * 64,
+                capacity_sats=1_000_000,
+                local_sats=100_000,
+                is_profitable=True,
+                is_active=True,
+            ),
+            # extreme over-local neutral -> rejected as not_valuable
+            ChannelInput(
+                channel_id="243x1x0",
+                peer_id="02" + "2" * 64,
+                capacity_sats=1_000_000,
+                local_sats=950_000,
+            ),
+            ChannelInput(
+                channel_id="255x1x0",
+                peer_id="02" + "3" * 64,
+                capacity_sats=1_000_000,
+                local_sats=950_000,
+            ),
+        ],
+        allocations,
+    )
+    engine._build_snapshot = MagicMock(return_value=snapshot)
+
+    selected = engine.find_candidates()
+    debug = engine.get_last_cycle_debug()
+
+    assert selected == []
+    assert debug["summary"]["considered_pairs"] == 0
+    diagnostics = debug["hold_diagnostics"]
+    assert diagnostics["source_rejected_neutral"] == 2
+    # depleted destination is funded and not in cooldown -> no dest blocker;
+    # plan.skipped still records its no_partner reason for the operator.
+    skip_reasons = {row["channel_id"]: row["reason"] for row in debug["skipped"]}
+    assert skip_reasons.get("159x1x0") == "no_partner"
+    assert skip_reasons.get("243x1x0") == "not_valuable"
+    assert skip_reasons.get("255x1x0") == "not_valuable"
+
+
+def test_polar_s9_pairless_failure_names_dest_cooldown_and_neutral_sources(
+    mock_plugin, mock_database
+):
+    """Phase 1.4 regression: Polar S9 (fleet-r2) had one channel at 6.6% local
+    blocked by cooldown and two channels at 100% local rejected as neutral.
+    revenue-rebalance-debug.last_cycle must surface both blockers."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "123x1x0": ChannelCapexBudget(channel_id="123x1x0", budget_msat=1_000_000),
+        }
+    )
+    snapshot = build_state_snapshot(
+        [
+            # depleted profitable in cooldown -> dest blocked
+            ChannelInput(
+                channel_id="123x1x0",
+                peer_id="02" + "9" * 64,
+                capacity_sats=1_000_000,
+                local_sats=66_000,
+                is_profitable=True,
+                cooldown_active=True,
+            ),
+            # 100%-local neutral channels -> rejected as not_valuable
+            ChannelInput(
+                channel_id="200x2x0",
+                peer_id="02" + "8" * 64,
+                capacity_sats=1_000_000,
+                local_sats=1_000_000,
+            ),
+            ChannelInput(
+                channel_id="201x2x0",
+                peer_id="02" + "7" * 64,
+                capacity_sats=1_000_000,
+                local_sats=1_000_000,
+            ),
+        ],
+        allocations,
+    )
+    engine._build_snapshot = MagicMock(return_value=snapshot)
+
+    selected = engine.find_candidates()
+    debug = engine.get_last_cycle_debug()
+
+    assert selected == []
+    assert debug["summary"]["considered_pairs"] == 0
+    diagnostics = debug["hold_diagnostics"]
+    assert diagnostics["dest_blocked_by_cooldown"] == 1
+    assert diagnostics["source_rejected_neutral"] == 2
+
+
 def test_get_last_cycle_debug_emits_pairless_hold_diagnostics(
     mock_plugin, mock_database
 ):
