@@ -356,6 +356,42 @@ class RebalanceEngine:
             "score_decomposition": copy.deepcopy(pair.score_decomposition or {}),
         }
 
+    def _hold_diagnostics(self, snapshot: Optional[Any]) -> Dict[str, int]:
+        """Phase 1.2: bucket per-channel state so an operator can tell why
+        zero pairs formed without re-deriving it from raw skip rows."""
+        buckets = {
+            "dest_blocked_by_cooldown": 0,
+            "dest_not_funded": 0,
+            "source_rejected_neutral": 0,
+            "source_protected": 0,
+            "source_inside_band": 0,
+        }
+        channels = getattr(snapshot, "channels", None) or ()
+        if not channels:
+            return buckets
+
+        cfg = self.config if not hasattr(self.config, "snapshot") else self.config.snapshot()
+        low = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
+        high = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
+
+        for ch in channels:
+            local_ratio = float(getattr(ch, "local_ratio", 0.0) or 0.0)
+            source_reason = str(getattr(ch, "source_reason", "") or "")
+            dest_reason = str(getattr(ch, "dest_reason", "") or "")
+            if local_ratio < low:
+                if dest_reason == "cooldown":
+                    buckets["dest_blocked_by_cooldown"] += 1
+                elif dest_reason == "no_budget":
+                    buckets["dest_not_funded"] += 1
+            elif local_ratio > high:
+                if source_reason == "not_valuable":
+                    buckets["source_rejected_neutral"] += 1
+                elif source_reason == "cooldown":
+                    buckets["source_protected"] += 1
+            else:
+                buckets["source_inside_band"] += 1
+        return buckets
+
     def get_last_cycle_debug(self, max_candidates: int = 10) -> Dict[str, Any]:
         result = self._last_cycle_result or CycleResult()
         limit = max(0, int(max_candidates or 0))
@@ -388,6 +424,7 @@ class RebalanceEngine:
 
         considered = list(getattr(result, "considered_candidates", []) or [])
         selected = list(getattr(result, "candidates", []) or [])
+        snapshot = getattr(result, "snapshot", None)
         return {
             "summary": {
                 "considered_pairs": len(considered),
@@ -395,9 +432,10 @@ class RebalanceEngine:
                 "skipped_pairs": len(getattr(result.plan, "skipped", []) or []),
                 "execution_count": len(result.executions),
                 "execution_success_count": sum(1 for item in result.executions if getattr(item, "success", False)),
-                "valuable_channel_count": int(getattr(getattr(result, "snapshot", None), "valuable_channel_count", 0) or 0),
-                "total_remaining_budget_sats": int(getattr(getattr(result, "snapshot", None), "total_remaining_budget_sats", 0) or 0),
+                "valuable_channel_count": int(getattr(snapshot, "valuable_channel_count", 0) or 0),
+                "total_remaining_budget_sats": int(getattr(snapshot, "total_remaining_budget_sats", 0) or 0),
             },
+            "hold_diagnostics": self._hold_diagnostics(snapshot),
             "considered_candidates": [
                 self._serialize_pair_candidate(pair) for pair in _limit(considered)
             ],

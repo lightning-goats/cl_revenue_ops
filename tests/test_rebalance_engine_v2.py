@@ -342,6 +342,78 @@ def test_engine_debug_keeps_route_over_budget_candidate_in_considered_pairs(
     assert decomposition["beats_do_nothing"] is False
 
 
+def test_get_last_cycle_debug_emits_pairless_hold_diagnostics(
+    mock_plugin, mock_database
+):
+    """Phase 1.2: when the planner produces zero pairs, the operator surface
+    must explain why -- depleted destinations stuck in cooldown, depleted
+    destinations with no budget, over-local sources rejected as neutral, and
+    in-band channels that simply aren't candidates."""
+    from modules.rebalance_engine_v2 import CycleResult
+    from modules.rebalance_state_v2 import ChannelState, StateSnapshot
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    def _ch(channel_id, *, local_ratio, source_eligible, dest_eligible,
+            source_reason="", dest_reason="", value_class="active"):
+        return ChannelState(
+            channel_id=channel_id,
+            peer_id="02" + channel_id[0] * 64,
+            capacity_sats=1_000_000,
+            local_ratio=local_ratio,
+            actual_inbound_fee_ppm=0,
+            value_class=value_class,
+            is_valuable=value_class != "neutral",
+            remaining_budget_sats=1000 if dest_reason != "no_budget" else 0,
+            cooldown_active=(source_reason == "cooldown" or dest_reason == "cooldown"),
+            source_eligible=source_eligible,
+            dest_eligible=dest_eligible,
+            source_reason=source_reason,
+            dest_reason=dest_reason,
+            dest_urgency=max(0.0, 0.35 - local_ratio) / 0.35,
+            source_drain_score=max(0.0, local_ratio - 0.65) / 0.35,
+        )
+
+    snapshot = StateSnapshot(
+        channels=(
+            # depleted profitable channel sitting in cooldown -> dest_blocked_by_cooldown
+            _ch("100x1x0", local_ratio=0.07, source_eligible=False,
+                dest_eligible=False, dest_reason="cooldown",
+                source_reason="cooldown", value_class="profitable"),
+            # depleted candidate without funding -> dest_not_funded
+            _ch("101x1x0", local_ratio=0.10, source_eligible=False,
+                dest_eligible=False, dest_reason="no_budget",
+                source_reason="no_budget", value_class="active"),
+            # over-local neutral channel rejected as not_valuable -> source_rejected_neutral
+            _ch("200x2x0", local_ratio=0.95, source_eligible=False,
+                dest_eligible=False, source_reason="not_valuable",
+                dest_reason="not_valuable", value_class="neutral"),
+            # over-local but parked in cooldown -> source_protected
+            _ch("201x2x0", local_ratio=0.92, source_eligible=False,
+                dest_eligible=False, source_reason="cooldown",
+                dest_reason="cooldown", value_class="profitable"),
+            # in-band channel -> source_inside_band
+            _ch("300x3x0", local_ratio=0.50, source_eligible=True,
+                dest_eligible=True, value_class="profitable"),
+        ),
+        total_capacity_sats=5_000_000,
+        total_remaining_budget_sats=4_000,
+        valuable_channel_count=4,
+    )
+
+    engine._cache_cycle_result(CycleResult(snapshot=snapshot))
+
+    debug = engine.get_last_cycle_debug()
+
+    assert debug["summary"]["considered_pairs"] == 0
+    diagnostics = debug["hold_diagnostics"]
+    assert diagnostics["dest_blocked_by_cooldown"] == 1
+    assert diagnostics["dest_not_funded"] == 1
+    assert diagnostics["source_rejected_neutral"] == 1
+    assert diagnostics["source_protected"] == 1
+    assert diagnostics["source_inside_band"] == 1
+
+
 def test_engine_build_snapshot_uses_membership_router_for_hive_value_class(
     mock_plugin, mock_database
 ):
