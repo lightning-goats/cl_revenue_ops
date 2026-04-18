@@ -24,6 +24,50 @@ _VALUE_SCORES = {
 }
 
 
+def _bootstrap_score_decomposition(
+    *,
+    value_score: int,
+    imbalance_score: float,
+    pair_score: float,
+    amount_sats: int,
+    pair_budget_sats: int,
+    source_local_ratio: float,
+    dest_local_ratio: float,
+) -> dict:
+    """Return the initial explicit score breakdown for a planned pair.
+
+    This is intentionally lightweight and descriptive. It exposes the current
+    heuristic planner state before route pricing or empirical learning updates
+    are applied by the engine.
+    """
+    p_success = 0.5
+    expected_future_value = round(float(pair_score), 6)
+    final_score = round(p_success * expected_future_value, 6)
+    return {
+        "model_version": "v2-bootstrap-explainability",
+        "score_units": "planner_score_minus_budget_share",
+        "stage": "planner_pre_route",
+        "p_success": p_success,
+        "expected_future_value": expected_future_value,
+        "expected_fee": 0.0,
+        "source_opportunity_cost": 0.0,
+        "failure_penalty": 0.0,
+        "capital_risk_penalty": 0.0,
+        "do_nothing_score": 0.0,
+        "final_score": final_score,
+        "beats_do_nothing": final_score > 0.0,
+        "rejection_reason": "",
+        "inputs": {
+            "value_score": int(value_score),
+            "imbalance_score": round(float(imbalance_score), 6),
+            "amount_sats": int(amount_sats),
+            "pair_budget_sats": int(pair_budget_sats),
+            "source_local_ratio": round(float(source_local_ratio), 6),
+            "dest_local_ratio": round(float(dest_local_ratio), 6),
+        },
+    }
+
+
 class RebalancePlanner:
     """Pair-based rebalance planner using actual fees and budgets."""
 
@@ -192,9 +236,22 @@ class RebalancePlanner:
                     dest_peer_id=dest.peer_id,
                     amount_sats=amount,
                     pair_budget_sats=pair_budget,
+                    source_capacity_sats=src.capacity_sats,
+                    dest_capacity_sats=dest.capacity_sats,
+                    source_value_class=src.value_class,
+                    dest_value_class=dest.value_class,
                     score=score,
                     source_local_ratio=src.local_ratio,
                     dest_local_ratio=dest.local_ratio,
+                    score_decomposition=_bootstrap_score_decomposition(
+                        value_score=value_score,
+                        imbalance_score=imbalance_score,
+                        pair_score=score,
+                        amount_sats=amount,
+                        pair_budget_sats=pair_budget,
+                        source_local_ratio=src.local_ratio,
+                        dest_local_ratio=dest.local_ratio,
+                    ),
                 ))
 
         return pairs

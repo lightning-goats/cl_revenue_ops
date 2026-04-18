@@ -26,6 +26,10 @@ class PairCandidate:
     dest_peer_id: str
     amount_sats: int
     pair_budget_sats: int
+    source_capacity_sats: int = 0
+    dest_capacity_sats: int = 0
+    source_value_class: str = "neutral"
+    dest_value_class: str = "neutral"
     route_cost_sats: Optional[int] = None
     route: Optional[List[Dict[str, Any]]] = None  # sendpay-ready route from router
     score: float = 0.0
@@ -36,6 +40,8 @@ class PairCandidate:
     coordination_hint_id: str = ""
     coordination_rank_bonus: float = 0.0
     route_decision: Optional[RouteDecision] = None
+    score_decomposition: Dict[str, Any] = field(default_factory=dict)
+    rejection_reason: str = ""
 
 
 @dataclass

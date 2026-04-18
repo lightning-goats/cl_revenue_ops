@@ -202,6 +202,146 @@ def test_active_engine_honors_hive_only_pairs(mock_plugin, mock_database):
     engine.router_v3.price_pair.assert_not_called()
 
 
+def test_engine_debug_exposes_score_decomposition_for_selected_pairs(
+    mock_plugin, mock_database
+):
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+
+    candidate = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10,
+        source_capacity_sats=100_000,
+        dest_capacity_sats=100_000,
+        score=2.0,
+        source_local_ratio=0.80,
+        dest_local_ratio=0.20,
+    )
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=2,
+        route=[{"channel": "300x3x0"}],
+        probability_ppm=750_000,
+        error="",
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner = planner_cls.return_value
+        planner.plan.return_value = SimpleNamespace(
+            selected=[candidate],
+            skipped=[],
+        )
+
+        selected = engine.find_candidates()
+
+    assert selected == [candidate]
+    debug = engine.get_last_cycle_debug()
+    assert debug["summary"]["considered_pairs"] == 1
+    assert debug["summary"]["selected_pairs"] == 1
+    decomposition = debug["selected_candidates"][0]["score_decomposition"]
+    assert decomposition["p_success"] == 0.75
+    assert decomposition["beats_do_nothing"] is True
+    assert decomposition["rejection_reason"] == ""
+    assert decomposition["inputs"]["expected_fee_sats"] == 2
+
+
+def test_engine_debug_keeps_route_over_budget_candidate_in_considered_pairs(
+    mock_plugin, mock_database
+):
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+
+    candidate = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10,
+        source_capacity_sats=100_000,
+        dest_capacity_sats=100_000,
+        score=1.0,
+        source_local_ratio=0.80,
+        dest_local_ratio=0.20,
+    )
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=12,
+        route=[{"channel": "300x3x0"}],
+        probability_ppm=600_000,
+        error="",
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner = planner_cls.return_value
+        planner.plan.return_value = SimpleNamespace(
+            selected=[candidate],
+            skipped=[],
+        )
+
+        selected = engine.find_candidates()
+
+    assert selected == []
+    debug = engine.get_last_cycle_debug()
+    assert debug["summary"]["considered_pairs"] == 1
+    assert debug["summary"]["selected_pairs"] == 0
+    decomposition = debug["considered_candidates"][0]["score_decomposition"]
+    assert decomposition["rejection_reason"] == "route_over_budget"
+    assert decomposition["beats_do_nothing"] is False
+
+
 def test_engine_build_snapshot_uses_membership_router_for_hive_value_class(
     mock_plugin, mock_database
 ):

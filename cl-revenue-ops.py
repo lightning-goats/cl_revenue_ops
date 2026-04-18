@@ -2393,7 +2393,13 @@ def revenue_rebalance_debug(
                 "active_jobs": 0,
             }
         },
-        "rejection_reasons": []
+        "rejection_reasons": [],
+        "last_decision": (
+            rebalancer.get_last_decision_summary()
+            if hasattr(rebalancer, "get_last_decision_summary")
+            else {}
+        ),
+        "last_cycle": {},
     }
 
     cfg = config.snapshot()
@@ -2655,6 +2661,16 @@ def revenue_rebalance_debug(
     if not summary_only:
         hive_status["segment_scores"] = segment_scores
     result["hive_hints"] = hive_status
+
+    engine = getattr(rebalancer, "rebalance_engine_v2", None)
+    if engine is not None and hasattr(engine, "get_last_cycle_debug"):
+        try:
+            cycle_limit = max_candidates if max_candidates > 0 else 10
+            result["last_cycle"] = engine.get_last_cycle_debug(
+                max_candidates=cycle_limit,
+            )
+        except Exception as e:
+            result["last_cycle"] = {"error": str(e)}
     return result
 
 
