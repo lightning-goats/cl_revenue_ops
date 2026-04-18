@@ -579,6 +579,69 @@ def test_sling_noroutes_classified_as_transient_failure(mock_plugin, mock_databa
         assert engine._classify_failure_kind(result) == "temporary_channel_failure"
 
 
+def test_no_route_pairs_no_longer_fall_through_to_sling(
+    mock_plugin, mock_database
+):
+    """Iter3: when askrene reports no route, sling will also report no
+    route (same pathfinder). The legacy fallback_unpriced path was
+    submitting known-impossible pairs to sling, burning preflight cycles
+    and creating spurious pair_cooldown entries. Skip with no_route
+    instead."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()], valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=500,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=1.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+    )
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=False, route_cost_sats=None, route=None,
+        probability_ppm=0, error="no_route_found",
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.return_value = SimpleNamespace(
+            selected=[pair], skipped=[]
+        )
+        selected = engine.find_candidates()
+
+    assert selected == []  # not submitted to sling
+    debug = engine.get_last_cycle_debug()
+    skipped_reasons = {row["channel_id"]: row["reason"] for row in debug["skipped"]}
+    assert skipped_reasons.get("200x2x0") == "no_route"
+
+
 def test_first_transient_failure_uses_short_cooldown(mock_plugin, mock_database):
     """Iter2: temporary_channel_failure base cooldown is 300s (5 min) on a
     first failure. Sling classifies these as retriable and the prior 1800s
@@ -1551,15 +1614,18 @@ def test_engine_signals_local_route_pricing_failure_without_blocking_selection(
 
         selected = engine.find_candidates()
 
-    assert selected == [pair]
-    assert pair.route is None
-    assert pair.route_cost_sats == pair.pair_budget_sats
+    # Iter3: when the router can't find a route, the pair is skipped with
+    # reason='no_route' instead of being submitted to sling unpriced
+    # (sling would also fail using the same pathfinder). The skip is
+    # surfaced through the unified plan.skipped audit loop.
+    assert selected == []
     engine.router_v3.price_pair.assert_called_once()
     assert engine.router_v3.price_pair.call_args.kwargs["exclude"] is None
     engine._audit.log_pick.assert_not_called()
-    engine._audit.log_skip.assert_called_once()
-    assert engine._audit.log_skip.call_args.kwargs["reason"] == "no_route"
-    assert "no_route" in engine._audit.log_skip.call_args.kwargs["detail"]
+    log_skip_calls = [c.args for c in engine._audit.log_skip.call_args_list]
+    assert any(args and args[1] == "no_route" for args in log_skip_calls), (
+        f"expected a no_route skip; got {log_skip_calls}"
+    )
 
 
 def test_engine_run_cycle_skips_when_sling_unavailable(mock_plugin, mock_database):
