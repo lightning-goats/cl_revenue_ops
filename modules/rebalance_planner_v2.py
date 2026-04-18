@@ -33,12 +33,17 @@ def _bootstrap_score_decomposition(
     pair_budget_sats: int,
     source_local_ratio: float,
     dest_local_ratio: float,
+    dest_urgency_term: float = 0.0,
+    source_drain_term: float = 0.0,
+    dest_value_term: float = 0.0,
+    cheap_return_term: float = 0.0,
 ) -> dict:
     """Return the initial explicit score breakdown for a planned pair.
 
-    This is intentionally lightweight and descriptive. It exposes the current
-    heuristic planner state before route pricing or empirical learning updates
-    are applied by the engine.
+    Phase 4.1 exposes the additive role-aware terms (dest_urgency,
+    source_drain, dest_value, cheap_return) alongside the legacy
+    value_score/imbalance_score diagnostics. The engine layers route
+    success and fee on top via _build_score_decomposition.
     """
     p_success = 0.5
     expected_future_value = round(float(pair_score), 6)
@@ -64,6 +69,10 @@ def _bootstrap_score_decomposition(
             "pair_budget_sats": int(pair_budget_sats),
             "source_local_ratio": round(float(source_local_ratio), 6),
             "dest_local_ratio": round(float(dest_local_ratio), 6),
+            "dest_urgency_term": round(float(dest_urgency_term), 6),
+            "source_drain_term": round(float(source_drain_term), 6),
+            "dest_value_term": round(float(dest_value_term), 6),
+            "cheap_return_term": round(float(cheap_return_term), 6),
         },
     }
 
@@ -206,30 +215,46 @@ class RebalancePlanner:
 
                 pair_budget = max(src.remaining_budget_sats, dest.remaining_budget_sats)
 
-                # Score: value * imbalance + Phase 2.3 source-side terms
+                # Phase 4.1: explicit additive role-aware planner score.
+                # Each term carries a clear meaning instead of a single
+                # value*imbalance scalar.
                 src_value = _VALUE_SCORES.get(src.value_class, 0)
                 dest_value = _VALUE_SCORES.get(dest.value_class, 0)
-                value_score = max(src_value, dest_value)
 
+                # Destination value drives the investment decision. Phase 5
+                # makes this fully destination-led; Phase 4 already stops
+                # mixing source and destination value classes.
+                dest_value_term = float(dest_value) * 0.20
+
+                # Refill urgency -- how badly the destination needs sats.
+                dest_urgency_term = float(dest.dest_urgency or 0.0) * 0.30
+
+                # Drain benefit -- how stagnant/overfull the source is.
+                source_drain_term = float(src.source_drain_score or 0.0) * 0.20
+
+                # Cheap-return bonus -- low inbound fee shortens the circular
+                # route cost. Capped so it can't dominate the urgency term.
+                inbound_fee_ppm = max(0, int(src.actual_inbound_fee_ppm or 0))
+                cheap_return_term = max(
+                    0.0, (5_000 - min(5_000, inbound_fee_ppm)) / 50_000.0
+                )
+
+                # Imbalance retained as derived diagnostic, not a scoring
+                # input -- urgency + drain already encode it.
                 src_imbalance = max(0.0, src.local_ratio - self.target_band_high)
                 dest_imbalance = max(0.0, self.target_band_low - dest.local_ratio)
                 imbalance_score = (src_imbalance + dest_imbalance) / 2.0
 
-                # Phase 2.3: explicit source-side preference. The drain term
-                # nudges the planner toward stagnant overfull channels, and
-                # the cheap-return term prefers low-fee inbound paths so the
-                # circular route is cheaper to settle. Both terms are small
-                # additive nudges -- Phase 4 replaces this with the additive
-                # role-aware utility model.
-                drain_bonus = float(src.source_drain_score or 0.0) * 0.10
-                inbound_fee_ppm = max(0, int(src.actual_inbound_fee_ppm or 0))
-                cheap_return_bonus = max(0.0, (5_000 - min(5_000, inbound_fee_ppm)) / 50_000.0)
-
                 score = (
-                    value_score * imbalance_score
-                    + drain_bonus
-                    + cheap_return_bonus
+                    dest_urgency_term
+                    + source_drain_term
+                    + dest_value_term
+                    + cheap_return_term
                 )
+
+                # Backwards-compat: keep value_score reference for callers and
+                # tests that still inspect it via the bootstrap decomposition.
+                value_score = dest_value
 
                 pairs.append(PairCandidate(
                     source_channel_id=src.channel_id,
@@ -253,6 +278,10 @@ class RebalancePlanner:
                         pair_budget_sats=pair_budget,
                         source_local_ratio=src.local_ratio,
                         dest_local_ratio=dest.local_ratio,
+                        dest_urgency_term=dest_urgency_term,
+                        source_drain_term=source_drain_term,
+                        dest_value_term=dest_value_term,
+                        cheap_return_term=cheap_return_term,
                     ),
                 ))
 

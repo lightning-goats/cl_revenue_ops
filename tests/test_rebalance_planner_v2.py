@@ -27,6 +27,18 @@ def _ch(
         dest_eligible, dest_reason = False, "no_budget"
     else:
         dest_eligible, dest_reason = True, ""
+    # Mirror build_state_snapshot's drain/urgency math against default bands.
+    drain_headroom = max(0.0, 1.0 - 0.65)
+    drain_excess = max(0.0, local_ratio - 0.65)
+    source_drain_score = (
+        round(min(1.0, drain_excess / drain_headroom), 6) if drain_headroom > 0 else 0.0
+    )
+    urgency_band = 0.35
+    dest_urgency = (
+        round(min(1.0, max(0.0, urgency_band - local_ratio) / urgency_band), 6)
+        if urgency_band > 0
+        else 0.0
+    )
     return ChannelState(
         channel_id=channel_id,
         peer_id=peer_id,
@@ -41,6 +53,8 @@ def _ch(
         dest_eligible=dest_eligible,
         source_reason=source_reason,
         dest_reason=dest_reason,
+        dest_urgency=dest_urgency,
+        source_drain_score=source_drain_score,
     )
 
 
@@ -231,21 +245,21 @@ class TestScoring:
         # Hive source should win due to higher value score
         assert result.selected[0].source_channel_id == "hive_src"
 
-    def test_score_includes_value_and_imbalance(self):
+    def test_score_is_strictly_positive_for_valid_pair(self):
+        """Phase 4: the additive role-aware score is always positive for a
+        well-formed candidate, but its magnitude depends on urgency/drain
+        rather than the legacy value*imbalance product."""
         planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
         src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
-                  local_ratio=0.85, value_class="profitable")  # value=2, imbalance=0.20
+                  local_ratio=0.85, value_class="profitable")
         dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
-                   local_ratio=0.10, value_class="active")  # value=1, imbalance=0.25
+                   local_ratio=0.10, value_class="active")
         snap = _snap(src, dest)
 
         result = planner.plan(snap)
 
         pair = result.selected[0]
-        # value*imbalance baseline (0.45) plus a small additive drain term
-        # introduced in Phase 2.3 -- score is bounded but no longer exact 0.45.
-        assert pair.score >= 0.45
-        assert pair.score < 0.60
+        assert pair.score > 0.0
 
     def test_cheaper_return_source_wins_when_other_terms_equal(self):
         """Phase 2.3: when two sources have the same value class and the same
@@ -315,6 +329,66 @@ class TestScoring:
         assert skipped.get("200x2x0") == "no_partner"
         assert skipped.get("201x2x0") == "no_partner"
         assert skipped.get("123x1x0") == "cooldown"
+
+    def test_additive_score_decomposition_exposes_role_terms(self):
+        """Phase 4.1: planner pairs carry an explicit additive decomposition
+        with explicit destination urgency, source drain, dest value, and
+        cheap-return terms. The summed terms equal the pair score."""
+        planner = RebalancePlanner()
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.95, value_class="active",
+                  actual_inbound_fee_ppm=200)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.05, value_class="profitable")
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+        pair = result.selected[0]
+        decomp = pair.score_decomposition
+
+        # The additive role-aware terms must be exposed by name.
+        for term in (
+            "dest_urgency_term",
+            "source_drain_term",
+            "dest_value_term",
+            "cheap_return_term",
+        ):
+            assert term in decomp["inputs"], f"missing term {term}"
+            assert decomp["inputs"][term] >= 0.0
+
+        # Score equals the sum of the additive terms (within float tolerance).
+        expected = (
+            decomp["inputs"]["dest_urgency_term"]
+            + decomp["inputs"]["source_drain_term"]
+            + decomp["inputs"]["dest_value_term"]
+            + decomp["inputs"]["cheap_return_term"]
+        )
+        assert abs(pair.score - expected) < 1e-6
+
+    def test_destination_drives_value_term_not_source(self):
+        """Phase 4.1: under the additive model the destination's value class
+        drives the value term -- a hive source paired with an active dest
+        should NOT outrank an active source paired with a hive dest."""
+        planner = RebalancePlanner()
+        # Pair A: hive source -> active dest. Source value should not beat dest.
+        hive_src = _ch(channel_id="hive_src", peer_id="02" + "aa" * 32,
+                       local_ratio=0.85, value_class="hive",
+                       actual_inbound_fee_ppm=100)
+        active_dest = _ch(channel_id="active_dest", peer_id="02" + "bb" * 32,
+                          local_ratio=0.15, value_class="active")
+        # Pair B: active source -> hive dest.
+        active_src = _ch(channel_id="active_src", peer_id="02" + "cc" * 32,
+                         local_ratio=0.85, value_class="active",
+                         actual_inbound_fee_ppm=100)
+        hive_dest = _ch(channel_id="hive_dest", peer_id="02" + "dd" * 32,
+                        local_ratio=0.15, value_class="hive")
+        snap = _snap(hive_src, active_dest, active_src, hive_dest)
+
+        result = planner.plan(snap)
+
+        # Highest-scoring pair should have the hive *destination*.
+        sorted_pairs = sorted(result.selected, key=lambda p: p.score, reverse=True)
+        assert sorted_pairs[0].dest_channel_id == "hive_dest"
 
     def test_more_drained_source_wins_when_value_and_return_tied(self):
         """Phase 2.3: explicit drain preference -- a more over-local source is
