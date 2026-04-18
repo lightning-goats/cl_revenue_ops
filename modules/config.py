@@ -87,6 +87,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_max_amount': int,
     'rebalance_min_amount': int,
     'rebalance_cooldown_hours': int,
+    'rebalance_emergency_local_ratio': float,
     'hive_equalization_enabled': bool,
     'hive_equalization_low_pct': float,
     'hive_equalization_high_pct': float,
@@ -222,6 +223,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hot_channel_protection_profit_budget_pct': (0.0, 1.0),
     'inbound_fee_estimate_ppm': (0, 5000),
     'rebalance_cooldown_hours': (1, 168),
+    'rebalance_emergency_local_ratio': (0.0, 1.0),
     'hive_equalization_low_pct': (0.0, 1.0),
     'hive_equalization_high_pct': (0.0, 1.0),
     'hive_equalization_cooldown_hours': (1, 168),
@@ -327,6 +329,10 @@ class Config:
     low_liquidity_threshold: float = 0.3  # Below 30% = low outbound
     high_liquidity_threshold: float = 0.7 # Above 70% = high outbound
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
+    # Phase 3 drift override: a destination below this local ratio is still
+    # refill-eligible even when the channel-level cooldown is active. Set to
+    # 0 to disable the override and keep the strict cooldown gate.
+    rebalance_emergency_local_ratio: float = 0.10
     hive_equalization_enabled: bool = True  # Fallback pure-hive inventory equalization
     hive_equalization_low_pct: float = 0.35  # Lower bound for hive balance band
     hive_equalization_high_pct: float = 0.65  # Upper bound for hive balance band
@@ -736,6 +742,7 @@ class ConfigSnapshot:
     low_liquidity_threshold: float
     high_liquidity_threshold: float
     rebalance_cooldown_hours: int
+    rebalance_emergency_local_ratio: float
     hive_equalization_enabled: bool
     hive_equalization_low_pct: float
     hive_equalization_high_pct: float

@@ -558,7 +558,18 @@ class RebalanceEngine:
                 "cooldown_active": cooldown,
             })
 
-        return build_state_snapshot(normalized, capex_allocations)
+        target_band_low = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
+        target_band_high = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
+        target_emergency_low = float(
+            getattr(cfg, "rebalance_emergency_local_ratio", 0.10) or 0.0
+        )
+        return build_state_snapshot(
+            normalized,
+            capex_allocations,
+            target_band_low=target_band_low,
+            target_band_high=target_band_high,
+            target_emergency_low=target_emergency_low,
+        )
 
     def _is_hive_member(self, peer_id: str) -> bool:
         if not peer_id:

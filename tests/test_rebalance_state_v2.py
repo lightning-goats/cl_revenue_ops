@@ -118,11 +118,11 @@ def test_build_state_snapshot_emits_role_eligibility_metadata():
                 capacity_sats=1_000_000,
                 local_sats=100_000,
             ),
-            ChannelInput(  # depleted profitable but cooldown active -> source not eligible
+            ChannelInput(  # moderately depleted profitable in cooldown -> both roles blocked
                 channel_id="333x3x0",
                 peer_id="02" + "c" * 64,
                 capacity_sats=1_000_000,
-                local_sats=66_000,
+                local_sats=200_000,
                 is_profitable=True,
                 cooldown_active=True,
             ),
@@ -148,12 +148,14 @@ def test_build_state_snapshot_emits_role_eligibility_metadata():
     assert neutral.dest_urgency > 0.0          # well below the low band
     assert neutral.source_drain_score == 0.0   # not over-local
 
-    # Depleted profitable in cooldown: cooldown blocks both roles.
+    # Depleted profitable in cooldown (local_ratio above emergency floor):
+    # cooldown still blocks both roles -- Phase 3 drift override only fires
+    # for emergency-low local ratios.
     assert depleted.source_eligible is False
     assert depleted.dest_eligible is False
     assert depleted.source_reason == "cooldown"
     assert depleted.dest_reason == "cooldown"
-    assert depleted.dest_urgency > 0.5         # severely depleted
+    assert depleted.dest_urgency > 0.0         # depleted but not at emergency
 
 
 def test_source_eligibility_allows_neutral_channels_with_no_budget():
@@ -235,6 +237,81 @@ def test_source_eligibility_blocked_only_by_cooldown():
     )
 
     channel = state.channels[0]
+    assert channel.source_eligible is False
+    assert channel.source_reason == "cooldown"
+
+
+def test_emergency_local_ratio_overrides_destination_cooldown():
+    """Phase 3.1+3.2: a destination that has drifted below the emergency
+    local ratio is refill-eligible even when channel-level cooldown is
+    active. The Polar S9 case (depleted profitable channel held in
+    cooldown after drifting back to 6.6% local) becomes refillable."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "100x1x0": ChannelCapexBudget(channel_id="100x1x0", budget_msat=1_000_000),
+            "200x2x0": ChannelCapexBudget(channel_id="200x2x0", budget_msat=1_000_000),
+        }
+    )
+    state = build_state_snapshot(
+        [
+            # severely depleted profitable in cooldown -> override fires
+            ChannelInput(
+                channel_id="100x1x0",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                local_sats=66_000,
+                is_profitable=True,
+                cooldown_active=True,
+            ),
+            # moderately depleted profitable in cooldown -> still blocked
+            ChannelInput(
+                channel_id="200x2x0",
+                peer_id="02" + "b" * 64,
+                capacity_sats=1_000_000,
+                local_sats=250_000,
+                is_profitable=True,
+                cooldown_active=True,
+            ),
+        ],
+        allocations,
+        target_emergency_low=0.10,
+    )
+
+    severe, moderate = state.channels
+    # Severe drift defeats the cooldown gate for the destination role.
+    assert severe.dest_eligible is True
+    assert severe.dest_reason == ""
+    assert severe.cooldown_active is True
+    # Moderate drift does not defeat cooldown -- still blocked.
+    assert moderate.dest_eligible is False
+    assert moderate.dest_reason == "cooldown"
+
+
+def test_emergency_override_does_not_relax_source_cooldown():
+    """Phase 3: drift override is for refill destinations only. Source-side
+    cooldown protection (recently drained from this channel) stays in force
+    so we don't immediately re-drain a recovering channel."""
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="300x3x0",
+                peer_id="02" + "c" * 64,
+                capacity_sats=1_000_000,
+                local_sats=950_000,
+                cooldown_active=True,
+            ),
+        ],
+        {},
+        target_emergency_low=0.10,
+    )
+
+    channel = state.channels[0]
+    # Source still cooldown-protected even though channel is drainable.
     assert channel.source_eligible is False
     assert channel.source_reason == "cooldown"
 

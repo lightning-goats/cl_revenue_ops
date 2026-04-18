@@ -161,6 +161,10 @@ def _value_class(channel: ChannelInput, remaining_budget_sats: int = 0) -> str:
 # planner defaults so role metadata stays consistent without coupling modules.
 _DEFAULT_TARGET_BAND_LOW = 0.35
 _DEFAULT_TARGET_BAND_HIGH = 0.65
+# Phase 3 emergency-depleted threshold: below this local ratio a cooldown-held
+# destination is still refill-eligible. Default chosen to match the Polar S9
+# 6.6% local case while leaving normal under-band depletion (~10-30%) blocked.
+_DEFAULT_TARGET_EMERGENCY_LOW = 0.10
 
 
 def _source_eligibility(*, cooldown_active: bool) -> Tuple[bool, str]:
@@ -177,17 +181,23 @@ def _destination_eligibility(
     is_valuable: bool,
     cooldown_active: bool,
     remaining_budget_sats: int,
+    cooldown_override: bool = False,
 ) -> Tuple[bool, str]:
     """Phase 2.1 destination gate: a refill destination must be a value
     channel (hive/profitable/active/funded), have remaining capex budget,
     and not be in cooldown. This stays conservative -- destinations
-    authorize spend, sources do not."""
+    authorize spend, sources do not.
+
+    Phase 3.1+3.2 drift override: cooldown_override skips the cooldown gate
+    when the channel has materially drifted away from its post-rebalance
+    state (e.g. severely depleted again). Value and budget gates always apply.
+    """
     if not is_valuable:
         return False, "not_valuable"
-    if cooldown_active:
-        return False, "cooldown"
     if remaining_budget_sats <= 0:
         return False, "no_budget"
+    if cooldown_active and not cooldown_override:
+        return False, "cooldown"
     return True, ""
 
 
@@ -212,6 +222,7 @@ def build_state_snapshot(
     *,
     target_band_low: float = _DEFAULT_TARGET_BAND_LOW,
     target_band_high: float = _DEFAULT_TARGET_BAND_HIGH,
+    target_emergency_low: float = _DEFAULT_TARGET_EMERGENCY_LOW,
 ) -> StateSnapshot:
     """Build a normalized, immutable v2 state snapshot."""
 
@@ -233,6 +244,11 @@ def build_state_snapshot(
         value_class = _value_class(channel, remaining_budget_sats)
         is_valuable = value_class != "neutral"
         cooldown_active = bool(channel.cooldown_active)
+        cooldown_override = (
+            cooldown_active
+            and target_emergency_low > 0.0
+            and local_ratio < target_emergency_low
+        )
         source_eligible, source_reason = _source_eligibility(
             cooldown_active=cooldown_active,
         )
@@ -240,6 +256,7 @@ def build_state_snapshot(
             is_valuable=is_valuable,
             cooldown_active=cooldown_active,
             remaining_budget_sats=remaining_budget_sats,
+            cooldown_override=cooldown_override,
         )
 
         normalized_channels.append(
