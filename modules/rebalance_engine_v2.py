@@ -842,85 +842,137 @@ class RebalanceEngine:
         if plan.selected:
             router = self._cycle_router
             priced = []
-            for pair in plan.selected:
-                pair_key = self._pair_key(pair)
-                debug_pair = considered_lookup.get(pair_key)
-                cooldown = self._get_persisted_pair_cooldown(
-                    pair.source_channel_id, pair.dest_channel_id
-                )
-                if cooldown is not None:
-                    self._update_pair_score_decomposition(
-                        pair,
-                        rejection_reason="pair_cooldown",
-                        route_status="pair_cooldown",
+            hive_router = self._hive_router
+            if hive_router is not None:
+                hive_router.begin_cycle()
+            try:
+                for pair in plan.selected:
+                    pair_key = self._pair_key(pair)
+                    debug_pair = considered_lookup.get(pair_key)
+                    cooldown = self._get_persisted_pair_cooldown(
+                        pair.source_channel_id, pair.dest_channel_id
                     )
-                    if debug_pair is not None:
+                    if cooldown is not None:
                         self._update_pair_score_decomposition(
-                            debug_pair,
+                            pair,
                             rejection_reason="pair_cooldown",
                             route_status="pair_cooldown",
                         )
-                    plan.skipped.append(SkipRecord(
-                        channel_id=pair.dest_channel_id,
-                        reason="pair_cooldown",
-                        value_class="valuable",
-                        detail=(
-                            f"src={pair.source_channel_id} "
-                            f"kind={cooldown['failure_kind']} "
-                            f"count={cooldown['failure_count']} "
-                            f"cooldown_until={cooldown['cooldown_until']}"
-                        ),
-                    ))
-                    continue
-                route_result, route_label = self._route_pair(
-                    pair=pair,
-                    router=router,
-                    exclude=None,
-                )
-                if route_result.success:
-                    pair.route_cost_sats = route_result.route_cost_sats
-                    pair.route = route_result.route
-                    effective_budget = self._probability_adjusted_budget(
-                        pair.pair_budget_sats,
-                        getattr(route_result, "probability_ppm", 0),
+                        if debug_pair is not None:
+                            self._update_pair_score_decomposition(
+                                debug_pair,
+                                rejection_reason="pair_cooldown",
+                                route_status="pair_cooldown",
+                            )
+                        plan.skipped.append(SkipRecord(
+                            channel_id=pair.dest_channel_id,
+                            reason="pair_cooldown",
+                            value_class="valuable",
+                            detail=(
+                                f"src={pair.source_channel_id} "
+                                f"kind={cooldown['failure_kind']} "
+                                f"count={cooldown['failure_count']} "
+                                f"cooldown_until={cooldown['cooldown_until']}"
+                            ),
+                        ))
+                        continue
+                    route_result, route_label = self._route_pair(
+                        pair=pair,
+                        router=router,
+                        exclude=None,
                     )
-                    self._update_pair_score_decomposition(
-                        pair,
-                        probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
-                        route_cost_sats=route_result.route_cost_sats,
-                        effective_budget_sats=effective_budget,
-                        route_status="priced",
-                    )
-                    if debug_pair is not None:
-                        debug_pair.route_cost_sats = route_result.route_cost_sats
-                        debug_pair.route = route_result.route
+                    if route_result.success:
+                        pair.route_cost_sats = route_result.route_cost_sats
+                        pair.route = route_result.route
+                        effective_budget = self._probability_adjusted_budget(
+                            pair.pair_budget_sats,
+                            getattr(route_result, "probability_ppm", 0),
+                        )
                         self._update_pair_score_decomposition(
-                            debug_pair,
+                            pair,
                             probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
                             route_cost_sats=route_result.route_cost_sats,
                             effective_budget_sats=effective_budget,
                             route_status="priced",
                         )
-                    if route_result.route_cost_sats <= effective_budget:
-                        # Phase 4.3: do_nothing hard gate. A priced pair
-                        # whose final_score does not clear the configured
-                        # hold margin is rejected with an explicit reason
-                        # rather than silently picked.
-                        hold_margin_raw = getattr(cfg, "rebalance_hold_margin", 0.0)
-                        if isinstance(hold_margin_raw, (int, float)):
-                            hold_margin = float(hold_margin_raw)
+                        if debug_pair is not None:
+                            debug_pair.route_cost_sats = route_result.route_cost_sats
+                            debug_pair.route = route_result.route
+                            self._update_pair_score_decomposition(
+                                debug_pair,
+                                probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                                route_cost_sats=route_result.route_cost_sats,
+                                effective_budget_sats=effective_budget,
+                                route_status="priced",
+                            )
+                        if route_result.route_cost_sats <= effective_budget:
+                            # Phase 4.3: do_nothing hard gate. A priced pair
+                            # whose final_score does not clear the configured
+                            # hold margin is rejected with an explicit reason
+                            # rather than silently picked.
+                            hold_margin_raw = getattr(cfg, "rebalance_hold_margin", 0.0)
+                            if isinstance(hold_margin_raw, (int, float)):
+                                hold_margin = float(hold_margin_raw)
+                            else:
+                                hold_margin = 0.0
+                            decomp = pair.score_decomposition or {}
+                            final_score = float(decomp.get("final_score", 0.0) or 0.0)
+                            if hold_margin > 0.0 and final_score <= hold_margin:
+                                self._update_pair_score_decomposition(
+                                    pair,
+                                    probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                                    route_cost_sats=route_result.route_cost_sats,
+                                    effective_budget_sats=effective_budget,
+                                    rejection_reason="below_hold_margin",
+                                    route_status="below_hold_margin",
+                                )
+                                if debug_pair is not None:
+                                    self._update_pair_score_decomposition(
+                                        debug_pair,
+                                        probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                                        route_cost_sats=route_result.route_cost_sats,
+                                        effective_budget_sats=effective_budget,
+                                        rejection_reason="below_hold_margin",
+                                        route_status="below_hold_margin",
+                                    )
+                                self._audit.log_skip(
+                                    channel_id=pair.dest_channel_id,
+                                    reason="below_hold_margin",
+                                    value_class="valuable",
+                                    remaining_budget_sats=pair.pair_budget_sats,
+                                    detail=(
+                                        f"score={final_score:.4f} margin={hold_margin:.4f}"
+                                    ),
+                                    router=router_tag,
+                                )
+                                plan.skipped.append(SkipRecord(
+                                    channel_id=pair.dest_channel_id,
+                                    reason="below_hold_margin",
+                                    value_class="valuable",
+                                    detail=(
+                                        f"src={pair.source_channel_id} "
+                                        f"score={final_score:.4f} "
+                                        f"margin={hold_margin:.4f}"
+                                    ),
+                                ))
+                                continue
+                            priced.append(pair)
+                            self._audit.log_pick(
+                                pair.source_channel_id,
+                                pair.dest_channel_id,
+                                pair.amount_sats,
+                                route_result.route_cost_sats,
+                                pair.score,
+                                router=route_label,
+                            )
                         else:
-                            hold_margin = 0.0
-                        decomp = pair.score_decomposition or {}
-                        final_score = float(decomp.get("final_score", 0.0) or 0.0)
-                        if hold_margin > 0.0 and final_score <= hold_margin:
                             self._update_pair_score_decomposition(
                                 pair,
                                 probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
                                 route_cost_sats=route_result.route_cost_sats,
                                 effective_budget_sats=effective_budget,
-                                rejection_reason="below_hold_margin",
-                                route_status="below_hold_margin",
+                                rejection_reason="route_over_budget",
+                                route_status="route_over_budget",
                             )
                             if debug_pair is not None:
                                 self._update_pair_score_decomposition(
@@ -928,120 +980,76 @@ class RebalanceEngine:
                                     probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
                                     route_cost_sats=route_result.route_cost_sats,
                                     effective_budget_sats=effective_budget,
-                                    rejection_reason="below_hold_margin",
-                                    route_status="below_hold_margin",
+                                    rejection_reason="route_over_budget",
+                                    route_status="route_over_budget",
                                 )
-                            self._audit.log_skip(
+                            plan.skipped.append(SkipRecord(
                                 channel_id=pair.dest_channel_id,
-                                reason="below_hold_margin",
+                                reason="route_over_budget",
                                 value_class="valuable",
                                 remaining_budget_sats=pair.pair_budget_sats,
                                 detail=(
-                                    f"score={final_score:.4f} margin={hold_margin:.4f}"
-                                ),
-                                router=router_tag,
-                            )
-                            plan.skipped.append(SkipRecord(
-                                channel_id=pair.dest_channel_id,
-                                reason="below_hold_margin",
-                                value_class="valuable",
-                                detail=(
-                                    f"src={pair.source_channel_id} "
-                                    f"score={final_score:.4f} "
-                                    f"margin={hold_margin:.4f}"
+                                    f"route_cost={route_result.route_cost_sats} "
+                                    f"effective_budget={effective_budget} "
+                                    f"probability_ppm={getattr(route_result, 'probability_ppm', 0)}"
                                 ),
                             ))
-                            continue
-                        priced.append(pair)
-                        self._audit.log_pick(
-                            pair.source_channel_id,
-                            pair.dest_channel_id,
-                            pair.amount_sats,
-                            route_result.route_cost_sats,
-                            pair.score,
-                            router=route_label,
-                        )
                     else:
-                        self._update_pair_score_decomposition(
-                            pair,
-                            probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
-                            route_cost_sats=route_result.route_cost_sats,
-                            effective_budget_sats=effective_budget,
-                            rejection_reason="route_over_budget",
-                            route_status="route_over_budget",
+                        # Iter3: when askrene reports no route, sling uses the
+                        # same pathfinder so it would also fail. Skip with
+                        # reason='no_route' instead of submitting unpriced.
+                        # Defensive escape valve: allow_router_fallback=True
+                        # restores the legacy fallback_unpriced submit path
+                        # for non-fail-closed policies. Default is False.
+                        decision = self._route_decision_for_pair(pair)
+                        fail_closed = self._fail_closed_on_route_failure(decision)
+                        allow_fallback_raw = getattr(cfg, "allow_router_fallback", False)
+                        allow_fallback = (
+                            bool(allow_fallback_raw) and not fail_closed
                         )
-                        if debug_pair is not None:
+                        if allow_fallback:
+                            pair.route = None
+                            pair.route_cost_sats = pair.pair_budget_sats
                             self._update_pair_score_decomposition(
-                                debug_pair,
-                                probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
-                                route_cost_sats=route_result.route_cost_sats,
-                                effective_budget_sats=effective_budget,
-                                rejection_reason="route_over_budget",
-                                route_status="route_over_budget",
-                            )
-                        plan.skipped.append(SkipRecord(
-                            channel_id=pair.dest_channel_id,
-                            reason="route_over_budget",
-                            value_class="valuable",
-                            remaining_budget_sats=pair.pair_budget_sats,
-                            detail=(
-                                f"route_cost={route_result.route_cost_sats} "
-                                f"effective_budget={effective_budget} "
-                                f"probability_ppm={getattr(route_result, 'probability_ppm', 0)}"
-                            ),
-                        ))
-                else:
-                    # Iter3: when askrene reports no route, sling uses the
-                    # same pathfinder so it would also fail. Skip with
-                    # reason='no_route' instead of submitting unpriced.
-                    # Defensive escape valve: allow_router_fallback=True
-                    # restores the legacy fallback_unpriced submit path
-                    # for non-fail-closed policies. Default is False.
-                    decision = self._route_decision_for_pair(pair)
-                    fail_closed = self._fail_closed_on_route_failure(decision)
-                    allow_fallback_raw = getattr(cfg, "allow_router_fallback", False)
-                    allow_fallback = (
-                        bool(allow_fallback_raw) and not fail_closed
-                    )
-                    if allow_fallback:
-                        pair.route = None
-                        pair.route_cost_sats = pair.pair_budget_sats
-                        self._update_pair_score_decomposition(
-                            pair,
-                            route_cost_sats=pair.pair_budget_sats,
-                            effective_budget_sats=pair.pair_budget_sats,
-                            route_status="fallback_unpriced",
-                        )
-                        if debug_pair is not None:
-                            debug_pair.route = None
-                            debug_pair.route_cost_sats = pair.pair_budget_sats
-                            self._update_pair_score_decomposition(
-                                debug_pair,
+                                pair,
                                 route_cost_sats=pair.pair_budget_sats,
                                 effective_budget_sats=pair.pair_budget_sats,
                                 route_status="fallback_unpriced",
                             )
-                        priced.append(pair)
-                        continue
-                    self._update_pair_score_decomposition(
-                        pair,
-                        rejection_reason="no_route",
-                        route_status="no_route",
-                    )
-                    if debug_pair is not None:
+                            if debug_pair is not None:
+                                debug_pair.route = None
+                                debug_pair.route_cost_sats = pair.pair_budget_sats
+                                self._update_pair_score_decomposition(
+                                    debug_pair,
+                                    route_cost_sats=pair.pair_budget_sats,
+                                    effective_budget_sats=pair.pair_budget_sats,
+                                    route_status="fallback_unpriced",
+                                )
+                            priced.append(pair)
+                            continue
                         self._update_pair_score_decomposition(
-                            debug_pair,
+                            pair,
                             rejection_reason="no_route",
                             route_status="no_route",
                         )
-                    plan.skipped.append(SkipRecord(
-                        channel_id=pair.dest_channel_id,
-                        reason="no_route",
-                        value_class="valuable",
-                        remaining_budget_sats=pair.pair_budget_sats,
-                        detail=str(route_result.error or "router_no_route"),
-                    ))
-                    continue
+                        if debug_pair is not None:
+                            self._update_pair_score_decomposition(
+                                debug_pair,
+                                rejection_reason="no_route",
+                                route_status="no_route",
+                            )
+                        plan.skipped.append(SkipRecord(
+                            channel_id=pair.dest_channel_id,
+                            reason="no_route",
+                            value_class="valuable",
+                            remaining_budget_sats=pair.pair_budget_sats,
+                            detail=str(route_result.error or "router_no_route"),
+                        ))
+                        continue
+
+            finally:
+                if hive_router is not None:
+                    hive_router.end_cycle()
 
             plan.selected = priced
 
@@ -1517,33 +1525,40 @@ class RebalanceEngine:
         )
         pair.route_decision = getattr(candidate, "route_decision", None)
 
+        hive_router = self._hive_router
+        if hive_router is not None:
+            hive_router.begin_cycle()
         try:
-            route_result, route_label = self._route_pair(
-                pair=pair,
-                router=self._cycle_router,
-                exclude=None,
-            )
-        except Exception as e:
-            self._log(
-                f"Manual route pricing failed for {source_channel_id}->{dest_channel_id}: {e}",
-                level="info",
-            )
-            return ExecutionResult(
-                success=False,
-                error=f"route_pricing_failed: {e}",
-                amount_sats=amount_sats,
-                route_type="sling",
-            )
-        else:
-            if route_result.success:
-                pair.route_cost_sats = route_result.route_cost_sats
-                pair.route = route_result.route
-            else:
+            try:
+                route_result, route_label = self._route_pair(
+                    pair=pair,
+                    router=self._cycle_router,
+                    exclude=None,
+                )
+            except Exception as e:
                 self._log(
-                    f"Manual route pricing failed for {source_channel_id}->{dest_channel_id}: "
-                    f"{route_result.error or 'no_route'} ({route_label})",
+                    f"Manual route pricing failed for {source_channel_id}->{dest_channel_id}: {e}",
                     level="info",
                 )
+                return ExecutionResult(
+                    success=False,
+                    error=f"route_pricing_failed: {e}",
+                    amount_sats=amount_sats,
+                    route_type="sling",
+                )
+            else:
+                if route_result.success:
+                    pair.route_cost_sats = route_result.route_cost_sats
+                    pair.route = route_result.route
+                else:
+                    self._log(
+                        f"Manual route pricing failed for {source_channel_id}->{dest_channel_id}: "
+                        f"{route_result.error or 'no_route'} ({route_label})",
+                        level="info",
+                    )
+        finally:
+            if hive_router is not None:
+                hive_router.end_cycle()
 
         decision = self._route_decision_for_pair(pair)
         if route_result is not None and not route_result.success and self._fail_closed_on_route_failure(decision):

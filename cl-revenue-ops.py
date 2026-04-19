@@ -269,12 +269,13 @@ class ThreadSafeRpcProxy:
             proxy_timeout = 30
             if config:
                 proxy_timeout = config.rpc_timeout_seconds
-            # If the caller supplies its own ``timeout`` kwarg (e.g.
-            # ``waitsendpay(timeout=60)``), extend the proxy's effective
-            # wait so we never cut a legitimately long call short. Adds a
-            # small grace period so the underlying method has time to
-            # settle before the proxy fires its own timeout.
-            user_timeout = kwargs.get("timeout")
+            # If the caller supplies its own ``timeout`` kwarg, extend the
+            # proxy's effective wait so we never cut a legitimately long
+            # call short. For methods that natively accept ``timeout`` (e.g.
+            # ``waitsendpay``) we leave it in kwargs; for callers that pass
+            # ``_proxy_timeout`` we strip it so it never reaches pyln.
+            proxy_only = kwargs.pop("_proxy_timeout", None)
+            user_timeout = proxy_only if proxy_only is not None else kwargs.get("timeout")
             if isinstance(user_timeout, (int, float)) and user_timeout > 0:
                 proxy_timeout = max(proxy_timeout, int(user_timeout) + 5)
             future = self._submit_main(fn, name, proxy_timeout, *args, **kwargs)
@@ -326,21 +327,27 @@ class ThreadSafeRpcProxy:
         future.add_done_callback(lambda _f: self._async_submit_slots.release())
         return True
 
-    def call(self, method_name: str, payload: Any = None, **kwargs):
-        timeout = 30
+    def call(self, method_name: str, payload: Any = None, *, timeout: Optional[float] = None, **kwargs):
+        proxy_timeout = 30
         if config:
-            timeout = config.rpc_timeout_seconds
+            proxy_timeout = config.rpc_timeout_seconds
+        # Callers (e.g. askrene-getroutes on a loaded node) can extend the
+        # proxy ceiling past ``config.rpc_timeout_seconds`` without changing
+        # it globally. The kwarg is consumed here and never reaches pyln,
+        # so CLN's JSON-RPC schema never sees an unknown ``timeout`` field.
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            proxy_timeout = max(proxy_timeout, int(timeout) + 5)
         future = self._submit_main(
             self._rpc.call,
             method_name,
-            timeout,
+            proxy_timeout,
             method_name,
             payload if payload is not None else {},
         )
         try:
-            return future.result(timeout=timeout)
+            return future.result(timeout=proxy_timeout)
         except (TimeoutError, self._FuturesTimeoutError):
-            self._plugin.log(f"RPC timeout after {timeout}s on {method_name}", level="warn")
+            self._plugin.log(f"RPC timeout after {proxy_timeout}s on {method_name}", level="warn")
             raise RPCTimeoutError(method_name)
 
     def fire_and_forget(self, method_name: str, payload: Any = None):

@@ -8,6 +8,7 @@ policies.
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -68,6 +69,44 @@ class RebalanceHiveRouter:
         self.hive_hints = hive_hints
         self.data_service = data_service
         self.log = log or (lambda _msg, _level="info": None)
+        # Cycle state is thread-local so a manual revenue-rebalance (on the
+        # RPC worker thread) can't tear down the background pricing cycle's
+        # layers, and vice versa.
+        self._thread_state = threading.local()
+
+    def _cycle_active(self) -> bool:
+        return bool(getattr(self._thread_state, "active", False))
+
+    def _cycle_layers_dict(self) -> Dict[frozenset, str]:
+        layers = getattr(self._thread_state, "layers", None)
+        if layers is None:
+            layers = {}
+            self._thread_state.layers = layers
+        return layers
+
+    def begin_cycle(self) -> None:
+        """Enter a pricing cycle that reuses exclude layers across calls.
+
+        Within a cycle, identical exclude sets share a single askrene layer,
+        turning N × (create + M disables + remove) RPCs into one such batch
+        per unique exclude set. end_cycle() tears them down.
+        """
+        self.end_cycle()
+        self._thread_state.active = True
+
+    def end_cycle(self) -> None:
+        layers = self._cycle_layers_dict()
+        to_remove = list(layers.values())
+        layers.clear()
+        self._thread_state.active = False
+        for layer_name in to_remove:
+            try:
+                self._remove_layer(layer_name)
+            except Exception as exc:
+                self._log(
+                    f"end_cycle remove_layer({layer_name}) failed: {exc}",
+                    level="debug",
+                )
 
     def _log(self, msg: str, level: str = "info") -> None:
         try:
@@ -124,10 +163,16 @@ class RebalanceHiveRouter:
         else:
             self.plugin.rpc.call("askrene-disable-node", {"layer": layer, "node": node})
 
+    GETROUTES_TIMEOUT_SEC = 30
+
     def _get_routes(self, **kwargs) -> Dict[str, Any]:
         if self.data_service is not None:
-            return self.data_service.get_routes(**kwargs)
-        return self.plugin.rpc.call("getroutes", kwargs)
+            return self.data_service.get_routes(
+                timeout=self.GETROUTES_TIMEOUT_SEC, **kwargs
+            )
+        return self.plugin.rpc.call(
+            "getroutes", kwargs, timeout=self.GETROUTES_TIMEOUT_SEC
+        )
 
     def _is_hive_member(self, peer_id: str) -> bool:
         try:
@@ -221,28 +266,55 @@ class RebalanceHiveRouter:
     def _is_node_exclude(entry: str) -> bool:
         return "/" not in entry and "x" not in entry and ":" not in entry
 
-    @contextmanager
-    def _exclude_layer(self, excludes: List[str]) -> Iterator[Optional[str]]:
-        if not excludes:
-            yield None
-            return
+    @staticmethod
+    def _normalize_exclude_entry(entry: Any) -> str:
+        return str(entry or "").strip().replace(":", "x")
 
+    def _build_exclude_layer(self, normalized_excludes: List[str]) -> str:
         type(self)._exclude_counter += 1
         layer_name = f"rebalance-exclude-{type(self)._exclude_counter}"
         try:
             self._create_layer(layer_name)
-            for entry in excludes:
-                normalized = str(entry or "").strip().replace(":", "x")
-                if not normalized:
+            for entry in normalized_excludes:
+                if self._is_node_exclude(entry):
+                    self._disable_node(layer_name, entry)
                     continue
-                if self._is_node_exclude(normalized):
-                    self._disable_node(layer_name, normalized)
-                    continue
-                if "/" in normalized:
-                    self._disable_channel(layer_name, normalized)
+                if "/" in entry:
+                    self._disable_channel(layer_name, entry)
                     continue
                 for direction in (0, 1):
-                    self._disable_channel(layer_name, f"{normalized}/{direction}")
+                    self._disable_channel(layer_name, f"{entry}/{direction}")
+        except Exception:
+            try:
+                self._remove_layer(layer_name)
+            except Exception:
+                pass
+            raise
+        return layer_name
+
+    @contextmanager
+    def _exclude_layer(self, excludes: List[str]) -> Iterator[Optional[str]]:
+        normalized = [
+            n for n in (self._normalize_exclude_entry(e) for e in excludes) if n
+        ]
+        if not normalized:
+            yield None
+            return
+
+        if self._cycle_active():
+            key = frozenset(normalized)
+            cycle_layers = self._cycle_layers_dict()
+            cached = cycle_layers.get(key)
+            if cached is not None:
+                yield cached
+                return
+            layer_name = self._build_exclude_layer(normalized)
+            cycle_layers[key] = layer_name
+            yield layer_name
+            return
+
+        layer_name = self._build_exclude_layer(normalized)
+        try:
             yield layer_name
         finally:
             try:
