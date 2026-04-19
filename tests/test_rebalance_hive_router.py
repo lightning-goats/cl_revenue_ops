@@ -343,3 +343,130 @@ def test_hive_router_retries_once_when_expansion_layers_rotate():
     second_layers = data_service.get_routes.call_args_list[1].kwargs["layers"]
     assert "revenue-local" in first_layers
     assert "revenue-local" not in second_layers
+
+
+def _two_source_channel_fixture(data_service: MagicMock) -> None:
+    """Wire data_service to expose two local channels so _fleet_local_excludes
+    produces a non-empty exclude set that must be layered in askrene."""
+    data_service.get_askrene_layers.return_value = {"layers": [
+        {"layer": "hive-fleet"},
+        {"layer": "revenue-local"},
+    ]}
+    data_service.get_peer_channels.side_effect = lambda peer_id=None: (
+        {
+            "channels": [
+                {
+                    "short_channel_id": "100x1x0",
+                    "peer_id": SRC_PEER,
+                    "state": "CHANNELD_NORMAL",
+                },
+                {
+                    "short_channel_id": "400x1x0",
+                    "peer_id": MID_PEER,
+                    "state": "CHANNELD_NORMAL",
+                },
+            ]
+        }
+        if peer_id is None
+        else {
+            "channels": [{
+                "short_channel_id": "200x1x0",
+                "peer_id": DST_PEER,
+                "updates": {"remote": {
+                    "fee_base_msat": 0,
+                    "fee_proportional_millionths": 0,
+                    "cltv_expiry_delta": 6,
+                }},
+            }]
+        }
+    )
+    data_service.get_configs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000000,
+            "path": [{
+                "short_channel_id_dir": "100x1x0/0",
+                "next_node_id": DST_PEER,
+                "amount_msat": 100000000,
+                "delay": 18,
+            }],
+        }],
+    }
+
+
+def test_hive_router_reuses_exclude_layer_within_cycle():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    _two_source_channel_fixture(data_service)
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    router.begin_cycle()
+    try:
+        router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+        router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+    finally:
+        router.end_cycle()
+
+    # Two price_pair calls with the same exclude set share one created layer.
+    assert data_service.askrene_create_layer.call_count == 1
+    # Disables happen once (on layer creation), not per price_pair call.
+    assert data_service.askrene_update_channel.call_count == 1
+    # end_cycle tears the shared layer down exactly once.
+    assert data_service.askrene_remove_layer.call_count == 1
+
+
+def test_hive_router_without_cycle_tears_down_each_call():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    _two_source_channel_fixture(data_service)
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+    router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+
+    assert data_service.askrene_create_layer.call_count == 2
+    assert data_service.askrene_remove_layer.call_count == 2
+
+
+def test_hive_router_get_routes_passes_timeout():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    _two_source_channel_fixture(data_service)
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+
+    assert data_service.get_routes.call_args.kwargs.get("timeout") == (
+        RebalanceHiveRouter.GETROUTES_TIMEOUT_SEC
+    )

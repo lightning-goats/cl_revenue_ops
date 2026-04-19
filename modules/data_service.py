@@ -272,7 +272,15 @@ class DataService:
         return self._plugin.rpc.getroute(node_id, amount_msat, **kwargs)
 
     def get_routes(self, **kwargs) -> Dict:
-        """Multi-route search via askrene. Never cached."""
+        """Multi-route search via askrene. Never cached.
+
+        The optional ``timeout`` kwarg is consumed by the RPC proxy (to
+        extend the per-call proxy ceiling) and is stripped before the
+        payload reaches CLN so askrene's strict schema never rejects it.
+        """
+        timeout = kwargs.pop("timeout", None)
+        if timeout is not None:
+            return self._plugin.rpc.call("getroutes", kwargs, timeout=timeout)
         return self._plugin.rpc.call("getroutes", kwargs)
 
     # --- Payment lifecycle ---
