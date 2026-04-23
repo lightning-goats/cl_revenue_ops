@@ -9,12 +9,12 @@ nodes:
     t0: "REPLACE_ME"
     transport: ["ssh", "lnnode"]
     lightning_cli_prefix: "lightning-cli --lightning-dir=/data/lightningd"
-    log_extract_command: "grep -E 'FEE:|REBALANCE_FLOOR|competition_aware|INITIAL_FEE|Hive member|Traceback|Error' /data/lightningd/cln.log | tail -100000"
+    log_extract_command: "grep -E 'FEE:|REBALANCE_FLOOR|competition_aware|INITIAL_FEE|Hive member|Traceback|TypeError|AttributeError|KeyError|Error|plugin-cl-revenue-ops.py|cl-revenue-ops.py' /data/lightningd/cln.log | tail -100000"
   hive-nexus-02:
     t0: "REPLACE_ME"
     transport: ["docker", "exec", "cl-hive-node-hive-nexus-02", "sh", "-lc"]
     lightning_cli_prefix: "lightning-cli --lightning-dir=/data/lightning/bitcoin"
-    log_extract_command: "grep -E 'FEE:|REBALANCE_FLOOR|competition_aware|INITIAL_FEE|Hive member|Traceback|Error' /data/lightning/bitcoin/bitcoin/log | tail -100000"
+    log_extract_command: "grep -E 'FEE:|REBALANCE_FLOOR|competition_aware|INITIAL_FEE|Hive member|Traceback|TypeError|AttributeError|KeyError|Error|plugin-cl-revenue-ops.py|cl-revenue-ops.py' /data/lightning/bitcoin/bitcoin/log | tail -100000"
 thresholds:
   rollback:
     plugin_restart_limit_24h: 3
