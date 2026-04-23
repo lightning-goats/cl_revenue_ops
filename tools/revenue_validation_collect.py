@@ -10,6 +10,9 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from tools import revenue_validation_common as common
 
 JSON_COMMANDS: list[tuple[str, str]] = [

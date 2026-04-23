@@ -8,6 +8,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from tools import revenue_validation_common as common
 
 SEVERITY_RANK = {
@@ -143,13 +146,17 @@ def _window_bounds(run_date: str | date, days: int) -> tuple[int, int]:
     return int(start_dt.timestamp()), int(end_dt.timestamp())
 
 
+def _daily_log_lines(lines: list[str], run_date: str | date) -> list[str]:
+    prefix = f"{_parse_run_date(run_date).isoformat()}T"
+    filtered = [line for line in lines if line.startswith(prefix)]
+    return filtered or lines
+
+
 def check_plugin_restart_count(lines: list[str], limit: int) -> dict[str, Any]:
     restart_lines = [
         line
         for line in lines
-        if "cl-revenue-ops.py" in line.lower() and any(
-            token in line.lower() for token in ("plugin", "restart", "starting", "started", "stopped")
-        )
+        if "initializing cl-revenue-ops plugin" in line.lower()
     ]
     severity = "red" if len(restart_lines) > limit else "green"
     return {
@@ -271,6 +278,7 @@ def check_revenue_drop(
     t0_dt = _parse_timestamp(t0)
     pre_start = t0_dt - timedelta(days=14)
     pre_end = t0_dt
+    post_window_complete = run_end >= t0_dt + timedelta(days=14)
     post_start = max(t0_dt, run_end - timedelta(days=14))
 
     pre_fees = 0
@@ -291,7 +299,7 @@ def check_revenue_drop(
     post_days = max((run_end - post_start).days, 1)
     pre_avg = pre_fees / 14 if pre_fees else 0
     post_avg = post_fees / post_days if post_fees else 0
-    drop_observed = pre_avg > 0 and post_avg < pre_avg * (1 - drop_pct / 100)
+    drop_observed = post_window_complete and pre_avg > 0 and post_avg < pre_avg * (1 - drop_pct / 100)
     severity = "red" if drop_observed else "green"
     return {
         "rule": "revenue_drop",
@@ -299,10 +307,15 @@ def check_revenue_drop(
         "pre_14d_fee_sats": pre_fees,
         "post_window_fee_sats": post_fees,
         "post_window_days": post_days,
+        "window_complete": post_window_complete,
         "pre_avg_sats_per_day": round(pre_avg, 2),
         "post_avg_sats_per_day": round(post_avg, 2),
         "threshold_pct": drop_pct,
-        "message": "routing revenue comparison vs pre-deploy trailing 14-day average",
+        "message": (
+            "routing revenue comparison vs pre-deploy trailing 14-day average"
+            if post_window_complete
+            else "post-deploy revenue window incomplete; deferring drop check"
+        ),
     }
 
 
@@ -400,16 +413,22 @@ def evaluate_node_day(
     log_lines = _read_lines(node_path / "rollback-watch.log")
     if not log_lines:
         log_lines = _read_lines(node_path / "debug-log-extract.log")
+    daily_log_lines = _daily_log_lines(log_lines, run_date)
+
+    restart_finding = check_plugin_restart_count(daily_log_lines, int(thresholds["plugin_restart_limit_24h"]))
+    if _parse_run_date(run_date) == _parse_timestamp(node_cfg["t0"]).date():
+        restart_finding["severity"] = "green"
+        restart_finding["message"] = "deploy-day restart check suppressed on T0"
 
     findings = [
-        check_plugin_restart_count(log_lines, int(thresholds["plugin_restart_limit_24h"])),
+        restart_finding,
         check_zero_ppm_non_hive(peerchannels, hive_members),
         check_ceiling_pricing(peerchannels, hive_members, revenue_config),
         check_rebalance_success_rate(listpays, run_date, int(thresholds["rebalance_success_floor_pct"])),
         check_revenue_drop(listforwards, node_cfg["t0"], run_date, int(thresholds["revenue_drop_pct"])),
-        check_traceback_volume(log_lines),
-        check_rebalance_floor_volume(log_lines),
-        check_competition_aware_oscillation(log_lines),
+        check_traceback_volume(daily_log_lines),
+        check_rebalance_floor_volume(daily_log_lines),
+        check_competition_aware_oscillation(daily_log_lines),
     ]
 
     return {

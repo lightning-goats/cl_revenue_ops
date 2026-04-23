@@ -4,6 +4,11 @@ import argparse
 import sys
 from datetime import date
 
+if __package__ in {None, ""}:
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from tools import revenue_validation_collect as collect
 from tools import revenue_validation_report as report
 from tools import revenue_validation_watch as watch

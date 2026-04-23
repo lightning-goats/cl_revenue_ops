@@ -50,11 +50,16 @@ htmlcov/
 # Local runtime/state directories (if created)
 logs/
 data/
+results/revenue-validation/
 
 # Vendor directory (bundled dependencies)
 vendor/
 
 # Local git worktrees
 .worktrees/
+
+# Generated validation drafts
+docs/reports/*-production-t14-findings.md
+docs/reports/*-production-t28-findings.md
 
 #TODO.md
