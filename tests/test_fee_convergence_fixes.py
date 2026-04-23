@@ -4,35 +4,87 @@ import pytest
 from modules.fee_controller import FeeController, GaussianThompsonState
 
 
-class TestSparseBlendRatio:
-    """Verify SPARSE_TARGET_BLEND_RATIO raised to 0.20."""
+class TestVarianceContinuousBlendRatio:
+    """Phase A.2 (2026-04-23): blend ratio is driven by posterior_std, not
+    by the binary sparse_data_conservative flag.
 
-    def test_sparse_blend_ratio_is_020(self):
+    Old behavior tied the confidence boost to `not sparse_data_conservative`,
+    which left tight-posterior channels stuck at 0.20/cycle whenever the
+    observation-count flag was set — even when the posterior was genuinely
+    confident. New mapping: posterior_std bands drive the ratio directly.
+    """
+
+    def test_sparse_constant_still_defined(self):
+        """Constant retained as the high-variance band value."""
         assert FeeController.SPARSE_TARGET_BLEND_RATIO == 0.20
 
-    def test_sparse_blend_moves_20_percent(self):
+    def test_high_variance_uses_sparse_rate(self):
+        fc = FeeController.__new__(FeeController)
+        ratio = fc._get_target_blend_ratio(
+            woke_from_sleep=False,
+            sparse_data_conservative=False,
+            posterior_std=250.0,
+        )
+        assert ratio == 0.20
+
+    def test_moderate_variance_medium_rate(self):
+        fc = FeeController.__new__(FeeController)
+        ratio = fc._get_target_blend_ratio(
+            woke_from_sleep=False,
+            sparse_data_conservative=False,
+            posterior_std=120.0,
+        )
+        assert ratio == 0.30
+
+    def test_tightening_posterior_accelerates(self):
+        fc = FeeController.__new__(FeeController)
+        ratio = fc._get_target_blend_ratio(
+            woke_from_sleep=False,
+            sparse_data_conservative=False,
+            posterior_std=70.0,
+        )
+        assert ratio == 0.45
+
+    def test_tight_posterior_converges_fast(self):
+        fc = FeeController.__new__(FeeController)
+        ratio = fc._get_target_blend_ratio(
+            woke_from_sleep=False,
+            sparse_data_conservative=False,
+            posterior_std=20.0,
+        )
+        assert ratio == 0.60
+
+    def test_sparse_flag_no_longer_gates_confidence(self):
+        """The whole point of the change: sparse=True with tight posterior
+        still gets the fast rate. Prior design stuck this at 0.20."""
         fc = FeeController.__new__(FeeController)
         ratio = fc._get_target_blend_ratio(
             woke_from_sleep=False,
             sparse_data_conservative=True,
+            posterior_std=20.0,
         )
-        assert ratio == 0.20
+        assert ratio == 0.60
 
-    def test_normal_blend_unchanged(self):
+    def test_wake_from_sleep_caps_at_wake_ratio(self):
+        """WAKE cap still applies across all variance bands."""
+        fc = FeeController.__new__(FeeController)
+        for std in (250.0, 20.0):
+            ratio = fc._get_target_blend_ratio(
+                woke_from_sleep=True,
+                sparse_data_conservative=True,
+                posterior_std=std,
+            )
+            assert ratio == 0.15
+
+    def test_default_posterior_std_is_moderate_band(self):
+        """Callers that forget to pass posterior_std get the 100.0 default,
+        which lands in the moderate band."""
         fc = FeeController.__new__(FeeController)
         ratio = fc._get_target_blend_ratio(
             woke_from_sleep=False,
             sparse_data_conservative=False,
         )
-        assert ratio == 0.35
-
-    def test_wake_blend_still_capped_at_015(self):
-        fc = FeeController.__new__(FeeController)
-        ratio = fc._get_target_blend_ratio(
-            woke_from_sleep=True,
-            sparse_data_conservative=True,
-        )
-        assert ratio == 0.15
+        assert ratio == 0.30
 
 
 class TestObservationWindow:
