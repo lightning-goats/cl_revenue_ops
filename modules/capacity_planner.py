@@ -884,7 +884,7 @@ class CapacityPlanner:
                 # EXCEPTION: Hard bleeders bypass the defibrillation gate -- they are
                 # structurally unprofitable (rebalance cost > 2x revenue AND net loss > 1000 sats).
                 # Accounting v2.0: Include estimated closure cost
-                estimated_closure_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+                estimated_closure_cost = self._estimate_close_cost()
                 reason = fire_sale_reason if is_fire_sale else "STAGNANT"
 
                 if is_hard_bleeder or attempt_count >= 2:
@@ -992,7 +992,7 @@ class CapacityPlanner:
             "marginal_roi": round(getattr(prof, "marginal_roi_percent", 0.0), 2),
             "classification": classification,
             "capacity": getattr(prof, "capacity_sats", 0),
-            "estimated_closure_cost_sats": ChainCostDefaults.CHANNEL_CLOSE_COST_SATS,
+            "estimated_closure_cost_sats": self._estimate_close_cost(),
             "rebal_difficulty": 0.0,
             "opener": opener,
             "action": action,
@@ -1631,15 +1631,9 @@ class CapacityPlanner:
         marginal_30d = loser.get("marginal_profit_30d_sats", 0)
         residual_value = marginal_30d * 3
 
-        # On-chain costs
-        try:
-            feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
-            sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
-            close_cost = int(sat_per_vb * 200)
-            open_cost = int(sat_per_vb * 140)
-        except Exception:
-            close_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
-            open_cost = ChainCostDefaults.CHANNEL_OPEN_COST_SATS
+        # On-chain costs (dynamic via feerates RPC, legacy static fallback)
+        open_cost = self._estimate_open_cost()
+        close_cost = self._estimate_close_cost()
 
         recycle_ev = candidate_ev - residual_value - close_cost - open_cost
         return recycle_ev
@@ -2185,15 +2179,9 @@ class CapacityPlanner:
             except Exception:
                 pass
 
-        # Estimate on-chain costs
-        try:
-            feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
-            sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
-            open_cost = int(sat_per_vb * 140)   # ~140 vbytes for open tx
-            close_cost = int(sat_per_vb * 200)  # ~200 vbytes for close tx
-        except Exception:
-            open_cost = ChainCostDefaults.CHANNEL_OPEN_COST_SATS
-            close_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+        # Estimate on-chain costs (dynamic via feerates RPC, legacy fallback)
+        open_cost = self._estimate_open_cost()
+        close_cost = self._estimate_close_cost()
 
         on_chain_cost = open_cost + close_cost
 
@@ -2229,7 +2217,7 @@ class CapacityPlanner:
             redeployment_ev = winner_ev - loser_ongoing_cost - closure_cost
             If no winners, returns (negative_ev, None, 0)
         """
-        closure_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+        closure_cost = self._estimate_close_cost()
         loser_capacity = loser.get("capacity", 0)
 
         # Ongoing cost: projected 6-month loss (0 if channel is profitable)
@@ -2259,6 +2247,21 @@ class CapacityPlanner:
             return int(sat_per_vb * 140)  # ~140 vbytes for funding tx
         except Exception:
             return ChainCostDefaults.CHANNEL_OPEN_COST_SATS
+
+    def _estimate_close_cost(self) -> int:
+        """Estimate the on-chain cost of closing a channel.
+
+        Uses the same feerate signal the planner's open-cost and recycle-EV
+        paths already use — falls back to the legacy static default only
+        when the feerate RPC fails. 200 vbytes matches the inline closure
+        size used at capacity_planner lines 1638 and 2193.
+        """
+        try:
+            feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
+            sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
+            return int(sat_per_vb * 200)  # ~200 vbytes for close tx
+        except Exception:
+            return ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
 
     @staticmethod
     def _parse_min_chan_size_error(error_msg: str) -> int:
@@ -2573,7 +2576,7 @@ class CapacityPlanner:
                     action_type="close",
                     peer_id=peer_id,
                     channel_id=channel_id,
-                    estimated_cost_sats=ChainCostDefaults.CHANNEL_CLOSE_COST_SATS,
+                    estimated_cost_sats=self._estimate_close_cost(),
                     reason=reason,
                 )
             except Exception as e:
@@ -2633,7 +2636,7 @@ class CapacityPlanner:
             # Record close cost in spend_events (matches open cost tracking pattern)
             if db:
                 try:
-                    close_cost = ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+                    close_cost = self._estimate_close_cost()
                     close_reservation_id = f"planner-close-{channel_id}-{int(time.time())}"
                     reserved = db.reserve_spend(
                         reservation_id=close_reservation_id,
