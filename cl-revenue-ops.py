@@ -483,6 +483,78 @@ plugin.add_option(
 
 
 plugin.add_option(
+    name='revenue-ops-market-fee-mode',
+    default='undercut',
+    description=(
+        'How to price relative to neighbor-median fee. '
+        '"undercut" (default): price below the median to win volume. '
+        '"match": target the median, no undercut. '
+        '"premium": price above the median using the same per-corridor '
+        'weight that would otherwise undercut. Use "premium" in '
+        'inelastic-demand markets (e.g., hive-coordinated with reliable '
+        'routing) to maximize revenue per forward. '
+        '"competition_aware": apply the median-undercut ONLY when a '
+        "competitor is priced at or below DTS's target; preserve DTS when "
+        "we're already below every competitor (undercut would otherwise "
+        'drag fees down against an inelastic market).'
+    )
+)
+
+
+plugin.add_option(
+    name='revenue-ops-base-fee-policy',
+    default='off',
+    description=(
+        'Base-fee policy (Upgrade A, 2026-04-22). '
+        '"off" (default): use revenue-ops-base-fee-msat for all channels. '
+        '"adaptive": apply revenue-ops-base-fee-intra-fleet to hive fleet '
+        'members and revenue-ops-base-fee-non-hive to everyone else. '
+        'Motivated by the 168x per-forward fee gap observed vs clboss.'
+    )
+)
+
+plugin.add_option(
+    name='revenue-ops-base-fee-intra-fleet',
+    default='0',
+    description='Base fee in msat for channels to hive fleet members (default: 0).'
+)
+
+plugin.add_option(
+    name='revenue-ops-base-fee-non-hive',
+    default='1000',
+    description=(
+        'Base fee in msat for channels to non-hive peers when '
+        'revenue-ops-base-fee-policy=adaptive (default: 1000 msat). '
+        'Conservative starting point; clboss observed at 15,307 msat.'
+    )
+)
+
+plugin.add_option(
+    name='revenue-ops-fee-ppm-intra-fleet',
+    default='1',
+    description=(
+        'Proportional fee in ppm for channels to hive fleet members '
+        '(default: 1). The legacy 0-PPM policy leaked revenue on external '
+        'traffic transiting the hive mesh. 1 ppm keeps members "cheapest '
+        'path" (50-500x below typical competitors) while recapturing '
+        'that leak. Set to 0 to restore legacy 0-PPM.'
+    )
+)
+
+plugin.add_option(
+    name='revenue-ops-neighbor-median-min-competitors',
+    default='2',
+    description=(
+        'Minimum competitor count for neighbor_median computation '
+        '(default: 2). The median is used by market-fee-mode '
+        '(undercut/match/premium/competition_aware); below this threshold '
+        'the helper returns None and the market-fee-mode branch is '
+        'skipped. Prod nodes with dense gossip may prefer 3.'
+    )
+)
+
+
+plugin.add_option(
     name='revenue-ops-rebalance-min-profit',
     default='10',
     description='Minimum profit in sats to trigger rebalance (default: 10)'
@@ -1405,6 +1477,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         target_flow=_safe_int('revenue-ops-target-flow'),
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
+        market_fee_mode=options.get('revenue-ops-market-fee-mode', 'undercut').lower(),
+        base_fee_policy=options.get('revenue-ops-base-fee-policy', 'off').lower(),
+        base_fee_msat_intra_fleet=_safe_int_opt('revenue-ops-base-fee-intra-fleet', '0'),
+        base_fee_msat_non_hive=_safe_int_opt('revenue-ops-base-fee-non-hive', '1000'),
+        fee_ppm_intra_fleet=_safe_int_opt('revenue-ops-fee-ppm-intra-fleet', '1'),
+        neighbor_median_min_competitors=_safe_int_opt('revenue-ops-neighbor-median-min-competitors', '2'),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         rebalance_emergency_local_ratio=_safe_float_opt(
             'revenue-ops-rebalance-emergency-local-ratio', '0.10'

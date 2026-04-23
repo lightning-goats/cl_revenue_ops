@@ -35,6 +35,10 @@ def mock_config():
     c.min_fee_ppm = 10
     c.max_fee_ppm = 5000
     c.thompson_prior_std_fee = 100
+    # Keep the old threshold so legacy tests that count "few channels"
+    # still classify 1-2 competitors as insufficient.
+    c.neighbor_median_min_competitors = 3
+    c.snapshot = MagicMock(return_value=c)
     return c
 
 @pytest.fixture
@@ -176,21 +180,28 @@ class TestFailedForwardObservation:
 
 
 class TestConfidenceScaledBlend:
+    """Phase A.2 semantics: blend ratio is a function of posterior_std,
+    not of the sparse_data_conservative flag. The flag remained in the
+    signature for call-site compatibility but no longer gates the
+    confidence boost."""
+
     def test_high_confidence_increases_blend(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
-        sparse_ratio = fc._get_target_blend_ratio(False, True, posterior_std=100.0)
+        high_var_ratio = fc._get_target_blend_ratio(False, True, posterior_std=250.0)
         confident_ratio = fc._get_target_blend_ratio(False, False, posterior_std=20.0)
-        assert confident_ratio > sparse_ratio
+        assert confident_ratio > high_var_ratio
 
     def test_blend_capped_at_sixty_percent(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
         ratio = fc._get_target_blend_ratio(False, False, posterior_std=1.0)
         assert ratio <= 0.60
 
-    def test_sparse_data_not_boosted(self, mock_plugin, mock_config, mock_database):
+    def test_tight_posterior_under_sparse_flag_gets_boost(self, mock_plugin, mock_config, mock_database):
+        """Prior design stuck sparse channels at 0.20 even with tight posterior.
+        Phase A.2: posterior_std drives the ratio; sparse flag no longer caps."""
         fc = FeeController(mock_plugin, mock_config, mock_database)
         ratio = fc._get_target_blend_ratio(False, True, posterior_std=10.0)
-        assert ratio == 0.20  # Sparse rate, no confidence boost
+        assert ratio == 0.60  # Tight posterior -> fast convergence regardless of flag
 
 
 class TestNeighborFeeAwareness:

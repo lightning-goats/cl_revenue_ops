@@ -126,6 +126,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'routing_intelligence_cache_seconds': int,
     # Fields present in CONFIG_FIELD_RANGES that need type registration
     'base_fee_msat': int,
+    'fee_ppm_intra_fleet': int,
+    'neighbor_median_min_competitors': int,
     'flow_window_days': int,
     'estimated_open_cost_sats': int,
     'target_flow': int,
@@ -212,6 +214,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'max_concurrent_jobs': (1, 20),
     'askrene_max_age_sec': (10, 86400),
     'base_fee_msat': (0, 10000),
+    'fee_ppm_intra_fleet': (0, 1000),
+    'neighbor_median_min_competitors': (2, 50),
     'rebalance_min_profit': (0, 1000000),
     'rebalance_min_amount': (1000, 50000000),
     'rebalance_max_amount': (10000, 100000000),
@@ -274,6 +278,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
     'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
     'rebalance_router': ('v3',),
+    'market_fee_mode': ('undercut', 'match', 'premium', 'competition_aware'),
 }
 
 
@@ -325,7 +330,47 @@ class Config:
     # Fee parameters
     min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)
     max_fee_ppm: int = 5000        # Ceiling fee in PPM
-    base_fee_msat: int = 0         # Base fee (we focus on PPM)
+    base_fee_msat: int = 0         # Base fee fallback when base_fee_policy = "off"
+
+    # Adaptive base_fee (Upgrade A, 2026-04-22) — per-channel-role base_fee_msat.
+    # Motivated by the 168x per-forward fee gap observed between clboss-ivan
+    # (15,307 msat base) and hive (0 msat base) in the 2026-04-21 tier runs.
+    # policy = "off" -> use base_fee_msat (legacy). "adaptive" -> classify each
+    # peer and apply role-specific base fee. V1 classification is two-bucket:
+    # hive fleet members get base_fee_msat_intra_fleet (0); everyone else gets
+    # base_fee_msat_non_hive. Gateway/leaf split is deferred until data shows
+    # a single non-hive value is insufficient.
+    base_fee_policy: str = "off"            # off | adaptive
+    base_fee_msat_intra_fleet: int = 0
+    base_fee_msat_non_hive: int = 1000      # conservative default per advisor calibration
+
+    # Intra-fleet proportional fee (Path B Step 3, 2026-04-22). The prior
+    # 0-PPM fleet policy was a revenue leak: 2 of 3 hive channels earned
+    # nothing, and external traffic transiting the hive mesh got free
+    # hops it could not distinguish from member-to-member flow. A small
+    # nonzero value (default 1 ppm) preserves "cheapest path for members"
+    # (1 ppm is ~50-500× below typical competitor rates) while extracting
+    # revenue on external transit. Set to 0 to restore legacy 0-PPM policy.
+    fee_ppm_intra_fleet: int = 1
+
+    # Minimum competitor count for _get_neighbor_fee_median to return a
+    # value. The original threshold of 3 was too strict for small labs /
+    # sparse gossip: peers with only 2 other inbound channels produced
+    # None and skipped market-fee-mode entirely. Default 2 is the lowest
+    # value that still requires *some* competition — a single outlier
+    # cannot drag the median. Production nodes with dense gossip may
+    # prefer 3 for smoother medians.
+    neighbor_median_min_competitors: int = 2
+
+    # Market-fee mode: how we price relative to the weighted-median of neighbor
+    # competitors' fees. Added 2026-04-21 to close the head-to-head-vs-clboss
+    # gap. Default "undercut" preserves existing behavior; "premium" prices
+    # above median in inelastic markets where the hive's coordinated routing
+    # means we lose less volume to a price increase than a single operator would.
+    #   - "undercut": price below the median (existing behavior)
+    #   - "match":    price at the median
+    #   - "premium":  price above the median by the same per-corridor weight
+    market_fee_mode: str = "undercut"
     
     # Rebalancing parameters
     rebalance_min_profit: int = 10     # Min profit in sats to trigger (legacy, used when ppm=0)
@@ -763,7 +808,13 @@ class ConfigSnapshot:
     min_fee_ppm: int
     max_fee_ppm: int
     base_fee_msat: int
-    
+    market_fee_mode: str
+    base_fee_policy: str
+    base_fee_msat_intra_fleet: int
+    base_fee_msat_non_hive: int
+    fee_ppm_intra_fleet: int
+    neighbor_median_min_competitors: int
+
     # Rebalancing parameters
     rebalance_min_profit: int
     rebalance_min_profit_ppm: int

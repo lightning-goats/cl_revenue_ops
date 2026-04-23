@@ -22,6 +22,12 @@ def mock_config():
     c.min_fee_ppm = 10
     c.max_fee_ppm = 5000
     c.vegas_decay_rate = 0.95
+    # Path B (2026-04-22): intra-fleet ppm is now configurable. Tests that
+    # exercise _check_hive_member_fee explicitly set this; default to 0 so
+    # pre-existing assertions that expect 0 still pass.
+    c.fee_ppm_intra_fleet = 0
+    c.neighbor_median_min_competitors = 2
+    c.snapshot = MagicMock(return_value=c)
     return c
 
 
@@ -85,8 +91,9 @@ class TestFeeHiveBias:
         assert multiplier > 1.5
 
 
-class TestMemberZeroFee:
-    def test_hive_member_gets_zero_ppm(self, mock_plugin, mock_config, mock_database):
+class TestMemberIntraFleetFee:
+    def test_hive_member_gets_intra_fleet_ppm_zero_legacy(self, mock_plugin, mock_config, mock_database):
+        """Legacy 0-PPM policy when fee_ppm_intra_fleet=0 (fixture default)."""
         fc = FeeController(mock_plugin, mock_config, mock_database)
         adapter = MagicMock()
         adapter.is_hive_member.return_value = True
@@ -95,6 +102,18 @@ class TestMemberZeroFee:
         fc.hive_hints = adapter
         result = fc._check_hive_member_fee("02member")
         assert result == 0
+
+    def test_hive_member_gets_configured_intra_fleet_ppm(self, mock_plugin, mock_config, mock_database):
+        """When fee_ppm_intra_fleet is set, members get that value."""
+        mock_config.fee_ppm_intra_fleet = 1
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        adapter = MagicMock()
+        adapter.is_hive_member.return_value = True
+        adapter.is_fresh.return_value = True
+        adapter._effective_ttl.return_value = 900
+        fc.hive_hints = adapter
+        result = fc._check_hive_member_fee("02member")
+        assert result == 1
 
     def test_non_member_returns_none(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
@@ -110,19 +129,20 @@ class TestMemberZeroFee:
         result = fc._check_hive_member_fee("02peer")
         assert result is None
 
-    def test_grace_period_holds_zero_after_stale(self, mock_plugin, mock_config, mock_database):
-        """0-PPM held for one TTL after hints go stale (gossip oscillation protection)."""
+    def test_grace_period_holds_intra_fleet_after_stale(self, mock_plugin, mock_config, mock_database):
+        """Intra-fleet ppm held for one TTL after hints go stale (gossip oscillation protection)."""
+        mock_config.fee_ppm_intra_fleet = 1
         fc = FeeController(mock_plugin, mock_config, mock_database)
         adapter = MagicMock()
         adapter.is_hive_member.return_value = True
         adapter.is_fresh.return_value = True
         adapter._effective_ttl.return_value = 900
         fc.hive_hints = adapter
-        assert fc._check_hive_member_fee("02peer") == 0
+        assert fc._check_hive_member_fee("02peer") == 1
 
         adapter.is_hive_member.return_value = False
         adapter.is_fresh.return_value = False
-        assert fc._check_hive_member_fee("02peer") == 0
+        assert fc._check_hive_member_fee("02peer") == 1
 
     def test_grace_period_expires(self, mock_plugin, mock_config, mock_database):
         """After grace period expires, revert to DTS+PID (return None)."""

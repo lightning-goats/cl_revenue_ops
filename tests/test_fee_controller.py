@@ -357,14 +357,16 @@ class TestRebalanceCostFloor:
         ]
         mock_database.get_channel_rebalance_success_rate.return_value = None
 
-        # Should return floor for SOURCE
-        result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
-        assert result is not None
-        assert result > 0
-
-        # Should return None for non-SOURCE flow states
+        # SOURCE and ROUTER both rebalance — both get the cost-recovery floor
+        # (Phase B.2, 2026-04-23: widened from SOURCE-only).
+        source_floor = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
+        assert source_floor is not None
+        assert source_floor > 0
+        router_floor = fc._get_rebalance_cost_floor(channel_id, peer_id, "router")
+        assert router_floor is not None
+        assert router_floor > 0
+        # SINK (inbound-heavy) and DORMANT (no flow) still excluded.
         assert fc._get_rebalance_cost_floor(channel_id, peer_id, "sink") is None
-        assert fc._get_rebalance_cost_floor(channel_id, peer_id, "router") is None
         assert fc._get_rebalance_cost_floor(channel_id, peer_id, "dormant") is None
 
     def test_rebalance_floor_calculates_cost_with_margin(self, mock_database, mock_plugin):
@@ -393,7 +395,11 @@ class TestRebalanceCostFloor:
         assert result == expected
 
     def test_rebalance_floor_requires_min_samples(self, mock_database, mock_plugin):
-        """Rebalance floor should return None if insufficient samples."""
+        """Rebalance floor should return None if insufficient samples.
+
+        Phase B.2 (2026-04-23): min_samples was lowered from 3 to 2, so
+        1 sample is now the below-threshold case.
+        """
         from modules.fee_controller import FeeController
         from modules.config import Config
 
@@ -403,10 +409,9 @@ class TestRebalanceCostFloor:
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
-        # Only 2 samples (default min is 3)
+        # Only 1 sample — below the new min of 2.
         mock_database.get_channel_cost_history.return_value = [
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400},
-            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 2},
         ]
         # Also no peer history available
         mock_database.get_historical_inbound_fee_ppm.return_value = None
@@ -567,7 +572,11 @@ class TestSuccessRateAdjustedFloor:
         assert floor_low == 1200
 
     def test_success_rate_insufficient_samples(self, mock_database, mock_plugin):
-        """Success rate = 1.0 should be used when < min_samples."""
+        """Success rate = 1.0 should be used when < min_samples.
+
+        Phase B.2 (2026-04-23): min_samples was lowered from 3 to 2, so
+        the below-threshold case is now 1 rebalance.
+        """
         fc = self._make_fc(mock_plugin, mock_database)
 
         channel_id = "123x456x0"
@@ -575,10 +584,10 @@ class TestSuccessRateAdjustedFloor:
 
         mock_database.get_channel_cost_history.return_value = self._cost_history(100, 5)
 
-        # Only 2 rebalances (below min_samples=3)
+        # Only 1 rebalance (below min_samples=2)
         mock_database.get_channel_rebalance_success_rate.return_value = {
-            'total': 2, 'successes': 1, 'failures': 1,
-            'success_rate': 0.5, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
+            'total': 1, 'successes': 0, 'failures': 1,
+            'success_rate': 0.0, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
         }
         floor = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
 
