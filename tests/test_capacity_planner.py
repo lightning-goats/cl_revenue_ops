@@ -2790,6 +2790,39 @@ class TestEstimateOpenCost:
         assert cost == 140
 
 
+class TestEstimateCloseCost:
+    """Tests for _estimate_close_cost helper (2026-04-23)."""
+
+    def test_estimate_from_feerates(self):
+        """Uses RPC feerates to estimate close cost. 200 vbytes for close tx."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 5000}}  # 5 sat/vB
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        cost = planner._estimate_close_cost()
+        # 5 sat/vB * 200 vB = 1000
+        assert cost == 1000
+
+    def test_estimate_fallback_on_rpc_error(self):
+        """Falls back to ChainCostDefaults when RPC fails."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.side_effect = Exception("RPC down")
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        cost = planner._estimate_close_cost()
+        from modules.config import ChainCostDefaults
+        assert cost == ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+
+    def test_close_cost_tracks_open_cost_shape(self):
+        """Close should be proportional to open at the same feerate (200/140 ratio)."""
+        plugin = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": 10_000}}  # 10 sat/vB
+        planner = CapacityPlanner(plugin, MagicMock(), MagicMock())
+        open_cost = planner._estimate_open_cost()
+        close_cost = planner._estimate_close_cost()
+        # 10 sat/vB * 140 = 1400; 10 sat/vB * 200 = 2000; ratio 200/140.
+        assert open_cost == 1400
+        assert close_cost == 2000
+
+
 # ---------------------------------------------------------------------------
 # Channel Open Execution Tests
 # ---------------------------------------------------------------------------
