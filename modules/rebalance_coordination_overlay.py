@@ -346,13 +346,35 @@ def merge_coordination_pairs(
     overlay_pairs: Iterable[PairCandidate],
     *,
     max_pairs: int,
+    coordination_reserved_slots: int = 0,
 ) -> List[PairCandidate]:
+    """Merge planner-selected pairs with coordination overlay pairs.
+
+    Coordination overlay pairs (built from hive-export-hints'
+    rebalance_recommendations / rebalance_campaigns) are admitted first,
+    sorted by priority. Planner pairs fill any remaining room.
+
+    When `coordination_reserved_slots > 0`, coordination pairs may consume
+    up to `max_pairs + coordination_reserved_slots` total slots; planner
+    pairs still respect `max_pairs` strictly. This honors the
+    hive-export-hints contract that coordination candidates "materialize
+    before the normal pair cap is applied" — a small reserve keeps hive-
+    blessed work from being squeezed out by a crop of EV-positive planner
+    pairs, without letting coordination dominate arbitrarily. Default 0
+    preserves pre-Phase-B.f behavior (strict cap, coordination competes
+    against planner pairs within it).
+    """
+    reserved = max(0, coordination_reserved_slots)
+
     selected: list[PairCandidate] = []
     seen_pairs: set[tuple[str, str]] = set()
     used_sources: set[str] = set()
     used_dests: set[str] = set()
+    coord_count = 0
+    plan_count = 0
 
-    def add_pair(pair: PairCandidate) -> bool:
+    def add_pair(pair: PairCandidate, is_coord: bool) -> bool:
+        nonlocal coord_count, plan_count
         key = _pair_key(pair)
         if key in seen_pairs:
             for existing in selected:
@@ -375,12 +397,27 @@ def merge_coordination_pairs(
             return False
         if pair.source_channel_id in used_sources or pair.dest_channel_id in used_dests:
             return False
-        if len(selected) >= max_pairs:
-            return False
+        # Capacity check. Coord pairs have access to `reserved` slots on top
+        # of max_pairs; additional coord pairs compete in the planner pool.
+        # Plan pairs only see the planner pool (after any overflow coord).
+        if is_coord:
+            if coord_count >= reserved:
+                # Overflow — compete in the shared planner pool.
+                coord_overflow = coord_count - reserved
+                if coord_overflow + plan_count >= max_pairs:
+                    return False
+        else:
+            coord_overflow = max(0, coord_count - reserved)
+            if coord_overflow + plan_count >= max_pairs:
+                return False
         selected.append(pair)
         seen_pairs.add(key)
         used_sources.add(pair.source_channel_id)
         used_dests.add(pair.dest_channel_id)
+        if is_coord:
+            coord_count += 1
+        else:
+            plan_count += 1
         return True
 
     overlay_sorted = sorted(
@@ -396,10 +433,10 @@ def merge_coordination_pairs(
     )
 
     for pair in overlay_sorted:
-        add_pair(pair)
+        add_pair(pair, is_coord=True)
 
     for pair in plan.selected:
-        if add_pair(pair):
+        if add_pair(pair, is_coord=False):
             continue
         if _pair_key(pair) in seen_pairs:
             continue

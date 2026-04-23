@@ -201,3 +201,124 @@ def test_overlay_applies_segment_score_bias_to_coordinated_pair():
 
     assert len(candidates) == 1
     assert candidates[0].score > 250_000
+
+
+# -----------------------------------------------------------------------------
+# Phase B.f (2026-04-23): reserved coordination slots bypass max_pairs cap.
+# -----------------------------------------------------------------------------
+
+def _plain_pair(src: str, dst: str, score: float = 10.0) -> PairCandidate:
+    """Build a non-coordinated planner pair for cap-boundary tests."""
+    return PairCandidate(
+        source_channel_id=src,
+        dest_channel_id=dst,
+        source_peer_id="02" + (src * 64)[:64],
+        dest_peer_id="02" + (dst * 64)[:64],
+        amount_sats=100_000,
+        pair_budget_sats=50,
+        score=score,
+    )
+
+
+def _coordination_pair(idx: int) -> PairCandidate:
+    """Build a coordination pair with unique src/dst so dedup doesn't fire."""
+    return PairCandidate(
+        source_channel_id=f"9{idx}0x1x0",
+        dest_channel_id=f"8{idx}0x1x0",
+        source_peer_id="02" + f"c{idx}" + "0" * 60,
+        dest_peer_id="02" + f"d{idx}" + "0" * 60,
+        amount_sats=100_000,
+        pair_budget_sats=50,
+        score=0.1,
+        reason_code="coordinated_rebalance",
+        coordination_hint_type="recommendation",
+        coordination_hint_id=f"rec-{idx}",
+        coordination_rank_bonus=90.0,
+    )
+
+
+def test_reserved_slots_zero_preserves_strict_cap():
+    """Default (0 reserved) keeps the pre-Phase-B.f semantics: planner pairs
+    can occupy the full max_pairs slots; coordination pairs displace planner
+    pairs rather than bypassing the cap."""
+    from modules.rebalance_coordination_overlay import merge_coordination_pairs
+
+    plan = PlanResult(
+        selected=[_plain_pair("p1", "q1"), _plain_pair("p2", "q2")],
+        skipped=[],
+    )
+    coord = [_coordination_pair(1), _coordination_pair(2)]
+
+    selected = merge_coordination_pairs(
+        plan, coord, max_pairs=2, coordination_reserved_slots=0
+    )
+    # 2 coordination pairs fill the 2-slot cap; both planner pairs displaced.
+    assert len(selected) == 2
+    assert all(p.coordination_hint_id for p in selected)
+
+
+def test_reserved_slots_let_coordination_bypass_cap():
+    """Phase B.f: with reserved=2 and max_pairs=2, two coordination pairs
+    bypass the cap; planner pairs can still fill the base cap."""
+    from modules.rebalance_coordination_overlay import merge_coordination_pairs
+
+    plan = PlanResult(
+        selected=[_plain_pair("p1", "q1"), _plain_pair("p2", "q2")],
+        skipped=[],
+    )
+    coord = [_coordination_pair(1), _coordination_pair(2)]
+
+    selected = merge_coordination_pairs(
+        plan, coord, max_pairs=2, coordination_reserved_slots=2
+    )
+    # Coordination uses 2 reserved slots (total 2); plan pairs fill 2 base
+    # slots -> 4 selected total (2 coord + 2 plan, no collisions).
+    assert len(selected) == 4
+    coord_ids = {p.coordination_hint_id for p in selected if p.coordination_hint_id}
+    assert coord_ids == {"rec-1", "rec-2"}
+
+
+def test_plan_pairs_still_respect_max_pairs_when_reserved_unused():
+    """If the overlay has no coordination pairs, the reserved slots stay
+    idle — planner pairs cannot expand into them."""
+    from modules.rebalance_coordination_overlay import merge_coordination_pairs
+
+    plan = PlanResult(
+        selected=[
+            _plain_pair("p1", "q1"),
+            _plain_pair("p2", "q2"),
+            _plain_pair("p3", "q3"),
+        ],
+        skipped=[],
+    )
+
+    selected = merge_coordination_pairs(
+        plan, [], max_pairs=2, coordination_reserved_slots=2
+    )
+    # No coordination pairs; plan respects max_pairs=2 only.
+    assert len(selected) == 2
+
+
+def test_coordination_cannot_exceed_reserved_plus_max():
+    """10 coordination pairs with reserved=2 and max_pairs=3 admit at most 5."""
+    from modules.rebalance_coordination_overlay import merge_coordination_pairs
+
+    plan = PlanResult(selected=[], skipped=[])
+    coord = [_coordination_pair(i) for i in range(10)]
+
+    selected = merge_coordination_pairs(
+        plan, coord, max_pairs=3, coordination_reserved_slots=2
+    )
+    assert len(selected) == 5
+
+
+def test_negative_reserved_clamped_to_zero():
+    """Defensive: a misconfigured negative value doesn't inflate the cap."""
+    from modules.rebalance_coordination_overlay import merge_coordination_pairs
+
+    plan = PlanResult(selected=[_plain_pair("p1", "q1")], skipped=[])
+    selected = merge_coordination_pairs(
+        plan, [], max_pairs=2, coordination_reserved_slots=-5
+    )
+    # Negative clamps to 0; no change vs the default.
+    assert len(selected) == 1
