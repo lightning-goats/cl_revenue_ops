@@ -792,10 +792,12 @@ class RebalanceEngine:
         planner_max_pairs = getattr(planner, "max_pairs", 10)
         if not isinstance(planner_max_pairs, int) or planner_max_pairs <= 0:
             planner_max_pairs = 10
+        reserved = int(getattr(cfg, "rebalance_coordination_reserved_slots", 0) or 0)
         plan.selected = merge_coordination_pairs(
             plan,
             overlay.selected,
             max_pairs=planner_max_pairs,
+            coordination_reserved_slots=reserved,
         )
         if not plan.selected:
             hive_equalization = self._hive_equalization_overlay(

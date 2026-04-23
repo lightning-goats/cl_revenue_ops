@@ -519,6 +519,19 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-rebalance-coordination-reserved-slots',
+    default='2',
+    description=(
+        "Reserved slots for coordination pairs (from cl-hive's rebalance_"
+        "recommendations / rebalance_campaigns hints) on top of the "
+        "planner's max_pairs cap. Default 2 lets a small number of "
+        "hive-blessed pairs bypass the cap without letting coordination "
+        "dominate arbitrarily. Set to 0 to restore strict-cap behavior "
+        "(coordination competes inside max_pairs)."
+    )
+)
+
+plugin.add_option(
     name='revenue-ops-allow-router-fallback',
     default='false',
     description='When true, MARKET_ONLY/HYBRID pairs whose router cannot find a route are still submitted to sling unpriced (legacy fallback_unpriced). Default false; flip true only if production askrene is more pessimistic than sling (Iter3 escape valve).'
@@ -1417,6 +1430,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         ),
         pair_fee_cap_ppm=_safe_int_opt(
             'revenue-ops-pair-fee-cap-ppm', '1000'
+        ),
+        rebalance_coordination_reserved_slots=_safe_int_opt(
+            'revenue-ops-rebalance-coordination-reserved-slots', '2'
         ),
         allow_router_fallback=options.get(
             'revenue-ops-allow-router-fallback', 'false'

@@ -97,6 +97,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hive_equalization_high_pct': float,
     'hive_equalization_cooldown_hours': int,
     'hive_equalization_max_candidates_per_cycle': int,
+    'rebalance_coordination_reserved_slots': int,
     'hive_push_enabled': bool,
     'hive_push_trigger_ratio': float,
     'hive_push_target_ratio': float,
@@ -235,6 +236,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hive_equalization_high_pct': (0.0, 1.0),
     'hive_equalization_cooldown_hours': (1, 168),
     'hive_equalization_max_candidates_per_cycle': (1, 10),
+    'rebalance_coordination_reserved_slots': (0, 10),
     'futility_cooldown_hours': (1, 168),
     'target_flow': (1000, 100000000),
     'estimated_open_cost_sats': (0, 1000000),
@@ -371,6 +373,19 @@ class Config:
     hive_push_enabled: bool = True            # Deploy capital to fleet member channels
     hive_push_trigger_ratio: float = 0.60     # Push when local ratio exceeds this
     hive_push_target_ratio: float = 0.50      # Push balance toward this ratio
+
+    # Reserved slots for coordination pairs on top of the planner's
+    # max_pairs cap (Phase B.f, 2026-04-23). cl-hive publishes
+    # rebalance_recommendations / rebalance_campaigns via hive-export-hints,
+    # and the documented contract is that those pairs should "materialize
+    # before the normal pair cap is applied." Before this default, they
+    # competed for the planner's 10-slot cap and could be squeezed out
+    # entirely by a crop of EV-positive planner pairs. Default 2 lets up
+    # to two hive-blessed coordination pairs bypass the normal cap without
+    # letting coordination dominate arbitrarily. Set to 0 to restore the
+    # strict-cap behavior.
+    rebalance_coordination_reserved_slots: int = 2
+
     futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
     inbound_fee_estimate_ppm: int = 50  # Route cost buffer added on top of last-hop fee (PPM)
     
@@ -785,6 +800,7 @@ class ConfigSnapshot:
     hive_push_enabled: bool
     hive_push_trigger_ratio: float
     hive_push_target_ratio: float
+    rebalance_coordination_reserved_slots: int
     futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
 
