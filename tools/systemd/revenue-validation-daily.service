@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily production revenue validation pipeline
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/sat/bin/cl_revenue_ops
+ExecStart=/home/sat/bin/cl_revenue_ops/.venv/bin/python /home/sat/bin/cl_revenue_ops/tools/revenue_validation_daily.py --config /home/sat/bin/cl_revenue_ops/config/revenue_validation.yaml
+Environment=PYTHONUNBUFFERED=1

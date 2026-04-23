@@ -109,6 +109,39 @@ git -C ~/.lightning/plugins/cl_revenue_ops pull
 lightning-cli plugin start ~/.lightning/plugins/cl_revenue_ops/cl-revenue-ops.py
 ```
 
+## Production Validation Automation
+
+This repo includes a read-only daily validation pipeline for tracking the production effect of recent fee, capex, and rebalance changes across `lnnode` and `hive-nexus-02`.
+
+- Edit `config/revenue_validation.yaml` and replace each node `t0` placeholder with the actual deploy timestamp before enabling the timer.
+- The timer runs once per day at `06:00` in the control host's local timezone. The intended host timezone for this workflow is `America/Denver`.
+- The pipeline is read-only by design: it collects evidence, evaluates red/yellow rollout-watch checks, and refreshes draft T+14/T+28 reports.
+
+Install the user units on the control host:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp tools/systemd/revenue-validation-daily.service ~/.config/systemd/user/
+cp tools/systemd/revenue-validation-daily.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now revenue-validation-daily.timer
+```
+
+Trigger a manual run:
+
+```bash
+systemctl --user start revenue-validation-daily.service
+systemctl --user status revenue-validation-daily.service --no-pager
+```
+
+Saved artifacts:
+
+- Raw daily evidence: `results/revenue-validation/YYYY-MM-DD/<node>/`
+- Daily manifest: `results/revenue-validation/manifests/YYYY-MM-DD.json`
+- Daily watch findings: `results/revenue-validation/watch/YYYY-MM-DD.json`
+- Trend rows: `results/revenue-validation/trends/<node>.jsonl`
+- Draft checkpoint reports: `docs/reports/*-production-t14-findings.md` and `docs/reports/*-production-t28-findings.md`
+
 ## Day-1 Operator Workflow
 
 1. Start the plugin and check `revenue-status`.
