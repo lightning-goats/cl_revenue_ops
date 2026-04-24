@@ -2080,6 +2080,48 @@ class FeeController:
             )
             return None
 
+    def _get_hive_market_boundary_fee(
+        self,
+        peer_id: str,
+        cfg: Optional[Any] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return advisory market boundary context from cl-hive fee intelligence.
+
+        Local gossip remains authoritative when present. This fallback exists for
+        the case cl-hive has fresher external-peer observations than our local
+        graph cache, so underpriced channels with proven flow can still monetize.
+        """
+        if not bool(getattr(cfg, "fee_market_boundary_enabled", True)):
+            return None
+        if not self.hive_hints:
+            return None
+
+        try:
+            boundary_ppm = int(self.hive_hints.get_optimal_fee_estimate(peer_id) or 0)
+        except Exception:
+            return None
+        if not (1 <= boundary_ppm <= self.ABS_MAX_FEE_PPM):
+            return None
+
+        confidence = None
+        try:
+            raw_confidence = self.hive_hints.get_traffic_confidence(peer_id)
+            confidence = float(raw_confidence)
+        except Exception:
+            confidence = None
+
+        return {
+            "boundary_ppm": boundary_ppm,
+            "cheapest_competitor_ppm": boundary_ppm,
+            "competitor_count": 1,
+            "cheapest_competitor_capacity_sats": 0,
+            "sample_competitor_fees_ppm": [boundary_ppm],
+            "cache_ttl_seconds": 0,
+            "force_refreshed": True,
+            "source": "hive_optimal_fee_estimate",
+            "traffic_confidence": confidence,
+        }
+
     def _apply_market_boundary_downshift(
         self,
         current_fee_ppm: int,
@@ -4389,6 +4431,8 @@ class FeeController:
                 cfg=cfg,
                 force_refresh=force_boundary_refresh,
             )
+            if market_boundary_info is None:
+                market_boundary_info = self._get_hive_market_boundary_fee(peer_id, cfg=cfg)
             if market_boundary_info is not None:
                 boundary_target_ppm, boundary_margin_ppm = self._get_market_boundary_target(
                     int(market_boundary_info["boundary_ppm"]),
