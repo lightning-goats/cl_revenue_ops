@@ -1,9 +1,9 @@
 """
 rebalance_executor — Native rebalance engine using safe explicit routes.
 
-Replaces sling for rebalance execution while keeping askrene and hive data on
-the planning side. Fleet-planned and network-planned rebalances both execute
-through a single explicit-route `getroute` + `sendpay` model with retry,
+Keeps askrene and hive data on the planning side. Fleet-planned and
+network-planned rebalances both execute through a single explicit-route
+`getroute` + `sendpay` model with retry,
 transient routing memory, and askrene result feedback.
 """
 

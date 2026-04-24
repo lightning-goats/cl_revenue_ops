@@ -11,7 +11,7 @@ forwarded **kwargs unchanged. Any RPC method whose own API accepts a
 'timeout' keyword (notably waitsendpay) collided with the parameter name.
 
 Secondary: the proxy's default rpc_timeout_seconds=15s is shorter than
-SENDPAY_TIMEOUT=60s in rebalance_executor_v2, so even after the rename
+SENDPAY_TIMEOUT=60s in the native rebalance executor, so even after the rename
 the proxy would cut waitsendpay short at 15s. The fix extends the proxy's
 effective timeout to max(proxy_default, user_timeout + grace) when the
 caller supplies its own 'timeout' kwarg.
@@ -89,7 +89,7 @@ def test_waitsendpay_with_user_timeout_does_not_raise_type_error(proxy_class):
     plugin = _make_plugin_with_rpc(rpc)
     proxy = proxy_class(plugin)
 
-    # This exact call is what rebalance_executor_v2.py line 164 issues.
+    # This exact call is what the native route executor issues.
     # Before the fix it raised:
     #   TypeError: _submit_main() got multiple values for argument 'timeout'
     result = proxy.waitsendpay(payment_hash="abc123", timeout=60)

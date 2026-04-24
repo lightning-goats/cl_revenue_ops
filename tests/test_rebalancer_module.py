@@ -184,7 +184,7 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
             fee_msat=1501,
             fee_ppm=30,
             hops=3,
-            route_type="sling",
+            route_type="native",
             attempts=1,
             parts=1,
         )
@@ -254,7 +254,7 @@ class TestCoordinatedRebalanceReporting:
             fee_msat=2500,
             fee_ppm=50,
             hops=3,
-            route_type="sling",
+            route_type="native",
             attempts=1,
             parts=1,
         )
@@ -310,7 +310,7 @@ class TestCoordinatedRebalanceReporting:
         r.rebalance_engine_v2 = MagicMock()
         r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
             success=False,
-            route_type="sling",
+            route_type="native",
             attempts=2,
             error="retriable_failure: WIRE_TEMPORARY_CHANNEL_FAILURE",
         )
@@ -742,8 +742,7 @@ class TestExecuteOnceManual:
 
 
 
-# Sling-specific test classes removed: TestSlingOnceNewParams,
-# TestChannelExclusions, TestGetActiveRebalancingPeers.
+# Obsolete executor-specific test classes removed.
 
 # =============================================================================
 # Audit Round 8 – Turn 2 Regression Tests

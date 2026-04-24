@@ -3,6 +3,8 @@
 from unittest.mock import MagicMock, patch
 
 from modules.rebalance_engine_v2 import RebalanceEngine, CycleResult
+from modules.rebalance_execution import ExecutionResult
+from modules.rebalance_router_v2 import RouteResult
 
 
 def _make_engine(channels=None, capex_budgets=None):
@@ -49,6 +51,10 @@ def _make_engine(channels=None, capex_budgets=None):
     config.rebalance_max_amount = 2_000_000
 
     database = MagicMock()
+    database.record_rebalance.return_value = 1
+    database.reserve_budget.return_value = (True, 9999)
+    database.mark_budget_spent.return_value = True
+    database.release_budget_reservation.return_value = True
 
     capex = MagicMock()
     if capex_budgets:
@@ -85,18 +91,20 @@ def _make_engine(channels=None, capex_budgets=None):
     return engine, plugin
 
 
+def _set_price_result(engine, *, success=True, route_cost_sats=100, error=""):
+    engine.router_v3 = MagicMock()
+    engine.router_v3.price_pair.return_value = RouteResult(
+        success=success,
+        route_cost_sats=route_cost_sats,
+        route=[],
+        error=error,
+    )
+
+
 class TestFindCandidates:
     def test_returns_candidates_for_imbalanced_channels(self):
         engine, plugin = _make_engine()
-        # Mock getroute to return a cheap route
-        plugin.rpc.getroute.return_value = {
-            "route": [
-                {"id": "02" + "dd" * 32, "channel": "333x3x0",
-                 "amount_msat": 500_100_000, "delay": 40},
-                {"id": "02" + "aa" * 32, "channel": "222x2x0",
-                 "amount_msat": 500_000_000, "delay": 10},
-            ]
-        }
+        _set_price_result(engine, route_cost_sats=1)
 
         candidates = engine.find_candidates()
 
@@ -123,14 +131,7 @@ class TestFindCandidates:
 
     def test_emits_audit_logs(self):
         engine, plugin = _make_engine()
-        plugin.rpc.getroute.return_value = {
-            "route": [
-                {"id": "02" + "dd" * 32, "channel": "333x3x0",
-                 "amount_msat": 500_100_000, "delay": 40},
-                {"id": "02" + "aa" * 32, "channel": "222x2x0",
-                 "amount_msat": 500_000_000, "delay": 10},
-            ]
-        }
+        _set_price_result(engine, route_cost_sats=1)
 
         engine.find_candidates()
 
@@ -142,14 +143,7 @@ class TestFindCandidates:
     def test_skips_route_over_budget(self):
         engine, plugin = _make_engine()
         # Expensive route: 1000 sat fee exceeds 500 sat budget
-        plugin.rpc.getroute.return_value = {
-            "route": [
-                {"id": "02" + "dd" * 32, "channel": "333x3x0",
-                 "amount_msat": 501_000_000_000, "delay": 40},
-                {"id": "02" + "aa" * 32, "channel": "222x2x0",
-                 "amount_msat": 500_000_000, "delay": 10},
-            ]
-        }
+        _set_price_result(engine, route_cost_sats=1000)
 
         candidates = engine.find_candidates()
 
@@ -159,7 +153,7 @@ class TestFindCandidates:
 
     def test_skips_no_route(self):
         engine, plugin = _make_engine()
-        plugin.rpc.getroute.side_effect = Exception("no route found")
+        _set_price_result(engine, success=False, error="no_route: test")
 
         candidates = engine.find_candidates()
 
@@ -169,24 +163,21 @@ class TestFindCandidates:
 class TestRunCycle:
     def test_executes_candidates(self):
         engine, plugin = _make_engine()
-        # Route for find_candidates
-        plugin.rpc.getroute.return_value = {
-            "route": [
-                {"id": "02" + "dd" * 32, "channel": "333x3x0",
-                 "amount_msat": 500_100_000, "delay": 40},
-                {"id": "02" + "aa" * 32, "channel": "222x2x0",
-                 "amount_msat": 500_000_000, "delay": 10},
-            ]
-        }
-        plugin.rpc.invoice.return_value = {
-            "payment_hash": "abc123",
-            "bolt11": "lnbc...",
-        }
-        plugin.rpc.waitsendpay.return_value = {
-            "amount_sent_msat": 500_100_000,
-        }
+        _set_price_result(engine, route_cost_sats=1)
 
-        result = engine.run_cycle()
+        with patch("modules.rebalance_engine_v2.NativeRouteExecutor") as executor_cls:
+            executor = executor_cls.return_value
+            executor.is_available.return_value = True
+            executor.execute.return_value = ExecutionResult(
+                success=True,
+                amount_sats=500_000,
+                fee_sats=10,
+                fee_msat=10_000,
+                fee_ppm=20,
+                route_type="native",
+            )
+
+            result = engine.run_cycle()
 
         assert len(result.candidates) >= 1
         assert len(result.executions) >= 1

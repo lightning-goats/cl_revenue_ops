@@ -89,7 +89,7 @@ class TestFailureMetadataPersistence:
         assert meta["last_attempted_ppm"] == 0
 
 
-# TestFailureClassification removed -- _classify_sling_error deleted with sling code.
+# TestFailureClassification removed -- legacy failure classifier deleted.
 
 
 # =============================================================================
@@ -207,7 +207,7 @@ class TestFasterNoRouteFutility:
         assert EVRebalancer._should_skip_futility(0, "") is False
 
 
-# TestAdaptiveChunkSizing removed -- _scale_chunk_for_escalation deleted with sling code.
+# TestAdaptiveChunkSizing removed -- _scale_chunk_for_escalation deleted with legacy job code.
 
 
 class TestFleetFeeCapRestoration:
@@ -265,5 +265,4 @@ class TestFleetFeeCapRestoration:
 
         assert candidate.max_fee_ppm == 200
         assert candidate.max_budget_sats == 100
-
 

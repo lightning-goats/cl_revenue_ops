@@ -29,7 +29,9 @@ No build system - this is a CLN plugin deployed by copying `cl-revenue-ops.py` a
 ```
 cl-revenue-ops (Execution Layer - "The CFO")
     ↓
-Native RebalanceExecutor (getroutes + sendpay)
+RebalanceEngineV2 (askrene getroutes pricing)
+    ↓
+native sendpay / waitsendpay
     ↓
 Core Lightning
 ```
@@ -39,7 +41,7 @@ Core Lightning
 | Module | Purpose |
 |--------|---------|
 | `fee_controller.py` | DTS+PID fee optimization, Vegas Reflex, congestion handling |
-| `rebalancer.py` | EV-based rebalancing, sling integration, futility circuit breaker |
+| `rebalancer.py` | EV-based rebalancing, native route execution, futility circuit breaker |
 | `flow_analysis.py` | Sink/Source detection, Kalman-filtered flow estimation with NaN recovery |
 | `policy_manager.py` | Per-peer policy engine (dynamic/static/passive) |
 | `profitability_analyzer.py` | P&L calculation, ROC metrics, capacity recommendations |
@@ -66,7 +68,7 @@ Core Lightning
 - Only rebalance if `Expected_Revenue > Rebalance_Cost`
 - Volume-weighted inventory targets
 - Futility circuit breaker (10 failures → stop)
-- Native execution path uses CLN `getroutes` + `sendpay` through `RebalanceExecutor`; `sling` is no longer required for live rebalancing
+- Live execution uses native explicit-route payment through `RebalanceEngineV2`; askrene `getroutes` prices and classifies routes before execution
 
 **Kalman Flow Estimation** (in `flow_analysis.py`):
 - State vector: [flow_ratio, velocity] with 2x2 covariance matrix
@@ -133,9 +135,6 @@ Canonical per-channel fields:
 - **Core Lightning**: v23.05+
 - **Python 3.10+**
 - **pyln-client**: >=24.0
-
-### Built In
-- **Native rebalancer**: `RebalanceExecutor` uses CLN `getroutes` + `sendpay`; no external rebalance plugin is required
 
 ### Recommended
 - **bookkeeper plugin**: For accurate on-chain cost tracking
@@ -224,7 +223,7 @@ cl-revenue-ops optionally consumes fleet coordination hints from cl-hive via a s
 
 - Test files in `tests/` directory (488 tests across 26 files)
 - Use pytest fixtures for mocking
-- Mock RPC calls and sling responses
+- Mock RPC calls and native executor responses
 - Test categories: fee, rebalance, policy, flow, accounting
 
 ## File Structure

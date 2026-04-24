@@ -30,6 +30,8 @@ class PairCandidate:
     dest_capacity_sats: int = 0
     source_value_class: str = "neutral"
     dest_value_class: str = "neutral"
+    source_budget_source: str = "none"
+    dest_budget_source: str = "none"
     route_cost_sats: Optional[int] = None
     route: Optional[List[Dict[str, Any]]] = None  # sendpay-ready route from router
     score: float = 0.0

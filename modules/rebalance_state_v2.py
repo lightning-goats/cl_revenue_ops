@@ -53,6 +53,7 @@ class ChannelState:
     dest_reason: str = ""
     dest_urgency: float = 0.0
     source_drain_score: float = 0.0
+    budget_source: str = "none"
 
 
 @dataclass(frozen=True)
@@ -228,6 +229,7 @@ def build_state_snapshot(
     target_band_low: float = _DEFAULT_TARGET_BAND_LOW,
     target_band_high: float = _DEFAULT_TARGET_BAND_HIGH,
     target_emergency_low: float = _DEFAULT_TARGET_EMERGENCY_LOW,
+    hive_bootstrap_budget_sats: int = 0,
 ) -> StateSnapshot:
     """Build a normalized, immutable v2 state snapshot."""
 
@@ -246,6 +248,12 @@ def build_state_snapshot(
             local_ratio = min(1.0, max(0.0, local_sats / capacity_sats))
 
         remaining_budget_sats = max(0, budget_by_channel.get(channel.channel_id, 0))
+        budget_source = "capex" if remaining_budget_sats > 0 else "none"
+        if channel.is_hive_member and remaining_budget_sats <= 0:
+            bootstrap_budget = max(0, _as_int(hive_bootstrap_budget_sats, 0))
+            if bootstrap_budget > 0:
+                remaining_budget_sats = bootstrap_budget
+                budget_source = "hive_bootstrap"
         value_class = _value_class(channel, remaining_budget_sats)
         is_valuable = value_class != "neutral"
         cooldown_active = bool(channel.cooldown_active)
@@ -285,6 +293,7 @@ def build_state_snapshot(
                 dest_reason=dest_reason,
                 dest_urgency=_refill_urgency(local_ratio, target_band_low),
                 source_drain_score=_drain_score(local_ratio, target_band_high),
+                budget_source=budget_source,
             )
         )
         total_capacity_sats += capacity_sats

@@ -19,7 +19,8 @@ from .rebalance_coordination_overlay import (
     merge_coordination_pairs,
     pair_segment_bias_multiplier,
 )
-from .rebalance_executor_v2 import RebalanceExecutor, ExecutionResult
+from .rebalance_execution import ExecutionResult
+from .rebalance_native_executor_v2 import NativeRouteExecutor
 from .rebalance_hive_router import RebalanceHiveRouter
 from .rebalance_planner_v2 import RebalancePlanner
 from .rebalance_route_policy import (
@@ -31,8 +32,9 @@ from .rebalance_route_policy import (
 from .rebalance_router_v2 import RouteResult
 from .rebalance_router_v3 import RebalanceRouterV3, _parse_layer_names
 from .rebalance_state_v2 import StateSnapshot, build_state_snapshot
-from .sling_segment_observations import SlingSegmentObservationStore
+from .segment_observations import SegmentObservationStore
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
+from .utils import base_to_sats_ceil
 
 
 @dataclass
@@ -61,6 +63,8 @@ class RebalanceEngine:
         data_service: Any = None,
         hive_router: Any = None,
         segment_observation_store: Any = None,
+        global_budget_limit_provider: Any = None,
+        external_liquidity_cost_provider: Any = None,
     ):
         self.plugin = plugin
         self.config = config
@@ -76,6 +80,8 @@ class RebalanceEngine:
             hive_router if hasattr(hive_router, "price_pair") else None
         )
         self._segment_observation_store = segment_observation_store
+        self.global_budget_limit_provider = global_budget_limit_provider
+        self.external_liquidity_cost_provider = external_liquidity_cost_provider
 
         self._our_id: Optional[str] = None
         self._audit = RebalanceAudit(plugin)
@@ -93,10 +99,9 @@ class RebalanceEngine:
         self._futility_threshold: int = 3
         self._futility_window_sec: float = 1800.0  # 30 minutes
         # Iter2: lower base cooldown for the most common transient failure
-        # (no_route / temporary_channel_failure). The previous 1800s on a
-        # FIRST sling failure was excessive -- sling itself classifies these
-        # as retriable. Backoff multiplier in record_pair_rebalance_failure
-        # already escalates repeated failures (×failure_count up to ×6).
+        # (no_route / temporary_channel_failure). Backoff multiplier in
+        # record_pair_rebalance_failure already escalates repeated failures
+        # (x failure_count up to x6).
         self._pair_failure_cooldowns: Dict[str, int] = {
             "temporary_channel_failure": 300,    # 5 min on first failure
             "fee_insufficient": 1800,            # 30 min (rare; usually persistent)
@@ -250,8 +255,6 @@ class RebalanceEngine:
             p_success = min(0.99, max(0.05, probability_ppm / 1_000_000.0))
         elif rejection_reason == "no_route":
             p_success = 0.05
-        elif route_status == "fallback_unpriced":
-            p_success = 0.25
         else:
             p_success = 0.5
 
@@ -314,6 +317,8 @@ class RebalanceEngine:
                 "target_band_high": round(high_threshold, 6),
                 "source_value_class": str(getattr(pair, "source_value_class", "") or ""),
                 "dest_value_class": str(getattr(pair, "dest_value_class", "") or ""),
+                "source_budget_source": str(getattr(pair, "source_budget_source", "") or ""),
+                "dest_budget_source": str(getattr(pair, "dest_budget_source", "") or ""),
             },
         }
 
@@ -351,15 +356,38 @@ class RebalanceEngine:
             "score": round(float(pair.score or 0.0), 6),
             "source_local_ratio": round(float(pair.source_local_ratio or 0.0), 6),
             "dest_local_ratio": round(float(pair.dest_local_ratio or 0.0), 6),
+            "source_value_class": str(getattr(pair, "source_value_class", "") or ""),
+            "dest_value_class": str(getattr(pair, "dest_value_class", "") or ""),
+            "source_budget_source": str(getattr(pair, "source_budget_source", "") or ""),
+            "dest_budget_source": str(getattr(pair, "dest_budget_source", "") or ""),
             "reason_code": pair.reason_code,
             "route_policy": getattr(
                 getattr(getattr(pair, "route_decision", None), "policy", None),
                 "value",
                 None,
             ),
+            "route_summary": self._route_summary(pair.route or []),
             "rejection_reason": pair.rejection_reason or None,
             "score_decomposition": copy.deepcopy(pair.score_decomposition or {}),
         }
+
+    @staticmethod
+    def _route_summary(route: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        summary: List[Dict[str, Any]] = []
+        for index, hop in enumerate(route or []):
+            if not isinstance(hop, dict):
+                continue
+            summary.append(
+                {
+                    "index": index,
+                    "channel": str(hop.get("channel", "") or ""),
+                    "direction": hop.get("direction"),
+                    "id": str(hop.get("id", "") or ""),
+                    "amount_msat": hop.get("amount_msat"),
+                    "delay": hop.get("delay"),
+                }
+            )
+        return summary
 
     def _hold_diagnostics(self, snapshot: Optional[Any]) -> Dict[str, int]:
         """Phase 1.2: bucket per-channel state so an operator can tell why
@@ -415,6 +443,8 @@ class RebalanceEngine:
                 "fee_msat": int(getattr(item, "fee_msat", 0) or 0),
                 "attempts": int(getattr(item, "attempts", 0) or 0),
                 "route_type": getattr(item, "route_type", "") or "",
+                "excluded_channels": list(getattr(item, "excluded_channels", []) or []),
+                "failure_data": copy.deepcopy(getattr(item, "failure_data", {}) or {}),
             })
 
         skipped: List[Dict[str, Any]] = []
@@ -603,6 +633,9 @@ class RebalanceEngine:
             target_band_low=target_band_low,
             target_band_high=target_band_high,
             target_emergency_low=target_emergency_low,
+            hive_bootstrap_budget_sats=int(
+                getattr(cfg, "hive_rebalance_bootstrap_budget_sats", 0) or 0
+            ),
         )
 
     def _is_hive_member(self, peer_id: str) -> bool:
@@ -703,6 +736,12 @@ class RebalanceEngine:
                         dest_peer_id=dest.peer_id,
                         amount_sats=amount_sats,
                         pair_budget_sats=0,
+                        source_capacity_sats=source.capacity_sats,
+                        dest_capacity_sats=dest.capacity_sats,
+                        source_value_class=source.value_class,
+                        dest_value_class=dest.value_class,
+                        source_budget_source=source.budget_source,
+                        dest_budget_source=dest.budget_source,
                         score=float(source_excess + dest_need),
                         source_local_ratio=source.local_ratio,
                         dest_local_ratio=dest.local_ratio,
@@ -918,8 +957,9 @@ class RebalanceEngine:
                             else:
                                 hold_margin = 0.0
                             decomp = pair.score_decomposition or {}
+                            final_score_present = "final_score" in decomp
                             final_score = float(decomp.get("final_score", 0.0) or 0.0)
-                            if hold_margin > 0.0 and final_score <= hold_margin:
+                            if final_score_present and final_score <= hold_margin:
                                 self._update_pair_score_decomposition(
                                     pair,
                                     probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
@@ -997,38 +1037,9 @@ class RebalanceEngine:
                                 ),
                             ))
                     else:
-                        # Iter3: when askrene reports no route, sling uses the
-                        # same pathfinder so it would also fail. Skip with
-                        # reason='no_route' instead of submitting unpriced.
-                        # Defensive escape valve: allow_router_fallback=True
-                        # restores the legacy fallback_unpriced submit path
-                        # for non-fail-closed policies. Default is False.
-                        decision = self._route_decision_for_pair(pair)
-                        fail_closed = self._fail_closed_on_route_failure(decision)
-                        allow_fallback_raw = getattr(cfg, "allow_router_fallback", False)
-                        allow_fallback = (
-                            bool(allow_fallback_raw) and not fail_closed
-                        )
-                        if allow_fallback:
-                            pair.route = None
-                            pair.route_cost_sats = pair.pair_budget_sats
-                            self._update_pair_score_decomposition(
-                                pair,
-                                route_cost_sats=pair.pair_budget_sats,
-                                effective_budget_sats=pair.pair_budget_sats,
-                                route_status="fallback_unpriced",
-                            )
-                            if debug_pair is not None:
-                                debug_pair.route = None
-                                debug_pair.route_cost_sats = pair.pair_budget_sats
-                                self._update_pair_score_decomposition(
-                                    debug_pair,
-                                    route_cost_sats=pair.pair_budget_sats,
-                                    effective_budget_sats=pair.pair_budget_sats,
-                                    route_status="fallback_unpriced",
-                                )
-                            priced.append(pair)
-                            continue
+                        # Native execution requires a priced explicit route.
+                        # Skip with reason='no_route' instead of submitting an
+                        # unpriced attempt.
                         self._update_pair_score_decomposition(
                             pair,
                             rejection_reason="no_route",
@@ -1110,15 +1121,43 @@ class RebalanceEngine:
         pair.score = float(getattr(pair, "score", 0.0) or 0.0) * multiplier
 
     @staticmethod
-    def _market_price_pair(router: Any, pair: PairCandidate, exclude: Optional[List[str]]):
-        return router.price_pair(
-            source_channel_id=pair.source_channel_id,
-            dest_channel_id=pair.dest_channel_id,
-            source_peer_id=pair.source_peer_id,
-            dest_peer_id=pair.dest_peer_id,
-            amount_sats=pair.amount_sats,
-            exclude=exclude,
-        )
+    def _market_price_pair(
+        router: Any,
+        pair: PairCandidate,
+        exclude: Optional[List[str]],
+        *,
+        market_only_layers: bool = False,
+    ):
+        kwargs = {
+            "source_channel_id": pair.source_channel_id,
+            "dest_channel_id": pair.dest_channel_id,
+            "source_peer_id": pair.source_peer_id,
+            "dest_peer_id": pair.dest_peer_id,
+            "amount_sats": pair.amount_sats,
+            "exclude": exclude,
+        }
+        if market_only_layers:
+            kwargs.update(
+                {
+                    "layer_names_override": [],
+                    "include_observed_liquidity": False,
+                }
+            )
+        try:
+            return router.price_pair(**kwargs)
+        except TypeError as exc:
+            if not market_only_layers:
+                raise
+            message = str(exc)
+            if (
+                "layer_names_override" not in message
+                and "include_observed_liquidity" not in message
+                and "unexpected keyword" not in message
+            ):
+                raise
+            kwargs.pop("layer_names_override", None)
+            kwargs.pop("include_observed_liquidity", None)
+            return router.price_pair(**kwargs)
 
     @staticmethod
     def _route_error(error: str) -> RouteResult:
@@ -1157,13 +1196,23 @@ class RebalanceEngine:
     ):
         decision = self._route_decision_for_pair(pair)
         if decision.policy is RoutePolicy.MARKET_ONLY:
-            return self._market_price_pair(router, pair, exclude), "market"
+            return self._market_price_pair(
+                router,
+                pair,
+                exclude,
+                market_only_layers=True,
+            ), "market"
 
         hive_router = self._hive_router
         if hive_router is None:
             if self._fail_closed_on_route_failure(decision):
                 return self._route_error("hive_router_unavailable"), "hive"
-            return self._market_price_pair(router, pair, exclude), "market"
+            return self._market_price_pair(
+                router,
+                pair,
+                exclude,
+                market_only_layers=True,
+            ), "market"
 
         try:
             hive_result = hive_router.price_pair(
@@ -1177,9 +1226,19 @@ class RebalanceEngine:
         if decision.policy is RoutePolicy.HIVE_ONLY:
             if getattr(hive_result, "success", False) or self._fail_closed_on_route_failure(decision):
                 return hive_result, "hive"
-            return self._market_price_pair(router, pair, exclude), "market"
+            return self._market_price_pair(
+                router,
+                pair,
+                exclude,
+                market_only_layers=True,
+            ), "market"
 
-        market_result = self._market_price_pair(router, pair, exclude)
+        market_result = self._market_price_pair(
+            router,
+            pair,
+            exclude,
+            market_only_layers=True,
+        )
         if decision.policy is RoutePolicy.HYBRID:
             if not getattr(hive_result, "success", False) and self._fail_closed_on_route_failure(decision):
                 return hive_result, "hive"
@@ -1238,10 +1297,8 @@ class RebalanceEngine:
         error = str(getattr(exec_result, "error", "") or "").lower()
         if "temporary_channel_failure" in error:
             return "temporary_channel_failure"
-        # Iter2: sling reports "NoRoutes" as a transient routing failure
-        # (gossip not converged, peer-side liquidity not visible, brief
-        # capacity dip). Treat it the same as temporary_channel_failure for
-        # cooldown purposes -- short base cooldown with fast escalation.
+        # Treat NoRoutes as transient: gossip may not be converged, peer-side
+        # liquidity may not be visible, or capacity may have briefly dipped.
         if "noroutes" in error or "no_routes" in error or "no route" in error:
             return "temporary_channel_failure"
         if "fee_insufficient" in error:
@@ -1322,6 +1379,134 @@ class RebalanceEngine:
         bonus_fraction = clamped * bonus_rate
         return int(pair_budget_sats * (1.0 + bonus_fraction))
 
+    def _config_snapshot(self) -> Any:
+        return self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
+
+    def _get_external_liquidity_costs(self) -> Dict[str, int]:
+        provider = getattr(self, "external_liquidity_cost_provider", None)
+        if not callable(provider):
+            return {"spent_24h_sats": 0, "reserved_24h_sats": 0}
+        try:
+            data = provider()
+            if not isinstance(data, dict):
+                return {"spent_24h_sats": 0, "reserved_24h_sats": 0}
+            return {
+                "spent_24h_sats": max(0, int(data.get("spent_24h_sats", 0) or 0)),
+                "reserved_24h_sats": max(0, int(data.get("reserved_24h_sats", 0) or 0)),
+            }
+        except Exception as exc:
+            self._log(f"external liquidity cost provider failed: {exc}", level="warn")
+            return {"spent_24h_sats": 0, "reserved_24h_sats": 0}
+
+    def _get_global_budget_limit(self, cfg: Any) -> int:
+        provider = getattr(self, "global_budget_limit_provider", None)
+        if callable(provider):
+            try:
+                data = provider()
+                if isinstance(data, dict):
+                    if "effective_budget_sats" in data:
+                        return max(0, int(data.get("effective_budget_sats", 0) or 0))
+                    if "budget_sats" in data:
+                        return max(0, int(data.get("budget_sats", 0) or 0))
+                if isinstance(data, (int, float, str)):
+                    return max(0, int(float(data)))
+            except Exception as exc:
+                self._log(f"global budget limit provider failed: {exc}", level="warn")
+        return max(0, int(getattr(cfg, "daily_budget_sats", 0) or 0))
+
+    def _reserve_execution_budget(
+        self,
+        pair: PairCandidate,
+        *,
+        reservation_id: str,
+    ) -> Tuple[bool, Optional[ExecutionResult]]:
+        """Reserve the maximum fee budget for one automatic execution.
+
+        Manual/explicit execute_candidate callers deliberately skip this path;
+        their caller owns override semantics and accounting.
+        """
+        max_fee_sats = max(0, int(getattr(pair, "pair_budget_sats", 0) or 0))
+        if max_fee_sats <= 0:
+            return False, None
+        if self.database is None or not callable(getattr(self.database, "reserve_budget", None)):
+            return False, ExecutionResult(
+                success=False,
+                amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+                error="local_budget_block: reserve_budget_unavailable",
+                route_type=self._executor_mode(),
+            )
+
+        cfg = self._config_snapshot()
+        now = int(time.time())
+        window_hours = max(
+            1,
+            int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24),
+        )
+        since_ts = now - (window_hours * 3600)
+        effective_budget = self._get_global_budget_limit(cfg)
+        external = self._get_external_liquidity_costs()
+        ext_spent = int(external.get("spent_24h_sats", 0) or 0)
+        ext_reserved = int(external.get("reserved_24h_sats", 0) or 0)
+        budget_limit = max(0, effective_budget - ext_spent - ext_reserved)
+
+        try:
+            reserved, remaining = self.database.reserve_budget(
+                reservation_id=reservation_id,
+                amount_sats=max_fee_sats,
+                channel_id=pair.dest_channel_id,
+                budget_limit=budget_limit,
+                since_timestamp=since_ts,
+                weekly_budget_limit=getattr(cfg, "weekly_budget_sats", None),
+                weekly_since_timestamp=now - 7 * 86400,
+            )
+        except Exception as exc:
+            self._log(
+                f"budget reservation failed for {pair.source_channel_id}->{pair.dest_channel_id}: {exc}",
+                level="warn",
+            )
+            return False, ExecutionResult(
+                success=False,
+                amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+                error=f"local_budget_block: {exc}",
+                route_type=self._executor_mode(),
+            )
+
+        if reserved:
+            return True, None
+
+        return False, ExecutionResult(
+            success=False,
+            amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+            error=(
+                f"local_budget_block: {remaining} sats remaining "
+                f"of {budget_limit} after external costs"
+            ),
+            route_type=self._executor_mode(),
+        )
+
+    def _finish_execution_budget(
+        self,
+        *,
+        reservation_id: str,
+        reserved_budget: bool,
+        result: Optional[ExecutionResult],
+    ) -> None:
+        if not reserved_budget or self.database is None:
+            return
+        try:
+            if result is not None and result.success:
+                self.database.mark_budget_spent(
+                    reservation_id,
+                    max(0, int(getattr(result, "fee_sats", 0) or 0)),
+                )
+            else:
+                self.database.release_budget_reservation(reservation_id)
+        except Exception as exc:
+            self._log(
+                f"budget reservation cleanup failed for {reservation_id}: {exc}",
+                level="warn",
+            )
+
     def _execution_kwargs(self, pair: PairCandidate) -> Dict[str, Any]:
         router_kind = "v3" if self._cycle_router is self.router_v3 else "v2"
         decision = self._route_decision_for_pair(pair)
@@ -1347,16 +1532,316 @@ class RebalanceEngine:
             },
         }
 
+    def _executor_mode(self) -> str:
+        return "native"
+
+    def _make_executor(self) -> NativeRouteExecutor:
+        return NativeRouteExecutor(
+            self.plugin,
+            self.database,
+            observation_store=self._segment_observation_store,
+        )
+
+    def _executor_unavailable_reason(self) -> tuple[str, str]:
+        return "native_unavailable", "native route executor RPC surface unavailable"
+
+    def _retry_native_pair_with_exclusions(
+        self,
+        pair: PairCandidate,
+        executor: Any,
+        first_result: ExecutionResult,
+    ) -> ExecutionResult:
+        """Retry a native sendpay once after excluding failed route segments."""
+        if self._executor_mode() != "native":
+            return first_result
+        if getattr(first_result, "success", False):
+            return first_result
+
+        exclusions: List[str] = []
+        seen: set[str] = set()
+        for entry in getattr(first_result, "excluded_channels", []) or []:
+            value = str(entry or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                exclusions.append(value)
+        if not exclusions:
+            return first_result
+
+        router = self._cycle_router or self._active_router()
+        if router is None:
+            return first_result
+
+        # Keep the retry conservative: when the hive router owns route choice,
+        # do not call it from an execution worker outside its cycle window.
+        decision = self._route_decision_for_pair(pair)
+        if self._hive_router is not None and decision.policy is not RoutePolicy.MARKET_ONLY:
+            return first_result
+
+        retry_data = dict(getattr(first_result, "failure_data", {}) or {})
+        retry_data["retry_excluded_channels"] = list(exclusions)
+        try:
+            route_result, route_label = self._route_pair(
+                pair=pair,
+                router=router,
+                exclude=exclusions,
+            )
+        except Exception as exc:
+            first_result.error = f"{first_result.error}; retry_pricing_failed: {exc}"
+            retry_data["retry_error"] = str(exc)
+            first_result.failure_data = retry_data
+            first_result.attempts = max(1, int(first_result.attempts or 1)) + 1
+            return first_result
+
+        if not getattr(route_result, "success", False):
+            detail = str(getattr(route_result, "error", "") or "no_route")
+            first_result.error = f"{first_result.error}; retry_no_route: {detail}"
+            retry_data["retry_error"] = detail
+            first_result.failure_data = retry_data
+            first_result.attempts = max(1, int(first_result.attempts or 1)) + 1
+            return first_result
+
+        effective_budget = self._probability_adjusted_budget(
+            int(getattr(pair, "pair_budget_sats", 0) or 0),
+            int(getattr(route_result, "probability_ppm", 0) or 0),
+        )
+        if int(getattr(route_result, "route_cost_sats", 0) or 0) > effective_budget:
+            first_result.error = (
+                f"{first_result.error}; retry_route_over_budget: "
+                f"{int(getattr(route_result, 'route_cost_sats', 0) or 0)} > {effective_budget}"
+            )
+            retry_data["retry_error"] = "route_over_budget"
+            first_result.failure_data = retry_data
+            first_result.attempts = max(1, int(first_result.attempts or 1)) + 1
+            return first_result
+
+        pair.route = list(getattr(route_result, "route", []) or [])
+        pair.route_cost_sats = int(getattr(route_result, "route_cost_sats", 0) or 0)
+        self._log(
+            f"Retrying native rebalance {pair.source_channel_id}->{pair.dest_channel_id} "
+            f"with exclusions={exclusions} via {route_label}",
+            level="info",
+        )
+        try:
+            retry_result = executor.execute(**self._execution_kwargs(pair))
+        except Exception as exc:
+            retry_result = ExecutionResult(
+                success=False,
+                amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+                error=f"executor_error: {exc}",
+                route_type="native",
+            )
+
+        retry_attempts = max(1, int(getattr(retry_result, "attempts", 0) or 1))
+        first_attempts = max(1, int(getattr(first_result, "attempts", 0) or 1))
+        retry_result.attempts = first_attempts + retry_attempts
+        merged_data = dict(getattr(retry_result, "failure_data", {}) or {})
+        merged_data.setdefault("previous_failure", first_result.error)
+        merged_data.setdefault("retry_excluded_channels", list(exclusions))
+        merged_data.setdefault("retry_route_cost_sats", pair.route_cost_sats)
+        retry_result.failure_data = merged_data
+        if not retry_result.success:
+            retry_result.excluded_channels = list(
+                dict.fromkeys(
+                    list(getattr(retry_result, "excluded_channels", []) or [])
+                    + exclusions
+                )
+            )
+        return retry_result
+
+    @staticmethod
+    def _native_partial_amounts(amount_sats: int) -> List[int]:
+        """Return bounded descending partial-fill retry amounts."""
+        try:
+            original = int(amount_sats)
+        except (TypeError, ValueError):
+            return []
+        if original <= 0:
+            return []
+
+        min_amount = min(original - 1, max(1_000, min(5_000, original // 2)))
+        if min_amount <= 0:
+            return []
+
+        amounts: List[int] = []
+        current = original // 2
+        while current >= min_amount and len(amounts) < 6:
+            if current < original and current not in amounts:
+                amounts.append(current)
+            next_amount = current // 2
+            if next_amount == current:
+                break
+            current = next_amount
+
+        if min_amount < original and min_amount not in amounts:
+            amounts.append(min_amount)
+        return amounts[:7]
+
+    @staticmethod
+    def _native_failure_allows_partial(result: ExecutionResult) -> bool:
+        if getattr(result, "success", False):
+            return False
+        if str(getattr(result, "route_type", "") or "") != "native":
+            return False
+        data = getattr(result, "failure_data", {}) or {}
+        if str(data.get("failure_class") or "").lower() == "liquidity":
+            return True
+        error = str(getattr(result, "error", "") or "").lower()
+        return "temporary_channel_failure" in error
+
+    def _retry_native_pair_with_partial_amounts(
+        self,
+        pair: PairCandidate,
+        executor: Any,
+        prior_result: ExecutionResult,
+    ) -> ExecutionResult:
+        """Retry native execution at smaller amounts after a liquidity failure."""
+        if self._executor_mode() != "native":
+            return prior_result
+        if not self._native_failure_allows_partial(prior_result):
+            return prior_result
+
+        router = self._cycle_router or self._active_router()
+        if router is None:
+            return prior_result
+
+        decision = self._route_decision_for_pair(pair)
+        if self._hive_router is not None and decision.policy is not RoutePolicy.MARKET_ONLY:
+            return prior_result
+
+        original_amount = int(getattr(pair, "amount_sats", 0) or 0)
+        original_route = list(getattr(pair, "route", []) or [])
+        original_route_cost = getattr(pair, "route_cost_sats", None)
+        partial_attempts: List[Dict[str, Any]] = []
+        total_attempts = max(1, int(getattr(prior_result, "attempts", 0) or 1))
+
+        for amount_sats in self._native_partial_amounts(original_amount):
+            pair.amount_sats = amount_sats
+            try:
+                route_result, route_label = self._route_pair(
+                    pair=pair,
+                    router=router,
+                    exclude=None,
+                )
+            except Exception as exc:
+                partial_attempts.append(
+                    {
+                        "amount_sats": amount_sats,
+                        "status": "pricing_error",
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            if not getattr(route_result, "success", False):
+                partial_attempts.append(
+                    {
+                        "amount_sats": amount_sats,
+                        "status": "no_route",
+                        "error": str(getattr(route_result, "error", "") or "no_route"),
+                    }
+                )
+                continue
+
+            route_cost = int(getattr(route_result, "route_cost_sats", 0) or 0)
+            effective_budget = self._probability_adjusted_budget(
+                int(getattr(pair, "pair_budget_sats", 0) or 0),
+                int(getattr(route_result, "probability_ppm", 0) or 0),
+            )
+            if route_cost > effective_budget:
+                partial_attempts.append(
+                    {
+                        "amount_sats": amount_sats,
+                        "status": "route_over_budget",
+                        "route_cost_sats": route_cost,
+                        "effective_budget_sats": effective_budget,
+                    }
+                )
+                continue
+
+            pair.route = list(getattr(route_result, "route", []) or [])
+            pair.route_cost_sats = route_cost
+            self._log(
+                f"Retrying native rebalance {pair.source_channel_id}->{pair.dest_channel_id} "
+                f"as partial amount={amount_sats} sats via {route_label}",
+                level="info",
+            )
+            try:
+                retry_result = executor.execute(**self._execution_kwargs(pair))
+            except Exception as exc:
+                retry_result = ExecutionResult(
+                    success=False,
+                    amount_sats=amount_sats,
+                    error=f"executor_error: {exc}",
+                    route_type="native",
+                )
+
+            total_attempts += max(1, int(getattr(retry_result, "attempts", 0) or 1))
+            if getattr(retry_result, "success", False):
+                retry_result.attempts = total_attempts
+                retry_result.amount_sats = int(getattr(retry_result, "amount_sats", 0) or amount_sats)
+                self._update_pair_score_decomposition(
+                    pair,
+                    probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
+                    route_cost_sats=route_cost,
+                    effective_budget_sats=effective_budget,
+                    route_status="partial_priced",
+                )
+                merged_data = dict(getattr(retry_result, "failure_data", {}) or {})
+                merged_data.setdefault("previous_failure", prior_result.error)
+                merged_data["partial_fill"] = {
+                    "planned_amount_sats": original_amount,
+                    "executed_amount_sats": retry_result.amount_sats,
+                    "route_cost_sats": route_cost,
+                    "attempts": partial_attempts
+                    + [{"amount_sats": amount_sats, "status": "success"}],
+                }
+                pair.score_decomposition["partial_fill"] = dict(
+                    merged_data["partial_fill"]
+                )
+                retry_result.failure_data = merged_data
+                return retry_result
+
+            partial_attempts.append(
+                {
+                    "amount_sats": amount_sats,
+                    "status": "execution_failed",
+                    "error": str(getattr(retry_result, "error", "") or ""),
+                    "excluded_channels": list(
+                        getattr(retry_result, "excluded_channels", []) or []
+                    ),
+                }
+            )
+
+        pair.amount_sats = original_amount
+        pair.route = original_route
+        pair.route_cost_sats = original_route_cost
+        data = dict(getattr(prior_result, "failure_data", {}) or {})
+        data["partial_fill"] = {
+            "planned_amount_sats": original_amount,
+            "executed_amount_sats": 0,
+            "attempts": partial_attempts,
+        }
+        prior_result.failure_data = data
+        prior_result.attempts = total_attempts
+        if partial_attempts:
+            prior_result.error = (
+                f"{prior_result.error}; partial_retry_failed: "
+                f"{partial_attempts[-1].get('status')}"
+            )
+        return prior_result
+
     def _execute_pair(
         self,
         pair: PairCandidate,
-        executor: RebalanceExecutor,
+        executor: NativeRouteExecutor,
+        *,
+        reserve_budget: bool = False,
+        account_costs: bool = False,
     ) -> Optional[ExecutionResult]:
         """Execute a single pair in a worker thread.
 
-        Sling-backed execution does not require a stored local route snapshot.
-        If one is present it is ignored by the executor; if it is absent we
-        still execute the selected pair directly.
+        Native execution requires the route priced by the active router and
+        executes that exact route.
         """
         # Stage 2D Defect 3 fix: the v2 engine used to leave ``rebalance_history``
         # empty on automatic cycles, which made ``revenue-status.rebalance_decision.
@@ -1364,8 +1849,54 @@ class RebalanceEngine:
         # Legacy ``execute_rebalance`` already records to the DB; we mirror that
         # behavior here so the summary and the history agree.
         rebalance_id: Optional[int] = self._record_rebalance_pending(pair)
-        result = executor.execute(**self._execution_kwargs(pair))
-        self._record_rebalance_result(rebalance_id, result, pair=pair)
+        reservation_id = (
+            str(rebalance_id)
+            if rebalance_id is not None
+            else f"v2-{time.time_ns()}-{pair.source_channel_id}-{pair.dest_channel_id}"
+        )
+        reserved_budget = False
+        result: Optional[ExecutionResult] = None
+
+        if reserve_budget:
+            reserved_budget, budget_result = self._reserve_execution_budget(
+                pair,
+                reservation_id=reservation_id,
+            )
+            if budget_result is not None:
+                self._record_rebalance_result(
+                    rebalance_id,
+                    budget_result,
+                    pair=pair,
+                    account_costs=False,
+                )
+                return budget_result
+
+        try:
+            result = executor.execute(**self._execution_kwargs(pair))
+        except Exception as exc:
+            result = ExecutionResult(
+                success=False,
+                amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+                error=f"executor_error: {exc}",
+                route_type=self._executor_mode(),
+            )
+
+        if result is not None:
+            result = self._retry_native_pair_with_exclusions(pair, executor, result)
+        if result is not None:
+            result = self._retry_native_pair_with_partial_amounts(pair, executor, result)
+
+        self._record_rebalance_result(
+            rebalance_id,
+            result,
+            pair=pair,
+            account_costs=account_costs,
+        )
+        self._finish_execution_budget(
+            reservation_id=reservation_id,
+            reserved_budget=reserved_budget,
+            result=result,
+        )
         if result is not None and not result.success:
             self._push_segment_observation_snapshot()
         return result
@@ -1406,6 +1937,7 @@ class RebalanceEngine:
         result: Optional[ExecutionResult],
         *,
         pair: Optional[PairCandidate] = None,
+        account_costs: bool = False,
     ) -> None:
         """Update the rebalance_history row with the terminal status."""
         if rebalance_id is None or self.database is None:
@@ -1438,7 +1970,29 @@ class RebalanceEngine:
                     actual_fee_sats=int(getattr(result, "fee_sats", 0) or 0),
                     actual_fee_msat=int(getattr(result, "fee_msat", 0) or 0),
                     post_local_ratio=post_local_ratio,
+                    amount_sats=int(
+                        getattr(result, "amount_sats", 0)
+                        or getattr(pair, "amount_sats", 0)
+                        or 0
+                    ),
                 )
+                if account_costs and pair is not None:
+                    fee_msat = int(getattr(result, "fee_msat", 0) or 0)
+                    if fee_msat <= 0:
+                        fee_msat = int(getattr(result, "fee_sats", 0) or 0) * 1000
+                    if fee_msat > 0:
+                        self.database.record_rebalance_cost(
+                            channel_id=pair.dest_channel_id,
+                            peer_id=pair.dest_peer_id,
+                            cost_sats=base_to_sats_ceil(fee_msat),
+                            cost_msat=fee_msat,
+                            amount_sats=int(
+                                getattr(result, "amount_sats", 0)
+                                or getattr(pair, "amount_sats", 0)
+                                or 0
+                            ),
+                            timestamp=int(time.time()),
+                        )
             else:
                 self.database.update_rebalance_result(
                     rebalance_id,
@@ -1474,14 +2028,14 @@ class RebalanceEngine:
         if self._data_service is not None and hasattr(self._data_service, "datastore_push"):
             return bool(
                 self._data_service.datastore_push(
-                    SlingSegmentObservationStore.DATASTORE_KEY,
+                    SegmentObservationStore.DATASTORE_KEY,
                     snapshot,
                 )
             )
 
         try:
             self.plugin.rpc.datastore(
-                key=SlingSegmentObservationStore.DATASTORE_KEY,
+                key=SegmentObservationStore.DATASTORE_KEY,
                 string=json.dumps(snapshot),
                 mode="create-or-replace",
             )
@@ -1512,7 +2066,7 @@ class RebalanceEngine:
                 success=False,
                 error="router_unavailable",
                 amount_sats=amount_sats,
-                route_type="sling",
+                route_type="native",
             )
         pair = PairCandidate(
             source_channel_id=source_channel_id,
@@ -1546,7 +2100,7 @@ class RebalanceEngine:
                     success=False,
                     error=f"route_pricing_failed: {e}",
                     amount_sats=amount_sats,
-                    route_type="sling",
+                    route_type="native",
                 )
             else:
                 if route_result.success:
@@ -1568,15 +2122,16 @@ class RebalanceEngine:
                 success=False,
                 error=route_result.error or "hive_route_unavailable",
                 amount_sats=amount_sats,
-                route_type="sling",
+                route_type="native",
             )
 
-        executor = RebalanceExecutor(
-            self.plugin,
-            self.database,
-            observation_store=self._segment_observation_store,
+        executor = self._make_executor()
+        return self._execute_pair(
+            pair,
+            executor,
+            reserve_budget=False,
+            account_costs=False,
         )
-        return self._execute_pair(pair, executor)
 
     def run_cycle(self) -> CycleResult:
         """Live execution: find candidates (already priced), execute concurrently.
@@ -1638,12 +2193,9 @@ class RebalanceEngine:
             self._cache_cycle_result(result)
             return result
 
-        executor = RebalanceExecutor(
-            self.plugin,
-            self.database,
-            observation_store=self._segment_observation_store,
-        )
+        executor = self._make_executor()
         if not executor.is_available():
+            unavailable_reason, unavailable_detail = self._executor_unavailable_reason()
             for pair in live_candidates:
                 debug_pair = considered_lookup.get(self._pair_key(pair))
                 if debug_pair is not None:
@@ -1651,15 +2203,15 @@ class RebalanceEngine:
                         debug_pair,
                         route_cost_sats=debug_pair.route_cost_sats,
                         effective_budget_sats=int(getattr(debug_pair, "pair_budget_sats", 0) or 0),
-                        rejection_reason="sling_unavailable",
-                        route_status="sling_unavailable",
+                        rejection_reason=unavailable_reason,
+                        route_status=unavailable_reason,
                     )
                 self._audit.log_skip(
                     channel_id=pair.dest_channel_id,
-                    reason="sling_unavailable",
+                    reason=unavailable_reason,
                     value_class="valuable",
                     remaining_budget_sats=int(getattr(pair, "pair_budget_sats", 0) or 0),
-                    detail="sling-once RPC not loaded",
+                    detail=unavailable_detail,
                     router="v3",
                 )
             result.candidates = []
@@ -1669,7 +2221,13 @@ class RebalanceEngine:
         # Submit the surviving candidates to the thread pool
         futures: Dict[Future, PairCandidate] = {}
         for pair in live_candidates:
-            future = self._pool.submit(self._execute_pair, pair, executor)
+            future = self._pool.submit(
+                self._execute_pair,
+                pair,
+                executor,
+                reserve_budget=True,
+                account_costs=True,
+            )
             futures[future] = pair
 
         # Collect results as they complete (main thread only — no lock needed)
@@ -1710,6 +2268,24 @@ class RebalanceEngine:
                 f"{len(result.executions)}/{len(futures)} completed",
                 level="warn",
             )
+            for future, pair in futures.items():
+                if future.done():
+                    continue
+                future.cancel()
+                timeout_result = ExecutionResult(
+                    success=False,
+                    error="executor_timeout",
+                    amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+                    fee_sats=0,
+                    fee_msat=0,
+                    route_type=self._executor_mode(),
+                )
+                result.executions.append(timeout_result)
+                self._record_pair_failure(
+                    pair.source_channel_id,
+                    pair.dest_channel_id,
+                )
+                self._persist_pair_failure(pair, timeout_result)
 
         self._cache_cycle_result(result)
         return result

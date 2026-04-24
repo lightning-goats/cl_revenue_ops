@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from .rebalance_route_policy import RouteDecision, RoutePolicy
-from .rebalance_router_v2 import RouteResult
+from .rebalance_router_v2 import RebalanceRouter as RebalanceRouterV2, RouteResult
 
 
 def _parse_msat(value: Any) -> int:
@@ -69,6 +69,11 @@ class RebalanceHiveRouter:
         self.hive_hints = hive_hints
         self.data_service = data_service
         self.log = log or (lambda _msg, _level="info": None)
+        self._v2_helpers = RebalanceRouterV2(
+            plugin,
+            our_node_id,
+            data_service=data_service,
+        )
         # Cycle state is thread-local so a manual revenue-rebalance (on the
         # RPC worker thread) can't tear down the background pricing cycle's
         # layers, and vice versa.
@@ -400,7 +405,15 @@ class RebalanceHiveRouter:
         elif decision.policy is RoutePolicy.HYBRID and not self._has_hive_hop(path):
             return RouteResult(success=False, error="no_fleet_route")
 
-        full_route = [_translate_getroutes_hop(hop) for hop in path]
+        prefix_route = [_translate_getroutes_hop(hop) for hop in path]
+        prefix_route, reprice_error = self._v2_helpers._reprice_middle_route_amounts(
+            prefix_route,
+            final_amount_msat=required_amount_msat,
+        )
+        if prefix_route is None:
+            return RouteResult(success=False, error=reprice_error)
+
+        full_route = list(prefix_route)
         full_route.append({
             "id": self.our_node_id,
             "channel": str(pair.dest_channel_id).replace(":", "x"),
@@ -409,17 +422,6 @@ class RebalanceHiveRouter:
             "delay": self._invoice_final_cltv(),
             "style": "tlv",
         })
-
-        # Strip our phantom local first-hop fee. askrene prices our outgoing
-        # channel like a normal edge, but circular self-payments do not pay
-        # ourselves. Keep the route monotonic after correction.
-        if full_route and int(full_route[0].get("amount_msat", 0) or 0) > required_amount_msat:
-            full_route[0]["amount_msat"] = required_amount_msat
-            for idx in range(1, len(full_route)):
-                previous = int(full_route[idx - 1].get("amount_msat", 0) or 0)
-                current = int(full_route[idx].get("amount_msat", 0) or 0)
-                if current > previous:
-                    full_route[idx]["amount_msat"] = previous
 
         total_fee_msat = max(0, int(full_route[0].get("amount_msat", amount_msat) or amount_msat) - amount_msat)
         total_cost_sats = (total_fee_msat + 999) // 1000
