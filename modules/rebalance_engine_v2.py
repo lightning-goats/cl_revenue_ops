@@ -30,7 +30,7 @@ from .rebalance_route_policy import (
     decide_route_policy,
 )
 from .rebalance_router_v2 import RouteResult
-from .rebalance_router_v3 import RebalanceRouterV3, _parse_layer_names
+from .rebalance_router_v3 import RebalanceRouterV3, _configured_layer_names
 from .rebalance_state_v2 import StateSnapshot, build_state_snapshot
 from .segment_observations import SegmentObservationStore
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
@@ -118,9 +118,14 @@ class RebalanceEngine:
         # fail-closed: legacy getroute routing has been removed.
         self.router_v3: Optional[RebalanceRouterV3] = None
         if self._probe_askrene():
-            layer_names = _parse_layer_names(
-                getattr(config, "askrene_layers", "")
-            )
+            raw_layer_config = getattr(config, "askrene_layers", None)
+            layer_names = _configured_layer_names(raw_layer_config)
+            if raw_layer_config is None or not str(raw_layer_config).strip():
+                self._log(
+                    "[router-v3] empty askrene_layers config; using default "
+                    f"layers={layer_names}",
+                    "warn",
+                )
             self.router_v3 = RebalanceRouterV3(
                 plugin=plugin,
                 our_node_id=our_id,

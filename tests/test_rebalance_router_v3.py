@@ -28,6 +28,20 @@ def test_parse_layer_names_empty_returns_empty_list():
     assert _parse_layer_names(",,") == []
 
 
+def test_configured_layer_names_blank_uses_hive_default():
+    from modules.rebalance_router_v3 import _configured_layer_names
+    assert _configured_layer_names("") == ["hive-fleet"]
+    assert _configured_layer_names(" ") == ["hive-fleet"]
+    assert _configured_layer_names(None) == ["hive-fleet"]
+
+
+def test_configured_layer_names_supports_explicit_standalone():
+    from modules.rebalance_router_v3 import _configured_layer_names
+    assert _configured_layer_names("none") == []
+    assert _configured_layer_names("standalone") == []
+    assert _configured_layer_names("OFF") == []
+
+
 def test_v3_router_constructs_with_empty_layers():
     from modules.rebalance_router_v3 import RebalanceRouterV3
     plugin = MagicMock()

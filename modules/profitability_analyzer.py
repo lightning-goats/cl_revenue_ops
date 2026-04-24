@@ -27,6 +27,7 @@ import threading
 from pyln.client import Plugin, RpcError
 
 from .utils import (
+    normalize_scid,
     parse_msat as _shared_parse_msat,
     base_to_sats_floor,
     base_to_sats_ceil,
@@ -667,6 +668,7 @@ class ChannelProfitabilityAnalyzer:
             ChannelProfitability object or None if analysis fails
         """
         try:
+            channel_id = normalize_scid(channel_id)
             # Get channel info if not provided
             if channel_info is None:
                 channels = self._get_all_channels()
@@ -791,7 +793,7 @@ class ChannelProfitabilityAnalyzer:
         if (int(time.time()) - self._cache_timestamp) > self._cache_ttl:
             self.analyze_all_channels()
 
-        return self._profitability_cache.get(channel_id)
+        return self._profitability_cache.get(normalize_scid(channel_id))
 
     def get_profitability_by_peer(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -1023,6 +1025,7 @@ class ChannelProfitabilityAnalyzer:
             cost_sats: Fee paid for the rebalance
             amount_sats: Amount rebalanced
         """
+        channel_id = normalize_scid(channel_id)
         self.database.record_rebalance_cost(
             channel_id=channel_id,
             peer_id=peer_id,
@@ -1050,7 +1053,7 @@ class ChannelProfitabilityAnalyzer:
             timestamp: Actual channel open time (defaults to now for new opens)
         """
         self.database.record_channel_open_cost(
-            channel_id=channel_id,
+            channel_id=normalize_scid(channel_id),
             peer_id=peer_id,
             open_cost_sats=open_cost_sats,
             capacity_sats=capacity_sats,
@@ -1415,6 +1418,7 @@ class ChannelProfitabilityAnalyzer:
                     if net_pnl_sats < 0 and total_activity > 0:
                         bleeders.append({
                             'channel_id': channel_id,
+                            'short_channel_id': channel_id,
                             'peer_id': info.get('peer_id', ''),
                             'capacity_sats': info.get('capacity', 0),
                             # Direct revenue (as exit channel)
@@ -1602,7 +1606,7 @@ class ChannelProfitabilityAnalyzer:
             new_cache = {c.channel_id: c for c in self.identify_bleeders_v2()}
             self._bleeder_cache = new_cache
             self._bleeder_cache_time = now
-        return self._bleeder_cache.get(channel_id)
+        return self._bleeder_cache.get(normalize_scid(channel_id))
 
     def calculate_roc(self, window_days: int = 30) -> Dict[str, Any]:
         """
@@ -1720,7 +1724,7 @@ class ChannelProfitabilityAnalyzer:
                 if state != "CHANNELD_NORMAL":
                     continue
 
-                channel_id = channel.get("short_channel_id")
+                channel_id = normalize_scid(channel.get("short_channel_id"))
                 if not channel_id:
                     continue
                 
@@ -2232,14 +2236,36 @@ class ChannelProfitabilityAnalyzer:
 
         result_map: Dict[str, ChannelRevenue] = {}
         for channel_id, data in totals.items():
-            result_map[channel_id] = ChannelRevenue(
-                channel_id=channel_id,
-                fees_earned_msat=int(data.get("fees_earned_msat", 0) or 0),
-                volume_routed_msat=int(data.get("volume_routed_msat", 0) or 0),
-                forward_count=int(data.get("forward_count", 0) or 0),
-                sourced_volume_msat=int(data.get("sourced_volume_msat", 0) or 0),
-                sourced_fee_contribution_msat=int(data.get("sourced_fee_contribution_msat", 0) or 0),
-                sourced_forward_count=int(data.get("sourced_forward_count", 0) or 0),
+            normalized_channel_id = normalize_scid(channel_id)
+            if not normalized_channel_id:
+                continue
+            existing = result_map.get(normalized_channel_id)
+            result_map[normalized_channel_id] = ChannelRevenue(
+                channel_id=normalized_channel_id,
+                fees_earned_msat=(
+                    (existing.fees_earned_msat if existing else 0) +
+                    int(data.get("fees_earned_msat", 0) or 0)
+                ),
+                volume_routed_msat=(
+                    (existing.volume_routed_msat if existing else 0) +
+                    int(data.get("volume_routed_msat", 0) or 0)
+                ),
+                forward_count=(
+                    (existing.forward_count if existing else 0) +
+                    int(data.get("forward_count", 0) or 0)
+                ),
+                sourced_volume_msat=(
+                    (existing.sourced_volume_msat if existing else 0) +
+                    int(data.get("sourced_volume_msat", 0) or 0)
+                ),
+                sourced_fee_contribution_msat=(
+                    (existing.sourced_fee_contribution_msat if existing else 0) +
+                    int(data.get("sourced_fee_contribution_msat", 0) or 0)
+                ),
+                sourced_forward_count=(
+                    (existing.sourced_forward_count if existing else 0) +
+                    int(data.get("sourced_forward_count", 0) or 0)
+                ),
             )
 
         return result_map
@@ -2254,6 +2280,7 @@ class ChannelProfitabilityAnalyzer:
 
         Note: For batch operations, use _get_all_revenue_data() instead.
         """
+        channel_id = normalize_scid(channel_id)
         try:
             totals = self.database.get_channel_revenue_totals(channel_id)
         except Exception as e:

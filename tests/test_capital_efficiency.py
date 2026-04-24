@@ -195,6 +195,20 @@ class TestCapitalEfficiencyAnalyzer:
 
         assert fleet.channel_efficiencies["100:1:0"].dead_capital_stage == "fee_reduction"
 
+    def test_flow_lookup_normalizes_scid_keys(self):
+        profitability = {
+            "100x1x0": _make_profitability("100x1x0", "peer-a", 2_000_000, 0, 30),
+        }
+        flow = {
+            "100:1:0": _make_flow("100:1:0", "peer-a", 2_000_000, 0, 0),
+        }
+        analyzer = _make_analyzer(profitability, flow)
+
+        fleet = analyzer.analyze()
+
+        assert fleet.channel_efficiencies["100x1x0"].is_dead_capital is True
+        assert fleet.dead_capital_count == 1
+
     def test_stage_lookup_degrades_cleanly_on_db_failure(self):
         profitability = {
             "100x1x0": _make_profitability("100x1x0", "peer-a", 2_000_000, 0, 30),

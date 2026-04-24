@@ -57,6 +57,11 @@ class CapitalEfficiencyAnalyzer:
             raw_stages = self._database.get_dead_capital_stages() if self._database else {}
         except Exception:
             raw_stages = {}
+        flow_by_normalized_channel = {
+            normalize_scid(channel_id): metrics
+            for channel_id, metrics in (flow or {}).items()
+            if normalize_scid(channel_id)
+        }
         stages = {
             normalize_scid(channel_id): value
             for channel_id, value in (raw_stages or {}).items()
@@ -88,7 +93,11 @@ class CapitalEfficiencyAnalyzer:
         for channel_id in channel_ids:
             prof = profitability[channel_id]
             normalized_channel_id = normalize_scid(channel_id)
-            flow_metrics = flow.get(channel_id) or flow.get(normalized_channel_id)
+            flow_metrics = (
+                flow.get(channel_id)
+                or flow.get(normalized_channel_id)
+                or flow_by_normalized_channel.get(normalized_channel_id)
+            )
             is_dead_capital = self._is_dead_capital(
                 prof=prof,
                 flow_metrics=flow_metrics,
