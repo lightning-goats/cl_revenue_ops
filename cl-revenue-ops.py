@@ -4122,7 +4122,11 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
         # Build warnings list
         warnings = []
         for bleeder in bleeders:
-            scid = bleeder.get("short_channel_id", "unknown")
+            scid = (
+                bleeder.get("channel_id")
+                or bleeder.get("short_channel_id")
+                or "unknown"
+            )
             spent = bleeder.get("rebalance_cost_sats", 0)
             earned = bleeder.get("revenue_sats", 0)
             alias = bleeder.get("alias", "")

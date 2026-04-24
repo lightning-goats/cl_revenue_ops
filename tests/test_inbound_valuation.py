@@ -184,6 +184,15 @@ def _create_test_db():
             timestamp INTEGER
         )
     """)
+    conn.execute("""
+        CREATE TABLE channel_costs (
+            channel_id TEXT PRIMARY KEY,
+            peer_id TEXT,
+            open_cost_sats INTEGER,
+            capacity_sats INTEGER,
+            opened_at INTEGER
+        )
+    """)
     return conn
 
 
@@ -312,6 +321,51 @@ class TestDatabaseMsatReturns:
         since = now - 86400
         total = db.get_total_routing_revenue(since)
         assert total == 900  # 3 * 300 = 900 msat (not 0 from truncation)
+
+    def test_profitability_reads_normalized_scid_aliases(self):
+        """Profitability DB reads must see legacy ':' SCID rows and canonical 'x' rows."""
+        conn = _create_test_db()
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO forwards VALUES (?, ?, ?, ?, ?, ?)",
+            ("100:1:0", "200:1:0", 50_000, 49_500, 500, now)
+        )
+        conn.execute(
+            "INSERT INTO forwards VALUES (?, ?, ?, ?, ?, ?)",
+            ("100x1x0", "200x1x0", 70_000, 69_300, 700, now)
+        )
+        conn.execute(
+            "INSERT INTO rebalance_costs VALUES (?, ?, ?)",
+            ("200:1:0", 1, now)
+        )
+        conn.execute(
+            "INSERT INTO channel_costs VALUES (?, ?, ?, ?, ?)",
+            ("200:1:0", "peer", 11, 1_000_000, now)
+        )
+        conn.commit()
+
+        from modules.database import Database
+        db = Database.__new__(Database)
+        db.plugin = MagicMock()
+        db._get_connection = lambda: conn
+
+        all_totals = db.get_all_channels_revenue_totals()
+        assert all_totals["200x1x0"]["fees_earned_msat"] == 1200
+        assert all_totals["200x1x0"]["forward_count"] == 2
+
+        single = db.get_channel_revenue_totals("200x1x0")
+        assert single["fees_earned_msat"] == 1200
+        assert single["forward_count"] == 2
+
+        pnl = db.get_channel_full_pnl("200x1x0", window_days=30)
+        assert pnl["channel_id"] == "200x1x0"
+        assert pnl["direct_revenue_msat"] == 1200
+        assert pnl["rebalance_cost_msat"] == 1000
+        assert pnl["net_pnl_msat"] == 200
+
+        assert db.get_last_forward_time_any_direction("200x1x0") == now
+        assert db.get_channel_rebalance_costs("200x1x0") == 1
+        assert db.get_channel_open_cost("200x1x0") == 11
 
 
 class TestRevenueDataConstruction:
@@ -565,6 +619,8 @@ class TestBleederIdentification:
         bleeders = analyzer.identify_bleeders(window_days=30)
         assert len(bleeders) == 1
         b = bleeders[0]
+        assert b['channel_id'] == "100x1x0"
+        assert b['short_channel_id'] == "100x1x0"
         assert b['sourced_forward_count'] == 50
         assert b['total_forward_count'] == 50
 
