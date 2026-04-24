@@ -49,6 +49,7 @@ class TestCapexBudgetConfig:
         assert snap.capex_exploration_rate == 0.10
         assert snap.capex_tactical_rate == 0.15
         assert snap.capex_global_envelope_sats == 0
+        assert snap.planner_min_annual_roi_pct == 1.0
 
 
 from modules.capex_budget import (
@@ -549,7 +550,7 @@ class TestFleetExplorationBudget:
         alloc = engine.compute_allocations()
         assert alloc.fleet_exploration_budget_sats == 7_000
 
-    def test_revenue_funded_exploration_ignores_wallet_bootstrap_path(self):
+    def test_revenue_funded_exploration_gets_one_open_fee_wallet_floor(self):
         engine = _make_engine(
             channel_profitabilities={
                 "100x1x0": _make_mock_profitability(
@@ -561,7 +562,21 @@ class TestFleetExplorationBudget:
             confirmed_onchain_sats=1_250_000,
         )
         alloc = engine.compute_allocations()
-        assert alloc.fleet_exploration_budget_sats == 50
+        assert alloc.fleet_exploration_budget_sats == 5_000
+
+    def test_revenue_funded_exploration_floor_does_not_exceed_wallet_excess(self):
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=500_000,
+                    fees_earned_msat=500_000,
+                    total_forward_count=50,
+                ),
+            },
+            confirmed_onchain_sats=1_001_000,
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.fleet_exploration_budget_sats == 1_000
 
     def test_exploration_budget_reduced_by_open_spend_and_reservations(self):
         engine = _make_engine(

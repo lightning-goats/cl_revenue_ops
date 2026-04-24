@@ -26,6 +26,7 @@ def test_public_runtime_keys_are_safety_only():
         "planner_execute_closes",
         "planner_max_opens_per_cycle",
         "planner_max_closes_per_cycle",
+        "planner_min_annual_roi_pct",
         "capex_probability_budget_bonus",
     ]
 
@@ -59,6 +60,7 @@ def test_public_runtime_dict_returns_only_public_keys():
         "planner_execute_closes": False,
         "planner_max_opens_per_cycle": 1,
         "planner_max_closes_per_cycle": 0,
+        "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
     }
 
@@ -192,8 +194,10 @@ def test_planner_cycle_limit_defaults_match_config():
     assert cfg.planner_max_closes_per_cycle == 0
     assert snapshot.planner_max_opens_per_cycle == 1
     assert snapshot.planner_max_closes_per_cycle == 0
+    assert snapshot.planner_min_annual_roi_pct == 1.0
     assert mod.plugin.options["revenue-ops-planner-max-opens-per-cycle"]["default"] == "1"
     assert mod.plugin.options["revenue-ops-planner-max-closes-per-cycle"]["default"] == "0"
+    assert mod.plugin.options["revenue-ops-planner-min-annual-roi-pct"]["default"] == "1.0"
 
 
 def test_planner_execute_closes_option_is_parsed_during_init(monkeypatch):
@@ -220,6 +224,17 @@ def test_planner_cycle_limits_are_parsed_during_init(monkeypatch):
 
     assert cfg.planner_max_opens_per_cycle == 3
     assert cfg.planner_max_closes_per_cycle == 2
+
+
+def test_planner_min_annual_roi_option_is_parsed_during_init(monkeypatch):
+    mod = load_plugin_module()
+    cfg = _run_init_with_stubbed_dependencies(
+        mod,
+        monkeypatch,
+        {"revenue-ops-planner-min-annual-roi-pct": "2.5"},
+    )
+
+    assert cfg.planner_min_annual_roi_pct == 2.5
 
 
 def test_init_wires_rebalancer_back_into_capacity_planner(monkeypatch):
@@ -525,8 +540,9 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "planner_execute_closes",
         "planner_max_closes_per_cycle",
         "planner_max_opens_per_cycle",
+        "planner_min_annual_roi_pct",
     ]
-    assert result["count"] == 17
+    assert result["count"] == 18
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -551,6 +567,7 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "planner_execute_closes": False,
         "planner_max_opens_per_cycle": 1,
         "planner_max_closes_per_cycle": 0,
+        "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
     }
 
@@ -820,6 +837,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "planner_execute_closes": False,
         "planner_max_opens_per_cycle": 1,
         "planner_max_closes_per_cycle": 0,
+        "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
     }
     assert "config" not in result

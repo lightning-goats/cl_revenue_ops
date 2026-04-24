@@ -111,7 +111,7 @@ class TestExplorationBudgetGate:
         # Stub listpeerchannels
         planner.plugin.rpc.listpeerchannels.return_value = {"channels": []}
 
-        summary = planner.execute_cycle()
+        summary = planner.execute_cycle(planner.config)
 
         # Total budget 1000 < open cost 5000 → all opens blocked
         exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
@@ -138,7 +138,7 @@ class TestExplorationBudgetGate:
         planner._check_safety_guards = MagicMock(return_value=(True, "ok"))
         planner._execute_open = MagicMock(return_value={"status": "dry_run", "action_id": 1})
 
-        summary = planner.execute_cycle()
+        summary = planner.execute_cycle(planner.config)
 
         # No exploration budget skips — candidate passed the gate
         exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
@@ -163,7 +163,7 @@ class TestExplorationBudgetGate:
         planner._check_safety_guards = MagicMock(return_value=(True, "ok"))
         planner._execute_open = MagicMock(return_value={"status": "dry_run", "action_id": 1})
 
-        summary = planner.execute_cycle()
+        summary = planner.execute_cycle(planner.config)
 
         # No exploration budget skips — gate not applied
         exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
@@ -189,11 +189,45 @@ class TestExplorationBudgetGate:
         planner._check_safety_guards = MagicMock(return_value=(True, "ok"))
         planner._execute_open = MagicMock(return_value={"status": "dry_run", "action_id": 1})
 
-        summary = planner.execute_cycle()
+        summary = planner.execute_cycle(planner.config)
 
         assert len(summary["opens"]) == 1
         exploration_skips = [r for r in summary["skipped_reasons"] if "Exploration budget" in r]
         assert len(exploration_skips) >= 1
+
+    def test_viable_opens_are_selected_by_ev_not_score(self):
+        """Heuristic score discovers candidates, but final open choice maximizes EV."""
+        planner = self._make_planner_for_cycle(exploration_budget=5000)
+        cfg = planner.config.snapshot.return_value
+        cfg.planner_max_opens_per_cycle = 1
+        high_score_peer = "02" + "a" * 64
+        high_ev_peer = "02" + "b" * 64
+
+        planner._discover_peers = MagicMock(return_value=[
+            {"peer_id": high_score_peer, "score": 100, "reason": "high score"},
+            {"peer_id": high_ev_peer, "score": 10, "reason": "high ev"},
+        ])
+
+        planner.plugin.rpc.listfunds.return_value = {
+            "outputs": [{"amount_msat": 10_000_000_000, "status": "confirmed"}],
+            "channels": [],
+        }
+        planner.plugin.rpc.listpeerchannels.return_value = {"channels": []}
+
+        planner._size_channel = MagicMock(return_value=1_000_000)
+        planner._calculate_open_ev = MagicMock(
+            side_effect=lambda peer_id, _size, _cfg: 1000 if peer_id == high_ev_peer else 100
+        )
+        planner._check_safety_guards = MagicMock(return_value=(True, "ok"))
+        planner._execute_open = MagicMock(return_value={"status": "dry_run", "action_id": 1})
+
+        summary = planner.execute_cycle(cfg)
+
+        assert len(summary["opens"]) == 1
+        assert summary["opens"][0]["peer_id"] == high_ev_peer
+        assert summary["opens"][0]["ev"] == 1000
+        evaluated = {item["peer_id"]: item["ev"] for item in summary["evaluated_open_candidates"]}
+        assert evaluated == {high_score_peer: 100, high_ev_peer: 1000}
 
 
 class TestCloseCostRecording:

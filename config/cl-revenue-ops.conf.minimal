@@ -38,3 +38,4 @@ revenue-ops-hot-channel-protection-enabled=true
 #revenue-ops-planner-execute-closes=false
 #revenue-ops-planner-max-opens-per-cycle=1
 #revenue-ops-planner-max-closes-per-cycle=0
+#revenue-ops-planner-min-annual-roi-pct=1.0
