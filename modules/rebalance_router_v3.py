@@ -32,15 +32,39 @@ def _parse_layer_names(csv: str) -> List[str]:
     """Parse a comma-separated layer-name string into a list.
 
     Handles whitespace trimming and drops empty entries. Returns [] for
-    blank input so standalone nodes without cl-hive see an empty layer list
-    (which askrene accepts — getroutes falls back to its built-in gossip view).
+    blank input so callers that intentionally pass no layers can still route
+    through askrene's built-in gossip view.
     """
     if not csv:
         return []
     return [name.strip() for name in csv.split(",") if name.strip()]
 
 
+DEFAULT_ASKRENE_LAYERS = "hive-fleet"
+ASKRENE_STANDALONE_LAYER_VALUES = frozenset({
+    "none",
+    "off",
+    "disabled",
+    "standalone",
+    "false",
+    "0",
+})
 OBSERVED_LIQUIDITY_LAYER = "hive-observed-liquidity"
+
+
+def _configured_layer_names(raw: Any) -> List[str]:
+    """Normalize operator config into requested askrene layer names.
+
+    Blank config values are treated as "use the safe default" rather than
+    "disable every configured layer". Use an explicit standalone sentinel to
+    run without cl-hive bias.
+    """
+    text = "" if raw is None else str(raw).strip()
+    if text.lower() in ASKRENE_STANDALONE_LAYER_VALUES:
+        return []
+    if not text:
+        text = DEFAULT_ASKRENE_LAYERS
+    return _parse_layer_names(text)
 
 
 def _parse_msat(v: Any) -> int:

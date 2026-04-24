@@ -515,6 +515,7 @@ def test_askrene_layer_option_defaults_to_hive_fleet_bias():
     assert mod.plugin.options["revenue-ops-askrene-layers"]["default"] == "hive-fleet"
     assert "askrene getroutes" in mod.plugin.options["revenue-ops-rebalance-router"]["description"]
     assert "cl-hive bias" in mod.plugin.options["revenue-ops-askrene-layers"]["description"]
+    assert "standalone" in mod.plugin.options["revenue-ops-askrene-layers"]["description"]
 
 
 def test_revenue_config_list_mutable_returns_public_controls_only():
