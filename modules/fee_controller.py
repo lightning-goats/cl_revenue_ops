@@ -1218,6 +1218,13 @@ class ChannelFeeState:
     # PID balance controller state
     pid: PIDState = field(default_factory=PIDState)
 
+    # Last fee-decision context for operator/debug surfaces.
+    last_fee_profile: str = "active"
+    last_context_key: str = ""
+    last_time_bucket: str = "normal"
+    last_corridor_role: str = "P"
+    last_contextual_sample_used: bool = False
+
     # Restore target for temporary dynamic HTLC minimum defenses
     dynamic_htlcmin_baseline_msat: Optional[int] = None
 
@@ -1271,6 +1278,11 @@ class ChannelFeeState:
             "last_broadcast_at": self.last_broadcast_at,
             # PID balance controller state
             "pid_state": self.pid.to_dict(),
+            "last_fee_profile": self.last_fee_profile,
+            "last_context_key": self.last_context_key,
+            "last_time_bucket": self.last_time_bucket,
+            "last_corridor_role": self.last_corridor_role,
+            "last_contextual_sample_used": self.last_contextual_sample_used,
             "dynamic_htlcmin_baseline_msat": self.dynamic_htlcmin_baseline_msat,
         }
 
@@ -1311,6 +1323,12 @@ class ChannelFeeState:
         # PID balance controller state
         pid_data = d.get("pid_state", {})
         state.pid = PIDState.from_dict(pid_data) if pid_data else PIDState()
+
+        state.last_fee_profile = d.get("last_fee_profile", "active")
+        state.last_context_key = d.get("last_context_key", "")
+        state.last_time_bucket = d.get("last_time_bucket", "normal")
+        state.last_corridor_role = d.get("last_corridor_role", "P")
+        state.last_contextual_sample_used = bool(d.get("last_contextual_sample_used", False))
 
         state.dynamic_htlcmin_baseline_msat = d.get("dynamic_htlcmin_baseline_msat")
 
@@ -1521,6 +1539,38 @@ class FeeAdjustment:
         }
 
 
+@dataclass(frozen=True)
+class FeeProfileSettings:
+    """Runtime aggressiveness knobs for the fee controller."""
+
+    min_observation_hours: float
+    min_forwards_for_signal: int
+    dts_discount_gamma: float
+    dts_sparse_discount_gamma: float
+    normal_target_blend_ratio: float
+    wake_target_blend_ratio: float
+    sparse_target_blend_ratio: float
+    normal_cycle_max_delta_ratio: float
+    normal_cycle_min_delta_ppm: int
+    wake_cycle_max_delta_ratio: float
+    wake_cycle_min_delta_ppm: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "min_observation_hours": self.min_observation_hours,
+            "min_forwards_for_signal": self.min_forwards_for_signal,
+            "dts_discount_gamma": self.dts_discount_gamma,
+            "dts_sparse_discount_gamma": self.dts_sparse_discount_gamma,
+            "normal_target_blend_ratio": self.normal_target_blend_ratio,
+            "wake_target_blend_ratio": self.wake_target_blend_ratio,
+            "sparse_target_blend_ratio": self.sparse_target_blend_ratio,
+            "normal_cycle_max_delta_ratio": self.normal_cycle_max_delta_ratio,
+            "normal_cycle_min_delta_ppm": self.normal_cycle_min_delta_ppm,
+            "wake_cycle_max_delta_ratio": self.wake_cycle_max_delta_ratio,
+            "wake_cycle_min_delta_ppm": self.wake_cycle_min_delta_ppm,
+        }
+
+
 class FeeController:
     """
     DTS+PID fee controller for revenue maximization.
@@ -1572,6 +1622,34 @@ class FeeController:
     NORMAL_CYCLE_MIN_DELTA_PPM = 100
     WAKE_CYCLE_MAX_DELTA_RATIO = 0.20
     WAKE_CYCLE_MIN_DELTA_PPM = 50
+    FEE_PROFILES = {
+        "active": FeeProfileSettings(
+            min_observation_hours=MIN_OBSERVATION_HOURS,
+            min_forwards_for_signal=MIN_FORWARDS_FOR_SIGNAL,
+            dts_discount_gamma=DTS_DISCOUNT_GAMMA,
+            dts_sparse_discount_gamma=DTS_SPARSE_DISCOUNT_GAMMA,
+            normal_target_blend_ratio=NORMAL_TARGET_BLEND_RATIO,
+            wake_target_blend_ratio=WAKE_TARGET_BLEND_RATIO,
+            sparse_target_blend_ratio=SPARSE_TARGET_BLEND_RATIO,
+            normal_cycle_max_delta_ratio=NORMAL_CYCLE_MAX_DELTA_RATIO,
+            normal_cycle_min_delta_ppm=NORMAL_CYCLE_MIN_DELTA_PPM,
+            wake_cycle_max_delta_ratio=WAKE_CYCLE_MAX_DELTA_RATIO,
+            wake_cycle_min_delta_ppm=WAKE_CYCLE_MIN_DELTA_PPM,
+        ),
+        "conservative": FeeProfileSettings(
+            min_observation_hours=1.0,
+            min_forwards_for_signal=6,
+            dts_discount_gamma=0.992,
+            dts_sparse_discount_gamma=0.996,
+            normal_target_blend_ratio=0.20,
+            wake_target_blend_ratio=0.10,
+            sparse_target_blend_ratio=0.10,
+            normal_cycle_max_delta_ratio=0.25,
+            normal_cycle_min_delta_ppm=25,
+            wake_cycle_max_delta_ratio=0.10,
+            wake_cycle_min_delta_ppm=10,
+        ),
+    }
     EXPLORATION_FEE_MULTIPLIER = 1.25
     EXPLORATION_MAX_DISCOUNT_RATIO = 0.50
     EXPLORATION_HEADROOM_RATIO = 0.35
@@ -1712,6 +1790,24 @@ class FeeController:
 
     def get_last_decision_summary(self) -> Dict[str, Any]:
         return dict(self._last_decision_summary)
+
+    def get_fee_profile_settings(self, cfg: Optional[Any] = None) -> Dict[str, Any]:
+        """Return the active fee profile and resolved runtime knobs."""
+        name, settings = self._resolve_fee_profile(cfg)
+        data = settings.to_dict()
+        data["name"] = name
+        return data
+
+    def _resolve_fee_profile(self, cfg: Optional[Any] = None) -> Tuple[str, FeeProfileSettings]:
+        if cfg is None:
+            try:
+                cfg = self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
+            except Exception:
+                cfg = None
+        name = str(getattr(cfg, "fee_profile", "active") or "active").lower()
+        if name not in self.FEE_PROFILES:
+            name = "active"
+        return name, self.FEE_PROFILES[name]
 
     def _get_hive_fee_bias(self, peer_id: str) -> float:
         """Return bounded multiplicative fee bias from hive hints. 1.0 if unavailable."""
@@ -1910,15 +2006,24 @@ class FeeController:
             self._our_node_id = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id", "")
         return self._our_node_id
 
-    def _get_peer_inbound_channels(self, peer_id: str) -> list:
-        """Get channels pointing at peer_id, cached for 30 minutes.
+    def _get_peer_inbound_channels(
+        self,
+        peer_id: str,
+        ttl_seconds: int = 1800,
+        force_refresh: bool = False,
+    ) -> list:
+        """Get channels pointing at peer_id, cached for the requested TTL.
 
         Uses the same cache dict as _get_neighbor_fee_median but with
         a different key prefix. Returns [] on RPC failure.
         """
+        try:
+            ttl_seconds = max(1, int(ttl_seconds))
+        except (TypeError, ValueError):
+            ttl_seconds = 1800
         cache_key = f"gossip_channels_{peer_id}"
         cached = self._neighbor_fee_cache.get(cache_key)
-        if cached and (time.time() - cached["ts"]) < 1800:
+        if not force_refresh and cached and (time.time() - cached["ts"]) < ttl_seconds:
             return cached["value"]
 
         try:
@@ -1929,6 +2034,143 @@ class FeeController:
 
         self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
         return result
+
+    def _get_market_boundary_target(
+        self,
+        boundary_ppm: int,
+        floor_ppm: int,
+        cfg: Optional[Any] = None,
+    ) -> Tuple[int, int]:
+        """Return the target fee and margin below the cheapest active competitor."""
+        try:
+            margin_ppm = int(getattr(cfg, "fee_market_boundary_margin_ppm", 5))
+        except (TypeError, ValueError):
+            margin_ppm = 5
+        try:
+            margin_ratio = float(getattr(cfg, "fee_market_boundary_margin_ratio", 0.05))
+        except (TypeError, ValueError):
+            margin_ratio = 0.05
+
+        margin_ppm = max(0, margin_ppm)
+        margin_ratio = max(0.0, min(0.50, margin_ratio))
+        computed_margin = max(margin_ppm, int(math.ceil(max(0, boundary_ppm) * margin_ratio)))
+        target_ppm = max(int(floor_ppm), int(boundary_ppm) - computed_margin)
+        return target_ppm, computed_margin
+
+    def _get_market_boundary_fee(
+        self,
+        peer_id: str,
+        cfg: Optional[Any] = None,
+        force_refresh: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Return cheapest active competitor context for the destination peer.
+
+        This deliberately uses the cheapest active competitor, not the median.
+        In a competitive routing market the lowest viable competing edge often
+        defines the route-selection boundary.
+        """
+        if not bool(getattr(cfg, "fee_market_boundary_enabled", True)):
+            return None
+
+        try:
+            min_competitors = max(1, int(getattr(cfg, "fee_market_boundary_min_competitors", 1)))
+        except (TypeError, ValueError):
+            min_competitors = 1
+        try:
+            ttl_seconds = max(10, int(getattr(cfg, "fee_market_boundary_cache_seconds", 60)))
+        except (TypeError, ValueError):
+            ttl_seconds = 60
+
+        if self.data_service is None:
+            return None
+
+        try:
+            our_id = self._get_our_id()
+            peer_channels = self._get_peer_inbound_channels(
+                peer_id,
+                ttl_seconds=ttl_seconds,
+                force_refresh=force_refresh,
+            )
+            competitors: List[Dict[str, Any]] = []
+            for ch in peer_channels:
+                if ch.get("source") == our_id:
+                    continue
+                if not ch.get("active", False):
+                    continue
+                try:
+                    fee_ppm = int(ch.get("fee_per_millionth", 0))
+                except (TypeError, ValueError):
+                    continue
+                if not (1 <= fee_ppm <= self.ABS_MAX_FEE_PPM):
+                    continue
+
+                capacity = ch.get("satoshis", base_to_sats_floor(ch.get("amount_msat", 0)))
+                try:
+                    capacity = int(capacity or 0)
+                except (TypeError, ValueError):
+                    capacity = 0
+                competitors.append({
+                    "fee_ppm": fee_ppm,
+                    "capacity_sats": max(0, capacity),
+                    "last_update": int(ch.get("last_update", 0) or 0),
+                })
+
+            if len(competitors) < min_competitors:
+                return None
+
+            competitors.sort(key=lambda item: (item["fee_ppm"], -item["capacity_sats"]))
+            cheapest = competitors[0]
+            return {
+                "boundary_ppm": cheapest["fee_ppm"],
+                "cheapest_competitor_ppm": cheapest["fee_ppm"],
+                "competitor_count": len(competitors),
+                "cheapest_competitor_capacity_sats": cheapest["capacity_sats"],
+                "sample_competitor_fees_ppm": [item["fee_ppm"] for item in competitors[:5]],
+                "cache_ttl_seconds": ttl_seconds,
+                "force_refreshed": force_refresh,
+            }
+        except Exception as e:
+            self.plugin.log(
+                f"FEE: market boundary lookup failed for {peer_id[:12]}...: {e}",
+                level='debug'
+            )
+            return None
+
+    def _apply_market_boundary_downshift(
+        self,
+        current_fee_ppm: int,
+        candidate_fee_ppm: int,
+        boundary_target_ppm: int,
+        cfg: Optional[Any] = None,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Accelerate downward correction when current price is above market."""
+        try:
+            max_downshift_ratio = float(
+                getattr(cfg, "fee_market_boundary_max_downshift_ratio", 0.35)
+            )
+        except (TypeError, ValueError):
+            max_downshift_ratio = 0.35
+        max_downshift_ratio = max(0.05, min(1.0, max_downshift_ratio))
+        max_downshift_ppm = max(1, int(math.ceil(max(0, current_fee_ppm) * max_downshift_ratio)))
+
+        info = {
+            "applied": False,
+            "max_downshift_ratio": max_downshift_ratio,
+            "max_downshift_ppm": max_downshift_ppm,
+            "pre_downshift_fee_ppm": int(candidate_fee_ppm),
+            "post_downshift_fee_ppm": int(candidate_fee_ppm),
+        }
+
+        if current_fee_ppm <= boundary_target_ppm or candidate_fee_ppm <= boundary_target_ppm:
+            return candidate_fee_ppm, info
+
+        boundary_limited_fee = max(int(boundary_target_ppm), int(current_fee_ppm) - max_downshift_ppm)
+        if boundary_limited_fee < candidate_fee_ppm:
+            info["applied"] = True
+            info["post_downshift_fee_ppm"] = boundary_limited_fee
+            return boundary_limited_fee, info
+
+        return candidate_fee_ppm, info
 
     def _get_neighbor_fee_median(self, peer_id: str) -> int | None:
         """Get median fee charged by other nodes to the same peer.
@@ -2313,7 +2555,8 @@ class FeeController:
         self,
         channel_id: str,
         peer_id: str,
-        outbound_ratio: float
+        outbound_ratio: float,
+        flow_state: str = "balanced",
     ) -> Tuple[str, str, str]:
         """
         Extract context features and return both the key and raw values.
@@ -2322,6 +2565,7 @@ class FeeController:
             channel_id: Channel SCID
             peer_id: Peer pubkey
             outbound_ratio: Current outbound liquidity ratio (0.0-1.0)
+            flow_state: Flow-analysis state for coarse role fallback
 
         Returns:
             Tuple of (context_key, time_bucket, corridor_role) where
@@ -2339,8 +2583,29 @@ class FeeController:
         else:
             balance = "saturated"
 
-        time_bucket = "normal"
+        current_hour = int(time.strftime("%H"))
+        time_bucket = "low" if current_hour < 6 else ("peak" if current_hour >= 18 else "normal")
+        if self.hive_hints:
+            try:
+                confidence = self.hive_hints.get_traffic_confidence(peer_id)
+                peak_hours = self.hive_hints.get_peak_hours(peer_id)
+                if isinstance(confidence, (int, float)) and confidence > 0.5 and peak_hours:
+                    time_bucket = "peak" if current_hour in set(peak_hours) else "normal"
+            except Exception:
+                pass
+
         role = "P"  # Primary by default
+        if self.hive_hints:
+            try:
+                hint_role = str(self.hive_hints.get_corridor_role(peer_id) or "").lower()
+                if hint_role in {"secondary", "edge", "leaf"}:
+                    role = "S"
+                elif hint_role in {"owner", "primary", "hub"}:
+                    role = "P"
+            except Exception:
+                pass
+        elif flow_state in {"sink", "dormant", "unknown"}:
+            role = "S"
 
         context_key = f"{balance}:{time_bucket}:{role}"
         return (context_key, time_bucket, role)
@@ -2876,8 +3141,9 @@ class FeeController:
         """
         woken = 0
         now = int(time.time())
+        _, profile = self._resolve_fee_profile()
         # Backdate far enough to satisfy the observation window check
-        backdated = now - int(self.MIN_OBSERVATION_HOURS * 3600) - 1
+        backdated = now - int(profile.min_observation_hours * 3600) - 1
 
         # TS-3: All state mutations must be inside _state_lock
         with self._state_lock:
@@ -3147,6 +3413,7 @@ class FeeController:
                         pre_forward_count=pre_forward_count,
                         actual_fee_ppm=actual_fee,
                         pre_last_broadcast_fee_ppm=pre_last_broadcast_fee,
+                        cfg=cfg,
                     )
                     skip_reasons[skip_reason] += 1
 
@@ -3223,14 +3490,16 @@ class FeeController:
         pre_forward_count: int,
         actual_fee_ppm: int,
         pre_last_broadcast_fee_ppm: int,
+        cfg: Optional[Any] = None,
     ) -> str:
         """Classify scheduler skip reasons without trusting post-call timer resets."""
+        _, profile = self._resolve_fee_profile(cfg)
         if pre_is_sleeping:
             return "sleeping"
 
         if pre_last_update > 0:
-            time_ok = pre_hours_elapsed >= self.MIN_OBSERVATION_HOURS
-            forwards_ok = pre_forward_count >= self.MIN_FORWARDS_FOR_SIGNAL
+            time_ok = pre_hours_elapsed >= profile.min_observation_hours
+            forwards_ok = pre_forward_count >= profile.min_forwards_for_signal
             if not time_ok and not forwards_ok:
                 return "waiting_time"
 
@@ -3431,17 +3700,23 @@ class FeeController:
                               else cycle_state.forward_count_since_update if cycle_state else 0),
         }
 
-    def _get_fee_step_cap(self, current_fee_ppm: int, woke_from_sleep: bool) -> int:
+    def _get_fee_step_cap(
+        self,
+        current_fee_ppm: int,
+        woke_from_sleep: bool,
+        cfg: Optional[Any] = None,
+    ) -> int:
         """Return the maximum allowed per-cycle fee move for the current mode."""
+        _, profile = self._resolve_fee_profile(cfg)
         ratio = (
-            self.WAKE_CYCLE_MAX_DELTA_RATIO
+            profile.wake_cycle_max_delta_ratio
             if woke_from_sleep else
-            self.NORMAL_CYCLE_MAX_DELTA_RATIO
+            profile.normal_cycle_max_delta_ratio
         )
         min_delta = (
-            self.WAKE_CYCLE_MIN_DELTA_PPM
+            profile.wake_cycle_min_delta_ppm
             if woke_from_sleep else
-            self.NORMAL_CYCLE_MIN_DELTA_PPM
+            profile.normal_cycle_min_delta_ppm
         )
         scaled_delta = int(math.ceil(max(current_fee_ppm, 1) * ratio))
         return max(min_delta, scaled_delta)
@@ -3452,11 +3727,13 @@ class FeeController:
         forward_count: int,
         hours_elapsed: float,
         current_revenue_rate: float,
+        cfg: Optional[Any] = None,
     ) -> bool:
         """Return True when a channel should be repriced conservatively."""
+        _, profile = self._resolve_fee_profile(cfg)
         if observation_count < GaussianThompsonState.MIN_OBSERVATIONS:
             return True
-        if forward_count < self.MIN_FORWARDS_FOR_SIGNAL:
+        if forward_count < profile.min_forwards_for_signal:
             return True
         if hours_elapsed >= 1.0 and current_revenue_rate <= 0.0:
             return True
@@ -3467,6 +3744,7 @@ class FeeController:
         woke_from_sleep: bool,
         sparse_data_conservative: bool,
         posterior_std: float = 100.0,
+        cfg: Optional[Any] = None,
     ) -> float:
         """Variance-continuous blend ratio (Phase A.2, 2026-04-23).
 
@@ -3488,8 +3766,9 @@ class FeeController:
         Wake-from-sleep still caps to WAKE_TARGET_BLEND_RATIO — after a
         hysteresis wake we want fresh observations before moving fast.
         """
+        profile_name, profile = self._resolve_fee_profile(cfg)
         if posterior_std >= 200.0:
-            ratio = self.SPARSE_TARGET_BLEND_RATIO  # 0.20
+            ratio = profile.sparse_target_blend_ratio
         elif posterior_std >= 100.0:
             ratio = 0.30
         elif posterior_std >= 50.0:
@@ -3497,8 +3776,11 @@ class FeeController:
         else:
             ratio = 0.60
 
+        if profile_name != "active":
+            ratio = min(ratio, profile.normal_target_blend_ratio)
+
         if woke_from_sleep:
-            ratio = min(ratio, self.WAKE_TARGET_BLEND_RATIO)
+            ratio = min(ratio, profile.wake_target_blend_ratio)
 
         return ratio
 
@@ -3509,12 +3791,14 @@ class FeeController:
         woke_from_sleep: bool,
         sparse_data_conservative: bool,
         posterior_std: float = 100.0,
+        cfg: Optional[Any] = None,
     ) -> Tuple[int, Dict[str, Any]]:
         """Move part-way toward the bounded target before delta capping."""
         blend_ratio = self._get_target_blend_ratio(
             woke_from_sleep=woke_from_sleep,
             sparse_data_conservative=sparse_data_conservative,
             posterior_std=posterior_std,
+            cfg=cfg,
         )
         requested_delta = int(bounded_target_ppm) - int(current_fee_ppm)
         blended_delta = int(round(requested_delta * blend_ratio))
@@ -3566,6 +3850,7 @@ class FeeController:
         current_fee_ppm: int,
         target_fee_ppm: int,
         woke_from_sleep: bool,
+        cfg: Optional[Any] = None,
     ) -> Tuple[int, Dict[str, Any]]:
         """
         Convert a blended DTS+PID target into the fee we will actually apply.
@@ -3574,7 +3859,7 @@ class FeeController:
         how much of that move can land in a single normal adjustment cycle.
         """
         requested_delta = int(target_fee_ppm) - int(current_fee_ppm)
-        max_delta_ppm = self._get_fee_step_cap(current_fee_ppm, woke_from_sleep)
+        max_delta_ppm = self._get_fee_step_cap(current_fee_ppm, woke_from_sleep, cfg=cfg)
         cap_reason = "none"
         cap_applied = False
 
@@ -3628,6 +3913,7 @@ class FeeController:
         # Ensure we have a ConfigSnapshot
         if cfg is None:
             cfg = self.config.snapshot()
+        fee_profile_name, fee_profile = self._resolve_fee_profile(cfg)
 
         # Used for structured logs. Fee controller sets this before applying modifiers;
         # DTS uses step_ppm as the absolute fee delta, so original==step.
@@ -3644,8 +3930,18 @@ class FeeController:
         delta_cap_ppm = 0
         delta_cap_applied = False
         sparse_data_conservative = False
-        target_blend_ratio = self.NORMAL_TARGET_BLEND_RATIO
+        target_blend_ratio = fee_profile.normal_target_blend_ratio
         exploration_mode = "none"
+        context_key = ""
+        time_bucket = "normal"
+        corridor_role = "P"
+        contextual_sample_used = False
+        context_observation_count = 0
+        market_boundary_info = None
+        market_boundary_applied = False
+        market_boundary_downshift_info = {"applied": False}
+        market_boundary_support_info = {"applied": False}
+        market_boundary_window_bypass_info = {"applied": False}
 
         # Detect critical state
         is_congested = (state and state.get("state") == "congested")
@@ -3784,8 +4080,8 @@ class FeeController:
             # This prevents stagnant channels from waiting forever while still
             # allowing quick reaction when routing data is available.
 
-            time_ok = hours_elapsed >= self.MIN_OBSERVATION_HOURS
-            forwards_ok = forward_count >= self.MIN_FORWARDS_FOR_SIGNAL
+            time_ok = hours_elapsed >= fee_profile.min_observation_hours
+            forwards_ok = forward_count >= fee_profile.min_forwards_for_signal
 
             if time_ok or forwards_ok:
                 # Either condition met - proceed with adjustment
@@ -3796,14 +4092,56 @@ class FeeController:
                     level='debug'
                 )
             else:
-                # Neither condition met yet - wait for more time or data
+                # Neither condition met yet. Usually we wait for more time or
+                # data, but do not let the observation window trap a channel
+                # above a visible market boundary after route flow has left.
+                window_boundary_info = self._get_market_boundary_fee(
+                    peer_id,
+                    cfg=cfg,
+                    force_refresh=True,
+                )
+                if window_boundary_info is not None:
+                    boundary_target_ppm, boundary_margin_ppm = self._get_market_boundary_target(
+                        int(window_boundary_info["boundary_ppm"]),
+                        cfg.min_fee_ppm,
+                        cfg=cfg,
+                    )
+                    if current_fee_ppm > boundary_target_ppm:
+                        market_boundary_window_bypass_info = {
+                            "applied": True,
+                            "boundary_ppm": int(window_boundary_info["boundary_ppm"]),
+                            "target_ppm": int(boundary_target_ppm),
+                            "margin_ppm": int(boundary_margin_ppm),
+                            "current_fee_ppm": int(current_fee_ppm),
+                            "forwards_since_update": int(forward_count),
+                            "hours_since_update": float(hours_elapsed),
+                        }
+                        self.plugin.log(
+                            f"DYNAMIC_WINDOW: {channel_id[:12]}... bypassing wait for "
+                            f"market boundary downshift ({current_fee_ppm}->{boundary_target_ppm}ppm, "
+                            f"competitor={window_boundary_info['boundary_ppm']}ppm, "
+                            f"{forward_count}/{fee_profile.min_forwards_for_signal} forwards, "
+                            f"{hours_elapsed:.1f}/{fee_profile.min_observation_hours}h)",
+                            level='debug'
+                        )
+                    else:
+                        window_boundary_info = None
+
+                if not market_boundary_window_bypass_info.get("applied"):
+                    # Neither condition met yet - wait for more time or data
+                    self.plugin.log(
+                        f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting "
+                        f"({forward_count}/{fee_profile.min_forwards_for_signal} forwards, "
+                        f"{hours_elapsed:.1f}/{fee_profile.min_observation_hours}h, "
+                        f"profile={fee_profile_name})",
+                        level='debug'
+                    )
+                    return None
+
                 self.plugin.log(
-                    f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting "
-                    f"({forward_count}/{self.MIN_FORWARDS_FOR_SIGNAL} forwards, "
-                    f"{hours_elapsed:.1f}/{self.MIN_OBSERVATION_HOURS}h)",
+                    f"DYNAMIC_WINDOW: {channel_id[:12]}... proceeding via market boundary bypass",
                     level='debug'
                 )
-                return None
 
         # First run initialization
         if hours_elapsed <= 0:
@@ -3936,6 +4274,7 @@ class FeeController:
                     forward_count=forward_count,
                     hours_elapsed=hours_elapsed,
                     current_revenue_rate=current_revenue_rate,
+                    cfg=cfg,
                 )
                 new_fee_ppm = self._get_exploration_fee_target(
                     current_fee_ppm=max(current_fee_ppm, floor_ppm),
@@ -3966,6 +4305,7 @@ class FeeController:
                     forward_count=forward_count,
                     hours_elapsed=hours_elapsed,
                     current_revenue_rate=current_revenue_rate,
+                    cfg=cfg,
                 )
                 new_fee_ppm = self._get_exploration_fee_target(
                     current_fee_ppm=current_fee_ppm,
@@ -3998,11 +4338,13 @@ class FeeController:
 
             # Load channel fee state
             ts_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+            observation_count = len(ts_state.thompson.observations)
             sparse_data_conservative = self._is_sparse_data_channel(
-                observation_count=len(ts_state.thompson.observations),
+                observation_count=observation_count,
                 forward_count=forward_count,
                 hours_elapsed=hours_elapsed,
                 current_revenue_rate=current_revenue_rate,
+                cfg=cfg,
             )
             # Track rate change for logging and hysteresis
             rate_change = current_revenue_rate - ts_state.last_revenue_rate
@@ -4010,7 +4352,7 @@ class FeeController:
 
             # Get context key and raw values for contextual DTS
             context_key, time_bucket, corridor_role = self._get_context_with_values(
-                channel_id, peer_id, outbound_ratio
+                channel_id, peer_id, outbound_ratio, flow_state=flow_state
             )
 
 
@@ -4103,9 +4445,9 @@ class FeeController:
             # DTS: Apply discount factor before sampling (posterior forgetting)
             # =====================================================================
             discount_gamma = (
-                self.DTS_SPARSE_DISCOUNT_GAMMA
+                fee_profile.dts_sparse_discount_gamma
                 if sparse_data_conservative else
-                self.DTS_DISCOUNT_GAMMA
+                fee_profile.dts_discount_gamma
             )
             ts_state.thompson.apply_dts_discount(gamma=discount_gamma)
 
@@ -4135,7 +4477,19 @@ class FeeController:
                 except Exception:
                     pass  # Thompson impl may not support scale_variance; graceful degradation
 
-            dts_fee = ts_state.thompson.sample_fee(floor_ppm, ceiling_ppm)
+            ctx_tuple = ts_state.thompson.contextual_posteriors.get(context_key)
+            if ctx_tuple:
+                context_observation_count = int(ctx_tuple[2])
+            dts_fee = ts_state.thompson.sample_fee_contextual(context_key, floor_ppm, ceiling_ppm)
+            contextual_sample_used = (
+                ctx_tuple is not None
+                and context_observation_count >= GaussianThompsonState.MIN_OBSERVATIONS
+            )
+            ts_state.last_fee_profile = fee_profile_name
+            ts_state.last_context_key = context_key
+            ts_state.last_time_bucket = time_bucket
+            ts_state.last_corridor_role = corridor_role
+            ts_state.last_contextual_sample_used = contextual_sample_used
 
             # =============================================================
             # DTS+PID PATH: PID multiplier for balance management
@@ -4339,32 +4693,134 @@ class FeeController:
                     level='debug'
                 )
 
+            # Market boundary guard: if one cheap active competitor to the same
+            # destination defines the route-choice boundary, cap our target
+            # below it. This is intentionally after rebalance-cost nudging so
+            # cost recovery cannot price a channel out of the market.
+            # A ready fee cycle is a pricing decision point. Use current gossip
+            # instead of a cached market boundary so fast competitor moves do
+            # not leave us defending against a stale route-choice threshold.
+            force_boundary_refresh = True
+            market_boundary_info = self._get_market_boundary_fee(
+                peer_id,
+                cfg=cfg,
+                force_refresh=force_boundary_refresh,
+            )
+            if market_boundary_info is not None:
+                boundary_target_ppm, boundary_margin_ppm = self._get_market_boundary_target(
+                    int(market_boundary_info["boundary_ppm"]),
+                    floor_ppm,
+                    cfg=cfg,
+                )
+                market_boundary_info = {
+                    **market_boundary_info,
+                    "target_ppm": boundary_target_ppm,
+                    "margin_ppm": boundary_margin_ppm,
+                    "floor_ppm": floor_ppm,
+                    "pre_guard_target_ppm": post_pid_target_ppm,
+                    "current_fee_ppm": current_fee_ppm,
+                }
+                if post_pid_target_ppm > boundary_target_ppm:
+                    pre_boundary = post_pid_target_ppm
+                    post_pid_target_ppm = boundary_target_ppm
+                    market_boundary_applied = True
+                    market_boundary_info["applied"] = True
+                    self.plugin.log(
+                        f"FEE: {channel_id[:16]}... market boundary guard: "
+                        f"{pre_boundary}->{boundary_target_ppm}ppm "
+                        f"(cheapest_competitor={market_boundary_info['boundary_ppm']}ppm, "
+                        f"margin={boundary_margin_ppm}ppm, competitors={market_boundary_info['competitor_count']})",
+                        level='debug'
+                    )
+
+                    if sparse_data_conservative and ts_state and ts_state.thompson:
+                        ts = ts_state.thompson
+                        if ts.posterior_mean > boundary_target_ppm and ts.posterior_std >= 50:
+                            prior_prec = 1.0 / max(ts.MIN_STD ** 2, ts.posterior_std ** 2)
+                            obs_prec = prior_prec * 0.15
+                            total_prec = prior_prec + obs_prec
+                            if total_prec > 0:
+                                ts.posterior_mean = float(
+                                    (prior_prec * ts.posterior_mean + obs_prec * boundary_target_ppm) / total_prec
+                                )
+                                ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
+                elif (
+                    current_revenue_rate > 0.0
+                    and current_fee_ppm <= boundary_target_ppm
+                    and post_pid_target_ppm < boundary_target_ppm
+                ):
+                    # If we are already winning flow below the market boundary,
+                    # do not chase a low DTS sample further down. That gives up
+                    # revenue without improving route selection.
+                    pre_boundary = post_pid_target_ppm
+                    post_pid_target_ppm = boundary_target_ppm
+                    market_boundary_support_info = {
+                        "applied": True,
+                        "pre_support_target_ppm": int(pre_boundary),
+                        "post_support_target_ppm": int(boundary_target_ppm),
+                        "current_revenue_rate": float(current_revenue_rate),
+                    }
+                    market_boundary_info["applied"] = False
+                    market_boundary_info["support_applied"] = True
+                    self.plugin.log(
+                        f"FEE: {channel_id[:16]}... market boundary support: "
+                        f"{pre_boundary}->{boundary_target_ppm}ppm "
+                        f"(cheapest_competitor={market_boundary_info['boundary_ppm']}ppm, "
+                        f"revenue_rate={current_revenue_rate:.2f}sats/hr)",
+                        level='debug'
+                    )
+                else:
+                    market_boundary_info["applied"] = False
+
             bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
             if bounded_target_ppm != post_pid_target_ppm:
                 bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
+
+            blend_posterior_std = ts_state.thompson.posterior_std
+            if observation_count < GaussianThompsonState.MIN_OBSERVATIONS:
+                blend_posterior_std = max(blend_posterior_std, 200.0)
 
             blended_target_ppm, blend_info = self._blend_fee_target(
                 current_fee_ppm=current_fee_ppm,
                 bounded_target_ppm=bounded_target_ppm,
                 woke_from_sleep=woke_from_sleep,
                 sparse_data_conservative=sparse_data_conservative,
-                posterior_std=ts_state.thompson.posterior_std,
+                posterior_std=blend_posterior_std,
+                cfg=cfg,
             )
             target_blend_ratio = blend_info["blend_ratio"]
             new_fee_ppm, damping_info = self._apply_damped_fee_target(
                 current_fee_ppm=current_fee_ppm,
                 target_fee_ppm=blended_target_ppm,
                 woke_from_sleep=woke_from_sleep,
+                cfg=cfg,
             )
+            if market_boundary_info is not None:
+                new_fee_ppm, market_boundary_downshift_info = self._apply_market_boundary_downshift(
+                    current_fee_ppm=current_fee_ppm,
+                    candidate_fee_ppm=new_fee_ppm,
+                    boundary_target_ppm=int(market_boundary_info["target_ppm"]),
+                    cfg=cfg,
+                )
             applied_target_ppm = new_fee_ppm
             delta_cap_reason = damping_info["cap_reason"]
             delta_cap_ppm = damping_info["max_delta_ppm"]
             delta_cap_applied = damping_info["cap_applied"]
+            if market_boundary_downshift_info.get("applied"):
+                delta_cap_reason = "market_boundary_downshift"
+                delta_cap_ppm = market_boundary_downshift_info["max_downshift_ppm"]
+                delta_cap_applied = True
 
             hive_tag = f", hive={hive_fee_bias:.2f}" if hive_fee_bias != 1.0 else ""
+            boundary_tag = ""
+            if market_boundary_info is not None:
+                boundary_tag = (
+                    f", boundary={market_boundary_info['boundary_ppm']}ppm"
+                    f"->{market_boundary_info['target_ppm']}ppm"
+                )
             decision_reason = (
                 f"dts_pid (dts={dts_fee}, pid={pid_multiplier:.2f}, "
-                f"flow={flow_state_str}{hive_tag})"
+                f"flow={flow_state_str}{hive_tag}{boundary_tag})"
             )
 
             # Update volume tracking
@@ -4531,16 +4987,27 @@ class FeeController:
         applied_delta = int(new_fee_ppm) - int(current_fee_ppm)
         applied_dir = "up" if applied_delta > 0 else ("down" if applied_delta < 0 else "flat")
         rebal_cost_tag = f", rebal_cost_floor:{rebalance_cost_ppm}ppm" if rebalance_cost_ppm > 0 else ""
+        market_boundary_tag = ""
+        if market_boundary_info is not None:
+            market_action = "applied" if market_boundary_applied else "observed"
+            if market_boundary_downshift_info.get("applied"):
+                market_action = "downshift"
+            elif market_boundary_support_info.get("applied"):
+                market_action = "support"
+            market_boundary_tag = (
+                f", market_boundary:{market_action}:"
+                f"{market_boundary_info['boundary_ppm']}->{market_boundary_info['target_ppm']}ppm"
+            )
         target_summary = (
             f"targets=dts:{raw_dts_target_ppm}, post_pid:{post_pid_target_ppm}, "
             f"bounded:{bounded_target_ppm}, blended:{blended_target_ppm}, applied:{applied_target_ppm}, "
             f"blend:{target_blend_ratio:.2f}, bound:{bound_reason}, cap:{delta_cap_reason}({delta_cap_ppm}ppm), "
             f"wake:{wake_reason}, sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
-            f"{rebal_cost_tag}"
+            f"{market_boundary_tag}{rebal_cost_tag}"
             if raw_dts_target_ppm is not None else
             f"targets=n/a, blend:{target_blend_ratio:.2f}, wake:{wake_reason}, "
             f"sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
-            f"{rebal_cost_tag}"
+            f"{market_boundary_tag}{rebal_cost_tag}"
         )
 
         common_reason_suffix = (
@@ -4685,11 +5152,23 @@ class FeeController:
                     "delta_cap_reason": delta_cap_reason,
                     "delta_cap_ppm": delta_cap_ppm,
                     "delta_cap_applied": delta_cap_applied,
+                    "market_boundary": market_boundary_info,
+                    "market_boundary_applied": market_boundary_applied,
+                    "market_boundary_downshift": market_boundary_downshift_info,
+                    "market_boundary_support": market_boundary_support_info,
+                    "market_boundary_window_bypass": market_boundary_window_bypass_info,
                     "wake_damping_applied": woke_from_sleep,
                     "wake_reason": wake_reason,
                     "sparse_data_conservative": sparse_data_conservative,
                     "exploration_mode": exploration_mode,
                     "rebalance_cost_floor_ppm": rebalance_cost_ppm,
+                    "fee_profile": fee_profile_name,
+                    "fee_profile_settings": fee_profile.to_dict(),
+                    "context_key": context_key,
+                    "time_bucket": time_bucket,
+                    "corridor_role": corridor_role,
+                    "context_observation_count": context_observation_count,
+                    "contextual_sample_used": contextual_sample_used,
                 },
                 reason_code=fee_reason_code,
             )
