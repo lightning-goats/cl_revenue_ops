@@ -41,6 +41,7 @@ PUBLIC_RUNTIME_KEYS = (
     'planner_execute_closes',
     'planner_max_opens_per_cycle',
     'planner_max_closes_per_cycle',
+    'planner_min_annual_roi_pct',
     # V3 router probability-aware budget relaxation (default 0.0 = off).
     # Exposed so operators running the askrene router can enable the
     # reliability-weighted budget bonus without editing code or the database.
@@ -160,6 +161,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_min_channel_age_days': int,
     'planner_min_peer_uptime_pct': float,
     'planner_max_fee_rate_sat_vb': float,
+    'planner_min_annual_roi_pct': float,
     # Hive Hints
     'hive_hints_enabled': bool,
     'hive_hints_ttl_seconds': int,
@@ -266,6 +268,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_channel_age_days': (1, 365),
     'planner_min_peer_uptime_pct': (0.0, 100.0),
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
+    'planner_min_annual_roi_pct': (0.0, 100.0),
     'hive_hints_ttl_seconds': (60, 7200),
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': (0.0, 1.0),
@@ -491,6 +494,7 @@ class Config:
     planner_min_channel_age_days: int = 30
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
+    planner_min_annual_roi_pct: float = 1.0
     # Hive Hints integration
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
@@ -902,6 +906,7 @@ class ConfigSnapshot:
     planner_min_channel_age_days: int = 30
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
+    planner_min_annual_roi_pct: float = 1.0
     # Hive Hints
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0

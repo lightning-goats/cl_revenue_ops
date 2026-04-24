@@ -179,13 +179,15 @@ class CapexBudgetEngine:
         )
 
         # Compute fleet exploration and tactical budgets (msat)
-        exploration_msat = int(total_fleet_contribution_msat * cfg.capex_exploration_rate)
         reserve_deficit_msat = self._get_reserve_deficit(cfg) * MSAT_PER_SAT
         tactical_msat = min(reserve_deficit_msat, int(total_fleet_contribution_msat * cfg.capex_tactical_rate))
         tactical_msat = max(0, tactical_msat)
 
         spend_summary = self._get_spend_ledger_summary(window_days=30)
         if total_fleet_contribution_msat > 0:
+            revenue_exploration_msat = int(total_fleet_contribution_msat * cfg.capex_exploration_rate)
+            wallet_floor_msat = self._get_wallet_exploration_floor_msat(cfg)
+            exploration_msat = max(revenue_exploration_msat, wallet_floor_msat)
             exploration_msat = self._apply_category_spend_remaining(
                 budget_msat=exploration_msat,
                 summary=spend_summary,
@@ -492,6 +494,25 @@ class CapexBudgetEngine:
         reserved_by_category = summary.get("reserved_by_category", {}) or {}
         reserved_open_sats = int(reserved_by_category.get("channel_open", 0) or 0)
         return max(0, wallet_excess_sats - reserved_open_sats) * MSAT_PER_SAT
+
+    def _get_wallet_exploration_floor_msat(self, cfg) -> int:
+        """Allow one open-fee worth of exploration when wallet excess exists.
+
+        Revenue-funded fleets can otherwise get stuck below the current open
+        fee after earning small amounts. This floor covers only the configured
+        fee estimate, not the full wallet excess used during zero-revenue
+        bootstrap.
+        """
+        onchain_sats = self._get_confirmed_onchain_sats()
+        wallet_excess_sats = max(0, onchain_sats - cfg.min_wallet_reserve)
+        if wallet_excess_sats <= 0:
+            return 0
+        try:
+            open_fee_sats = int(getattr(cfg, "estimated_open_cost_sats", 0) or 0)
+        except (TypeError, ValueError):
+            open_fee_sats = 0
+        open_fee_sats = max(0, open_fee_sats)
+        return min(wallet_excess_sats, open_fee_sats) * MSAT_PER_SAT
 
     def _get_total_capex_by_channel(self, window_days: int = 30) -> Dict[str, int]:
         """Get total capex per channel from rebalance_costs + spend_events."""

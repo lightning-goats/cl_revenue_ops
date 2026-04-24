@@ -97,6 +97,7 @@
 #revenue-ops-planner-min-channel-sats=500000
 #revenue-ops-planner-max-channel-sats=10000000
 #revenue-ops-planner-max-fee-rate=50.0
+#revenue-ops-planner-min-annual-roi-pct=1.0
 
 # ============================================================================
 # CAPITAL SAFETY (Global Capital Controls)

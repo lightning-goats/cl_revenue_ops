@@ -54,6 +54,7 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 - **Multi-strategy discovery** — winner (proven revenue), demand-flow (gossip heuristics), hive (fleet intelligence), route-pair, graph, and neighbor strategies
 - **Score normalization** — within-strategy 0-1 normalization with configurable weights; pool slot quotas prevent strategy monoculture
 - **Demand-flow classifier** — classifies peers as source/sink/router using FlowMetrics aggregation and gossip heuristics (exchange, LSP, sink keyword matching)
+- **Capital hurdle** — open EV subtracts a configurable annualized return hurdle (`planner_min_annual_roi_pct`, default 1%) so low-yield channel opens do not pass on tiny absolute-profit edges
 - **Capital recycling** — evaluates underperformers for close-and-reopen when recycle EV exceeds threshold; coordinates with Boltz for on-chain fund management
 - **Dual-fund support** — uses `fundchannel request_amt` when peers advertise `option_will_fund`
 
