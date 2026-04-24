@@ -759,6 +759,35 @@ def test_revenue_report_peer_returns_aggregated_profitability_and_all_flow_state
     assert result["flow_state"] is None
 
 
+def test_revenue_dashboard_bleeder_warning_uses_channel_id():
+    mod = _load_report_surface_module()
+    mod.profitability_analyzer.get_tlv.return_value = {"tlv_sats": 1_000_000}
+    mod.profitability_analyzer.get_pnl_summary.return_value = {
+        "net_profit_sats": -5,
+        "operating_margin_pct": -50.0,
+        "gross_revenue_sats": 10,
+        "opex_sats": 15,
+        "rebalance_cost_sats": 15,
+        "closure_cost_sats": 0,
+        "volume_sats": 100_000,
+        "forward_count": 3,
+    }
+    mod.profitability_analyzer.calculate_roc.return_value = {
+        "annualized_roc_pct": -1.0,
+    }
+    mod.profitability_analyzer.identify_bleeders.return_value = [{
+        "channel_id": "123x1x0",
+        "rebalance_cost_sats": 15,
+        "revenue_sats": 10,
+    }]
+
+    result = mod.revenue_dashboard(mod.plugin, window_days=30)
+
+    assert result["warnings"] == [
+        "Channel 123x1x0 is bleeding: Spent 15 sats rebalancing, earned 10 sats."
+    ]
+
+
 def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
     mod = load_plugin_module()
     mod.config = SimpleNamespace(

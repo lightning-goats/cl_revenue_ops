@@ -136,6 +136,54 @@ class TestGossipHeuristics:
         profile = classifier.classify_candidate("peer_cb", node_info, [])
         assert profile.role == "source"
 
+    def test_non_string_alias_does_not_crash(self):
+        classifier = DemandFlowClassifier()
+        node_info = {"alias": None, "addresses": []}
+        profile = classifier.classify_candidate("peer_none_alias", node_info, [])
+        assert profile.role == "unknown"
+
+    def test_string_msat_amounts_are_parsed_for_structure(self):
+        classifier = DemandFlowClassifier()
+        node_info = {"alias": "Unknown", "addresses": []}
+        channels = [
+            {"amount_msat": "6000000000msat", "active": True, "fee_per_millionth": 100}
+            for _ in range(5)
+        ]
+        profile = classifier.classify_candidate("peer_source_struct", node_info, channels)
+        assert "structure_source" in profile.gossip_signals
+
+    def test_malformed_channel_amounts_do_not_abort_classification(self):
+        classifier = DemandFlowClassifier()
+        node_info = {"alias": "Unknown", "addresses": []}
+        channels = [
+            {
+                "amount_msat": "not-msat",
+                "active": True,
+                "base_fee_millisatoshi": "0msat",
+                "fee_per_millionth": "10",
+            }
+            for _ in range(4)
+        ]
+        profile = classifier.classify_candidate("peer_bad_amount", node_info, channels)
+        assert profile.role == "sink"
+        assert "fee_sink" in profile.gossip_signals
+
+    def test_string_fee_fields_are_parsed_for_fee_policy(self):
+        classifier = DemandFlowClassifier()
+        node_info = {"alias": "Unknown", "addresses": []}
+        channels = [
+            {
+                "amount_msat": 2_000_000_000,
+                "active": True,
+                "base_fee_millisatoshi": "0msat",
+                "fee_per_millionth": "25",
+            }
+            for _ in range(20)
+        ]
+        profile = classifier.classify_candidate("peer_string_fee", node_info, channels)
+        assert profile.role == "sink"
+        assert "fee_sink" in profile.gossip_signals
+
 
 class TestSinkAdjacentDiscovery:
 

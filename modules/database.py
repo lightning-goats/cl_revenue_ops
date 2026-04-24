@@ -35,6 +35,24 @@ from .utils import (
 _SIZE_BUCKET_LABELS = ("micro", "small", "medium", "large", "whale")
 
 
+def _scid_aliases(channel_id: str) -> Tuple[str, ...]:
+    """Return canonical and legacy SCID spellings for read-side lookups."""
+    canonical = normalize_scid(channel_id)
+    aliases: List[str] = []
+    for candidate in (canonical, str(channel_id or "")):
+        if candidate and candidate not in aliases:
+            aliases.append(candidate)
+    if canonical.count("x") == 2:
+        legacy_colon = canonical.replace("x", ":")
+        if legacy_colon not in aliases:
+            aliases.append(legacy_colon)
+    return tuple(aliases or ("",))
+
+
+def _sql_placeholders(values: Tuple[str, ...]) -> str:
+    return ",".join("?" for _ in values)
+
+
 def _revenue_by_size_bucket_sql(conn, channel_id: str, window_days: int = 7) -> dict:
     """Query forwards table and return {label: total_fee_msat} grouped by payment size bucket.
 
@@ -2402,6 +2420,9 @@ class Database:
         Returns:
             Dict with revenue_sats, rebalance_cost_sats, net_pnl_sats, forward_count
         """
+        channel_id = normalize_scid(channel_id)
+        aliases = _scid_aliases(channel_id)
+        placeholders = _sql_placeholders(aliases)
         conn = self._get_connection()
         since = int(time.time()) - (window_days * 86400)
         since_day = (since // 86400) * 86400
@@ -2413,33 +2434,33 @@ class Database:
         today_start = (int(time.time()) // 86400) * 86400
 
         # Revenue from this channel (as outbound)
-        rev_row = conn.execute("""
+        rev_row = conn.execute(f"""
             SELECT
                 (
                     SELECT COALESCE(SUM(fee_msat), 0)
                     FROM forwards
-                    WHERE out_channel = ? AND timestamp >= ?
+                    WHERE out_channel IN ({placeholders}) AND timestamp >= ?
                 ) +
                 (
                     SELECT COALESCE(SUM(total_fee_msat), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ? AND date >= ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date >= ? AND date < ?
                 ) AS revenue_msat,
                 (
                     SELECT COALESCE(COUNT(*), 0)
                     FROM forwards
-                    WHERE out_channel = ? AND timestamp >= ?
+                    WHERE out_channel IN ({placeholders}) AND timestamp >= ?
                 ) +
                 (
                     SELECT COALESCE(SUM(forward_count), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ? AND date >= ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date >= ? AND date < ?
                 ) AS forward_count
         """, (
-            channel_id, since,
-            channel_id, since_day, today_start,
-            channel_id, since,
-            channel_id, since_day, today_start,
+            *aliases, since,
+            *aliases, since_day, today_start,
+            *aliases, since,
+            *aliases, since_day, today_start,
         )).fetchone()
 
         # C6 FIX: Use unpruned rebalance_costs table instead of rebalance_history.
@@ -2447,17 +2468,17 @@ class Database:
         # rebalance_costs is never pruned and serves as the source of truth
         # for lifetime cost accounting. This matters for channels open > 90 days.
         try:
-            cost_row = conn.execute("""
+            cost_row = conn.execute(f"""
                 SELECT COALESCE(SUM(COALESCE(cost_msat, cost_sats * 1000)), 0) as cost_msat
                 FROM rebalance_costs
-                WHERE channel_id = ? AND timestamp >= ?
-            """, (channel_id, since)).fetchone()
+                WHERE channel_id IN ({placeholders}) AND timestamp >= ?
+            """, (*aliases, since)).fetchone()
         except sqlite3.OperationalError:
-            cost_row = conn.execute("""
+            cost_row = conn.execute(f"""
                 SELECT COALESCE(SUM(cost_sats * 1000), 0) as cost_msat
                 FROM rebalance_costs
-                WHERE channel_id = ? AND timestamp >= ?
-            """, (channel_id, since)).fetchone()
+                WHERE channel_id IN ({placeholders}) AND timestamp >= ?
+            """, (*aliases, since)).fetchone()
 
         revenue_msat = int(rev_row['revenue_msat'] or 0) if rev_row else 0
         cost_msat = int(cost_row['cost_msat'] or 0) if cost_row else 0
@@ -2495,6 +2516,9 @@ class Database:
             Dict with sourced_volume_sats, sourced_fee_contribution_sats,
             sourced_forward_count
         """
+        channel_id = normalize_scid(channel_id)
+        aliases = _scid_aliases(channel_id)
+        placeholders = _sql_placeholders(aliases)
         conn = self._get_connection()
         since = int(time.time()) - (window_days * 86400)
         since_day = (since // 86400) * 86400
@@ -2502,45 +2526,45 @@ class Database:
         today_start = (int(time.time()) // 86400) * 86400
 
         # Get inbound contribution (where this channel was the entry point)
-        inbound_row = conn.execute("""
+        inbound_row = conn.execute(f"""
             SELECT
                 (
                     SELECT COALESCE(SUM(in_msat), 0)
                     FROM forwards
-                    WHERE in_channel = ? AND timestamp >= ?
+                    WHERE in_channel IN ({placeholders}) AND timestamp >= ?
                 ) +
                 (
                     SELECT COALESCE(SUM(total_in_msat), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ? AND date >= ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date >= ? AND date < ?
                 ) AS sourced_volume_msat,
                 (
                     SELECT COALESCE(SUM(fee_msat), 0)
                     FROM forwards
-                    WHERE in_channel = ? AND timestamp >= ?
+                    WHERE in_channel IN ({placeholders}) AND timestamp >= ?
                 ) +
                 (
                     SELECT COALESCE(SUM(total_fee_msat), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ? AND date >= ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date >= ? AND date < ?
                 ) AS sourced_fee_msat,
                 (
                     SELECT COALESCE(COUNT(*), 0)
                     FROM forwards
-                    WHERE in_channel = ? AND timestamp >= ?
+                    WHERE in_channel IN ({placeholders}) AND timestamp >= ?
                 ) +
                 (
                     SELECT COALESCE(SUM(forward_count), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ? AND date >= ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date >= ? AND date < ?
                 ) AS sourced_forward_count
         """, (
-            channel_id, since,
-            channel_id, since_day, today_start,
-            channel_id, since,
-            channel_id, since_day, today_start,
-            channel_id, since,
-            channel_id, since_day, today_start,
+            *aliases, since,
+            *aliases, since_day, today_start,
+            *aliases, since,
+            *aliases, since_day, today_start,
+            *aliases, since,
+            *aliases, since_day, today_start,
         )).fetchone()
 
         sourced_volume_msat = int(inbound_row['sourced_volume_msat'] or 0) if inbound_row else 0
@@ -2574,6 +2598,8 @@ class Database:
         Returns:
             Dict with complete P&L including contribution metrics
         """
+        channel_id = normalize_scid(channel_id)
+
         # Get direct P&L (exit channel fees) — msat native
         direct_pnl = self.get_channel_pnl(channel_id, window_days)
 
@@ -2626,23 +2652,25 @@ class Database:
         Daily stats don't preserve time-of-day, so we approximate the most recent
         activity within a day as (midnight + 86399).
         """
+        aliases = _scid_aliases(channel_id)
+        placeholders = _sql_placeholders(aliases)
         conn = self._get_connection()
-        row = conn.execute("""
+        row = conn.execute(f"""
             SELECT MAX(ts) as last_ts
             FROM (
                 SELECT MAX(timestamp) as ts
                 FROM forwards
-                WHERE out_channel = ? OR in_channel = ?
+                WHERE out_channel IN ({placeholders}) OR in_channel IN ({placeholders})
                 UNION ALL
                 SELECT MAX(date) + 86399 as ts
                 FROM daily_forwarding_stats
-                WHERE channel_id = ? AND forward_count > 0
+                WHERE channel_id IN ({placeholders}) AND forward_count > 0
                 UNION ALL
                 SELECT MAX(date) + 86399 as ts
                 FROM daily_forwarding_stats_inbound
-                WHERE channel_id = ? AND forward_count > 0
+                WHERE channel_id IN ({placeholders}) AND forward_count > 0
             )
-        """, (channel_id, channel_id, channel_id, channel_id)).fetchone()
+        """, (*aliases, *aliases, *aliases, *aliases)).fetchone()
 
         return int(row["last_ts"]) if row and row["last_ts"] else None
 
@@ -2657,83 +2685,86 @@ class Database:
 
         Returns a dict with values in msat and counts as integers.
         """
+        channel_id = normalize_scid(channel_id)
+        aliases = _scid_aliases(channel_id)
+        placeholders = _sql_placeholders(aliases)
         conn = self._get_connection()
 
         # Exclude current day from daily stats to prevent double-counting
         # with forwards that haven't been pruned yet (boundary day fix).
         today_start = (int(time.time()) // 86400) * 86400
 
-        exit_row = conn.execute("""
+        exit_row = conn.execute(f"""
             SELECT
                 (
                     SELECT COALESCE(SUM(fee_msat), 0)
                     FROM forwards
-                    WHERE out_channel = ?
+                    WHERE out_channel IN ({placeholders})
                 ) +
                 (
                     SELECT COALESCE(SUM(total_fee_msat), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date < ?
                 ) AS fee_msat,
                 (
                     SELECT COALESCE(SUM(out_msat), 0)
                     FROM forwards
-                    WHERE out_channel = ?
+                    WHERE out_channel IN ({placeholders})
                 ) +
                 (
                     SELECT COALESCE(SUM(total_out_msat), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date < ?
                 ) AS out_msat,
                 (
                     SELECT COALESCE(COUNT(*), 0)
                     FROM forwards
-                    WHERE out_channel = ?
+                    WHERE out_channel IN ({placeholders})
                 ) +
                 (
                     SELECT COALESCE(SUM(forward_count), 0)
                     FROM daily_forwarding_stats
-                    WHERE channel_id = ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date < ?
                 ) AS forward_count
-        """, (channel_id, channel_id, today_start,
-              channel_id, channel_id, today_start,
-              channel_id, channel_id, today_start)).fetchone()
+        """, (*aliases, *aliases, today_start,
+              *aliases, *aliases, today_start,
+              *aliases, *aliases, today_start)).fetchone()
 
-        inbound_row = conn.execute("""
+        inbound_row = conn.execute(f"""
             SELECT
                 (
                     SELECT COALESCE(SUM(in_msat), 0)
                     FROM forwards
-                    WHERE in_channel = ?
+                    WHERE in_channel IN ({placeholders})
                 ) +
                 (
                     SELECT COALESCE(SUM(total_in_msat), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date < ?
                 ) AS in_msat,
                 (
                     SELECT COALESCE(SUM(fee_msat), 0)
                     FROM forwards
-                    WHERE in_channel = ?
+                    WHERE in_channel IN ({placeholders})
                 ) +
                 (
                     SELECT COALESCE(SUM(total_fee_msat), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date < ?
                 ) AS fee_msat,
                 (
                     SELECT COALESCE(COUNT(*), 0)
                     FROM forwards
-                    WHERE in_channel = ?
+                    WHERE in_channel IN ({placeholders})
                 ) +
                 (
                     SELECT COALESCE(SUM(forward_count), 0)
                     FROM daily_forwarding_stats_inbound
-                    WHERE channel_id = ? AND date < ?
+                    WHERE channel_id IN ({placeholders}) AND date < ?
                 ) AS forward_count
-        """, (channel_id, channel_id, today_start,
-              channel_id, channel_id, today_start,
-              channel_id, channel_id, today_start)).fetchone()
+        """, (*aliases, *aliases, today_start,
+              *aliases, *aliases, today_start,
+              *aliases, *aliases, today_start)).fetchone()
 
         return {
             "fees_earned_msat": int(exit_row["fee_msat"] or 0) if exit_row else 0,
@@ -2787,17 +2818,20 @@ class Database:
         """, (today_start,)).fetchall()
 
         for r in exit_rows:
-            cid = r["channel_id"]
+            cid = normalize_scid(r["channel_id"])
             if not cid:
                 continue
-            revenue[cid] = {
-                "fees_earned_msat": int(r["fee_msat"] or 0),
-                "volume_routed_msat": int(r["out_msat"] or 0),
-                "forward_count": int(r["forward_count"] or 0),
+            data = revenue.setdefault(cid, {
+                "fees_earned_msat": 0,
+                "volume_routed_msat": 0,
+                "forward_count": 0,
                 "sourced_volume_msat": 0,
                 "sourced_fee_contribution_msat": 0,
                 "sourced_forward_count": 0,
-            }
+            })
+            data["fees_earned_msat"] += int(r["fee_msat"] or 0)
+            data["volume_routed_msat"] += int(r["out_msat"] or 0)
+            data["forward_count"] += int(r["forward_count"] or 0)
 
         # Entry-side aggregation (in_channel)
         inbound_rows = conn.execute("""
@@ -2825,7 +2859,7 @@ class Database:
         """, (today_start,)).fetchall()
 
         for r in inbound_rows:
-            cid = r["channel_id"]
+            cid = normalize_scid(r["channel_id"])
             if not cid:
                 continue
             if cid not in revenue:
@@ -2837,9 +2871,9 @@ class Database:
                     "sourced_fee_contribution_msat": 0,
                     "sourced_forward_count": 0,
                 }
-            revenue[cid]["sourced_volume_msat"] = int(r["in_msat"] or 0)
-            revenue[cid]["sourced_fee_contribution_msat"] = int(r["fee_msat"] or 0)
-            revenue[cid]["sourced_forward_count"] = int(r["forward_count"] or 0)
+            revenue[cid]["sourced_volume_msat"] += int(r["in_msat"] or 0)
+            revenue[cid]["sourced_fee_contribution_msat"] += int(r["fee_msat"] or 0)
+            revenue[cid]["sourced_forward_count"] += int(r["forward_count"] or 0)
 
         return revenue
 
@@ -4167,6 +4201,7 @@ class Database:
                                   open_cost_sats: int, capacity_sats: int,
                                   timestamp: Optional[int] = None):
         """Record the cost to open a channel."""
+        channel_id = normalize_scid(channel_id)
         conn = self._get_connection()
         conn.execute("""
             INSERT OR REPLACE INTO channel_costs 
@@ -4177,12 +4212,20 @@ class Database:
 
     def get_channel_open_cost(self, channel_id: str) -> Optional[int]:
         """Get the recorded open cost for a channel."""
+        channel_id = normalize_scid(channel_id)
+        aliases = _scid_aliases(channel_id)
+        placeholders = _sql_placeholders(aliases)
         conn = self._get_connection()
-        row = conn.execute(
-            "SELECT open_cost_sats FROM channel_costs WHERE channel_id = ?",
-            (channel_id,)
-        ).fetchone()
-        return row["open_cost_sats"] if row else None
+        rows = conn.execute(
+            f"SELECT channel_id, open_cost_sats FROM channel_costs WHERE channel_id IN ({placeholders})",
+            aliases
+        ).fetchall()
+        if not rows:
+            return None
+        for row in rows:
+            if row["channel_id"] == channel_id:
+                return row["open_cost_sats"]
+        return rows[0]["open_cost_sats"]
 
     def get_channel_cost(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -4198,18 +4241,27 @@ class Database:
             Dict with keys: channel_id, peer_id, open_cost_sats, capacity_sats, opened_at
             or None if no record exists.
         """
+        channel_id = normalize_scid(channel_id)
+        aliases = _scid_aliases(channel_id)
+        placeholders = _sql_placeholders(aliases)
         conn = self._get_connection()
-        row = conn.execute(
-            "SELECT * FROM channel_costs WHERE channel_id = ?",
-            (channel_id,)
-        ).fetchone()
-        return dict(row) if row else None
+        rows = conn.execute(
+            f"SELECT * FROM channel_costs WHERE channel_id IN ({placeholders})",
+            aliases
+        ).fetchall()
+        if not rows:
+            return None
+        for row in rows:
+            if row["channel_id"] == channel_id:
+                return dict(row)
+        return dict(rows[0])
     
     def record_rebalance_cost(self, channel_id: str, peer_id: str,
                               cost_sats: Optional[int] = None, amount_sats: int = 0,
                               cost_msat: Optional[int] = None,
                               timestamp: Optional[int] = None):
         """Record a rebalance cost for a channel."""
+        channel_id = normalize_scid(channel_id)
         conn = self._get_connection()
         persisted_cost_msat = int(cost_msat) if cost_msat is not None else None
         persisted_cost_sats = int(cost_sats) if cost_sats is not None else None
@@ -4226,28 +4278,34 @@ class Database:
 
     def get_channel_rebalance_costs(self, channel_id: str) -> int:
         """Get total rebalance costs for a channel."""
+        channel_id = normalize_scid(channel_id)
+        aliases = _scid_aliases(channel_id)
+        placeholders = _sql_placeholders(aliases)
         conn = self._get_connection()
         try:
             row = conn.execute(
-                "SELECT COALESCE(SUM(COALESCE(cost_msat, cost_sats * 1000)), 0) as total_msat FROM rebalance_costs WHERE channel_id = ?",
-                (channel_id,)
+                f"SELECT COALESCE(SUM(COALESCE(cost_msat, cost_sats * 1000)), 0) as total_msat FROM rebalance_costs WHERE channel_id IN ({placeholders})",
+                aliases
             ).fetchone()
         except sqlite3.OperationalError:
             row = conn.execute(
-                "SELECT COALESCE(SUM(cost_sats * 1000), 0) as total_msat FROM rebalance_costs WHERE channel_id = ?",
-                (channel_id,)
+                f"SELECT COALESCE(SUM(cost_sats * 1000), 0) as total_msat FROM rebalance_costs WHERE channel_id IN ({placeholders})",
+                aliases
             ).fetchone()
         total_msat = int(row["total_msat"] or 0) if row else 0
         return base_to_sats_ceil(total_msat)
     
     def get_channel_cost_history(self, channel_id: str) -> List[Dict[str, Any]]:
         """Get detailed cost history for a channel."""
+        channel_id = normalize_scid(channel_id)
+        aliases = _scid_aliases(channel_id)
+        placeholders = _sql_placeholders(aliases)
         conn = self._get_connection()
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT * FROM rebalance_costs 
-            WHERE channel_id = ? 
+            WHERE channel_id IN ({placeholders})
             ORDER BY timestamp DESC
-        """, (channel_id,)).fetchall()
+        """, aliases).fetchall()
         return [dict(row) for row in rows]
     
     def get_channel_rebalance_success_rate(
@@ -4263,9 +4321,11 @@ class Database:
             avg_cost_ppm, and avg_amount_sats.
             Returns None if no rebalance history for this channel.
         """
+        aliases = _scid_aliases(channel_id)
+        placeholders = _sql_placeholders(aliases)
         return self._get_rebalance_success_rate_for_where(
-            "to_channel = ?",
-            (channel_id,),
+            f"to_channel IN ({placeholders})",
+            aliases,
             window_days=window_days,
         )
 

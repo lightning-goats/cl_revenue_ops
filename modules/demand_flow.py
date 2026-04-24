@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
 
+from .utils import parse_msat
+
 
 EXCHANGE_KEYWORDS = [
     "kraken", "coinbase", "okx", "bitfinex", "binance", "bitstamp",
@@ -26,6 +28,16 @@ LSP_KEYWORDS = [
     "lnbig", "lqwd", "acinq", "breez", "phoenix", "muun",
     "olympus", "voltage", "greenlight",
 ]
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Convert loose RPC values to float without letting bad gossip abort scoring."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -91,7 +103,7 @@ class DemandFlowClassifier:
         """Classify a candidate node using gossip heuristics."""
         node_info = node_info or {}
         channels = channels or []
-        alias = node_info.get("alias", "")
+        alias = str(node_info.get("alias", "") or "")
         alias_lower = alias.lower()
 
         signals: Dict[str, float] = {}
@@ -113,11 +125,11 @@ class DemandFlowClassifier:
             router_score += 0.4
 
         # Heuristic 2: Channel structure analysis
-        active = [ch for ch in channels if ch.get("active", False)]
+        active = [ch for ch in channels if isinstance(ch, dict) and ch.get("active", False)]
         if active:
             count = len(active)
             total_cap_msat = sum(
-                int(str(ch.get("amount_msat", 0)).replace("msat", ""))
+                max(0, parse_msat(ch.get("amount_msat", 0)))
                 for ch in active
             )
             total_cap_btc = total_cap_msat / 100_000_000_000
@@ -137,15 +149,16 @@ class DemandFlowClassifier:
         if active:
             low_fee_count = sum(
                 1 for ch in active
-                if ch.get("base_fee_millisatoshi", 1000) == 0
-                and ch.get("fee_per_millionth", 1000) < 50
+                if parse_msat(ch.get("base_fee_millisatoshi", 1000)) == 0
+                and _safe_float(ch.get("fee_per_millionth", 1000), 1000.0) < 50
             )
             if low_fee_count > len(active) * 0.5:
                 signals["fee_sink"] = 0.3
                 sink_score += 0.3
 
             high_fee_count = sum(
-                1 for ch in active if ch.get("fee_per_millionth", 0) > 500
+                1 for ch in active
+                if _safe_float(ch.get("fee_per_millionth", 0), 0.0) > 500
             )
             if high_fee_count > len(active) * 0.5:
                 signals["fee_extractive"] = -0.2
