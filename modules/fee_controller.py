@@ -4403,6 +4403,11 @@ class FeeController:
                     "pre_guard_target_ppm": post_pid_target_ppm,
                     "current_fee_ppm": current_fee_ppm,
                 }
+                observed_market_flow = (
+                    current_revenue_rate > 0.0
+                    or int(forward_count or 0) > 0
+                    or int(volume_since_sats or 0) > 0
+                )
                 if post_pid_target_ppm > boundary_target_ppm:
                     pre_boundary = post_pid_target_ppm
                     post_pid_target_ppm = boundary_target_ppm
@@ -4428,7 +4433,7 @@ class FeeController:
                                 )
                                 ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
                 elif (
-                    current_revenue_rate > 0.0
+                    observed_market_flow
                     and current_fee_ppm <= boundary_target_ppm
                     and post_pid_target_ppm < boundary_target_ppm
                 ):
@@ -4442,6 +4447,8 @@ class FeeController:
                         "pre_support_target_ppm": int(pre_boundary),
                         "post_support_target_ppm": int(boundary_target_ppm),
                         "current_revenue_rate": float(current_revenue_rate),
+                        "forward_count": int(forward_count or 0),
+                        "volume_since_sats": int(volume_since_sats or 0),
                     }
                     market_boundary_info["applied"] = False
                     market_boundary_info["support_applied"] = True
@@ -4449,7 +4456,8 @@ class FeeController:
                         f"FEE: {channel_id[:16]}... market boundary support: "
                         f"{pre_boundary}->{boundary_target_ppm}ppm "
                         f"(cheapest_competitor={market_boundary_info['boundary_ppm']}ppm, "
-                        f"revenue_rate={current_revenue_rate:.2f}sats/hr)",
+                        f"revenue_rate={current_revenue_rate:.2f}sats/hr, "
+                        f"forwards={forward_count}, volume={volume_since_sats}sats)",
                         level='debug'
                     )
                 else:
