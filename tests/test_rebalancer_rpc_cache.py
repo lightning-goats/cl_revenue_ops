@@ -83,4 +83,4 @@ class TestChannelAgeDaysUsesDataService:
 
 
 # TestJobManagerUsesCache removed -- _get_channel_local_balance and
-# _get_local_balances_map deleted with sling code.
+# _get_local_balances_map deleted with legacy async job code.

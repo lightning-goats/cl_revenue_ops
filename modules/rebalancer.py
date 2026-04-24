@@ -3,7 +3,7 @@ EV-Based Rebalancer module for cl-revenue-ops
 
 Automatic rebalance cycles delegate to RebalanceEngineV2 via
 find_rebalance_candidates(). Manual rebalance RPCs (manual_rebalance,
-execute_rebalance) run through the shared RebalanceEngineV2 sling-backed
+execute_rebalance) run through the shared RebalanceEngineV2 native-route
 execution path.
 
 JobManager is a stripped stub that retains only source-failure tracking
@@ -23,7 +23,7 @@ from pyln.client import Plugin, RpcError
 
 from .config import Config, ConfigSnapshot
 from .database import Database
-from .rebalance_executor_v2 import RebalanceExecutor as RebalanceExecutorV2
+from .rebalance_execution import stable_failure_reason
 from .rebalance_state_v2 import build_state_snapshot as build_state_snapshot_v2
 from .policy_manager import PolicyManager
 from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
@@ -268,7 +268,7 @@ class EVRebalancer:
 
     This class acts as the "Strategist" - it calculates EV and determines
     IF and HOW MUCH to rebalance. The actual execution is delegated to
-    RebalanceEngineV2, which prices pairs locally and executes via sling.
+    RebalanceEngineV2, which prices pairs locally and executes explicit routes.
 
     Thread Safety (I-13, I-14, S-9):
     The rebalance cycle runs single-threaded on a timer. Candidate evaluation,
@@ -374,7 +374,7 @@ class EVRebalancer:
 
         Priority order:
         1. Pair-level rejection on a considered candidate (route_over_budget,
-           below_hold_margin, no_route, pair_cooldown, sling_unavailable,
+           below_hold_margin, no_route, pair_cooldown, native_unavailable,
            pair_futility) -- a pair did form but failed downstream.
         2. Channel-level hold from hold_diagnostics -- no pair could form.
         3. Fallback: no_rebalance_candidates.
@@ -1179,7 +1179,7 @@ class EVRebalancer:
             coordination_campaigns: List[Dict[str, Any]] = []
             our_node_id: Optional[str] = None
 
-            # Slot check (legacy sling monitoring removed; stubs always allow)
+            # Slot check (legacy async job monitoring removed; stubs always allow)
             available_slots = self.job_manager.slots_available()
             if available_slots <= 0:
                 self._set_last_decision_summary(
@@ -1278,7 +1278,7 @@ class EVRebalancer:
 
         Uses historical median when available, falls back to estimated inbound fee.
         This is used for EV calculation (expected cost), while max_budget_sats
-        remains the hard execution cap passed to Sling.
+        remains the hard execution cap passed to the native executor.
         """
         try:
             hist_data = self.database.get_historical_inbound_fee_ppm(dest_peer_id)
@@ -1727,7 +1727,7 @@ class EVRebalancer:
 
         Instead of returning a single "best" source, this returns ALL sources
         that have a positive spread (EV > 0), sorted by score (highest first).
-        This allows Sling to handle pathfinding failover automatically.
+        This lets the native route executor try the best-priced candidate first.
 
         When max_cost_ppm > 0, operates in CapEx mode: sources are accepted if
         total cost (inbound + opp_cost) is within the cap, even with negative
@@ -2021,7 +2021,7 @@ class EVRebalancer:
 
             candidates.append((cid, info, score, weighted_opp_cost))
 
-        # Sort by score (highest first) so Sling tries most profitable sources first
+        # Sort by score (highest first) so the executor tries profitable sources first.
         candidates.sort(key=lambda x: x[2], reverse=True)
 
         # =================================================================
@@ -2187,7 +2187,7 @@ class EVRebalancer:
 
         Uses RebalanceEngineV2 for all live rebalances.
         Fleet intelligence still influences planning, but execution flows
-        through the router-v2 plus sling path for both fleet-planned and
+        through the router-v3 plus native execution path for both fleet-planned and
         network-planned jobs.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
@@ -2439,7 +2439,7 @@ class EVRebalancer:
                                 )
                             else:
                                 error_str = exec_result.error or "no_routes"
-                                stable_error = RebalanceExecutorV2.stable_failure_reason(error_str)
+                                stable_error = stable_failure_reason(error_str)
                                 res = {
                                     "success": False,
                                     "error": stable_error,
@@ -2745,7 +2745,7 @@ class EVRebalancer:
                     "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
                 }
 
-            # Record in database (direct sling execution bypasses normal job flow)
+            # Record in database (direct diagnostic execution bypasses normal job flow)
             rebalance_id = self.database.record_rebalance(
                 from_channel=best_source_id,
                 to_channel=channel_id,
@@ -2856,7 +2856,7 @@ class EVRebalancer:
             dest_turnover_rate=0.0,
             source_turnover_rate=0.0
         )
-        # Manual rebalances use direct sling execution and bypass budget reservations.
+        # Manual rebalances bypass budget reservations.
         # Fees are still recorded in history and will reduce budget available for automated runs.
         rebalance_id = self.database.record_rebalance(
             from_channel=from_channel,

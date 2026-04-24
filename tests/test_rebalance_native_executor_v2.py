@@ -1,0 +1,249 @@
+"""Tests for the route-aware native v2 rebalance executor."""
+
+from modules.rebalance_native_executor_v2 import NativeRouteExecutor
+
+
+OUR_ID = "03" + "a" * 64
+SRC_PEER = "02" + "b" * 64
+MID_PEER = "02" + "c" * 64
+
+
+class FakeRpc:
+    def __init__(self, responses=None, failures=None):
+        self.responses = responses or {}
+        self.failures = failures or {}
+        self.calls = []
+
+    def call(self, method, params=None):
+        params = params or {}
+        self.calls.append((method, params))
+        if method in self.failures:
+            raise self.failures[method]
+        value = self.responses.get(method, {})
+        return value(params) if callable(value) else value
+
+
+class FakePlugin:
+    def __init__(self, rpc):
+        self.rpc = rpc
+        self.logs = []
+
+    def log(self, message, level="info"):
+        self.logs.append((level, message))
+
+
+class FakeRpcError(Exception):
+    def __init__(self, error):
+        super().__init__(error.get("message", "rpc error"))
+        self.error = error
+
+
+def _route(amount_sats=100, first_msat=101_000):
+    return [
+        {
+            "id": SRC_PEER,
+            "channel": "100x1x0",
+            "direction": 0,
+            "amount_msat": first_msat,
+            "delay": 40,
+            "style": "tlv",
+        },
+        {
+            "id": OUR_ID,
+            "channel": "200x1x0",
+            "direction": 1,
+            "amount_msat": amount_sats * 1000,
+            "delay": 18,
+            "style": "tlv",
+        },
+    ]
+
+
+def _route_with_middle(amount_sats=100):
+    return [
+        {
+            "id": SRC_PEER,
+            "channel": "100x1x0",
+            "direction": 0,
+            "amount_msat": 103_000,
+            "delay": 48,
+            "style": "tlv",
+        },
+        {
+            "id": MID_PEER,
+            "channel": "150x1x0",
+            "direction": 1,
+            "amount_msat": 102_000,
+            "delay": 36,
+            "style": "tlv",
+        },
+        {
+            "id": OUR_ID,
+            "channel": "200x1x0",
+            "direction": 1,
+            "amount_msat": amount_sats * 1000,
+            "delay": 18,
+            "style": "tlv",
+        },
+    ]
+
+
+def test_native_executor_executes_priced_route_with_sendpay():
+    rpc = FakeRpc(
+        responses={
+            "getinfo": {"id": OUR_ID},
+            "invoice": {
+                "payment_hash": "hash-1",
+                "bolt11": "lnbc-test",
+                "payment_secret": "secret-1",
+            },
+            "sendpay": {"status": "pending"},
+            "waitsendpay": {"status": "complete", "amount_sent_msat": "101000msat"},
+        }
+    )
+    executor = NativeRouteExecutor(FakePlugin(rpc))
+
+    result = executor.execute(
+        route=_route(),
+        amount_sats=100,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        max_fee_sats=1,
+    )
+
+    assert result.success is True
+    assert result.route_type == "native"
+    assert result.fee_msat == 1000
+    assert result.fee_sats == 1
+    methods = [method for method, _ in rpc.calls]
+    assert methods == ["getinfo", "invoice", "sendpay", "waitsendpay"]
+    assert rpc.calls[2][1]["route"] == _route()
+
+
+def test_native_executor_rejects_missing_route_before_invoice():
+    rpc = FakeRpc(responses={"getinfo": {"id": OUR_ID}})
+    executor = NativeRouteExecutor(FakePlugin(rpc))
+
+    result = executor.execute(
+        route=[],
+        amount_sats=100,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        max_fee_sats=1,
+    )
+
+    assert result.success is False
+    assert result.error == "native_route_invalid: missing_route"
+    assert [method for method, _ in rpc.calls] == []
+
+
+def test_native_executor_rejects_route_over_budget_before_invoice():
+    rpc = FakeRpc(responses={"getinfo": {"id": OUR_ID}})
+    executor = NativeRouteExecutor(FakePlugin(rpc))
+
+    result = executor.execute(
+        route=_route(first_msat=103_000),
+        amount_sats=100,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        max_fee_sats=1,
+    )
+
+    assert result.success is False
+    assert result.error == "native_route_over_budget: route_over_budget: 3 > 1"
+    assert result.fee_sats == 3
+    assert [method for method, _ in rpc.calls] == ["getinfo"]
+
+
+def test_native_executor_cleans_failed_sendpay_attempt():
+    rpc = FakeRpc(
+        responses={
+            "getinfo": {"id": OUR_ID},
+            "invoice": {"payment_hash": "hash-1", "bolt11": "lnbc-test"},
+            "delpay": {"ok": True},
+            "delinvoice": {"ok": True},
+        },
+        failures={"sendpay": RuntimeError("WIRE_TEMPORARY_CHANNEL_FAILURE")},
+    )
+    executor = NativeRouteExecutor(FakePlugin(rpc))
+
+    result = executor.execute(
+        route=_route(),
+        amount_sats=100,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        max_fee_sats=1,
+    )
+
+    assert result.success is False
+    assert "WIRE_TEMPORARY_CHANNEL_FAILURE" in result.error
+    assert [method for method, _ in rpc.calls] == [
+        "getinfo",
+        "invoice",
+        "sendpay",
+        "delpay",
+        "delinvoice",
+    ]
+
+
+def test_native_executor_extracts_erring_channel_from_rpc_error():
+    rpc = FakeRpc(
+        responses={
+            "getinfo": {"id": OUR_ID},
+            "invoice": {"payment_hash": "hash-1", "bolt11": "lnbc-test"},
+            "delpay": {"ok": True},
+            "delinvoice": {"ok": True},
+        },
+        failures={
+            "sendpay": FakeRpcError(
+                {
+                    "message": "failed: WIRE_TEMPORARY_CHANNEL_FAILURE",
+                    "data": {
+                        "erring_channel": "150x1x0",
+                        "erring_direction": 1,
+                        "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+                    },
+                }
+            )
+        },
+    )
+    executor = NativeRouteExecutor(FakePlugin(rpc))
+
+    result = executor.execute(
+        route=_route_with_middle(),
+        amount_sats=100,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        max_fee_sats=3,
+    )
+
+    assert result.success is False
+    assert result.excluded_channels == ["150x1x0/1"]
+    assert result.failure_data["failure_class"] == "liquidity"
+    assert result.failure_data["erring_channel"] == "150x1x0"
+    assert "failcodename=WIRE_TEMPORARY_CHANNEL_FAILURE" in result.error
+
+
+def test_native_executor_fallback_excludes_attempted_middle_path():
+    rpc = FakeRpc(
+        responses={
+            "getinfo": {"id": OUR_ID},
+            "invoice": {"payment_hash": "hash-1", "bolt11": "lnbc-test"},
+            "delpay": {"ok": True},
+            "delinvoice": {"ok": True},
+        },
+        failures={"sendpay": RuntimeError("WIRE_TEMPORARY_CHANNEL_FAILURE")},
+    )
+    executor = NativeRouteExecutor(FakePlugin(rpc))
+
+    result = executor.execute(
+        route=_route_with_middle(),
+        amount_sats=100,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        max_fee_sats=3,
+    )
+
+    assert result.success is False
+    assert result.excluded_channels == ["150x1x0/1"]
+    assert result.failure_data["route_summary"][1]["channel"] == "150x1x0"

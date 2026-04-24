@@ -5,23 +5,20 @@
 ## What Operators Need To Know
 
 - This is the executor. It owns local fee execution and rebalance execution.
-- Live rebalances on this branch execute through `RebalanceEngineV2` and `sling`; route discovery can still use the configured `v3`/askrene or `v2` router path.
-- The normal runtime controls are `paused`, `daily_budget_sats`, `min_fee_ppm`, and `max_fee_ppm`.
+- Live rebalances execute through `RebalanceEngineV2` using native explicit-route execution; route discovery is pinned to the `v3`/askrene router path.
+- The normal runtime controls are `paused`, `daily_budget_sats`, fee rails, fee market-boundary knobs, and planner execution caps.
 - The primary operator surfaces are `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug`.
 - The normal workflow is decision explainability first, knob tuning second.
 - Auto fee bands are enabled by default. Manual policy bands are fallback only when an auto band is not yet available.
-- `sling` must be installed and loaded for live rebalances. If `sling-once` is unavailable, rebalance execution is skipped.
-- `revenue-ops-sling-*` options are internal startup-hygiene overrides, not normal runtime knobs exposed through `revenue-config`.
 - `revenue-policy list|get|find|changes` are diagnostic surfaces. Write actions such as `set` and `delete` remain internal or debug workflows, not the normal operator path.
 - Planner closes are recommendation-only by default.
 - To allow live close RPCs, set `revenue-ops-planner-execute-closes=true` and `revenue-ops-planner-max-closes-per-cycle` to a positive value.
 
-## Sling Integration
+## Rebalance Execution
 
-- Route selection remains branch-specific: `rebalance_router=v3` keeps askrene and hive-layer path discovery, while `v2` keeps the legacy local router.
-- Regardless of router choice, live execution is `sling-once` plus `sling-stats` observation; the older internal `sendpay` rebalance executor path is no longer used on this branch.
-- At startup, `cl-revenue-ops` inspects the subset of `sling-*` runtime hygiene it owns and logs drift. It does not auto-apply those values via `setconfig` in dynamic-load CLN environments, because persisted plugin-owned `sling-*` keys can break restart.
-- The mirrored `revenue-ops-sling-*` plugin options remain internal defaults for diagnostics and drift reporting. If you need non-default live `sling-*` values, set the actual `sling-*` options directly in the node configuration that owns sling.
+- Route selection is pinned to `rebalance_router=v3`, which uses askrene and hive-layer path discovery.
+- Live execution uses the explicit route priced by askrene and pays it with native Core Lightning RPCs.
+- Failed route segments are recorded as local observations and exported through the `["revenue", "segment-observations"]` datastore key for hive-aware routing bias.
 
 ## Profitability Analysis
 
@@ -75,7 +72,7 @@ configured router (v3 askrene+hive or v2 local)
     ↓
 RebalanceEngineV2
     ↓
-sling-once / sling-stats
+native sendpay / waitsendpay
     ↓
 Core Lightning
 ```
@@ -86,7 +83,6 @@ Core Lightning
 
 - Core Lightning `v23.05+`
 - Python `3.10+`
-- `sling` plugin: required for live rebalance execution
 - bookkeeper plugin: recommended for cleaner P&L and cost accounting
 
 ### Start The Plugin
@@ -97,7 +93,6 @@ git clone https://github.com/lightning-goats/cl_revenue_ops.git
 cd cl_revenue_ops
 pip install -r requirements.txt
 chmod +x cl-revenue-ops.py
-# Ensure the sling plugin is already installed and loaded by lightningd.
 lightning-cli plugin start "$(pwd)/cl-revenue-ops.py"
 ```
 
@@ -145,14 +140,16 @@ Saved artifacts:
 ## Day-1 Operator Workflow
 
 1. Start the plugin and check `revenue-status`.
-2. Set only the safety rails you actually want to constrain: `paused`, `daily_budget_sats`, `min_fee_ppm`, `max_fee_ppm`.
+2. Set only the safety rails you actually want to constrain: `paused`, `daily_budget_sats`, `min_fee_ppm`, `max_fee_ppm`, `fee_profile`, and the `fee_market_boundary_*` controls.
 3. Let the executor run.
 4. Use `revenue-fee-debug` and `revenue-rebalance-debug` to understand holds, clamps, and actions before touching anything else.
 Example runtime adjustments:
 
 ```bash
 lightning-cli revenue-config get
+lightning-cli revenue-config set fee_profile conservative
 lightning-cli revenue-config set min_fee_ppm 75
+lightning-cli revenue-config set fee_market_boundary_margin_ratio 0.03
 lightning-cli revenue-config set daily_budget_sats 10000
 ```
 

@@ -10,7 +10,7 @@ Covers:
 7. Config: _apply_override enforces range validation
 8. Rebalancer: _estimate_push_ev passes channel SCID (not peer_id) to turnover calc
 
-Note: Fix 1 (fee_paid_sats kwarg) test removed -- _handle_job_timeout deleted with sling code.
+Note: Fix 1 (fee_paid_sats kwarg) test removed -- _handle_job_timeout was deleted with legacy async job code.
 """
 
 import pytest
@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-# TestRebalancerTimeoutKwarg removed -- _handle_job_timeout deleted with sling code.
+# TestRebalancerTimeoutKwarg removed -- _handle_job_timeout deleted with legacy async job code.
 
 
 # =============================================================================

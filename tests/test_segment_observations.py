@@ -1,10 +1,10 @@
-"""Tests for local sling segment observation export."""
+"""Tests for local route-segment observation export."""
 
-from modules.sling_segment_observations import SlingSegmentObservationStore
+from modules.segment_observations import SegmentObservationStore
 
 
 def test_export_snapshot_validates_and_buckets_failure_observations():
-    store = SlingSegmentObservationStore(ttl_seconds=900)
+    store = SegmentObservationStore(ttl_seconds=900)
     store.record_failure(
         short_channel_id="123x1x0",
         direction=1,

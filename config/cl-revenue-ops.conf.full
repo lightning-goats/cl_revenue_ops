@@ -36,13 +36,28 @@
 # The algorithm uses dynamic observation windows, so faster intervals are safe
 #revenue-ops-fee-interval=1800
 
+# Fee controller aggressiveness profile
+# active: faster learning for active routing nodes
+# conservative: longer windows and smaller per-cycle moves for low-volume nodes
+#revenue-ops-fee-profile=active
+
 # Fee floor - minimum fee rate (protects against L1 fee spikes)
 # RECOMMENDATION: 100 ppm for competitive markets, 50 ppm for volume focus
 #revenue-ops-min-fee-ppm=10
 
 # Fee ceiling - maximum fee rate
-# RECOMMENDATION: 2500-5000 ppm depending on channel positioning
-#revenue-ops-max-fee-ppm=5000
+# RECOMMENDATION: 1500-2500 ppm for most routing nodes; raise only for special positioning
+#revenue-ops-max-fee-ppm=2000
+
+# Competitive market boundary guard
+# Caps fee targets below the cheapest active competitor to the same destination
+# so a single cheaper rival cannot silently take all route quotes.
+#revenue-ops-fee-market-boundary-enabled=true
+#revenue-ops-fee-market-boundary-min-competitors=1
+#revenue-ops-fee-market-boundary-margin-ppm=5
+#revenue-ops-fee-market-boundary-margin-ratio=0.05
+#revenue-ops-fee-market-boundary-max-downshift-ratio=0.35
+#revenue-ops-fee-market-boundary-cache-seconds=60
 
 # --- Vegas Reflex ---
 # Dynamically raise fee floor during mempool congestion
@@ -62,8 +77,10 @@
 # RECOMMENDATION: 50-100 sats for active rebalancing, 200+ for conservative
 #revenue-ops-rebalance-min-profit=10
 
-# Rebalancer backend (only 'sling' supported)
-#revenue-ops-rebalancer=sling
+# Rebalance route discovery is pinned to v3/askrene.
+#revenue-ops-rebalance-router=v3
+
+# Rebalance execution uses the exact route priced by askrene.
 
 # ============================================================================
 # CAPACITY PLANNER
@@ -85,7 +102,7 @@
 # CAPITAL SAFETY (Global Capital Controls)
 # ============================================================================
 
-# Daily budget for rebalancing fees - acts as floor when proportional enabled
+# Daily budget for rebalancing fees
 # RECOMMENDATION: Start conservative (2000-5000), increase as you learn
 #revenue-ops-daily-budget-sats=5000
 
@@ -96,17 +113,6 @@
 
 # On-chain + Off-chain reserve threshold (abort rebalancing if below)
 #revenue-ops-min-wallet-reserve=1000000
-
-# --- Revenue-Proportional Budget ---
-# Scale daily budget as percentage of trailing 24h routing revenue
-# Formula: effective_budget = max(daily-budget-sats, revenue_24h * pct)
-
-# Enable revenue-proportional budget scaling
-#revenue-ops-proportional-budget=true
-
-# Percentage of 24h revenue to use as budget (0.10 = 10%)
-# RECOMMENDATION: 5-15% depending on risk tolerance
-#revenue-ops-proportional-budget-pct=0.30
 
 # ============================================================================
 # RISK MANAGEMENT (Kelly Criterion)
@@ -160,8 +166,6 @@
 # revenue-ops-min-fee-ppm=50
 # revenue-ops-max-fee-ppm=1500
 # revenue-ops-fee-interval=1800
-# revenue-ops-proportional-budget=true
-# revenue-ops-proportional-budget-pct=0.15
 # revenue-ops-enable-kelly=true
 # revenue-ops-kelly-fraction=0.6
 
@@ -173,6 +177,5 @@
 # revenue-ops-max-fee-ppm=5000
 # revenue-ops-fee-interval=3600
 # revenue-ops-daily-budget-sats=2000
-# revenue-ops-proportional-budget=false
 # revenue-ops-enable-kelly=true
 # revenue-ops-kelly-fraction=0.3

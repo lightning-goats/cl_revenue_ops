@@ -88,7 +88,7 @@ def test_decide_route_policy_marks_hybrid_when_hints_prefer_fleet():
     assert decision.policy is RoutePolicy.HYBRID
 
 
-def test_decide_route_policy_defaults_to_hive_only_when_both_endpoints_are_hive():
+def test_decide_route_policy_defaults_to_hybrid_when_both_endpoints_are_hive():
     from modules.rebalance_types_v2 import PairCandidate
 
     _, RoutePolicy, RoutePriority, decide_route_policy = _import_route_policy()
@@ -109,9 +109,9 @@ def test_decide_route_policy_defaults_to_hive_only_when_both_endpoints_are_hive(
         hive_hints=hints,
     )
 
-    assert decision.policy is RoutePolicy.HIVE_ONLY
-    assert decision.priority is RoutePriority.HIVE_EQUALIZATION
-    assert decision.allow_market_fallback is False
+    assert decision.policy is RoutePolicy.HYBRID
+    assert decision.priority is RoutePriority.EV_POSITIVE
+    assert decision.allow_market_fallback is True
 
 
 def test_pair_candidate_can_store_route_decision():

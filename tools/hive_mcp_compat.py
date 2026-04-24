@@ -216,14 +216,14 @@ async def handle_hive_node_diagnostic(args: Dict) -> Dict:
     if isinstance(revenue_status, Exception):
         result["revenue_status"] = {"error": str(revenue_status)}
         result["plugins"] = ["cl-hive"]
-        result["sling_status"] = {
+        result["rebalance_status"] = {
             "status": "unavailable",
             "reason": "revenue-status unavailable",
         }
     elif isinstance(revenue_status, dict) and "error" in revenue_status:
         result["revenue_status"] = revenue_status
         result["plugins"] = ["cl-hive"]
-        result["sling_status"] = {
+        result["rebalance_status"] = {
             "status": "unavailable",
             "reason": str(revenue_status["error"]),
         }
@@ -233,9 +233,9 @@ async def handle_hive_node_diagnostic(args: Dict) -> Dict:
         result["plugin_inventory_note"] = (
             "Legacy hive-plugin-list RPC was removed; only currently reachable plugin surfaces are reported."
         )
-        result["sling_status"] = {
+        result["rebalance_status"] = {
             "status": "unavailable",
-            "reason": "hive-sling-status RPC was removed; inspect revenue_status.rebalance_decision instead.",
+            "reason": "inspect revenue_status.rebalance_decision instead.",
             "rebalance_decision": revenue_status.get("rebalance_decision"),
         }
 

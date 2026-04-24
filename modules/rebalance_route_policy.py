@@ -260,10 +260,10 @@ def decide_route_policy(
 
     if src_is_hive and dst_is_hive:
         return RouteDecision(
-            policy=RoutePolicy.HIVE_ONLY,
-            priority=RoutePriority.HIVE_EQUALIZATION,
-            reason=reason_code or "hive_equalization",
-            allow_market_fallback=False,
+            policy=RoutePolicy.HYBRID,
+            priority=RoutePriority.EV_POSITIVE,
+            reason=reason_code or "ev_positive",
+            allow_market_fallback=True,
         )
 
     if src_is_hive or dst_is_hive:

@@ -57,7 +57,7 @@ def _make_plugin(
     return plugin
 
 
-def _dest_peer_channels(fee_ppm=275, cltv=40):
+def _dest_peer_channels(fee_ppm=275, cltv=40, fee_base_msat=0):
     """Standard dest peer channel response."""
     return {
         "channels": [{
@@ -65,6 +65,7 @@ def _dest_peer_channels(fee_ppm=275, cltv=40):
             "peer_id": DEST_PEER,
             "updates": {
                 "remote": {
+                    "fee_base_msat": fee_base_msat,
                     "fee_proportional_millionths": fee_ppm,
                     "cltv_expiry_delta": cltv,
                 },
@@ -145,6 +146,32 @@ class TestFinalHopFeeFromListpeerchannels:
         dest_call = [c for c in calls if c.kwargs.get("peer_id") == DEST_PEER]
         assert len(dest_call) >= 1
         plugin.rpc.listchannels.assert_called_with(short_channel_id="300x1x0")
+
+    def test_router_includes_final_hop_base_fee_in_middle_amount(self):
+        """Low-amount routes must budget the remote base fee, not only ppm."""
+        middle_route = [{
+            "id": DEST_PEER,
+            "channel": "300x1x0",
+            "amount_msat": 50_001_000,
+            "delay": 40,
+        }]
+        plugin = _make_plugin(
+            peer_channels_by_id={
+                DEST_PEER: _dest_peer_channels(fee_ppm=0, fee_base_msat=1000),
+                SOURCE_PEER: _source_peer_channels(),
+            },
+            list_channels=_middle_edge_channels(DEST_PEER),
+            getroute={"route": middle_route},
+        )
+        router = RebalanceRouter(plugin, OUR_ID)
+
+        result = router.price_pair(
+            SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, AMOUNT_SATS
+        )
+
+        assert result.success is True
+        assert plugin.rpc.getroute.call_args.kwargs["amount_msat"] == 50_001_000
+        assert result.route_cost_sats == 1
 
     def test_router_does_not_call_listpeerchannels_with_legacy_id_kwarg(self):
         """Regression test: earlier versions passed id= which raised
@@ -321,9 +348,10 @@ class TestFullRoute:
         )
 
         assert result.success is True
-        # ceil(50_015_750 * 100 / 1_000_000) + 5000 = 10_002 msat
-        assert result.route[0]["amount_msat"] == 50_025_752
-        assert result.route_cost_sats == 26
+        # Middle amount is repriced from the final-hop fee budget before the
+        # source peer's forwarding fee is added.
+        assert result.route[0]["amount_msat"] == 50_024_002
+        assert result.route_cost_sats == 25
         plugin.rpc.listchannels.assert_called_with(short_channel_id="300x1x0")
 
     def test_first_hop_delay_includes_cltv_delta_for_first_middle_edge(self):

@@ -2243,7 +2243,10 @@ class CapacityPlanner:
         """Estimate the on-chain cost of opening a channel."""
         try:
             feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
-            sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
+            opening_perkb = self._extract_opening_feerate_perkb(feerates)
+            if opening_perkb is None:
+                return ChainCostDefaults.CHANNEL_OPEN_COST_SATS
+            sat_per_vb = opening_perkb / 1000.0
             return int(sat_per_vb * 140)  # ~140 vbytes for funding tx
         except Exception:
             return ChainCostDefaults.CHANNEL_OPEN_COST_SATS
@@ -2258,10 +2261,28 @@ class CapacityPlanner:
         """
         try:
             feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
-            sat_per_vb = feerates.get("perkb", {}).get("opening", 1000) / 1000.0
+            opening_perkb = self._extract_opening_feerate_perkb(feerates)
+            if opening_perkb is None:
+                return ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+            sat_per_vb = opening_perkb / 1000.0
             return int(sat_per_vb * 200)  # ~200 vbytes for close tx
         except Exception:
             return ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+
+    @staticmethod
+    def _extract_opening_feerate_perkb(feerates) -> float | None:
+        """Return CLN's opening feerate or None for malformed RPC responses."""
+        if not isinstance(feerates, dict):
+            return None
+        perkb = feerates.get("perkb", {})
+        if not isinstance(perkb, dict):
+            return None
+        value = perkb.get("opening", 1000)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if value <= 0:
+            return None
+        return float(value)
 
     @staticmethod
     def _parse_min_chan_size_error(error_msg: str) -> int:

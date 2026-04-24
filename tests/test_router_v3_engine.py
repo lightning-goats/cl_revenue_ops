@@ -100,6 +100,67 @@ def test_engine_sweeps_orphan_exclude_layers_at_init():
     assert "hive-fleet" not in removed
 
 
+def test_router_v3_excludes_local_endpoint_channels_from_middle_path():
+    from modules.rebalance_router_v3 import RebalanceRouterV3
+
+    plugin = MagicMock()
+    plugin.rpc.call.return_value = {"layers": []}
+    plugin.rpc.getroutes.return_value = {
+        "routes": [
+            {
+                "amount_msat": 50_000_000,
+                "probability_ppm": 900_000,
+                "path": [
+                    {
+                        "short_channel_id_dir": "300x1x0/0",
+                        "next_node_id": "02" + "c" * 64,
+                        "amount_msat": 50_001_000,
+                        "delay": 40,
+                    }
+                ],
+            }
+        ]
+    }
+
+    router = RebalanceRouterV3(
+        plugin=plugin,
+        our_node_id="02" + "a" * 64,
+        layer_names=[],
+        log=MagicMock(),
+    )
+    router._v2_helpers._get_final_hop_policy = MagicMock(
+        return_value={"fee_ppm": 1, "fee_base_msat": 0, "cltv_delta": 6}
+    )
+    router._v2_helpers._get_dest_channel_cltv = MagicMock(return_value=6)
+    router._v2_helpers._get_invoice_final_cltv = MagicMock(return_value=18)
+    router._v2_helpers._compute_final_hop_fee_sats = MagicMock(return_value=1)
+    router._v2_helpers._get_first_middle_hop_policy = MagicMock(
+        return_value={"fee_base_msat": 0, "fee_ppm": 0, "cltv_delta": 0}
+    )
+    router._v2_helpers._channel_direction = MagicMock(return_value=0)
+
+    result = router.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+    )
+
+    assert result.success is True
+    update_entries = [
+        call.args[1]["short_channel_id_dir"]
+        for call in plugin.rpc.call.call_args_list
+        if call.args and call.args[0] == "askrene-update-channel"
+    ]
+    assert "100x1x0/0" in update_entries
+    assert "100x1x0/1" in update_entries
+    assert "200x1x0/0" in update_entries
+    assert "200x1x0/1" in update_entries
+    layers = plugin.rpc.getroutes.call_args.kwargs["layers"]
+    assert any(layer.startswith("rebalance-exclude-") for layer in layers)
+
+
 def test_engine_prefers_data_service_for_bootstrap_and_router_wiring():
     from modules import rebalance_engine_v2 as mod
 
@@ -218,6 +279,7 @@ def test_engine_hive_only_pairs_use_hive_router():
         dest_peer_id="02" + "b" * 64,
         amount_sats=1000,
         pair_budget_sats=10,
+        score=10.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.HIVE_ONLY,
             priority=RoutePriority.HIVE_EQUALIZATION,
@@ -260,6 +322,7 @@ def test_engine_hybrid_pairs_choose_cheaper_hive_route():
         dest_peer_id="02" + "b" * 64,
         amount_sats=1000,
         pair_budget_sats=10,
+        score=10.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.HYBRID,
             priority=RoutePriority.COORDINATED,
@@ -292,6 +355,56 @@ def test_engine_hybrid_pairs_choose_cheaper_hive_route():
     engine.router_v3.price_pair.assert_called_once()
 
 
+def test_engine_hybrid_market_leg_uses_layerless_market_fallback():
+    from modules.rebalance_router_v2 import RouteResult
+    from modules.rebalance_route_policy import RouteDecision, RoutePolicy, RoutePriority
+    from modules.rebalance_types_v2 import PairCandidate, PlanResult
+
+    engine, _ = _make_engine(askrene_available=True, rebalance_router="v3")
+    engine._build_snapshot = MagicMock(return_value=MagicMock(channels=[MagicMock()]))
+    engine._audit = MagicMock()
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "a" * 64,
+        dest_peer_id="02" + "b" * 64,
+        amount_sats=1000,
+        pair_budget_sats=10,
+        score=10.0,
+        route_decision=RouteDecision(
+            policy=RoutePolicy.HYBRID,
+            priority=RoutePriority.COORDINATED,
+            reason="coordinated_rebalance",
+            allow_market_fallback=True,
+        ),
+    )
+
+    market_route = [{"channel": "market"}]
+    engine.router_v3 = MagicMock()
+    engine.router_v3.price_pair.return_value = RouteResult(
+        success=True,
+        route_cost_sats=5,
+        route=market_route,
+    )
+    engine._hive_router = MagicMock()
+    engine._hive_router.price_pair.return_value = RouteResult(
+        success=False,
+        error="no_fleet_route",
+    )
+
+    fake_plan = PlanResult(selected=[pair], skipped=[])
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.return_value = fake_plan
+        selected = engine.find_candidates()
+
+    assert selected == [pair]
+    assert pair.route == market_route
+    kwargs = engine.router_v3.price_pair.call_args.kwargs
+    assert kwargs["layer_names_override"] == []
+    assert kwargs["include_observed_liquidity"] is False
+
+
 def test_engine_orders_pairs_by_route_priority():
     from modules.rebalance_router_v2 import RouteResult
     from modules.rebalance_types_v2 import PairCandidate, PlanResult
@@ -307,6 +420,7 @@ def test_engine_orders_pairs_by_route_priority():
         dest_peer_id="02" + "b" * 64,
         amount_sats=1000,
         pair_budget_sats=10,
+        score=10.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.MARKET_ONLY,
             priority=RoutePriority.EV_POSITIVE,
@@ -320,6 +434,7 @@ def test_engine_orders_pairs_by_route_priority():
         dest_peer_id="02" + "d" * 64,
         amount_sats=1000,
         pair_budget_sats=10,
+        score=10.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.HYBRID,
             priority=RoutePriority.COORDINATED,

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -78,12 +78,12 @@ class RebalanceRouter:
             value = value.rstrip("msat")
         return int(value)
 
-    def _get_final_hop_fee_ppm(self, dest_peer_id: str) -> Optional[int]:
-        """Get the actual inbound fee the dest peer charges us.
+    def _get_final_hop_policy(self, dest_peer_id: str) -> Optional[Dict[str, int]]:
+        """Get the actual inbound policy the dest peer charges us.
 
         Priority 1: listpeerchannels updates.remote.fee_proportional_millionths
         Priority 2: listchannels for the dest peer's channel toward us.
-        Returns None if fee cannot be determined.
+        Returns None if the policy cannot be determined.
         """
         # --- Priority 1: listpeerchannels filtered by peer ---
         try:
@@ -102,7 +102,11 @@ class RebalanceRouter:
                     continue
                 fee_ppm = remote.get("fee_proportional_millionths")
                 if fee_ppm is not None:
-                    return int(fee_ppm)
+                    return {
+                        "fee_ppm": int(fee_ppm),
+                        "fee_base_msat": int(remote.get("fee_base_msat", 0) or 0),
+                        "cltv_delta": int(remote.get("cltv_expiry_delta", 0) or 0),
+                    }
         except Exception as e:
             self._log(f"listpeerchannels lookup failed for {dest_peer_id}: {e}")
 
@@ -116,16 +120,38 @@ class RebalanceRouter:
                 if ch.get("destination") == self.our_node_id:
                     fee_ppm = ch.get("fee_per_millionth")
                     if fee_ppm is not None:
-                        return int(fee_ppm)
+                        return {
+                            "fee_ppm": int(fee_ppm),
+                            "fee_base_msat": int(
+                                ch.get("base_fee_millisatoshi", ch.get("fee_base_msat", 0))
+                                or 0
+                            ),
+                            "cltv_delta": int(ch.get("delay", 0) or 0),
+                        }
         except Exception as e:
             self._log(f"listchannels fallback failed for {dest_peer_id}: {e}")
 
         return None
 
     @staticmethod
-    def _compute_final_hop_fee_sats(amount_sats: int, fee_ppm: int) -> int:
+    def _get_final_hop_fee_ppm(self, dest_peer_id: str) -> Optional[int]:
+        """Return the final-hop proportional fee for legacy callers/tests."""
+        policy = self._get_final_hop_policy(dest_peer_id)
+        if policy is None:
+            return None
+        return int(policy["fee_ppm"])
+
+    @staticmethod
+    def _compute_final_hop_fee_sats(
+        amount_sats: int,
+        fee_ppm: int,
+        fee_base_msat: int = 0,
+    ) -> int:
         """Compute the fee in sats for the final hop at the given PPM rate."""
-        return math.ceil(amount_sats * fee_ppm / 1_000_000)
+        fee_msat = int(fee_base_msat or 0) + math.ceil(
+            (amount_sats * 1000) * int(fee_ppm or 0) / 1_000_000
+        )
+        return math.ceil(fee_msat / 1000)
 
     @staticmethod
     def _route_fee_sats(route: List[Dict[str, Any]], amount_sats: int) -> int:
@@ -143,14 +169,14 @@ class RebalanceRouter:
         delivery_msat = amount_sats * 1000
         return max(0, math.ceil((first_hop_msat - delivery_msat) / 1000))
 
-    def _get_first_middle_hop_policy(
+    def _get_forwarding_policy(
         self,
-        source_peer_id: str,
-        first_middle_hop: Dict[str, Any],
+        source_node_id: str,
+        hop: Dict[str, Any],
     ) -> Optional[Dict[str, int]]:
-        """Return the source peer's forwarding policy for the first middle edge."""
-        channel_id = first_middle_hop.get("channel")
-        next_node_id = first_middle_hop.get("id")
+        """Return a node's forwarding policy for a concrete outgoing hop."""
+        channel_id = hop.get("channel")
+        next_node_id = hop.get("id")
         if not channel_id or not next_node_id:
             return None
 
@@ -162,7 +188,7 @@ class RebalanceRouter:
             for ch in result.get("channels", []):
                 if (
                     ch.get("short_channel_id") != channel_id
-                    or ch.get("source") != source_peer_id
+                    or ch.get("source") != source_node_id
                     or ch.get("destination") != next_node_id
                 ):
                     continue
@@ -179,10 +205,54 @@ class RebalanceRouter:
                 }
         except Exception as e:
             self._log(
-                f"listchannels first-middle policy lookup failed for {channel_id}: {e}"
+                f"listchannels forwarding policy lookup failed for {channel_id}: {e}"
             )
 
         return None
+
+    def _get_first_middle_hop_policy(
+        self,
+        source_peer_id: str,
+        first_middle_hop: Dict[str, Any],
+    ) -> Optional[Dict[str, int]]:
+        """Return the source peer's forwarding policy for the first middle edge."""
+        return self._get_forwarding_policy(source_peer_id, first_middle_hop)
+
+    def _reprice_middle_route_amounts(
+        self,
+        middle_route: List[Dict[str, Any]],
+        *,
+        final_amount_msat: int,
+    ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        """Recompute middle hop amounts from live policies.
+
+        Route finders provide topology, but their amount fields can lag live
+        channel updates. A sendpay hop amount is what that hop's destination
+        receives, so each non-final middle hop includes the fee charged by its
+        destination for forwarding over the next middle hop.
+        """
+        repriced = [dict(hop) for hop in (middle_route or [])]
+        if not repriced:
+            return repriced, ""
+
+        repriced[-1]["amount_msat"] = int(final_amount_msat)
+        for index in range(len(repriced) - 2, -1, -1):
+            forwarding_node_id = str(repriced[index].get("id", "") or "")
+            outgoing_hop = repriced[index + 1]
+            policy = self._get_forwarding_policy(forwarding_node_id, outgoing_hop)
+            if policy is None:
+                self._log(
+                    "middle forwarding policy unavailable for "
+                    f"{outgoing_hop.get('channel')}; keeping router amount"
+                )
+                continue
+            downstream_msat = self._parse_msat_value(outgoing_hop.get("amount_msat"))
+            forwarding_fee_msat = int(policy["fee_base_msat"]) + math.ceil(
+                downstream_msat * int(policy["fee_ppm"]) / 1_000_000
+            )
+            repriced[index]["amount_msat"] = downstream_msat + forwarding_fee_msat
+
+        return repriced, ""
 
     # ------------------------------------------------------------------
     # Public API
@@ -283,16 +353,22 @@ class RebalanceRouter:
         Returns:
             RouteResult with pricing or failure details.
         """
-        # Step 1: Get actual final-hop fee
-        final_hop_fee_ppm = self._get_final_hop_fee_ppm(dest_peer_id)
-        if final_hop_fee_ppm is None:
+        # Step 1: Get actual final-hop fee. Include both base and proportional
+        # policy; omitting the base fee causes low-amount routes to fail with
+        # WIRE_FEE_INSUFFICIENT at the preceding hop.
+        final_hop_policy = self._get_final_hop_policy(dest_peer_id)
+        if final_hop_policy is None:
             return RouteResult(
                 success=False,
                 error=f"cannot determine final-hop fee for peer {dest_peer_id}",
             )
+        final_hop_fee_ppm = int(final_hop_policy["fee_ppm"])
+        final_hop_fee_base_msat = int(final_hop_policy.get("fee_base_msat", 0) or 0)
 
         final_hop_fee_sats = self._compute_final_hop_fee_sats(
-            amount_sats, final_hop_fee_ppm
+            amount_sats,
+            final_hop_fee_ppm,
+            final_hop_fee_base_msat,
         )
         dest_cltv = self._get_dest_channel_cltv(dest_peer_id)
         invoice_final_cltv = self._get_invoice_final_cltv()
@@ -331,6 +407,12 @@ class RebalanceRouter:
                     success=False,
                     error="getroute returned empty route",
                 )
+            middle_route, reprice_error = self._reprice_middle_route_amounts(
+                middle_route,
+                final_amount_msat=route_amount_msat,
+            )
+            if middle_route is None:
+                return RouteResult(success=False, error=reprice_error)
 
         # Step 3: Build the full circular route
         # First hop: us → source_peer via source_channel.

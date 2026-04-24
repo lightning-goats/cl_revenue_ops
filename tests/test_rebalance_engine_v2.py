@@ -27,6 +27,10 @@ def _make_engine(plugin, database):
     plugin.rpc.listconfigs.return_value = {
         "configs": {"cltv-final": {"value_int": 18}}
     }
+    database.record_rebalance.return_value = 1
+    database.reserve_budget.return_value = (True, 9999)
+    database.mark_budget_spent.return_value = True
+    database.release_budget_reservation.return_value = True
     return RebalanceEngine(plugin=plugin, config=cfg, database=database)
 
 
@@ -562,10 +566,9 @@ def test_get_last_cycle_debug_emits_pairless_hold_diagnostics(
     assert diagnostics["source_inside_band"] == 1
 
 
-def test_sling_noroutes_classified_as_transient_failure(mock_plugin, mock_database):
-    """Iter2: sling reports 'NoRoutes' as a routing-layer transient (often
-    gossip-convergence or short liquidity dip). Should map to the short-cooldown
-    transient bucket, not the catch-all other_retriable."""
+def test_no_routes_classified_as_transient_failure(mock_plugin, mock_database):
+    """NoRoutes should map to the short-cooldown transient bucket, not the
+    catch-all other_retriable bucket."""
     from modules.rebalance_engine_v2 import ExecutionResult
 
     engine = _make_engine(mock_plugin, mock_database)
@@ -579,14 +582,11 @@ def test_sling_noroutes_classified_as_transient_failure(mock_plugin, mock_databa
         assert engine._classify_failure_kind(result) == "temporary_channel_failure"
 
 
-def test_no_route_pairs_no_longer_fall_through_to_sling(
+def test_no_route_pairs_are_not_selected_without_priced_route(
     mock_plugin, mock_database
 ):
-    """Iter3: when askrene reports no route, sling will also report no
-    route (same pathfinder). The legacy fallback_unpriced path was
-    submitting known-impossible pairs to sling, burning preflight cycles
-    and creating spurious pair_cooldown entries. Skip with no_route
-    instead."""
+    """Native execution requires an explicit priced route, so router no-route
+    pairs must be skipped before execution."""
     from modules.config import Config
     from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_types_v2 import PairCandidate
@@ -636,88 +636,16 @@ def test_no_route_pairs_no_longer_fall_through_to_sling(
         )
         selected = engine.find_candidates()
 
-    assert selected == []  # not submitted to sling
+    assert selected == []
     debug = engine.get_last_cycle_debug()
     skipped_reasons = {row["channel_id"]: row["reason"] for row in debug["skipped"]}
     assert skipped_reasons.get("200x2x0") == "no_route"
 
 
-def test_allow_router_fallback_restores_unpriced_submit(
-    mock_plugin, mock_database
-):
-    """Defensive escape valve: if production askrene rejects routes that
-    sling can actually find (e.g. unusual gossip lag or askrene layer
-    misconfiguration), the operator can flip allow_router_fallback=True
-    to restore the legacy fallback_unpriced submit-to-sling behavior for
-    MARKET_ONLY pairs. Default is False (Iter3 skip-with-no_route)."""
-    from modules.config import Config
-    from modules.rebalance_engine_v2 import RebalanceEngine
-    from modules.rebalance_types_v2 import PairCandidate
-
-    cfg = Config(
-        dry_run=True,
-        rebalance_router="v3",
-        allow_router_fallback=True,
-    )
-    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
-    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
-    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
-    mock_plugin.rpc.listchannels.return_value = {"channels": []}
-    mock_plugin.rpc.listconfigs.return_value = {
-        "configs": {"cltv-final": {"value_int": 18}}
-    }
-    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine._audit = MagicMock()
-    engine._audit.log_pick = MagicMock()
-    engine._audit.log_skip = MagicMock()
-    engine._audit.log_cycle_summary = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=SimpleNamespace(
-            channels=[object()], valuable_channel_count=1,
-            total_remaining_budget_sats=10_000,
-        )
-    )
-
-    pair = PairCandidate(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x2x0",
-        source_peer_id="03" + "b" * 64,
-        dest_peer_id="03" + "c" * 64,
-        amount_sats=50_000,
-        pair_budget_sats=500,
-        source_capacity_sats=1_000_000,
-        dest_capacity_sats=1_000_000,
-        score=1.0,
-        source_local_ratio=0.85,
-        dest_local_ratio=0.10,
-    )
-    engine.router_v3.price_pair.return_value = SimpleNamespace(
-        success=False, route_cost_sats=None, route=None,
-        probability_ppm=0, error="no_route_found",
-    )
-
-    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
-        planner_cls.return_value.plan.return_value = SimpleNamespace(
-            selected=[pair], skipped=[]
-        )
-        selected = engine.find_candidates()
-
-    assert selected == [pair], (
-        "with allow_router_fallback=True the pair should be submitted "
-        f"to sling unpriced; got selected={selected}"
-    )
-    decomp = pair.score_decomposition or {}
-    assert decomp.get("stage") == "fallback_unpriced", (
-        f"expected stage=fallback_unpriced, got {decomp}"
-    )
-
-
 def test_first_transient_failure_uses_short_cooldown(mock_plugin, mock_database):
     """Iter2: temporary_channel_failure base cooldown is 300s (5 min) on a
-    first failure. Sling classifies these as retriable and the prior 1800s
-    base was too aggressive -- it kept good pairs out of contention for
-    half an hour after a single transient route failure."""
+    first failure so good pairs do not disappear for half an hour after a
+    single transient route failure."""
     engine = _make_engine(mock_plugin, mock_database)
 
     assert engine._pair_failure_cooldowns["temporary_channel_failure"] == 300
@@ -1036,6 +964,69 @@ def test_pair_below_hold_margin_is_rejected_with_explicit_reason(
     assert skipped_reasons.get("200x2x0") == "below_hold_margin"
 
 
+def test_negative_ev_pair_is_rejected_at_default_hold_margin(
+    mock_plugin, mock_database
+):
+    """Default hold margin is zero, but zero still means do not execute
+    pairs whose priced final_score loses to do_nothing."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._audit.log_pick = MagicMock()
+    engine._audit.log_skip = MagicMock()
+    engine._audit.log_cycle_summary = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+
+    weak_pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=100,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=0.10,
+        source_local_ratio=0.70,
+        dest_local_ratio=0.30,
+    )
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True, route_cost_sats=50, route=[{"channel": "300x3x0"}],
+        probability_ppm=990_000, error="",
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.return_value = SimpleNamespace(
+            selected=[weak_pair], skipped=[]
+        )
+        selected = engine.find_candidates()
+
+    assert selected == []
+    debug = engine.get_last_cycle_debug()
+    skipped_reasons = {row["channel_id"]: row["reason"] for row in debug["skipped"]}
+    assert skipped_reasons.get("200x2x0") == "below_hold_margin"
+    assert debug["considered_candidates"][0]["score_decomposition"]["final_score"] < 0.0
+
+
 def test_engine_layer_preserves_route_success_fee_and_penalty_terms(
     mock_plugin, mock_database
 ):
@@ -1125,6 +1116,11 @@ def test_engine_build_snapshot_uses_membership_router_for_hive_value_class(
     assert snapshot is not None
     assert snapshot.channels[0].value_class == "hive"
     assert snapshot.channels[0].is_valuable is True
+    assert (
+        snapshot.channels[0].remaining_budget_sats
+        == cfg.hive_rebalance_bootstrap_budget_sats
+    )
+    assert snapshot.channels[0].budget_source == "hive_bootstrap"
     membership_router.is_hive_member.assert_called_once()
 
 
@@ -1361,7 +1357,7 @@ def test_engine_execute_candidate_continues_when_local_route_pricing_fails(
     result = engine.execute_candidate(candidate)
 
     assert result.success is True
-    assert result.route_type == "sling"
+    assert result.route_type == "native"
     engine.router_v3.price_pair.assert_called_once()
     assert engine.router_v3.price_pair.call_args.kwargs["exclude"] is None
     engine._execute_pair.assert_called_once()
@@ -1369,11 +1365,11 @@ def test_engine_execute_candidate_continues_when_local_route_pricing_fails(
 
 def test_engine_execute_candidate_exports_failure_snapshot(mock_plugin, mock_database):
     from modules.rebalance_executor_v2 import ExecutionResult
-    from modules.sling_segment_observations import SlingSegmentObservationStore
+    from modules.segment_observations import SegmentObservationStore
 
     engine = _make_engine(mock_plugin, mock_database)
     engine._data_service = MagicMock()
-    engine._segment_observation_store = SlingSegmentObservationStore()
+    engine._segment_observation_store = SegmentObservationStore()
     engine.router_v3 = MagicMock()
     engine.router_v3.price_pair.return_value = SimpleNamespace(
         success=True,
@@ -1416,7 +1412,7 @@ def test_engine_execute_candidate_exports_failure_snapshot(mock_plugin, mock_dat
                 error="retriable_failure: WIRE_TEMPORARY_CHANNEL_FAILURE",
             )
 
-    with patch("modules.rebalance_engine_v2.RebalanceExecutor", FakeExecutor):
+    with patch("modules.rebalance_engine_v2.NativeRouteExecutor", FakeExecutor):
         result = engine.execute_candidate(candidate)
 
     assert result.success is False
@@ -1540,8 +1536,8 @@ def test_engine_merges_coordination_pairs_before_pair_cap(
 
         selected = engine.find_candidates()
 
-    assert selected == [coordinated_pair]
-    engine.router_v3.price_pair.assert_called_once()
+    assert selected == [coordinated_pair, local_pair]
+    assert engine.router_v3.price_pair.call_count == 2
 
 
 def test_engine_skips_pairs_with_persisted_cooldown_before_pricing(
@@ -1626,7 +1622,7 @@ def test_engine_runs_planner_selected_pair_without_local_route_snapshot(
         ]
     )
 
-    with patch("modules.rebalance_engine_v2.RebalanceExecutor") as executor_cls:
+    with patch("modules.rebalance_engine_v2.NativeRouteExecutor") as executor_cls:
         executor = executor_cls.return_value
         executor.is_available.return_value = True
         executor.execute.return_value = ExecutionResult(
@@ -1640,6 +1636,250 @@ def test_engine_runs_planner_selected_pair_without_local_route_snapshot(
     assert len(result.executions) == 1
     executor.execute.assert_called_once()
     assert executor.execute.call_args.kwargs["route"] == []
+
+
+def test_engine_native_executor_consumes_priced_route(mock_plugin, mock_database):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_executor = "native"
+    priced_route = [
+        {
+            "id": "02" + "b" * 64,
+            "channel": "100x1x0",
+            "amount_msat": 50_010_000,
+            "delay": 40,
+        },
+        {
+            "id": "03" + "u" * 64,
+            "channel": "200x1x0",
+            "amount_msat": 50_000_000,
+            "delay": 18,
+        },
+    ]
+    engine.find_candidates = MagicMock(
+        return_value=[
+            PairCandidate(
+                source_channel_id="100x1x0",
+                dest_channel_id="200x1x0",
+                source_peer_id="02" + "b" * 64,
+                dest_peer_id="02" + "c" * 64,
+                amount_sats=50_000,
+                pair_budget_sats=10,
+                route=priced_route,
+            )
+        ]
+    )
+
+    with patch("modules.rebalance_engine_v2.NativeRouteExecutor") as executor_cls:
+        executor = executor_cls.return_value
+        executor.is_available.return_value = True
+        executor.execute.return_value = ExecutionResult(
+            success=True,
+            fee_msat=10_000,
+            fee_sats=10,
+            route_type="native",
+        )
+
+        result = engine.run_cycle()
+
+    assert len(result.executions) == 1
+    assert result.executions[0].route_type == "native"
+    executor.execute.assert_called_once()
+    assert executor.execute.call_args.kwargs["route"] == priced_route
+
+
+def test_engine_native_executor_retries_with_failed_segment_excluded(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_executor = "native"
+    engine._cycle_router = MagicMock()
+    engine._hive_router = None
+    original_route = [
+        {
+            "id": "02" + "b" * 64,
+            "channel": "100x1x0",
+            "amount_msat": 50_010_000,
+            "delay": 40,
+        },
+        {
+            "id": "03" + "u" * 64,
+            "channel": "200x1x0",
+            "amount_msat": 50_000_000,
+            "delay": 18,
+        },
+    ]
+    retry_route = [
+        {
+            "id": "02" + "b" * 64,
+            "channel": "100x1x0",
+            "amount_msat": 50_011_000,
+            "delay": 40,
+        },
+        {
+            "id": "02" + "d" * 64,
+            "channel": "175x1x0",
+            "direction": 0,
+            "amount_msat": 50_010_000,
+            "delay": 30,
+        },
+        {
+            "id": "03" + "u" * 64,
+            "channel": "200x1x0",
+            "amount_msat": 50_000_000,
+            "delay": 18,
+        },
+    ]
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=20,
+        route=original_route,
+    )
+    engine._route_pair = MagicMock(
+        return_value=(
+            SimpleNamespace(
+                success=True,
+                route_cost_sats=11,
+                route=retry_route,
+                probability_ppm=0,
+                error="",
+            ),
+            "market",
+        )
+    )
+    executor = MagicMock()
+    first = ExecutionResult(
+        success=False,
+        amount_sats=50_000,
+        route_type="native",
+        attempts=1,
+        error="native_sendpay_error: failed: WIRE_TEMPORARY_CHANNEL_FAILURE",
+        excluded_channels=["150x1x0/1"],
+    )
+    second = ExecutionResult(
+        success=True,
+        amount_sats=50_000,
+        route_type="native",
+        attempts=1,
+        fee_sats=11,
+        fee_msat=11_000,
+    )
+    executor.execute.side_effect = [first, second]
+
+    result = engine._execute_pair(pair, executor)
+
+    assert result is second
+    assert result.success is True
+    assert result.attempts == 2
+    assert result.failure_data["previous_failure"].startswith("native_sendpay_error")
+    assert result.failure_data["retry_excluded_channels"] == ["150x1x0/1"]
+    engine._route_pair.assert_called_once()
+    assert engine._route_pair.call_args.kwargs["exclude"] == ["150x1x0/1"]
+    assert executor.execute.call_count == 2
+    assert executor.execute.call_args.kwargs["route"] == retry_route
+
+
+def test_engine_native_executor_retries_smaller_partial_amount_after_liquidity_failure(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_executor = "native"
+    engine._cycle_router = MagicMock()
+    engine._hive_router = None
+    mock_database.record_rebalance.return_value = 123
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=100_000,
+        pair_budget_sats=50,
+        dest_capacity_sats=1_000_000,
+        dest_local_ratio=0.10,
+        route=[{"id": "02" + "b" * 64, "channel": "100x1x0", "amount_msat": 100_010_000}],
+    )
+    partial_route = [
+        {
+            "id": "02" + "b" * 64,
+            "channel": "100x1x0",
+            "amount_msat": 50_006_000,
+            "delay": 40,
+        },
+        {
+            "id": "03" + "u" * 64,
+            "channel": "200x1x0",
+            "amount_msat": 50_000_000,
+            "delay": 18,
+        },
+    ]
+    engine._route_pair = MagicMock(
+        side_effect=[
+            (
+                SimpleNamespace(success=False, error="no_route", route_cost_sats=0),
+                "market",
+            ),
+            (
+                SimpleNamespace(
+                    success=True,
+                    route_cost_sats=6,
+                    route=partial_route,
+                    probability_ppm=0,
+                    error="",
+                ),
+                "market",
+            ),
+        ]
+    )
+    executor = MagicMock()
+    first = ExecutionResult(
+        success=False,
+        amount_sats=100_000,
+        route_type="native",
+        attempts=1,
+        error="native_sendpay_error: failed: WIRE_TEMPORARY_CHANNEL_FAILURE",
+        excluded_channels=["150x1x0/1"],
+        failure_data={"failure_class": "liquidity"},
+    )
+    partial_success = ExecutionResult(
+        success=True,
+        amount_sats=50_000,
+        route_type="native",
+        attempts=1,
+        fee_sats=6,
+        fee_msat=6_000,
+    )
+    executor.execute.side_effect = [first, partial_success]
+
+    result = engine._execute_pair(pair, executor)
+
+    assert result.success is True
+    assert result.amount_sats == 50_000
+    assert result.attempts == 3
+    assert result.failure_data["partial_fill"]["planned_amount_sats"] == 100_000
+    assert result.failure_data["partial_fill"]["executed_amount_sats"] == 50_000
+    assert engine._route_pair.call_args_list[1].kwargs["exclude"] is None
+    assert executor.execute.call_count == 2
+    assert executor.execute.call_args.kwargs["amount_sats"] == 50_000
+    assert executor.execute.call_args.kwargs["route"] == partial_route
+
+    uargs, ukwargs = mock_database.update_rebalance_result.call_args
+    assert uargs[0] == 123
+    assert uargs[1] == "success"
+    assert ukwargs["amount_sats"] == 50_000
+    assert ukwargs["post_local_ratio"] == pytest.approx(0.15)
 
 
 def test_engine_signals_local_route_pricing_failure_without_blocking_selection(
@@ -1685,10 +1925,9 @@ def test_engine_signals_local_route_pricing_failure_without_blocking_selection(
 
         selected = engine.find_candidates()
 
-    # Iter3: when the router can't find a route, the pair is skipped with
-    # reason='no_route' instead of being submitted to sling unpriced
-    # (sling would also fail using the same pathfinder). The skip is
-    # surfaced through the unified plan.skipped audit loop.
+    # Native execution requires a priced explicit route, so no-route pairs are
+    # skipped before reaching execution. The skip is surfaced through the
+    # unified plan.skipped audit loop.
     assert selected == []
     engine.router_v3.price_pair.assert_called_once()
     assert engine.router_v3.price_pair.call_args.kwargs["exclude"] is None
@@ -1701,10 +1940,10 @@ def test_engine_signals_local_route_pricing_failure_without_blocking_selection(
     ), f"expected a no_route skip; got {log_skip_calls}"
 
 
-def test_engine_run_cycle_skips_when_sling_unavailable(mock_plugin, mock_database):
+def test_engine_run_cycle_skips_when_native_executor_unavailable(mock_plugin, mock_database):
     from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_types_v2 import PairCandidate
-    from modules.rebalance_executor_v2 import RebalanceExecutor
+    from modules.rebalance_native_executor_v2 import NativeRouteExecutor
 
     engine = _make_engine(mock_plugin, mock_database)
     engine._build_snapshot = MagicMock(
@@ -1728,7 +1967,7 @@ def test_engine_run_cycle_skips_when_sling_unavailable(mock_plugin, mock_databas
     )
     engine.find_candidates = MagicMock(return_value=[pair])
 
-    with patch.object(RebalanceExecutor, "is_available", return_value=False):
+    with patch.object(NativeRouteExecutor, "is_available", return_value=False):
         result = engine.run_cycle()
 
     assert result.executions == []
@@ -1760,7 +1999,8 @@ def test_engine_records_persistent_pair_failure_after_failed_execution(
         )
     )
 
-    engine.run_cycle()
+    with patch("modules.rebalance_engine_v2.NativeRouteExecutor.is_available", return_value=True):
+        engine.run_cycle()
 
     mock_database.record_pair_rebalance_failure.assert_called_once()
     args, kwargs = mock_database.record_pair_rebalance_failure.call_args
@@ -1768,7 +2008,51 @@ def test_engine_records_persistent_pair_failure_after_failed_execution(
     assert kwargs["cooldown_seconds"] > 0
 
 
-def test_engine_failed_sling_execution_returns_original_failure_without_retry(
+def test_engine_records_unfinished_executions_after_cycle_timeout(
+    mock_plugin, mock_database
+):
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+    class FakeFuture:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+            return True
+
+    pair = SimpleNamespace(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+    )
+    future = FakeFuture()
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.find_candidates = MagicMock(return_value=[pair])
+    engine._pool = MagicMock()
+    engine._pool.submit.return_value = future
+
+    with patch("modules.rebalance_engine_v2.NativeRouteExecutor") as executor_cls, patch(
+        "modules.rebalance_engine_v2.as_completed",
+        side_effect=FuturesTimeoutError,
+    ):
+        executor_cls.return_value.is_available.return_value = True
+        result = engine.run_cycle()
+
+    assert future.cancelled is True
+    assert len(result.executions) == 1
+    assert result.executions[0].error == "executor_timeout"
+    mock_database.record_pair_rebalance_failure.assert_called_once()
+    args, kwargs = mock_database.record_pair_rebalance_failure.call_args
+    assert args[:2] == ("100x1x0", "200x1x0")
+    assert kwargs["cooldown_seconds"] > 0
+
+
+def test_engine_failed_non_native_retry_execution_returns_original_failure_without_retry(
     mock_plugin, mock_database
 ):
     from modules.rebalance_executor_v2 import ExecutionResult
@@ -1849,6 +2133,181 @@ def test_engine_execute_pair_records_pending_then_success_in_rebalance_history(
     assert ukwargs.get("actual_fee_msat") == 3_000
 
 
+def test_engine_auto_execute_pair_accounts_costs_and_budget_reservation(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.record_rebalance.return_value = 77
+    mock_database.reserve_budget.return_value = (True, 9_900)
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        reason_code="ev_positive",
+        route=None,
+    )
+    executor = MagicMock()
+    executor.execute.return_value = ExecutionResult(
+        success=True,
+        amount_sats=50_000,
+        fee_sats=3,
+        fee_msat=2_500,
+    )
+
+    engine._execute_pair(
+        pair,
+        executor,
+        reserve_budget=True,
+        account_costs=True,
+    )
+
+    mock_database.reserve_budget.assert_called_once()
+    rkwargs = mock_database.reserve_budget.call_args.kwargs
+    assert rkwargs["reservation_id"] == "77"
+    assert rkwargs["amount_sats"] == 10_000
+    assert rkwargs["channel_id"] == "200x1x0"
+
+    mock_database.record_rebalance_cost.assert_called_once()
+    ckwargs = mock_database.record_rebalance_cost.call_args.kwargs
+    assert ckwargs["channel_id"] == "200x1x0"
+    assert ckwargs["peer_id"] == "02" + "c" * 64
+    assert ckwargs["cost_sats"] == 3
+    assert ckwargs["cost_msat"] == 2_500
+    assert ckwargs["amount_sats"] == 50_000
+    mock_database.mark_budget_spent.assert_called_once_with("77", 3)
+    mock_database.release_budget_reservation.assert_not_called()
+
+
+def test_engine_auto_execute_pair_releases_budget_on_failure(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.record_rebalance.return_value = 88
+    mock_database.reserve_budget.return_value = (True, 9_900)
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        reason_code="ev_positive",
+        route=None,
+    )
+    executor = MagicMock()
+    executor.execute.return_value = ExecutionResult(
+        success=False,
+        error="retriable_failure: NoRoutes",
+    )
+
+    result = engine._execute_pair(
+        pair,
+        executor,
+        reserve_budget=True,
+        account_costs=True,
+    )
+
+    assert result.success is False
+    mock_database.record_rebalance_cost.assert_not_called()
+    mock_database.mark_budget_spent.assert_not_called()
+    mock_database.release_budget_reservation.assert_called_once_with("88")
+
+
+def test_engine_auto_execute_pair_blocks_when_budget_reservation_fails(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.record_rebalance.return_value = 99
+    mock_database.reserve_budget.return_value = (False, 5)
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        reason_code="ev_positive",
+        route=None,
+    )
+    executor = MagicMock()
+
+    result = engine._execute_pair(
+        pair,
+        executor,
+        reserve_budget=True,
+        account_costs=True,
+    )
+
+    assert result.success is False
+    assert "local_budget_block" in result.error
+    executor.execute.assert_not_called()
+    mock_database.update_rebalance_result.assert_called_once()
+    uargs, ukwargs = mock_database.update_rebalance_result.call_args
+    assert uargs[0] == 99
+    assert uargs[1] == "failed"
+    assert "local_budget_block" in (ukwargs.get("error_message") or "")
+
+
+def test_engine_explicit_execute_candidate_leaves_budget_to_caller(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalancer import RebalanceCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._active_router = MagicMock(return_value=MagicMock())
+    engine._route_pair = MagicMock(
+        return_value=(
+            SimpleNamespace(success=True, route_cost_sats=1, route=[]),
+            "market",
+        )
+    )
+    engine._execute_pair = MagicMock(
+        return_value=ExecutionResult(success=True, fee_sats=1, fee_msat=1000)
+    )
+
+    candidate = RebalanceCandidate(
+        source_candidates=["100x1x0"],
+        to_channel="200x1x0",
+        primary_source_peer_id="02" + "b" * 64,
+        to_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        amount_msat=50_000_000,
+        outbound_fee_ppm=0,
+        inbound_fee_ppm=0,
+        source_fee_ppm=0,
+        weighted_opp_cost_ppm=0,
+        spread_ppm=0,
+        max_budget_sats=10_000,
+        max_budget_msat=10_000_000,
+        max_fee_ppm=200_000,
+        expected_profit_sats=0,
+        liquidity_ratio=0.5,
+        dest_flow_state="manual",
+        dest_turnover_rate=0.0,
+        source_turnover_rate=0.0,
+    )
+
+    engine.execute_candidate(candidate)
+
+    assert engine._execute_pair.call_args.kwargs["reserve_budget"] is False
+    assert engine._execute_pair.call_args.kwargs["account_costs"] is False
+
+
 def test_engine_execute_pair_records_failed_result_on_executor_failure(
     mock_plugin, mock_database
 ):
@@ -1871,7 +2330,7 @@ def test_engine_execute_pair_records_failed_result_on_executor_failure(
     executor = MagicMock()
     executor.execute.return_value = ExecutionResult(
         success=False,
-        error="sling_preflight_error: no sling",
+        error="native_sendpay_error: temporary_channel_failure",
     )
 
     engine._execute_pair(pair, executor)
@@ -1881,7 +2340,7 @@ def test_engine_execute_pair_records_failed_result_on_executor_failure(
     uargs, ukwargs = mock_database.update_rebalance_result.call_args
     assert uargs[0] == 42
     assert uargs[1] == "failed"
-    assert "sling_preflight_error" in (ukwargs.get("error_message") or "")
+    assert "native_sendpay_error" in (ukwargs.get("error_message") or "")
 
 
 def test_engine_execute_pair_survives_db_record_failure(
@@ -1938,7 +2397,8 @@ def test_engine_clears_persisted_pair_failure_after_success(
         return_value=ExecutionResult(success=True, fee_msat=1000, fee_sats=1)
     )
 
-    engine.run_cycle()
+    with patch("modules.rebalance_engine_v2.NativeRouteExecutor.is_available", return_value=True):
+        engine.run_cycle()
 
     mock_database.clear_pair_rebalance_failure.assert_called_once_with(
         "100x1x0", "200x1x0"

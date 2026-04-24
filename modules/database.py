@@ -1944,7 +1944,8 @@ class Database:
                                 actual_fee_msat: Optional[int] = None,
                                 actual_profit_sats: Optional[int] = None,
                                 error_message: Optional[str] = None,
-                                post_local_ratio: Optional[float] = None):
+                                post_local_ratio: Optional[float] = None,
+                                amount_sats: Optional[int] = None):
         """Update a rebalance record with the result.
 
         Phase 3.3: post_local_ratio captures the destination's local ratio
@@ -1963,14 +1964,20 @@ class Database:
             if post_local_ratio is not None
             else None
         )
+        actual_amount = (
+            max(0, int(amount_sats))
+            if amount_sats is not None
+            else None
+        )
         conn.execute("""
             UPDATE rebalance_history
             SET status = ?, actual_fee_sats = ?, actual_fee_msat = ?, actual_profit_sats = ?,
                 error_message = ?, timestamp = ?,
-                post_local_ratio = COALESCE(?, post_local_ratio)
+                post_local_ratio = COALESCE(?, post_local_ratio),
+                amount_sats = COALESCE(?, amount_sats)
             WHERE id = ?
         """, (status, fee_sats, fee_msat, actual_profit_sats, error_message,
-              int(time.time()), anchor_ratio, rebalance_id))
+              int(time.time()), anchor_ratio, actual_amount, rebalance_id))
 
     def get_last_post_rebalance_state(
         self, channel_id: str
@@ -2215,9 +2222,9 @@ class Database:
         Get the total rebalancing fees spent since a given timestamp.
         
         Used for Global Capital Controls to enforce daily budget limits.
-        Uses the rebalance_costs table as the source of truth because async Sling
-        jobs may record costs there even when rebalance_history.actual_fee_sats is
-        missing or delayed.
+        Uses the rebalance_costs table as the source of truth because executor
+        jobs may record costs there even when rebalance_history.actual_fee_sats
+        is missing or delayed.
         
         Args:
             since_timestamp: Unix timestamp to start summing from
@@ -2976,7 +2983,7 @@ class Database:
         """
         Clear ALL active budget reservations (Issue #33).
 
-        Use this to reset the reservation system when sling jobs are
+        Use this to reset the reservation system when executor jobs are
         manually stopped or stuck. Releases all active reservations
         regardless of age.
 
