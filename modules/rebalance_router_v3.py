@@ -13,6 +13,7 @@ Research basis: docs/superpowers/specs/2026-04-10-askrene-router-v3-research.md
 
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -179,7 +180,12 @@ class RebalanceRouterV3:
     # Init helpers
     # ------------------------------------------------------------------
 
-    def _probe_layers(self) -> List[str]:
+    def _probe_layers(
+        self,
+        layer_names: Optional[List[str]] = None,
+        *,
+        include_observed_liquidity: bool = True,
+    ) -> List[str]:
         """Check which of the requested layers exist on the node.
 
         Called once at init. askrene-listlayers returns every layer the
@@ -197,8 +203,10 @@ class RebalanceRouterV3:
             return []
 
         live_names = [layer.get("layer", "") for layer in result.get("layers", [])]
-        requested = list(self.layer_names)
+        requested = list(self.layer_names if layer_names is None else layer_names)
         if (
+            include_observed_liquidity
+            and
             OBSERVED_LIQUIDITY_LAYER in live_names
             and OBSERVED_LIQUIDITY_LAYER not in requested
         ):
@@ -227,33 +235,56 @@ class RebalanceRouterV3:
         dest_peer_id: str,
         amount_sats: int,
         exclude: Optional[List[str]] = None,
+        *,
+        layer_names_override: Optional[List[str]] = None,
+        include_observed_liquidity: bool = True,
     ) -> RouteResult:
         """Discover and price a circular rebalance route via askrene getroutes.
 
         Returns a RouteResult matching the v2 router's shape so the engine
         and executor can consume either router's output transparently.
         """
-        final_hop_fee_ppm = self._v2_helpers._get_final_hop_fee_ppm(dest_peer_id)
-        if final_hop_fee_ppm is None:
+        final_hop_policy = self._v2_helpers._get_final_hop_policy(dest_peer_id)
+        if final_hop_policy is None:
             return RouteResult(
                 success=False,
                 error=f"cannot determine final-hop fee for peer {dest_peer_id}",
             )
+        final_hop_fee_ppm = int(final_hop_policy["fee_ppm"])
+        final_hop_fee_base_msat = int(final_hop_policy.get("fee_base_msat", 0) or 0)
         dest_cltv = self._v2_helpers._get_dest_channel_cltv(dest_peer_id)
         invoice_final_cltv = self._v2_helpers._get_invoice_final_cltv()
         required_final_cltv = dest_cltv + invoice_final_cltv
         final_hop_fee_sats = self._v2_helpers._compute_final_hop_fee_sats(
-            amount_sats, final_hop_fee_ppm
+            amount_sats,
+            final_hop_fee_ppm,
+            final_hop_fee_base_msat,
         )
 
         route_amount_msat = (amount_sats + final_hop_fee_sats) * 1000
         # Re-probe live layers each call so cl-hive layers created after
         # engine startup are picked up without a plugin restart.
-        layers = list(self._probe_layers())
+        layers = list(
+            self._probe_layers(
+                layer_names_override,
+                include_observed_liquidity=include_observed_liquidity,
+            )
+        )
         if "auto.no_mpp_support" not in layers:
             layers.append("auto.no_mpp_support")
-        if exclude:
-            with self._exclude_layer(exclude) as exc_layer:
+        # The middle askrene query is source_peer -> dest_peer. If we leave
+        # our pinned first/last-hop channels available, askrene can pick a
+        # degenerate path that routes source_peer -> us -> dest_peer. That is
+        # correctly rejected by validation, but it also masks valid external
+        # middle paths. Always exclude the local endpoints from the middle
+        # search, plus any failure exclusions passed by retry logic.
+        middle_excludes = list(exclude or [])
+        for local_scid in (source_channel_id, dest_channel_id):
+            if local_scid and local_scid not in middle_excludes:
+                middle_excludes.append(local_scid)
+
+        if middle_excludes:
+            with self._exclude_layer(middle_excludes) as exc_layer:
                 if exc_layer is not None:
                     layers.append(exc_layer)
                 return self._price_pair_inner(
@@ -264,6 +295,7 @@ class RebalanceRouterV3:
                     amount_sats=amount_sats,
                     route_amount_msat=route_amount_msat,
                     final_hop_fee_ppm=final_hop_fee_ppm,
+                    final_hop_fee_base_msat=final_hop_fee_base_msat,
                     invoice_final_cltv=invoice_final_cltv,
                     required_final_cltv=required_final_cltv,
                     layers=layers,
@@ -276,6 +308,7 @@ class RebalanceRouterV3:
             amount_sats=amount_sats,
             route_amount_msat=route_amount_msat,
             final_hop_fee_ppm=final_hop_fee_ppm,
+            final_hop_fee_base_msat=final_hop_fee_base_msat,
             invoice_final_cltv=invoice_final_cltv,
             required_final_cltv=required_final_cltv,
             layers=layers,
@@ -291,6 +324,7 @@ class RebalanceRouterV3:
         amount_sats: int,
         route_amount_msat: int,
         final_hop_fee_ppm: int,
+        final_hop_fee_base_msat: int,
         invoice_final_cltv: int,
         required_final_cltv: int,
         layers: List[str],
@@ -313,7 +347,7 @@ class RebalanceRouterV3:
             return RouteResult(success=False, error=f"{reason}: {detail}")
 
         routes = result.get("routes", [])
-        if not routes:
+        if not isinstance(routes, list) or not routes:
             return RouteResult(
                 success=False, error="no_route: getroutes returned empty"
             )
@@ -334,21 +368,51 @@ class RebalanceRouterV3:
         middle_sendpay = [
             _translate_getroutes_hop_to_sendpay(hop) for hop in middle_path
         ]
+        middle_sendpay, reprice_error = self._v2_helpers._reprice_middle_route_amounts(
+            middle_sendpay,
+            final_amount_msat=route_amount_msat,
+        )
+        if middle_sendpay is None:
+            return RouteResult(success=False, error=reprice_error)
 
         # Wrap the middle path with our own first and last hops to produce
         # a full circular sendpay route: us → peer_A → ... → peer_B → us.
         # v2's executor expects sendpay format (channel, direction, id, amount, delay).
-        middle_fee_msat = self._route_fee_msat(cheapest)
         final_hop_fee_sats = self._v2_helpers._compute_final_hop_fee_sats(
-            amount_sats, final_hop_fee_ppm
+            amount_sats,
+            final_hop_fee_ppm,
+            final_hop_fee_base_msat,
         )
-        total_forward_msat = (
-            amount_sats + final_hop_fee_sats + (middle_fee_msat + 999) // 1000
-        ) * 1000
-
-        first_hop_delay = (
-            middle_sendpay[0]["delay"] if middle_sendpay else required_final_cltv
-        )
+        if middle_sendpay:
+            first_middle_hop = middle_sendpay[0]
+            first_middle_policy = self._v2_helpers._get_first_middle_hop_policy(
+                source_peer_id,
+                first_middle_hop,
+            )
+            if first_middle_policy is None:
+                return RouteResult(
+                    success=False,
+                    error=(
+                        "cannot determine source peer forwarding policy for "
+                        f"{first_middle_hop.get('channel')}"
+                    ),
+                )
+            middle_forward_msat = _parse_msat(first_middle_hop.get("amount_msat"))
+            first_middle_fee_msat = (
+                int(first_middle_policy["fee_base_msat"])
+                + math.ceil(
+                    middle_forward_msat
+                    * int(first_middle_policy["fee_ppm"])
+                    / 1_000_000
+                )
+            )
+            total_forward_msat = middle_forward_msat + first_middle_fee_msat
+            first_hop_delay = int(first_middle_hop.get("delay", 0) or 0) + int(
+                first_middle_policy["cltv_delta"]
+            )
+        else:
+            total_forward_msat = (amount_sats + final_hop_fee_sats) * 1000
+            first_hop_delay = required_final_cltv
 
         first_hop = {
             "id": source_peer_id,
@@ -373,9 +437,10 @@ class RebalanceRouterV3:
 
         full_route = [first_hop] + middle_sendpay + [final_hop]
 
-        total_cost_sats = (
-            (middle_fee_msat + 999) // 1000
-        ) + final_hop_fee_sats
+        total_cost_sats = max(
+            0,
+            math.ceil((total_forward_msat - (amount_sats * 1000)) / 1000),
+        )
 
         # Pass askrene's per-route success-probability estimate through to
         # the engine so the probability-aware budget relaxation can see it.
@@ -427,7 +492,7 @@ class RebalanceRouterV3:
             else:
                 self.plugin.rpc.call("askrene-create-layer", {"layer": layer_name})
             for entry in failed_channel_ids:
-                # rebalance_executor_v2 reports exclude entries in directional
+                # Native execution reports exclude entries in directional
                 # form 'scid/dir' (PR #82) so getroute and askrene both accept
                 # them directly. Detect the suffix and disable only that
                 # specific direction. Fall back to disabling both directions

@@ -284,6 +284,8 @@ class RebalancePlanner:
                     dest_capacity_sats=dest.capacity_sats,
                     source_value_class=src.value_class,
                     dest_value_class=dest.value_class,
+                    source_budget_source=src.budget_source,
+                    dest_budget_source=dest.budget_source,
                     score=score,
                     source_local_ratio=src.local_ratio,
                     dest_local_ratio=dest.local_ratio,

@@ -728,10 +728,19 @@ class HiveHintAdapter:
             }
         age = int(time.time()) - int(self._snapshot.get("generated_at", 0))
         hints = self._snapshot.get("hints", {})
+        member_hints = [
+            hint
+            for hint in hints.values()
+            if isinstance(hint, dict) and bool(hint.get("member", False))
+        ]
         return {
             "snapshot_fresh": self.is_fresh(),
             "snapshot_usable": self.is_usable(),
             "stale_fallback": self._using_stale_fallback,
             "snapshot_age_seconds": age,
             "hints_count": len(hints),
+            "member_hints_count": len(member_hints),
+            "rebalance_recommendations_count": len(self.get_rebalance_recommendations()),
+            "rebalance_campaigns_count": len(self.get_rebalance_campaigns()),
+            "route_segment_leases_count": len(self.get_route_segment_leases()),
         }

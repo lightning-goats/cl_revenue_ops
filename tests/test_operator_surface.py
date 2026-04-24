@@ -14,6 +14,13 @@ def test_public_runtime_keys_are_safety_only():
         "daily_budget_sats",
         "min_fee_ppm",
         "max_fee_ppm",
+        "fee_profile",
+        "fee_market_boundary_enabled",
+        "fee_market_boundary_min_competitors",
+        "fee_market_boundary_margin_ppm",
+        "fee_market_boundary_margin_ratio",
+        "fee_market_boundary_max_downshift_ratio",
+        "fee_market_boundary_cache_seconds",
         "planner_enabled",
         "planner_dry_run",
         "planner_execute_closes",
@@ -28,9 +35,8 @@ def test_internal_knobs_are_not_public():
 
     assert "enable_vegas_reflex" not in cfg.public_runtime_keys()
     assert "thompson_prior_std_fee" not in cfg.public_runtime_keys()
-    assert "sling_target_sink" not in cfg.public_runtime_keys()
-    assert "sling_candidates_min_age" not in cfg.public_runtime_keys()
-    assert "sling_maxhops" not in cfg.public_runtime_keys()
+    assert "askrene_layers" not in cfg.public_runtime_keys()
+    assert "hive_hints_enabled" not in cfg.public_runtime_keys()
 
 
 def test_public_runtime_dict_returns_only_public_keys():
@@ -41,6 +47,13 @@ def test_public_runtime_dict_returns_only_public_keys():
         "daily_budget_sats": 1200,
         "min_fee_ppm": 15,
         "max_fee_ppm": 2500,
+        "fee_profile": "active",
+        "fee_market_boundary_enabled": True,
+        "fee_market_boundary_min_competitors": 1,
+        "fee_market_boundary_margin_ppm": 5,
+        "fee_market_boundary_margin_ratio": 0.05,
+        "fee_market_boundary_max_downshift_ratio": 0.35,
+        "fee_market_boundary_cache_seconds": 60,
         "planner_enabled": False,
         "planner_dry_run": False,
         "planner_execute_closes": False,
@@ -55,8 +68,8 @@ def test_runtime_key_classification_distinguishes_public_deprecated_and_internal
 
     assert cfg.classify_runtime_key("paused") == "public"
     assert cfg.classify_runtime_key("enable_vegas_reflex") == "internal"
-    assert cfg.classify_runtime_key("sling_candidates_min_age") == "internal"
-    assert cfg.classify_runtime_key("sling_stats_delete_failures_age") == "internal"
+    assert cfg.classify_runtime_key("askrene_layers") == "internal"
+    assert cfg.classify_runtime_key("hive_hints_enabled") == "internal"
     assert cfg.classify_runtime_key("dry_run") == "internal"
 
 
@@ -123,16 +136,7 @@ def _run_init_with_stubbed_dependencies(
     fake_rpc.listplugins.return_value = {"plugins": []}
     fake_rpc.listforwards.return_value = {"forwards": []}
     fake_rpc.listpeers.return_value = {"peers": []}
-    fake_rpc.listconfigs.return_value = listconfigs_payload or {
-        "configs": {
-            "sling-stats-delete-failures-age": {},
-            "sling-stats-delete-successes-age": {},
-            "sling-candidates-min-age": {},
-            "sling-maxhops": {},
-            "sling-depleteuptopercent": {},
-            "sling-depleteuptoamount": {},
-        }
-    }
+    fake_rpc.listconfigs.return_value = listconfigs_payload or {"configs": {}}
     if rpc_mutator is not None:
         rpc_mutator(fake_rpc)
 
@@ -275,13 +279,13 @@ def test_init_wires_rebalancer_back_into_capacity_planner(monkeypatch):
     assert planner_mock.rebalancer is rebalancer_mock
 
 
-def test_init_logs_sling_backed_rebalancing(monkeypatch):
+def test_init_logs_native_route_rebalancing(monkeypatch):
     mod = load_plugin_module()
     _run_init_with_stubbed_dependencies(mod, monkeypatch)
 
     messages = [call.args[0] for call in mod.plugin.log.call_args_list if call.args]
 
-    assert any("sling" in message.lower() for message in messages)
+    assert any("native route execution" in message.lower() for message in messages)
     assert not any("getroute + sendpay" in message for message in messages)
 
 
@@ -437,6 +441,59 @@ def test_hive_hint_plugin_options_are_registered():
     assert mod.plugin.options["revenue-ops-hive-hints-ttl"]["default"] == "0"
 
 
+def test_rebalance_tuning_plugin_options_are_dynamic():
+    mod = load_plugin_module()
+
+    for option in (
+        "revenue-ops-rebalance-hold-margin",
+        "revenue-ops-pair-fee-cap-ppm",
+        "revenue-ops-hive-rebalance-bootstrap-budget-sats",
+    ):
+        assert mod.plugin.options[option]["dynamic"] is True
+        assert mod.plugin.options[option]["on_change"] is mod._on_rebalance_tuning_change
+
+
+def test_rebalance_tuning_setconfig_updates_live_config():
+    mod = load_plugin_module()
+    mod.config = SimpleNamespace(
+        rebalance_hold_margin=0.0,
+        pair_fee_cap_ppm=1000,
+        hive_rebalance_bootstrap_budget_sats=300,
+    )
+
+    mod._on_rebalance_tuning_change(
+        mod.plugin,
+        "revenue-ops-rebalance-hold-margin",
+        "0.25",
+    )
+    mod._on_rebalance_tuning_change(
+        mod.plugin,
+        "revenue-ops-pair-fee-cap-ppm",
+        "750",
+    )
+    mod._on_rebalance_tuning_change(
+        mod.plugin,
+        "revenue-ops-hive-rebalance-bootstrap-budget-sats",
+        "125",
+    )
+
+    assert mod.config.rebalance_hold_margin == 0.25
+    assert mod.config.pair_fee_cap_ppm == 750
+    assert mod.config.hive_rebalance_bootstrap_budget_sats == 125
+
+
+def test_rebalance_tuning_setconfig_rejects_out_of_range_values():
+    mod = load_plugin_module()
+    mod.config = SimpleNamespace(rebalance_hold_margin=0.0)
+
+    with pytest.raises(ValueError, match="<= 1.0"):
+        mod._on_rebalance_tuning_change(
+            mod.plugin,
+            "revenue-ops-rebalance-hold-margin",
+            "1.25",
+        )
+
+
 def test_askrene_layer_option_defaults_to_hive_fleet_bias():
     mod = load_plugin_module()
 
@@ -453,6 +510,13 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
     assert result["mutable_keys"] == [
         "capex_probability_budget_bonus",
         "daily_budget_sats",
+        "fee_market_boundary_cache_seconds",
+        "fee_market_boundary_enabled",
+        "fee_market_boundary_margin_ppm",
+        "fee_market_boundary_margin_ratio",
+        "fee_market_boundary_max_downshift_ratio",
+        "fee_market_boundary_min_competitors",
+        "fee_profile",
         "max_fee_ppm",
         "min_fee_ppm",
         "paused",
@@ -462,7 +526,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "planner_max_closes_per_cycle",
         "planner_max_opens_per_cycle",
     ]
-    assert result["count"] == 10
+    assert result["count"] == 17
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -475,6 +539,13 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "daily_budget_sats": 1200,
         "min_fee_ppm": 15,
         "max_fee_ppm": 2500,
+        "fee_profile": "active",
+        "fee_market_boundary_enabled": True,
+        "fee_market_boundary_min_competitors": 1,
+        "fee_market_boundary_margin_ppm": 5,
+        "fee_market_boundary_margin_ratio": 0.05,
+        "fee_market_boundary_max_downshift_ratio": 0.35,
+        "fee_market_boundary_cache_seconds": 60,
         "planner_enabled": False,
         "planner_dry_run": False,
         "planner_execute_closes": False,
@@ -737,6 +808,13 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "daily_budget_sats": 1200,
         "min_fee_ppm": 15,
         "max_fee_ppm": 2500,
+        "fee_profile": "active",
+        "fee_market_boundary_enabled": True,
+        "fee_market_boundary_min_competitors": 1,
+        "fee_market_boundary_margin_ppm": 5,
+        "fee_market_boundary_margin_ratio": 0.05,
+        "fee_market_boundary_max_downshift_ratio": 0.35,
+        "fee_market_boundary_cache_seconds": 60,
         "planner_enabled": False,
         "planner_dry_run": False,
         "planner_execute_closes": False,

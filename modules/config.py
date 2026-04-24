@@ -29,6 +29,13 @@ PUBLIC_RUNTIME_KEYS = (
     'daily_budget_sats',
     'min_fee_ppm',
     'max_fee_ppm',
+    'fee_profile',
+    'fee_market_boundary_enabled',
+    'fee_market_boundary_min_competitors',
+    'fee_market_boundary_margin_ppm',
+    'fee_market_boundary_margin_ratio',
+    'fee_market_boundary_max_downshift_ratio',
+    'fee_market_boundary_cache_seconds',
     'planner_enabled',
     'planner_dry_run',
     'planner_execute_closes',
@@ -48,6 +55,13 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'paused': bool,
     'min_fee_ppm': int,
     'max_fee_ppm': int,
+    'fee_profile': str,
+    'fee_market_boundary_enabled': bool,
+    'fee_market_boundary_min_competitors': int,
+    'fee_market_boundary_margin_ppm': int,
+    'fee_market_boundary_margin_ratio': float,
+    'fee_market_boundary_max_downshift_ratio': float,
+    'fee_market_boundary_cache_seconds': int,
     'daily_budget_sats': int,
     'weekly_budget_sats': int,
     'hot_channel_protection_enabled': bool,
@@ -91,12 +105,12 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_drift_override_ratio': float,
     'rebalance_hold_margin': float,
     'pair_fee_cap_ppm': int,
-    'allow_router_fallback': bool,
     'hive_equalization_enabled': bool,
     'hive_equalization_low_pct': float,
     'hive_equalization_high_pct': float,
     'hive_equalization_cooldown_hours': int,
     'hive_equalization_max_candidates_per_cycle': int,
+    'hive_rebalance_bootstrap_budget_sats': int,
     'rebalance_coordination_reserved_slots': int,
     'hive_push_enabled': bool,
     'hive_push_trigger_ratio': float,
@@ -149,13 +163,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Hive Hints
     'hive_hints_enabled': bool,
     'hive_hints_ttl_seconds': int,
-    # Internal sling runtime hygiene
-    'sling_candidates_min_age': int,
-    'sling_stats_delete_failures_age': int,
-    'sling_stats_delete_successes_age': int,
-    'sling_maxhops': int,
-    'sling_depleteuptopercent': float,
-    'sling_depleteuptoamount': int,
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': float,
     'capex_bootstrap_bps': int,
@@ -177,6 +184,11 @@ DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset()
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
     'max_fee_ppm': (1, 100000),
+    'fee_market_boundary_min_competitors': (1, 100),
+    'fee_market_boundary_margin_ppm': (0, 10000),
+    'fee_market_boundary_margin_ratio': (0.0, 0.50),
+    'fee_market_boundary_max_downshift_ratio': (0.05, 1.0),
+    'fee_market_boundary_cache_seconds': (10, 3600),
     'daily_budget_sats': (0, 10000000),
     'weekly_budget_sats': (0, 70_000_000),
     'boltz_auto_cycle_interval_minutes': (1, 1440),
@@ -236,6 +248,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hive_equalization_high_pct': (0.0, 1.0),
     'hive_equalization_cooldown_hours': (1, 168),
     'hive_equalization_max_candidates_per_cycle': (1, 10),
+    'hive_rebalance_bootstrap_budget_sats': (0, 10_000),
     'rebalance_coordination_reserved_slots': (0, 10),
     'futility_cooldown_hours': (1, 168),
     'target_flow': (1000, 100000000),
@@ -254,13 +267,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_peer_uptime_pct': (0.0, 100.0),
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
     'hive_hints_ttl_seconds': (60, 7200),
-    # Internal sling runtime hygiene
-    'sling_candidates_min_age': (0, 3650),
-    'sling_stats_delete_failures_age': (1, 3650),
-    'sling_stats_delete_successes_age': (1, 3650),
-    'sling_maxhops': (1, 20),
-    'sling_depleteuptopercent': (0.0, 1.0),
-    'sling_depleteuptoamount': (0, 10_000_000_000),
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': (0.0, 1.0),
     'capex_bootstrap_bps': (0, 100),
@@ -275,6 +281,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 # Valid values for string enum fields
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
     'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
+    'fee_profile': ('active', 'conservative'),
     'rebalance_router': ('v3',),
 }
 
@@ -326,8 +333,17 @@ class Config:
     
     # Fee parameters
     min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)
-    max_fee_ppm: int = 5000        # Ceiling fee in PPM
+    max_fee_ppm: int = 2000        # Ceiling fee in PPM (matches plugin option default)
     base_fee_msat: int = 0         # Base fee (we focus on PPM)
+    fee_profile: str = 'active'    # Fee-controller aggressiveness profile
+    # Competitive boundary guard. Median market pricing misses the lab case
+    # where one cheap active competitor owns the route-choice boundary.
+    fee_market_boundary_enabled: bool = True
+    fee_market_boundary_min_competitors: int = 1
+    fee_market_boundary_margin_ppm: int = 5
+    fee_market_boundary_margin_ratio: float = 0.05
+    fee_market_boundary_max_downshift_ratio: float = 0.35
+    fee_market_boundary_cache_seconds: int = 60
     
     # Rebalancing parameters
     rebalance_min_profit: int = 10     # Min profit in sats to trigger (legacy, used when ppm=0)
@@ -353,23 +369,20 @@ class Config:
     rebalance_hold_margin: float = 0.0
     # Iter1 pair fee budget: layered on top of the destination's capex
     # bootstrap budget so a small/new channel can still pay enough route
-    # fee for sling to find a path. pair_budget_sats =
+    # fee for the selected route. pair_budget_sats =
     #   max(dest.remaining_capex_sats, ceil(amount * pair_fee_cap_ppm / 1M)).
     # Default 1000 ppm = 0.1% of rebalance amount. 0 disables the layer
     # and keeps the Phase 5 capex-only behavior.
     pair_fee_cap_ppm: int = 1000
-    # Iter3 escape valve: when True, MARKET_ONLY pairs whose router cannot
-    # find a route are still submitted to sling (legacy fallback_unpriced
-    # behavior). The Polar lab proved sling uses the same pathfinder as
-    # askrene so this is wasted work; default False. Flip True only if a
-    # production node sees askrene reject routes that sling could actually
-    # find -- e.g. unusual gossip lag or askrene layer misconfiguration.
-    allow_router_fallback: bool = False
     hive_equalization_enabled: bool = True  # Fallback pure-hive inventory equalization
     hive_equalization_low_pct: float = 0.35  # Lower bound for hive balance band
     hive_equalization_high_pct: float = 0.65  # Upper bound for hive balance band
     hive_equalization_cooldown_hours: int = 48  # Longer than standard rebalance cooldown
     hive_equalization_max_candidates_per_cycle: int = 1
+    # Conservative fee budget for active hive-member channels whose capex
+    # allocation has not appeared yet. Global/weekly budget reservations still
+    # enforce aggregate spend; 0 disables this bootstrap path.
+    hive_rebalance_bootstrap_budget_sats: int = 300
     hive_push_enabled: bool = True            # Deploy capital to fleet member channels
     hive_push_trigger_ratio: float = 0.60     # Push when local ratio exceeds this
     hive_push_target_ratio: float = 0.50      # Push balance toward this ratio
@@ -481,13 +494,6 @@ class Config:
     # Hive Hints integration
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
-    # Internal sling runtime hygiene
-    sling_candidates_min_age: int = 0
-    sling_stats_delete_failures_age: int = 30
-    sling_stats_delete_successes_age: int = 30
-    sling_maxhops: int = 8
-    sling_depleteuptopercent: float = 0.2
-    sling_depleteuptoamount: int = 2_000_000_000
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50       # Fraction of channel contribution for all capex
     capex_bootstrap_bps: int = 10               # Bootstrap: basis points of capacity per 30d
@@ -516,6 +522,13 @@ class Config:
                 "hive_equalization_low_pct must be less than "
                 "hive_equalization_high_pct"
             )
+        profile = str(self.fee_profile or "active").lower()
+        if profile not in STRING_ENUM_VALID_VALUES["fee_profile"]:
+            raise ValueError(
+                "fee_profile must be one of: "
+                + ", ".join(STRING_ENUM_VALID_VALUES["fee_profile"])
+            )
+        self.fee_profile = profile
         router = str(self.rebalance_router or "v3").lower()
         if router not in STRING_ENUM_VALID_VALUES["rebalance_router"]:
             raise ValueError(
@@ -778,6 +791,13 @@ class ConfigSnapshot:
     min_fee_ppm: int
     max_fee_ppm: int
     base_fee_msat: int
+    fee_profile: str
+    fee_market_boundary_enabled: bool
+    fee_market_boundary_min_competitors: int
+    fee_market_boundary_margin_ppm: int
+    fee_market_boundary_margin_ratio: float
+    fee_market_boundary_max_downshift_ratio: float
+    fee_market_boundary_cache_seconds: int
     
     # Rebalancing parameters
     rebalance_min_profit: int
@@ -791,12 +811,12 @@ class ConfigSnapshot:
     rebalance_drift_override_ratio: float
     rebalance_hold_margin: float
     pair_fee_cap_ppm: int
-    allow_router_fallback: bool
     hive_equalization_enabled: bool
     hive_equalization_low_pct: float
     hive_equalization_high_pct: float
     hive_equalization_cooldown_hours: int
     hive_equalization_max_candidates_per_cycle: int
+    hive_rebalance_bootstrap_budget_sats: int
     hive_push_enabled: bool
     hive_push_trigger_ratio: float
     hive_push_target_ratio: float
@@ -885,13 +905,6 @@ class ConfigSnapshot:
     # Hive Hints
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0
-    # Internal sling runtime hygiene
-    sling_candidates_min_age: int = 0
-    sling_stats_delete_failures_age: int = 30
-    sling_stats_delete_successes_age: int = 30
-    sling_maxhops: int = 8
-    sling_depleteuptopercent: float = 0.2
-    sling_depleteuptoamount: int = 2_000_000_000
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50
     capex_bootstrap_bps: int = 10

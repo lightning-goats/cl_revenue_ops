@@ -10,7 +10,7 @@ Dependencies:
 - pyln-client: Core Lightning plugin framework
 - bookkeeper plugin (built-in): On-chain cost attribution (opens/closes) and accounting-grade events
 - Local forwards table (SQLite): Routing history for flow analysis (hydrated once on startup)
-- Native rebalancer (RebalanceExecutor): Executes rebalance payments via getroutes+sendpay
+- Native rebalancer: prices pairs with askrene getroutes and executes explicit sendpay routes
 
 Author: Lightning Goats Team
 License: MIT
@@ -52,7 +52,7 @@ from modules.policy_manager import (
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.capex_budget import CapexBudgetEngine
 from modules.capital_efficiency import CapitalEfficiencyAnalyzer
-from modules.sling_segment_observations import SlingSegmentObservationStore
+from modules.segment_observations import SegmentObservationStore
 from modules.utils import normalize_scid, parse_msat
 
 
@@ -62,8 +62,8 @@ from modules.utils import normalize_scid, parse_msat
 # v2.4.1: Release Metadata Alignment
 #   - Patch release so the published tag contains the declared plugin version
 #   - Keeps repo version metadata aligned with GitHub release state
-# v2.4.0: Sling Mainline + Fleet Equalization
-#   - Sling rebalancer stack ported to main
+# v2.4.0: Native Route Rebalancing + Fleet Equalization
+#   - Native route-aware rebalancer stack ported to main
 #   - Promoted segment hints consumed in the v3 rebalancer
 #   - Hive equalization restored and expanded with hint-driven 0ppm paths
 #   - Pair cooldown persistence across restarts
@@ -481,6 +481,48 @@ plugin.add_option(
     description='Maximum fee ceiling in PPM (default: 2000)'
 )
 
+plugin.add_option(
+    name='revenue-ops-fee-profile',
+    default='active',
+    description="Fee controller profile: 'active' for normal routing nodes, 'conservative' for low-volume nodes"
+)
+
+plugin.add_option(
+    name='revenue-ops-fee-market-boundary-enabled',
+    default='true',
+    description='Enable cheapest-active-competitor fee boundary guard (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-fee-market-boundary-min-competitors',
+    default='1',
+    description='Minimum active competitors needed before applying fee market boundary guard (default: 1)'
+)
+
+plugin.add_option(
+    name='revenue-ops-fee-market-boundary-margin-ppm',
+    default='5',
+    description='Absolute ppm margin below cheapest active competitor (default: 5)'
+)
+
+plugin.add_option(
+    name='revenue-ops-fee-market-boundary-margin-ratio',
+    default='0.05',
+    description='Fractional margin below cheapest active competitor, combined with ppm margin (default: 0.05)'
+)
+
+plugin.add_option(
+    name='revenue-ops-fee-market-boundary-max-downshift-ratio',
+    default='0.35',
+    description='Max fraction of current fee to drop in one boundary correction cycle (default: 0.35)'
+)
+
+plugin.add_option(
+    name='revenue-ops-fee-market-boundary-cache-seconds',
+    default='60',
+    description='Gossip cache TTL for fee market boundary detection (default: 60)'
+)
+
 
 plugin.add_option(
     name='revenue-ops-rebalance-min-profit',
@@ -506,16 +548,66 @@ plugin.add_option(
     description='Drift since last successful rebalance that bypasses the cooldown (Phase 3, default: 0.30; 0 disables)'
 )
 
+
+def _on_rebalance_tuning_change(plugin_: Plugin, option_name: str, new_value: Any) -> None:
+    """Apply rebalance tuning changes from lightning-cli setconfig at runtime."""
+    tuning_map = {
+        'revenue-ops-rebalance-hold-margin': ('rebalance_hold_margin', float, 0.0, 1.0),
+        'revenue-ops-pair-fee-cap-ppm': ('pair_fee_cap_ppm', int, 0, None),
+        'revenue-ops-hive-rebalance-bootstrap-budget-sats': (
+            'hive_rebalance_bootstrap_budget_sats',
+            int,
+            0,
+            None,
+        ),
+    }
+    if option_name not in tuning_map:
+        return
+    attr, parser, minimum, maximum = tuning_map[option_name]
+    try:
+        parsed_value = parser(new_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{option_name} must be a {parser.__name__}") from exc
+    if minimum is not None and parsed_value < minimum:
+        raise ValueError(f"{option_name} must be >= {minimum}")
+    if maximum is not None and parsed_value > maximum:
+        raise ValueError(f"{option_name} must be <= {maximum}")
+
+    cfg = globals().get('config')
+    if cfg is None:
+        return
+    if not hasattr(cfg, attr):
+        raise ValueError(f"active Config does not support {attr}")
+    old_value = getattr(cfg, attr)
+    setattr(cfg, attr, parsed_value)
+    plugin_.log(
+        f"REBALANCE TUNING: {option_name} changed from {old_value} to {parsed_value}",
+        level='info',
+    )
+
+
 plugin.add_option(
     name='revenue-ops-rebalance-hold-margin',
     default='0.0',
-    description='Minimum final_score a priced pair must clear or it is rejected as below_hold_margin (Phase 4, default: 0.0)'
+    description='Minimum final_score a priced pair must clear or it is rejected as below_hold_margin (Phase 4, default: 0.0)',
+    dynamic=True,
+    on_change=_on_rebalance_tuning_change,
 )
 
 plugin.add_option(
     name='revenue-ops-pair-fee-cap-ppm',
     default='1000',
-    description='Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples per-rebalance fee from capex bootstrap (Iter1, default: 1000 = 0.1% of amount; 0 disables)'
+    description='Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples per-rebalance fee from capex bootstrap (Iter1, default: 1000 = 0.1% of amount; 0 disables)',
+    dynamic=True,
+    on_change=_on_rebalance_tuning_change,
+)
+
+plugin.add_option(
+    name='revenue-ops-hive-rebalance-bootstrap-budget-sats',
+    default='300',
+    description='Conservative per-pair fee budget for active hive-member channels before capex/profitability history appears (default: 300 sats; 0 disables)',
+    dynamic=True,
+    on_change=_on_rebalance_tuning_change,
 )
 
 plugin.add_option(
@@ -531,11 +623,6 @@ plugin.add_option(
     )
 )
 
-plugin.add_option(
-    name='revenue-ops-allow-router-fallback',
-    default='false',
-    description='When true, MARKET_ONLY/HYBRID pairs whose router cannot find a route are still submitted to sling unpriced (legacy fallback_unpriced). Default false; flip true only if production askrene is more pessimistic than sling (Iter3 escape valve).'
-)
 
 plugin.add_option(
     name='revenue-ops-flow-window-days',
@@ -860,36 +947,6 @@ plugin.add_option(
     default='false',
     description='Allow the capacity planner to execute close RPCs (default: false)',
     dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-sling-candidates-min-age',
-    default='0',
-    description='Internal sling hygiene: minimum candidate age in days before rebalance use; 0 allows fresh channels (default: 0)'
-)
-plugin.add_option(
-    name='revenue-ops-sling-stats-delete-failures-age',
-    default='30',
-    description='Internal sling hygiene: retention window for sling failure stats in days (default: 30)'
-)
-plugin.add_option(
-    name='revenue-ops-sling-stats-delete-successes-age',
-    default='30',
-    description='Internal sling hygiene: retention window for sling success stats in days (default: 30)'
-)
-plugin.add_option(
-    name='revenue-ops-sling-maxhops',
-    default='8',
-    description='Internal sling hygiene: maximum hops for sling path search (default: 8)'
-)
-plugin.add_option(
-    name='revenue-ops-sling-depleteuptopercent',
-    default='0.2',
-    description='Internal sling hygiene: depletion guard percent for sling candidate sourcing (default: 0.2)'
-)
-plugin.add_option(
-    name='revenue-ops-sling-depleteuptoamount',
-    default='2000000000',
-    description='Internal sling hygiene: depletion guard amount in sats for sling candidate sourcing (default: 2000000000)'
 )
 plugin.add_option(
     name='revenue-ops-hive-hints-enabled',
@@ -1237,72 +1294,6 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
-def _apply_sling_startup_hygiene(rpc: Any, cfg: Config, plugin: Plugin) -> None:
-    """Inspect the subset of sling runtime knobs owned by this plugin."""
-    desired = (
-        ("sling-stats-delete-failures-age", cfg.sling_stats_delete_failures_age),
-        ("sling-stats-delete-successes-age", cfg.sling_stats_delete_successes_age),
-        ("sling-candidates-min-age", cfg.sling_candidates_min_age),
-        ("sling-maxhops", cfg.sling_maxhops),
-        ("sling-depleteuptopercent", cfg.sling_depleteuptopercent),
-        ("sling-depleteuptoamount", cfg.sling_depleteuptoamount),
-    )
-    try:
-        all_configs = rpc.listconfigs()
-        configs = (all_configs or {}).get("configs", {}) if isinstance(all_configs, dict) else {}
-    except Exception as e:
-        plugin.log(f"Skipping sling startup hygiene: could not inspect config surface: {e}", level='debug')
-        return
-
-    supported = {opt: configs.get(opt, {}) for opt, _ in desired if opt in configs}
-    if not supported:
-        plugin.log(
-            "Skipping sling startup hygiene: sling config keys are not exposed on this node",
-            level='info',
-        )
-        return
-
-    def _entry_value(entry: Any) -> Any:
-        if not isinstance(entry, dict):
-            return None
-        for field_name in ("value_bool", "value_int", "value_msat", "value_str"):
-            if field_name in entry:
-                return entry.get(field_name)
-        return None
-
-    def _serialize(value: Any) -> str:
-        if isinstance(value, bool):
-            return str(value).lower()
-        return str(value)
-
-    drift = []
-    aligned = []
-    for opt, val in desired:
-        if opt not in supported:
-            continue
-        current_value = _entry_value(supported[opt])
-        desired_value = _serialize(val)
-        current_serialized = _serialize(current_value) if current_value is not None else "<unknown>"
-        if current_value is not None and current_serialized == desired_value:
-            aligned.append(f"{opt}={desired_value}")
-        else:
-            drift.append(f"{opt}={current_serialized}->{desired_value}")
-
-    if drift:
-        plugin.log(
-            "Skipping unsafe sling startup hygiene persistence: "
-            "dynamic-load CLN restarts reject persisted plugin-owned sling-* keys. "
-            "Inspect and set sling defaults directly if you need non-default values. "
-            "Drift: " + ", ".join(drift),
-            level='warn',
-        )
-    elif aligned:
-        plugin.log(
-            "Sling runtime hygiene already satisfied by current node config: " + ", ".join(aligned),
-            level='info',
-        )
-
-
 @plugin.init()
 def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin, **kwargs):
     """
@@ -1344,10 +1335,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             except Exception:
                 pass
 
-        # Shutdown RebalanceExecutor thread pool
-        if rebalancer and rebalancer.rebalance_executor:
+        # Shutdown the active rebalance engine thread pool, if it was created.
+        rebalance_engine = getattr(rebalancer, "rebalance_engine_v2", None) if rebalancer else None
+        if rebalance_engine is not None and hasattr(rebalance_engine, "shutdown"):
             try:
-                rebalancer.rebalance_executor.shutdown()
+                rebalance_engine.shutdown()
             except Exception:
                 pass
 
@@ -1418,6 +1410,25 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         target_flow=_safe_int('revenue-ops-target-flow'),
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
+        fee_profile=str(options.get('revenue-ops-fee-profile', 'active') or 'active').lower(),
+        fee_market_boundary_enabled=options.get(
+            'revenue-ops-fee-market-boundary-enabled', 'true'
+        ).lower() == 'true',
+        fee_market_boundary_min_competitors=_safe_int_opt(
+            'revenue-ops-fee-market-boundary-min-competitors', '1'
+        ),
+        fee_market_boundary_margin_ppm=_safe_int_opt(
+            'revenue-ops-fee-market-boundary-margin-ppm', '5'
+        ),
+        fee_market_boundary_margin_ratio=_safe_float_opt(
+            'revenue-ops-fee-market-boundary-margin-ratio', '0.05'
+        ),
+        fee_market_boundary_max_downshift_ratio=_safe_float_opt(
+            'revenue-ops-fee-market-boundary-max-downshift-ratio', '0.35'
+        ),
+        fee_market_boundary_cache_seconds=_safe_int_opt(
+            'revenue-ops-fee-market-boundary-cache-seconds', '60'
+        ),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         rebalance_emergency_local_ratio=_safe_float_opt(
             'revenue-ops-rebalance-emergency-local-ratio', '0.10'
@@ -1431,12 +1442,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         pair_fee_cap_ppm=_safe_int_opt(
             'revenue-ops-pair-fee-cap-ppm', '1000'
         ),
+        hive_rebalance_bootstrap_budget_sats=_safe_int_opt(
+            'revenue-ops-hive-rebalance-bootstrap-budget-sats', '300'
+        ),
         rebalance_coordination_reserved_slots=_safe_int_opt(
             'revenue-ops-rebalance-coordination-reserved-slots', '2'
         ),
-        allow_router_fallback=options.get(
-            'revenue-ops-allow-router-fallback', 'false'
-        ).lower() == 'true',
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
@@ -1463,12 +1474,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
         planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
-        sling_candidates_min_age=_safe_int_opt('revenue-ops-sling-candidates-min-age', '0'),
-        sling_stats_delete_failures_age=_safe_int_opt('revenue-ops-sling-stats-delete-failures-age', '30'),
-        sling_stats_delete_successes_age=_safe_int_opt('revenue-ops-sling-stats-delete-successes-age', '30'),
-        sling_maxhops=_safe_int_opt('revenue-ops-sling-maxhops', '8'),
-        sling_depleteuptopercent=_safe_float_opt('revenue-ops-sling-depleteuptopercent', '0.2'),
-        sling_depleteuptoamount=_safe_int_opt('revenue-ops-sling-depleteuptoamount', '2000000000'),
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
         hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
         rebalance_router='v3',
@@ -1495,6 +1500,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     plugin.log(f"Configuration loaded: target_flow={config.target_flow}, "
                f"fee_range=[{config.min_fee_ppm}, {config.max_fee_ppm}], "
+               f"fee_profile={config.fee_profile}, "
+               f"rebalance_executor=native, "
                f"dry_run={config.dry_run}")
     
     # Create thread-safe RPC proxy (High-Uptime Stability)
@@ -1544,7 +1551,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             
         active_plugins = [p.get("name", "").lower() for p in plugins_result.get("plugins", [])]
         
-        plugin.log("Rebalancing uses RebalanceEngineV2 with sling-backed execution")
+        plugin.log("Rebalancing uses RebalanceEngineV2 with native route execution")
 
         # Check for bookkeeper plugin
         bookkeeper_found = any("bookkeeper" in name for name in active_plugins)
@@ -1582,8 +1589,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         plugin.log(f"Warning: Could not load config overrides: {e}", level='warn')
 
-    _apply_sling_startup_hygiene(safe_plugin.rpc, config, plugin)
-    
     # =========================================================================
     # FORWARDS TABLE HYDRATION (TODO #19: Double-Dip Fix)
     # =========================================================================
@@ -1808,7 +1813,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Rebalance engine: unified actual-fee pipeline
     from modules.rebalance_engine_v2 import RebalanceEngine
-    segment_observation_store = SlingSegmentObservationStore()
+    segment_observation_store = SegmentObservationStore()
     if rebalancer is not None:
         rebalancer.rebalance_engine_v2 = RebalanceEngine(
             plugin=safe_plugin,
@@ -1820,6 +1825,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             data_service=data_service,
             hive_router=hive_router,
             segment_observation_store=segment_observation_store,
+            global_budget_limit_provider=_total_cost_budget_limit_provider,
+            external_liquidity_cost_provider=_non_rebalance_liquidity_cost_components,
         )
         rebalancer.data_service = data_service
         plugin.log("RebalanceEngine initialized")
@@ -1894,19 +1901,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
 
         while not shutdown_event.is_set():
-            # Poll hive hints once per fee cycle
-            if hive_hints is not None:
-                try:
-                    hive_hints.poll()
-                except Exception:
-                    pass  # fail-open
-
-            # Apply corridor-aware auto-policies (runs after hint refresh)
-            if policy_manager is not None and hive_hints is not None:
-                try:
-                    policy_manager.apply_corridor_policies()
-                except Exception:
-                    pass  # fail-open
+            _refresh_fee_cycle_hive_inputs()
 
             try:
                 plugin.log("Running scheduled fee adjustment...")
@@ -2216,6 +2211,21 @@ def run_flow_analysis():
         raise
 
 
+def _refresh_fee_cycle_hive_inputs():
+    """Refresh advisory hive inputs before any fee adjustment path."""
+    if hive_hints is not None:
+        try:
+            hive_hints.poll()
+        except Exception:
+            pass  # fail-open
+
+    if policy_manager is not None and hive_hints is not None:
+        try:
+            policy_manager.apply_corridor_policies()
+        except Exception:
+            pass  # fail-open
+
+
 
 def run_fee_adjustment():
     """
@@ -2225,7 +2235,7 @@ def run_fee_adjustment():
     """
     if fee_controller is None:
         plugin.log("Fee controller not initialized", level='error')
-        return
+        return []
     
     try:
         adjustments = fee_controller.adjust_all_fees()
@@ -2265,6 +2275,7 @@ def run_fee_adjustment():
 
         # Push dashboard snapshot (cheap, idempotent, runs each fee cycle)
         _push_dashboard_to_datastore()
+        return adjustments
 
     except Exception as e:
         plugin.log(f"Fee adjustment failed: {e}", level='error')
@@ -2306,6 +2317,32 @@ def run_rebalance_check():
     except Exception as e:
         plugin.log(f"Rebalance check failed: {e}", level='error')
         raise
+
+
+@plugin.method("revenue-rebalance-cycle")
+def revenue_rebalance_cycle(plugin: Plugin, max_candidates: int = 20) -> Dict[str, Any]:
+    """Run one automatic rebalance cycle immediately and return debug state."""
+    if rebalancer is None:
+        return {"error": "Rebalancer not initialized"}
+    try:
+        refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
+    except Exception:
+        pass  # fail-open; missing hive must not block standalone rebalancing
+    try:
+        run_rebalance_check()
+        engine = getattr(rebalancer, "rebalance_engine_v2", None)
+        cycle_debug = (
+            engine.get_last_cycle_debug(max_candidates=max_candidates)
+            if engine is not None and hasattr(engine, "get_last_cycle_debug")
+            else {}
+        )
+        return {
+            "status": "success",
+            "rebalance_decision": rebalancer.get_last_decision_summary(),
+            "last_cycle": cycle_debug,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # =============================================================================
@@ -2758,18 +2795,26 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     if database is None or fee_controller is None:
         return {"error": "Plugin not fully initialized"}
 
-    # Import fee controller constants for accurate debug output
-    from modules.fee_controller import FeeController
-    min_obs_hours = FeeController.MIN_OBSERVATION_HOURS
-    min_forwards = FeeController.MIN_FORWARDS_FOR_SIGNAL
+    cfg_snap = config.snapshot() if hasattr(config, "snapshot") else config
+    profile = fee_controller.get_fee_profile_settings(cfg_snap)
+    min_obs_hours = profile["min_observation_hours"]
+    min_forwards = profile["min_forwards_for_signal"]
 
     now = int(time.time())
     result = {
         "timestamp": now,
         "config": {
             "fee_interval_seconds": config.fee_interval if config else 1800,
+            "fee_profile": profile["name"],
+            "market_boundary_enabled": getattr(cfg_snap, "fee_market_boundary_enabled", True),
+            "market_boundary_min_competitors": getattr(cfg_snap, "fee_market_boundary_min_competitors", 1),
+            "market_boundary_margin_ppm": getattr(cfg_snap, "fee_market_boundary_margin_ppm", 5),
+            "market_boundary_margin_ratio": getattr(cfg_snap, "fee_market_boundary_margin_ratio", 0.05),
+            "market_boundary_max_downshift_ratio": getattr(cfg_snap, "fee_market_boundary_max_downshift_ratio", 0.35),
+            "market_boundary_cache_seconds": getattr(cfg_snap, "fee_market_boundary_cache_seconds", 60),
             "min_observation_hours": min_obs_hours,
             "min_forwards_for_signal": min_forwards,
+            "profile_settings": profile,
         },
         "channels": [],
         "summary": {
@@ -2796,6 +2841,12 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         forward_count = fs.get("forward_count_since_update", 0)
         last_broadcast_fee = fs.get("last_broadcast_fee_ppm", 0)
         last_revenue_rate = fs.get("last_revenue_rate", 0.0)
+        v2_state = {}
+        try:
+            v2_state = json.loads(fs.get("v2_state_json") or "{}")
+        except Exception:
+            v2_state = {}
+        ts_state = v2_state.get("thompson_state") or {}
 
         hours_since_update = (now - last_update) / 3600.0 if last_update > 0 else 0.0
 
@@ -2833,10 +2884,36 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "last_broadcast_fee_ppm": last_broadcast_fee,
             "last_revenue_rate": round(last_revenue_rate, 2),
             "flow_state": chan_state.get("state", "unknown"),
+            "fee_profile": v2_state.get("last_fee_profile", profile["name"]),
+            "dts": {
+                "posterior_mean": ts_state.get("posterior_mean"),
+                "posterior_std": ts_state.get("posterior_std"),
+                "observations": len(ts_state.get("observations") or []),
+                "last_sampled_fee": ts_state.get("last_sampled_fee"),
+            },
+            "context": {
+                "key": v2_state.get("last_context_key", ""),
+                "time_bucket": v2_state.get("last_time_bucket", "normal"),
+                "corridor_role": v2_state.get("last_corridor_role", "P"),
+                "contextual_sample_used": bool(v2_state.get("last_contextual_sample_used", False)),
+                "contexts_tracked": len(ts_state.get("contextual_posteriors") or {}),
+            },
         })
         result["summary"]["total"] += 1
 
     return result
+
+
+@plugin.method("revenue-fee-cycle")
+def revenue_fee_cycle(plugin: Plugin) -> Dict[str, Any]:
+    """Run one fee adjustment cycle immediately."""
+    _refresh_fee_cycle_hive_inputs()
+    adjustments = run_fee_adjustment() or []
+    return {
+        "ok": True,
+        "adjusted_channels": len(adjustments),
+        "fee_debug": revenue_fee_debug(plugin),
+    }
 
 
 @plugin.method("revenue-analyze")
@@ -3017,7 +3094,7 @@ def revenue_rebalance(plugin: Plugin,
         if not allowed:
             return {"status": "error", "error": msg}
 
-    # Sling is no longer required — RebalanceExecutor handles all rebalances
+    # Native route execution is handled by RebalanceEngineV2.
 
     # L-21: Validate SCID format
     for cid in (from_channel, to_channel):

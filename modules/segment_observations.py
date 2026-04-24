@@ -1,4 +1,4 @@
-"""Local sling-derived segment observation storage and export."""
+"""Local route-segment failure observation storage and export."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 
-class SlingSegmentObservationStore:
+class SegmentObservationStore:
     """Thread-safe in-memory store for local failure-derived observations."""
 
     DATASTORE_KEY = ["revenue", "segment-observations"]

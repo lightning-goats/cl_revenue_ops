@@ -78,17 +78,31 @@ def test_v3_router_includes_live_observed_liquidity_layer_when_present():
     data_service.get_configs.return_value = {
         "configs": {"cltv-final": {"value_int": 18}}
     }
-    data_service.get_channels.return_value = {
-        "channels": [
-            {
-                "source": DST_PEER,
-                "destination": OUR_ID,
-                "short_channel_id": "200x1x0",
-                "fee_per_millionth": 0,
-                "delay": 40,
+    def get_channels(**kwargs):
+        if kwargs.get("short_channel_id"):
+            return {
+                "channels": [{
+                    "source": SRC_PEER,
+                    "destination": "03" + "x" * 64,
+                    "short_channel_id": kwargs["short_channel_id"],
+                    "fee_per_millionth": 0,
+                    "base_fee_millisatoshi": 0,
+                    "delay": 0,
+                }]
             }
-        ]
-    }
+        return {
+            "channels": [
+                {
+                    "source": DST_PEER,
+                    "destination": OUR_ID,
+                    "short_channel_id": "200x1x0",
+                    "fee_per_millionth": 0,
+                    "delay": 40,
+                }
+            ]
+        }
+
+    data_service.get_channels.side_effect = get_channels
     data_service.get_routes.return_value = {
         "probability_ppm": 990000,
         "routes": [
@@ -116,6 +130,80 @@ def test_v3_router_includes_live_observed_liquidity_layer_when_present():
 
     assert result.success is True
     assert "hive-observed-liquidity" in data_service.get_routes.call_args.kwargs["layers"]
+
+
+def test_v3_router_layer_override_can_force_market_only_layers():
+    plugin = MagicMock()
+    data_service = MagicMock()
+    data_service.get_askrene_layers.return_value = {
+        "layers": [
+            {"layer": "hive-fleet"},
+            {"layer": "hive-observed-liquidity"},
+        ]
+    }
+    data_service.get_peer_channels.return_value = {"channels": []}
+    data_service.get_configs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    def get_channels(**kwargs):
+        if kwargs.get("short_channel_id"):
+            return {
+                "channels": [{
+                    "source": SRC_PEER,
+                    "destination": "03" + "x" * 64,
+                    "short_channel_id": kwargs["short_channel_id"],
+                    "fee_per_millionth": 0,
+                    "base_fee_millisatoshi": 0,
+                    "delay": 0,
+                }]
+            }
+        return {
+            "channels": [
+                {
+                    "source": DST_PEER,
+                    "destination": OUR_ID,
+                    "short_channel_id": "200x1x0",
+                    "fee_per_millionth": 0,
+                    "delay": 40,
+                }
+            ]
+        }
+
+    data_service.get_channels.side_effect = get_channels
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [
+            {
+                "probability_ppm": 990000,
+                "amount_msat": 100000000,
+                "path": _clean_middle_path_peer_A_to_peer_B(),
+            }
+        ],
+    }
+
+    router = _make_v3_router(
+        plugin,
+        layer_names=("hive-fleet",),
+        data_service=data_service,
+    )
+
+    result = router.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100_000,
+        layer_names_override=[],
+        include_observed_liquidity=False,
+    )
+
+    assert result.success is True
+    layers = data_service.get_routes.call_args.kwargs["layers"]
+    assert "hive-fleet" not in layers
+    assert "hive-observed-liquidity" not in layers
+    assert "auto.no_mpp_support" in layers
+    assert any(layer.startswith("rebalance-exclude-") for layer in layers)
 
 
 def test_v3_router_handles_askrene_listlayers_failure():
@@ -300,21 +388,57 @@ SRC_PEER = "03" + "a" * 64
 DST_PEER = "03" + "b" * 64
 
 
-def _make_plugin_with_listchannels_fee(fee_ppm: int = 0, cltv: int = 40):
+def _make_plugin_with_listchannels_fee(
+    fee_ppm: int = 0,
+    fee_base_msat: int = 0,
+    cltv: int = 40,
+    source_fee_ppm: int = 0,
+    source_base_msat: int = 0,
+    source_cltv: int = 0,
+):
     plugin = MagicMock()
     plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
     plugin.rpc.listpeerchannels.return_value = {"channels": []}
     plugin.rpc.listconfigs.return_value = {
         "configs": {"cltv-final": {"value_int": 18}}
     }
-    plugin.rpc.listchannels.return_value = {
-        "channels": [{
-            "source": DST_PEER,
-            "destination": OUR_ID,
-            "fee_per_millionth": fee_ppm,
-            "delay": cltv,
-        }]
-    }
+    middle_peer = "03" + "x" * 64
+
+    def listchannels_side_effect(**kwargs):
+        if kwargs.get("short_channel_id"):
+            channel_id = kwargs["short_channel_id"]
+            if channel_id == "222x2x2":
+                return {
+                    "channels": [{
+                        "short_channel_id": channel_id,
+                        "source": middle_peer,
+                        "destination": DST_PEER,
+                        "fee_per_millionth": 0,
+                        "base_fee_millisatoshi": 0,
+                        "delay": 0,
+                    }]
+                }
+            return {
+                "channels": [{
+                    "short_channel_id": channel_id,
+                    "source": SRC_PEER,
+                    "destination": middle_peer,
+                    "fee_per_millionth": source_fee_ppm,
+                    "base_fee_millisatoshi": source_base_msat,
+                    "delay": source_cltv,
+                }]
+            }
+        return {
+            "channels": [{
+                "source": DST_PEER,
+                "destination": OUR_ID,
+                "fee_per_millionth": fee_ppm,
+                "base_fee_millisatoshi": fee_base_msat,
+                "delay": cltv,
+            }]
+        }
+
+    plugin.rpc.listchannels.side_effect = listchannels_side_effect
     return plugin
 
 
@@ -402,6 +526,97 @@ def test_price_pair_picks_cheapest_when_multiple_routes():
     )
     assert result.success is True
     assert result.route_cost_sats <= 1  # cheapest middle was 100 msat fee -> rounds to 1 sat
+
+
+def test_price_pair_adds_source_peer_forwarding_fee_to_first_hop():
+    plugin = _make_plugin_with_listchannels_fee(
+        fee_ppm=0,
+        source_base_msat=1_000,
+        source_fee_ppm=0,
+        source_cltv=7,
+    )
+    plugin.rpc.getroutes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000,
+            "final_cltv": 58,
+            "path": [
+                {
+                    "short_channel_id_dir": "111x1x1/0",
+                    "next_node_id": "03" + "x" * 64,
+                    "amount_msat": 100100,
+                    "delay": 124,
+                },
+                {
+                    "short_channel_id_dir": "222x2x2/0",
+                    "next_node_id": DST_PEER,
+                    "amount_msat": 100000,
+                    "delay": 58,
+                },
+            ],
+        }],
+    }
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+
+    assert result.success is True
+    assert result.route[0]["amount_msat"] == 101000
+    assert result.route[0]["delay"] == 131
+    assert result.route_cost_sats == 1
+
+
+def test_price_pair_includes_final_hop_base_fee_in_getroutes_amount():
+    plugin = _make_plugin_with_listchannels_fee(
+        fee_ppm=0,
+        fee_base_msat=1_000,
+        source_fee_ppm=0,
+        source_base_msat=0,
+        source_cltv=0,
+    )
+    plugin.rpc.getroutes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 101000,
+            "final_cltv": 58,
+            "path": [
+                {
+                    "short_channel_id_dir": "111x1x1/0",
+                    "next_node_id": "03" + "x" * 64,
+                    "amount_msat": 101000,
+                    "delay": 124,
+                },
+                {
+                    "short_channel_id_dir": "222x2x2/0",
+                    "next_node_id": DST_PEER,
+                    "amount_msat": 101000,
+                    "delay": 58,
+                },
+            ],
+        }],
+    }
+
+    r = _make_v3_router(plugin)
+    result = r.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+
+    assert result.success is True
+    assert plugin.rpc.getroutes.call_args.kwargs["amount_msat"] == 101000
+    assert result.route[0]["amount_msat"] == 101000
+    assert result.route_cost_sats == 1
 
 
 def test_price_pair_uses_invoice_cltv_and_explicit_synthetic_hops():
@@ -698,6 +913,16 @@ def test_v3_router_prefers_data_service_for_routes_and_policy_reads():
     data_service.get_configs.return_value = {
         "configs": {"cltv-final": {"value_int": 18}}
     }
+    data_service.get_channels.side_effect = lambda **kwargs: {
+        "channels": [{
+            "source": SRC_PEER,
+            "destination": "03" + "x" * 64,
+            "short_channel_id": kwargs.get("short_channel_id", "111x1x1"),
+            "fee_per_millionth": 0,
+            "base_fee_millisatoshi": 0,
+            "delay": 0,
+        }]
+    } if kwargs.get("short_channel_id") else {"channels": []}
     data_service.get_routes.return_value = {
         "routes": [{
             "probability_ppm": 990000,
@@ -825,14 +1050,28 @@ def test_replay_multi_hop_fixture_succeeds():
     plugin = MagicMock()
     plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
     plugin.rpc.listpeerchannels.return_value = {"channels": []}
-    plugin.rpc.listchannels.return_value = {
-        "channels": [{
-            "source": "03c157946cc1cd376b929e36006e645fae490b1b1d4156b40db804e01b4bda48cd",
-            "destination": "0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
-            "fee_per_millionth": 0,
-            "delay": 40,
-        }]
-    }
+    def listchannels(**kwargs):
+        if kwargs.get("short_channel_id") == "942863x384x9":
+            return {
+                "channels": [{
+                    "short_channel_id": "942863x384x9",
+                    "source": "03796a3c5b18080db99b0b880e2e326db9f5eb6bf3d7394b924f633da3eae31412",
+                    "destination": "0298f6074a454a1f5345cb2a7c6f9fce206cd0bf675d177cdbf0ca7508dd28852f",
+                    "fee_per_millionth": 0,
+                    "base_fee_millisatoshi": 0,
+                    "delay": 0,
+                }]
+            }
+        return {
+            "channels": [{
+                "source": "03c157946cc1cd376b929e36006e645fae490b1b1d4156b40db804e01b4bda48cd",
+                "destination": "0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
+                "fee_per_millionth": 0,
+                "delay": 40,
+            }]
+        }
+
+    plugin.rpc.listchannels.side_effect = listchannels
     plugin.rpc.getroutes.return_value = _load_fixture("getroutes_multi_hop.json")
 
     from modules.rebalance_router_v3 import RebalanceRouterV3

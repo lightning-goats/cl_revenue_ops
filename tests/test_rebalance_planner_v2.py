@@ -102,7 +102,7 @@ class TestPairGeneration:
         """Iter1: capex bootstrap budget (e.g. 200 sats) is meant for channel
         opens, not per-rebalance fees. The planner should layer a fee cap
         derived from the rebalance amount on top, so a small capex channel
-        can still pay enough route fee for sling to find a path."""
+        can still pay enough route fee for a priced path."""
         planner = RebalancePlanner(pair_fee_cap_ppm=1000)  # 0.1% of amount
         src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
                   local_ratio=0.90, remaining_budget_sats=0)

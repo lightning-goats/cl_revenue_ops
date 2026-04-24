@@ -586,6 +586,8 @@ class TestDiagnostics:
         status = adapter.get_status()
         assert status["snapshot_fresh"] is True
         assert status["hints_count"] == 2
+        assert status["member_hints_count"] == 2
+        assert status["rebalance_recommendations_count"] == 1
         assert "snapshot_age_seconds" in status
 
     def test_malformed_peer_entries_are_sanitized_to_empty_dicts(self, mock_plugin):

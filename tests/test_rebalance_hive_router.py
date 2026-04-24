@@ -120,6 +120,106 @@ def test_hive_router_uses_all_live_hive_and_revenue_layers():
     ]
 
 
+def test_hive_router_reprices_prefix_amounts_from_live_forwarding_policies():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    data_service.get_askrene_layers.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    data_service.get_peer_channels.side_effect = lambda peer_id=None: (
+        {
+            "channels": [{
+                "short_channel_id": "100x1x0",
+                "peer_id": SRC_PEER,
+                "state": "CHANNELD_NORMAL",
+            }]
+        }
+        if peer_id is None
+        else {
+            "channels": [{
+                "short_channel_id": "200x1x0",
+                "peer_id": DST_PEER,
+                "updates": {"remote": {
+                    "fee_base_msat": 0,
+                    "fee_proportional_millionths": 0,
+                    "cltv_expiry_delta": 6,
+                }},
+            }]
+        }
+    )
+    data_service.get_configs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    def get_channels(**kwargs):
+        scid = kwargs.get("short_channel_id")
+        if scid == "300x1x0":
+            return {"channels": [{
+                "short_channel_id": "300x1x0",
+                "source": SRC_PEER,
+                "destination": MID_PEER,
+                "fee_per_millionth": 2000,
+                "base_fee_millisatoshi": 1000,
+                "delay": 14,
+            }]}
+        if scid == "301x1x0":
+            return {"channels": [{
+                "short_channel_id": "301x1x0",
+                "source": MID_PEER,
+                "destination": DST_PEER,
+                "fee_per_millionth": 1000,
+                "base_fee_millisatoshi": 1000,
+                "delay": 12,
+            }]}
+        return {"channels": []}
+
+    data_service.get_channels.side_effect = get_channels
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": 100000000,
+            "path": [
+                {
+                    "short_channel_id_dir": "100x1x0/0",
+                    "next_node_id": SRC_PEER,
+                    "amount_msat": 100000000,
+                    "delay": 44,
+                },
+                {
+                    "short_channel_id_dir": "300x1x0/0",
+                    "next_node_id": MID_PEER,
+                    "amount_msat": 100000000,
+                    "delay": 30,
+                },
+                {
+                    "short_channel_id_dir": "301x1x0/0",
+                    "next_node_id": DST_PEER,
+                    "amount_msat": 100000000,
+                    "delay": 18,
+                },
+            ],
+        }],
+    }
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, MID_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    result = router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+
+    assert result.success is True
+    assert result.route[0]["amount_msat"] == 100302202
+    assert result.route[1]["amount_msat"] == 100101000
+    assert result.route[2]["amount_msat"] == 100000000
+    assert result.route[-1]["amount_msat"] == 100000000
+    assert result.route_cost_sats == 303
+
+
 def test_hive_router_excludes_expansion_test_layers_from_live_routes():
     from modules.rebalance_hive_router import RebalanceHiveRouter
 

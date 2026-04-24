@@ -6,10 +6,10 @@ These tests verify that hive integration, legacy standalone fee algorithms
 absent from the codebase.  The current architecture is DTS+PID only.
 """
 import ast
-import importlib
 import inspect
 import os
 from pathlib import Path
+import subprocess
 import pytest
 
 
@@ -33,9 +33,16 @@ REBALANCE_BOUNDARY_FILES = [
 class TestNoHiveReintroduction:
     """Hive integration must not return."""
 
-    def test_no_hive_bridge_module(self):
-        with pytest.raises(ModuleNotFoundError):
-            importlib.import_module("modules.hive_bridge")
+    def test_no_tracked_hive_bridge_module(self):
+        result = subprocess.run(
+            ["git", "ls-files", "modules/hive_bridge.py"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert result.stdout.strip() == ""
 
     def test_no_hive_bridge_import_in_source(self):
         for path in _source_files():

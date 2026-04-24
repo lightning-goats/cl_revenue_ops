@@ -217,6 +217,61 @@ def test_destination_eligibility_keeps_conservative_value_gate():
     assert channel.source_eligible is True  # also drainable, but not over-local
 
 
+def test_hive_member_without_capex_gets_conservative_bootstrap_budget():
+    """Fresh hive-member channels can be strategically valuable before the
+    capex/profitability cache has a per-channel allocation. The state builder
+    gives them a small explicit budget only when the caller opts in."""
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="300x3x0",
+                peer_id="02" + "h" * 64,
+                capacity_sats=1_000_000,
+                local_sats=20_000,
+                is_hive_member=True,
+            ),
+        ],
+        {},
+        hive_bootstrap_budget_sats=300,
+    )
+
+    channel = state.channels[0]
+    assert channel.value_class == "hive"
+    assert channel.remaining_budget_sats == 300
+    assert channel.budget_source == "hive_bootstrap"
+    assert channel.dest_eligible is True
+    assert channel.dest_reason == ""
+
+
+def test_hive_bootstrap_budget_is_disabled_at_zero():
+    """The bootstrap path is bounded and can be disabled for strict capex-only
+    operation."""
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="301x3x0",
+                peer_id="02" + "i" * 64,
+                capacity_sats=1_000_000,
+                local_sats=20_000,
+                is_hive_member=True,
+            ),
+        ],
+        {},
+        hive_bootstrap_budget_sats=0,
+    )
+
+    channel = state.channels[0]
+    assert channel.value_class == "hive"
+    assert channel.remaining_budget_sats == 0
+    assert channel.budget_source == "none"
+    assert channel.dest_eligible is False
+    assert channel.dest_reason == "no_budget"
+
+
 def test_source_eligibility_blocked_only_by_cooldown():
     """Phase 2.2: source-side gate only blocks on cooldown protection. The
     cooldown flag is the source-protection mechanism for now; budget and
