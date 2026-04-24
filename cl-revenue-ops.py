@@ -1081,8 +1081,8 @@ plugin.add_option(
     name='revenue-ops-askrene-layers',
     default='hive-fleet',
     description="CSV of askrene layer names passed to v3 router getroutes calls. "
-                "Missing layers are silently dropped by askrene. Empty string = standalone mode "
-                "with no cl-hive bias. Default: 'hive-fleet'."
+                "Missing layers are silently dropped by askrene. Blank values use the default "
+                "'hive-fleet' cl-hive bias; set to 'none' or 'standalone' for no configured layers."
 )
 
 
@@ -1564,7 +1564,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
         hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
         rebalance_router='v3',
-        askrene_layers=str(options.get('revenue-ops-askrene-layers', 'hive-fleet') or 'hive-fleet'),
+        askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'hive-fleet',
     )
     configured_router = str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower()
     if configured_router != 'v3':
