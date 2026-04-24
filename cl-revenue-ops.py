@@ -1015,6 +1015,11 @@ plugin.add_option(
     description='Maximum on-chain fee rate (sat/vB) for automated opens/closes (default: 50.0)'
 )
 plugin.add_option(
+    name='revenue-ops-planner-min-annual-roi-pct',
+    default='1.0',
+    description='Minimum annualized return hurdle for automated channel opens (default: 1.0%)'
+)
+plugin.add_option(
     name='revenue-ops-planner-execute-closes',
     default='false',
     description='Allow the capacity planner to execute close RPCs (default: false)',
@@ -1552,6 +1557,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
         planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
+        planner_min_annual_roi_pct=_safe_float_opt(
+            'revenue-ops-planner-min-annual-roi-pct',
+            '1.0',
+        ),
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
         hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
         rebalance_router='v3',

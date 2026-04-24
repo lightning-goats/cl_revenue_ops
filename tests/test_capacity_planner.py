@@ -2310,6 +2310,17 @@ class TestSafetyGuards:
         assert "Cooldown" in reason
         assert "1 action(s)" in reason
 
+    def test_cooldown_ignores_dry_run_and_failed_actions(self):
+        """Dry-run/failed planner actions are audit records, not cooldown locks."""
+        planner = self._make_planner(recent_actions=[
+            {"peer_id": "peer1", "action": "open", "status": "dry_run"},
+            {"peer_id": "peer1", "action": "open", "status": "failed"},
+        ])
+
+        ok, reason = planner._check_cooldown("peer1")
+        assert ok is True
+        assert "No recent actions" in reason
+
     def test_cooldown_allows_no_recent_actions(self):
         """Actions allowed when peer has no recent actions."""
         planner = self._make_planner(recent_actions=[])
@@ -2632,20 +2643,22 @@ class TestOpenEV:
         cfg.planner_min_channel_sats = 500000
         cfg.planner_max_channel_sats = 10000000
         cfg.min_wallet_reserve = 1000000
+        cfg.planner_min_annual_roi_pct = 1.0
         return cfg
 
     def test_positive_ev_for_good_peer(self):
         """Positive EV for peer with profit history."""
         planner = self._make_planner(
             feerates_return={"perkb": {"opening": 1000}},  # 1 sat/vB
-            closed_summary={"daily_net_est_sats": 100},     # 100 sats/day
+            closed_summary={"daily_net_est_sats": 250},     # 250 sats/day
         )
         cfg = self._make_cfg()
         ev = planner._calculate_open_ev("peer1", 5000000, cfg)
-        # Revenue: 100 * 180 = 18000
+        # Revenue: 250 * 180 = 45000
         # On-chain: (1*140) + (1*200) = 340
-        # Rebal: 10 * 180 = 1800
-        # EV = 18000 - 340 - 1800 = 15860
+        # Rebal: 25 * 180 = 4500
+        # Capital hurdle: 5M * 1% * 180/365 ~= 24658
+        # EV ~= 15402
         assert ev > 0
 
     def test_negative_ev_for_high_costs(self):
@@ -2680,7 +2693,8 @@ class TestOpenEV:
         expected_revenue = 50 * 180
         expected_rebal = 5 * 180
         expected_on_chain = 140 + 200
-        expected_ev = expected_revenue - expected_on_chain - expected_rebal
+        expected_hurdle = 2_000_000 * 0.01 * (180 / 365)
+        expected_ev = expected_revenue - expected_on_chain - expected_rebal - expected_hurdle
         assert abs(ev - expected_ev) < 1.0  # Allow float tolerance
 
     def test_ev_fallback_estimate(self):
@@ -2715,8 +2729,34 @@ class TestOpenEV:
         ev = planner._calculate_open_ev("peer1", 5000000, cfg)
 
         daily_revenue = (5000000 * 0.3 * 150 / 1_000_000) * 1.10
-        expected_ev = (daily_revenue * 180) - ((daily_revenue * 0.1) * 180) - (140 + 200)
+        expected_hurdle = 5_000_000 * 0.01 * (180 / 365)
+        expected_ev = (daily_revenue * 180) - ((daily_revenue * 0.1) * 180) - (140 + 200) - expected_hurdle
         assert abs(ev - expected_ev) < 1.0
+
+    def test_ev_rejects_low_yield_channel_below_capital_hurdle(self):
+        """Positive absolute profit is rejected when return on locked capital is too low."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 1000}},
+            closed_summary={"daily_net_est_sats": 50},
+        )
+        cfg = self._make_cfg()
+
+        ev = planner._calculate_open_ev("peer1", 10_000_000, cfg)
+
+        assert ev < 0
+
+    def test_ev_hurdle_can_be_disabled_for_legacy_behavior(self):
+        """Operators can set the capital hurdle to 0 to restore absolute-profit EV."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 1000}},
+            closed_summary={"daily_net_est_sats": 100},
+        )
+        cfg = self._make_cfg()
+        cfg.planner_min_annual_roi_pct = 0.0
+
+        ev = planner._calculate_open_ev("peer1", 5_000_000, cfg)
+
+        assert ev > 0
 
     def test_ev_negative_closed_summary_uses_fallback(self):
         """Negative daily_net_est_sats in closed summary triggers fallback."""
@@ -3585,7 +3625,7 @@ class TestExecuteCycle:
 
         # Ensure positive EV: give closed summary with good history
         prof.database.get_peer_closed_channel_profit_summary.return_value = {
-            'count': 1, 'marginal_roi_proxy': 0.5, 'daily_net_est_sats': 100,
+            'count': 1, 'marginal_roi_proxy': 0.5, 'daily_net_est_sats': 350,
         }
 
         cfg = _make_cycle_cfg(planner_max_opens_per_cycle=1)

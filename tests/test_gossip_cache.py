@@ -103,6 +103,16 @@ class TestGetPeerInboundChannels:
         fc._get_peer_inbound_channels("02peer")
         assert mock_plugin.rpc.listchannels.call_count == 2
 
+    def test_force_refresh_bypasses_cache(self, fc, mock_plugin):
+        mock_plugin.rpc.listchannels.return_value = {"channels": [{"source": "02a"}]}
+        fc._get_peer_inbound_channels("02peer")
+        mock_plugin.rpc.listchannels.return_value = {"channels": [{"source": "02b"}]}
+
+        result = fc._get_peer_inbound_channels("02peer", force_refresh=True)
+
+        assert result == [{"source": "02b"}]
+        assert mock_plugin.rpc.listchannels.call_count == 2
+
     def test_different_peers_cached_separately(self, fc, mock_plugin):
         mock_plugin.rpc.listchannels.return_value = {"channels": []}
         fc._get_peer_inbound_channels("02peer_a")

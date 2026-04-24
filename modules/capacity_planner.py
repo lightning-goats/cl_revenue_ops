@@ -256,6 +256,7 @@ class CapacityPlanner:
             "defibrillations": [],
             "closes": [],
             "skipped_reasons": [],
+            "evaluated_open_candidates": [],
         }
 
         # 1. Check fee gate
@@ -423,7 +424,49 @@ class CapacityPlanner:
                 )
 
             opens_this_cycle = 0
+            evaluated_candidates = []
+            score_ranked_candidates = sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)
+            sizing_slots = max(1, min(max_opens, len(score_ranked_candidates)))
+
+            def sizing_pool_for(candidate):
+                """Size against executable slots, not every discovered alternative."""
+                peer_id = candidate.get("peer_id")
+                pool = [candidate]
+                for other in score_ranked_candidates:
+                    if other.get("peer_id") == peer_id:
+                        continue
+                    pool.append(other)
+                    if len(pool) >= sizing_slots:
+                        break
+                return pool
+
             for candidate in sorted(candidates, key=lambda c: c.get("score", 0), reverse=True):
+                peer_id = candidate["peer_id"]
+                channel_size = self._size_channel(candidate, sizing_pool_for(candidate), available_sats, cfg)
+                ev = self._calculate_open_ev(peer_id, channel_size, cfg)
+                summary["evaluated_open_candidates"].append({
+                    "peer_id": peer_id,
+                    "source": candidate.get("source", ""),
+                    "score": round(float(candidate.get("score", 0) or 0), 6),
+                    "amount_sats": channel_size,
+                    "ev": round(ev, 0),
+                })
+                if ev <= 0:
+                    summary["skipped_reasons"].append(
+                        f"Negative EV ({ev:.0f}) for {peer_id[:16]}..."
+                    )
+                    continue
+                evaluated = dict(candidate)
+                evaluated["_planned_channel_size"] = channel_size
+                evaluated["_planned_ev"] = ev
+                evaluated_candidates.append(evaluated)
+
+            ranked_candidates = sorted(
+                evaluated_candidates,
+                key=lambda c: (c.get("_planned_ev", 0), c.get("score", 0)),
+                reverse=True,
+            )
+            for candidate in ranked_candidates:
                 if opens_this_cycle >= max_opens:
                     break
 
@@ -436,11 +479,13 @@ class CapacityPlanner:
                     )
                     break  # No point checking more candidates
 
-                # Size channel
-                channel_size = self._size_channel(candidate, candidates, available_sats, cfg)
-
-                # Check EV
-                ev = self._calculate_open_ev(peer_id, channel_size, cfg)
+                if opens_this_cycle > 0:
+                    # Recompute against updated available funds after prior successful opens.
+                    channel_size = self._size_channel(candidate, sizing_pool_for(candidate), available_sats, cfg)
+                    ev = self._calculate_open_ev(peer_id, channel_size, cfg)
+                else:
+                    channel_size = candidate.get("_planned_channel_size", 0)
+                    ev = candidate.get("_planned_ev", 0)
                 if ev <= 0:
                     summary["skipped_reasons"].append(
                         f"Negative EV ({ev:.0f}) for {peer_id[:16]}..."
@@ -1990,6 +2035,10 @@ class CapacityPlanner:
             return True, "No database available for cooldown check"
         try:
             recent = db.get_recent_planner_actions(peer_id, hours=24)
+            recent = [
+                action for action in recent
+                if str(action.get("status", "")).lower() not in ("dry_run", "failed")
+            ]
             if recent:
                 return False, f"Cooldown: {len(recent)} action(s) for peer in last 24h"
             return True, "No recent actions for peer"
@@ -2204,7 +2253,13 @@ class CapacityPlanner:
         expected_revenue = daily_revenue * lifetime_days
         expected_rebal_cost = rebal_cost_per_day * lifetime_days
 
-        ev = expected_revenue - on_chain_cost - expected_rebal_cost
+        min_annual_roi_pct = getattr(cfg, "planner_min_annual_roi_pct", 1.0)
+        if isinstance(min_annual_roi_pct, bool) or not isinstance(min_annual_roi_pct, (int, float)):
+            min_annual_roi_pct = 1.0
+        min_annual_roi_pct = max(0.0, float(min_annual_roi_pct))
+        capital_hurdle = channel_size_sats * (min_annual_roi_pct / 100.0) * (lifetime_days / 365.0)
+
+        ev = expected_revenue - on_chain_cost - expected_rebal_cost - capital_hurdle
         return ev
 
     def _calculate_redeployment_ev(
