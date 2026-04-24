@@ -148,8 +148,7 @@ def _window_bounds(run_date: str | date, days: int) -> tuple[int, int]:
 
 def _daily_log_lines(lines: list[str], run_date: str | date) -> list[str]:
     prefix = f"{_parse_run_date(run_date).isoformat()}T"
-    filtered = [line for line in lines if line.startswith(prefix)]
-    return filtered or lines
+    return [line for line in lines if line.startswith(prefix)]
 
 
 def check_plugin_restart_count(lines: list[str], limit: int) -> dict[str, Any]:

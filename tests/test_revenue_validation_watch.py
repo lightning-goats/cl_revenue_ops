@@ -146,6 +146,61 @@ def test_evaluate_all_nodes_suppresses_restart_alarm_on_t0_day(tmp_path: Path) -
     assert restart_finding["severity"] == "green"
 
 
+def test_evaluate_all_nodes_does_not_count_stale_restart_extract_as_current_day(tmp_path: Path) -> None:
+    results_root = tmp_path
+    day_dir = results_root / "2026-04-24" / "lnnode"
+    day_dir.mkdir(parents=True)
+
+    (results_root / "manifests").mkdir(parents=True)
+    (results_root / "manifests" / "2026-04-24.json").write_text(
+        json.dumps({"date": "2026-04-24", "nodes": {"lnnode": {"status": "ok", "errors": {}}}}),
+        encoding="utf-8",
+    )
+
+    (day_dir / "listpeerchannels.json").write_text(json.dumps({"channels": []}), encoding="utf-8")
+    (day_dir / "hive-members.json").write_text(json.dumps({"members": []}), encoding="utf-8")
+    (day_dir / "listpays.json").write_text(json.dumps({"pays": []}), encoding="utf-8")
+    (day_dir / "listforwards.json").write_text(json.dumps({"forwards": []}), encoding="utf-8")
+    (day_dir / "revenue-config.json").write_text(json.dumps({"config": {"max_fee_ppm": 5000}}), encoding="utf-8")
+    (day_dir / "rollback-watch.log").write_text(
+        "\n".join(
+            [
+                "2026-04-07T17:13:41.852Z INFO    plugin-cl-revenue-ops.py: Initializing cl-revenue-ops plugin...",
+                "2026-04-07T18:03:08.419Z INFO    plugin-cl-revenue-ops.py: Initializing cl-revenue-ops plugin...",
+                "2026-04-07T22:06:12.189Z INFO    plugin-cl-revenue-ops.py: Initializing cl-revenue-ops plugin...",
+                "2026-04-07T23:06:12.189Z INFO    plugin-cl-revenue-ops.py: Initializing cl-revenue-ops plugin...",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = {
+        "paths": {"results_root": str(results_root)},
+        "thresholds": {
+            "rollback": {
+                "plugin_restart_limit_24h": 3,
+                "revenue_drop_pct": 25,
+                "rebalance_success_floor_pct": 50,
+            }
+        },
+        "nodes": {
+            "lnnode": {
+                "t0": "2026-04-23T16:31:01Z",
+            }
+        },
+    }
+
+    result = mod.evaluate_all_nodes(config, run_date="2026-04-24")
+
+    restart_finding = next(
+        finding
+        for finding in result["nodes"]["lnnode"]["findings"]
+        if finding["rule"] == "plugin_restart_count"
+    )
+    assert restart_finding["count"] == 0
+    assert restart_finding["severity"] == "green"
+
+
 def test_evaluate_all_nodes_writes_watch_file_and_marks_red(tmp_path: Path) -> None:
     results_root = tmp_path
     day_dir = results_root / "2026-04-23" / "lnnode"
