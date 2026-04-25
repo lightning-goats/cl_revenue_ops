@@ -22,6 +22,12 @@ def mock_config():
     c.min_fee_ppm = 10
     c.max_fee_ppm = 5000
     c.vegas_decay_rate = 0.95
+    # Path B (2026-04-22): intra-fleet ppm is now configurable. Tests that
+    # exercise _check_hive_member_fee explicitly set this; default to 0 so
+    # pre-existing assertions that expect 0 still pass.
+    c.fee_ppm_intra_fleet = 0
+    c.neighbor_median_min_competitors = 2
+    c.snapshot = MagicMock(return_value=c)
     return c
 
 
@@ -98,6 +104,20 @@ class TestMemberFeePolicy:
         assert result is None
         assert fc._consume_hive_member_advisory("02member") is True
         assert fc._consume_hive_member_advisory("02member") is False
+
+    def test_configured_intra_fleet_ppm_does_not_force_static_member_fee(self, mock_plugin, mock_config, mock_database):
+        """Hive membership remains advisory even when intra-fleet ppm is configured."""
+        mock_config.fee_ppm_intra_fleet = 1
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        adapter = MagicMock()
+        adapter.is_hive_member.return_value = True
+        adapter.is_fresh.return_value = True
+        adapter.is_usable.return_value = True
+        adapter._effective_ttl.return_value = 900
+        fc.hive_hints = adapter
+        result = fc._check_hive_member_fee("02member")
+        assert result is None
+        assert fc._consume_hive_member_advisory("02member") is True
 
     def test_non_member_returns_none(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)

@@ -1668,8 +1668,18 @@ class FeeController:
     # Issue #32: Rebalance Cost-Aware Fee Floor
     # ==========================================================================
     REBALANCE_FLOOR_MARGIN = 1.20
-    REBALANCE_FLOOR_MIN_SAMPLES = 3
+    # Phase B.2 (2026-04-23): lowered from 3. Short lab windows and newly-
+    # opened production channels rarely accumulate 3 rebalances before the
+    # posterior stabilizes; 2 samples are enough to start recovering cost
+    # and the 20% margin absorbs sample noise.
+    REBALANCE_FLOOR_MIN_SAMPLES = 2
     REBALANCE_FLOOR_WINDOW_DAYS = 30
+
+    # Phase B.3 (2026-04-23): variance-gated undercut. When DTS posterior
+    # variance is above this threshold the channel is still exploring;
+    # clamping DTS's sampled target down to the undercut anchor locks in
+    # a low-confidence guess. Let DTS explore until the posterior tightens.
+    UNDERCUT_EXPLORATION_STD_THRESHOLD = 100.0
 
     # =============================================================================
     # GOSSIP REFRESH FOR FROZEN CHANNEL DETECTION
@@ -1810,6 +1820,52 @@ class FeeController:
             return max(0.9, min(1.1, bias))
         except Exception:
             return 1.0
+
+    def _classify_channel_role(self, peer_id: str) -> str:
+        """Return channel role for base_fee selection.
+
+        V1 (Upgrade A, 2026-04-22) is two-bucket: "intra_fleet" for hive
+        members, "non_hive" for everyone else. Falls back to "non_hive"
+        when hive_hints are unavailable so strangers default to the
+        revenue-capturing branch (consistent with the observed gap vs
+        clboss where hive was losing per-forward fees on non-fleet
+        channels by charging 0 base).
+        """
+        if not peer_id:
+            return "non_hive"
+        if self.hive_hints is None:
+            return "non_hive"
+        try:
+            if self.hive_hints.is_hive_member(peer_id):
+                return "intra_fleet"
+        except Exception:
+            pass
+        return "non_hive"
+
+    def _resolve_base_fee_msat(self, peer_id: str, cfg: Optional['ConfigSnapshot'] = None) -> int:
+        """Return base_fee_msat to use for this peer.
+
+        Respects cfg.base_fee_policy ("off" | "adaptive"). Always returns
+        the legacy cfg.base_fee_msat when policy is "off" so back-compat
+        holds when the option is not set.
+
+        When policy is "adaptive" but hive_hints is not yet wired (plugin
+        startup race before cl-revenue-ops.py:1783 injects the adapter),
+        fall back to the legacy cfg.base_fee_msat rather than classifying
+        every unknown peer as non_hive — this prevents the ~30s startup
+        window from charging intra-fleet channels 1000 msat.
+        """
+        if cfg is None:
+            cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+        policy = getattr(cfg, 'base_fee_policy', 'off')
+        if policy != 'adaptive':
+            return int(getattr(cfg, 'base_fee_msat', 0))
+        if self.hive_hints is None:
+            return int(getattr(cfg, 'base_fee_msat', 0))
+        role = self._classify_channel_role(peer_id)
+        if role == "intra_fleet":
+            return int(getattr(cfg, 'base_fee_msat_intra_fleet', 0))
+        return int(getattr(cfg, 'base_fee_msat_non_hive', 1000))
 
     def _get_hive_exploration_multiplier(self, peer_id: str) -> float:
         """Return bounded DTS variance multiplier from hive intelligence."""
@@ -2210,6 +2266,8 @@ class FeeController:
                 fee_ppm = ch.get("fee_per_millionth", 0)
                 if not (1 <= fee_ppm <= 10000):
                     continue
+                if self._is_cln_default_fee(ch):
+                    continue
                 # Weight by capacity (bigger channels = more credible signal)
                 capacity = max(1, ch.get("satoshis", base_to_sats_floor(ch.get("amount_msat", 1000000))))
                 # Weight by recency (recently updated = more active)
@@ -2220,7 +2278,13 @@ class FeeController:
                 weighted_fees.append((fee_ppm, weight))
 
             result = None
-            if len(weighted_fees) >= 3:
+            min_competitors = 3
+            try:
+                cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+                min_competitors = int(getattr(cfg, 'neighbor_median_min_competitors', 3) or 3)
+            except Exception:
+                pass
+            if len(weighted_fees) >= min_competitors:
                 # Weighted median: sort by fee, find the fee at cumulative 50% weight
                 weighted_fees.sort(key=lambda x: x[0])
                 total_weight = sum(w for _, w in weighted_fees)
@@ -2232,6 +2296,128 @@ class FeeController:
                             result = fee
                             break
 
+            self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
+            return result
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_cln_default_fee(ch: dict) -> bool:
+        """Return True if the gossip channel looks like an untouched CLN default.
+
+        CLN initializes channels at base_fee=1000 msat / fee_per_millionth=10.
+        Nodes that never run a fee plugin sit at that exact tuple forever;
+        they are not meaningful competitors for pricing decisions because
+        they're not actively pricing at all. Including them in the neighbor
+        median / min pulls the signal toward "nobody is trying to compete,"
+        which historically dragged our undercut target to the floor.
+
+        Matches both field-name spellings across CLN versions
+        (`base_fee_millisatoshi` pre-24.x, `fee_base_msat` post-24.x).
+        Behaviour is conservative: if either field is missing we assume
+        the channel is NOT default and keep it in the pool.
+        """
+        ppm = ch.get("fee_per_millionth")
+        if ppm != 10:
+            return False
+        base = ch.get("base_fee_millisatoshi")
+        if base is None:
+            base = ch.get("fee_base_msat")
+        return base == 1000
+
+    def _get_neighbor_fee_percentile(self, peer_id: str, pct: float) -> int | None:
+        """Return the `pct`-th percentile of competitor fees for this peer.
+
+        Phase D.1 (2026-04-23): competition_aware originally preserved DTS
+        when we were cheaper than the ABSOLUTE cheapest competitor — a
+        brittle trigger that almost never fires in practice. A percentile
+        trigger ("we're in the cheap quartile") is more useful and more
+        robust against noisy outliers. Default callers request p25.
+
+        Uses the same gossip-derived competitor pool as the median/min
+        helpers, including the CLN-default-fee filter (Phase B.1) and the
+        `neighbor_median_min_competitors` threshold.
+        """
+        cache_key = f"neighbor_fee_p{int(pct * 100):02d}_{peer_id}"
+        cached = self._neighbor_fee_cache.get(cache_key)
+        if cached and (time.time() - cached["ts"]) < 1800:
+            return cached["value"]
+
+        try:
+            our_id = self._get_our_id()
+            peer_channels = self._get_peer_inbound_channels(peer_id)
+            fees = []
+            for ch in peer_channels:
+                if ch.get("source") == our_id:
+                    continue
+                if not ch.get("active", False):
+                    continue
+                fee_ppm = ch.get("fee_per_millionth", 0)
+                if not (1 <= fee_ppm <= 10000):
+                    continue
+                if self._is_cln_default_fee(ch):
+                    continue
+                fees.append(fee_ppm)
+
+            min_competitors = 3
+            try:
+                cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+                min_competitors = int(getattr(cfg, 'neighbor_median_min_competitors', 3) or 3)
+            except Exception:
+                pass
+            if len(fees) < min_competitors:
+                result = None
+            else:
+                fees.sort()
+                # Nearest-rank percentile; good enough for a small competitor pool.
+                idx = min(len(fees) - 1, max(0, int(round(pct * (len(fees) - 1)))))
+                result = fees[idx]
+            self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
+            return result
+        except Exception:
+            return None
+
+    def _get_neighbor_fee_min(self, peer_id: str) -> int | None:
+        """Get the cheapest competitor fee for the same peer.
+
+        Used by `competition_aware` market_fee_mode to decide whether
+        DTS's natural target is already undercutting every competitor.
+        If it is, we skip the median-based undercut — it would only push
+        our fee lower without adding traffic (inelastic against a median
+        we're already below).
+
+        Returns None when fewer than `neighbor_median_min_competitors`
+        have valid gossip data (same threshold as the median helper),
+        to avoid being dragged around by a single cheap outlier.
+        """
+        cache_key = f"neighbor_fee_min_{peer_id}"
+        cached = self._neighbor_fee_cache.get(cache_key)
+        if cached and (time.time() - cached["ts"]) < 1800:
+            return cached["value"]
+
+        try:
+            our_id = self._get_our_id()
+            peer_channels = self._get_peer_inbound_channels(peer_id)
+            fees = []
+            for ch in peer_channels:
+                if ch.get("source") == our_id:
+                    continue
+                if not ch.get("active", False):
+                    continue
+                fee_ppm = ch.get("fee_per_millionth", 0)
+                if not (1 <= fee_ppm <= 10000):
+                    continue
+                if self._is_cln_default_fee(ch):
+                    continue
+                fees.append(fee_ppm)
+
+            min_competitors = 3
+            try:
+                cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+                min_competitors = int(getattr(cfg, 'neighbor_median_min_competitors', 3) or 3)
+            except Exception:
+                pass
+            result = min(fees) if len(fees) >= min_competitors else None
             self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
             return result
         except Exception:
@@ -2805,7 +2991,13 @@ class FeeController:
         """
         Calculate minimum fee floor based on historical rebalance costs (Issue #32).
 
-        Only applies to SOURCE channels (outbound-heavy, need rebalancing).
+        Applies to any channel that actually rebalances (SOURCE or ROUTER).
+        Phase B.2 (2026-04-23) widened from SOURCE-only because ROUTER-classified
+        channels still pay rebalance cost when we rebalance them — the prior
+        narrowing left balanced channels without any cost-recovery floor.
+        SINK channels don't rebalance outbound and DORMANT channels have no
+        flow to recover costs against, so both stay excluded.
+
         Uses per-channel cost history as primary data source, with per-peer
         fallback for cold-start scenarios.
 
@@ -2818,8 +3010,9 @@ class FeeController:
             Minimum fee floor in PPM, or None if insufficient data or not applicable
         """
 
-        # Only apply to SOURCE channels - sinks don't need rebalancing
-        if flow_state != "source":
+        # Skip channels that don't pay rebalance costs: sinks fill from inbound,
+        # dormant channels have no flow to amortize costs against.
+        if flow_state in ("sink", "dormant"):
             return None
 
         # Strategy 1: Per-channel cost history
@@ -3608,17 +3801,41 @@ class FeeController:
         posterior_std: float = 100.0,
         cfg: Optional[Any] = None,
     ) -> float:
-        _, profile = self._resolve_fee_profile(cfg)
-        ratio = profile.normal_target_blend_ratio
+        """Variance-continuous blend ratio (Phase A.2, 2026-04-23).
+
+        Prior design gated the confidence boost on `not sparse_data_conservative`,
+        so a sparse channel with a tightening posterior stayed capped at 0.20
+        per cycle — it could never accelerate to its observed confidence.
+        Lab traces showed DTS sampling 60-412 ppm while the applied fee
+        tracked a slow-moving low-pass average around 90-140. The issue was
+        structural: posterior_std was ignored whenever sparse_data_conservative
+        was set.
+
+        New mapping drives the ratio directly from posterior_std, so a
+        tight-posterior channel accelerates regardless of observation count:
+            >= 200 std (very uncertain): 0.20 (= legacy SPARSE)
+            100-200 std (moderate):       0.30
+            50-100 std (tightening):      0.45
+            < 50 std  (tight):            0.60 (= legacy NORMAL boosted cap)
+
+        Wake-from-sleep still caps to WAKE_TARGET_BLEND_RATIO — after a
+        hysteresis wake we want fresh observations before moving fast.
+        """
+        profile_name, profile = self._resolve_fee_profile(cfg)
+        if posterior_std >= 200.0:
+            ratio = profile.sparse_target_blend_ratio
+        elif posterior_std >= 100.0:
+            ratio = 0.30
+        elif posterior_std >= 50.0:
+            ratio = 0.45
+        else:
+            ratio = 0.60
+
+        if profile_name != "active":
+            ratio = min(ratio, profile.normal_target_blend_ratio)
+
         if woke_from_sleep:
             ratio = min(ratio, profile.wake_target_blend_ratio)
-        if sparse_data_conservative:
-            ratio = min(ratio, profile.sparse_target_blend_ratio)
-
-        # Confidence boost: tight posterior → faster convergence
-        if posterior_std < 100.0 and not sparse_data_conservative:
-            confidence_factor = 1.0 + max(0.0, (100.0 - posterior_std) / 100.0)
-            ratio = min(0.60, ratio * confidence_factor)  # Cap at 60%
 
         return ratio
 
@@ -4201,8 +4418,9 @@ class FeeController:
 
             # Load channel fee state
             ts_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+            observation_count = len(ts_state.thompson.observations)
             sparse_data_conservative = self._is_sparse_data_channel(
-                observation_count=len(ts_state.thompson.observations),
+                observation_count=observation_count,
                 forward_count=forward_count,
                 hours_elapsed=hours_elapsed,
                 current_revenue_rate=current_revenue_rate,
@@ -4403,39 +4621,128 @@ class FeeController:
                                 (prior_prec * ts.posterior_mean + obs_prec * neighbor_median) / total_prec
                             )
                             ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
-            # Competitive undercut: price below neighbor median based on our
-            # competitive position. Larger channels need less undercut (they win
-            # on capacity). Smaller channels undercut more (fee is their edge).
-            # High-fee corridors get more aggressive undercut. Low-fee corridors
-            # get less (margins are thin).
+            # Market-fee policy: price relative to neighbor_median based on the
+            # configured mode. "undercut" (default) prices below the median to win
+            # volume. "match" targets the median. "premium" prices above the median
+            # using the same per-corridor weight that would otherwise undercut —
+            # used in inelastic markets where hive coordination means we retain
+            # volume at higher margins (added 2026-04-21 to close vs-clboss gap).
             if neighbor_median is not None:
                 undercut_pct = self._get_competitive_undercut_pct(peer_id, channel_id, neighbor_median)
-                undercut_target = int(neighbor_median * (1.0 - undercut_pct))
-                undercut_target = max(floor_ppm, undercut_target)  # Never below floor
+                mode = getattr(cfg, 'market_fee_mode', 'undercut') if cfg else 'undercut'
 
-                # Pipeline: cap target at undercut level (only pulls DOWN)
-                if post_pid_target_ppm > undercut_target:
-                    pre_undercut = post_pid_target_ppm
-                    post_pid_target_ppm = undercut_target
-                    self.plugin.log(
-                        f"FEE: {channel_id[:16]}... competitive undercut: "
-                        f"{pre_undercut}->{undercut_target}ppm "
-                        f"(market={neighbor_median}, undercut={undercut_pct:.0%})",
-                        level='debug'
+                if mode == 'premium':
+                    target = int(neighbor_median * (1.0 + undercut_pct))
+                    target = min(self.config.max_fee_ppm, max(floor_ppm, target))
+                    # Pipeline: FLOOR target at premium level (only pulls UP)
+                    if post_pid_target_ppm < target:
+                        pre = post_pid_target_ppm
+                        post_pid_target_ppm = target
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competitive PREMIUM: "
+                            f"{pre}->{target}ppm "
+                            f"(market={neighbor_median}, premium={undercut_pct:.0%})",
+                            level='debug'
+                        )
+                elif mode == 'match':
+                    target = max(floor_ppm, int(neighbor_median))
+                    target = min(self.config.max_fee_ppm, target)
+                    # Match mode: pull toward median regardless of direction
+                    if abs(post_pid_target_ppm - target) > 0:
+                        pre = post_pid_target_ppm
+                        post_pid_target_ppm = target
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competitive MATCH: "
+                            f"{pre}->{target}ppm (market={neighbor_median})",
+                            level='debug'
+                        )
+                elif mode == 'competition_aware':
+                    # Apply the median-based undercut ONLY when we're NOT
+                    # already priced in the cheap quartile. Being in the
+                    # cheap quartile (p25) is sufficient to win elastic
+                    # traffic — there's no reward for being the absolute
+                    # minimum. Forcing undercut against a p25 pool that
+                    # we're already below just drags fees to floor with
+                    # no volume gain.
+                    #
+                    # Phase D.1 (2026-04-23): preserve trigger moved from
+                    # "cheaper than cheapest" (brittle, almost-never-fires)
+                    # to "cheaper than p25" (robust, fires when we have
+                    # real competitive margin).
+                    preserve_threshold = self._get_neighbor_fee_percentile(peer_id, 0.25)
+                    undercut_target = int(neighbor_median * (1.0 - undercut_pct))
+                    undercut_target = max(floor_ppm, undercut_target)
+                    exploring = (
+                        ts_state and ts_state.thompson and
+                        ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
                     )
+                    if preserve_threshold is not None and post_pid_target_ppm < preserve_threshold:
+                        # We're in the cheap quartile — preserve DTS target.
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competition_aware preserve: "
+                            f"{post_pid_target_ppm}ppm "
+                            f"(p25_competitor={preserve_threshold}, "
+                            f"median={neighbor_median})",
+                            level='debug'
+                        )
+                    elif exploring:
+                        # Phase B.3: high-variance DTS is exploring; don't
+                        # clamp down to undercut_target or we lock in a
+                        # low-confidence guess before observations arrive.
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competition_aware explore: "
+                            f"{post_pid_target_ppm}ppm preserved "
+                            f"(posterior_std={ts_state.thompson.posterior_std:.0f})",
+                            level='debug'
+                        )
+                    elif post_pid_target_ppm > undercut_target:
+                        pre = post_pid_target_ppm
+                        post_pid_target_ppm = undercut_target
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competition_aware undercut: "
+                            f"{pre}->{undercut_target}ppm "
+                            f"(median={neighbor_median}, "
+                            f"p25_competitor={preserve_threshold})",
+                            level='debug'
+                        )
+                else:  # undercut (default / back-compat)
+                    undercut_target = int(neighbor_median * (1.0 - undercut_pct))
+                    undercut_target = max(floor_ppm, undercut_target)
+                    exploring = (
+                        ts_state and ts_state.thompson and
+                        ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
+                    )
+                    if exploring:
+                        # Phase B.3: DTS is still exploring — skip the undercut
+                        # clamp so observations feed a meaningful range of fees.
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... undercut explore: "
+                            f"{post_pid_target_ppm}ppm preserved "
+                            f"(posterior_std={ts_state.thompson.posterior_std:.0f})",
+                            level='debug'
+                        )
+                    elif post_pid_target_ppm > undercut_target:
+                        pre_undercut = post_pid_target_ppm
+                        post_pid_target_ppm = undercut_target
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competitive undercut: "
+                            f"{pre_undercut}->{undercut_target}ppm "
+                            f"(market={neighbor_median}, undercut={undercut_pct:.0%})",
+                            level='debug'
+                        )
 
-                # Posterior: bias DTS learning toward undercut on sparse channels
-                if sparse_data_conservative and ts_state and ts_state.thompson:
-                    ts = ts_state.thompson
-                    if ts.posterior_mean > undercut_target and ts.posterior_std >= 50:
-                        prior_prec = 1.0 / max(ts.MIN_STD ** 2, ts.posterior_std ** 2)
-                        obs_prec = prior_prec * 0.10  # 10% weight
-                        total_prec = prior_prec + obs_prec
-                        if total_prec > 0:
-                            ts.posterior_mean = float(
-                                (prior_prec * ts.posterior_mean + obs_prec * undercut_target) / total_prec
-                            )
-                            ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
+                    # Posterior bias (undercut mode only — preserves prior behavior)
+                    if sparse_data_conservative and ts_state and ts_state.thompson:
+                        ts = ts_state.thompson
+                        if ts.posterior_mean > undercut_target and ts.posterior_std >= 50:
+                            prior_prec = 1.0 / max(ts.MIN_STD ** 2, ts.posterior_std ** 2)
+                            obs_prec = prior_prec * 0.10
+                            total_prec = prior_prec + obs_prec
+                            if total_prec > 0:
+                                ts.posterior_mean = float(
+                                    (prior_prec * ts.posterior_mean + obs_prec * undercut_target) / total_prec
+                                )
+                                ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
 
             # Rebalance cost awareness: routing-value-scaled nudge toward cost recovery
             # Applied BEFORE bounding so the nudge actually reaches the blending step.
@@ -4559,12 +4866,16 @@ class FeeController:
             if bounded_target_ppm != post_pid_target_ppm:
                 bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
 
+            blend_posterior_std = ts_state.thompson.posterior_std
+            if observation_count < GaussianThompsonState.MIN_OBSERVATIONS:
+                blend_posterior_std = max(blend_posterior_std, 200.0)
+
             blended_target_ppm, blend_info = self._blend_fee_target(
                 current_fee_ppm=current_fee_ppm,
                 bounded_target_ppm=bounded_target_ppm,
                 woke_from_sleep=woke_from_sleep,
                 sparse_data_conservative=sparse_data_conservative,
-                posterior_std=ts_state.thompson.posterior_std,
+                posterior_std=blend_posterior_std,
                 cfg=cfg,
             )
             target_blend_ratio = blend_info["blend_ratio"]
@@ -5110,7 +5421,8 @@ class FeeController:
                        enforce_limits: bool = True,
                        channel_info: Optional[Dict[str, Any]] = None,
                        htlcmin_msat: Optional[int] = None,
-                       htlcmax_msat: Optional[int] = None) -> Dict[str, Any]:
+                       htlcmax_msat: Optional[int] = None,
+                       base_fee_msat_override: Optional[int] = None) -> Dict[str, Any]:
         """
         Set the fee for a channel.
 
@@ -5214,12 +5526,19 @@ class FeeController:
                 result["message"] = "Dry run - no changes made"
                 return result
             
+            # Resolve base_fee_msat: explicit override > adaptive policy > legacy.
+            # See `_resolve_base_fee_msat` for the adaptive classification rules.
+            if base_fee_msat_override is not None:
+                feebase_msat = int(base_fee_msat_override)
+            else:
+                feebase_msat = self._resolve_base_fee_msat(peer_id, cfg)
             # Use setchannel command
             rpc_params = {
                 "id": resolved_channel_id,
-                "feebase": self.config.base_fee_msat,
+                "feebase": feebase_msat,
                 "feeppm": fee_ppm
             }
+            result["base_fee_msat"] = feebase_msat
             if htlcmin_msat is not None:
                 rpc_params["htlcmin"] = f"{htlcmin_msat}msat"
             if htlcmax_msat is not None:
