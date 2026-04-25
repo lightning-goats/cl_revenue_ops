@@ -203,18 +203,86 @@ def _pay_between(
         f"{label_prefix} {payer} to {payee}",
     )
     bolt11 = str(invoice.get("bolt11") or "")
-    paid = (
-        tournament.cln(payer, "pay", bolt11, timeout_seconds=45.0)
-        if bolt11 else
-        {"ok": False, "reason": "invoice_missing_bolt11", "invoice": invoice}
+    payment_hash = str(invoice.get("payment_hash") or "")
+    payment_secret = str(invoice.get("payment_secret") or "")
+    payee_id = _node_id(payee)
+    connected = (
+        tournament.cln(payer, "connect", f"{payee_id}@{payee}:9735")
+        if payee_id else
+        {"ok": False, "reason": "payee_id_missing"}
     )
+    route_result = (
+        tournament.cln(
+            payer,
+            "getroute",
+            f"id={payee_id}",
+            f"amount_msat={int(amount_sats) * 1000}",
+            "riskfactor=1",
+            "maxhops=1",
+        )
+        if bolt11 and payment_hash and payee_id else
+        {"ok": False, "reason": "direct_route_inputs_missing"}
+    )
+    route = route_result.get("route") if isinstance(route_result, dict) else None
+    if not (isinstance(route, list) and route) and payee_id:
+        direct_channel = _peer_channel(payer, payee_id)
+        direct_scid = str(direct_channel.get("short_channel_id") or "")
+        if direct_scid:
+            route = [
+                {
+                    "id": payee_id,
+                    "channel": direct_scid,
+                    "amount_msat": int(amount_sats) * 1000,
+                    "delay": 9,
+                    "style": "tlv",
+                }
+            ]
+            route_result = {
+                "ok": True,
+                "route": route,
+                "fallback": "manual_single_hop_peer_channel",
+                "getroute": route_result,
+            }
+    if isinstance(route, list) and route and bolt11 and payment_hash:
+        sendpay_args = [
+            "sendpay",
+            f"route={json.dumps(route, separators=(',', ':'))}",
+            f"payment_hash={payment_hash}",
+            f"amount_msat={int(amount_sats) * 1000}",
+            f"bolt11={bolt11}",
+        ]
+        if payment_secret:
+            sendpay_args.append(f"payment_secret={payment_secret}")
+        sent = tournament.cln(payer, *sendpay_args, timeout_seconds=45.0)
+        paid = (
+            tournament.cln(
+                payer,
+                "waitsendpay",
+                payment_hash,
+                "45",
+                timeout_seconds=50.0,
+            )
+            if tournament.rpc_result_ok(sent) else
+            {"ok": False, "reason": "sendpay_failed", "sendpay": sent}
+        )
+    else:
+        sent = {"ok": False, "reason": "direct_route_missing", "route_result": route_result}
+        paid = sent
     return {
-        "ok": tournament.rpc_result_ok(invoice) and tournament.rpc_result_ok(paid),
+        "ok": (
+            tournament.rpc_result_ok(invoice)
+            and tournament.rpc_result_ok(route_result)
+            and tournament.rpc_result_ok(sent)
+            and tournament.rpc_result_ok(paid)
+        ),
         "payer": payer,
         "payee": payee,
         "amount_sats": amount_sats,
         "label": label,
         "invoice": invoice,
+        "connect": connected,
+        "route": route_result,
+        "sendpay": sent,
         "pay": paid,
     }
 
@@ -509,6 +577,37 @@ def enable_cl_hive(
     )
 
 
+def push_hive_hints_datastore(node: str = REVENUE) -> dict[str, Any]:
+    """Force current cl-hive hints into the shared datastore.
+
+    The Polar harness seeds synthetic members by writing cl-hive's SQLite DB
+    directly. cl_revenue_ops prefers the datastore snapshot, so tests must
+    refresh that snapshot immediately instead of waiting for the background
+    cl-hive hint-push loop.
+    """
+    exported = tournament.cln(node, "hive-export-hints")
+    if not tournament.rpc_result_ok(exported):
+        return {
+            "ok": False,
+            "stage": "hive-export-hints",
+            "export_hints": exported,
+        }
+    payload = json.dumps(exported, separators=(",", ":"), sort_keys=True)
+    payload_hex = payload.encode("utf-8").hex()
+    pushed = tournament.cln(
+        node,
+        "datastore",
+        'key=["hive","hints"]',
+        f"hex={payload_hex}",
+        "mode=create-or-replace",
+    )
+    return {
+        "ok": tournament.rpc_result_ok(pushed),
+        "export_hints": exported,
+        "datastore": pushed,
+    }
+
+
 def seed_hive_channel_peers(
     *,
     peer_ids: list[str] | None = None,
@@ -552,29 +651,32 @@ def seed_hive_channel_peers(
         json.dumps(selected),
         hive_id,
     )
-    exported = tournament.cln(node, "hive-export-hints")
+    pushed = push_hive_hints_datastore(node)
     return {
-        "ok": bool(seeded.get("ok", False)) and tournament.rpc_result_ok(exported),
+        "ok": bool(seeded.get("ok", False)) and bool(pushed.get("ok", False)),
         "discovered_channel_peers": discovered,
         "include_channel_peers": include_channel_peers,
         "selected_peers": selected,
         "seeded": seeded,
-        "export_hints": exported,
+        "export_hints": pushed.get("export_hints"),
+        "push_datastore": pushed,
     }
 
 
 def refresh_cl_hive_runtime(node: str = REVENUE) -> dict[str, Any]:
     triggered = tournament.cln(node, "hive-trigger-all", timeout_seconds=45.0)
-    exported = tournament.cln(node, "hive-export-hints")
+    pushed = push_hive_hints_datastore(node)
+    exported = pushed.get("export_hints", {})
     layers = tournament.cln(node, "askrene-listlayers")
     return {
         "ok": (
             (tournament.rpc_result_ok(triggered) or "error" not in triggered)
-            and tournament.rpc_result_ok(exported)
+            and bool(pushed.get("ok", False))
             and tournament.rpc_result_ok(layers)
         ),
         "trigger_all": triggered,
         "export_hints": exported,
+        "push_datastore": pushed,
         "askrene_layers": layers,
     }
 
@@ -602,7 +704,13 @@ def clear_rebalance_cooldowns(node: str = REVENUE) -> dict[str, Any]:
 
 
 def set_hive_hints_disabled(node: str = REVENUE) -> dict[str, Any]:
-    first = tournament.cln(node, "setconfig", "revenue-ops-hive-hints-enabled", "false")
+    first = tournament.cln(
+        node,
+        "setconfig",
+        "revenue-ops-hive-hints-enabled",
+        "false",
+        "true",
+    )
     if first.get("ok", False) and "error" not in first:
         return {"ok": True, "method": "positional", "result": first}
     second = tournament.cln(
@@ -610,6 +718,7 @@ def set_hive_hints_disabled(node: str = REVENUE) -> dict[str, Any]:
         "setconfig",
         "config=revenue-ops-hive-hints-enabled",
         "val=false",
+        "transient=true",
     )
     return {
         "ok": second.get("ok", False) and "error" not in second,
@@ -635,11 +744,12 @@ def set_revenue_config_overrides(
             "setconfig",
             f"config={option}",
             f"val={value_text}",
+            "transient=true",
         )
         if named.get("ok", False) and "error" not in named:
             results[option] = {"ok": True, "method": "named", "value": value_text, "result": named}
             continue
-        positional = tournament.cln(node, "setconfig", option, value_text)
+        positional = tournament.cln(node, "setconfig", option, value_text, "true")
         results[option] = {
             "ok": positional.get("ok", False) and "error" not in positional,
             "method": "positional",
@@ -651,7 +761,7 @@ def set_revenue_config_overrides(
         "ok": all(item.get("ok", False) for item in results.values()),
         "overrides": overrides,
         "results": results,
-        "requires_restart": True,
+        "requires_restart": False,
     }
 
 

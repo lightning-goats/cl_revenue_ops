@@ -523,7 +523,6 @@ plugin.add_option(
     description='Gossip cache TTL for fee market boundary detection (default: 60)'
 )
 
-
 plugin.add_option(
     name='revenue-ops-market-fee-mode',
     default='undercut',
@@ -594,7 +593,6 @@ plugin.add_option(
         'skipped. Prod nodes with dense gossip may prefer 3.'
     )
 )
-
 
 plugin.add_option(
     name='revenue-ops-rebalance-min-profit',

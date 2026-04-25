@@ -97,6 +97,8 @@ class HiveHintAdapter:
                     self._snapshot = stale_candidate
                     self._snapshot_fetched_at = int(time.time())
                     self._using_stale_fallback = True
+                elif self._error_indicates_hive_unavailable(e):
+                    self._clear_snapshot()
                 return
             candidate = self._validate_and_normalize_snapshot(raw)
 
@@ -106,6 +108,10 @@ class HiveHintAdapter:
                 self._snapshot_fetched_at = int(time.time())
                 self._using_stale_fallback = True
                 return
+            if self._raw_indicates_hive_unavailable(raw):
+                self._clear_snapshot()
+                return
+            self._clear_snapshot()
             self._plugin.log("HIVE_HINTS: invalid snapshot schema, ignoring", level='debug')
             return
 
@@ -115,12 +121,38 @@ class HiveHintAdapter:
                 self._snapshot_fetched_at = int(time.time())
                 self._using_stale_fallback = True
                 return
+            self._clear_snapshot()
             self._plugin.log("HIVE_HINTS: stale snapshot, ignoring", level='debug')
             return
 
         self._snapshot = candidate
         self._snapshot_fetched_at = int(time.time())
         self._using_stale_fallback = False
+
+    def _clear_snapshot(self) -> None:
+        self._snapshot = None
+        self._snapshot_fetched_at = 0
+        self._using_stale_fallback = False
+
+    @staticmethod
+    def _error_indicates_hive_unavailable(error) -> bool:
+        text = str(error).lower()
+        return (
+            "unknown command" in text
+            or "hive-export-hints" in text and "not found" in text
+            or "not a hive member" in text
+        )
+
+    @staticmethod
+    def _raw_indicates_hive_unavailable(raw) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        text = " ".join(str(raw.get(key) or "") for key in ("error", "stderr", "message")).lower()
+        return (
+            "unknown command" in text
+            or "hive-export-hints" in text and "not found" in text
+            or "not a hive member" in text
+        )
 
     @staticmethod
     def _validate_snapshot(raw) -> bool:
@@ -426,6 +458,31 @@ class HiveHintAdapter:
             }
         return {}
 
+    def get_fleet_topology(self, peer_id: str) -> list:
+        """Return validated topology entries advertised by a hive member hint."""
+        hint = self._get_peer_hint(peer_id)
+        merged = []
+        for value in (
+            *self._normalize_str_list(hint.get("fleet_hive_topology")),
+            *self._normalize_str_list(hint.get("fleet_topology")),
+        ):
+            if value not in merged:
+                merged.append(value)
+        return merged
+
+    def get_member_peer_ids(self) -> list:
+        """Return hive member peer ids represented in the current hint snapshot."""
+        if not self.is_usable():
+            return []
+        hints = self._snapshot.get("hints", {})
+        if not isinstance(hints, dict):
+            return []
+        return [
+            str(peer_id)
+            for peer_id, hint in hints.items()
+            if peer_id and isinstance(hint, dict) and bool(hint.get("member", False))
+        ]
+
     # ------------------------------------------------------------------
     # Coordination sections
     # ------------------------------------------------------------------
@@ -451,14 +508,35 @@ class HiveHintAdapter:
         if not isinstance(raw, dict):
             return None
         recommendation_id = raw.get("recommendation_id")
-        route_segments = raw.get("route_segments")
         if not isinstance(recommendation_id, str) or not recommendation_id.strip():
             return None
+        route_segments_missing = "route_segments" not in raw
+        route_segments = raw.get("route_segments", [])
+        if route_segments is None:
+            route_segments_missing = True
+            route_segments = []
         if not isinstance(route_segments, list):
             return None
         normalized_route_segments = self._normalize_route_segments(route_segments)
         if route_segments and not normalized_route_segments:
             return None
+        if route_segments_missing and not normalized_route_segments:
+            has_source_sink = bool(
+                str(raw.get("source_scid") or "").strip()
+                and str(raw.get("sink_scid") or "").strip()
+            )
+            has_peer_pair = bool(
+                str(raw.get("source_peer_id") or raw.get("from_peer_id") or "").strip()
+                and str(
+                    raw.get("destination_peer_id")
+                    or raw.get("dest_peer_id")
+                    or raw.get("to_peer_id")
+                    or raw.get("target_peer_id")
+                    or ""
+                ).strip()
+            )
+            if not (has_source_sink or has_peer_pair):
+                return None
         recommendation = dict(raw)
         recommendation["recommendation_id"] = recommendation_id.strip()
         recommendation["route_segments"] = normalized_route_segments

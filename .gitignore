@@ -23,6 +23,7 @@ ENV/
 .coverage.*
 htmlcov/
 .pytest_cache/
+coverage.xml
 
 # Editors / OS
 .vscode/
@@ -46,6 +47,19 @@ htmlcov/
 
 # Logs
 *.log
+
+# Generated experiment outputs
+#
+# Keep curated summaries in docs/ or as intentional top-level results/*.md files.
+# Timestamped run directories should stay local unless force-added on purpose.
+results/fee-*/
+results/hive-hints-truth-*/
+results/module-loop-*/
+results/rebalancer-polar-mcp-*/
+artifacts/
+
+# unittest.mock spillover from accidental file-backed mocks
+MagicMock/
 
 # Local runtime/state directories (if created)
 logs/

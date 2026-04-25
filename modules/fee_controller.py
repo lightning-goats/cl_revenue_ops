@@ -1758,6 +1758,8 @@ class FeeController:
         # Hive hints adapter (injected by main plugin; None = disabled)
         self.hive_hints = None
         self._hive_member_set_at: Dict[str, int] = {}
+        self._hive_member_released_peers: set[str] = set()
+        self._hive_member_advisory_peers: set[str] = set()
 
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
@@ -2500,37 +2502,41 @@ class FeeController:
         except Exception:
             return 0
 
-    def _check_hive_member_fee(self, peer_id: str,
-                               cfg: Optional['ConfigSnapshot'] = None) -> Optional[int]:
-        """Return the intra-fleet ppm if peer is a hive member, else None.
+    def _check_hive_member_fee(self, peer_id: str) -> Optional[int]:
+        """Refresh hive membership state and let dynamic pricing set the fee.
 
-        This is a categorical trust-based decision, not a continuous bias.
-        It does NOT update DTS posterior or trigger hysteresis sleep.
-
-        The actual ppm value comes from cfg.fee_ppm_intra_fleet (default 1).
-        Legacy callers that passed no cfg get the configured default via
-        self.config.snapshot(); a zero value restores the pre-Path-B 0-PPM
-        fleet policy.
-
-        Gossip oscillation protection: if a peer was recently identified as
-        a member and hints then go stale, hold the intra-fleet ppm for one
-        additional TTL period before reverting.
+        Hive membership used to be a hard 0-PPM fleet policy. Tournament
+        testing showed that wins route share but destroys fee revenue, so the
+        member hint is now advisory: it seeds/biases DTS+PID elsewhere and
+        forces a prompt dynamic reprice when membership is observed or removed.
         """
         if self.hive_hints is None:
             return None
 
-        if cfg is None:
-            cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-        intra_ppm = int(getattr(cfg, 'fee_ppm_intra_fleet', 0) or 0)
+        hints_usable = True
+        try:
+            if hasattr(self.hive_hints, "is_usable"):
+                hints_usable = bool(self.hive_hints.is_usable())
+        except Exception:
+            hints_usable = True
 
         try:
             if self.hive_hints.is_hive_member(peer_id):
                 self._hive_member_set_at[peer_id] = int(time.time())
-                return intra_ppm
+                self._hive_member_advisory_peers.add(peer_id)
+                return None
         except Exception:
             pass
 
-        # Grace period: hold intra-fleet ppm for one TTL after hints go stale
+        if not hints_usable:
+            if peer_id in self._hive_member_set_at:
+                self._hive_member_released_peers.add(peer_id)
+            self._hive_member_set_at.pop(peer_id, None)
+            self._hive_member_advisory_peers.discard(peer_id)
+            return None
+
+        # Grace period: treat stale-but-usable membership as advisory for one
+        # extra TTL window to avoid oscillating when gossip/export lags.
         last_set = self._hive_member_set_at.get(peer_id)
         if last_set is not None:
             try:
@@ -2538,11 +2544,25 @@ class FeeController:
             except Exception:
                 ttl = 900
             if int(time.time()) - last_set <= ttl * 2:
-                return intra_ppm
+                self._hive_member_advisory_peers.add(peer_id)
+                return None
             else:
                 del self._hive_member_set_at[peer_id]
+                self._hive_member_advisory_peers.discard(peer_id)
 
         return None
+
+    def _consume_hive_member_release(self, peer_id: str) -> bool:
+        if peer_id in self._hive_member_released_peers:
+            self._hive_member_released_peers.discard(peer_id)
+            return True
+        return False
+
+    def _consume_hive_member_advisory(self, peer_id: str) -> bool:
+        if peer_id in self._hive_member_advisory_peers:
+            self._hive_member_advisory_peers.discard(peer_id)
+            return True
+        return False
 
     def _refresh_askrene_cache(self, cfg) -> None:
         """Refresh AskRene constraints cache (best-effort, 30s TTL)."""
@@ -3392,25 +3412,11 @@ class FeeController:
                             skip_reasons["policy_static"] += 1
                     continue
 
-                # HIVE MEMBER: intra-fleet ppm policy (hint-driven, no DTS/hysteresis)
-                hive_member_fee = self._check_hive_member_fee(peer_id, cfg)
-                if hive_member_fee is not None:
-                    channel_info = channels.get(channel_id)
-                    if channel_info:
-                        current_fee = channel_info.get("fee_proportional_millionths", 0)
-                        if current_fee != hive_member_fee:
-                            try:
-                                self.set_channel_fee(
-                                    channel_id, hive_member_fee,
-                                    reason=f"Hive member: {hive_member_fee}-PPM fleet policy",
-                                    reason_code=FeeReasonCode.POLICY_STATIC.value,
-                                    enforce_limits=False
-                                )
-                            except Exception as e:
-                                self.plugin.log(f"Error setting hive member fee for {channel_id}: {e}", level='error')
-                    continue
-
                 # DYNAMIC strategy continues to normal fee optimization below
+
+            # Hive membership is advisory: keep DTS/PID active while using
+            # hive hints for priors, market boundary estimates, and bias.
+            self._check_hive_member_fee(peer_id)
 
             # Get channel info
             channel_info = channels.get(channel_id)
@@ -3434,13 +3440,20 @@ class FeeController:
                         channel_id, pre_last_update
                     )
 
+                force_reprice_reason = None
+                if self._consume_hive_member_release(peer_id):
+                    force_reprice_reason = "hive_unavailable"
+                elif self._consume_hive_member_advisory(peer_id):
+                    force_reprice_reason = "hive_member_advisory"
+
                 adjustment = self._adjust_channel_fee(
                     channel_id=channel_id,
                     peer_id=peer_id,
                     state=state,
                     channel_info=channel_info,
                     chain_costs=chain_costs,
-                    cfg=cfg
+                    cfg=cfg,
+                    force_reprice_reason=force_reprice_reason,
                 )
 
                 if adjustment:
@@ -3926,7 +3939,8 @@ class FeeController:
                            state: Dict[str, Any],
                            channel_info: Dict[str, Any],
                            chain_costs: Optional[Dict[str, int]] = None,
-                           cfg: Optional['ConfigSnapshot'] = None) -> Optional[FeeAdjustment]:
+                           cfg: Optional['ConfigSnapshot'] = None,
+                           force_reprice_reason: Optional[str] = None) -> Optional[FeeAdjustment]:
         """
         Adjust fee for a single channel.
 
@@ -4025,6 +4039,23 @@ class FeeController:
         _sleep_until = _ts_sleep_state.sleep_until
         _sleep_last_update = _ts_sleep_state.last_update
         _sleep_last_revenue_rate = _ts_sleep_state.last_revenue_rate
+
+        if _sleep_is_sleeping and force_reprice_reason:
+            woke_from_sleep = True
+            wake_reason = force_reprice_reason
+            _sleep_is_sleeping = False
+            _ts_sleep_state.is_sleeping = False
+            _ts_sleep_state.sleep_until = 0
+            _ts_sleep_state.stable_cycles = 0
+            self._save_channel_fee_state(channel_id, _ts_sleep_state)
+            cycle.is_sleeping = False
+            cycle.sleep_until = 0
+            cycle.stable_cycles = 0
+            self._save_cycle_state(channel_id, cycle)
+            self.plugin.log(
+                f"HYSTERESIS: Channel {channel_id[:12]}... waking up due to {force_reprice_reason}",
+                level='info'
+            )
 
         if _sleep_is_sleeping:
             # Check if it's time to wake up (sleep timer expired)
@@ -4125,7 +4156,14 @@ class FeeController:
             time_ok = hours_elapsed >= fee_profile.min_observation_hours
             forwards_ok = forward_count >= fee_profile.min_forwards_for_signal
 
-            if time_ok or forwards_ok:
+            if force_reprice_reason:
+                self.plugin.log(
+                    f"DYNAMIC_WINDOW: {channel_id[:12]}... bypassing wait due to {force_reprice_reason} "
+                    f"({forward_count}/{fee_profile.min_forwards_for_signal} forwards, "
+                    f"{hours_elapsed:.1f}/{fee_profile.min_observation_hours}h)",
+                    level='debug'
+                )
+            elif time_ok or forwards_ok:
                 # Either condition met - proceed with adjustment
                 reason = "time" if time_ok else "forwards"
                 self.plugin.log(
@@ -4927,13 +4965,23 @@ class FeeController:
         )
 
         # Check if fee changed meaningfully (Alpha Guard)
+        raw_zero_fee_recovery = (
+            raw_chain_fee <= 0
+            and new_fee_ppm > 0
+            and not is_under_exploration
+        )
         fee_change = abs(new_fee_ppm - current_fee_ppm)
         if current_fee_ppm < 100:
             min_change = 1
         else:
             min_change = max(5, (current_fee_ppm * 3 + 99) // 100)  # Ceiling of 3%
             
-        if fee_change < min_change and not is_congested and not htlcmin_policy_change:
+        if (
+            fee_change < min_change
+            and not is_congested
+            and not htlcmin_policy_change
+            and not raw_zero_fee_recovery
+        ):
             # CRITICAL: Reset observation timer so the next cycle doesn't
             # double-count the current window's data.  DTS+PID posteriors,
             # demand baselines, and elasticity trackers were
@@ -5707,21 +5755,16 @@ class FeeController:
                         channel_info=channel_info
                     )
 
-            # HIVE MEMBER: intra-fleet ppm policy (hint-driven)
+            # Hive membership should improve the dynamic prior/bias, not force
+            # a free public route that destroys routing revenue.
             if self.hive_hints is not None:
                 try:
                     if self.hive_hints.is_hive_member(peer_id):
                         self._hive_member_set_at[peer_id] = int(time.time())
-                        intra_ppm = int(getattr(cfg, 'fee_ppm_intra_fleet', 0) or 0)
+                        self._hive_member_advisory_peers.add(peer_id)
                         self.plugin.log(
-                            f"INITIAL_FEE: {scid[:16]}... -> {intra_ppm} PPM (hive member)"
-                        )
-                        return self.set_channel_fee(
-                            scid, intra_ppm,
-                            reason="Initial fee: hive member",
-                            reason_code=FeeReasonCode.POLICY_STATIC.value,
-                            enforce_limits=False,
-                            channel_info=channel_info
+                            f"INITIAL_FEE: {scid[:16]}... hive member; using dynamic fleet-aware pricing",
+                            level='debug'
                         )
                 except Exception:
                     pass

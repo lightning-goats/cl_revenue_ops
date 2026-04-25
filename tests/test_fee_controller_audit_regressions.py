@@ -586,6 +586,45 @@ class TestAdjustChannelFeeEndToEnd:
         assert fc._cycle_states[channel_id].last_broadcast_at == cycle.last_broadcast_at
         assert fc._channel_fee_states[channel_id].last_broadcast_at == ts_state.last_broadcast_at
 
+    def test_raw_zero_fee_recovery_bypasses_alpha_guard(self, mock_plugin, mock_database):
+        fc, cfg = self._make_fc_full(mock_plugin, mock_database)
+        fc.config.dry_run = False
+        fc.config.base_fee_msat = 0
+        fc.data_service = MagicMock()
+        fc.data_service.set_channel.return_value = {}
+        channel_id = "123x456x6"
+        peer_id = "02" + "e" * 64
+        now = int(time.time())
+
+        cycle = ChannelCycleState(
+            last_revenue_rate=0.0,
+            last_fee_ppm=0,
+            last_broadcast_fee_ppm=0,
+            last_update=now - 7200,
+        )
+        fc._cycle_states[channel_id] = cycle
+
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=0)
+        ts_state.last_fee_ppm = 0
+        ts_state.last_broadcast_fee_ppm = 0
+        ts_state.last_update = now - 7200
+        ts_state.thompson.sample_fee = lambda floor, ceiling: cfg.min_fee_ppm
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
+        channel_info = {
+            "fee_proportional_millionths": 0,
+            "capacity": 2_000_000,
+            "spendable_msat": "1000000000msat",
+            "opener": "local",
+        }
+        state = {"state": "balanced", "forward_count": 50, "sats_out": 10000}
+
+        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
+
+        assert result is not None
+        assert result.new_fee_ppm > 0
+        assert fc.data_service.set_channel.called
+
     def test_successful_broadcast_updates_both_observation_and_broadcast_timestamps(self, mock_plugin, mock_database):
         fc, cfg = self._make_fc_full(mock_plugin, mock_database)
         channel_id = "123x456x5"
