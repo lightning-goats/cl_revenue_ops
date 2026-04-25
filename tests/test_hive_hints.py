@@ -102,6 +102,36 @@ class TestPolling:
         adapter.poll()
         assert adapter._snapshot is first_snapshot
 
+    def test_poll_unknown_hive_command_clears_last_good(self, mock_plugin):
+        mock_plugin.rpc.call.return_value = VALID_SNAPSHOT
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.data_service = MagicMock()
+        adapter.data_service.list_datastore.return_value = {"datastore": []}
+        adapter.poll()
+        assert adapter.is_hive_member("02aabbcc") is True
+
+        mock_plugin.rpc.call.side_effect = Exception("Unknown command 'hive-export-hints'")
+        adapter.poll()
+
+        assert adapter._snapshot is None
+        assert adapter.is_usable() is False
+        assert adapter.is_hive_member("02aabbcc") is False
+
+    def test_poll_non_member_response_clears_last_good(self, mock_plugin):
+        mock_plugin.rpc.call.return_value = VALID_SNAPSHOT
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.data_service = MagicMock()
+        adapter.data_service.list_datastore.return_value = {"datastore": []}
+        adapter.poll()
+        assert adapter.is_hive_member("02aabbcc") is True
+
+        mock_plugin.rpc.call.return_value = {"ok": True, "error": "Not a Hive member"}
+        adapter.poll()
+
+        assert adapter._snapshot is None
+        assert adapter.is_usable() is False
+        assert adapter.is_hive_member("02aabbcc") is False
+
     def test_poll_rpc_failure_no_prior_snapshot(self, mock_plugin):
         mock_plugin.rpc.call.side_effect = Exception("connection refused")
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)

@@ -69,7 +69,6 @@ def _channel_need_sats(channel: ChannelState, target_band_low: float) -> int:
 def _is_viable_source(channel: ChannelState, target_band_high: float) -> bool:
     return (
         not channel.cooldown_active
-        and channel.remaining_budget_sats > 0
         and _channel_excess_sats(channel, target_band_high) > 0
     )
 

@@ -1,0 +1,8 @@
+# /etc/sudoers.d/cl-revenue-ops-validation
+# Enable Hermes collection from sat -> lightningd for production validation.
+# Validate with: visudo -cf /etc/sudoers.d/cl-revenue-ops-validation
+
+Cmnd_Alias CRO_LIGHTNING = /usr/bin/lightning-cli
+Cmnd_Alias CRO_LOGS = /usr/bin/tail
+
+sat ALL=(lightningd) NOPASSWD: CRO_LIGHTNING, CRO_LOGS
