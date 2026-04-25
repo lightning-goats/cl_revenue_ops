@@ -90,6 +90,43 @@ def test_node_policy_selects_policy_by_pubkey():
     assert runner.node_policy(chan_info, "b") == {"fee_rate_milli_msat": "60"}
 
 
+def test_policy_update_window_waits_for_lnd_graph_rate_limit(monkeypatch):
+    runner = load_runner()
+    sleeps = []
+
+    monkeypatch.setattr(runner, "_LAST_COMPETITOR_POLICY_UPDATE_MONOTONIC", None)
+    monkeypatch.setattr(
+        runner,
+        "competitor_sink_channel_ids",
+        lambda sink_pubkey: {"lnd_channel_id": "123", "short_channel_id": "1x1x1"},
+    )
+    monkeypatch.setattr(runner.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(runner.time, "monotonic", lambda: 2_000.0)
+    monkeypatch.setattr(runner.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    def fake_lnd(node, *args, **kwargs):
+        assert node == runner.PAYER
+        assert args == ("getchaninfo", "123")
+        return {
+            "ok": True,
+            "node1_pub": "other",
+            "node1_policy": {"last_update": 1},
+            "node2_pub": "competitor",
+            "node2_policy": {"last_update": 930},
+        }
+
+    monkeypatch.setattr(runner, "lnd", fake_lnd)
+
+    result = runner.wait_for_competitor_policy_update_window(
+        context={"sink_pubkey": "sink", "competitor_pubkey": "competitor"},
+        min_interval_seconds=90.0,
+    )
+
+    assert sleeps == [20.0]
+    assert result["wait_seconds"] == 20.0
+    assert result["last_graph_update"] == 930
+
+
 def test_force_fee_cycle_prefers_manual_cycle_rpc(monkeypatch):
     runner = load_runner()
     calls = []

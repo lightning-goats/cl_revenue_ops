@@ -20,9 +20,12 @@ python3 -m pytest tests/ -v
 
 # Run tests matching a pattern
 python3 -m pytest tests/ -k "test_rebalance"
+
+# Preview local cache/artifact cleanup
+scripts/clean-local.sh
 ```
 
-No build system - this is a CLN plugin deployed by copying `cl-revenue-ops.py` and `modules/` to the plugin directory.
+No packaging build is required for deployment. This is a CLN plugin deployed by copying `cl-revenue-ops.py` and `modules/` to the plugin directory. `pyproject.toml` exists for local test/import/tool configuration.
 
 ## Architecture
 
@@ -36,20 +39,18 @@ native sendpay / waitsendpay
 Core Lightning
 ```
 
-### Module Organization (8 modules)
+### Module Organization
 
-| Module | Purpose |
-|--------|---------|
-| `fee_controller.py` | DTS+PID fee optimization, Vegas Reflex, congestion handling |
-| `rebalancer.py` | EV-based rebalancing, native route execution, futility circuit breaker |
-| `flow_analysis.py` | Sink/Source detection, Kalman-filtered flow estimation with NaN recovery |
-| `policy_manager.py` | Per-peer policy engine (dynamic/static/passive) |
-| `profitability_analyzer.py` | P&L calculation, ROC metrics, capacity recommendations |
-| `capacity_planner.py` | Channel sizing recommendations ("Winners & Losers") |
-| `boltz_manager.py` | Submarine swap integration |
-| `database.py` | SQLite with WAL mode, accounting + Kalman state persistence |
-| `config.py` | Hot-reloadable configuration |
-| `utils.py` | Shared utility functions |
+| Area | Key Modules | Purpose |
+|------|-------------|---------|
+| Plugin entrypoint | `cl-revenue-ops.py` | CLN plugin wiring, RPC registration, background loop orchestration |
+| Fee control | `fee_controller.py`, `policy_manager.py` | DTS+PID fee optimization, fee bounds, per-peer policy engine |
+| Rebalancing | `rebalancer.py`, `rebalance_engine_v2.py`, `rebalance_router_v3.py`, `rebalance_*_v2.py` | Candidate selection, askrene pricing, route policy, native explicit-route execution |
+| Flow and profitability | `flow_analysis.py`, `profitability_analyzer.py`, `capital_efficiency.py`, `segment_observations.py` | Flow classification, Kalman state, P&L, fleet efficiency, failed-segment memory |
+| Planning and capex | `capacity_planner.py`, `capex_budget.py`, `demand_flow.py` | Channel-open recommendations, capital budgets, demand-flow heuristics |
+| Hive integration | `hive_hints.py`, `hive_router.py`, `hive_runtime.py`, `rebalance_hive_router.py`, `rebalance_coordination_overlay.py` | Fleet hints, hive route policy, coordination overlays |
+| Boltz automation | `boltz_manager.py` | Submarine swap quoting, execution, budgets, and auto-cycle support |
+| Persistence/config | `database.py`, `data_service.py`, `config.py`, `utils.py` | SQLite persistence, RPC/data wrappers, runtime config, shared conversions |
 
 ### Key Algorithms
 

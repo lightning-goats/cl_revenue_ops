@@ -169,6 +169,7 @@ def test_run_plan_bootstraps_cl_hive_when_enabled(tmp_path, monkeypatch):
         cycle_wait=0,
         policy_settle_seconds=0,
         policy_verify_timeout_seconds=1,
+        policy_min_update_interval_seconds=75,
         post_payment_settle_seconds=0,
         channel_id="277x1x0",
         competitor_controller="scripted",
@@ -195,6 +196,7 @@ def test_run_plan_bootstraps_cl_hive_when_enabled(tmp_path, monkeypatch):
     assert result["cl_hive_setup"] == {"ok": True, "enabled": True}
     assert ensure_calls[0]["hive_id"] == "test-hive"
     assert run_phase_calls[0]["with_cl_hive"] is True
+    assert run_phase_calls[0]["policy_min_update_interval_seconds"] == 75
 
 
 def test_run_plan_disables_cl_hive_when_not_enabled(tmp_path, monkeypatch):

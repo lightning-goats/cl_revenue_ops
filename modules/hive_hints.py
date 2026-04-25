@@ -458,6 +458,31 @@ class HiveHintAdapter:
             }
         return {}
 
+    def get_fleet_topology(self, peer_id: str) -> list:
+        """Return validated topology entries advertised by a hive member hint."""
+        hint = self._get_peer_hint(peer_id)
+        merged = []
+        for value in (
+            *self._normalize_str_list(hint.get("fleet_hive_topology")),
+            *self._normalize_str_list(hint.get("fleet_topology")),
+        ):
+            if value not in merged:
+                merged.append(value)
+        return merged
+
+    def get_member_peer_ids(self) -> list:
+        """Return hive member peer ids represented in the current hint snapshot."""
+        if not self.is_usable():
+            return []
+        hints = self._snapshot.get("hints", {})
+        if not isinstance(hints, dict):
+            return []
+        return [
+            str(peer_id)
+            for peer_id, hint in hints.items()
+            if peer_id and isinstance(hint, dict) and bool(hint.get("member", False))
+        ]
+
     # ------------------------------------------------------------------
     # Coordination sections
     # ------------------------------------------------------------------

@@ -934,6 +934,66 @@ class TestChannelOpenHints:
         assert adapter.get_open_candidates() == []
 
 
+# ---------------------------------------------------------------------------
+# Fleet topology hints
+# ---------------------------------------------------------------------------
+
+class TestFleetTopologyHints:
+    def test_get_member_peer_ids_and_fleet_topology_without_balance_fields(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02member_a": {
+                    "member": True,
+                    "fleet_hive_topology": ["02member_b", "03member_c", ""],
+                    "fleet_topology": ["03member_c", "02external_peer"],
+                },
+                "02member_b": {
+                    "member": True,
+                },
+                "02external": {
+                    "member": False,
+                    "fleet_topology": ["02ignored"],
+                },
+            },
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_member_peer_ids() == ["02member_a", "02member_b"]
+        assert adapter.get_fleet_topology("02member_a") == [
+            "02member_b",
+            "03member_c",
+            "02external_peer",
+        ]
+        assert adapter.get_fleet_topology("02member_b") == []
+
+    def test_get_fleet_balance_still_includes_topology_when_balances_exist(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02member_a": {
+                    "member": True,
+                    "fleet_capacity_sats": 1_000_000,
+                    "fleet_available_sats": 400_000,
+                    "fleet_topology": ["02member_b"],
+                },
+            },
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_fleet_balance("02member_a") == {
+            "capacity_sats": 1_000_000,
+            "available_sats": 400_000,
+            "topology": ["02member_b"],
+        }
+
+
 class TestCoordinationSections:
     def _make_adapter(self, mock_plugin, snapshot):
         mock_plugin.rpc.call.return_value = snapshot

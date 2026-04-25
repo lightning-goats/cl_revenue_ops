@@ -339,6 +339,7 @@ def run_plan(args: argparse.Namespace, phases: list[PlannedPhase]) -> dict[str, 
             set_competitor_policy=set_policy,
             competitor_controller=phase.competitor_controller,
             policy_verify_timeout_seconds=args.policy_verify_timeout_seconds,
+            policy_min_update_interval_seconds=getattr(args, "policy_min_update_interval_seconds", 0.0),
             with_cl_hive=with_cl_hive,
         )
         result["long_tournament_phase"] = asdict(phase)
@@ -359,6 +360,7 @@ def run_plan(args: argparse.Namespace, phases: list[PlannedPhase]) -> dict[str, 
             "cycle_wait": args.cycle_wait,
             "policy_settle_seconds": args.policy_settle_seconds,
             "policy_verify_timeout_seconds": args.policy_verify_timeout_seconds,
+            "policy_min_update_interval_seconds": getattr(args, "policy_min_update_interval_seconds", 0.0),
             "post_payment_settle_seconds": args.post_payment_settle_seconds,
             "channel_id": args.channel_id,
             "competitor_controller": args.competitor_controller,
@@ -387,6 +389,7 @@ def render_plan_markdown(phases: list[PlannedPhase], args: argparse.Namespace) -
         f"- `rounds_per_phase`: {args.rounds_per_phase}",
         f"- `amounts`: {', '.join(str(a) for a in args.amounts)}",
         f"- `with_cl_hive`: {getattr(args, 'with_cl_hive', False)}",
+        f"- `policy_min_update_interval_seconds`: {getattr(args, 'policy_min_update_interval_seconds', 0.0)}",
         f"- `requested_competitor_controller`: {args.competitor_controller}",
         f"- `planned_competitor_controllers`: {', '.join(planned_controllers)}",
         f"- `total_phases`: {len(phases)}",
@@ -436,6 +439,12 @@ def main() -> int:
     parser.add_argument("--skip-disable-cl-hive", action="store_true")
     parser.add_argument("--policy-settle-seconds", type=float, default=12.0)
     parser.add_argument("--policy-verify-timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--policy-min-update-interval-seconds",
+        type=float,
+        default=75.0,
+        help="Minimum spacing between scripted competitor policy updates to avoid LND gossip rate limits.",
+    )
     parser.add_argument("--post-payment-settle-seconds", type=float, default=2.0)
     parser.add_argument("--competitor-cltv-delta", type=int, default=40)
     parser.add_argument("--payer-time-pref", type=float, default=0.0)

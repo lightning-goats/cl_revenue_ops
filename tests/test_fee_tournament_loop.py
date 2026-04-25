@@ -128,6 +128,7 @@ def test_build_args_threads_cl_hive_options(tmp_path):
         plugin_path="/tmp/cl_revenue_ops/cl-revenue-ops.py",
         policy_settle_seconds=0,
         policy_verify_timeout_seconds=1,
+        policy_min_update_interval_seconds=75,
         post_payment_settle_seconds=0,
         channel_id="277x1x0",
         with_cl_hive=True,
@@ -148,6 +149,7 @@ def test_build_args_threads_cl_hive_options(tmp_path):
     assert args.skip_cl_hive_deploy is True
     assert args.skip_cl_hive_genesis is True
     assert args.skip_disable_cl_hive is False
+    assert args.policy_min_update_interval_seconds == 75
 
 
 def test_collect_loop_preflight_prepares_enabled_hive(monkeypatch):

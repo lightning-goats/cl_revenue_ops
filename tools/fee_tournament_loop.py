@@ -324,6 +324,7 @@ def build_args(
     policy_verify_timeout_seconds: float,
     post_payment_settle_seconds: float,
     channel_id: str,
+    policy_min_update_interval_seconds: float = 0.0,
     with_cl_hive: bool = False,
     cl_hive_host_path: str | Path = tournament.DEFAULT_CL_HIVE_HOST_PATH,
     cl_hive_plugin_path: str = tournament.DEFAULT_CL_HIVE_PLUGIN_PATH,
@@ -348,6 +349,7 @@ def build_args(
         plugin_path=plugin_path,
         policy_settle_seconds=policy_settle_seconds,
         policy_verify_timeout_seconds=policy_verify_timeout_seconds,
+        policy_min_update_interval_seconds=policy_min_update_interval_seconds,
         post_payment_settle_seconds=post_payment_settle_seconds,
         competitor_cltv_delta=profile.competitor_cltv_delta,
         payer_time_pref=profile.payer_time_pref,
@@ -397,6 +399,7 @@ def run_iteration(
     skip_cl_hive_start: bool = False,
     skip_cl_hive_genesis: bool = False,
     skip_disable_cl_hive: bool = False,
+    policy_min_update_interval_seconds: float = 0.0,
 ) -> dict[str, Any]:
     iteration_dir.mkdir(parents=True, exist_ok=True)
     args = build_args(
@@ -413,6 +416,7 @@ def run_iteration(
         plugin_path=plugin_path,
         policy_settle_seconds=policy_settle_seconds,
         policy_verify_timeout_seconds=policy_verify_timeout_seconds,
+        policy_min_update_interval_seconds=policy_min_update_interval_seconds,
         post_payment_settle_seconds=post_payment_settle_seconds,
         channel_id=channel_id,
         with_cl_hive=with_cl_hive,
@@ -448,6 +452,7 @@ def run_iteration(
             "skip_disable_cl_hive": skip_disable_cl_hive,
             "policy_settle_seconds": policy_settle_seconds,
             "policy_verify_timeout_seconds": policy_verify_timeout_seconds,
+            "policy_min_update_interval_seconds": policy_min_update_interval_seconds,
             "estimated_payment_volume_sats": estimate_plan_payment_volume(phases, rounds_per_phase),
         },
         "phases": [asdict(phase) for phase in phases],
@@ -588,6 +593,12 @@ def main() -> int:
     parser.add_argument("--skip-disable-cl-hive", action="store_true")
     parser.add_argument("--policy-settle-seconds", type=float, default=12.0)
     parser.add_argument("--policy-verify-timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--policy-min-update-interval-seconds",
+        type=float,
+        default=75.0,
+        help="Minimum spacing between scripted competitor policy updates to avoid LND gossip rate limits.",
+    )
     parser.add_argument("--post-payment-settle-seconds", type=float, default=1.0)
     parser.add_argument("--channel-id", default="277x1x0")
     parser.add_argument("--restore-liquidity", action="store_true")
@@ -635,6 +646,7 @@ def main() -> int:
                 plugin_path=args.plugin_path,
                 policy_settle_seconds=args.policy_settle_seconds,
                 policy_verify_timeout_seconds=args.policy_verify_timeout_seconds,
+                policy_min_update_interval_seconds=args.policy_min_update_interval_seconds,
                 post_payment_settle_seconds=args.post_payment_settle_seconds,
                 channel_id=args.channel_id,
                 execute=args.execute,
@@ -683,6 +695,7 @@ def main() -> int:
             "target_payer_local_sats": args.target_payer_local_sats,
             "policy_settle_seconds": args.policy_settle_seconds,
             "policy_verify_timeout_seconds": args.policy_verify_timeout_seconds,
+            "policy_min_update_interval_seconds": args.policy_min_update_interval_seconds,
         },
         "preflight": preflight,
         "results": results,

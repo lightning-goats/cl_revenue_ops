@@ -35,6 +35,8 @@ DEFAULT_CL_HIVE_CONTAINER_DIR = "/tmp/cl_hive"
 DEFAULT_CL_HIVE_PLUGIN_PATH = f"{DEFAULT_CL_HIVE_CONTAINER_DIR}/cl-hive.py"
 DEFAULT_CL_HIVE_ID = "cl-revenue-ops-test"
 
+_LAST_COMPETITOR_POLICY_UPDATE_MONOTONIC: float | None = None
+
 
 def _safe_text(value: Any) -> str:
     if value is None:
@@ -528,6 +530,57 @@ def competitor_sink_channel_ids(sink_pubkey: str) -> dict[str, str]:
     return {"lnd_channel_id": "", "short_channel_id": ""}
 
 
+def wait_for_competitor_policy_update_window(
+    *,
+    context: dict[str, str],
+    min_interval_seconds: float,
+) -> dict[str, Any]:
+    """Avoid scripted LND policy churn that remote LND nodes rate-limit."""
+    global _LAST_COMPETITOR_POLICY_UPDATE_MONOTONIC
+
+    if min_interval_seconds <= 0:
+        return {"ok": True, "skipped": True, "reason": "policy update interval disabled"}
+
+    channel_ids = competitor_sink_channel_ids(context["sink_pubkey"])
+    lnd_channel_id = channel_ids["lnd_channel_id"]
+    payer_result: dict[str, Any] = {}
+    payer_policy: dict[str, Any] = {}
+    last_graph_update = 0
+    if lnd_channel_id:
+        payer_result = lnd(PAYER, "getchaninfo", lnd_channel_id)
+        if payer_result.get("ok", False):
+            payer_policy = node_policy(payer_result, context["competitor_pubkey"])
+            last_graph_update = int_field(payer_policy.get("last_update"), 0)
+
+    now_wall = time.time()
+    wall_wait = (
+        max(0.0, min_interval_seconds - max(0.0, now_wall - float(last_graph_update)))
+        if last_graph_update > 0 else
+        0.0
+    )
+    monotonic_wait = (
+        max(0.0, min_interval_seconds - (time.monotonic() - _LAST_COMPETITOR_POLICY_UPDATE_MONOTONIC))
+        if _LAST_COMPETITOR_POLICY_UPDATE_MONOTONIC is not None else
+        0.0
+    )
+    wait_seconds = max(wall_wait, monotonic_wait)
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+
+    return {
+        "ok": True,
+        "min_interval_seconds": min_interval_seconds,
+        "wait_seconds": wait_seconds,
+        "wall_wait_seconds": wall_wait,
+        "monotonic_wait_seconds": monotonic_wait,
+        "lnd_channel_id": lnd_channel_id,
+        "short_channel_id": channel_ids["short_channel_id"],
+        "last_graph_update": last_graph_update,
+        "payer_policy": payer_policy,
+        "payer_result_ok": payer_result.get("ok", False) if payer_result else False,
+    }
+
+
 def wait_for_competitor_graph_policy(
     *,
     context: dict[str, str],
@@ -804,10 +857,19 @@ def run_phase(
     set_competitor_policy: bool = True,
     competitor_controller: str = "scripted",
     policy_verify_timeout_seconds: float = 30.0,
+    policy_min_update_interval_seconds: float = 0.0,
     with_cl_hive: bool = False,
 ) -> dict[str, Any]:
     started = int(time.time())
     context = collect_static_context()
+    policy_update_window = (
+        wait_for_competitor_policy_update_window(
+            context=context,
+            min_interval_seconds=policy_min_update_interval_seconds,
+        )
+        if set_competitor_policy else
+        {"ok": True, "skipped": True}
+    )
     policy_result = (
         set_lnd_policy(COMPETITOR, competitor_ppm, cltv_delta=competitor_cltv_delta)
         if set_competitor_policy else
@@ -818,8 +880,20 @@ def run_phase(
             "competitor_controller": competitor_controller,
         }
     )
+    if set_competitor_policy and policy_result.get("ok", False):
+        global _LAST_COMPETITOR_POLICY_UPDATE_MONOTONIC
+        _LAST_COMPETITOR_POLICY_UPDATE_MONOTONIC = time.monotonic()
     if set_competitor_policy and not policy_result.get("ok", False):
-        raise RuntimeError(json.dumps({"stage": "policy_update", "result": policy_result}, indent=2))
+        raise RuntimeError(
+            json.dumps(
+                {
+                    "stage": "policy_update",
+                    "policy_update_window": policy_update_window,
+                    "result": policy_result,
+                },
+                indent=2,
+            )
+        )
     reset_result = lnd(PAYER, "resetmc") if reset_mc else {"ok": True, "skipped": True}
     if policy_settle_seconds > 0:
         time.sleep(policy_settle_seconds)
@@ -839,6 +913,7 @@ def run_phase(
             json.dumps(
                 {
                     "stage": "policy_graph_verify",
+                    "policy_update_window": policy_update_window,
                     "policy_result": policy_result,
                     "policy_graph_result": policy_graph_result,
                 },
@@ -923,9 +998,11 @@ def run_phase(
         "competitor_controller": competitor_controller,
         "set_competitor_policy": set_competitor_policy,
         "reset_mc": reset_mc,
+        "policy_min_update_interval_seconds": policy_min_update_interval_seconds,
         "policy_settle_seconds": policy_settle_seconds,
         "post_payment_settle_seconds": post_payment_settle_seconds,
         "pubkeys": context,
+        "policy_update_window": policy_update_window,
         "policy_result": policy_result,
         "policy_graph_result": policy_graph_result,
         "reset_result": reset_result,
@@ -976,6 +1053,12 @@ def main() -> int:
     parser.add_argument("--skip-cl-hive-genesis", action="store_true")
     parser.add_argument("--policy-settle-seconds", type=float, default=12.0)
     parser.add_argument("--policy-verify-timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--policy-min-update-interval-seconds",
+        type=float,
+        default=75.0,
+        help="Minimum spacing between scripted competitor policy updates to avoid LND gossip rate limits.",
+    )
     parser.add_argument("--post-payment-settle-seconds", type=float, default=2.0)
     parser.add_argument("--competitor-cltv-delta", type=int, default=40)
     parser.add_argument("--payer-time-pref", type=float, default=0.0)
@@ -1039,6 +1122,7 @@ def main() -> int:
                 set_competitor_policy=not args.skip_policy_updates,
                 competitor_controller=args.competitor_controller,
                 policy_verify_timeout_seconds=args.policy_verify_timeout_seconds,
+                policy_min_update_interval_seconds=args.policy_min_update_interval_seconds,
                 with_cl_hive=args.with_cl_hive,
                 out_dir=args.out_dir,
             )
