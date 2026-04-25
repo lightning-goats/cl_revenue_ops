@@ -65,6 +65,7 @@ class FakeHiveHints:
         corridor_bias: dict[str, float] | None = None,
         reputation: dict[str, float] | None = None,
         corridor_roles: dict[str, str] | None = None,
+        closure_recommendations: set[str] | None = None,
     ):
         self.members = members or set()
         self.open_hints = open_hints or {}
@@ -72,6 +73,7 @@ class FakeHiveHints:
         self.corridor_bias = corridor_bias or {}
         self.reputation = reputation or {}
         self.corridor_roles = corridor_roles or {}
+        self.closure_recommendations = closure_recommendations or set()
 
     def get_open_candidates(self):
         return [
@@ -99,7 +101,7 @@ class FakeHiveHints:
         return self.corridor_roles.get(peer_id, "")
 
     def is_closure_recommended(self, peer_id: str) -> bool:
-        return False
+        return peer_id in self.closure_recommendations
 
 
 def write_json(path: Path, data) -> None:
@@ -366,6 +368,33 @@ def _hive_score_scenario() -> ScenarioResult:
     )
 
 
+def _hive_avoid_score_scenario() -> ScenarioResult:
+    hive = FakeHiveHints(
+        open_hints={
+            BASELINE_PEER: {
+                "open_preference": "avoid",
+                "topology_confidence": 1.0,
+                "reason": "fleet_avoid",
+            }
+        }
+    )
+    disabled, _ = _planner(closed_daily_net_sats=None)
+    enabled, _ = _planner(closed_daily_net_sats=None, hive_hints=hive)
+    disabled_score = disabled._score_candidate(BASELINE_PEER, 1.0)
+    enabled_score = enabled._score_candidate(BASELINE_PEER, 1.0)
+    passed = enabled_score < disabled_score
+    return ScenarioResult(
+        name="hive_avoid_hint_penalizes_candidate",
+        mode="ab",
+        passed=passed,
+        action="penalize" if passed else "flat",
+        ev_sats=None,
+        opens=0,
+        skipped_reasons=[],
+        reason=f"disabled_score={disabled_score:.3f}, enabled_score={enabled_score:.3f}",
+    )
+
+
 def _hive_ev_bias_scenario(*, min_annual_roi_pct: float) -> ScenarioResult:
     hive = FakeHiveHints(rebalance_bias={BASELINE_PEER: 1.06})
     disabled, _ = _planner(closed_daily_net_sats=300)
@@ -413,6 +442,67 @@ def _hive_cycle_scenario(*, min_annual_roi_pct: float) -> ScenarioResult:
         opens=enabled.opens,
         skipped_reasons=disabled.skipped_reasons + enabled.skipped_reasons,
         reason=f"disabled_opens={disabled.opens}, enabled_opens={enabled.opens}",
+    )
+
+
+def _hive_closure_hint_scenario() -> ScenarioResult:
+    from modules.profitability_analyzer import ProfitabilityClass
+
+    hive = FakeHiveHints(closure_recommendations={BASELINE_PEER})
+    disabled, _ = _planner(closed_daily_net_sats=None)
+    enabled, _ = _planner(closed_daily_net_sats=None, hive_hints=hive)
+    for planner in (disabled, enabled):
+        planner._identify_losers = CapacityPlanner._identify_losers.__get__(
+            planner,
+            CapacityPlanner,
+        )
+        planner.profitability.database.get_top_route_pairs.return_value = []
+        planner.profitability.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0
+        }
+        planner.profitability.database.get_channel_rebalance_success_rate.return_value = None
+        planner.profitability.identify_bleeders_v2.return_value = []
+
+    prof = SimpleNamespace(
+        peer_id=BASELINE_PEER,
+        days_open=45,
+        classification=ProfitabilityClass.UNDERWATER,
+        roi_percent=-5.0,
+        marginal_roi_percent=-10.0,
+        marginal_profit_30d_sats=-100,
+        capacity_sats=5_000_000,
+        opener="local",
+        channel_role=None,
+        revenue=SimpleNamespace(sourced_fee_contribution_sats=0),
+    )
+    flow = SimpleNamespace(
+        confidence=1.0,
+        capacity=5_000_000,
+        daily_volume=100_000,
+        flow_ratio=0.5,
+    )
+
+    disabled_losers = disabled._identify_losers({"100x1x0": prof}, {"100x1x0": flow})
+    enabled_losers = enabled._identify_losers({"100x1x0": prof}, {"100x1x0": flow})
+    enabled_action = enabled_losers[0].get("action") if enabled_losers else "none"
+    passed = (
+        not disabled_losers
+        and len(enabled_losers) == 1
+        and enabled_losers[0].get("hive_closure_flagged") is True
+        and enabled_action == "DEFIBRILLATE"
+    )
+    return ScenarioResult(
+        name="hive_closure_hint_escalates_underwater_peer",
+        mode="ab",
+        passed=passed,
+        action=str(enabled_action).lower(),
+        ev_sats=None,
+        opens=0,
+        skipped_reasons=[],
+        reason=(
+            f"disabled_losers={len(disabled_losers)}, "
+            f"enabled_losers={len(enabled_losers)}, enabled_action={enabled_action}"
+        ),
     )
 
 
@@ -484,8 +574,10 @@ def _hive_ab_results(*, min_annual_roi_pct: float) -> list[ScenarioResult]:
     return [
         _hive_discovery_scenario(),
         _hive_score_scenario(),
+        _hive_avoid_score_scenario(),
         _hive_ev_bias_scenario(min_annual_roi_pct=min_annual_roi_pct),
         _hive_cycle_scenario(min_annual_roi_pct=min_annual_roi_pct),
+        _hive_closure_hint_scenario(),
         _capex_hive_budget_scenario(),
     ]
 

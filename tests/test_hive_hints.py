@@ -102,6 +102,36 @@ class TestPolling:
         adapter.poll()
         assert adapter._snapshot is first_snapshot
 
+    def test_poll_unknown_hive_command_clears_last_good(self, mock_plugin):
+        mock_plugin.rpc.call.return_value = VALID_SNAPSHOT
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.data_service = MagicMock()
+        adapter.data_service.list_datastore.return_value = {"datastore": []}
+        adapter.poll()
+        assert adapter.is_hive_member("02aabbcc") is True
+
+        mock_plugin.rpc.call.side_effect = Exception("Unknown command 'hive-export-hints'")
+        adapter.poll()
+
+        assert adapter._snapshot is None
+        assert adapter.is_usable() is False
+        assert adapter.is_hive_member("02aabbcc") is False
+
+    def test_poll_non_member_response_clears_last_good(self, mock_plugin):
+        mock_plugin.rpc.call.return_value = VALID_SNAPSHOT
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.data_service = MagicMock()
+        adapter.data_service.list_datastore.return_value = {"datastore": []}
+        adapter.poll()
+        assert adapter.is_hive_member("02aabbcc") is True
+
+        mock_plugin.rpc.call.return_value = {"ok": True, "error": "Not a Hive member"}
+        adapter.poll()
+
+        assert adapter._snapshot is None
+        assert adapter.is_usable() is False
+        assert adapter.is_hive_member("02aabbcc") is False
+
     def test_poll_rpc_failure_no_prior_snapshot(self, mock_plugin):
         mock_plugin.rpc.call.side_effect = Exception("connection refused")
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
@@ -902,6 +932,66 @@ class TestChannelOpenHints:
     def test_get_open_candidates_no_snapshot(self, mock_plugin):
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
         assert adapter.get_open_candidates() == []
+
+
+# ---------------------------------------------------------------------------
+# Fleet topology hints
+# ---------------------------------------------------------------------------
+
+class TestFleetTopologyHints:
+    def test_get_member_peer_ids_and_fleet_topology_without_balance_fields(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02member_a": {
+                    "member": True,
+                    "fleet_hive_topology": ["02member_b", "03member_c", ""],
+                    "fleet_topology": ["03member_c", "02external_peer"],
+                },
+                "02member_b": {
+                    "member": True,
+                },
+                "02external": {
+                    "member": False,
+                    "fleet_topology": ["02ignored"],
+                },
+            },
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_member_peer_ids() == ["02member_a", "02member_b"]
+        assert adapter.get_fleet_topology("02member_a") == [
+            "02member_b",
+            "03member_c",
+            "02external_peer",
+        ]
+        assert adapter.get_fleet_topology("02member_b") == []
+
+    def test_get_fleet_balance_still_includes_topology_when_balances_exist(self, mock_plugin):
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02member_a": {
+                    "member": True,
+                    "fleet_capacity_sats": 1_000_000,
+                    "fleet_available_sats": 400_000,
+                    "fleet_topology": ["02member_b"],
+                },
+            },
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.get_fleet_balance("02member_a") == {
+            "capacity_sats": 1_000_000,
+            "available_sats": 400_000,
+            "topology": ["02member_b"],
+        }
 
 
 class TestCoordinationSections:

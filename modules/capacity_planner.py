@@ -1568,12 +1568,17 @@ class CapacityPlanner:
             open_candidates = self.hive_hints.get_open_candidates()
         except Exception as e:
             self.plugin.log(f"Hive discovery: get_open_candidates() failed: {e}", level='info')
-            return []
+            open_candidates = []
         if not open_candidates:
             self.plugin.log("Hive discovery: get_open_candidates() returned empty", level='debug')
-            return []
         candidates = []
         for peer_id, hint in open_candidates:
+            if self._has_direct_peer_channel(peer_id):
+                self.plugin.log(
+                    f"Hive discovery: ignoring open hint for existing direct peer {str(peer_id)[:12]}...",
+                    level='debug',
+                )
+                continue
             confidence = hint.get("topology_confidence", 0.0)
             reason_str = hint.get("reason", "hive_topology")
             candidates.append({
@@ -1583,8 +1588,164 @@ class CapacityPlanner:
                 "reason": f"Hive: {reason_str}",
                 "hive_open_hint": hint,
             })
+        candidates.extend(self._discover_from_hive_member_topology())
+        candidates = self._dedupe_hive_candidates(candidates)
         self.plugin.log(f"Hive discovery: produced {len(candidates)} candidates", level='debug')
         return candidates
+
+    def _dedupe_hive_candidates(self, candidates: List[Dict]) -> List[Dict]:
+        """Deduplicate hive-discovered open candidates by peer id.
+
+        Explicit channel-open hints are authoritative when the same peer is also
+        found through fleet topology fallback. Topology metadata is retained as
+        supplemental context, but it must not replace the explicit hint payload.
+        """
+        deduped: Dict[str, Dict] = {}
+        for candidate in candidates:
+            peer_id = str(candidate.get("peer_id") or "")
+            if not peer_id or self._has_direct_peer_channel(peer_id):
+                continue
+
+            candidate = dict(candidate)
+            candidate["peer_id"] = peer_id
+            existing = deduped.get(peer_id)
+            if existing is None:
+                deduped[peer_id] = candidate
+                continue
+
+            existing_has_hint = existing.get("hive_open_hint") is not None
+            candidate_has_hint = candidate.get("hive_open_hint") is not None
+            if candidate_has_hint and not existing_has_hint:
+                replacement = candidate
+                if existing.get("hive_topology_witnesses") and not replacement.get("hive_topology_witnesses"):
+                    replacement["hive_topology_witnesses"] = existing["hive_topology_witnesses"]
+                replacement["score"] = max(
+                    float(replacement.get("score", 0.0)),
+                    float(existing.get("score", 0.0)),
+                )
+                deduped[peer_id] = replacement
+                continue
+
+            keeper = existing
+            if candidate.get("hive_topology_witnesses") and not keeper.get("hive_topology_witnesses"):
+                keeper["hive_topology_witnesses"] = candidate["hive_topology_witnesses"]
+            keeper["score"] = max(
+                float(keeper.get("score", 0.0)),
+                float(candidate.get("score", 0.0)),
+            )
+
+        return list(deduped.values())
+
+    def _get_our_node_id(self) -> str:
+        try:
+            if self.data_service is not None:
+                return str(self.data_service.get_node_id() or "")
+            return str(self.plugin.rpc.getinfo().get("id") or "")
+        except Exception:
+            return ""
+
+    def _has_direct_peer_channel(self, peer_id: str) -> bool:
+        """Return True when we already have a normal direct channel to peer_id."""
+        if not peer_id:
+            return False
+        try:
+            if self.data_service is not None:
+                result = self.data_service.get_peer_channels(peer_id=peer_id)
+            else:
+                result = self.plugin.rpc.call("listpeerchannels", {"id": peer_id})
+        except Exception:
+            return False
+
+        channels = result.get("channels", []) if isinstance(result, dict) else []
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            if channel.get("state") == "CHANNELD_NORMAL":
+                return True
+        return False
+
+    def _is_peer_connected(self, peer_id: str) -> bool:
+        """Return True when peer_id is currently connected, channel or not."""
+        if not peer_id:
+            return False
+        try:
+            if self.data_service is not None:
+                result = self.data_service.get_peers()
+            else:
+                result = self.plugin.rpc.call("listpeers", {"id": peer_id})
+        except Exception:
+            return False
+
+        peers = result.get("peers", []) if isinstance(result, dict) else []
+        for peer in peers:
+            if not isinstance(peer, dict):
+                continue
+            if str(peer.get("id") or "") == peer_id and bool(peer.get("connected", False)):
+                return True
+        return False
+
+    def _is_hive_topology_witness(self, peer_id: str) -> bool:
+        """A hive witness only needs an active peer connection, not a channel."""
+        return self._is_peer_connected(peer_id) or self._has_direct_peer_channel(peer_id)
+
+    def _discover_from_hive_member_topology(self) -> List[Dict]:
+        """Discover non-direct hive members advertised by direct hive peers.
+
+        cl-hive member hints can carry each member's known topology. When a
+        connected hive peer reports other hive members in that topology, those are
+        useful mesh-expansion candidates for faster hive gossip and coordination.
+        """
+        if self.hive_hints is None:
+            return []
+
+        try:
+            member_ids = self.hive_hints.get_member_peer_ids()
+        except Exception:
+            return []
+        if not isinstance(member_ids, list):
+            return []
+
+        our_node_id = self._get_our_node_id()
+        member_set = {str(peer_id) for peer_id in member_ids if peer_id}
+        direct_members = [
+            peer_id
+            for peer_id in sorted(member_set)
+            if peer_id != our_node_id and self._is_hive_topology_witness(peer_id)
+        ]
+        if not direct_members:
+            return []
+
+        witnesses_by_target: Dict[str, set] = {}
+        for witness in direct_members:
+            try:
+                topology = self.hive_hints.get_fleet_topology(witness)
+            except Exception:
+                topology = []
+            if not isinstance(topology, list):
+                continue
+            for target in topology:
+                target_id = str(target or "")
+                if (
+                    not target_id
+                    or target_id == our_node_id
+                    or target_id == witness
+                    or target_id not in member_set
+                    or self._has_direct_peer_channel(target_id)
+                ):
+                    continue
+                witnesses_by_target.setdefault(target_id, set()).add(witness)
+
+        candidates = []
+        for target_id, witnesses in witnesses_by_target.items():
+            witness_count = len(witnesses)
+            candidates.append({
+                "peer_id": target_id,
+                "source": "hive",
+                "score": min(0.30, 0.14 + (0.04 * witness_count)),
+                "reason": f"Hive topology: advertised by {witness_count} connected hive member(s)",
+                "hive_topology_witnesses": sorted(witnesses),
+            })
+        return sorted(candidates, key=lambda c: c["score"], reverse=True)
 
     def _discover_from_demand_flow(self, all_flow, existing_peers: set) -> List[Dict]:
         """Strategy 6: Find candidates adjacent to our sink peers."""
@@ -1808,6 +1969,9 @@ class CapacityPlanner:
                 hint = self.hive_hints.get_channel_open_hint(peer_id)
                 pref = hint.get("open_preference")
                 conf = hint.get("topology_confidence", 0.0)
+                reason = hint.get("reason")
+                if pref == "open" and reason == "member_connectivity" and self._has_direct_peer_channel(peer_id):
+                    pref = None
                 if pref == "open":
                     score *= 1.0 + (0.20 * conf)
                 elif pref == "avoid":
