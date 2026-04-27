@@ -239,12 +239,14 @@ class RebalanceRouterV3:
         found = [name for name in requested if name in live_names]
         missing = [name for name in requested if name not in live_names]
 
-        msg = (
-            f"[router-v3] requested layers={requested} found={found}"
-        )
+        msg = f"[router-v3] requested layers={requested} found={found}"
         if missing:
             msg += f" missing={missing}"
-        self.log(msg, "info")
+        # price_pair re-probes layers on every route attempt so hive layers can
+        # appear without restarting the plugin. Healthy probes, including the
+        # explicit market-only override requested=[], should not spam operator
+        # logs at info level.
+        self.log(msg, "info" if missing else "debug")
         return found
 
     # ------------------------------------------------------------------

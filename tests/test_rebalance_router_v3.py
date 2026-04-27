@@ -79,6 +79,25 @@ def test_v3_router_records_found_and_missing_layers():
     assert "hive-reputation" in log_text
 
 
+def test_v3_router_empty_layer_override_logs_debug_not_info():
+    from modules.rebalance_router_v3 import RebalanceRouterV3
+    plugin = MagicMock()
+    plugin.rpc.call.return_value = {"layers": []}
+    logs = []
+    r = RebalanceRouterV3(
+        plugin=plugin,
+        our_node_id="03" + "a" * 64,
+        layer_names=["hive-fleet"],
+        log=lambda m, l: logs.append((l, m)),
+    )
+
+    logs.clear()
+    assert r._probe_layers([], include_observed_liquidity=False) == []
+
+    assert any(level == "debug" and "requested layers=[] found=[]" in msg for level, msg in logs)
+    assert not any(level == "info" and "requested layers=[] found=[]" in msg for level, msg in logs)
+
+
 def test_v3_router_includes_live_observed_liquidity_layer_when_present():
     plugin = MagicMock()
     data_service = MagicMock()
