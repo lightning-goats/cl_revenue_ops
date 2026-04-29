@@ -26,6 +26,7 @@ class ChannelInput:
     is_profitable: bool = False
     is_active: bool = False
     cooldown_active: bool = False
+    rebalance_bias: float = 1.0
     # Phase 3.3: caller-supplied drift override (e.g. computed by the engine
     # from rebalance-history anchor state). When True the destination cooldown
     # gate is skipped regardless of local_ratio vs target_emergency_low.
@@ -54,6 +55,7 @@ class ChannelState:
     dest_urgency: float = 0.0
     source_drain_score: float = 0.0
     budget_source: str = "none"
+    rebalance_bias: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,14 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _as_rebalance_bias(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.85, min(1.15, parsed))
+
+
 def _normalize_channel_input(value: Any) -> ChannelInput:
     if isinstance(value, ChannelInput):
         return value
@@ -105,6 +115,7 @@ def _normalize_channel_input(value: Any) -> ChannelInput:
             is_profitable=_as_bool(value.get("is_profitable", False)),
             is_active=_as_bool(value.get("is_active", False)),
             cooldown_active=_as_bool(value.get("cooldown_active", False)),
+            rebalance_bias=_as_rebalance_bias(value.get("rebalance_bias", 1.0)),
             cooldown_override=_as_bool(value.get("cooldown_override", False)),
         )
     raise TypeError(f"Unsupported channel input type: {type(value)!r}")
@@ -294,6 +305,7 @@ def build_state_snapshot(
                 dest_urgency=_refill_urgency(local_ratio, target_band_low),
                 source_drain_score=_drain_score(local_ratio, target_band_high),
                 budget_source=budget_source,
+                rebalance_bias=channel.rebalance_bias,
             )
         )
         total_capacity_sats += capacity_sats

@@ -105,6 +105,53 @@ def test_overlay_builds_pair_from_recommendation_source_and_sink_scids():
     assert candidates[0].route_decision.policy is RoutePolicy.HIVE_ONLY
 
 
+def test_overlay_pair_budget_uses_sink_budget_not_source_budget():
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    snapshot = build_state_snapshot(
+        [
+            {
+                "channel_id": "100x1x0",
+                "peer_id": "02" + "1" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 900_000,
+                "is_hive_member": True,
+            },
+            {
+                "channel_id": "200x1x0",
+                "peer_id": "02" + "2" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 100_000,
+                "is_hive_member": True,
+            },
+        ],
+        {
+            "channel_budgets": {
+                "100x1x0": {"budget_sats": 10_000},
+                "200x1x0": {"budget_sats": 40},
+            }
+        },
+    )
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-budget",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+                "route_policy": "hive_only",
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].pair_budget_sats == 40
+
+
 def test_engine_preserves_coordinated_candidate_even_when_local_pair_score_is_lower():
     from modules.rebalance_coordination_overlay import merge_coordination_pairs
 

@@ -204,7 +204,9 @@ def _build_pair_from_entry(
         source_peer_id=source.peer_id,
         dest_peer_id=sink.peer_id,
         amount_sats=amount_sats,
-        pair_budget_sats=max(source.remaining_budget_sats, sink.remaining_budget_sats),
+        # Destination authorizes spend. Source budget represents its own refill
+        # authority, not the fee envelope for draining it.
+        pair_budget_sats=sink.remaining_budget_sats,
         source_capacity_sats=source.capacity_sats,
         dest_capacity_sats=sink.capacity_sats,
         source_value_class=source.value_class,

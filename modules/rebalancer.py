@@ -1223,6 +1223,32 @@ class EVRebalancer:
                 )
                 return candidates
 
+            if cfg.dry_run:
+                dry_run_candidates = engine.find_candidates()
+                self.plugin.log(
+                    f"[DRY RUN] Rebalance engine identified "
+                    f"{len(dry_run_candidates)} candidate(s); execution suppressed",
+                    level='debug'
+                )
+                if dry_run_candidates:
+                    self._set_last_decision_summary(
+                        action="rebalance",
+                        reason="dry_run",
+                        dominant_input="rebalance_engine",
+                        safety_block=False,
+                        budget_blocked=False,
+                    )
+                else:
+                    hold_reason = self._derive_hold_reason(engine)
+                    self._set_last_decision_summary(
+                        action="hold",
+                        reason=hold_reason,
+                        dominant_input="rebalance_engine",
+                        safety_block=False,
+                        budget_blocked=False,
+                    )
+                return []
+
             cycle_result = engine.run_cycle()
             executed = len(cycle_result.executions)
             succeeded = sum(1 for e in cycle_result.executions if e.success)
@@ -1965,7 +1991,10 @@ class EVRebalancer:
                     # Apply Stagnant Inventory Bonus (only for truly dormant channels)
                     if flow_state == "balanced" and source_turnover_rate < 0.0015:
                         score += 10 # Awakening Bonus
-                        self.plugin.log(f"STAGNANT BONUS: Applying +10 priority to stagnant channel {cid[:12]}...", level='info')
+                        self.plugin.log(
+                            f"STAGNANT BONUS: Applying +10 priority to stagnant channel {cid[:12]}...",
+                            level='debug',
+                        )
 
                     score += 20
 
@@ -2034,7 +2063,7 @@ class EVRebalancer:
             self.plugin.log(
                 f"SOURCE REJECTION BREAKDOWN for {dest_channel[:12]}...: "
                 f"Evaluated {len(sources)} sources, {total_rejected} rejected: {non_zero}",
-                level='info'
+                level='debug'
             )
 
             # Log the "near miss" - closest to profitable
@@ -2045,7 +2074,7 @@ class EVRebalancer:
                     f"(need >0). Components: dest_fee={b['dest_fee']}, "
                     f"inbound_cost={b['inbound_fee']}, opp_cost={b['opp_cost']} "
                     f"(flow={b['flow_state']})",
-                    level='info'
+                    level='debug'
                 )
 
         self._last_profitable_count = len(candidates)
@@ -2260,7 +2289,8 @@ class EVRebalancer:
                 )
                 self.plugin.log(
                     f"[DRY RUN] Would rebalance {candidate.amount_sats} sats "
-                    f"from {candidate.from_channel} to {candidate.to_channel}"
+                    f"from {candidate.from_channel} to {candidate.to_channel}",
+                    level='debug'
                 )
                 self.database.update_rebalance_result(
                     rebalance_id, 'success', 0, candidate.expected_profit_sats
