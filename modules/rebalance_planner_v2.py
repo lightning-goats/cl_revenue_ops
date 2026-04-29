@@ -24,6 +24,10 @@ _VALUE_SCORES = {
 }
 
 
+def _sats_from_ratio_delta(ratio_delta: float, capacity_sats: int) -> int:
+    return max(0, int(round(float(ratio_delta) * max(0, int(capacity_sats)))))
+
+
 def _bootstrap_score_decomposition(
     *,
     value_score: int,
@@ -37,6 +41,10 @@ def _bootstrap_score_decomposition(
     source_drain_term: float = 0.0,
     dest_value_term: float = 0.0,
     cheap_return_term: float = 0.0,
+    pre_hint_pair_score: float = 0.0,
+    hive_source_rebalance_bias: float = 1.0,
+    hive_dest_rebalance_bias: float = 1.0,
+    hive_hint_score_multiplier: float = 1.0,
 ) -> dict:
     """Return the initial explicit score breakdown for a planned pair.
 
@@ -73,6 +81,10 @@ def _bootstrap_score_decomposition(
             "source_drain_term": round(float(source_drain_term), 6),
             "dest_value_term": round(float(dest_value_term), 6),
             "cheap_return_term": round(float(cheap_return_term), 6),
+            "pre_hint_pair_score": round(float(pre_hint_pair_score), 6),
+            "hive_source_rebalance_bias": round(float(hive_source_rebalance_bias), 6),
+            "hive_dest_rebalance_bias": round(float(hive_dest_rebalance_bias), 6),
+            "hive_hint_score_multiplier": round(float(hive_hint_score_multiplier), 6),
         },
     }
 
@@ -205,11 +217,13 @@ class RebalancePlanner:
                 if src.peer_id == dest.peer_id:
                     continue
 
-                source_excess = int(
-                    (src.local_ratio - self.target_band_high) * src.capacity_sats
+                source_excess = _sats_from_ratio_delta(
+                    src.local_ratio - self.target_band_high,
+                    src.capacity_sats,
                 )
-                dest_need = int(
-                    (self.target_band_low - dest.local_ratio) * dest.capacity_sats
+                dest_need = _sats_from_ratio_delta(
+                    self.target_band_low - dest.local_ratio,
+                    dest.capacity_sats,
                 )
                 amount = min(
                     max(0, source_excess),
@@ -268,6 +282,18 @@ class RebalancePlanner:
                     + dest_value_term
                     + cheap_return_term
                 )
+                pre_hint_score = score
+                source_rebalance_bias = self._normalize_rebalance_bias(
+                    getattr(src, "rebalance_bias", 1.0)
+                )
+                dest_rebalance_bias = self._normalize_rebalance_bias(
+                    getattr(dest, "rebalance_bias", 1.0)
+                )
+                hint_multiplier = self._pair_hint_multiplier(
+                    source_rebalance_bias,
+                    dest_rebalance_bias,
+                )
+                score *= hint_multiplier
 
                 # Backwards-compat: keep value_score reference for callers and
                 # tests that still inspect it via the bootstrap decomposition.
@@ -286,6 +312,9 @@ class RebalancePlanner:
                     dest_value_class=dest.value_class,
                     source_budget_source=src.budget_source,
                     dest_budget_source=dest.budget_source,
+                    hive_source_rebalance_bias=source_rebalance_bias,
+                    hive_dest_rebalance_bias=dest_rebalance_bias,
+                    hive_hint_score_multiplier=hint_multiplier,
                     score=score,
                     source_local_ratio=src.local_ratio,
                     dest_local_ratio=dest.local_ratio,
@@ -301,7 +330,34 @@ class RebalancePlanner:
                         source_drain_term=source_drain_term,
                         dest_value_term=dest_value_term,
                         cheap_return_term=cheap_return_term,
+                        pre_hint_pair_score=pre_hint_score,
+                        hive_source_rebalance_bias=source_rebalance_bias,
+                        hive_dest_rebalance_bias=dest_rebalance_bias,
+                        hive_hint_score_multiplier=hint_multiplier,
                     ),
                 ))
 
         return pairs
+
+    @staticmethod
+    def _normalize_rebalance_bias(value: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        return max(0.85, min(1.15, parsed))
+
+    @classmethod
+    def _pair_hint_multiplier(cls, source_bias: float, dest_bias: float) -> float:
+        """Convert peer rebalance preferences into a pair-role score multiplier.
+
+        HiveHintAdapter defines sink preference as >1.0 because the peer is a
+        better refill destination, and source preference as <1.0 because the
+        peer is a worse refill destination. A pair has both roles, so the
+        source side is intentionally inverted: source-pref peers are better
+        drain sources, while sink-pref peers are worse drain sources.
+        """
+        source_bias = cls._normalize_rebalance_bias(source_bias)
+        dest_bias = cls._normalize_rebalance_bias(dest_bias)
+        multiplier = 1.0 + (dest_bias - 1.0) - (source_bias - 1.0)
+        return max(0.85, min(1.15, multiplier))

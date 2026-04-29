@@ -86,7 +86,8 @@ class RebalanceEngine:
         self._our_id: Optional[str] = None
         self._audit = RebalanceAudit(plugin)
         self._pool = ThreadPoolExecutor(
-            max_workers=3, thread_name_prefix="rebal-v2"
+            max_workers=self._max_concurrent_jobs(),
+            thread_name_prefix="rebal-v2",
         )
         # Pair-level futility tracker: {(src_scid, dst_scid): [failure_ts, ...]}.
         # A pair that fails _futility_threshold times within _futility_window_sec
@@ -161,6 +162,19 @@ class RebalanceEngine:
     def _active_router(self) -> Optional[Any]:
         """Return the active router currently configured for dispatch."""
         return self.router_v3
+
+    def _max_concurrent_jobs(self, cfg: Optional[Any] = None) -> int:
+        """Return the configured automatic rebalance execution cap."""
+        if cfg is None:
+            cfg = self.config if not hasattr(self.config, "snapshot") else self.config.snapshot()
+        value = getattr(cfg, "max_concurrent_jobs", 5)
+        if not isinstance(value, (int, float, str)):
+            value = 5
+        try:
+            max_jobs = int(float(value))
+        except (TypeError, ValueError):
+            max_jobs = 5
+        return max(1, min(20, max_jobs))
 
     def _sweep_orphan_exclude_layers(self) -> int:
         """Remove leftover rebalance-exclude-* layers from previous crashed cycles.
@@ -324,6 +338,18 @@ class RebalanceEngine:
                 "dest_value_class": str(getattr(pair, "dest_value_class", "") or ""),
                 "source_budget_source": str(getattr(pair, "source_budget_source", "") or ""),
                 "dest_budget_source": str(getattr(pair, "dest_budget_source", "") or ""),
+                "hive_source_rebalance_bias": round(
+                    float(getattr(pair, "hive_source_rebalance_bias", 1.0) or 1.0),
+                    6,
+                ),
+                "hive_dest_rebalance_bias": round(
+                    float(getattr(pair, "hive_dest_rebalance_bias", 1.0) or 1.0),
+                    6,
+                ),
+                "hive_hint_score_multiplier": round(
+                    float(getattr(pair, "hive_hint_score_multiplier", 1.0) or 1.0),
+                    6,
+                ),
             },
         }
 
@@ -365,6 +391,18 @@ class RebalanceEngine:
             "dest_value_class": str(getattr(pair, "dest_value_class", "") or ""),
             "source_budget_source": str(getattr(pair, "source_budget_source", "") or ""),
             "dest_budget_source": str(getattr(pair, "dest_budget_source", "") or ""),
+            "hive_source_rebalance_bias": round(
+                float(getattr(pair, "hive_source_rebalance_bias", 1.0) or 1.0),
+                6,
+            ),
+            "hive_dest_rebalance_bias": round(
+                float(getattr(pair, "hive_dest_rebalance_bias", 1.0) or 1.0),
+                6,
+            ),
+            "hive_hint_score_multiplier": round(
+                float(getattr(pair, "hive_hint_score_multiplier", 1.0) or 1.0),
+                6,
+            ),
             "reason_code": pair.reason_code,
             "route_policy": getattr(
                 getattr(getattr(pair, "route_decision", None), "policy", None),
@@ -619,6 +657,7 @@ class RebalanceEngine:
                 "is_hive_member": is_hive,
                 "is_profitable": is_profitable,
                 "is_active": is_active,
+                "rebalance_bias": self._get_hive_rebalance_bias(peer_id),
                 "cooldown_active": cooldown,
                 "cooldown_override": cooldown_override,
             })
@@ -657,6 +696,15 @@ class RebalanceEngine:
             except Exception:
                 pass
         return False
+
+    def _get_hive_rebalance_bias(self, peer_id: str) -> float:
+        if not peer_id or self._hive_hints is None:
+            return 1.0
+        try:
+            bias = float(self._hive_hints.get_rebalance_bias(peer_id))
+        except Exception:
+            return 1.0
+        return max(0.85, min(1.15, bias))
 
     def _hive_equalization_overlay(
         self,
@@ -819,7 +867,7 @@ class RebalanceEngine:
             target_band_low=target_band_low,
             target_band_high=target_band_high,
             max_chunk_sats=max_chunk_sats,
-            max_pairs=10,
+            max_pairs=self._max_concurrent_jobs(cfg),
             pair_fee_cap_ppm=pair_fee_cap_ppm,
         )
 
@@ -2223,6 +2271,41 @@ class RebalanceEngine:
             self._cache_cycle_result(result)
             return result
 
+        execution_limit = self._max_concurrent_jobs()
+        if len(live_candidates) > execution_limit:
+            overflow = live_candidates[execution_limit:]
+            live_candidates = live_candidates[:execution_limit]
+            result.candidates = list(live_candidates)
+            for pair in overflow:
+                debug_pair = considered_lookup.get(self._pair_key(pair))
+                if debug_pair is not None:
+                    self._update_pair_score_decomposition(
+                        debug_pair,
+                        route_cost_sats=debug_pair.route_cost_sats,
+                        effective_budget_sats=int(getattr(debug_pair, "pair_budget_sats", 0) or 0),
+                        rejection_reason="max_pairs_reached",
+                        route_status="max_concurrent_jobs",
+                    )
+                skip = SkipRecord(
+                    channel_id=pair.dest_channel_id,
+                    reason="max_pairs_reached",
+                    value_class="valuable",
+                    remaining_budget_sats=int(getattr(pair, "pair_budget_sats", 0) or 0),
+                    detail=(
+                        f"src={pair.source_channel_id} "
+                        f"max_concurrent_jobs={execution_limit}"
+                    ),
+                )
+                result.audit_records.append(skip)
+                self._audit.log_skip(
+                    channel_id=skip.channel_id,
+                    reason=skip.reason,
+                    value_class=skip.value_class,
+                    remaining_budget_sats=skip.remaining_budget_sats,
+                    detail=skip.detail,
+                    router="v3",
+                )
+
         # Submit the surviving candidates to the thread pool
         futures: Dict[Future, PairCandidate] = {}
         for pair in live_candidates:
@@ -2236,37 +2319,44 @@ class RebalanceEngine:
             futures[future] = pair
 
         # Collect results as they complete (main thread only — no lock needed)
-        try:
-            for future in as_completed(futures, timeout=120):
-                pair = futures[future]
-                try:
-                    exec_result = future.result()
-                    if exec_result is not None:
-                        result.executions.append(exec_result)
-                        if exec_result.success:
-                            self._record_pair_success(
-                                pair.source_channel_id, pair.dest_channel_id
-                            )
-                            self._clear_persisted_pair_failure(pair)
-                        else:
-                            self._record_pair_failure(
-                                pair.source_channel_id, pair.dest_channel_id
-                            )
-                            self._persist_pair_failure(pair, exec_result)
+        completed_futures: set[Future] = set()
+
+        def consume_future_result(future: Future, pair: PairCandidate) -> None:
+            try:
+                exec_result = future.result()
+                completed_futures.add(future)
+                if exec_result is not None:
+                    result.executions.append(exec_result)
+                    if exec_result.success:
+                        self._record_pair_success(
+                            pair.source_channel_id, pair.dest_channel_id
+                        )
+                        self._clear_persisted_pair_failure(pair)
                     else:
-                        # _execute_pair returned None (no route stored on the pair) — count as failure
                         self._record_pair_failure(
                             pair.source_channel_id, pair.dest_channel_id
                         )
-                except Exception as e:
+                        self._persist_pair_failure(pair, exec_result)
+                else:
+                    # _execute_pair returned None (no route stored on the pair) — count as failure
                     self._record_pair_failure(
                         pair.source_channel_id, pair.dest_channel_id
                     )
-                    self._log(
-                        f"Execution thread failed for "
-                        f"{pair.source_channel_id}->{pair.dest_channel_id}: {e}",
-                        level="warn",
-                    )
+            except Exception as e:
+                completed_futures.add(future)
+                self._record_pair_failure(
+                    pair.source_channel_id, pair.dest_channel_id
+                )
+                self._log(
+                    f"Execution thread failed for "
+                    f"{pair.source_channel_id}->{pair.dest_channel_id}: {e}",
+                    level="warn",
+                )
+
+        try:
+            for future in as_completed(futures, timeout=120):
+                pair = futures[future]
+                consume_future_result(future, pair)
         except TimeoutError:
             self._log(
                 f"Execution timed out after 120s, "
@@ -2274,23 +2364,28 @@ class RebalanceEngine:
                 level="warn",
             )
             for future, pair in futures.items():
-                if future.done():
+                if future in completed_futures:
                     continue
-                future.cancel()
-                timeout_result = ExecutionResult(
-                    success=False,
-                    error="executor_timeout",
-                    amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
-                    fee_sats=0,
-                    fee_msat=0,
-                    route_type=self._executor_mode(),
+                if future.done():
+                    consume_future_result(future, pair)
+                    continue
+                if future.cancel():
+                    timeout_result = ExecutionResult(
+                        success=False,
+                        error="executor_timeout_cancelled",
+                        amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+                        fee_sats=0,
+                        fee_msat=0,
+                        route_type=self._executor_mode(),
+                    )
+                    result.executions.append(timeout_result)
+                    continue
+                self._log(
+                    f"Execution still running after cycle timeout for "
+                    f"{pair.source_channel_id}->{pair.dest_channel_id}; "
+                    "worker will finish bookkeeping asynchronously",
+                    level="warn",
                 )
-                result.executions.append(timeout_result)
-                self._record_pair_failure(
-                    pair.source_channel_id,
-                    pair.dest_channel_id,
-                )
-                self._persist_pair_failure(pair, timeout_result)
 
         self._cache_cycle_result(result)
         return result

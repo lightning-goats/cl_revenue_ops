@@ -3307,7 +3307,7 @@ class FeeController:
                 dominant_input="concurrency_guard",
                 safety_block=True,
             )
-            self.plugin.log("Fee adjustment already in progress, skipping", level='info')
+            self.plugin.log("Fee adjustment already in progress, skipping", level='debug')
             return []
         try:
             cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
@@ -3353,7 +3353,7 @@ class FeeController:
                 dominant_input="channel_state_data",
                 safety_block=False,
             )
-            self.plugin.log("No channel state data for fee adjustment")
+            self.plugin.log("No channel state data for fee adjustment", level='debug')
             return adjustments
         
         # Get current channel info for capacity and balance
@@ -3550,7 +3550,7 @@ class FeeController:
                 self.plugin.log(
                     f"Fee adjustment: 0/{len(channel_states)} channels adjusted. "
                     f"Skip reasons: {active_skips}",
-                    level='info'
+                    level='debug'
                 )
             else:
                 self._set_last_decision_summary(
@@ -3561,6 +3561,10 @@ class FeeController:
                 )
         elif adjustments:
             last_adjustment = adjustments[-1]
+            self.plugin.log(
+                f"Fee adjustment: {len(adjustments)}/{len(channel_states)} channels adjusted",
+                level='info'
+            )
             if last_adjustment.new_fee_ppm > last_adjustment.old_fee_ppm:
                 action = "raise"
             elif last_adjustment.new_fee_ppm < last_adjustment.old_fee_ppm:
@@ -3721,7 +3725,7 @@ class FeeController:
             f"GOSSIP_REFRESH: {channel_id[:12]}... idle {hours_since_forward:.0f}h, "
             f"no broadcast {hours_since_broadcast:.0f}h. "
             f"Nudging fee {current_fee_ppm} -> {nudge_fee} ppm to refresh network visibility.",
-            level='info'
+            level='debug'
         )
 
         # Execute the fee change (must be real to force CLN to gossip a new update).
@@ -4095,7 +4099,7 @@ class FeeController:
             self._save_cycle_state(channel_id, cycle)
             self.plugin.log(
                 f"HYSTERESIS: Channel {channel_id[:12]}... waking up due to {force_reprice_reason}",
-                level='info'
+                level='debug'
             )
 
         if _sleep_is_sleeping:
@@ -4114,7 +4118,7 @@ class FeeController:
                 self._save_cycle_state(channel_id, cycle)
                 self.plugin.log(
                     f"HYSTERESIS: Channel {channel_id[:12]}... waking up (sleep timer expired)",
-                    level='info'
+                    level='debug'
                 )
             else:
                 # Still within sleep period - check for revenue spike that should wake us
@@ -4153,7 +4157,7 @@ class FeeController:
                     self.plugin.log(
                         f"HYSTERESIS: Channel {channel_id[:12]}... waking up due to revenue spike "
                         f"({percent_change:.0%} change, threshold={self.WAKE_UP_THRESHOLD:.0%})",
-                        level='info'
+                        level='debug'
                     )
                 else:
                     # No significant change - stay asleep, skip this adjustment cycle
@@ -4326,7 +4330,7 @@ class FeeController:
             self.plugin.log(
                 f"REBALANCE_FLOOR: {channel_id[:12]}... floor raised from "
                 f"{base_floor_ppm} to {rebalance_floor_ppm} ppm (cost recovery)",
-                level='info'
+                level='debug'
             )
             base_floor_ppm = rebalance_floor_ppm
 
@@ -4417,7 +4421,7 @@ class FeeController:
                     f"EXPLORATION: Channel {channel_id[:12]}... observed "
                     f"{forward_count} forwards / {volume_since_sats} sats during bounded exploration. "
                     f"Holding at safe exploration fee {new_fee_ppm} ppm.",
-                    level='info'
+                    level='debug'
                 )
 
             else:
@@ -4512,7 +4516,7 @@ class FeeController:
                     self._save_cycle_state(channel_id, cycle)
                     self.plugin.log(
                         f"THOMPSON: Market Calm - {channel_id[:12]}... entering sleep mode.",
-                        level='info'
+                        level='debug'
                     )
                     return None
             else:
@@ -5118,7 +5122,7 @@ class FeeController:
             self.plugin.log(
                 f"HYSTERESIS: Target fee {new_fee_ppm} is <5% delta from broadcast {cycle.last_broadcast_fee_ppm}. "
                 f"Skipping gossip; pausing observation.",
-                level='info'
+                level='debug'
             )
 
             # Persist DTS+PID state changes too (posterior updates, PID state, etc).
@@ -5284,7 +5288,7 @@ class FeeController:
                 f"FEE: {channel_id[:12]}... {current_fee_ppm}->{new_fee_ppm}ppm "
                 f"[{fee_reason_code}] "
                 f"step:{original_step_ppm}->{step_ppm} | {target_summary} | {decision_reason}",
-                level='info'
+                level='debug'
             )
 
             return FeeAdjustment(
@@ -5574,7 +5578,7 @@ class FeeController:
                         self._save_cycle_state(resolved_channel_id, cycle)
                         self.plugin.log(
                             f"MANUAL_WAKE: Channel {resolved_channel_id[:12]}... woken due to manual fee change",
-                            level='info'
+                            level='debug'
                         )
                 if manual and resolved_channel_id in self._channel_fee_states:
                     ts_state = self._channel_fee_states[resolved_channel_id]
@@ -5586,7 +5590,10 @@ class FeeController:
 
             # Set the fee
             if self.config.dry_run:
-                self.plugin.log(f"[DRY RUN] Would set fee for {resolved_channel_id} to {fee_ppm} PPM")
+                self.plugin.log(
+                    f"[DRY RUN] Would set fee for {resolved_channel_id} to {fee_ppm} PPM",
+                    level='debug',
+                )
                 result["success"] = True
                 result["message"] = "Dry run - no changes made"
                 return result
@@ -5692,7 +5699,8 @@ class FeeController:
             
             self.plugin.log(
                 f"Set fee for {resolved_channel_id[:16]}...: {old_fee_ppm} -> {fee_ppm} PPM "
-                f"({reason})"
+                f"({reason})",
+                level='debug'
             )
             
         except RpcError as e:
@@ -5811,7 +5819,8 @@ class FeeController:
 
                 if policy.strategy == FeeStrategy.STATIC and policy.fee_ppm_target is not None:
                     self.plugin.log(
-                        f"INITIAL_FEE: {scid[:16]}... -> {policy.fee_ppm_target} PPM (STATIC policy)"
+                        f"INITIAL_FEE: {scid[:16]}... -> {policy.fee_ppm_target} PPM (STATIC policy)",
+                        level='debug'
                     )
                     return self.set_channel_fee(
                         scid, policy.fee_ppm_target,
@@ -5847,7 +5856,8 @@ class FeeController:
                         fleet_prior = {"mean": fleet_fee, "std": 50}
                         self.plugin.log(
                             f"INITIAL_FEE: {scid[:16]}... using fleet prior "
-                            f"(mean={fleet_fee}, std=50)"
+                            f"(mean={fleet_fee}, std=50)",
+                            level='debug'
                         )
                 except Exception:
                     pass
@@ -5863,14 +5873,16 @@ class FeeController:
                 if not fleet_prior and network_prior:
                     self.plugin.log(
                         f"INITIAL_FEE: {scid[:16]}... using network prior "
-                        f"(mean={network_prior['mean']}, std={network_prior['std']})"
+                        f"(mean={network_prior['mean']}, std={network_prior['std']})",
+                        level='debug'
                     )
 
             initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
 
             self.plugin.log(
                 f"INITIAL_FEE: {scid[:16]}... -> {initial_fee} PPM "
-                f"(DTS prior sample)"
+                f"(DTS prior sample)",
+                level='debug'
             )
             return self.set_channel_fee(
                 scid, initial_fee,

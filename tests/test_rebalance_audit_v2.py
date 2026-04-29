@@ -81,7 +81,7 @@ def test_log_pick_calls_plugin_log():
     logged_msg = plugin.log.call_args[0][0]
     assert "REBAL_PICK" in logged_msg
     assert "source=111x1x0" in logged_msg
-    assert plugin.log.call_args[1]["level"] == "info"
+    assert plugin.log.call_args[1]["level"] == "debug"
 
 
 def test_log_skip_calls_plugin_log():
@@ -99,7 +99,7 @@ def test_log_skip_calls_plugin_log():
     logged_msg = plugin.log.call_args[0][0]
     assert "REBAL_SKIP" in logged_msg
     assert "reason=skipped_no_route" in logged_msg
-    assert plugin.log.call_args[1]["level"] == "info"
+    assert plugin.log.call_args[1]["level"] == "debug"
 
 
 def test_log_cycle_summary_format():

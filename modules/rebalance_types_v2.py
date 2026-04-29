@@ -32,6 +32,9 @@ class PairCandidate:
     dest_value_class: str = "neutral"
     source_budget_source: str = "none"
     dest_budget_source: str = "none"
+    hive_source_rebalance_bias: float = 1.0
+    hive_dest_rebalance_bias: float = 1.0
+    hive_hint_score_multiplier: float = 1.0
     route_cost_sats: Optional[int] = None
     route: Optional[List[Dict[str, Any]]] = None  # sendpay-ready route from router
     score: float = 0.0
