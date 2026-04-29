@@ -59,7 +59,7 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
-# v2.4.1: Release Metadata Alignment
+# v2.5.0: Fee Controller, Native Rebalance, and Safety Controls
 #   - Patch release so the published tag contains the declared plugin version
 #   - Keeps repo version metadata aligned with GitHub release state
 # v2.4.0: Native Route Rebalancing + Fleet Equalization
@@ -72,7 +72,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.4.1"
+PLUGIN_VERSION = "2.5.0"
 
 
 # =============================================================================
