@@ -71,6 +71,31 @@ class TestPassiveStrategy:
         assert policy.strategy != FeeStrategy.DYNAMIC
 
 
+class TestPauseControl:
+    """Global pause suppresses automated fee broadcasts."""
+
+    def test_adjust_all_fees_returns_without_db_work_when_paused(self, mock_database, mock_plugin):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        cfg = Config(paused=True)
+        mock_database.get_all_channel_states = MagicMock()
+
+        fc = FeeController(mock_plugin, cfg, mock_database)
+
+        adjustments = fc.adjust_all_fees()
+        summary = fc.get_last_decision_summary()
+
+        assert adjustments == []
+        assert summary == {
+            "action": "suppressed",
+            "reason": "paused",
+            "dominant_input": "paused",
+            "safety_block": True,
+        }
+        mock_database.get_all_channel_states.assert_not_called()
+
+
 class TestConfigSnapshotThreadSafety:
     """Test ConfigSnapshot thread safety."""
 
@@ -913,4 +938,114 @@ class TestLastDecisionSummary:
         assert summary["action"] == "suppressed"
         assert summary["reason"] == "temporary_overlay"
         assert summary["dominant_input"] == "temporary_overlay"
+
+
+class TestStaticStrategyExecution:
+    """Scheduler-level STATIC policy execution regressions."""
+
+    def _make_static_controller(
+        self,
+        mock_plugin,
+        mock_database,
+        sample_peer_ids,
+        *,
+        target_fee=1,
+        current_fee=100,
+        set_result=None,
+    ):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        channel_id = "123x456x0"
+        peer_id = sample_peer_ids[0]
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000)
+        policy_manager = MagicMock()
+        policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=peer_id,
+            strategy=FeeStrategy.STATIC,
+            fee_ppm_target=target_fee,
+        )
+
+        mock_database.get_all_channel_states.return_value = [
+            {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced"}
+        ]
+
+        fc = FeeController(mock_plugin, cfg, mock_database, policy_manager=policy_manager)
+        fc._get_channels_info = MagicMock(return_value={
+            channel_id: {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "fee_proportional_millionths": current_fee,
+            }
+        })
+        fc._get_dynamic_chain_costs = MagicMock(return_value=None)
+        fc.set_channel_fee = MagicMock(
+            return_value=set_result if set_result is not None else {"success": True, "fee_ppm": 10}
+        )
+        return fc, channel_id
+
+    def test_static_policy_reports_applied_fee_and_reason_code(
+        self, mock_plugin, mock_database, sample_peer_ids
+    ):
+        from modules.fee_controller import FeeReasonCode
+
+        fc, channel_id = self._make_static_controller(
+            mock_plugin,
+            mock_database,
+            sample_peer_ids,
+            target_fee=1,
+            current_fee=100,
+            set_result={"success": True, "fee_ppm": 10},
+        )
+
+        adjustments = fc.adjust_all_fees()
+
+        fc.set_channel_fee.assert_called_once_with(
+            channel_id,
+            1,
+            reason="Policy: STATIC",
+            reason_code=FeeReasonCode.POLICY_STATIC.value,
+        )
+        assert len(adjustments) == 1
+        assert adjustments[0].new_fee_ppm == 10
+        assert adjustments[0].reason_code == FeeReasonCode.POLICY_STATIC.value
+        assert adjustments[0].algorithm_values["requested_fee_ppm"] == 1
+        assert adjustments[0].algorithm_values["effective_fee_ppm"] == 10
+
+    def test_static_policy_failure_does_not_append_success_adjustment(
+        self, mock_plugin, mock_database, sample_peer_ids
+    ):
+        fc, _channel_id = self._make_static_controller(
+            mock_plugin,
+            mock_database,
+            sample_peer_ids,
+            target_fee=500,
+            current_fee=100,
+            set_result={"success": False, "message": "setchannel failed", "fee_ppm": 500},
+        )
+
+        adjustments = fc.adjust_all_fees()
+        summary = fc.get_last_decision_summary()
+
+        assert adjustments == []
+        assert summary["action"] == "suppressed"
+        assert summary["reason"] == "error"
+
+    def test_static_policy_compares_against_effective_clamped_target(
+        self, mock_plugin, mock_database, sample_peer_ids
+    ):
+        fc, _channel_id = self._make_static_controller(
+            mock_plugin,
+            mock_database,
+            sample_peer_ids,
+            target_fee=1,
+            current_fee=10,
+        )
+
+        adjustments = fc.adjust_all_fees()
+        summary = fc.get_last_decision_summary()
+
+        assert adjustments == []
+        fc.set_channel_fee.assert_not_called()
+        assert summary["reason"] == "policy_static"
         assert summary["safety_block"] is True

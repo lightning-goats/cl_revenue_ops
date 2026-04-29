@@ -669,6 +669,25 @@ def test_revenue_set_fee_accepts_full_channel_id_hash():
     )
 
 
+def test_revenue_set_fee_returns_error_when_controller_fails():
+    mod = load_plugin_module()
+    mod.fee_controller = MagicMock()
+    mod.fee_controller.set_channel_fee.return_value = {
+        "success": False,
+        "channel_id": "123x456x0",
+        "fee_ppm": 125,
+        "message": "Channel 123x456x0 not found",
+    }
+    mod.config = Config(min_fee_ppm=10, max_fee_ppm=5000)
+    mod.force_rate_limiter = MagicMock()
+
+    result = mod.revenue_set_fee(mod.plugin, "123x456x0", 125)
+
+    assert result["status"] == "error"
+    assert result["success"] is False
+    assert result["error"] == "Channel 123x456x0 not found"
+
+
 def test_revenue_analyze_normalizes_colon_scid_before_flow_analysis():
     mod = load_plugin_module()
     mod.flow_analyzer = MagicMock()

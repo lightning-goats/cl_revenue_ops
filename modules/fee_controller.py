@@ -1857,15 +1857,25 @@ class FeeController:
         """
         if cfg is None:
             cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-        policy = getattr(cfg, 'base_fee_policy', 'off')
+        def _cfg_int(name: str, default: int) -> int:
+            value = getattr(cfg, name, default)
+            if not isinstance(value, (int, float, str)):
+                return int(default)
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return int(default)
+
+        raw_policy = getattr(cfg, 'base_fee_policy', 'off')
+        policy = raw_policy.lower() if isinstance(raw_policy, str) else 'off'
         if policy != 'adaptive':
-            return int(getattr(cfg, 'base_fee_msat', 0))
+            return _cfg_int('base_fee_msat', 0)
         if self.hive_hints is None:
-            return int(getattr(cfg, 'base_fee_msat', 0))
+            return _cfg_int('base_fee_msat', 0)
         role = self._classify_channel_role(peer_id)
         if role == "intra_fleet":
-            return int(getattr(cfg, 'base_fee_msat_intra_fleet', 0))
-        return int(getattr(cfg, 'base_fee_msat_non_hive', 1000))
+            return _cfg_int('base_fee_msat_intra_fleet', 0)
+        return _cfg_int('base_fee_msat_non_hive', 1000)
 
     def _get_hive_exploration_multiplier(self, peer_id: str) -> float:
         """Return bounded DTS variance multiplier from hive intelligence."""
@@ -2104,6 +2114,8 @@ class FeeController:
                 except (TypeError, ValueError):
                     continue
                 if not (1 <= fee_ppm <= self.ABS_MAX_FEE_PPM):
+                    continue
+                if self._is_cln_default_fee(ch):
                     continue
 
                 capacity = ch.get("satoshis", base_to_sats_floor(ch.get("amount_msat", 0)))
@@ -3298,6 +3310,16 @@ class FeeController:
             self.plugin.log("Fee adjustment already in progress, skipping", level='info')
             return []
         try:
+            cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+            if bool(getattr(cfg, "paused", False)):
+                self._set_last_decision_summary(
+                    action="suppressed",
+                    reason="paused",
+                    dominant_input="paused",
+                    safety_block=True,
+                )
+                self.plugin.log("Fee adjustment suppressed: revenue-ops is paused", level='info')
+                return []
             return self._adjust_all_fees_inner()
         finally:
             self._state_lock.release()
@@ -3389,21 +3411,40 @@ class FeeController:
                     channel_info = channels.get(channel_id)
                     if channel_info:
                         current_fee = channel_info.get("fee_proportional_millionths", 0)
-                        if current_fee != policy.fee_ppm_target:
+                        requested_static_fee = int(policy.fee_ppm_target)
+                        effective_static_fee = max(
+                            cfg.min_fee_ppm,
+                            min(cfg.max_fee_ppm, requested_static_fee),
+                        )
+                        if current_fee != effective_static_fee:
                             try:
-                                self.set_channel_fee(
+                                result = self.set_channel_fee(
                                     channel_id,
-                                    policy.fee_ppm_target,
+                                    requested_static_fee,
                                     reason="Policy: STATIC",
                                     reason_code=FeeReasonCode.POLICY_STATIC.value
                                 )
+                                if not result.get("success"):
+                                    self.plugin.log(
+                                        f"Error setting static fee for {channel_id}: "
+                                        f"{result.get('message', 'unknown error')}",
+                                        level='error'
+                                    )
+                                    skip_reasons["error"] += 1
+                                    continue
+                                applied_fee_ppm = int(result.get("fee_ppm", effective_static_fee))
                                 adjustments.append(FeeAdjustment(
                                     channel_id=channel_id,
                                     peer_id=peer_id,
                                     old_fee_ppm=current_fee,
-                                    new_fee_ppm=policy.fee_ppm_target,
+                                    new_fee_ppm=applied_fee_ppm,
                                     reason="Policy: STATIC fee override",
-                                    algorithm_values={"policy": "static"}
+                                    algorithm_values={
+                                        "policy": "static",
+                                        "requested_fee_ppm": requested_static_fee,
+                                        "effective_fee_ppm": applied_fee_ppm,
+                                    },
+                                    reason_code=FeeReasonCode.POLICY_STATIC.value,
                                 ))
                             except Exception as e:
                                 self.plugin.log(f"Error setting static fee for {channel_id}: {e}", level='error')
@@ -4936,7 +4977,12 @@ class FeeController:
         # DYNAMIC HTLC POLICY TARGETS
         # =====================================================================
         htlcmax_msat = None
-        if getattr(cfg, 'enable_dynamic_htlcmax', False):
+        dynamic_htlcmax_enabled = getattr(cfg, 'enable_dynamic_htlcmax', False)
+        if isinstance(dynamic_htlcmax_enabled, str):
+            dynamic_htlcmax_enabled = dynamic_htlcmax_enabled.lower() in ("true", "1", "yes")
+        else:
+            dynamic_htlcmax_enabled = dynamic_htlcmax_enabled is True
+        if dynamic_htlcmax_enabled:
             capacity_msat = sats_to_base(channel_info.get("capacity", 0))
             if capacity_msat > 0:
                 if flow_state == "source":
@@ -4957,11 +5003,25 @@ class FeeController:
 
         # Dynamic HTLC min removed (was _calculate_dynamic_htlcmin_msat)
         htlcmin_msat = None
+        current_base_fee_msat = parse_msat(channel_info.get("fee_base_msat", 0))
+        target_base_fee_msat = self._resolve_base_fee_msat(peer_id, cfg)
+        base_fee_policy_change = int(current_base_fee_msat) != int(target_base_fee_msat)
         current_htlcmin_msat = parse_msat(
             channel_info.get("htlc_minimum_msat", channel_info.get("htlc_min_msat", 0))
         )
+        current_htlcmax_msat = parse_msat(
+            channel_info.get("htlc_maximum_msat", channel_info.get("htlc_max_msat", 0))
+        )
         htlcmin_policy_change = (
             htlcmin_msat is not None and int(htlcmin_msat) != int(current_htlcmin_msat)
+        )
+        htlcmax_policy_change = (
+            htlcmax_msat is not None and int(htlcmax_msat) != int(current_htlcmax_msat)
+        )
+        channel_policy_change = (
+            base_fee_policy_change
+            or htlcmin_policy_change
+            or htlcmax_policy_change
         )
 
         # Check if fee changed meaningfully (Alpha Guard)
@@ -4979,7 +5039,7 @@ class FeeController:
         if (
             fee_change < min_change
             and not is_congested
-            and not htlcmin_policy_change
+            and not channel_policy_change
             and not raw_zero_fee_recovery
         ):
             # CRITICAL: Reset observation timer so the next cycle doesn't
@@ -5029,7 +5089,7 @@ class FeeController:
                              (target_found and last_state_category != current_state_category) or \
                              (not target_found and cycle.last_state == "CONGESTION")
 
-        if not significant_change and not htlcmin_policy_change:
+        if not significant_change and not channel_policy_change:
             # =========================================================================
             # GOSSIP REFRESH CHECK
             # Broadcast staleness uses last_broadcast_at, so observation-cursor
@@ -5142,7 +5202,7 @@ class FeeController:
             reason = f"DTS+PID: {common_reason_suffix}, {dts_info}"
         
         # IDEMPOTENCY GUARD: Skip RPC if target is physically set
-        if new_fee_ppm == raw_chain_fee and not htlcmin_policy_change:
+        if new_fee_ppm == raw_chain_fee and not channel_policy_change:
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = raw_chain_fee
             cycle.last_broadcast_fee_ppm = new_fee_ppm
@@ -5190,7 +5250,8 @@ class FeeController:
             enforce_limits=True,
             channel_info=channel_info,
             htlcmin_msat=htlcmin_msat,
-            htlcmax_msat=htlcmax_msat
+            htlcmax_msat=htlcmax_msat,
+            base_fee_msat_override=target_base_fee_msat,
         )
         
         if result.get("success"):
@@ -5257,6 +5318,10 @@ class FeeController:
                     "market_boundary_downshift": market_boundary_downshift_info,
                     "market_boundary_support": market_boundary_support_info,
                     "market_boundary_window_bypass": market_boundary_window_bypass_info,
+                    "base_fee_policy_change": base_fee_policy_change,
+                    "current_base_fee_msat": current_base_fee_msat,
+                    "target_base_fee_msat": target_base_fee_msat,
+                    "htlcmax_policy_change": htlcmax_policy_change,
                     "wake_damping_applied": woke_from_sleep,
                     "wake_reason": wake_reason,
                     "sparse_data_conservative": sparse_data_conservative,
@@ -5470,29 +5535,6 @@ class FeeController:
             "message": ""
         }
 
-        # TS-1: Protect state mutations with _state_lock (RLock allows re-entrant calls)
-        # BUG FIX: Wake sleeping channel on manual fee change
-        # A manual override should reset the observation window
-        with self._state_lock:
-            if manual and channel_id in self._cycle_states:
-                cycle = self._cycle_states[channel_id]
-                if cycle.is_sleeping:
-                    cycle.is_sleeping = False
-                    cycle.sleep_until = 0
-                    cycle.stable_cycles = 0
-                    self._save_cycle_state(channel_id, cycle)
-                    self.plugin.log(
-                        f"MANUAL_WAKE: Channel {channel_id[:12]}... woken due to manual fee change",
-                        level='info'
-                    )
-            if manual and channel_id in self._channel_fee_states:
-                ts_state = self._channel_fee_states[channel_id]
-                if ts_state.is_sleeping:
-                    ts_state.is_sleeping = False
-                    ts_state.sleep_until = 0
-                    ts_state.stable_cycles = 0
-                    self._save_channel_fee_state(channel_id, ts_state)
-
         try:
             # Get channel info to find peer ID and current fee
             resolved_channel_id = normalize_scid(channel_id)
@@ -5518,10 +5560,33 @@ class FeeController:
             
             peer_id = channel_info.get("peer_id", "")
             old_fee_ppm = channel_info.get("fee_proportional_millionths", 0)
-            
+
+            # TS-1: Protect state mutations with _state_lock (RLock allows re-entrant calls).
+            # Resolve the reference first so manual full-channel IDs/colon SCIDs update
+            # the canonical SCID state instead of creating a parallel state row.
+            with self._state_lock:
+                if manual and resolved_channel_id in self._cycle_states:
+                    cycle = self._cycle_states[resolved_channel_id]
+                    if cycle.is_sleeping:
+                        cycle.is_sleeping = False
+                        cycle.sleep_until = 0
+                        cycle.stable_cycles = 0
+                        self._save_cycle_state(resolved_channel_id, cycle)
+                        self.plugin.log(
+                            f"MANUAL_WAKE: Channel {resolved_channel_id[:12]}... woken due to manual fee change",
+                            level='info'
+                        )
+                if manual and resolved_channel_id in self._channel_fee_states:
+                    ts_state = self._channel_fee_states[resolved_channel_id]
+                    if ts_state.is_sleeping:
+                        ts_state.is_sleeping = False
+                        ts_state.sleep_until = 0
+                        ts_state.stable_cycles = 0
+                        self._save_channel_fee_state(resolved_channel_id, ts_state)
+
             # Set the fee
             if self.config.dry_run:
-                self.plugin.log(f"[DRY RUN] Would set fee for {channel_id} to {fee_ppm} PPM")
+                self.plugin.log(f"[DRY RUN] Would set fee for {resolved_channel_id} to {fee_ppm} PPM")
                 result["success"] = True
                 result["message"] = "Dry run - no changes made"
                 return result
@@ -5568,7 +5633,7 @@ class FeeController:
 
             # Step 3: Record the change with explainability data
             self.database.record_fee_change(
-                channel_id=channel_id,
+                channel_id=resolved_channel_id,
                 peer_id=peer_id,
                 old_fee_ppm=old_fee_ppm,
                 new_fee_ppm=fee_ppm,
@@ -5594,7 +5659,7 @@ class FeeController:
                 # TS-1: Protect state mutations with _state_lock
                 with self._state_lock:
                     try:
-                        cycle = self._get_cycle_state(channel_id, actual_fee_ppm=fee_ppm)
+                        cycle = self._get_cycle_state(resolved_channel_id, actual_fee_ppm=fee_ppm)
                         cycle.is_sleeping = False
                         cycle.sleep_until = 0
                         cycle.stable_cycles = 0
@@ -5603,12 +5668,12 @@ class FeeController:
                         cycle.last_broadcast_at = now
                         cycle.last_update = now
                         cycle.last_state = reason_code or "manual"
-                        self._save_cycle_state(channel_id, cycle)
+                        self._save_cycle_state(resolved_channel_id, cycle)
                     except Exception as e:
-                        self.plugin.log(f"STATE_SYNC: Failed to update cycle state for {channel_id}: {e}", level="debug")
+                        self.plugin.log(f"STATE_SYNC: Failed to update cycle state for {resolved_channel_id}: {e}", level="debug")
 
                     try:
-                        ts_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=fee_ppm)
+                        ts_state = self._get_channel_fee_state(resolved_channel_id, peer_id, actual_fee_ppm=fee_ppm)
                         ts_state.is_sleeping = False
                         ts_state.sleep_until = 0
                         ts_state.stable_cycles = 0
@@ -5617,16 +5682,16 @@ class FeeController:
                         ts_state.last_broadcast_at = now
                         ts_state.last_update = now
                         ts_state.last_state = reason_code or "manual"
-                        self._save_channel_fee_state(channel_id, ts_state)
+                        self._save_channel_fee_state(resolved_channel_id, ts_state)
                     except Exception as e:
-                        self.plugin.log(f"STATE_SYNC: Failed to update DTS state for {channel_id}: {e}", level="debug")
+                        self.plugin.log(f"STATE_SYNC: Failed to update DTS state for {resolved_channel_id}: {e}", level="debug")
             
             result["success"] = True
             result["old_fee_ppm"] = old_fee_ppm
             result["message"] = f"Fee set to {fee_ppm} PPM"
             
             self.plugin.log(
-                f"Set fee for {channel_id[:16]}...: {old_fee_ppm} -> {fee_ppm} PPM "
+                f"Set fee for {resolved_channel_id[:16]}...: {old_fee_ppm} -> {fee_ppm} PPM "
                 f"({reason})"
             )
             

@@ -270,6 +270,58 @@ class TestSetChannelFeeLimits:
         assert result["success"] is True
         assert _setchannel_kwargs(mock_plugin)["id"] == channel_id
 
+    def test_manual_full_channel_id_syncs_canonical_scid_state(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import ChannelCycleState, ChannelFeeState, FeeController
+
+        channel_id = "123x456x0"
+        full_channel_id = "ad" * 32
+        peer_id = "02" + "a" * 64
+        now = int(time.time())
+
+        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_current_payload(
+            channel_id,
+            peer_id,
+            fee_ppm=100,
+            full_channel_id=full_channel_id,
+        )
+        mock_plugin.rpc.setchannel = MagicMock()
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
+        fc._cycle_states[channel_id] = ChannelCycleState(
+            last_fee_ppm=100,
+            last_broadcast_fee_ppm=100,
+            last_update=now - 7200,
+            is_sleeping=True,
+            sleep_until=now + 3600,
+            stable_cycles=2,
+        )
+        fc._channel_fee_states[channel_id] = ChannelFeeState(
+            last_fee_ppm=100,
+            last_broadcast_fee_ppm=100,
+            last_update=now - 7200,
+            is_sleeping=True,
+            sleep_until=now + 3600,
+            stable_cycles=2,
+        )
+
+        result = fc.set_channel_fee(full_channel_id, 125, manual=True)
+
+        assert result["success"] is True
+        assert result["channel_id"] == channel_id
+        assert _setchannel_kwargs(mock_plugin)["id"] == channel_id
+        assert full_channel_id not in fc._cycle_states
+        assert full_channel_id not in fc._channel_fee_states
+        assert fc._cycle_states[channel_id].last_broadcast_fee_ppm == 125
+        assert fc._cycle_states[channel_id].is_sleeping is False
+        assert fc._channel_fee_states[channel_id].last_broadcast_fee_ppm == 125
+        assert fc._channel_fee_states[channel_id].is_sleeping is False
+        assert mock_database.record_fee_change.call_args.kwargs["channel_id"] == channel_id
+
     def test_set_channel_fee_rejects_ambiguous_peer_id(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.fee_controller import FeeController
