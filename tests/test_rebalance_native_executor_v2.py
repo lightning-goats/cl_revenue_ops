@@ -101,7 +101,8 @@ def test_native_executor_executes_priced_route_with_sendpay():
             "waitsendpay": {"status": "complete", "amount_sent_msat": "101000msat"},
         }
     )
-    executor = NativeRouteExecutor(FakePlugin(rpc))
+    plugin = FakePlugin(rpc)
+    executor = NativeRouteExecutor(plugin)
 
     result = executor.execute(
         route=_route(),
@@ -118,11 +119,16 @@ def test_native_executor_executes_priced_route_with_sendpay():
     methods = [method for method, _ in rpc.calls]
     assert methods == ["getinfo", "invoice", "sendpay", "waitsendpay"]
     assert rpc.calls[2][1]["route"] == _route()
+    assert any(
+        level == "debug" and "Native route success" in message
+        for level, message in plugin.logs
+    )
 
 
 def test_native_executor_rejects_missing_route_before_invoice():
     rpc = FakeRpc(responses={"getinfo": {"id": OUR_ID}})
-    executor = NativeRouteExecutor(FakePlugin(rpc))
+    plugin = FakePlugin(rpc)
+    executor = NativeRouteExecutor(plugin)
 
     result = executor.execute(
         route=[],
@@ -139,7 +145,8 @@ def test_native_executor_rejects_missing_route_before_invoice():
 
 def test_native_executor_rejects_route_over_budget_before_invoice():
     rpc = FakeRpc(responses={"getinfo": {"id": OUR_ID}})
-    executor = NativeRouteExecutor(FakePlugin(rpc))
+    plugin = FakePlugin(rpc)
+    executor = NativeRouteExecutor(plugin)
 
     result = executor.execute(
         route=_route(first_msat=103_000),
@@ -165,7 +172,8 @@ def test_native_executor_cleans_failed_sendpay_attempt():
         },
         failures={"sendpay": RuntimeError("WIRE_TEMPORARY_CHANNEL_FAILURE")},
     )
-    executor = NativeRouteExecutor(FakePlugin(rpc))
+    plugin = FakePlugin(rpc)
+    executor = NativeRouteExecutor(plugin)
 
     result = executor.execute(
         route=_route(),
@@ -177,6 +185,10 @@ def test_native_executor_cleans_failed_sendpay_attempt():
 
     assert result.success is False
     assert "WIRE_TEMPORARY_CHANNEL_FAILURE" in result.error
+    assert any(
+        level == "debug" and "native_sendpay_error" in message
+        for level, message in plugin.logs
+    )
     assert [method for method, _ in rpc.calls] == [
         "getinfo",
         "invoice",

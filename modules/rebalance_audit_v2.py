@@ -163,5 +163,5 @@ class RebalanceAudit:
                 total_channels,
                 total_budget_sats,
             ),
-            level="info",
+            level="debug",
         )
