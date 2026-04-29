@@ -1672,7 +1672,7 @@ class RebalanceEngine:
         self._log(
             f"Retrying native rebalance {pair.source_channel_id}->{pair.dest_channel_id} "
             f"with exclusions={exclusions} via {route_label}",
-            level="info",
+            level="debug",
         )
         try:
             retry_result = executor.execute(**self._execution_kwargs(pair))
@@ -1816,7 +1816,7 @@ class RebalanceEngine:
             self._log(
                 f"Retrying native rebalance {pair.source_channel_id}->{pair.dest_channel_id} "
                 f"as partial amount={amount_sats} sats via {route_label}",
-                level="info",
+                level="debug",
             )
             try:
                 retry_result = executor.execute(**self._execution_kwargs(pair))
