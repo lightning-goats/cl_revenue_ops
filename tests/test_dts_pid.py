@@ -1039,6 +1039,51 @@ class TestMarketBoundaryGuard:
         assert fc._get_market_boundary_fee(peer_id, cfg=cfg)["boundary_ppm"] == 100
         assert fc._get_market_boundary_fee(peer_id, cfg=cfg, force_refresh=True)["boundary_ppm"] == 60
 
+    def test_market_boundary_ignores_untouched_cln_default_competitors(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        peer_id = "02" + "d" * 64
+        our_id = "our-node"
+        fc.data_service = MagicMock()
+        fc.data_service.get_node_id.return_value = our_id
+        fc._our_node_id = our_id
+        fc.data_service.get_channels.return_value = {
+            "channels": [
+                {
+                    "source": our_id,
+                    "destination": peer_id,
+                    "active": True,
+                    "fee_per_millionth": 112,
+                    "fee_base_msat": 0,
+                    "satoshis": 2_000_000,
+                },
+                {
+                    "source": "cln-default",
+                    "destination": peer_id,
+                    "active": True,
+                    "fee_per_millionth": 10,
+                    "fee_base_msat": 1000,
+                    "satoshis": 2_000_000,
+                    "last_update": int(time.time()),
+                },
+                {
+                    "source": "priced-competitor",
+                    "destination": peer_id,
+                    "active": True,
+                    "fee_per_millionth": 80,
+                    "fee_base_msat": 0,
+                    "satoshis": 2_000_000,
+                    "last_update": int(time.time()),
+                },
+            ]
+        }
+
+        info = fc._get_market_boundary_fee(peer_id, cfg=cfg, force_refresh=True)
+
+        assert info["boundary_ppm"] == 80
+        assert info["competitor_count"] == 1
+
     def test_market_boundary_downshift_bypasses_slow_blend_to_boundary(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
 
@@ -1051,6 +1096,80 @@ class TestMarketBoundaryGuard:
 
         assert info["applied"] is True
         assert new_fee == 75
+
+    def test_base_fee_only_policy_change_bypasses_fee_hysteresis(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.base_fee_policy = "adaptive"
+        cfg.base_fee_msat = 0
+        cfg.base_fee_msat_intra_fleet = 0
+        cfg.base_fee_msat_non_hive = 1500
+
+        channel_id = "277x2x0"
+        peer_id = "02" + "f" * 64
+        current_fee_ppm = 200
+        now = int(time.time())
+
+        hints = MagicMock()
+        hints.is_hive_member.return_value = False
+        fc.hive_hints = hints
+        fc._get_neighbor_fee_median = MagicMock(return_value=None)
+        fc._get_market_boundary_fee = MagicMock(return_value=None)
+        fc._get_hive_market_boundary_fee = MagicMock(return_value=None)
+        fc._get_rebalance_cost_floor = MagicMock(return_value=None)
+        fc._get_channel_rebalance_cost_ppm = MagicMock(return_value=0)
+        fc._calculate_floor = MagicMock(return_value=cfg.min_fee_ppm)
+        fc.set_channel_fee = MagicMock(return_value={"success": True, "fee_ppm": current_fee_ppm})
+
+        fc._cycle_states[channel_id] = ChannelCycleState(
+            last_revenue_rate=0.0,
+            last_fee_ppm=current_fee_ppm,
+            last_update=now - 7200,
+            last_broadcast_fee_ppm=current_fee_ppm,
+            last_state="dts_pid",
+        )
+        ts_state = ChannelFeeState(
+            last_revenue_rate=0.0,
+            last_fee_ppm=current_fee_ppm,
+            last_update=now - 7200,
+            last_broadcast_fee_ppm=current_fee_ppm,
+            last_state="dts_pid",
+        )
+        ts_state.thompson.observations = [
+            (current_fee_ppm, 1.0, 1.0, now, "normal")
+        ] * GaussianThompsonState.MIN_OBSERVATIONS
+        ts_state.thompson.sample_fee_contextual = MagicMock(return_value=current_fee_ppm)
+        fc._channel_fee_states[channel_id] = ts_state
+
+        result = fc._adjust_channel_fee(
+            channel_id,
+            peer_id,
+            {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced"},
+            {
+                "channel_id": channel_id,
+                "short_channel_id": channel_id,
+                "peer_id": peer_id,
+                "capacity": 1_000_000,
+                "spendable_msat": 500_000_000,
+                "receivable_msat": 500_000_000,
+                "fee_base_msat": 0,
+                "fee_proportional_millionths": current_fee_ppm,
+                "htlc_minimum_msat": 0,
+                "htlc_maximum_msat": 0,
+                "opener": "local",
+            },
+            chain_costs=None,
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.old_fee_ppm == current_fee_ppm
+        assert result.new_fee_ppm == current_fee_ppm
+        assert result.algorithm_values["base_fee_policy_change"] is True
+        assert result.algorithm_values["target_base_fee_msat"] == 1500
+        fc.set_channel_fee.assert_called_once()
+        assert fc.set_channel_fee.call_args.kwargs["base_fee_msat_override"] == 1500
 
     def test_adjustment_caps_target_below_single_cheapest_competitor(
         self, mock_plugin, mock_database

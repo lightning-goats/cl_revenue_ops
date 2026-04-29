@@ -121,7 +121,7 @@ class RebalanceAudit:
                 value_score,
                 router=router,
             ),
-            level="info",
+            level="debug",
         )
 
     def log_skip(
@@ -144,7 +144,7 @@ class RebalanceAudit:
                 detail,
                 router=router,
             ),
-            level="info",
+            level="debug",
         )
 
     def log_cycle_summary(

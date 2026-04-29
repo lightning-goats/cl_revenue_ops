@@ -34,11 +34,33 @@ def _make_engine(plugin, database):
     return RebalanceEngine(plugin=plugin, config=cfg, database=database)
 
 
-def test_rebalancer_calls_engine_run_cycle(mock_plugin, mock_database):
+def test_rebalancer_dry_run_calls_engine_find_candidates_without_execution(
+    mock_plugin, mock_database
+):
     from modules.config import Config
     from modules.rebalancer import EVRebalancer
 
     cfg = Config(dry_run=True)
+    mock_database.cleanup_stale_reservations.return_value = 0
+
+    r = EVRebalancer(mock_plugin, cfg, mock_database)
+    r._check_capital_controls = MagicMock(return_value=True)
+    r.rebalance_engine_v2 = MagicMock()
+    r.rebalance_engine_v2.find_candidates.return_value = []
+    r.rebalance_engine_v2.get_last_cycle_debug.return_value = {}
+
+    result = r.find_rebalance_candidates()
+
+    assert result == []
+    r.rebalance_engine_v2.find_candidates.assert_called_once()
+    r.rebalance_engine_v2.run_cycle.assert_not_called()
+
+
+def test_rebalancer_live_mode_calls_engine_run_cycle(mock_plugin, mock_database):
+    from modules.config import Config
+    from modules.rebalancer import EVRebalancer
+
+    cfg = Config(dry_run=False)
     mock_database.cleanup_stale_reservations.return_value = 0
 
     r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -50,6 +72,86 @@ def test_rebalancer_calls_engine_run_cycle(mock_plugin, mock_database):
 
     assert result == []
     r.rebalance_engine_v2.run_cycle.assert_called_once()
+
+
+def test_engine_run_cycle_respects_max_concurrent_jobs(
+    mock_plugin, mock_database
+):
+    from concurrent.futures import Future
+
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.max_concurrent_jobs = 2
+    pairs = [
+        PairCandidate(
+            source_channel_id=f"10{idx}x1x0",
+            dest_channel_id=f"20{idx}x1x0",
+            source_peer_id="02" + str(idx) * 64,
+            dest_peer_id="03" + str(idx) * 64,
+            amount_sats=50_000,
+            pair_budget_sats=100,
+        )
+        for idx in range(3)
+    ]
+    engine.find_candidates = MagicMock(return_value=pairs)
+    executor = MagicMock()
+    executor.is_available.return_value = True
+    engine._make_executor = MagicMock(return_value=executor)
+    futures = []
+    for _idx in range(2):
+        future = Future()
+        future.set_result(ExecutionResult(success=True, amount_sats=50_000))
+        futures.append(future)
+    engine._pool = MagicMock()
+    engine._pool.submit.side_effect = futures
+
+    result = engine.run_cycle()
+
+    assert engine._pool.submit.call_count == 2
+    assert len(result.candidates) == 2
+    assert len(result.executions) == 2
+    assert result.audit_records[-1].reason == "max_pairs_reached"
+    assert "max_concurrent_jobs=2" in result.audit_records[-1].detail
+
+
+def test_engine_find_candidates_passes_max_concurrent_jobs_to_planner(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_state_v2 import ChannelState
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.max_concurrent_jobs = 2
+    engine.config.hive_equalization_enabled = False
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=(
+                ChannelState(
+                    channel_id="100x1x0",
+                    peer_id="02" + "1" * 64,
+                    capacity_sats=1_000_000,
+                    local_ratio=0.5,
+                    actual_inbound_fee_ppm=0,
+                    value_class="neutral",
+                    is_valuable=False,
+                    remaining_budget_sats=0,
+                    cooldown_active=False,
+                ),
+            ),
+            valuable_channel_count=0,
+            total_remaining_budget_sats=0,
+        )
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.return_value = SimpleNamespace(
+            selected=[],
+            skipped=[],
+        )
+        engine.find_candidates()
+
+    assert planner_cls.call_args.kwargs["max_pairs"] == 2
 
 
 def test_rebalancer_without_engine_suppresses(mock_plugin, mock_database):
@@ -81,7 +183,8 @@ def test_rebalancer_reports_no_candidates(mock_plugin, mock_database):
     r = EVRebalancer(mock_plugin, cfg, mock_database)
     r._check_capital_controls = MagicMock(return_value=True)
     r.rebalance_engine_v2 = MagicMock()
-    r.rebalance_engine_v2.run_cycle.return_value = _make_cycle_result()
+    r.rebalance_engine_v2.find_candidates.return_value = []
+    r.rebalance_engine_v2.get_last_cycle_debug.return_value = {}
 
     r.find_rebalance_candidates()
 
@@ -95,7 +198,7 @@ def test_rebalancer_reports_successful_execution(mock_plugin, mock_database):
     from modules.rebalancer import EVRebalancer
     from modules.rebalance_executor_v2 import ExecutionResult
 
-    cfg = Config(dry_run=True)
+    cfg = Config(dry_run=False)
     mock_database.cleanup_stale_reservations.return_value = 0
 
     r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -118,7 +221,7 @@ def test_rebalancer_reports_failed_execution(mock_plugin, mock_database):
     from modules.rebalancer import EVRebalancer
     from modules.rebalance_executor_v2 import ExecutionResult
 
-    cfg = Config(dry_run=True)
+    cfg = Config(dry_run=False)
     mock_database.cleanup_stale_reservations.return_value = 0
 
     r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -758,6 +861,7 @@ def test_top_level_hold_reason_maps_specific_blocker_from_engine(
     cycle_result = CycleResult(snapshot=snapshot)
     engine = MagicMock()
     engine.run_cycle.return_value = cycle_result
+    engine.find_candidates.return_value = []
     engine.get_last_cycle_debug.return_value = {
         "summary": {"considered_pairs": 0, "selected_pairs": 0},
         "hold_diagnostics": {
@@ -1122,6 +1226,275 @@ def test_engine_build_snapshot_uses_membership_router_for_hive_value_class(
     )
     assert snapshot.channels[0].budget_source == "hive_bootstrap"
     membership_router.is_hive_member.assert_called_once()
+
+
+def test_engine_build_snapshot_carries_hive_rebalance_bias(
+    mock_plugin, mock_database
+):
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    peer_id = "03" + "b" * 64
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    hive_hints = MagicMock()
+    hive_hints.get_rebalance_bias.return_value = 1.05
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": peer_id,
+                "short_channel_id": "100x1x0",
+                "total_msat": "2000000msat",
+                "our_amount_msat": "1000000msat",
+                "updates": {"remote": {"fee_proportional_millionths": 123}},
+            }
+        ]
+    }
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(
+        mock_plugin,
+        cfg,
+        mock_database,
+        hive_hints=hive_hints,
+    )
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot is not None
+    assert snapshot.channels[0].rebalance_bias == pytest.approx(1.05)
+    hive_hints.get_rebalance_bias.assert_called_once_with(peer_id)
+
+
+def test_v2_planner_uses_hive_rebalance_bias_for_pair_roles():
+    from modules.rebalance_planner_v2 import RebalancePlanner
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    disfavored_source = "100x1x0"
+    favored_source = "101x1x0"
+    dest = "200x1x0"
+    snapshot = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id=disfavored_source,
+                peer_id="03" + "1" * 64,
+                capacity_sats=1_000_000,
+                local_sats=900_000,
+                rebalance_bias=1.05,
+            ),
+            ChannelInput(
+                channel_id=favored_source,
+                peer_id="03" + "2" * 64,
+                capacity_sats=1_000_000,
+                local_sats=900_000,
+                rebalance_bias=0.95,
+            ),
+            ChannelInput(
+                channel_id=dest,
+                peer_id="03" + "3" * 64,
+                capacity_sats=1_000_000,
+                local_sats=100_000,
+                rebalance_bias=1.05,
+            ),
+        ],
+        {"channel_budgets": {dest: {"budget_sats": 1_000}}},
+    )
+
+    selected = RebalancePlanner(max_pairs=1).plan(snapshot).selected
+
+    assert len(selected) == 1
+    pair = selected[0]
+    assert pair.source_channel_id == favored_source
+    assert pair.dest_channel_id == dest
+    assert pair.hive_source_rebalance_bias == pytest.approx(0.95)
+    assert pair.hive_dest_rebalance_bias == pytest.approx(1.05)
+    assert pair.hive_hint_score_multiplier == pytest.approx(1.10)
+    inputs = pair.score_decomposition["inputs"]
+    assert inputs["hive_source_rebalance_bias"] == pytest.approx(0.95)
+    assert inputs["hive_dest_rebalance_bias"] == pytest.approx(1.05)
+    assert inputs["hive_hint_score_multiplier"] == pytest.approx(1.10)
+    assert pair.score > inputs["pre_hint_pair_score"]
+
+
+def test_c1_planner_accepts_known_good_pair_and_explains_no_budget_destination():
+    from modules.rebalance_planner_v2 import RebalancePlanner
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    source = "100x1x0"
+    known_good_dest = "200x1x0"
+    no_budget_dest = "201x1x0"
+    snapshot = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id=source,
+                peer_id="03" + "1" * 64,
+                capacity_sats=1_000_000,
+                local_sats=900_000,
+            ),
+            ChannelInput(
+                channel_id=known_good_dest,
+                peer_id="03" + "2" * 64,
+                capacity_sats=1_000_000,
+                local_sats=100_000,
+                is_hive_member=True,
+                rebalance_bias=1.05,
+            ),
+            ChannelInput(
+                channel_id=no_budget_dest,
+                peer_id="03" + "3" * 64,
+                capacity_sats=1_000_000,
+                local_sats=100_000,
+                is_active=True,
+            ),
+        ],
+        {"channel_budgets": {known_good_dest: {"budget_sats": 500}}},
+    )
+
+    by_channel = {channel.channel_id: channel for channel in snapshot.channels}
+    assert by_channel[source].source_eligible is True
+    assert by_channel[known_good_dest].dest_eligible is True
+    assert by_channel[known_good_dest].remaining_budget_sats == 500
+    assert by_channel[no_budget_dest].dest_eligible is False
+    assert by_channel[no_budget_dest].dest_reason == "no_budget"
+    assert snapshot.valuable_channel_count == 2
+    assert snapshot.total_remaining_budget_sats == 500
+
+    plan = RebalancePlanner(max_pairs=2).plan(snapshot)
+
+    assert len(plan.selected) == 1
+    pair = plan.selected[0]
+    assert pair.source_channel_id == source
+    assert pair.dest_channel_id == known_good_dest
+    assert pair.amount_sats == 250_000
+    assert pair.pair_budget_sats == 500
+    assert pair.dest_value_class == "hive"
+    assert pair.score_decomposition["beats_do_nothing"] is True
+    skipped = {skip.channel_id: skip.reason for skip in plan.skipped}
+    assert skipped[no_budget_dest] == "no_budget"
+
+
+def test_c1_engine_selects_known_good_pair_with_positive_margin(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=1_000,
+        )
+    )
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="03" + "1" * 64,
+        dest_peer_id="03" + "2" * 64,
+        amount_sats=250_000,
+        pair_budget_sats=1_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        source_value_class="neutral",
+        dest_value_class="hive",
+        source_budget_source="none",
+        dest_budget_source="capex",
+        score=2.0,
+        source_local_ratio=0.90,
+        dest_local_ratio=0.10,
+    )
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=6,
+        route=[{"channel": "300x1x0"}],
+        probability_ppm=900_000,
+        error="",
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.return_value = SimpleNamespace(
+            selected=[pair],
+            skipped=[],
+        )
+        selected = engine.find_candidates()
+
+    assert selected == [pair]
+    debug = engine.get_last_cycle_debug()
+    assert debug["summary"]["selected_pairs"] == 1
+    decomposition = debug["selected_candidates"][0]["score_decomposition"]
+    assert decomposition["stage"] == "priced"
+    assert decomposition["beats_do_nothing"] is True
+    assert decomposition["final_score"] > 0.0
+    assert decomposition["inputs"]["expected_fee_sats"] == 6
+    assert decomposition["inputs"]["pair_budget_sats"] == 1_000
+
+
+def test_c1_engine_rejects_route_bait_even_when_route_prices(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=100,
+        )
+    )
+    bait_pair = PairCandidate(
+        source_channel_id="101x1x0",
+        dest_channel_id="201x1x0",
+        source_peer_id="03" + "3" * 64,
+        dest_peer_id="03" + "4" * 64,
+        amount_sats=20_000,
+        pair_budget_sats=100,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        source_value_class="neutral",
+        dest_value_class="active",
+        source_budget_source="none",
+        dest_budget_source="capex",
+        score=0.20,
+        source_local_ratio=0.68,
+        dest_local_ratio=0.30,
+    )
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=90,
+        route=[{"channel": "301x1x0"}],
+        probability_ppm=990_000,
+        error="",
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.return_value = SimpleNamespace(
+            selected=[bait_pair],
+            skipped=[],
+        )
+        selected = engine.find_candidates()
+
+    assert selected == []
+    debug = engine.get_last_cycle_debug()
+    assert debug["summary"]["considered_pairs"] == 1
+    assert debug["summary"]["selected_pairs"] == 0
+    decomposition = debug["considered_candidates"][0]["score_decomposition"]
+    assert decomposition["stage"] == "below_hold_margin"
+    assert decomposition["rejection_reason"] == "below_hold_margin"
+    assert decomposition["beats_do_nothing"] is False
+    assert decomposition["capital_risk_penalty"] == pytest.approx(0.9)
+    assert decomposition["inputs"]["expected_fee_sats"] == 90
+    skipped = {row["channel_id"]: row["reason"] for row in debug["skipped"]}
+    assert skipped["201x1x0"] == "below_hold_margin"
 
 
 def test_engine_falls_back_to_hive_equalization_when_hive_channels_have_no_budget(
@@ -2008,7 +2381,7 @@ def test_engine_records_persistent_pair_failure_after_failed_execution(
     assert kwargs["cooldown_seconds"] > 0
 
 
-def test_engine_records_unfinished_executions_after_cycle_timeout(
+def test_engine_does_not_cooldown_cancelled_execution_after_cycle_timeout(
     mock_plugin, mock_database
 ):
     from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -2045,11 +2418,48 @@ def test_engine_records_unfinished_executions_after_cycle_timeout(
 
     assert future.cancelled is True
     assert len(result.executions) == 1
-    assert result.executions[0].error == "executor_timeout"
-    mock_database.record_pair_rebalance_failure.assert_called_once()
-    args, kwargs = mock_database.record_pair_rebalance_failure.call_args
-    assert args[:2] == ("100x1x0", "200x1x0")
-    assert kwargs["cooldown_seconds"] > 0
+    assert result.executions[0].error == "executor_timeout_cancelled"
+    mock_database.record_pair_rebalance_failure.assert_not_called()
+
+
+def test_engine_does_not_cooldown_still_running_execution_after_cycle_timeout(
+    mock_plugin, mock_database
+):
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+    class FakeFuture:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+            return False
+
+    pair = SimpleNamespace(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+    )
+    future = FakeFuture()
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.find_candidates = MagicMock(return_value=[pair])
+    engine._pool = MagicMock()
+    engine._pool.submit.return_value = future
+
+    with patch("modules.rebalance_engine_v2.NativeRouteExecutor") as executor_cls, patch(
+        "modules.rebalance_engine_v2.as_completed",
+        side_effect=FuturesTimeoutError,
+    ):
+        executor_cls.return_value.is_available.return_value = True
+        result = engine.run_cycle()
+
+    assert future.cancelled is True
+    assert result.executions == []
+    mock_database.record_pair_rebalance_failure.assert_not_called()
 
 
 def test_engine_failed_non_native_retry_execution_returns_original_failure_without_retry(
