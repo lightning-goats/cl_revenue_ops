@@ -121,4 +121,4 @@ def test_log_cycle_summary_format():
     assert "skipped=7" in logged_msg
     assert "valuable=10/25" in logged_msg
     assert "budget_remaining=15000" in logged_msg
-    assert plugin.log.call_args[1]["level"] == "info"
+    assert plugin.log.call_args[1]["level"] == "debug"

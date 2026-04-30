@@ -377,7 +377,8 @@ class NativeRouteExecutor:
                 result.fee_ppm = (actual_fee_msat * 1_000_000) // (amount_sats * 1000)
             self._log(
                 f"Native route success: {amount_sats} sats to {dest_channel_id}, "
-                f"fee {result.fee_sats} sats"
+                f"fee {result.fee_sats} sats",
+                level="debug",
             )
             return result
         except Exception as exc:
@@ -403,5 +404,5 @@ class NativeRouteExecutor:
                 observation_store=observation_store,
                 observation_context=observation_context,
             )
-            self._log(result.error, level="info")
+            self._log(result.error, level="debug")
             return result
