@@ -1709,6 +1709,10 @@ class FeeController:
     PROFIT_MARKET_BREAK_EVEN_WEIGHT = 0.65
     PROFIT_MARKET_PROFITABLE_WEIGHT = 1.00
     PROFIT_MARKET_SOFT_FLOW_WEIGHT = 0.35
+    MIN_AUTOMATIC_FEE_FLOOR_PPM = 5
+    MARKET_FLOOR_HARD_MIN_PPM = 5
+    MARKET_FLOOR_MIN_CONFIDENCE = 0.50
+    MARKET_FLOOR_MIN_PROFITABLE_SAMPLES = 3
 
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  policy_manager: Optional[PolicyManager] = None,
@@ -2257,7 +2261,7 @@ class FeeController:
         market_boundary_info: Optional[Dict[str, Any]],
         cfg: Optional[Any] = None,
     ) -> Tuple[int, int, Dict[str, Any]]:
-        """Let current market reality move the effective floor down or ceiling up."""
+        """Let market reality raise the ceiling; keep the economic floor hard."""
         seed_floor = int(floor_ppm)
         seed_ceiling = int(ceiling_ppm)
         info = {
@@ -2269,11 +2273,50 @@ class FeeController:
             "effective_floor_ppm": seed_floor,
             "effective_ceiling_ppm": seed_ceiling,
         }
-        if not isinstance(market_boundary_info, dict):
-            return seed_floor, seed_ceiling, info
 
-        effective_floor = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, seed_floor))
+        try:
+            configured_floor = int(getattr(cfg, "min_fee_ppm", seed_floor))
+        except (TypeError, ValueError):
+            configured_floor = seed_floor
+        economic_floor = max(self.MIN_AUTOMATIC_FEE_FLOOR_PPM, configured_floor)
+        economic_floor = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, economic_floor))
+        effective_floor = max(
+            economic_floor,
+            self.ABS_MIN_FEE_PPM,
+            min(self.ABS_MAX_FEE_PPM, seed_floor),
+        )
         effective_ceiling = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, seed_ceiling))
+        if not isinstance(market_boundary_info, dict):
+            info["effective_floor_ppm"] = int(effective_floor)
+            info["effective_ceiling_ppm"] = int(effective_ceiling)
+            return int(effective_floor), int(effective_ceiling), info
+
+        try:
+            hard_market_floor = int(getattr(cfg, "fee_market_floor_hard_min_ppm", self.MARKET_FLOOR_HARD_MIN_PPM))
+        except (TypeError, ValueError):
+            hard_market_floor = self.MARKET_FLOOR_HARD_MIN_PPM
+        hard_market_floor = max(self.MARKET_FLOOR_HARD_MIN_PPM, min(self.ABS_MAX_FEE_PPM, hard_market_floor))
+
+        try:
+            min_market_confidence = float(getattr(cfg, "fee_market_floor_min_confidence", self.MARKET_FLOOR_MIN_CONFIDENCE))
+        except (TypeError, ValueError):
+            min_market_confidence = self.MARKET_FLOOR_MIN_CONFIDENCE
+        min_market_confidence = max(0.0, min(1.0, min_market_confidence))
+
+        try:
+            min_market_samples = int(getattr(cfg, "fee_market_floor_min_profitable_samples", self.MARKET_FLOOR_MIN_PROFITABLE_SAMPLES))
+        except (TypeError, ValueError):
+            min_market_samples = self.MARKET_FLOOR_MIN_PROFITABLE_SAMPLES
+        min_market_samples = max(1, min_market_samples)
+
+        try:
+            market_confidence = float(market_boundary_info.get("market_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            market_confidence = 0.0
+        try:
+            profitable_sample_count = int(market_boundary_info.get("profitable_sample_count", 0) or 0)
+        except (TypeError, ValueError):
+            profitable_sample_count = 0
 
         explicit_floor = None
         try:
@@ -2281,10 +2324,18 @@ class FeeController:
         except (TypeError, ValueError):
             explicit_floor = None
         if explicit_floor is not None and 1 <= explicit_floor <= self.ABS_MAX_FEE_PPM:
-            if explicit_floor < effective_floor:
-                effective_floor = explicit_floor
-                info["floor_adjusted_down"] = True
+            candidate_floor = max(hard_market_floor, explicit_floor)
+            floor_has_enough_evidence = (
+                market_confidence >= min_market_confidence
+                and profitable_sample_count >= min_market_samples
+            )
             info["market_floor_ppm"] = explicit_floor
+            info["market_floor_candidate_ppm"] = candidate_floor
+            info["market_floor_eligible"] = floor_has_enough_evidence
+            info["market_floor_action"] = "diagnostic_only"
+            info["market_floor_hard_min_ppm"] = hard_market_floor
+            info["market_floor_min_confidence"] = min_market_confidence
+            info["market_floor_min_profitable_samples"] = min_market_samples
 
         explicit_ceiling = None
         try:
@@ -2305,7 +2356,7 @@ class FeeController:
         if 1 <= boundary_ppm <= self.ABS_MAX_FEE_PPM:
             route_target_ppm, margin_ppm = self._get_market_boundary_target(
                 boundary_ppm,
-                self.ABS_MIN_FEE_PPM,
+                effective_floor,
                 cfg=cfg,
             )
             route_target_ppm = max(
@@ -2313,9 +2364,6 @@ class FeeController:
                 min(self.ABS_MAX_FEE_PPM, int(route_target_ppm)),
             )
 
-            if route_target_ppm < effective_floor:
-                effective_floor = route_target_ppm
-                info["floor_adjusted_down"] = True
             if route_target_ppm > effective_ceiling:
                 effective_ceiling = route_target_ppm
                 info["ceiling_adjusted_up"] = True
@@ -2324,6 +2372,7 @@ class FeeController:
                 "boundary_ppm": boundary_ppm,
                 "route_target_ppm": route_target_ppm,
                 "margin_ppm": int(margin_ppm),
+                "boundary_floor_adjustment_allowed": False,
             })
 
         if effective_floor >= effective_ceiling:
@@ -4575,7 +4624,7 @@ class FeeController:
                 if window_boundary_info is not None and window_boundary_ppm > 0:
                     boundary_target_ppm, boundary_margin_ppm = self._get_market_boundary_target(
                         window_boundary_ppm,
-                        self.ABS_MIN_FEE_PPM,
+                        cfg.min_fee_ppm,
                         cfg=cfg,
                     )
                     if current_fee_ppm > boundary_target_ppm:
@@ -4707,9 +4756,9 @@ class FeeController:
             channel_id, current_fee_ppm, base_ceiling_ppm
         )
 
-        # Market reality can move configured seeds in either direction. A cheap
-        # viable market can pull the effective floor below cfg.min_fee_ppm; an
-        # expensive viable market can lift the effective ceiling above cfg.max_fee_ppm.
+        # Market reality can lift the effective ceiling above cfg.max_fee_ppm.
+        # The configured min_fee_ppm remains the hard automatic execution floor;
+        # hive market floors are advisory diagnostics for target selection only.
         force_boundary_refresh = True
         local_market_boundary_info = self._get_market_boundary_fee(
             peer_id,
@@ -5917,7 +5966,16 @@ class FeeController:
         fee_ppm = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, int(fee_ppm)))
         # Economic policy clamp applies unless explicitly bypassed (force/manual overrides, etc).
         if enforce_limits:
-            effective_floor = cfg.min_fee_ppm if limit_floor_ppm is None else int(limit_floor_ppm)
+            try:
+                configured_floor = int(getattr(cfg, "min_fee_ppm", self.MIN_AUTOMATIC_FEE_FLOOR_PPM))
+            except (TypeError, ValueError):
+                configured_floor = self.MIN_AUTOMATIC_FEE_FLOOR_PPM
+            dynamic_floor = configured_floor if limit_floor_ppm is None else int(limit_floor_ppm)
+            effective_floor = max(
+                self.MIN_AUTOMATIC_FEE_FLOOR_PPM,
+                configured_floor,
+                dynamic_floor,
+            )
             effective_ceiling = cfg.max_fee_ppm if limit_ceiling_ppm is None else int(limit_ceiling_ppm)
             effective_floor = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, effective_floor))
             effective_ceiling = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, effective_ceiling))
