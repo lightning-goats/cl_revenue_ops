@@ -284,7 +284,7 @@ class HiveHintAdapter:
     def is_hive_member(self, peer_id: str) -> bool:
         """Return True if peer is a hive fleet member. False if unavailable/stale."""
         hint = self._get_peer_hint(peer_id)
-        return bool(hint.get("member", False))
+        return hint.get("member") is True
 
     def get_corridor_role(self, peer_id: str) -> str:
         """Return validated corridor_role, or 'none' if unavailable."""
@@ -480,7 +480,7 @@ class HiveHintAdapter:
         return [
             str(peer_id)
             for peer_id, hint in hints.items()
-            if peer_id and isinstance(hint, dict) and bool(hint.get("member", False))
+            if peer_id and isinstance(hint, dict) and hint.get("member") is True
         ]
 
     # ------------------------------------------------------------------
@@ -772,10 +772,12 @@ class HiveHintAdapter:
     def is_closure_recommended(self, peer_id: str) -> bool:
         """Return True if cl-hive reputation layer recommends closing this peer."""
         hint = self._get_peer_hint(peer_id)
-        return bool(hint.get("closure_recommended", False))
+        return hint.get("closure_recommended") is True
 
     def get_closure_reason(self, peer_id: str) -> str:
         """Return closure reason string, or '' if no recommendation."""
+        if not self.is_closure_recommended(peer_id):
+            return ""
         hint = self._get_peer_hint(peer_id)
         return str(hint.get("closure_reason", ""))
 
@@ -809,7 +811,7 @@ class HiveHintAdapter:
         member_hints = [
             hint
             for hint in hints.values()
-            if isinstance(hint, dict) and bool(hint.get("member", False))
+            if isinstance(hint, dict) and hint.get("member") is True
         ]
         return {
             "snapshot_fresh": self.is_fresh(),
