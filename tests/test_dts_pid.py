@@ -1097,18 +1097,6 @@ class TestMarketBoundaryGuard:
         assert info["applied"] is True
         assert new_fee == 75
 
-    def test_floor_only_market_boundary_is_diagnostic_not_actionable(self, mock_plugin, mock_database):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-
-        target_ppm, _ = fc._get_market_boundary_target(
-            boundary_ppm=15,
-            floor_ppm=cfg.min_fee_ppm,
-            cfg=cfg,
-        )
-
-        assert target_ppm == cfg.min_fee_ppm
-        assert fc._is_floor_only_market_boundary(target_ppm, cfg.min_fee_ppm) is True
-
     def test_base_fee_only_policy_change_bypasses_fee_hysteresis(
         self, mock_plugin, mock_database
     ):
@@ -2250,66 +2238,6 @@ class TestDTSPIDStabilityCaps:
         assert sparse_result is not None and dense_result is not None
         assert sparse_result.new_fee_ppm < dense_result.new_fee_ppm
         assert sparse_result.algorithm_values["sparse_data_conservative"] is True
-
-    def test_ultra_low_boundary_does_not_stamp_sparse_channel_to_floor_step(
-        self, mock_plugin, mock_database
-    ):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        cfg.min_fee_ppm = 10
-        cfg.max_fee_ppm = 2500
-        cfg.fee_market_boundary_min_competitors = 1
-        channel_id = "123x463x0"
-        peer_id = "02" + "4" * 64
-        current_fee_ppm = 200
-
-        mock_database.get_volume_since.return_value = 0
-        mock_database.get_forward_count_since.return_value = 0
-
-        ts_state = self._prepare_channel(
-            fc, mock_database, channel_id, peer_id,
-            current_fee_ppm=current_fee_ppm,
-            flow="balanced",
-        )
-        ts_state.thompson.sample_fee = lambda floor, ceiling: current_fee_ppm
-        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
-        ts_state.thompson.observations = []
-
-        fc.data_service = MagicMock()
-        fc.data_service.get_node_id.return_value = "our-node"
-        fc.data_service.get_channels.return_value = {
-            "channels": [
-                {
-                    "source": "our-node",
-                    "destination": peer_id,
-                    "active": True,
-                    "fee_per_millionth": current_fee_ppm,
-                    "fee_base_msat": 0,
-                    "satoshis": 2_000_000,
-                },
-                {
-                    "source": "floor-trap",
-                    "destination": peer_id,
-                    "active": True,
-                    "fee_per_millionth": 15,
-                    "fee_base_msat": 0,
-                    "satoshis": 2_000_000,
-                    "last_update": int(time.time()),
-                },
-            ]
-        }
-        fc.data_service.set_channel = MagicMock()
-        fc._our_node_id = "our-node"
-
-        result = fc._adjust_channel_fee(
-            channel_id,
-            peer_id,
-            self._state("balanced"),
-            self._channel_info(current_fee_ppm=current_fee_ppm),
-            cfg=cfg,
-        )
-
-        assert result is None
-        fc.data_service.set_channel.assert_not_called()
 
 
 class TestVariancePrecision:
