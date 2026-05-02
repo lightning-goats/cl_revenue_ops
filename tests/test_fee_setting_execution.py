@@ -220,7 +220,7 @@ class TestSetChannelFeeLimits:
 
         assert _setchannel_kwargs(mock_plugin)["feeppm"] == 1
 
-    def test_set_channel_fee_uses_effective_dynamic_limits_for_automatic_decisions(
+    def test_set_channel_fee_keeps_configured_floor_when_dynamic_floor_is_lower(
         self, mock_plugin, mock_database
     ):
         from modules.config import Config
@@ -248,7 +248,7 @@ class TestSetChannelFeeLimits:
             limit_floor_ppm=5,
             limit_ceiling_ppm=800,
         )
-        assert _setchannel_kwargs(mock_plugin)["feeppm"] == 20
+        assert _setchannel_kwargs(mock_plugin)["feeppm"] == 50
 
         fc.set_channel_fee(
             channel_id,
@@ -259,6 +259,37 @@ class TestSetChannelFeeLimits:
             limit_ceiling_ppm=800,
         )
         assert _setchannel_kwargs(mock_plugin)["feeppm"] == 700
+
+    def test_set_channel_fee_enforces_sane_floor_for_stale_zero_config(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+
+        cfg = Config(min_fee_ppm=0, max_fee_ppm=500, base_fee_msat=0, dry_run=False)
+
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(channel_id, peer_id, fee_ppm=100)
+        mock_plugin.rpc.setchannel = MagicMock()
+
+        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
+        mock_database.record_fee_change = MagicMock()
+
+        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc.data_service = _make_data_service(mock_plugin)
+
+        fc.set_channel_fee(
+            channel_id,
+            0,
+            manual=False,
+            enforce_limits=True,
+            limit_floor_ppm=0,
+            limit_ceiling_ppm=500,
+        )
+
+        assert _setchannel_kwargs(mock_plugin)["feeppm"] == FeeController.MIN_AUTOMATIC_FEE_FLOOR_PPM
 
     def test_set_channel_fee_normalizes_colon_scid(self, mock_plugin, mock_database):
         from modules.config import Config
