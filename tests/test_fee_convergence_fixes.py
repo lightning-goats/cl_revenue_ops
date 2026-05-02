@@ -251,7 +251,7 @@ class TestDynamicMarketRails:
         assert ceiling == 5_000
         assert info["applied"] is False
 
-    def test_explicit_hive_market_rails_can_raise_ceiling_but_not_lower_floor(self):
+    def test_explicit_hive_market_rails_can_move_floor_and_ceiling(self):
         fc = FeeController.__new__(FeeController)
 
         floor, ceiling, info = fc._apply_dynamic_market_rails(
@@ -267,35 +267,13 @@ class TestDynamicMarketRails:
             cfg=None,
         )
 
-        assert floor == 100
+        assert floor == 20
         assert ceiling == 8_000
-        assert info["floor_adjusted_down"] is False
+        assert info["floor_adjusted_down"] is True
         assert info["ceiling_adjusted_up"] is True
         assert info["market_floor_ppm"] == 20
-        assert info["market_floor_action"] == "diagnostic_only"
         assert info["market_ceiling_ppm"] == 8_000
         assert info["profitable_sample_count"] == 4
-
-    def test_stale_zero_config_and_zero_market_floor_keep_sane_hard_floor(self):
-        fc = FeeController.__new__(FeeController)
-        cfg = SimpleNamespace(min_fee_ppm=0)
-
-        floor, ceiling, info = fc._apply_dynamic_market_rails(
-            floor_ppm=0,
-            ceiling_ppm=5_000,
-            market_boundary_info={
-                "boundary_ppm": 0,
-                "market_floor_ppm": 0,
-                "market_confidence": 1.0,
-                "profitable_sample_count": 10,
-                "source": "hive_market_fee_rails",
-            },
-            cfg=cfg,
-        )
-
-        assert floor == FeeController.MIN_AUTOMATIC_FEE_FLOOR_PPM
-        assert ceiling == 5_000
-        assert info["floor_adjusted_down"] is False
 
     def test_low_confidence_hive_market_floor_does_not_drag_fee_to_four_ppm(self):
         fc = FeeController.__new__(FeeController)

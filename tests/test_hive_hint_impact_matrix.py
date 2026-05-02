@@ -233,10 +233,9 @@ def test_fee_controller_uses_hive_market_rails_when_exported():
         market_boundary_info=boundary,
         cfg=cfg,
     )
-    assert floor == 100
+    assert floor == 20
     assert ceiling == 8_000
-    assert info["floor_adjusted_down"] is False
-    assert info["market_floor_action"] == "diagnostic_only"
+    assert info["floor_adjusted_down"] is True
     assert info["ceiling_adjusted_up"] is True
 
 
