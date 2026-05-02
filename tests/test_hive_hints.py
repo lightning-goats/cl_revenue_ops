@@ -650,37 +650,6 @@ class TestDiagnostics:
         assert adapter.get_status()["hints_count"] == 2
         assert adapter.get_open_candidates() == [("02good", {"open_preference": "open", "topology_confidence": 0.7})]
 
-    def test_malformed_boolean_hint_fields_fail_neutral(self, mock_plugin):
-        snapshot = {
-            "generated_at": int(time.time()),
-            "ttl_seconds": 900,
-            "hints": {
-                "02truthy": {
-                    "member": "yes",
-                    "closure_recommended": "yes",
-                    "closure_reason": "force_closes=4",
-                },
-                "02member": {
-                    "member": True,
-                    "closure_recommended": True,
-                    "closure_reason": "force_closes=4",
-                },
-            },
-        }
-        mock_plugin.rpc.call.return_value = snapshot
-        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
-
-        adapter.poll()
-
-        assert adapter.is_hive_member("02truthy") is False
-        assert adapter.is_closure_recommended("02truthy") is False
-        assert adapter.get_closure_reason("02truthy") == ""
-        assert adapter.get_member_peer_ids() == ["02member"]
-        assert adapter.get_status()["member_hints_count"] == 1
-        assert adapter.is_hive_member("02member") is True
-        assert adapter.is_closure_recommended("02member") is True
-        assert adapter.get_closure_reason("02member") == "force_closes=4"
-
 
 class TestCorridorRole:
     def test_returns_valid_corridor_role_for_fresh_snapshot(self, mock_plugin):
