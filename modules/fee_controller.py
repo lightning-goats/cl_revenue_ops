@@ -1710,6 +1710,7 @@ class FeeController:
     PROFIT_MARKET_PROFITABLE_WEIGHT = 1.00
     PROFIT_MARKET_SOFT_FLOW_WEIGHT = 0.35
     MIN_AUTOMATIC_FEE_FLOOR_PPM = 5
+    LOW_FEE_MARKET_TARGET_SUPPRESSION_MAX_PPM = 25
     MARKET_FLOOR_HARD_MIN_PPM = 5
     MARKET_FLOOR_MIN_CONFIDENCE = 0.50
     MARKET_FLOOR_MIN_PROFITABLE_SAMPLES = 3
@@ -2079,6 +2080,32 @@ class FeeController:
         computed_margin = max(margin_ppm, int(math.ceil(max(0, boundary_ppm) * margin_ratio)))
         target_ppm = max(int(floor_ppm), int(boundary_ppm) - computed_margin)
         return target_ppm, computed_margin
+
+    @staticmethod
+    def _is_floor_only_market_boundary(boundary_target_ppm: int, floor_ppm: int) -> bool:
+        """Return True when a cheap boundary only says "go to the floor"."""
+        try:
+            target = int(boundary_target_ppm)
+            floor = int(floor_ppm)
+        except (TypeError, ValueError):
+            return False
+        return (
+            floor <= FeeController.LOW_FEE_MARKET_TARGET_SUPPRESSION_MAX_PPM
+            and target <= floor
+        )
+
+    @classmethod
+    def _is_sparse_low_fee_market_target(cls, target_ppm: int, floor_ppm: int) -> bool:
+        """Return True for ultra-low market targets that should not steer sparse channels."""
+        try:
+            target = int(target_ppm)
+            floor = int(floor_ppm)
+        except (TypeError, ValueError):
+            return False
+        return (
+            floor <= cls.LOW_FEE_MARKET_TARGET_SUPPRESSION_MAX_PPM
+            and target <= cls.LOW_FEE_MARKET_TARGET_SUPPRESSION_MAX_PPM
+        )
 
     @staticmethod
     def _profitability_class_name(value: Any) -> str:
@@ -4627,7 +4654,11 @@ class FeeController:
                         cfg.min_fee_ppm,
                         cfg=cfg,
                     )
-                    if current_fee_ppm > boundary_target_ppm:
+                    floor_only_boundary = self._is_floor_only_market_boundary(
+                        boundary_target_ppm,
+                        cfg.min_fee_ppm,
+                    )
+                    if current_fee_ppm > boundary_target_ppm and not floor_only_boundary:
                         market_boundary_window_bypass_info = {
                             "applied": True,
                             "boundary_ppm": int(window_boundary_info["boundary_ppm"]),
@@ -4646,6 +4677,15 @@ class FeeController:
                             level='debug'
                         )
                     else:
+                        if floor_only_boundary:
+                            market_boundary_window_bypass_info = {
+                                "applied": False,
+                                "suppressed": True,
+                                "reason": "floor_only_market_boundary",
+                                "boundary_ppm": int(window_boundary_ppm),
+                                "target_ppm": int(boundary_target_ppm),
+                                "floor_ppm": int(cfg.min_fee_ppm),
+                            }
                         window_boundary_info = None
 
                 if not market_boundary_window_bypass_info.get("applied"):
@@ -5067,6 +5107,25 @@ class FeeController:
             # Only pull DOWN toward market, never up — being cheaper is fine.
             neighbor_median = self._get_neighbor_fee_median(peer_id)
             if neighbor_median is not None:
+                sparse_no_flow_window = (
+                    sparse_data_conservative
+                    and current_revenue_rate <= 0.0
+                    and int(forward_count or 0) <= 0
+                    and int(volume_since_sats or 0) <= 0
+                )
+                low_neighbor_market_suppressed = (
+                    sparse_no_flow_window
+                    and self._is_sparse_low_fee_market_target(neighbor_median, floor_ppm)
+                )
+                if low_neighbor_market_suppressed:
+                    self.plugin.log(
+                        f"FEE: {channel_id[:16]}... suppressing ultra-low sparse neighbor market "
+                        f"target {neighbor_median}ppm at floor {floor_ppm}ppm",
+                        level='debug'
+                    )
+                    neighbor_median = None
+
+            if neighbor_median is not None:
                 if post_pid_target_ppm > neighbor_median * 2:
                     adjusted = int(post_pid_target_ppm * 0.8 + neighbor_median * 0.2)
                     self.plugin.log(
@@ -5258,14 +5317,6 @@ class FeeController:
                     floor_ppm,
                     cfg=cfg,
                 )
-                market_boundary_info = {
-                    **market_boundary_info,
-                    "target_ppm": boundary_target_ppm,
-                    "margin_ppm": boundary_margin_ppm,
-                    "floor_ppm": floor_ppm,
-                    "pre_guard_target_ppm": post_pid_target_ppm,
-                    "current_fee_ppm": current_fee_ppm,
-                }
                 observed_market_flow = (
                     current_revenue_rate > 0.0
                     or int(forward_count or 0) > 0
@@ -5275,7 +5326,27 @@ class FeeController:
                     profitability_market_anchor_info.get("weight", 0.0) or 0.0
                 )
                 support_weight = 1.0 if observed_market_flow else profitability_market_weight
-                if post_pid_target_ppm > boundary_target_ppm:
+                floor_only_boundary = self._is_floor_only_market_boundary(
+                    boundary_target_ppm,
+                    floor_ppm,
+                )
+                market_boundary_info = {
+                    **market_boundary_info,
+                    "margin_ppm": boundary_margin_ppm,
+                    "floor_ppm": floor_ppm,
+                    "pre_guard_target_ppm": post_pid_target_ppm,
+                    "current_fee_ppm": current_fee_ppm,
+                    "floor_only_boundary": floor_only_boundary,
+                }
+                if floor_only_boundary:
+                    market_boundary_info.update({
+                        "applied": False,
+                        "suppressed": True,
+                        "suppress_reason": "floor_only_market_boundary",
+                        "diagnostic_target_ppm": boundary_target_ppm,
+                    })
+                elif post_pid_target_ppm > boundary_target_ppm:
+                    market_boundary_info["target_ppm"] = boundary_target_ppm
                     pre_boundary = post_pid_target_ppm
                     post_pid_target_ppm = boundary_target_ppm
                     market_boundary_applied = True
@@ -5304,6 +5375,7 @@ class FeeController:
                     and current_fee_ppm <= boundary_target_ppm
                     and post_pid_target_ppm < boundary_target_ppm
                 ):
+                    market_boundary_info["target_ppm"] = boundary_target_ppm
                     # If we are already winning flow below the market boundary,
                     # do not chase a low DTS sample further down. That gives up
                     # revenue without improving route selection. Quiet windows
