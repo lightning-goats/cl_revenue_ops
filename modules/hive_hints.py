@@ -284,7 +284,7 @@ class HiveHintAdapter:
     def is_hive_member(self, peer_id: str) -> bool:
         """Return True if peer is a hive fleet member. False if unavailable/stale."""
         hint = self._get_peer_hint(peer_id)
-        return bool(hint.get("member", False))
+        return hint.get("member") is True
 
     def get_corridor_role(self, peer_id: str) -> str:
         """Return validated corridor_role, or 'none' if unavailable."""
@@ -441,6 +441,46 @@ class HiveHintAdapter:
             return int(val)
         return 0
 
+    def get_market_fee_target(self, peer_id: str) -> int:
+        """Return hive-derived market fee target PPM (0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_target_ppm")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        return 0
+
+    def get_market_fee_floor(self, peer_id: str) -> int:
+        """Return hive-derived market fee floor PPM (0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_floor_ppm")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        return 0
+
+    def get_market_fee_ceiling(self, peer_id: str) -> int:
+        """Return hive-derived market fee ceiling PPM (0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_ceiling_ppm")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        return 0
+
+    def get_market_fee_confidence(self, peer_id: str) -> float:
+        """Return hive-derived market fee confidence in [0.0, 1.0]."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_confidence")
+        if isinstance(val, (int, float)):
+            return max(0.0, min(1.0, float(val)))
+        return 0.0
+
+    def get_market_fee_profitable_sample_count(self, peer_id: str) -> int:
+        """Return count of positive-flow/profitable samples behind market rails."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_profitable_sample_count")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        return 0
+
     def get_fleet_balance(self, peer_id: str) -> dict:
         """Return fleet member balance data from hints (pushed by cl-hive).
 
@@ -480,7 +520,7 @@ class HiveHintAdapter:
         return [
             str(peer_id)
             for peer_id, hint in hints.items()
-            if peer_id and isinstance(hint, dict) and bool(hint.get("member", False))
+            if peer_id and isinstance(hint, dict) and hint.get("member") is True
         ]
 
     # ------------------------------------------------------------------
@@ -772,10 +812,12 @@ class HiveHintAdapter:
     def is_closure_recommended(self, peer_id: str) -> bool:
         """Return True if cl-hive reputation layer recommends closing this peer."""
         hint = self._get_peer_hint(peer_id)
-        return bool(hint.get("closure_recommended", False))
+        return hint.get("closure_recommended") is True
 
     def get_closure_reason(self, peer_id: str) -> str:
         """Return closure reason string, or '' if no recommendation."""
+        if not self.is_closure_recommended(peer_id):
+            return ""
         hint = self._get_peer_hint(peer_id)
         return str(hint.get("closure_reason", ""))
 
@@ -809,7 +851,7 @@ class HiveHintAdapter:
         member_hints = [
             hint
             for hint in hints.values()
-            if isinstance(hint, dict) and bool(hint.get("member", False))
+            if isinstance(hint, dict) and hint.get("member") is True
         ]
         return {
             "snapshot_fresh": self.is_fresh(),

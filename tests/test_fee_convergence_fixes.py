@@ -1,6 +1,8 @@
 """Tests for fee convergence tuning: sparse blend ratio and observation window."""
 
 import pytest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 from modules.fee_controller import FeeController, GaussianThompsonState
 
 
@@ -92,6 +94,203 @@ class TestObservationWindow:
 
     def test_min_observation_hours_is_025(self):
         assert FeeController.MIN_OBSERVATION_HOURS == 0.25
+
+
+class TestProfitabilityMarketAnchor:
+    """Profitability controls how strongly quiet channels trust market fees."""
+
+    def test_profitable_channel_gets_full_market_anchor_weight(self):
+        fc = FeeController.__new__(FeeController)
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = SimpleNamespace(
+            classification=SimpleNamespace(value="profitable"),
+            marginal_roi=0.24,
+            roi_percent=24.0,
+            net_profit_sats=1_200,
+            revenue=SimpleNamespace(total_forward_count=7, forward_count=7),
+        )
+        fc.profitability.get_profitability_by_peer.return_value = None
+
+        anchor = fc._get_profitability_market_anchor(
+            "123x1x0",
+            "02peer",
+            current_revenue_rate=0.0,
+            forward_count=0,
+            volume_since_sats=0,
+        )
+
+        assert anchor["weight"] == 1.0
+        assert anchor["reason"] == "profitable"
+        assert anchor["source"] == "channel_profitability"
+
+    def test_peer_profitability_can_anchor_when_channel_snapshot_is_missing(self):
+        fc = FeeController.__new__(FeeController)
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = None
+        fc.profitability.get_profitability_by_peer.return_value = {
+            "aggregate": {
+                "net_profit_sats": 900,
+                "overall_roi_percent": 12.5,
+                "total_forward_count": 5,
+                "classifications": {"profitable": 1},
+            },
+        }
+
+        anchor = fc._get_profitability_market_anchor(
+            "123x1x0",
+            "02peer",
+            current_revenue_rate=0.0,
+            forward_count=0,
+            volume_since_sats=0,
+        )
+
+        assert anchor["weight"] == 1.0
+        assert anchor["source"] == "peer_profitability"
+
+    def test_unprofitable_channel_gets_no_upward_market_anchor_without_flow(self):
+        fc = FeeController.__new__(FeeController)
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = SimpleNamespace(
+            classification=SimpleNamespace(value="zombie"),
+            marginal_roi=-0.40,
+            roi_percent=-40.0,
+            net_profit_sats=-2_000,
+            revenue=SimpleNamespace(total_forward_count=0, forward_count=0),
+        )
+        fc.profitability.get_profitability_by_peer.return_value = None
+
+        anchor = fc._get_profitability_market_anchor(
+            "123x1x0",
+            "02peer",
+            current_revenue_rate=0.0,
+            forward_count=0,
+            volume_since_sats=0,
+        )
+
+        assert anchor["weight"] == 0.0
+        assert anchor["reason"] == "unprofitable_or_unknown"
+
+    def test_empty_peer_profitability_payload_does_not_look_break_even(self):
+        fc = FeeController.__new__(FeeController)
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = None
+        fc.profitability.get_profitability_by_peer.return_value = {"aggregate": {}}
+
+        anchor = fc._get_profitability_market_anchor(
+            "123x1x0",
+            "02peer",
+            current_revenue_rate=0.0,
+            forward_count=0,
+            volume_since_sats=0,
+        )
+
+        assert anchor["weight"] == 0.0
+        assert anchor["reason"] != "break_even"
+
+    def test_market_support_target_blends_by_profitability_weight(self):
+        assert FeeController._profitability_market_support_target(100, 500, 0.0) == 100
+        assert FeeController._profitability_market_support_target(100, 500, 0.65) == 360
+        assert FeeController._profitability_market_support_target(100, 500, 1.0) == 500
+        assert FeeController._profitability_market_support_target(600, 500, 1.0) == 600
+
+
+class TestDynamicMarketRails:
+    """Configured fee limits are seeds; market reality can move effective rails."""
+
+    def test_market_reality_can_lower_effective_floor_below_config_seed(self):
+        fc = FeeController.__new__(FeeController)
+        cfg = SimpleNamespace(
+            fee_market_boundary_margin_ppm=5,
+            fee_market_boundary_margin_ratio=0.05,
+        )
+
+        floor, ceiling, info = fc._apply_dynamic_market_rails(
+            floor_ppm=100,
+            ceiling_ppm=5_000,
+            market_boundary_info={"boundary_ppm": 50},
+            cfg=cfg,
+        )
+
+        assert floor == 45
+        assert ceiling == 5_000
+        assert info["floor_adjusted_down"] is True
+        assert info["ceiling_adjusted_up"] is False
+
+    def test_market_reality_can_raise_effective_ceiling_above_config_seed(self):
+        fc = FeeController.__new__(FeeController)
+        cfg = SimpleNamespace(
+            fee_market_boundary_margin_ppm=5,
+            fee_market_boundary_margin_ratio=0.05,
+        )
+
+        floor, ceiling, info = fc._apply_dynamic_market_rails(
+            floor_ppm=25,
+            ceiling_ppm=5_000,
+            market_boundary_info={"boundary_ppm": 8_000},
+            cfg=cfg,
+        )
+
+        assert floor == 25
+        assert ceiling == 7_600
+        assert info["floor_adjusted_down"] is False
+        assert info["ceiling_adjusted_up"] is True
+
+    def test_missing_market_data_leaves_seed_rails_unchanged(self):
+        fc = FeeController.__new__(FeeController)
+
+        floor, ceiling, info = fc._apply_dynamic_market_rails(
+            floor_ppm=25,
+            ceiling_ppm=5_000,
+            market_boundary_info=None,
+            cfg=None,
+        )
+
+        assert floor == 25
+        assert ceiling == 5_000
+        assert info["applied"] is False
+
+    def test_explicit_hive_market_rails_can_move_floor_and_ceiling(self):
+        fc = FeeController.__new__(FeeController)
+
+        floor, ceiling, info = fc._apply_dynamic_market_rails(
+            floor_ppm=100,
+            ceiling_ppm=5_000,
+            market_boundary_info={
+                "market_floor_ppm": 20,
+                "market_ceiling_ppm": 8_000,
+                "market_confidence": 0.73,
+                "profitable_sample_count": 4,
+                "source": "hive_market_fee_rails",
+            },
+            cfg=None,
+        )
+
+        assert floor == 20
+        assert ceiling == 8_000
+        assert info["floor_adjusted_down"] is True
+        assert info["ceiling_adjusted_up"] is True
+        assert info["market_floor_ppm"] == 20
+        assert info["market_ceiling_ppm"] == 8_000
+        assert info["profitable_sample_count"] == 4
+
+    def test_hive_market_rails_can_augment_local_gossip_boundary(self):
+        fc = FeeController.__new__(FeeController)
+
+        merged = fc._merge_market_boundary_info(
+            {"boundary_ppm": 50, "source": "local_gossip"},
+            {
+                "boundary_ppm": 7600,
+                "source": "hive_market_fee_rails",
+                "market_floor_ppm": 20,
+                "market_ceiling_ppm": 8_000,
+                "market_confidence": 0.73,
+            },
+        )
+
+        assert merged["boundary_ppm"] == 50
+        assert merged["market_floor_ppm"] == 20
+        assert merged["market_ceiling_ppm"] == 8_000
+        assert merged["source"] == "local_gossip+hive_market_rails"
 
 
 class TestSleepExemption:

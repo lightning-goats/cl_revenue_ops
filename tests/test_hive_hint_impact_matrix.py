@@ -195,6 +195,50 @@ def test_fee_controller_uses_hive_as_bounded_bias_and_missing_gossip_boundary_fa
     assert boundary["traffic_confidence"] == pytest.approx(0.9)
 
 
+def test_fee_controller_uses_hive_market_rails_when_exported():
+    snap = _snapshot()
+    snap["hints"][OWNER].update({
+        "market_fee_target_ppm": 7_600,
+        "market_fee_floor_ppm": 20,
+        "market_fee_ceiling_ppm": 8_000,
+        "market_fee_confidence": 0.73,
+        "market_fee_profitable_sample_count": 4,
+    })
+    adapter = _adapter(snap)
+    cfg = SimpleNamespace(
+        vegas_decay_rate=0.1,
+        fee_market_boundary_enabled=True,
+    )
+    plugin = MagicMock()
+    plugin.rpc.getinfo.return_value = {"id": "02ours"}
+    controller = FeeController(plugin, cfg, MagicMock())
+    controller.hive_hints = adapter
+
+    assert adapter.get_market_fee_target(OWNER) == 7_600
+    assert adapter.get_market_fee_floor(OWNER) == 20
+    assert adapter.get_market_fee_ceiling(OWNER) == 8_000
+    assert adapter.get_market_fee_confidence(OWNER) == pytest.approx(0.73)
+
+    boundary = controller._get_hive_market_boundary_fee(OWNER, cfg)
+    assert boundary["source"] == "hive_market_fee_rails"
+    assert boundary["boundary_ppm"] == 7_600
+    assert boundary["market_floor_ppm"] == 20
+    assert boundary["market_ceiling_ppm"] == 8_000
+    assert boundary["market_confidence"] == pytest.approx(0.73)
+    assert boundary["profitable_sample_count"] == 4
+
+    floor, ceiling, info = controller._apply_dynamic_market_rails(
+        floor_ppm=100,
+        ceiling_ppm=5_000,
+        market_boundary_info=boundary,
+        cfg=cfg,
+    )
+    assert floor == 20
+    assert ceiling == 8_000
+    assert info["floor_adjusted_down"] is True
+    assert info["ceiling_adjusted_up"] is True
+
+
 def test_rebalancer_policy_and_coordination_follow_hive_recommendation_oracle():
     adapter = _adapter()
     snapshot = build_state_snapshot(
