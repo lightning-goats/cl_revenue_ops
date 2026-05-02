@@ -441,6 +441,46 @@ class HiveHintAdapter:
             return int(val)
         return 0
 
+    def get_market_fee_target(self, peer_id: str) -> int:
+        """Return hive-derived market fee target PPM (0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_target_ppm")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        return 0
+
+    def get_market_fee_floor(self, peer_id: str) -> int:
+        """Return hive-derived market fee floor PPM (0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_floor_ppm")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        return 0
+
+    def get_market_fee_ceiling(self, peer_id: str) -> int:
+        """Return hive-derived market fee ceiling PPM (0 if unavailable)."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_ceiling_ppm")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        return 0
+
+    def get_market_fee_confidence(self, peer_id: str) -> float:
+        """Return hive-derived market fee confidence in [0.0, 1.0]."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_confidence")
+        if isinstance(val, (int, float)):
+            return max(0.0, min(1.0, float(val)))
+        return 0.0
+
+    def get_market_fee_profitable_sample_count(self, peer_id: str) -> int:
+        """Return count of positive-flow/profitable samples behind market rails."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("market_fee_profitable_sample_count")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        return 0
+
     def get_fleet_balance(self, peer_id: str) -> dict:
         """Return fleet member balance data from hints (pushed by cl-hive).
 

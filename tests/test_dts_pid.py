@@ -1543,6 +1543,58 @@ class TestMarketBoundaryGuard:
         assert result.algorithm_values["market_boundary_downshift"]["applied"] is True
         assert result.algorithm_values["market_boundary_window_bypass"]["applied"] is True
 
+    def test_market_boundary_window_bypass_can_move_below_configured_seed_floor(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 100
+        cfg.max_fee_ppm = 2500
+        channel_id = "277x1x0"
+        peer_id = "02" + "e" * 64
+        current_fee_ppm = 80
+        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(60,))
+        mock_database.get_volume_since.return_value = 0
+        mock_database.get_forward_count_since.return_value = 0
+
+        now = int(time.time())
+        fc._cycle_states[channel_id] = ChannelCycleState(
+            last_revenue_rate=12.0,
+            last_fee_ppm=current_fee_ppm,
+            last_update=now - 60,
+            last_broadcast_fee_ppm=current_fee_ppm,
+        )
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=current_fee_ppm)
+        ts_state.last_revenue_rate = 12.0
+        ts_state.last_fee_ppm = current_fee_ppm
+        ts_state.last_update = now - 60
+        ts_state.last_broadcast_fee_ppm = current_fee_ppm
+        ts_state.thompson.observations = [(current_fee_ppm, 12.0, 1.0, now, "balanced:normal:P")] * 10
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 500
+        ts_state.thompson.sample_fee_contextual = lambda context_key, floor, ceiling: 500
+        ts_state.pid = PIDState()
+        ts_state.pid.last_update_time = now - 1800
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
+        result = fc._adjust_channel_fee(
+            channel_id,
+            peer_id,
+            {"state": "balanced", "forward_count": 0, "sats_out": 0},
+            {
+                "fee_proportional_millionths": current_fee_ppm,
+                "capacity": 2_000_000,
+                "spendable_msat": "1000000000msat",
+                "opener": "local",
+            },
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.new_fee_ppm == 55
+        assert result.algorithm_values["market_boundary_window_bypass"]["applied"] is True
+        assert result.algorithm_values["market_boundary_window_bypass"]["target_ppm"] == 55
+        assert result.algorithm_values["dynamic_market_rails"]["floor_adjusted_down"] is True
+        assert result.algorithm_values["dynamic_market_rails"]["effective_floor_ppm"] == 55
+
 
 class TestDTSPIDIntegration:
     def _channel_info(self, *, current_fee_ppm=150, outbound_pct=50.0):
