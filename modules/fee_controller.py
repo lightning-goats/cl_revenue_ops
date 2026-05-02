@@ -1709,9 +1709,6 @@ class FeeController:
     PROFIT_MARKET_BREAK_EVEN_WEIGHT = 0.65
     PROFIT_MARKET_PROFITABLE_WEIGHT = 1.00
     PROFIT_MARKET_SOFT_FLOW_WEIGHT = 0.35
-    MARKET_FLOOR_HARD_MIN_PPM = 5
-    MARKET_FLOOR_MIN_CONFIDENCE = 0.50
-    MARKET_FLOOR_MIN_PROFITABLE_SAMPLES = 3
 
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  policy_manager: Optional[PolicyManager] = None,
@@ -2277,32 +2274,6 @@ class FeeController:
 
         effective_floor = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, seed_floor))
         effective_ceiling = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, seed_ceiling))
-        try:
-            hard_market_floor = int(getattr(cfg, "fee_market_floor_hard_min_ppm", self.MARKET_FLOOR_HARD_MIN_PPM))
-        except (TypeError, ValueError):
-            hard_market_floor = self.MARKET_FLOOR_HARD_MIN_PPM
-        hard_market_floor = max(self.MARKET_FLOOR_HARD_MIN_PPM, min(self.ABS_MAX_FEE_PPM, hard_market_floor))
-
-        try:
-            min_market_confidence = float(getattr(cfg, "fee_market_floor_min_confidence", self.MARKET_FLOOR_MIN_CONFIDENCE))
-        except (TypeError, ValueError):
-            min_market_confidence = self.MARKET_FLOOR_MIN_CONFIDENCE
-        min_market_confidence = max(0.0, min(1.0, min_market_confidence))
-
-        try:
-            min_market_samples = int(getattr(cfg, "fee_market_floor_min_profitable_samples", self.MARKET_FLOOR_MIN_PROFITABLE_SAMPLES))
-        except (TypeError, ValueError):
-            min_market_samples = self.MARKET_FLOOR_MIN_PROFITABLE_SAMPLES
-        min_market_samples = max(1, min_market_samples)
-
-        try:
-            market_confidence = float(market_boundary_info.get("market_confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            market_confidence = 0.0
-        try:
-            profitable_sample_count = int(market_boundary_info.get("profitable_sample_count", 0) or 0)
-        except (TypeError, ValueError):
-            profitable_sample_count = 0
 
         explicit_floor = None
         try:
@@ -2310,20 +2281,10 @@ class FeeController:
         except (TypeError, ValueError):
             explicit_floor = None
         if explicit_floor is not None and 1 <= explicit_floor <= self.ABS_MAX_FEE_PPM:
-            candidate_floor = max(hard_market_floor, explicit_floor)
-            floor_has_enough_evidence = (
-                market_confidence >= min_market_confidence
-                and profitable_sample_count >= min_market_samples
-            )
-            if candidate_floor < effective_floor and floor_has_enough_evidence:
-                effective_floor = candidate_floor
+            if explicit_floor < effective_floor:
+                effective_floor = explicit_floor
                 info["floor_adjusted_down"] = True
             info["market_floor_ppm"] = explicit_floor
-            info["market_floor_candidate_ppm"] = candidate_floor
-            info["market_floor_eligible"] = floor_has_enough_evidence
-            info["market_floor_hard_min_ppm"] = hard_market_floor
-            info["market_floor_min_confidence"] = min_market_confidence
-            info["market_floor_min_profitable_samples"] = min_market_samples
 
         explicit_ceiling = None
         try:
@@ -2344,7 +2305,7 @@ class FeeController:
         if 1 <= boundary_ppm <= self.ABS_MAX_FEE_PPM:
             route_target_ppm, margin_ppm = self._get_market_boundary_target(
                 boundary_ppm,
-                effective_floor,
+                self.ABS_MIN_FEE_PPM,
                 cfg=cfg,
             )
             route_target_ppm = max(
@@ -2352,6 +2313,9 @@ class FeeController:
                 min(self.ABS_MAX_FEE_PPM, int(route_target_ppm)),
             )
 
+            if route_target_ppm < effective_floor:
+                effective_floor = route_target_ppm
+                info["floor_adjusted_down"] = True
             if route_target_ppm > effective_ceiling:
                 effective_ceiling = route_target_ppm
                 info["ceiling_adjusted_up"] = True
@@ -2360,7 +2324,6 @@ class FeeController:
                 "boundary_ppm": boundary_ppm,
                 "route_target_ppm": route_target_ppm,
                 "margin_ppm": int(margin_ppm),
-                "boundary_floor_adjustment_allowed": False,
             })
 
         if effective_floor >= effective_ceiling:
@@ -4612,7 +4575,7 @@ class FeeController:
                 if window_boundary_info is not None and window_boundary_ppm > 0:
                     boundary_target_ppm, boundary_margin_ppm = self._get_market_boundary_target(
                         window_boundary_ppm,
-                        cfg.min_fee_ppm,
+                        self.ABS_MIN_FEE_PPM,
                         cfg=cfg,
                     )
                     if current_fee_ppm > boundary_target_ppm:

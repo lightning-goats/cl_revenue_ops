@@ -1543,7 +1543,7 @@ class TestMarketBoundaryGuard:
         assert result.algorithm_values["market_boundary_downshift"]["applied"] is True
         assert result.algorithm_values["market_boundary_window_bypass"]["applied"] is True
 
-    def test_market_boundary_window_bypass_respects_configured_seed_floor(
+    def test_market_boundary_window_bypass_can_move_below_configured_seed_floor(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -1551,7 +1551,7 @@ class TestMarketBoundaryGuard:
         cfg.max_fee_ppm = 2500
         channel_id = "277x1x0"
         peer_id = "02" + "e" * 64
-        current_fee_ppm = 140
+        current_fee_ppm = 80
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(60,))
         mock_database.get_volume_since.return_value = 0
         mock_database.get_forward_count_since.return_value = 0
@@ -1589,11 +1589,11 @@ class TestMarketBoundaryGuard:
         )
 
         assert result is not None
-        assert result.new_fee_ppm >= 100
+        assert result.new_fee_ppm == 55
         assert result.algorithm_values["market_boundary_window_bypass"]["applied"] is True
-        assert result.algorithm_values["market_boundary_window_bypass"]["target_ppm"] == 100
-        assert result.algorithm_values["dynamic_market_rails"]["floor_adjusted_down"] is False
-        assert result.algorithm_values["dynamic_market_rails"]["effective_floor_ppm"] == 100
+        assert result.algorithm_values["market_boundary_window_bypass"]["target_ppm"] == 55
+        assert result.algorithm_values["dynamic_market_rails"]["floor_adjusted_down"] is True
+        assert result.algorithm_values["dynamic_market_rails"]["effective_floor_ppm"] == 55
 
 
 class TestDTSPIDIntegration:
