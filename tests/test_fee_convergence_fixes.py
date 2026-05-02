@@ -197,7 +197,7 @@ class TestProfitabilityMarketAnchor:
 class TestDynamicMarketRails:
     """Configured fee limits are seeds; market reality can move effective rails."""
 
-    def test_market_reality_can_lower_effective_floor_below_config_seed(self):
+    def test_route_boundary_does_not_lower_execution_floor_below_config_seed(self):
         fc = FeeController.__new__(FeeController)
         cfg = SimpleNamespace(
             fee_market_boundary_margin_ppm=5,
@@ -211,10 +211,12 @@ class TestDynamicMarketRails:
             cfg=cfg,
         )
 
-        assert floor == 45
+        assert floor == 100
         assert ceiling == 5_000
-        assert info["floor_adjusted_down"] is True
+        assert info["floor_adjusted_down"] is False
         assert info["ceiling_adjusted_up"] is False
+        assert info["route_target_ppm"] == 100
+        assert info["boundary_floor_adjustment_allowed"] is False
 
     def test_market_reality_can_raise_effective_ceiling_above_config_seed(self):
         fc = FeeController.__new__(FeeController)
@@ -272,6 +274,33 @@ class TestDynamicMarketRails:
         assert info["market_floor_ppm"] == 20
         assert info["market_ceiling_ppm"] == 8_000
         assert info["profitable_sample_count"] == 4
+
+    def test_low_confidence_hive_market_floor_does_not_drag_fee_to_four_ppm(self):
+        fc = FeeController.__new__(FeeController)
+        cfg = SimpleNamespace(
+            fee_market_boundary_margin_ppm=5,
+            fee_market_boundary_margin_ratio=0.05,
+        )
+
+        floor, ceiling, info = fc._apply_dynamic_market_rails(
+            floor_ppm=10,
+            ceiling_ppm=5_000,
+            market_boundary_info={
+                "boundary_ppm": 9,
+                "market_floor_ppm": 4,
+                "market_confidence": 0.25,
+                "profitable_sample_count": 1,
+                "source": "hive_market_fee_rails",
+            },
+            cfg=cfg,
+        )
+
+        assert floor == 10
+        assert ceiling == 5_000
+        assert info["floor_adjusted_down"] is False
+        assert info["market_floor_candidate_ppm"] == 5
+        assert info["market_floor_eligible"] is False
+        assert info["route_target_ppm"] == 10
 
     def test_hive_market_rails_can_augment_local_gossip_boundary(self):
         fc = FeeController.__new__(FeeController)
