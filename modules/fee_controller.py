@@ -1703,6 +1703,13 @@ class FeeController:
     ABS_MIN_FEE_PPM = 0
     ABS_MAX_FEE_PPM = 100_000
 
+    # Profitability-aware market anchoring. Market fees are most useful when a
+    # peer has proven it can route profitably; otherwise they are only weak priors.
+    PROFIT_MARKET_FULL_MARGINAL_ROI = 0.20
+    PROFIT_MARKET_BREAK_EVEN_WEIGHT = 0.65
+    PROFIT_MARKET_PROFITABLE_WEIGHT = 1.00
+    PROFIT_MARKET_SOFT_FLOW_WEIGHT = 0.35
+
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  policy_manager: Optional[PolicyManager] = None,
                  profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
@@ -2068,6 +2075,180 @@ class FeeController:
         computed_margin = max(margin_ppm, int(math.ceil(max(0, boundary_ppm) * margin_ratio)))
         target_ppm = max(int(floor_ppm), int(boundary_ppm) - computed_margin)
         return target_ppm, computed_margin
+
+    @staticmethod
+    def _profitability_class_name(value: Any) -> str:
+        raw = getattr(value, "value", value)
+        return str(raw or "unknown").strip().lower()
+
+    @staticmethod
+    def _finite_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return default
+        return result if math.isfinite(result) else default
+
+    @staticmethod
+    def _finite_int(value: Any, default: int = 0) -> int:
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            return default
+        return result
+
+    def _score_profitability_market_anchor(
+        self,
+        *,
+        classification: str = "unknown",
+        marginal_roi: Optional[float] = None,
+        roi_percent: Optional[float] = None,
+        net_profit_sats: Optional[int] = None,
+        forward_count: int = 0,
+        observed_market_flow: bool = False,
+        source: str = "unknown",
+    ) -> Dict[str, Any]:
+        """Return bounded trust in market fees based on proven profitability."""
+        classification = self._profitability_class_name(classification)
+        roi = marginal_roi
+        roi_known = roi is not None or roi_percent is not None
+        if roi is None and roi_percent is not None:
+            roi = roi_percent / 100.0
+        if roi is None:
+            roi = 0.0
+
+        profitable = (
+            classification == "profitable"
+            or (roi_known and roi >= self.PROFIT_MARKET_FULL_MARGINAL_ROI)
+            or ((net_profit_sats or 0) > 0 and forward_count > 0 and roi >= 0.0)
+        )
+        break_even = classification == "break_even" or (roi_known and roi >= 0.0)
+        soft_flow = (
+            observed_market_flow
+            and roi_known
+            and roi >= -0.10
+            and classification not in {"zombie", "stagnant"}
+        )
+
+        if profitable:
+            weight = self.PROFIT_MARKET_PROFITABLE_WEIGHT
+            reason = "profitable"
+        elif break_even:
+            weight = self.PROFIT_MARKET_BREAK_EVEN_WEIGHT
+            reason = "break_even"
+        elif soft_flow:
+            weight = self.PROFIT_MARKET_SOFT_FLOW_WEIGHT
+            reason = "soft_flow"
+        else:
+            weight = 0.0
+            reason = "unprofitable_or_unknown"
+
+        return {
+            "weight": round(max(0.0, min(1.0, weight)), 3),
+            "reason": reason,
+            "source": source,
+            "classification": classification,
+            "marginal_roi": round(float(roi), 4),
+            "net_profit_sats": int(net_profit_sats or 0),
+            "forward_count": int(forward_count or 0),
+        }
+
+    def _get_profitability_market_anchor(
+        self,
+        channel_id: str,
+        peer_id: str,
+        *,
+        current_revenue_rate: float = 0.0,
+        forward_count: int = 0,
+        volume_since_sats: int = 0,
+    ) -> Dict[str, Any]:
+        """Use channel/peer profitability to decide how much to trust market fees."""
+        observed_market_flow = (
+            current_revenue_rate > 0.0
+            or int(forward_count or 0) > 0
+            or int(volume_since_sats or 0) > 0
+        )
+        neutral = {
+            "weight": 0.0,
+            "reason": "no_profitability_data",
+            "source": "none",
+            "classification": "unknown",
+            "marginal_roi": 0.0,
+            "net_profit_sats": 0,
+            "forward_count": int(forward_count or 0),
+        }
+        if not self.profitability:
+            return neutral
+
+        best = neutral
+
+        try:
+            channel_profit = self.profitability.get_profitability(channel_id)
+        except Exception:
+            channel_profit = None
+        if channel_profit is not None:
+            revenue = getattr(channel_profit, "revenue", None)
+            channel_forwards = max(
+                int(forward_count or 0),
+                self._finite_int(getattr(revenue, "total_forward_count", None), 0),
+                self._finite_int(getattr(revenue, "forward_count", None), 0),
+            )
+            best = self._score_profitability_market_anchor(
+                classification=getattr(channel_profit, "classification", "unknown"),
+                marginal_roi=self._finite_float(getattr(channel_profit, "marginal_roi", None)),
+                roi_percent=self._finite_float(getattr(channel_profit, "roi_percent", None)),
+                net_profit_sats=self._finite_int(getattr(channel_profit, "net_profit_sats", 0), 0),
+                forward_count=channel_forwards,
+                observed_market_flow=observed_market_flow,
+                source="channel_profitability",
+            )
+
+        get_peer_profitability = getattr(self.profitability, "get_profitability_by_peer", None)
+        if callable(get_peer_profitability):
+            try:
+                peer_profit = get_peer_profitability(peer_id)
+            except Exception:
+                peer_profit = None
+            if isinstance(peer_profit, dict):
+                aggregate = peer_profit.get("aggregate", {})
+                if not isinstance(aggregate, dict):
+                    aggregate = {}
+                classifications = aggregate.get("classifications", {})
+                if isinstance(classifications, dict) and classifications:
+                    classification = max(classifications.items(), key=lambda item: item[1])[0]
+                else:
+                    classification = "unknown"
+                peer_score = self._score_profitability_market_anchor(
+                    classification=classification,
+                    roi_percent=self._finite_float(aggregate.get("overall_roi_percent")),
+                    net_profit_sats=self._finite_int(aggregate.get("net_profit_sats", 0), 0),
+                    forward_count=max(
+                        int(forward_count or 0),
+                        self._finite_int(aggregate.get("total_forward_count", 0), 0),
+                        self._finite_int(aggregate.get("total_sourced_forward_count", 0), 0),
+                    ),
+                    observed_market_flow=observed_market_flow,
+                    source="peer_profitability",
+                )
+                if peer_score["weight"] > best["weight"]:
+                    best = peer_score
+
+        return best
+
+    @staticmethod
+    def _profitability_market_support_target(
+        current_target_ppm: int,
+        boundary_target_ppm: int,
+        support_weight: float,
+    ) -> int:
+        """Blend a quiet-but-profitable peer upward toward the market target."""
+        if support_weight <= 0.0 or current_target_ppm >= boundary_target_ppm:
+            return int(current_target_ppm)
+        support_weight = max(0.0, min(1.0, float(support_weight)))
+        target = int(round(
+            current_target_ppm + (boundary_target_ppm - current_target_ppm) * support_weight
+        ))
+        return max(int(current_target_ppm), min(int(boundary_target_ppm), target))
 
     def _get_market_boundary_fee(
         self,
@@ -4043,6 +4224,7 @@ class FeeController:
         market_boundary_downshift_info = {"applied": False}
         market_boundary_support_info = {"applied": False}
         market_boundary_window_bypass_info = {"applied": False}
+        profitability_market_anchor_info = {"weight": 0.0, "reason": "not_evaluated", "source": "none"}
 
         # Detect critical state
         is_congested = (state and state.get("state") == "congested")
@@ -4283,6 +4465,13 @@ class FeeController:
         # DTS posterior variance already handles observation noise —
         # no additional EMA smoothing needed.
         current_revenue_rate = raw_revenue_rate
+        profitability_market_anchor_info = self._get_profitability_market_anchor(
+            channel_id,
+            peer_id,
+            current_revenue_rate=current_revenue_rate,
+            forward_count=forward_count,
+            volume_since_sats=volume_since_sats,
+        )
 
         # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity") or 2_000_000
@@ -4852,6 +5041,10 @@ class FeeController:
                     or int(forward_count or 0) > 0
                     or int(volume_since_sats or 0) > 0
                 )
+                profitability_market_weight = float(
+                    profitability_market_anchor_info.get("weight", 0.0) or 0.0
+                )
+                support_weight = 1.0 if observed_market_flow else profitability_market_weight
                 if post_pid_target_ppm > boundary_target_ppm:
                     pre_boundary = post_pid_target_ppm
                     post_pid_target_ppm = boundary_target_ppm
@@ -4877,31 +5070,44 @@ class FeeController:
                                 )
                                 ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
                 elif (
-                    observed_market_flow
+                    (observed_market_flow or support_weight > 0.0)
                     and current_fee_ppm <= boundary_target_ppm
                     and post_pid_target_ppm < boundary_target_ppm
                 ):
                     # If we are already winning flow below the market boundary,
                     # do not chase a low DTS sample further down. That gives up
-                    # revenue without improving route selection.
+                    # revenue without improving route selection. Quiet windows
+                    # for historically profitable peers also keep part of the
+                    # market anchor so DTS does not over-discount proven flow.
                     pre_boundary = post_pid_target_ppm
-                    post_pid_target_ppm = boundary_target_ppm
+                    post_pid_target_ppm = self._profitability_market_support_target(
+                        current_target_ppm=post_pid_target_ppm,
+                        boundary_target_ppm=boundary_target_ppm,
+                        support_weight=support_weight,
+                    )
                     market_boundary_support_info = {
                         "applied": True,
                         "pre_support_target_ppm": int(pre_boundary),
-                        "post_support_target_ppm": int(boundary_target_ppm),
+                        "post_support_target_ppm": int(post_pid_target_ppm),
                         "current_revenue_rate": float(current_revenue_rate),
                         "forward_count": int(forward_count or 0),
                         "volume_since_sats": int(volume_since_sats or 0),
+                        "support_weight": round(float(support_weight), 3),
+                        "support_reason": (
+                            "observed_market_flow" if observed_market_flow
+                            else "profitable_peer_market_anchor"
+                        ),
+                        "profitability_market_anchor": dict(profitability_market_anchor_info),
                     }
                     market_boundary_info["applied"] = False
                     market_boundary_info["support_applied"] = True
                     self.plugin.log(
                         f"FEE: {channel_id[:16]}... market boundary support: "
-                        f"{pre_boundary}->{boundary_target_ppm}ppm "
+                        f"{pre_boundary}->{post_pid_target_ppm}ppm "
                         f"(cheapest_competitor={market_boundary_info['boundary_ppm']}ppm, "
                         f"revenue_rate={current_revenue_rate:.2f}sats/hr, "
-                        f"forwards={forward_count}, volume={volume_since_sats}sats)",
+                        f"forwards={forward_count}, volume={volume_since_sats}sats, "
+                        f"profit_weight={support_weight:.2f})",
                         level='debug'
                     )
                 else:
@@ -5322,6 +5528,7 @@ class FeeController:
                     "market_boundary_downshift": market_boundary_downshift_info,
                     "market_boundary_support": market_boundary_support_info,
                     "market_boundary_window_bypass": market_boundary_window_bypass_info,
+                    "profitability_market_anchor": profitability_market_anchor_info,
                     "base_fee_policy_change": base_fee_policy_change,
                     "current_base_fee_msat": current_base_fee_msat,
                     "target_base_fee_msat": target_base_fee_msat,
