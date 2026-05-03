@@ -489,26 +489,26 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-enabled',
-    default='true',
-    description='Enable cheapest-active-competitor fee boundary guard (default: true)'
+    default='false',
+    description='Enable experimental competitor fee boundary guard (default: false)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-min-competitors',
-    default='1',
-    description='Minimum active competitors needed before applying fee market boundary guard (default: 1)'
+    default='3',
+    description='Minimum active competitors needed before applying fee market boundary guard (default: 3)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-margin-ppm',
     default='5',
-    description='Absolute ppm margin below cheapest active competitor (default: 5)'
+    description='Absolute ppm margin below credible low competitor when experimental market boundary is enabled (default: 5)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-margin-ratio',
     default='0.05',
-    description='Fractional margin below cheapest active competitor, combined with ppm margin (default: 0.05)'
+    description='Fractional margin below credible low competitor when experimental market boundary is enabled (default: 0.05)'
 )
 
 plugin.add_option(
@@ -1493,10 +1493,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         neighbor_median_min_competitors=_safe_int_opt('revenue-ops-neighbor-median-min-competitors', '2'),
         fee_profile=str(options.get('revenue-ops-fee-profile', 'active') or 'active').lower(),
         fee_market_boundary_enabled=options.get(
-            'revenue-ops-fee-market-boundary-enabled', 'true'
+            'revenue-ops-fee-market-boundary-enabled', 'false'
         ).lower() == 'true',
         fee_market_boundary_min_competitors=_safe_int_opt(
-            'revenue-ops-fee-market-boundary-min-competitors', '1'
+            'revenue-ops-fee-market-boundary-min-competitors', '3'
         ),
         fee_market_boundary_margin_ppm=_safe_int_opt(
             'revenue-ops-fee-market-boundary-margin-ppm', '5'
@@ -2891,8 +2891,8 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         "config": {
             "fee_interval_seconds": config.fee_interval if config else 1800,
             "fee_profile": profile["name"],
-            "market_boundary_enabled": getattr(cfg_snap, "fee_market_boundary_enabled", True),
-            "market_boundary_min_competitors": getattr(cfg_snap, "fee_market_boundary_min_competitors", 1),
+            "market_boundary_enabled": getattr(cfg_snap, "fee_market_boundary_enabled", False),
+            "market_boundary_min_competitors": getattr(cfg_snap, "fee_market_boundary_min_competitors", 3),
             "market_boundary_margin_ppm": getattr(cfg_snap, "fee_market_boundary_margin_ppm", 5),
             "market_boundary_margin_ratio": getattr(cfg_snap, "fee_market_boundary_margin_ratio", 0.05),
             "market_boundary_max_downshift_ratio": getattr(cfg_snap, "fee_market_boundary_max_downshift_ratio", 0.35),

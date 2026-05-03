@@ -175,7 +175,7 @@ def test_hive_hint_oracle_normalizes_corridor_fee_rebalance_and_open_signals():
     assert AVOID_TARGET not in open_peer_ids
 
 
-def test_fee_controller_uses_hive_as_bounded_bias_and_missing_gossip_boundary_fallback():
+def test_fee_controller_uses_hive_as_bounded_bias_not_market_boundary_fallback():
     cfg = SimpleNamespace(
         vegas_decay_rate=0.1,
         fee_market_boundary_enabled=True,
@@ -189,10 +189,8 @@ def test_fee_controller_uses_hive_as_bounded_bias_and_missing_gossip_boundary_fa
     assert controller._get_hive_fee_bias(SECONDARY) < 1.0
     assert controller._get_hive_exploration_multiplier(OWNER) > 1.0
 
-    boundary = controller._get_hive_market_boundary_fee(OWNER, cfg)
-    assert boundary["boundary_ppm"] == 81
-    assert boundary["source"] == "hive_optimal_fee_estimate"
-    assert boundary["traffic_confidence"] == pytest.approx(0.9)
+    assert controller.hive_hints.get_optimal_fee_estimate(OWNER) == 81
+    assert controller._get_hive_market_boundary_fee(OWNER, cfg) is None
 
 
 def test_rebalancer_policy_and_coordination_follow_hive_recommendation_oracle():
