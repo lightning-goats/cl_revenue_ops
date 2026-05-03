@@ -1703,17 +1703,6 @@ class FeeController:
     ABS_MIN_FEE_PPM = 0
     ABS_MAX_FEE_PPM = 100_000
 
-    # Profitability-aware market anchoring. Market fees are most useful when a
-    # peer has proven it can route profitably; otherwise they are only weak priors.
-    PROFIT_MARKET_FULL_MARGINAL_ROI = 0.20
-    PROFIT_MARKET_BREAK_EVEN_WEIGHT = 0.65
-    PROFIT_MARKET_PROFITABLE_WEIGHT = 1.00
-    PROFIT_MARKET_SOFT_FLOW_WEIGHT = 0.35
-    MIN_AUTOMATIC_FEE_FLOOR_PPM = 5
-    MARKET_FLOOR_HARD_MIN_PPM = 5
-    MARKET_FLOOR_MIN_CONFIDENCE = 0.50
-    MARKET_FLOOR_MIN_PROFITABLE_SAMPLES = 3
-
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  policy_manager: Optional[PolicyManager] = None,
                  profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
@@ -2064,7 +2053,7 @@ class FeeController:
         floor_ppm: int,
         cfg: Optional[Any] = None,
     ) -> Tuple[int, int]:
-        """Return the target fee and margin below the cheapest active competitor."""
+        """Return the target fee and margin below a credible low competitor."""
         try:
             margin_ppm = int(getattr(cfg, "fee_market_boundary_margin_ppm", 5))
         except (TypeError, ValueError):
@@ -2081,312 +2070,18 @@ class FeeController:
         return target_ppm, computed_margin
 
     @staticmethod
-    def _profitability_class_name(value: Any) -> str:
-        raw = getattr(value, "value", value)
-        return str(raw or "unknown").strip().lower()
+    def _market_boundary_has_room(boundary_ppm: int, floor_ppm: int, margin_ppm: int) -> bool:
+        """Return true only when a competitor boundary leaves room above our floor.
 
-    @staticmethod
-    def _finite_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+        If the cheapest credible competitor is already below our economic floor,
+        treating `floor_ppm` as the market target synchronizes unrelated
+        channels around the same chain-cost floor. In that case the market is
+        not executable for us and the guard should abstain.
+        """
         try:
-            result = float(value)
+            return int(boundary_ppm) - int(margin_ppm) > int(floor_ppm)
         except (TypeError, ValueError):
-            return default
-        return result if math.isfinite(result) else default
-
-    @staticmethod
-    def _finite_int(value: Any, default: int = 0) -> int:
-        try:
-            result = int(value)
-        except (TypeError, ValueError):
-            return default
-        return result
-
-    def _score_profitability_market_anchor(
-        self,
-        *,
-        classification: str = "unknown",
-        marginal_roi: Optional[float] = None,
-        roi_percent: Optional[float] = None,
-        net_profit_sats: Optional[int] = None,
-        forward_count: int = 0,
-        observed_market_flow: bool = False,
-        source: str = "unknown",
-    ) -> Dict[str, Any]:
-        """Return bounded trust in market fees based on proven profitability."""
-        classification = self._profitability_class_name(classification)
-        roi = marginal_roi
-        roi_known = roi is not None or roi_percent is not None
-        if roi is None and roi_percent is not None:
-            roi = roi_percent / 100.0
-        if roi is None:
-            roi = 0.0
-
-        profitable = (
-            classification == "profitable"
-            or (roi_known and roi >= self.PROFIT_MARKET_FULL_MARGINAL_ROI)
-            or ((net_profit_sats or 0) > 0 and forward_count > 0 and roi >= 0.0)
-        )
-        break_even = classification == "break_even" or (roi_known and roi >= 0.0)
-        soft_flow = (
-            observed_market_flow
-            and roi_known
-            and roi >= -0.10
-            and classification not in {"zombie", "stagnant"}
-        )
-
-        if profitable:
-            weight = self.PROFIT_MARKET_PROFITABLE_WEIGHT
-            reason = "profitable"
-        elif break_even:
-            weight = self.PROFIT_MARKET_BREAK_EVEN_WEIGHT
-            reason = "break_even"
-        elif soft_flow:
-            weight = self.PROFIT_MARKET_SOFT_FLOW_WEIGHT
-            reason = "soft_flow"
-        else:
-            weight = 0.0
-            reason = "unprofitable_or_unknown"
-
-        return {
-            "weight": round(max(0.0, min(1.0, weight)), 3),
-            "reason": reason,
-            "source": source,
-            "classification": classification,
-            "marginal_roi": round(float(roi), 4),
-            "net_profit_sats": int(net_profit_sats or 0),
-            "forward_count": int(forward_count or 0),
-        }
-
-    def _get_profitability_market_anchor(
-        self,
-        channel_id: str,
-        peer_id: str,
-        *,
-        current_revenue_rate: float = 0.0,
-        forward_count: int = 0,
-        volume_since_sats: int = 0,
-    ) -> Dict[str, Any]:
-        """Use channel/peer profitability to decide how much to trust market fees."""
-        observed_market_flow = (
-            current_revenue_rate > 0.0
-            or int(forward_count or 0) > 0
-            or int(volume_since_sats or 0) > 0
-        )
-        neutral = {
-            "weight": 0.0,
-            "reason": "no_profitability_data",
-            "source": "none",
-            "classification": "unknown",
-            "marginal_roi": 0.0,
-            "net_profit_sats": 0,
-            "forward_count": int(forward_count or 0),
-        }
-        if not self.profitability:
-            return neutral
-
-        best = neutral
-
-        try:
-            channel_profit = self.profitability.get_profitability(channel_id)
-        except Exception:
-            channel_profit = None
-        if channel_profit is not None:
-            revenue = getattr(channel_profit, "revenue", None)
-            channel_forwards = max(
-                int(forward_count or 0),
-                self._finite_int(getattr(revenue, "total_forward_count", None), 0),
-                self._finite_int(getattr(revenue, "forward_count", None), 0),
-            )
-            best = self._score_profitability_market_anchor(
-                classification=getattr(channel_profit, "classification", "unknown"),
-                marginal_roi=self._finite_float(getattr(channel_profit, "marginal_roi", None)),
-                roi_percent=self._finite_float(getattr(channel_profit, "roi_percent", None)),
-                net_profit_sats=self._finite_int(getattr(channel_profit, "net_profit_sats", 0), 0),
-                forward_count=channel_forwards,
-                observed_market_flow=observed_market_flow,
-                source="channel_profitability",
-            )
-
-        get_peer_profitability = getattr(self.profitability, "get_profitability_by_peer", None)
-        if callable(get_peer_profitability):
-            try:
-                peer_profit = get_peer_profitability(peer_id)
-            except Exception:
-                peer_profit = None
-            if isinstance(peer_profit, dict):
-                aggregate = peer_profit.get("aggregate", {})
-                if not isinstance(aggregate, dict):
-                    aggregate = {}
-                classifications = aggregate.get("classifications", {})
-                if isinstance(classifications, dict) and classifications:
-                    classification = max(classifications.items(), key=lambda item: item[1])[0]
-                else:
-                    classification = "unknown"
-                peer_score = self._score_profitability_market_anchor(
-                    classification=classification,
-                    roi_percent=self._finite_float(aggregate.get("overall_roi_percent")),
-                    net_profit_sats=self._finite_int(aggregate.get("net_profit_sats", 0), 0),
-                    forward_count=max(
-                        int(forward_count or 0),
-                        self._finite_int(aggregate.get("total_forward_count", 0), 0),
-                        self._finite_int(aggregate.get("total_sourced_forward_count", 0), 0),
-                    ),
-                    observed_market_flow=observed_market_flow,
-                    source="peer_profitability",
-                )
-                if peer_score["weight"] > best["weight"]:
-                    best = peer_score
-
-        return best
-
-    @staticmethod
-    def _profitability_market_support_target(
-        current_target_ppm: int,
-        boundary_target_ppm: int,
-        support_weight: float,
-    ) -> int:
-        """Blend a quiet-but-profitable peer upward toward the market target."""
-        if support_weight <= 0.0 or current_target_ppm >= boundary_target_ppm:
-            return int(current_target_ppm)
-        support_weight = max(0.0, min(1.0, float(support_weight)))
-        target = int(round(
-            current_target_ppm + (boundary_target_ppm - current_target_ppm) * support_weight
-        ))
-        return max(int(current_target_ppm), min(int(boundary_target_ppm), target))
-
-    def _apply_dynamic_market_rails(
-        self,
-        floor_ppm: int,
-        ceiling_ppm: int,
-        market_boundary_info: Optional[Dict[str, Any]],
-        cfg: Optional[Any] = None,
-    ) -> Tuple[int, int, Dict[str, Any]]:
-        """Let market reality raise the ceiling; keep the economic floor hard."""
-        seed_floor = int(floor_ppm)
-        seed_ceiling = int(ceiling_ppm)
-        info = {
-            "applied": False,
-            "floor_adjusted_down": False,
-            "ceiling_adjusted_up": False,
-            "seed_floor_ppm": seed_floor,
-            "seed_ceiling_ppm": seed_ceiling,
-            "effective_floor_ppm": seed_floor,
-            "effective_ceiling_ppm": seed_ceiling,
-        }
-
-        try:
-            configured_floor = int(getattr(cfg, "min_fee_ppm", seed_floor))
-        except (TypeError, ValueError):
-            configured_floor = seed_floor
-        economic_floor = max(self.MIN_AUTOMATIC_FEE_FLOOR_PPM, configured_floor)
-        economic_floor = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, economic_floor))
-        effective_floor = max(
-            economic_floor,
-            self.ABS_MIN_FEE_PPM,
-            min(self.ABS_MAX_FEE_PPM, seed_floor),
-        )
-        effective_ceiling = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, seed_ceiling))
-        if not isinstance(market_boundary_info, dict):
-            info["effective_floor_ppm"] = int(effective_floor)
-            info["effective_ceiling_ppm"] = int(effective_ceiling)
-            return int(effective_floor), int(effective_ceiling), info
-
-        try:
-            hard_market_floor = int(getattr(cfg, "fee_market_floor_hard_min_ppm", self.MARKET_FLOOR_HARD_MIN_PPM))
-        except (TypeError, ValueError):
-            hard_market_floor = self.MARKET_FLOOR_HARD_MIN_PPM
-        hard_market_floor = max(self.MARKET_FLOOR_HARD_MIN_PPM, min(self.ABS_MAX_FEE_PPM, hard_market_floor))
-
-        try:
-            min_market_confidence = float(getattr(cfg, "fee_market_floor_min_confidence", self.MARKET_FLOOR_MIN_CONFIDENCE))
-        except (TypeError, ValueError):
-            min_market_confidence = self.MARKET_FLOOR_MIN_CONFIDENCE
-        min_market_confidence = max(0.0, min(1.0, min_market_confidence))
-
-        try:
-            min_market_samples = int(getattr(cfg, "fee_market_floor_min_profitable_samples", self.MARKET_FLOOR_MIN_PROFITABLE_SAMPLES))
-        except (TypeError, ValueError):
-            min_market_samples = self.MARKET_FLOOR_MIN_PROFITABLE_SAMPLES
-        min_market_samples = max(1, min_market_samples)
-
-        try:
-            market_confidence = float(market_boundary_info.get("market_confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            market_confidence = 0.0
-        try:
-            profitable_sample_count = int(market_boundary_info.get("profitable_sample_count", 0) or 0)
-        except (TypeError, ValueError):
-            profitable_sample_count = 0
-
-        explicit_floor = None
-        try:
-            explicit_floor = int(market_boundary_info.get("market_floor_ppm", 0))
-        except (TypeError, ValueError):
-            explicit_floor = None
-        if explicit_floor is not None and 1 <= explicit_floor <= self.ABS_MAX_FEE_PPM:
-            candidate_floor = max(hard_market_floor, explicit_floor)
-            floor_has_enough_evidence = (
-                market_confidence >= min_market_confidence
-                and profitable_sample_count >= min_market_samples
-            )
-            info["market_floor_ppm"] = explicit_floor
-            info["market_floor_candidate_ppm"] = candidate_floor
-            info["market_floor_eligible"] = floor_has_enough_evidence
-            info["market_floor_action"] = "diagnostic_only"
-            info["market_floor_hard_min_ppm"] = hard_market_floor
-            info["market_floor_min_confidence"] = min_market_confidence
-            info["market_floor_min_profitable_samples"] = min_market_samples
-
-        explicit_ceiling = None
-        try:
-            explicit_ceiling = int(market_boundary_info.get("market_ceiling_ppm", 0))
-        except (TypeError, ValueError):
-            explicit_ceiling = None
-        if explicit_ceiling is not None and 1 <= explicit_ceiling <= self.ABS_MAX_FEE_PPM:
-            if explicit_ceiling > effective_ceiling:
-                effective_ceiling = explicit_ceiling
-                info["ceiling_adjusted_up"] = True
-            info["market_ceiling_ppm"] = explicit_ceiling
-
-        try:
-            boundary_ppm = int(market_boundary_info.get("boundary_ppm", 0))
-        except (TypeError, ValueError):
-            boundary_ppm = 0
-
-        if 1 <= boundary_ppm <= self.ABS_MAX_FEE_PPM:
-            route_target_ppm, margin_ppm = self._get_market_boundary_target(
-                boundary_ppm,
-                effective_floor,
-                cfg=cfg,
-            )
-            route_target_ppm = max(
-                self.ABS_MIN_FEE_PPM,
-                min(self.ABS_MAX_FEE_PPM, int(route_target_ppm)),
-            )
-
-            if route_target_ppm > effective_ceiling:
-                effective_ceiling = route_target_ppm
-                info["ceiling_adjusted_up"] = True
-
-            info.update({
-                "boundary_ppm": boundary_ppm,
-                "route_target_ppm": route_target_ppm,
-                "margin_ppm": int(margin_ppm),
-                "boundary_floor_adjustment_allowed": False,
-            })
-
-        if effective_floor >= effective_ceiling:
-            effective_ceiling = min(self.ABS_MAX_FEE_PPM, effective_floor + 10)
-
-        info.update({
-            "applied": bool(info["floor_adjusted_down"] or info["ceiling_adjusted_up"]),
-            "effective_floor_ppm": int(effective_floor),
-            "effective_ceiling_ppm": int(effective_ceiling),
-            "source": str(market_boundary_info.get("source", "local_gossip")),
-            "market_confidence": market_boundary_info.get("market_confidence"),
-            "profitable_sample_count": market_boundary_info.get("profitable_sample_count"),
-        })
-        return int(effective_floor), int(effective_ceiling), info
+            return False
 
     def _get_market_boundary_fee(
         self,
@@ -2394,191 +2089,33 @@ class FeeController:
         cfg: Optional[Any] = None,
         force_refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Return cheapest active competitor context for the destination peer.
+        """Deprecated compatibility stub for fee market boundaries.
 
-        This deliberately uses the cheapest active competitor, not the median.
-        In a competitive routing market the lowest viable competing edge often
-        defines the route-selection boundary.
+        Remote peer fees are not a reliable lower bound for our local fee.
+        Production data showed profitable channels whose remote policies were
+        0-1 ppm, so using those policies as route-choice boundaries can anchor
+        unrelated channels to unsafe low fees. Keep the method and config keys
+        for operator compatibility, but never let persisted
+        fee_market_boundary_enabled=true influence pricing.
         """
-        if not bool(getattr(cfg, "fee_market_boundary_enabled", True)):
-            return None
-
-        try:
-            min_competitors = max(1, int(getattr(cfg, "fee_market_boundary_min_competitors", 1)))
-        except (TypeError, ValueError):
-            min_competitors = 1
-        try:
-            ttl_seconds = max(10, int(getattr(cfg, "fee_market_boundary_cache_seconds", 60)))
-        except (TypeError, ValueError):
-            ttl_seconds = 60
-
-        if self.data_service is None:
-            return None
-
-        try:
-            our_id = self._get_our_id()
-            peer_channels = self._get_peer_inbound_channels(
-                peer_id,
-                ttl_seconds=ttl_seconds,
-                force_refresh=force_refresh,
-            )
-            competitors: List[Dict[str, Any]] = []
-            for ch in peer_channels:
-                if ch.get("source") == our_id:
-                    continue
-                if not ch.get("active", False):
-                    continue
-                try:
-                    fee_ppm = int(ch.get("fee_per_millionth", 0))
-                except (TypeError, ValueError):
-                    continue
-                if not (1 <= fee_ppm <= self.ABS_MAX_FEE_PPM):
-                    continue
-                if self._is_cln_default_fee(ch):
-                    continue
-
-                capacity = ch.get("satoshis", base_to_sats_floor(ch.get("amount_msat", 0)))
-                try:
-                    capacity = int(capacity or 0)
-                except (TypeError, ValueError):
-                    capacity = 0
-                competitors.append({
-                    "fee_ppm": fee_ppm,
-                    "capacity_sats": max(0, capacity),
-                    "last_update": int(ch.get("last_update", 0) or 0),
-                })
-
-            if len(competitors) < min_competitors:
-                return None
-
-            competitors.sort(key=lambda item: (item["fee_ppm"], -item["capacity_sats"]))
-            cheapest = competitors[0]
-            return {
-                "boundary_ppm": cheapest["fee_ppm"],
-                "cheapest_competitor_ppm": cheapest["fee_ppm"],
-                "competitor_count": len(competitors),
-                "cheapest_competitor_capacity_sats": cheapest["capacity_sats"],
-                "sample_competitor_fees_ppm": [item["fee_ppm"] for item in competitors[:5]],
-                "cache_ttl_seconds": ttl_seconds,
-                "force_refreshed": force_refresh,
-            }
-        except Exception as e:
-            self.plugin.log(
-                f"FEE: market boundary lookup failed for {peer_id[:12]}...: {e}",
-                level='debug'
-            )
-            return None
+        return None
 
     def _get_hive_market_boundary_fee(
         self,
         peer_id: str,
         cfg: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Return advisory market boundary context from cl-hive fee intelligence.
+        """Return no hive-derived market boundary.
 
-        Local gossip remains authoritative when present. This fallback exists for
-        the case cl-hive has fresher external-peer observations than our local
-        graph cache, so underpriced channels with proven flow can still monetize.
+        Legacy cl-hive `optimal_fee_estimate_ppm` is an advisory/diagnostic
+        field, not a verified competitor quote. Treating it as a cheapest
+        competing edge synchronized unrelated production channels around the
+        same low values when the estimate was polluted by topology/count-like
+        signals. All market-boundary influence is now deprecated; hive hints
+        may still bias the normal DTS/PID controller through the bounded hint
+        path, but they must not create hard market floors or caps.
         """
-        if not bool(getattr(cfg, "fee_market_boundary_enabled", True)):
-            return None
-        if not self.hive_hints:
-            return None
-
-        def _optional_hint_int(method_name: str) -> int:
-            try:
-                method = getattr(self.hive_hints, method_name, None)
-                if not callable(method):
-                    return 0
-                value = method(peer_id)
-                if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-                    return 0
-                return int(value or 0)
-            except Exception:
-                return 0
-
-        def _optional_hint_float(method_name: str) -> Optional[float]:
-            try:
-                method = getattr(self.hive_hints, method_name, None)
-                if not callable(method):
-                    return None
-                value = method(peer_id)
-                if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-                    return None
-                return float(value)
-            except Exception:
-                return None
-
-        market_target_ppm = _optional_hint_int("get_market_fee_target")
-        try:
-            legacy_optimal_ppm = int(self.hive_hints.get_optimal_fee_estimate(peer_id) or 0)
-        except Exception:
-            legacy_optimal_ppm = 0
-        boundary_ppm = market_target_ppm or legacy_optimal_ppm
-
-        market_floor_ppm = _optional_hint_int("get_market_fee_floor")
-        market_ceiling_ppm = _optional_hint_int("get_market_fee_ceiling")
-
-        has_boundary = 1 <= boundary_ppm <= self.ABS_MAX_FEE_PPM
-        has_floor = 1 <= market_floor_ppm <= self.ABS_MAX_FEE_PPM
-        has_ceiling = 1 <= market_ceiling_ppm <= self.ABS_MAX_FEE_PPM
-        if not (has_boundary or has_floor or has_ceiling):
-            return None
-
-        confidence = _optional_hint_float("get_market_fee_confidence")
-        if confidence is None or confidence <= 0.0:
-            try:
-                confidence = float(self.hive_hints.get_traffic_confidence(peer_id))
-            except Exception:
-                confidence = None
-
-        profitable_sample_count = _optional_hint_int("get_market_fee_profitable_sample_count")
-
-        return {
-            "boundary_ppm": boundary_ppm if has_boundary else 0,
-            "cheapest_competitor_ppm": boundary_ppm if has_boundary else 0,
-            "competitor_count": 1 if has_boundary else 0,
-            "cheapest_competitor_capacity_sats": 0,
-            "sample_competitor_fees_ppm": [boundary_ppm] if has_boundary else [],
-            "cache_ttl_seconds": 0,
-            "force_refreshed": True,
-            "source": "hive_market_fee_rails" if market_target_ppm or has_floor or has_ceiling else "hive_optimal_fee_estimate",
-            "traffic_confidence": confidence,
-            "market_target_ppm": market_target_ppm,
-            "legacy_optimal_fee_estimate_ppm": legacy_optimal_ppm,
-            "market_floor_ppm": market_floor_ppm if has_floor else 0,
-            "market_ceiling_ppm": market_ceiling_ppm if has_ceiling else 0,
-            "market_confidence": confidence,
-            "profitable_sample_count": profitable_sample_count,
-        }
-
-    def _merge_market_boundary_info(
-        self,
-        local_info: Optional[Dict[str, Any]],
-        hive_info: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        """Use local gossip for route boundary while allowing hive rail hints."""
-        if local_info is None:
-            return hive_info
-        if hive_info is None:
-            return local_info
-
-        merged = dict(local_info)
-        hive_rail_keys = (
-            "market_target_ppm",
-            "legacy_optimal_fee_estimate_ppm",
-            "market_floor_ppm",
-            "market_ceiling_ppm",
-            "market_confidence",
-            "profitable_sample_count",
-        )
-        for key in hive_rail_keys:
-            value = hive_info.get(key)
-            if value not in (None, 0, 0.0, ""):
-                merged[key] = value
-        merged["hive_market_boundary"] = dict(hive_info)
-        merged["source"] = f"{local_info.get('source', 'local_gossip')}+hive_market_rails"
-        return merged
+        return None
 
     def _apply_market_boundary_downshift(
         self,
@@ -2619,22 +2156,14 @@ class FeeController:
     def _get_neighbor_fee_median(self, peer_id: str) -> int | None:
         """Get median fee charged by other nodes to the same peer.
 
-        Prefers fleet-aggregated optimal fee estimate (from hive intelligence)
-        when available, falling back to gossip-based listchannels scan.
+        Uses gossip-based listchannels data only. Hive optimal-fee estimates are
+        intentionally ignored here because they are not direct peer-market
+        samples and must not synchronize unrelated channels around one fleet
+        hint value.
 
         Returns None if insufficient data (need >= 3 neighbors for gossip).
         Result is cached for 30 minutes to avoid expensive calls.
         """
-        # Fleet intelligence: use hive-aggregated optimal fee when available
-        # This is derived from multiple fleet members' observations and is
-        # more current than gossip (which can be hours stale).
-        if self.hive_hints:
-            try:
-                optimal = self.hive_hints.get_optimal_fee_estimate(peer_id)
-                if optimal and optimal > 0:
-                    return optimal
-            except Exception:
-                pass
         # Evict stale entries when cache grows large
         if len(self._neighbor_fee_cache) > 500:
             now = time.time()
@@ -2922,8 +2451,10 @@ class FeeController:
 
         try:
             if self.hive_hints.is_hive_member(peer_id):
+                previous_seen_at = self._hive_member_set_at.get(peer_id)
                 self._hive_member_set_at[peer_id] = int(time.time())
-                self._hive_member_advisory_peers.add(peer_id)
+                if previous_seen_at is None:
+                    self._hive_member_advisory_peers.add(peer_id)
                 return None
         except Exception:
             pass
@@ -2944,7 +2475,6 @@ class FeeController:
             except Exception:
                 ttl = 900
             if int(time.time()) - last_set <= ttl * 2:
-                self._hive_member_advisory_peers.add(peer_id)
                 return None
             else:
                 del self._hive_member_set_at[peer_id]
@@ -4431,8 +3961,6 @@ class FeeController:
         market_boundary_downshift_info = {"applied": False}
         market_boundary_support_info = {"applied": False}
         market_boundary_window_bypass_info = {"applied": False}
-        profitability_market_anchor_info = {"weight": 0.0, "reason": "not_evaluated", "source": "none"}
-        dynamic_market_rails_info = {"applied": False}
 
         # Detect critical state
         is_congested = (state and state.get("state") == "congested")
@@ -4615,24 +4143,51 @@ class FeeController:
                     cfg=cfg,
                     force_refresh=True,
                 )
-                if window_boundary_info is None:
-                    window_boundary_info = self._get_hive_market_boundary_fee(peer_id, cfg=cfg)
-                try:
-                    window_boundary_ppm = int((window_boundary_info or {}).get("boundary_ppm", 0))
-                except (TypeError, ValueError):
-                    window_boundary_ppm = 0
-                if window_boundary_info is not None and window_boundary_ppm > 0:
+                if window_boundary_info is not None:
+                    window_capacity = channel_info.get("capacity") or base_to_sats_floor(
+                        parse_msat(channel_info.get("total_msat", 0))
+                    ) or 2_000_000
+                    try:
+                        window_capacity = int(window_capacity)
+                    except (TypeError, ValueError):
+                        window_capacity = 2_000_000
+                    window_floor_ppm = self._calculate_floor(
+                        window_capacity,
+                        chain_costs=chain_costs,
+                        peer_id=peer_id,
+                        opener=channel_info.get("opener", "local"),
+                    )
+                    window_floor_ppm = max(window_floor_ppm, cfg.min_fee_ppm)
+                    window_flow_state = state.get("state", "balanced") if isinstance(state, dict) else "balanced"
+                    if window_flow_state == "source":
+                        window_floor_ppm = int(window_floor_ppm * 1.10)
+                    elif window_flow_state == "sink":
+                        window_floor_ppm = int(window_floor_ppm * 0.75)
+                    window_floor_ppm = max(window_floor_ppm, cfg.min_fee_ppm)
                     boundary_target_ppm, boundary_margin_ppm = self._get_market_boundary_target(
-                        window_boundary_ppm,
-                        cfg.min_fee_ppm,
+                        int(window_boundary_info["boundary_ppm"]),
+                        window_floor_ppm,
                         cfg=cfg,
                     )
-                    if current_fee_ppm > boundary_target_ppm:
+                    if not self._market_boundary_has_room(
+                        int(window_boundary_info["boundary_ppm"]),
+                        window_floor_ppm,
+                        boundary_margin_ppm,
+                    ):
+                        self.plugin.log(
+                            f"DYNAMIC_WINDOW: {channel_id[:12]}... market boundary ignored "
+                            f"(competitor={window_boundary_info['boundary_ppm']}ppm, "
+                            f"floor={window_floor_ppm}ppm, margin={boundary_margin_ppm}ppm)",
+                            level='debug'
+                        )
+                        window_boundary_info = None
+                    elif current_fee_ppm > boundary_target_ppm:
                         market_boundary_window_bypass_info = {
                             "applied": True,
                             "boundary_ppm": int(window_boundary_info["boundary_ppm"]),
                             "target_ppm": int(boundary_target_ppm),
                             "margin_ppm": int(boundary_margin_ppm),
+                            "floor_ppm": int(window_floor_ppm),
                             "current_fee_ppm": int(current_fee_ppm),
                             "forwards_since_update": int(forward_count),
                             "hours_since_update": float(hours_elapsed),
@@ -4679,13 +4234,6 @@ class FeeController:
         # DTS posterior variance already handles observation noise —
         # no additional EMA smoothing needed.
         current_revenue_rate = raw_revenue_rate
-        profitability_market_anchor_info = self._get_profitability_market_anchor(
-            channel_id,
-            peer_id,
-            current_revenue_rate=current_revenue_rate,
-            forward_count=forward_count,
-            volume_since_sats=volume_since_sats,
-        )
 
         # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity") or 2_000_000
@@ -4756,33 +4304,13 @@ class FeeController:
             channel_id, current_fee_ppm, base_ceiling_ppm
         )
 
-        # Market reality can lift the effective ceiling above cfg.max_fee_ppm.
-        # The configured min_fee_ppm remains the hard automatic execution floor;
-        # hive market floors are advisory diagnostics for target selection only.
-        force_boundary_refresh = True
-        local_market_boundary_info = self._get_market_boundary_fee(
-            peer_id,
-            cfg=cfg,
-            force_refresh=force_boundary_refresh,
-        )
-        hive_market_boundary_info = self._get_hive_market_boundary_fee(peer_id, cfg=cfg)
-        market_boundary_info = self._merge_market_boundary_info(
-            local_market_boundary_info,
-            hive_market_boundary_info,
-        )
-
-        # Final bounds used by all paths (DTS+PID, congestion, exploration).
-        floor_ppm, ceiling_ppm, dynamic_market_rails_info = self._apply_dynamic_market_rails(
-            base_floor_ppm,
-            base_ceiling_ppm,
-            market_boundary_info,
-            cfg=cfg,
-        )
+        # Final bounds used by all paths (DTS+PID, congestion, exploration)
+        floor_ppm = base_floor_ppm
+        ceiling_ppm = base_ceiling_ppm
 
         # Security: Ensure floor never exceeds ceiling
         if floor_ppm >= ceiling_ppm:
             ceiling_ppm = floor_ppm + 10
-            dynamic_market_rails_info["effective_ceiling_ppm"] = int(ceiling_ppm)
         
         # Target Decision Block (Fee Priority Chain)
         # Priority: Congestion > bounded low-fee exploration > DTS+PID
@@ -5066,7 +4594,19 @@ class FeeController:
             # Neighbor fee context: soft attraction toward market median
             # Only pull DOWN toward market, never up — being cheaper is fine.
             neighbor_median = self._get_neighbor_fee_median(peer_id)
+            neighbor_market_usable = False
             if neighbor_median is not None:
+                try:
+                    neighbor_market_usable = int(neighbor_median) > int(floor_ppm)
+                except (TypeError, ValueError):
+                    neighbor_market_usable = False
+            if neighbor_median is not None and not neighbor_market_usable:
+                self.plugin.log(
+                    f"FEE: {channel_id[:16]}... neighbor median ignored "
+                    f"(median={neighbor_median}ppm <= floor={floor_ppm}ppm)",
+                    level='debug'
+                )
+            if neighbor_market_usable:
                 if post_pid_target_ppm > neighbor_median * 2:
                     adjusted = int(post_pid_target_ppm * 0.8 + neighbor_median * 0.2)
                     self.plugin.log(
@@ -5095,15 +4635,23 @@ class FeeController:
             # using the same per-corridor weight that would otherwise undercut —
             # used in inelastic markets where hive coordination means we retain
             # volume at higher margins (added 2026-04-21 to close vs-clboss gap).
-            if neighbor_median is not None:
+            if neighbor_market_usable:
                 undercut_pct = self._get_competitive_undercut_pct(peer_id, channel_id, neighbor_median)
                 mode = getattr(cfg, 'market_fee_mode', 'undercut') if cfg else 'undercut'
 
                 if mode == 'premium':
                     target = int(neighbor_median * (1.0 + undercut_pct))
-                    target = min(ceiling_ppm, max(floor_ppm, target))
+                    if target <= floor_ppm:
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competitive PREMIUM ignored "
+                            f"(target={target}ppm <= floor={floor_ppm}ppm)",
+                            level='debug'
+                        )
+                        target = None
+                    else:
+                        target = min(self.config.max_fee_ppm, target)
                     # Pipeline: FLOOR target at premium level (only pulls UP)
-                    if post_pid_target_ppm < target:
+                    if target is not None and post_pid_target_ppm < target:
                         pre = post_pid_target_ppm
                         post_pid_target_ppm = target
                         self.plugin.log(
@@ -5113,8 +4661,8 @@ class FeeController:
                             level='debug'
                         )
                 elif mode == 'match':
-                    target = max(floor_ppm, int(neighbor_median))
-                    target = min(ceiling_ppm, target)
+                    target = int(neighbor_median)
+                    target = min(self.config.max_fee_ppm, target)
                     # Match mode: pull toward median regardless of direction
                     if abs(post_pid_target_ppm - target) > 0:
                         pre = post_pid_target_ppm
@@ -5139,12 +4687,17 @@ class FeeController:
                     # real competitive margin).
                     preserve_threshold = self._get_neighbor_fee_percentile(peer_id, 0.25)
                     undercut_target = int(neighbor_median * (1.0 - undercut_pct))
-                    undercut_target = max(floor_ppm, undercut_target)
                     exploring = (
                         ts_state and ts_state.thompson and
                         ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
                     )
-                    if preserve_threshold is not None and post_pid_target_ppm < preserve_threshold:
+                    if undercut_target <= floor_ppm:
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competition_aware ignored "
+                            f"(undercut_target={undercut_target}ppm <= floor={floor_ppm}ppm)",
+                            level='debug'
+                        )
+                    elif preserve_threshold is not None and post_pid_target_ppm < preserve_threshold:
                         # We're in the cheap quartile — preserve DTS target.
                         self.plugin.log(
                             f"FEE: {channel_id[:16]}... competition_aware preserve: "
@@ -5175,12 +4728,17 @@ class FeeController:
                         )
                 else:  # undercut (default / back-compat)
                     undercut_target = int(neighbor_median * (1.0 - undercut_pct))
-                    undercut_target = max(floor_ppm, undercut_target)
                     exploring = (
                         ts_state and ts_state.thompson and
                         ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
                     )
-                    if exploring:
+                    if undercut_target <= floor_ppm:
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competitive undercut ignored "
+                            f"(undercut_target={undercut_target}ppm <= floor={floor_ppm}ppm)",
+                            level='debug'
+                        )
+                    elif exploring:
                         # Phase B.3: DTS is still exploring — skip the undercut
                         # clamp so observations feed a meaningful range of fees.
                         self.plugin.log(
@@ -5200,7 +4758,12 @@ class FeeController:
                         )
 
                     # Posterior bias (undercut mode only — preserves prior behavior)
-                    if sparse_data_conservative and ts_state and ts_state.thompson:
+                    if (
+                        undercut_target > floor_ppm
+                        and sparse_data_conservative
+                        and ts_state
+                        and ts_state.thompson
+                    ):
                         ts = ts_state.thompson
                         if ts.posterior_mean > undercut_target and ts.posterior_std >= 50:
                             prior_prec = 1.0 / max(ts.MIN_STD ** 2, ts.posterior_std ** 2)
@@ -5241,20 +4804,25 @@ class FeeController:
                     level='debug'
                 )
 
-            # Market boundary guard: if one cheap active competitor to the same
-            # destination defines the route-choice boundary, cap our target
-            # below it. This is intentionally after rebalance-cost nudging so
-            # cost recovery cannot price a channel out of the market.
+            # Experimental market boundary guard: if credible active
+            # competitors to the same destination define a route-choice
+            # boundary, cap our target below it. This is intentionally after
+            # rebalance-cost nudging so cost recovery cannot price a channel
+            # out of the market when the guard is explicitly enabled.
             # A ready fee cycle is a pricing decision point. Use current gossip
             # instead of a cached market boundary so fast competitor moves do
             # not leave us defending against a stale route-choice threshold.
-            try:
-                active_boundary_ppm = int((market_boundary_info or {}).get("boundary_ppm", 0))
-            except (TypeError, ValueError):
-                active_boundary_ppm = 0
-            if market_boundary_info is not None and active_boundary_ppm > 0:
+            force_boundary_refresh = True
+            market_boundary_info = self._get_market_boundary_fee(
+                peer_id,
+                cfg=cfg,
+                force_refresh=force_boundary_refresh,
+            )
+            if market_boundary_info is None:
+                market_boundary_info = self._get_hive_market_boundary_fee(peer_id, cfg=cfg)
+            if market_boundary_info is not None:
                 boundary_target_ppm, boundary_margin_ppm = self._get_market_boundary_target(
-                    active_boundary_ppm,
+                    int(market_boundary_info["boundary_ppm"]),
                     floor_ppm,
                     cfg=cfg,
                 )
@@ -5271,11 +4839,19 @@ class FeeController:
                     or int(forward_count or 0) > 0
                     or int(volume_since_sats or 0) > 0
                 )
-                profitability_market_weight = float(
-                    profitability_market_anchor_info.get("weight", 0.0) or 0.0
-                )
-                support_weight = 1.0 if observed_market_flow else profitability_market_weight
-                if post_pid_target_ppm > boundary_target_ppm:
+                if not self._market_boundary_has_room(
+                    int(market_boundary_info["boundary_ppm"]),
+                    floor_ppm,
+                    boundary_margin_ppm,
+                ):
+                    self.plugin.log(
+                        f"FEE: {channel_id[:16]}... market boundary ignored "
+                        f"(competitor={market_boundary_info['boundary_ppm']}ppm, "
+                        f"floor={floor_ppm}ppm, margin={boundary_margin_ppm}ppm)",
+                        level='debug'
+                    )
+                    market_boundary_info = None
+                elif post_pid_target_ppm > boundary_target_ppm:
                     pre_boundary = post_pid_target_ppm
                     post_pid_target_ppm = boundary_target_ppm
                     market_boundary_applied = True
@@ -5300,44 +4876,31 @@ class FeeController:
                                 )
                                 ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
                 elif (
-                    (observed_market_flow or support_weight > 0.0)
+                    observed_market_flow
                     and current_fee_ppm <= boundary_target_ppm
                     and post_pid_target_ppm < boundary_target_ppm
                 ):
                     # If we are already winning flow below the market boundary,
                     # do not chase a low DTS sample further down. That gives up
-                    # revenue without improving route selection. Quiet windows
-                    # for historically profitable peers also keep part of the
-                    # market anchor so DTS does not over-discount proven flow.
+                    # revenue without improving route selection.
                     pre_boundary = post_pid_target_ppm
-                    post_pid_target_ppm = self._profitability_market_support_target(
-                        current_target_ppm=post_pid_target_ppm,
-                        boundary_target_ppm=boundary_target_ppm,
-                        support_weight=support_weight,
-                    )
+                    post_pid_target_ppm = boundary_target_ppm
                     market_boundary_support_info = {
                         "applied": True,
                         "pre_support_target_ppm": int(pre_boundary),
-                        "post_support_target_ppm": int(post_pid_target_ppm),
+                        "post_support_target_ppm": int(boundary_target_ppm),
                         "current_revenue_rate": float(current_revenue_rate),
                         "forward_count": int(forward_count or 0),
                         "volume_since_sats": int(volume_since_sats or 0),
-                        "support_weight": round(float(support_weight), 3),
-                        "support_reason": (
-                            "observed_market_flow" if observed_market_flow
-                            else "profitable_peer_market_anchor"
-                        ),
-                        "profitability_market_anchor": dict(profitability_market_anchor_info),
                     }
                     market_boundary_info["applied"] = False
                     market_boundary_info["support_applied"] = True
                     self.plugin.log(
                         f"FEE: {channel_id[:16]}... market boundary support: "
-                        f"{pre_boundary}->{post_pid_target_ppm}ppm "
+                        f"{pre_boundary}->{boundary_target_ppm}ppm "
                         f"(cheapest_competitor={market_boundary_info['boundary_ppm']}ppm, "
                         f"revenue_rate={current_revenue_rate:.2f}sats/hr, "
-                        f"forwards={forward_count}, volume={volume_since_sats}sats, "
-                        f"profit_weight={support_weight:.2f})",
+                        f"forwards={forward_count}, volume={volume_since_sats}sats)",
                         level='debug'
                     )
                 else:
@@ -5366,16 +4929,11 @@ class FeeController:
                 woke_from_sleep=woke_from_sleep,
                 cfg=cfg,
             )
-            boundary_target_for_downshift = (
-                market_boundary_info.get("target_ppm")
-                if isinstance(market_boundary_info, dict)
-                else None
-            )
-            if boundary_target_for_downshift is not None:
+            if market_boundary_info is not None:
                 new_fee_ppm, market_boundary_downshift_info = self._apply_market_boundary_downshift(
                     current_fee_ppm=current_fee_ppm,
                     candidate_fee_ppm=new_fee_ppm,
-                    boundary_target_ppm=int(boundary_target_for_downshift),
+                    boundary_target_ppm=int(market_boundary_info["target_ppm"]),
                     cfg=cfg,
                 )
             applied_target_ppm = new_fee_ppm
@@ -5389,7 +4947,7 @@ class FeeController:
 
             hive_tag = f", hive={hive_fee_bias:.2f}" if hive_fee_bias != 1.0 else ""
             boundary_tag = ""
-            if market_boundary_info is not None and market_boundary_info.get("target_ppm") is not None:
+            if market_boundary_info is not None:
                 boundary_tag = (
                     f", boundary={market_boundary_info['boundary_ppm']}ppm"
                     f"->{market_boundary_info['target_ppm']}ppm"
@@ -5593,7 +5151,7 @@ class FeeController:
         applied_dir = "up" if applied_delta > 0 else ("down" if applied_delta < 0 else "flat")
         rebal_cost_tag = f", rebal_cost_floor:{rebalance_cost_ppm}ppm" if rebalance_cost_ppm > 0 else ""
         market_boundary_tag = ""
-        if market_boundary_info is not None and market_boundary_info.get("target_ppm") is not None:
+        if market_boundary_info is not None:
             market_action = "applied" if market_boundary_applied else "observed"
             if market_boundary_downshift_info.get("applied"):
                 market_action = "downshift"
@@ -5697,8 +5255,6 @@ class FeeController:
             htlcmin_msat=htlcmin_msat,
             htlcmax_msat=htlcmax_msat,
             base_fee_msat_override=target_base_fee_msat,
-            limit_floor_ppm=floor_ppm,
-            limit_ceiling_ppm=ceiling_ppm,
         )
         
         if result.get("success"):
@@ -5765,8 +5321,6 @@ class FeeController:
                     "market_boundary_downshift": market_boundary_downshift_info,
                     "market_boundary_support": market_boundary_support_info,
                     "market_boundary_window_bypass": market_boundary_window_bypass_info,
-                    "dynamic_market_rails": dynamic_market_rails_info,
-                    "profitability_market_anchor": profitability_market_anchor_info,
                     "base_fee_policy_change": base_fee_policy_change,
                     "current_base_fee_msat": current_base_fee_msat,
                     "target_base_fee_msat": target_base_fee_msat,
@@ -5936,9 +5490,7 @@ class FeeController:
                        channel_info: Optional[Dict[str, Any]] = None,
                        htlcmin_msat: Optional[int] = None,
                        htlcmax_msat: Optional[int] = None,
-                       base_fee_msat_override: Optional[int] = None,
-                       limit_floor_ppm: Optional[int] = None,
-                       limit_ceiling_ppm: Optional[int] = None) -> Dict[str, Any]:
+                       base_fee_msat_override: Optional[int] = None) -> Dict[str, Any]:
         """
         Set the fee for a channel.
 
@@ -5966,44 +5518,12 @@ class FeeController:
         fee_ppm = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, int(fee_ppm)))
         # Economic policy clamp applies unless explicitly bypassed (force/manual overrides, etc).
         if enforce_limits:
-            try:
-                configured_floor = int(getattr(cfg, "min_fee_ppm", self.MIN_AUTOMATIC_FEE_FLOOR_PPM))
-            except (TypeError, ValueError):
-                configured_floor = self.MIN_AUTOMATIC_FEE_FLOOR_PPM
-            dynamic_floor = configured_floor if limit_floor_ppm is None else int(limit_floor_ppm)
-            effective_floor = max(
-                self.MIN_AUTOMATIC_FEE_FLOOR_PPM,
-                configured_floor,
-                dynamic_floor,
-            )
-            effective_ceiling = cfg.max_fee_ppm if limit_ceiling_ppm is None else int(limit_ceiling_ppm)
-            effective_floor = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, effective_floor))
-            effective_ceiling = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, effective_ceiling))
-            if effective_floor > effective_ceiling:
-                effective_ceiling = effective_floor
-            fee_ppm = max(effective_floor, min(effective_ceiling, fee_ppm))
-        else:
-            effective_floor = self.ABS_MIN_FEE_PPM
-            effective_ceiling = self.ABS_MAX_FEE_PPM
+            fee_ppm = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, fee_ppm))
         if fee_ppm != original_fee_ppm:
-            dynamic_limits = (
-                enforce_limits
-                and (
-                    limit_floor_ppm is not None
-                    or limit_ceiling_ppm is not None
-                )
-            )
             clamp_note = (
-                (
-                    f"(effective limits: {effective_floor}-{effective_ceiling} PPM; "
-                    f"seed limits: {cfg.min_fee_ppm}-{cfg.max_fee_ppm} PPM)"
-                )
-                if dynamic_limits else
-                (
-                    f"(limits: {cfg.min_fee_ppm}-{cfg.max_fee_ppm} PPM)"
-                    if enforce_limits else
-                    f"(absolute: {self.ABS_MIN_FEE_PPM}-{self.ABS_MAX_FEE_PPM} PPM; economic limits bypassed)"
-                )
+                f"(limits: {cfg.min_fee_ppm}-{cfg.max_fee_ppm} PPM)"
+                if enforce_limits else
+                f"(absolute: {self.ABS_MIN_FEE_PPM}-{self.ABS_MAX_FEE_PPM} PPM; economic limits bypassed)"
             )
             self.plugin.log(
                 f"FEE_LIMIT: Clamped fee for {channel_id[:16]}... from {original_fee_ppm} "

@@ -133,8 +133,8 @@ class TestMemberFeePolicy:
         result = fc._check_hive_member_fee("02peer")
         assert result is None
 
-    def test_grace_period_keeps_membership_advisory_after_stale(self, mock_plugin, mock_config, mock_database):
-        """Stale-but-usable hints keep dynamic pricing fleet-aware without forcing 0-PPM."""
+    def test_grace_period_keeps_membership_without_rearming_advisory_after_stale(self, mock_plugin, mock_config, mock_database):
+        """Stale-but-usable hints keep membership sticky without forcing repeated reprices."""
         fc = FeeController(mock_plugin, mock_config, mock_database)
         adapter = MagicMock()
         adapter.is_hive_member.return_value = True
@@ -149,7 +149,7 @@ class TestMemberFeePolicy:
         adapter.is_fresh.return_value = False
         adapter.is_usable.return_value = True
         assert fc._check_hive_member_fee("02peer") is None
-        assert fc._consume_hive_member_advisory("02peer") is True
+        assert fc._consume_hive_member_advisory("02peer") is False
 
     def test_explicit_hive_unavailable_clears_sticky_membership(self, mock_plugin, mock_config, mock_database):
         """When cl-hive is disabled, dynamic fee control should reprice immediately."""

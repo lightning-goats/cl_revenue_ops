@@ -384,10 +384,11 @@ class Config:
     #   - "premium":  price above the median by the same per-corridor weight
     market_fee_mode: str = "undercut"
     fee_profile: str = 'active'    # Fee-controller aggressiveness profile
-    # Competitive boundary guard. Median market pricing misses the lab case
-    # where one cheap active competitor owns the route-choice boundary.
-    fee_market_boundary_enabled: bool = True
-    fee_market_boundary_min_competitors: int = 1
+    # Experimental competitive boundary guard. Disabled by default because a
+    # market cap derived from peer gossip is too easy to anchor on cheap
+    # outliers and can synchronize unrelated channels around one floor.
+    fee_market_boundary_enabled: bool = False
+    fee_market_boundary_min_competitors: int = 3
     fee_market_boundary_margin_ppm: int = 5
     fee_market_boundary_margin_ratio: float = 0.05
     fee_market_boundary_max_downshift_ratio: float = 0.35

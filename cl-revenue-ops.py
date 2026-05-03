@@ -59,10 +59,10 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
-# v2.6.0: Hive Market Fee Rails + Rebalance Coordination Hardening
-#   - Consumes hive-provided market fee rails in the DTS/PID fee controller
-#   - Hardens fee execution, hive hint parsing, and native rebalance coordination
-#   - Quiets routine rebalance logs while preserving safety diagnostics
+# v2.5.1: Fee market boundary deprecation
+#   - Makes fee market boundary settings no-op compatibility controls
+#   - Prevents remote peer fee policies from anchoring local fee floors/caps
+#   - Keeps fee-debug output explicit about configured vs effective state
 # v2.5.0: Fee Controller, Native Rebalance, and Safety Controls
 #   - Patch release so the published tag contains the declared plugin version
 #   - Keeps repo version metadata aligned with GitHub release state
@@ -76,7 +76,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.6.0"
+PLUGIN_VERSION = "2.5.1"
 
 
 # =============================================================================
@@ -493,38 +493,38 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-enabled',
-    default='true',
-    description='Enable cheapest-active-competitor fee boundary guard (default: true)'
+    default='false',
+    description='Deprecated no-op compatibility flag; fee market boundary logic is ignored (default: false)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-min-competitors',
-    default='1',
-    description='Minimum active competitors needed before applying fee market boundary guard (default: 1)'
+    default='3',
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 3)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-margin-ppm',
     default='5',
-    description='Absolute ppm margin below cheapest active competitor (default: 5)'
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 5)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-margin-ratio',
     default='0.05',
-    description='Fractional margin below cheapest active competitor, combined with ppm margin (default: 0.05)'
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 0.05)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-max-downshift-ratio',
     default='0.35',
-    description='Max fraction of current fee to drop in one boundary correction cycle (default: 0.35)'
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 0.35)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-cache-seconds',
     default='60',
-    description='Gossip cache TTL for fee market boundary detection (default: 60)'
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 60)'
 )
 
 plugin.add_option(
@@ -1497,10 +1497,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         neighbor_median_min_competitors=_safe_int_opt('revenue-ops-neighbor-median-min-competitors', '2'),
         fee_profile=str(options.get('revenue-ops-fee-profile', 'active') or 'active').lower(),
         fee_market_boundary_enabled=options.get(
-            'revenue-ops-fee-market-boundary-enabled', 'true'
+            'revenue-ops-fee-market-boundary-enabled', 'false'
         ).lower() == 'true',
         fee_market_boundary_min_competitors=_safe_int_opt(
-            'revenue-ops-fee-market-boundary-min-competitors', '1'
+            'revenue-ops-fee-market-boundary-min-competitors', '3'
         ),
         fee_market_boundary_margin_ppm=_safe_int_opt(
             'revenue-ops-fee-market-boundary-margin-ppm', '5'
@@ -2888,6 +2888,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     profile = fee_controller.get_fee_profile_settings(cfg_snap)
     min_obs_hours = profile["min_observation_hours"]
     min_forwards = profile["min_forwards_for_signal"]
+    market_boundary_configured = bool(getattr(cfg_snap, "fee_market_boundary_enabled", False))
 
     now = int(time.time())
     result = {
@@ -2895,8 +2896,11 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         "config": {
             "fee_interval_seconds": config.fee_interval if config else 1800,
             "fee_profile": profile["name"],
-            "market_boundary_enabled": getattr(cfg_snap, "fee_market_boundary_enabled", True),
-            "market_boundary_min_competitors": getattr(cfg_snap, "fee_market_boundary_min_competitors", 1),
+            "market_boundary_enabled": False,
+            "market_boundary_configured": market_boundary_configured,
+            "market_boundary_effective": False,
+            "market_boundary_deprecated": True,
+            "market_boundary_min_competitors": getattr(cfg_snap, "fee_market_boundary_min_competitors", 3),
             "market_boundary_margin_ppm": getattr(cfg_snap, "fee_market_boundary_margin_ppm", 5),
             "market_boundary_margin_ratio": getattr(cfg_snap, "fee_market_boundary_margin_ratio", 0.05),
             "market_boundary_max_downshift_ratio": getattr(cfg_snap, "fee_market_boundary_max_downshift_ratio", 0.35),
