@@ -2089,88 +2089,16 @@ class FeeController:
         cfg: Optional[Any] = None,
         force_refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Return credible low competitor context for the destination peer.
+        """Deprecated compatibility stub for fee market boundaries.
 
-        This deliberately uses a low-but-not-necessarily-cheapest competitor.
-        In a competitive routing market one cheap edge can be an outlier, so
-        the absolute cheapest quote is ignored when enough competitors exist.
+        Remote peer fees are not a reliable lower bound for our local fee.
+        Production data showed profitable channels whose remote policies were
+        0-1 ppm, so using those policies as route-choice boundaries can anchor
+        unrelated channels to unsafe low fees. Keep the method and config keys
+        for operator compatibility, but never let persisted
+        fee_market_boundary_enabled=true influence pricing.
         """
-        if not bool(getattr(cfg, "fee_market_boundary_enabled", False)):
-            return None
-
-        try:
-            min_competitors = max(1, int(getattr(cfg, "fee_market_boundary_min_competitors", 3)))
-        except (TypeError, ValueError):
-            min_competitors = 3
-        try:
-            ttl_seconds = max(10, int(getattr(cfg, "fee_market_boundary_cache_seconds", 60)))
-        except (TypeError, ValueError):
-            ttl_seconds = 60
-
-        if self.data_service is None:
-            return None
-
-        try:
-            our_id = self._get_our_id()
-            peer_channels = self._get_peer_inbound_channels(
-                peer_id,
-                ttl_seconds=ttl_seconds,
-                force_refresh=force_refresh,
-            )
-            competitors: List[Dict[str, Any]] = []
-            for ch in peer_channels:
-                if ch.get("source") == our_id:
-                    continue
-                if not ch.get("active", False):
-                    continue
-                try:
-                    fee_ppm = int(ch.get("fee_per_millionth", 0))
-                except (TypeError, ValueError):
-                    continue
-                if not (1 <= fee_ppm <= self.ABS_MAX_FEE_PPM):
-                    continue
-                if self._is_cln_default_fee(ch):
-                    continue
-
-                capacity = ch.get("satoshis", base_to_sats_floor(ch.get("amount_msat", 0)))
-                try:
-                    capacity = int(capacity or 0)
-                except (TypeError, ValueError):
-                    capacity = 0
-                competitors.append({
-                    "fee_ppm": fee_ppm,
-                    "capacity_sats": max(0, capacity),
-                    "last_update": int(ch.get("last_update", 0) or 0),
-                })
-
-            if len(competitors) < min_competitors:
-                return None
-
-            competitors.sort(key=lambda item: (item["fee_ppm"], -item["capacity_sats"]))
-            cheapest = competitors[0]
-            # Use a credible low quote, not necessarily the absolute cheapest.
-            # With at least three competitors, the lowest edge is often an
-            # outlier/probe/default-like policy. The second-lowest quote keeps
-            # us competitive without letting one 1-ppm edge anchor all fees.
-            boundary_index = 1 if len(competitors) >= 3 else 0
-            boundary = competitors[boundary_index]
-            return {
-                "boundary_ppm": boundary["fee_ppm"],
-                "cheapest_competitor_ppm": cheapest["fee_ppm"],
-                "boundary_competitor_capacity_sats": boundary["capacity_sats"],
-                "boundary_rank": boundary_index + 1,
-                "competitor_count": len(competitors),
-                "cheapest_competitor_capacity_sats": cheapest["capacity_sats"],
-                "sample_competitor_fees_ppm": [item["fee_ppm"] for item in competitors[:5]],
-                "cache_ttl_seconds": ttl_seconds,
-                "force_refreshed": force_refresh,
-            }
-        except Exception as e:
-            self.plugin.log(
-                f"FEE: market boundary lookup failed for {peer_id[:12]}...: {e}",
-                level='debug'
-            )
-            return None
+        return None
 
     def _get_hive_market_boundary_fee(
         self,
@@ -2183,9 +2111,9 @@ class FeeController:
         field, not a verified competitor quote. Treating it as a cheapest
         competing edge synchronized unrelated production channels around the
         same low values when the estimate was polluted by topology/count-like
-        signals. Market boundaries must come from local gossip until cl-hive
-        exports a separate, confidence-gated contract for executable market
-        prices.
+        signals. All market-boundary influence is now deprecated; hive hints
+        may still bias the normal DTS/PID controller through the bounded hint
+        path, but they must not create hard market floors or caps.
         """
         return None
 

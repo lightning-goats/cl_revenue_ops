@@ -1002,37 +1002,30 @@ class TestMarketBoundaryGuard:
         fc.data_service.get_channels.return_value = {"channels": channels}
         fc._our_node_id = our_id
 
-    def test_single_cheapest_competitor_sets_market_boundary(self, mock_plugin, mock_database):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        peer_id = "02" + "b" * 64
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(80, 150))
-
-        info = fc._get_market_boundary_fee(peer_id, cfg=cfg)
-        target_ppm, margin_ppm = fc._get_market_boundary_target(
-            info["boundary_ppm"],
-            cfg.min_fee_ppm,
-            cfg=cfg,
-        )
-
-        assert info["boundary_ppm"] == 80
-        assert info["competitor_count"] == 2
-        assert margin_ppm == 5
-        assert target_ppm == 75
-
-    def test_market_boundary_uses_credible_low_quote_not_single_outlier(
+    def test_market_boundary_lookup_is_deprecated_noop_even_when_enabled(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.fee_market_boundary_enabled = True
+        peer_id = "02" + "b" * 64
+        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(0, 1, 10, 80, 150))
+
+        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
+        fc.data_service.get_channels.assert_not_called()
+
+    def test_market_boundary_lookup_ignores_force_refresh_when_deprecated(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.fee_market_boundary_enabled = True
         cfg.fee_market_boundary_min_competitors = 3
         peer_id = "02" + "c" * 64
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(1, 10, 80))
 
         info = fc._get_market_boundary_fee(peer_id, cfg=cfg, force_refresh=True)
 
-        assert info["cheapest_competitor_ppm"] == 1
-        assert info["boundary_ppm"] == 10
-        assert info["boundary_rank"] == 2
-        assert info["competitor_count"] == 3
+        assert info is None
+        fc.data_service.get_channels.assert_not_called()
 
     def test_market_boundary_respects_min_competitor_threshold(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -1042,22 +1035,26 @@ class TestMarketBoundaryGuard:
 
         assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
 
-    def test_market_boundary_force_refresh_bypasses_stale_cache(self, mock_plugin, mock_database):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        peer_id = "02" + "e" * 64
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(100,))
-
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg)["boundary_ppm"] == 100
-
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(60,))
-
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg)["boundary_ppm"] == 100
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg, force_refresh=True)["boundary_ppm"] == 60
-
-    def test_market_boundary_ignores_untouched_cln_default_competitors(
+    def test_market_boundary_force_refresh_does_not_reenable_deprecated_lookup(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.fee_market_boundary_enabled = True
+        peer_id = "02" + "e" * 64
+        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(100,))
+
+        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
+
+        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(60,))
+
+        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
+        assert fc._get_market_boundary_fee(peer_id, cfg=cfg, force_refresh=True) is None
+
+    def test_market_boundary_deprecation_skips_gossip_even_with_default_like_competitors(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.fee_market_boundary_enabled = True
         peer_id = "02" + "d" * 64
         our_id = "our-node"
         fc.data_service = MagicMock()
@@ -1096,11 +1093,17 @@ class TestMarketBoundaryGuard:
 
         info = fc._get_market_boundary_fee(peer_id, cfg=cfg, force_refresh=True)
 
-        assert info["boundary_ppm"] == 80
-        assert info["competitor_count"] == 1
+        assert info is None
+        fc.data_service.get_channels.assert_not_called()
 
-    def test_market_boundary_downshift_bypasses_slow_blend_to_boundary(self, mock_plugin, mock_database):
+    def test_deprecated_market_boundary_downshift_helper_is_not_reachable_from_lookup(
+        self, mock_plugin, mock_database
+    ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        peer_id = "02" + "5" * 64
+        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(80,))
+
+        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
 
         new_fee, info = fc._apply_market_boundary_downshift(
             current_fee_ppm=112,
@@ -1186,7 +1189,7 @@ class TestMarketBoundaryGuard:
         fc.set_channel_fee.assert_called_once()
         assert fc.set_channel_fee.call_args.kwargs["base_fee_msat_override"] == 1500
 
-    def test_adjustment_caps_target_below_single_cheapest_competitor(
+    def test_deprecated_market_boundary_does_not_cap_ready_fee_decision(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -1230,10 +1233,9 @@ class TestMarketBoundaryGuard:
         )
 
         assert result is not None
-        assert result.new_fee_ppm == 75
-        assert result.algorithm_values["market_boundary_applied"] is True
-        assert result.algorithm_values["market_boundary"]["boundary_ppm"] == 80
-        assert result.algorithm_values["market_boundary"]["target_ppm"] == 75
+        assert result.new_fee_ppm > 75
+        assert result.algorithm_values["market_boundary_applied"] is False
+        assert result.algorithm_values["market_boundary"] is None
 
     def test_market_boundary_below_floor_does_not_collapse_to_floor(
         self, mock_plugin, mock_database
@@ -1330,7 +1332,7 @@ class TestMarketBoundaryGuard:
 
         assert result is None
 
-    def test_adjustment_refreshes_market_boundary_before_fee_increase(
+    def test_deprecated_market_boundary_does_not_cap_fee_increase(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -1340,7 +1342,7 @@ class TestMarketBoundaryGuard:
         peer_id = "02" + "f" * 64
         current_fee_ppm = 75
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(100,))
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg)["boundary_ppm"] == 100
+        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
 
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(60,))
 
@@ -1377,11 +1379,11 @@ class TestMarketBoundaryGuard:
         )
 
         assert result is not None
-        assert result.algorithm_values["market_boundary"]["boundary_ppm"] == 60
-        assert result.algorithm_values["market_boundary"]["force_refreshed"] is True
-        assert result.new_fee_ppm <= 60
+        assert result.algorithm_values["market_boundary"] is None
+        assert result.algorithm_values["market_boundary_applied"] is False
+        assert result.new_fee_ppm > 60
 
-    def test_adjustment_uses_market_boundary_as_support_when_winning_flow(
+    def test_deprecated_market_boundary_does_not_support_winning_flow(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -1427,14 +1429,10 @@ class TestMarketBoundaryGuard:
         )
 
         assert result is not None
-        assert result.new_fee_ppm > current_fee_ppm
-        assert result.new_fee_ppm <= 45
-        assert result.algorithm_values["market_boundary"]["boundary_ppm"] == 50
-        assert result.algorithm_values["market_boundary"]["target_ppm"] == 45
-        assert result.algorithm_values["market_boundary"]["support_applied"] is True
-        assert result.algorithm_values["market_boundary_support"]["applied"] is True
+        assert result.algorithm_values["market_boundary"] is None
+        assert result.algorithm_values["market_boundary_support"]["applied"] is False
 
-    def test_market_boundary_support_uses_flow_when_zero_fee_earns_no_revenue(
+    def test_deprecated_market_boundary_does_not_raise_zero_fee_on_flow_alone(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -1480,14 +1478,9 @@ class TestMarketBoundaryGuard:
         )
 
         assert result is not None
-        assert result.new_fee_ppm > current_fee_ppm
         assert result.algorithm_values["current_revenue_rate"] == 0.0
-        assert result.algorithm_values["market_boundary"]["boundary_ppm"] == 80
-        assert result.algorithm_values["market_boundary"]["target_ppm"] == 75
-        assert result.algorithm_values["market_boundary"]["support_applied"] is True
-        assert result.algorithm_values["market_boundary_support"]["applied"] is True
-        assert result.algorithm_values["market_boundary_support"]["forward_count"] == 12
-        assert result.algorithm_values["market_boundary_support"]["volume_since_sats"] == 500_000
+        assert result.algorithm_values["market_boundary"] is None
+        assert result.algorithm_values["market_boundary_support"]["applied"] is False
 
     def test_hive_optimal_estimate_does_not_create_market_boundary_when_gossip_missing(
         self, mock_plugin, mock_database
@@ -1549,7 +1542,7 @@ class TestMarketBoundaryGuard:
         assert fc._get_neighbor_fee_median(peer_id) is None
         assert fc._get_hive_market_boundary_fee(peer_id, cfg=cfg) is None
 
-    def test_adjustment_refreshes_stale_boundary_before_supporting_winning_flow(
+    def test_deprecated_market_boundary_does_not_refresh_stale_support_boundary(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -1560,7 +1553,7 @@ class TestMarketBoundaryGuard:
         current_fee_ppm = 42
 
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(50,))
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg)["boundary_ppm"] == 50
+        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(60,))
 
         mock_database.get_volume_since.return_value = 1_000_000
@@ -1599,13 +1592,10 @@ class TestMarketBoundaryGuard:
         )
 
         assert result is not None
-        assert result.algorithm_values["market_boundary"]["boundary_ppm"] == 60
-        assert result.algorithm_values["market_boundary"]["target_ppm"] == 55
-        assert result.algorithm_values["market_boundary"]["force_refreshed"] is True
-        assert result.algorithm_values["market_boundary_support"]["applied"] is True
-        assert result.new_fee_ppm > 45
+        assert result.algorithm_values["market_boundary"] is None
+        assert result.algorithm_values["market_boundary_support"]["applied"] is False
 
-    def test_market_boundary_downshift_bypasses_observation_window_after_losing_flow(
+    def test_deprecated_market_boundary_does_not_bypass_observation_window_after_losing_flow(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -1650,12 +1640,7 @@ class TestMarketBoundaryGuard:
             cfg=cfg,
         )
 
-        assert result is not None
-        assert result.new_fee_ppm == 40
-        assert result.algorithm_values["market_boundary"]["boundary_ppm"] == 45
-        assert result.algorithm_values["market_boundary"]["target_ppm"] == 40
-        assert result.algorithm_values["market_boundary_downshift"]["applied"] is True
-        assert result.algorithm_values["market_boundary_window_bypass"]["applied"] is True
+        assert result is None
 
 
 class TestDTSPIDIntegration:

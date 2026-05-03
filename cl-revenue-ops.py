@@ -490,37 +490,37 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-enabled',
     default='false',
-    description='Enable experimental competitor fee boundary guard (default: false)'
+    description='Deprecated no-op compatibility flag; fee market boundary logic is ignored (default: false)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-min-competitors',
     default='3',
-    description='Minimum active competitors needed before applying fee market boundary guard (default: 3)'
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 3)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-margin-ppm',
     default='5',
-    description='Absolute ppm margin below credible low competitor when experimental market boundary is enabled (default: 5)'
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 5)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-margin-ratio',
     default='0.05',
-    description='Fractional margin below credible low competitor when experimental market boundary is enabled (default: 0.05)'
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 0.05)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-max-downshift-ratio',
     default='0.35',
-    description='Max fraction of current fee to drop in one boundary correction cycle (default: 0.35)'
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 0.35)'
 )
 
 plugin.add_option(
     name='revenue-ops-fee-market-boundary-cache-seconds',
     default='60',
-    description='Gossip cache TTL for fee market boundary detection (default: 60)'
+    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 60)'
 )
 
 plugin.add_option(
@@ -2884,6 +2884,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     profile = fee_controller.get_fee_profile_settings(cfg_snap)
     min_obs_hours = profile["min_observation_hours"]
     min_forwards = profile["min_forwards_for_signal"]
+    market_boundary_configured = bool(getattr(cfg_snap, "fee_market_boundary_enabled", False))
 
     now = int(time.time())
     result = {
@@ -2891,7 +2892,10 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         "config": {
             "fee_interval_seconds": config.fee_interval if config else 1800,
             "fee_profile": profile["name"],
-            "market_boundary_enabled": getattr(cfg_snap, "fee_market_boundary_enabled", False),
+            "market_boundary_enabled": False,
+            "market_boundary_configured": market_boundary_configured,
+            "market_boundary_effective": False,
+            "market_boundary_deprecated": True,
             "market_boundary_min_competitors": getattr(cfg_snap, "fee_market_boundary_min_competitors", 3),
             "market_boundary_margin_ppm": getattr(cfg_snap, "fee_market_boundary_margin_ppm", 5),
             "market_boundary_margin_ratio": getattr(cfg_snap, "fee_market_boundary_margin_ratio", 0.05),
