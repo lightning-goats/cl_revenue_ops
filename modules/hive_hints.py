@@ -10,6 +10,7 @@ If hints are missing, stale, invalid, or both transports fail, all
 lookups silently return 1.0 (neutral / no effect).
 """
 
+import json
 import time
 
 # Hard-coded bias caps -- not configurable by design
@@ -49,11 +50,76 @@ class HiveHintAdapter:
         self._snapshot = None
         self._snapshot_fetched_at = 0
         self._using_stale_fallback = False
+        self._snapshot_source = "none"
         self.data_service = None
 
     # ------------------------------------------------------------------
     # Polling
     # ------------------------------------------------------------------
+
+    def _read_datastore_raw(self):
+        info = {
+            "queried": True,
+            "source": "datastore",
+            "transport": "data_service" if self.data_service else "rpc.listdatastore",
+            "available": False,
+            "reason": "missing",
+            "error": "",
+        }
+        try:
+            ds = (
+                self.data_service.list_datastore(["hive", "hints"])
+                if self.data_service
+                else self._plugin.rpc.listdatastore(key=["hive", "hints"])
+            )
+            entries = ds.get("datastore", []) if isinstance(ds, dict) else []
+            if not isinstance(entries, list) or not entries:
+                return None, info
+            entry = entries[0] if isinstance(entries[0], dict) else {}
+            data_str = entry.get("string", "")
+            data_hex = entry.get("hex", "")
+            if data_str:
+                info["available"] = True
+                info["encoding"] = "string"
+                info["reason"] = ""
+                return json.loads(data_str), info
+            if data_hex:
+                info["available"] = True
+                info["encoding"] = "hex"
+                info["reason"] = ""
+                return json.loads(bytes.fromhex(data_hex).decode()), info
+            info["reason"] = "empty_payload"
+            return None, info
+        except Exception as e:
+            info["available"] = bool(info.get("available", False))
+            info["reason"] = "read_error" if not info["available"] else "decode_error"
+            info["error"] = str(e)
+            return None, info
+
+    def _read_live_export_raw(self):
+        info = {
+            "queried": True,
+            "source": "hive_export_rpc",
+            "transport": "hive-export-hints",
+            "available": False,
+            "reason": "",
+            "error": "",
+        }
+        try:
+            raw = self._plugin.rpc.call("hive-export-hints")
+            info["available"] = raw is not None
+            info["reason"] = "" if raw is not None else "empty_response"
+            return raw, info
+        except Exception as e:
+            info["reason"] = "rpc_error"
+            info["error"] = str(e)
+            return None, info
+
+    def _store_snapshot(self, snapshot: dict, source: str, *, stale_fallback: bool = False) -> None:
+        self._snapshot = snapshot
+        self._snapshot_fetched_at = int(time.time())
+        self._using_stale_fallback = bool(stale_fallback)
+        self._snapshot_source = source
 
     def poll(self):
         """Fetch a fresh hint snapshot. Prefers CLN datastore (fast local read),
@@ -64,49 +130,43 @@ class HiveHintAdapter:
         round-trip, eliminating the timeout problem.
         """
         raw = None
+        raw_source = "none"
 
         # Priority 1: Read from CLN datastore (fast, no cross-plugin RPC)
-        try:
-            import json as _json
-            ds = self.data_service.list_datastore(["hive", "hints"]) if self.data_service else self._plugin.rpc.listdatastore(key=["hive", "hints"])
-            entries = ds.get("datastore", [])
-            if entries:
-                entry = entries[0]
-                data_str = entry.get("string", "")
-                if data_str:
-                    raw = _json.loads(data_str)
-                else:
-                    data_hex = entry.get("hex", "")
-                    if data_hex:
-                        raw = _json.loads(bytes.fromhex(data_hex).decode())
-        except Exception:
-            pass
+        raw, datastore_info = self._read_datastore_raw()
+        if raw is not None:
+            raw_source = "datastore"
 
         candidate = self._validate_and_normalize_snapshot(raw)
+        stale_candidate_source = raw_source
         stale_candidate = (
             candidate
             if candidate is not None and not self._snapshot_is_fresh(candidate)
             else None
         )
         if candidate is None or stale_candidate is not None:
-            try:
-                raw = self._plugin.rpc.call("hive-export-hints")
-            except Exception as e:
-                self._plugin.log(f"HIVE_HINTS: poll failed: {e}", level='debug')
+            raw, export_info = self._read_live_export_raw()
+            if export_info.get("error"):
+                self._plugin.log(f"HIVE_HINTS: poll failed: {export_info['error']}", level='debug')
                 if stale_candidate is not None and self._snapshot_is_recent_enough_for_fallback(stale_candidate):
-                    self._snapshot = stale_candidate
-                    self._snapshot_fetched_at = int(time.time())
-                    self._using_stale_fallback = True
-                elif self._error_indicates_hive_unavailable(e):
+                    self._store_snapshot(
+                        stale_candidate,
+                        f"{stale_candidate_source or 'datastore'}_stale_fallback",
+                        stale_fallback=True,
+                    )
+                elif self._error_indicates_hive_unavailable(export_info.get("error", "")):
                     self._clear_snapshot()
                 return
+            raw_source = "hive_export_rpc"
             candidate = self._validate_and_normalize_snapshot(raw)
 
         if candidate is None:
             if stale_candidate is not None and self._snapshot_is_recent_enough_for_fallback(stale_candidate):
-                self._snapshot = stale_candidate
-                self._snapshot_fetched_at = int(time.time())
-                self._using_stale_fallback = True
+                self._store_snapshot(
+                    stale_candidate,
+                    f"{stale_candidate_source or 'datastore'}_stale_fallback",
+                    stale_fallback=True,
+                )
                 return
             if self._raw_indicates_hive_unavailable(raw):
                 self._clear_snapshot()
@@ -117,22 +177,23 @@ class HiveHintAdapter:
 
         if not self._snapshot_is_fresh(candidate):
             if stale_candidate is not None and self._snapshot_is_recent_enough_for_fallback(stale_candidate):
-                self._snapshot = stale_candidate
-                self._snapshot_fetched_at = int(time.time())
-                self._using_stale_fallback = True
+                self._store_snapshot(
+                    stale_candidate,
+                    f"{stale_candidate_source or 'datastore'}_stale_fallback",
+                    stale_fallback=True,
+                )
                 return
             self._clear_snapshot()
             self._plugin.log("HIVE_HINTS: stale snapshot, ignoring", level='debug')
             return
 
-        self._snapshot = candidate
-        self._snapshot_fetched_at = int(time.time())
-        self._using_stale_fallback = False
+        self._store_snapshot(candidate, raw_source or "unknown", stale_fallback=False)
 
     def _clear_snapshot(self) -> None:
         self._snapshot = None
         self._snapshot_fetched_at = 0
         self._using_stale_fallback = False
+        self._snapshot_source = "none"
 
     @staticmethod
     def _error_indicates_hive_unavailable(error) -> bool:
@@ -797,14 +858,230 @@ class HiveHintAdapter:
     # Diagnostics
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _snapshot_generation(raw) -> int | str | None:
+        if not isinstance(raw, dict):
+            return None
+        for key in ("generation", "refresh_generation", "hint_generation"):
+            value = raw.get(key)
+            if value not in (None, ""):
+                return int(value) if isinstance(value, (int, float)) else str(value)
+        for section_key in ("runtime", "metadata", "diagnostics"):
+            section = raw.get(section_key)
+            if not isinstance(section, dict):
+                continue
+            for key in ("generation", "refresh_generation", "hint_generation"):
+                value = section.get(key)
+                if value not in (None, ""):
+                    return int(value) if isinstance(value, (int, float)) else str(value)
+        return None
+
+    def _snapshot_debug_view(self, raw, source: str, transport_info: dict | None = None) -> dict:
+        info = dict(transport_info or {})
+        available = bool(info.get("available", raw is not None))
+        generated_at = raw.get("generated_at") if isinstance(raw, dict) else None
+        generated_at = int(generated_at) if isinstance(generated_at, (int, float)) else None
+        ttl = self._effective_ttl_for(raw if isinstance(raw, dict) else None)
+        age = int(time.time()) - generated_at if generated_at is not None else None
+        hints = raw.get("hints") if isinstance(raw, dict) else None
+        candidate = self._validate_and_normalize_snapshot(raw)
+        valid = candidate is not None
+        fresh = bool(valid and age is not None and age <= ttl)
+        stale_fallback_usable = bool(valid and self._snapshot_is_recent_enough_for_fallback(candidate))
+        if not available:
+            reason = str(info.get("reason") or "missing")
+        elif not valid:
+            reason = str(info.get("reason") or "invalid_schema")
+            if reason in {"", "missing"}:
+                reason = "invalid_schema"
+        elif fresh:
+            reason = "fresh"
+        else:
+            reason = "stale"
+        return {
+            "queried": bool(info.get("queried", False)),
+            "source": source,
+            "transport": info.get("transport"),
+            "available": available,
+            "valid": valid,
+            "fresh": fresh,
+            "usable": fresh,
+            "stale_fallback_usable": stale_fallback_usable,
+            "reason": reason,
+            "error": str(info.get("error") or ""),
+            "generation": self._snapshot_generation(raw),
+            "generated_at": generated_at,
+            "age_seconds": age,
+            "ttl_seconds": ttl,
+            "effective_ttl_seconds": ttl,
+            "hints_count": len(hints) if isinstance(hints, dict) else 0,
+        }
+
+    def _cache_debug_view(self) -> dict:
+        cache = self._snapshot_debug_view(
+            self._snapshot,
+            self._snapshot_source,
+            {
+                "queried": False,
+                "available": self._snapshot is not None,
+                "transport": "adapter_cache",
+                "reason": "missing" if self._snapshot is None else "",
+            },
+        )
+        cache["fresh"] = self.is_fresh()
+        cache["usable"] = self.is_usable()
+        cache["stale_fallback"] = self._using_stale_fallback
+        cache["fetched_at"] = int(self._snapshot_fetched_at or 0) or None
+        cache["cache_age_seconds"] = (
+            int(time.time()) - int(self._snapshot_fetched_at)
+            if self._snapshot_fetched_at
+            else None
+        )
+        return cache
+
+    @staticmethod
+    def _fallback_reason_from_probe(prefix: str, probe: dict) -> str:
+        reason = str(probe.get("reason") or "")
+        if not bool(probe.get("available", False)):
+            return f"{prefix}_missing"
+        if not bool(probe.get("valid", False)):
+            return f"{prefix}_invalid_schema"
+        if not bool(probe.get("fresh", False)):
+            return f"{prefix}_stale"
+        return reason or f"{prefix}_unusable"
+
+    def refresh_status_for_debug(self) -> dict:
+        """Refresh stale adapter cache for diagnostics and report each transport separately.
+
+        This only reads cl-hive state and updates the in-memory adapter snapshot,
+        matching poll() transport behavior without changing budgets or execution
+        decisions.
+        """
+        cache_before = self._cache_debug_view()
+        live_export_default = {
+            "queried": False,
+            "source": "hive_export_rpc",
+            "transport": "hive-export-hints",
+            "available": False,
+            "valid": False,
+            "fresh": False,
+            "usable": False,
+            "stale_fallback_usable": False,
+            "reason": "not_queried",
+            "error": "",
+            "generation": None,
+            "generated_at": None,
+            "age_seconds": None,
+            "ttl_seconds": None,
+            "effective_ttl_seconds": None,
+            "hints_count": 0,
+        }
+        diagnostics = {
+            "cache": cache_before,
+            "cache_after_refresh": cache_before,
+            "refresh_needed": not bool(cache_before.get("fresh", False)),
+            "refresh_attempted": False,
+            "refresh_result": "cache_fresh" if cache_before.get("fresh") else "not_attempted",
+            "live_datastore": {
+                "queried": False,
+                "source": "datastore",
+                "transport": "data_service" if self.data_service else "rpc.listdatastore",
+                "available": False,
+                "valid": False,
+                "fresh": False,
+                "usable": False,
+                "stale_fallback_usable": False,
+                "reason": "not_queried",
+                "error": "",
+                "generation": None,
+                "generated_at": None,
+                "age_seconds": None,
+                "ttl_seconds": None,
+                "effective_ttl_seconds": None,
+                "hints_count": 0,
+            },
+            "live_hive_export": dict(live_export_default),
+            "fallback": {
+                "needed": False,
+                "reason": "",
+                "used": False,
+                "used_source": "",
+                "stale_fallback_used": False,
+                "stale_fallback_reason": "",
+            },
+        }
+        if cache_before.get("fresh"):
+            return diagnostics
+
+        diagnostics["refresh_attempted"] = True
+        raw_datastore, datastore_info = self._read_datastore_raw()
+        datastore_probe = self._snapshot_debug_view(raw_datastore, "datastore", datastore_info)
+        diagnostics["live_datastore"] = datastore_probe
+        datastore_candidate = self._validate_and_normalize_snapshot(raw_datastore)
+        if datastore_candidate is not None and datastore_probe["fresh"]:
+            self._store_snapshot(datastore_candidate, "datastore", stale_fallback=False)
+            diagnostics["refresh_result"] = "refreshed_from_datastore"
+            diagnostics["cache_after_refresh"] = self._cache_debug_view()
+            return diagnostics
+
+        fallback_reason = self._fallback_reason_from_probe("datastore", datastore_probe)
+        diagnostics["fallback"]["needed"] = True
+        diagnostics["fallback"]["reason"] = fallback_reason
+
+        raw_export, export_info = self._read_live_export_raw()
+        export_probe = self._snapshot_debug_view(raw_export, "hive_export_rpc", export_info)
+        diagnostics["live_hive_export"] = export_probe
+        export_candidate = self._validate_and_normalize_snapshot(raw_export)
+        if export_candidate is not None and export_probe["fresh"]:
+            self._store_snapshot(export_candidate, "hive_export_rpc", stale_fallback=False)
+            diagnostics["fallback"]["used"] = True
+            diagnostics["fallback"]["used_source"] = "hive_export_rpc"
+            diagnostics["refresh_result"] = "refreshed_from_hive_export"
+            diagnostics["cache_after_refresh"] = self._cache_debug_view()
+            return diagnostics
+
+        if datastore_candidate is not None and self._snapshot_is_recent_enough_for_fallback(datastore_candidate):
+            self._store_snapshot(datastore_candidate, "datastore_stale_fallback", stale_fallback=True)
+            diagnostics["fallback"]["used"] = True
+            diagnostics["fallback"]["used_source"] = "datastore_stale_fallback"
+            diagnostics["fallback"]["stale_fallback_used"] = True
+            diagnostics["fallback"]["stale_fallback_reason"] = self._fallback_reason_from_probe(
+                "hive_export",
+                export_probe,
+            )
+            diagnostics["refresh_result"] = "using_stale_datastore_fallback"
+            diagnostics["cache_after_refresh"] = self._cache_debug_view()
+            return diagnostics
+
+        if self._raw_indicates_hive_unavailable(raw_export) or self._error_indicates_hive_unavailable(
+            export_info.get("error", "")
+        ):
+            self._clear_snapshot()
+            diagnostics["refresh_result"] = "hive_unavailable"
+        elif export_info.get("error"):
+            diagnostics["refresh_result"] = "refresh_failed_cache_retained"
+        else:
+            self._clear_snapshot()
+            diagnostics["refresh_result"] = "invalid_live_hive_export"
+        diagnostics["cache_after_refresh"] = self._cache_debug_view()
+        return diagnostics
+
     def get_status(self) -> dict:
         if self._snapshot is None:
             return {
                 "snapshot_fresh": False,
+                "snapshot_usable": False,
+                "stale_fallback": False,
                 "snapshot_age_seconds": None,
+                "snapshot_generated_at": None,
+                "snapshot_fetched_at": None,
+                "adapter_cache_age_seconds": None,
+                "effective_ttl_seconds": self._effective_ttl_for(None),
+                "snapshot_source": self._snapshot_source,
                 "hints_count": 0,
             }
         age = int(time.time()) - int(self._snapshot.get("generated_at", 0))
+        cache_age = int(time.time()) - int(self._snapshot_fetched_at or 0) if self._snapshot_fetched_at else None
         hints = self._snapshot.get("hints", {})
         member_hints = [
             hint
@@ -816,6 +1093,11 @@ class HiveHintAdapter:
             "snapshot_usable": self.is_usable(),
             "stale_fallback": self._using_stale_fallback,
             "snapshot_age_seconds": age,
+            "snapshot_generated_at": int(self._snapshot.get("generated_at", 0) or 0),
+            "snapshot_fetched_at": int(self._snapshot_fetched_at or 0),
+            "adapter_cache_age_seconds": cache_age,
+            "effective_ttl_seconds": self._effective_ttl(),
+            "snapshot_source": self._snapshot_source,
             "hints_count": len(hints),
             "member_hints_count": len(member_hints),
             "rebalance_recommendations_count": len(self.get_rebalance_recommendations()),

@@ -356,8 +356,101 @@ def test_revenue_rebalance_debug_reports_segment_hint_influence():
 
     result = mod.revenue_rebalance_debug(mod.plugin)
 
+    mod.hive_hints.poll.assert_called_once()
+    assert result["hive_hints"]["status_refresh_attempted"] is True
+    assert result["hive_hints"]["status_refresh_ok"] is True
     assert result["hive_hints"]["segment_scores_count"] == 1
     assert result["hive_hints"]["segment_scores"][0]["short_channel_id"] == "123x1x0"
+
+
+def test_revenue_rebalance_debug_exposes_hive_hint_refresh_diagnostics():
+    mod = load_plugin_module()
+    mod.config = Config()
+    mod.data_service = MagicMock()
+    mod.data_service.get_funds.return_value = {"outputs": [], "channels": []}
+    mod.database = MagicMock()
+    mod.database.get_daily_rebalance_spend.return_value = {
+        "total_spent_sats": 0,
+        "total_reserved_sats": 0,
+        "stale_reservations": 0,
+        "job_count": 0,
+        "success_count": 0,
+        "success_rate": 0.0,
+    }
+    mod.database.get_all_channel_states.return_value = []
+    mod._total_cost_budget_status = MagicMock(
+        return_value={
+            "effective_budget_sats": 1000,
+            "remaining_sats": 1000,
+            "actual_spent_by_category": {},
+            "reserved_by_category": {},
+        }
+    )
+    mod._boltz_liquidity_cost_components = MagicMock(
+        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
+    )
+    mod.rebalancer = SimpleNamespace(
+        _get_channels_with_balances=lambda: {},
+        job_manager=SimpleNamespace(active_channels=set()),
+    )
+    mod.hive_hints = MagicMock()
+    mod.hive_hints.refresh_status_for_debug.return_value = {
+        "refresh_needed": True,
+        "refresh_attempted": True,
+        "refresh_result": "refreshed_from_datastore",
+        "cache": {
+            "source": "hive_export_rpc",
+            "age_seconds": 391,
+            "effective_ttl_seconds": 300,
+            "usable": False,
+        },
+        "cache_after_refresh": {
+            "source": "datastore",
+            "age_seconds": 5,
+            "effective_ttl_seconds": 300,
+            "usable": True,
+        },
+        "live_datastore": {
+            "queried": True,
+            "generation": 5915,
+            "age_seconds": 5,
+            "ttl_seconds": 300,
+            "usable": True,
+        },
+        "live_hive_export": {
+            "queried": False,
+            "usable": False,
+        },
+        "fallback": {
+            "needed": False,
+            "reason": "",
+            "used": False,
+            "used_source": "",
+            "stale_fallback_used": False,
+        },
+    }
+    mod.hive_hints.get_status.return_value = {
+        "snapshot_fresh": True,
+        "snapshot_usable": True,
+        "snapshot_age_seconds": 5,
+        "hints_count": 2,
+    }
+    mod.hive_hints.get_segment_scores.return_value = []
+
+    result = mod.revenue_rebalance_debug(mod.plugin)
+
+    mod.hive_hints.refresh_status_for_debug.assert_called_once()
+    mod.hive_hints.poll.assert_not_called()
+    hive_status = result["hive_hints"]
+    assert hive_status["status_refresh_needed"] is True
+    assert hive_status["status_refresh_attempted"] is True
+    assert hive_status["status_refresh_result"] == "refreshed_from_datastore"
+    assert hive_status["cache"]["age_seconds"] == 391
+    assert hive_status["cache"]["source"] == "hive_export_rpc"
+    assert hive_status["cache_after_refresh"]["source"] == "datastore"
+    assert hive_status["live_datastore"]["generation"] == 5915
+    assert hive_status["live_hive_export"]["queried"] is False
+    assert hive_status["fallback"]["needed"] is False
 
 
 def test_revenue_rebalance_debug_includes_last_cycle_score_breakdown():
