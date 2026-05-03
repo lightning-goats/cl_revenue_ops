@@ -59,6 +59,10 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.5.1: Fee market boundary deprecation
+#   - Makes fee market boundary settings no-op compatibility controls
+#   - Prevents remote peer fee policies from anchoring local fee floors/caps
+#   - Keeps fee-debug output explicit about configured vs effective state
 # v2.5.0: Fee Controller, Native Rebalance, and Safety Controls
 #   - Patch release so the published tag contains the declared plugin version
 #   - Keeps repo version metadata aligned with GitHub release state
@@ -72,7 +76,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.5.0"
+PLUGIN_VERSION = "2.5.1"
 
 
 # =============================================================================
