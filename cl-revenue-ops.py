@@ -2843,13 +2843,56 @@ def revenue_rebalance_debug(
     except Exception as e:
         result["channels"]["error"] = str(e)
 
-    hive_status = (
-        hive_hints.get_status()
-        if hive_hints
-        else {"snapshot_fresh": False, "hints_count": 0}
-    )
+    hive_refresh_error = ""
+    hive_refresh_attempted = False
+    hive_refresh_diagnostics = None
+    if hive_hints:
+        debug_refresher = getattr(hive_hints, "refresh_status_for_debug", None)
+        if callable(debug_refresher):
+            try:
+                candidate_diagnostics = debug_refresher()
+                if isinstance(candidate_diagnostics, dict):
+                    hive_refresh_diagnostics = candidate_diagnostics
+            except Exception as e:
+                hive_refresh_error = str(e)
+                plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
+        if hive_refresh_diagnostics is None:
+            poller = getattr(hive_hints, "poll", None)
+            if callable(poller):
+                hive_refresh_attempted = True
+                try:
+                    poller()
+                except Exception as e:
+                    hive_refresh_error = str(e)
+                    plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
+        try:
+            hive_status = hive_hints.get_status()
+        except Exception as e:
+            hive_status = {
+                "snapshot_fresh": False,
+                "snapshot_usable": False,
+                "hints_count": 0,
+                "status_error": str(e),
+            }
+    else:
+        hive_status = {"snapshot_fresh": False, "snapshot_usable": False, "hints_count": 0}
     if not isinstance(hive_status, dict):
         hive_status = {"snapshot_fresh": False, "hints_count": 0}
+    if isinstance(hive_refresh_diagnostics, dict):
+        hive_refresh_attempted = bool(hive_refresh_diagnostics.get("refresh_attempted", False))
+        hive_status["cache"] = dict(hive_refresh_diagnostics.get("cache", {}) or {})
+        hive_status["cache_after_refresh"] = dict(hive_refresh_diagnostics.get("cache_after_refresh", {}) or {})
+        hive_status["live_datastore"] = dict(hive_refresh_diagnostics.get("live_datastore", {}) or {})
+        hive_status["live_hive_export"] = dict(hive_refresh_diagnostics.get("live_hive_export", {}) or {})
+        hive_status["fallback"] = dict(hive_refresh_diagnostics.get("fallback", {}) or {})
+        hive_status["status_refresh_needed"] = bool(hive_refresh_diagnostics.get("refresh_needed", False))
+        hive_status["status_refresh_result"] = str(hive_refresh_diagnostics.get("refresh_result") or "")
+    hive_status["status_refresh_attempted"] = hive_refresh_attempted
+    hive_status["status_refresh_ok"] = (not hive_refresh_error) and (
+        bool(hive_refresh_diagnostics is not None) or hive_refresh_attempted
+    )
+    if hive_refresh_error:
+        hive_status["status_refresh_error"] = hive_refresh_error
     segment_scores = _filtered_segment_scores()
     hive_status["segment_scores_count"] = len(segment_scores)
     if not summary_only:

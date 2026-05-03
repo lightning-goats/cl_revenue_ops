@@ -85,6 +85,21 @@ VALID_COORDINATION_SNAPSHOT_SECTIONS = {
 }
 
 
+def _hint_snapshot(*, age_seconds=0, ttl_seconds=300, generation=1, peer_id="02fresh"):
+    return {
+        "generated_at": int(time.time()) - int(age_seconds),
+        "ttl_seconds": ttl_seconds,
+        "generation": generation,
+        "hints": {
+            peer_id: {
+                "member": True,
+                "traffic_confidence": 0.7,
+                "corridor_role": "owner",
+            }
+        },
+    }
+
+
 class TestPolling:
     def test_poll_success_caches_snapshot(self, mock_plugin):
         mock_plugin.rpc.call.return_value = VALID_SNAPSHOT
@@ -243,6 +258,12 @@ class TestPolling:
         assert adapter._snapshot == snapshot
         assert adapter.is_hive_member("02fresh") is True
         mock_plugin.rpc.call.assert_not_called()
+        status = adapter.get_status()
+        assert status["snapshot_source"] == "datastore"
+        assert status["effective_ttl_seconds"] == 900
+        assert status["snapshot_generated_at"] == snapshot["generated_at"]
+        assert status["snapshot_fetched_at"] > 0
+        assert status["adapter_cache_age_seconds"] >= 0
 
     def test_poll_uses_recent_stale_datastore_snapshot_when_rpc_refresh_fails(self, mock_plugin):
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
@@ -273,6 +294,7 @@ class TestPolling:
         assert status["snapshot_fresh"] is False
         assert status["snapshot_usable"] is True
         assert status["stale_fallback"] is True
+        assert status["snapshot_source"] == "datastore_stale_fallback"
 
     def test_poll_ignores_ancient_stale_datastore_snapshot_when_rpc_refresh_fails(self, mock_plugin):
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
@@ -297,6 +319,117 @@ class TestPolling:
 
         assert adapter._snapshot is None
         assert adapter.is_usable() is False
+
+    def test_debug_refresh_stale_adapter_cache_uses_fresh_datastore_without_export(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter._store_snapshot(
+            adapter._validate_and_normalize_snapshot(_hint_snapshot(age_seconds=900, generation=1)),
+            "hive_export_rpc",
+        )
+        adapter.data_service = MagicMock()
+        fresh_datastore = _hint_snapshot(age_seconds=10, generation=2, peer_id="02datastore")
+        adapter.data_service.list_datastore.return_value = {
+            "datastore": [{"string": json.dumps(fresh_datastore)}]
+        }
+
+        diagnostics = adapter.refresh_status_for_debug()
+
+        assert diagnostics["refresh_attempted"] is True
+        assert diagnostics["cache"]["fresh"] is False
+        assert diagnostics["cache"]["usable"] is False
+        assert diagnostics["cache"]["source"] == "hive_export_rpc"
+        assert diagnostics["live_datastore"]["queried"] is True
+        assert diagnostics["live_datastore"]["generation"] == 2
+        assert diagnostics["live_datastore"]["usable"] is True
+        assert diagnostics["live_hive_export"]["queried"] is False
+        assert diagnostics["fallback"]["needed"] is False
+        assert diagnostics["cache_after_refresh"]["source"] == "datastore"
+        assert adapter.is_hive_member("02datastore") is True
+        mock_plugin.rpc.call.assert_not_called()
+
+    def test_debug_refresh_stale_adapter_cache_uses_fresh_hive_export(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter._store_snapshot(
+            adapter._validate_and_normalize_snapshot(_hint_snapshot(age_seconds=900, generation=1)),
+            "datastore",
+        )
+        adapter.data_service = MagicMock()
+        adapter.data_service.list_datastore.return_value = {"datastore": []}
+        fresh_export = _hint_snapshot(age_seconds=5, generation=3, peer_id="02export")
+        mock_plugin.rpc.call.return_value = fresh_export
+
+        diagnostics = adapter.refresh_status_for_debug()
+
+        assert diagnostics["refresh_attempted"] is True
+        assert diagnostics["fallback"]["needed"] is True
+        assert diagnostics["fallback"]["reason"] == "datastore_missing"
+        assert diagnostics["fallback"]["used"] is True
+        assert diagnostics["fallback"]["used_source"] == "hive_export_rpc"
+        assert diagnostics["live_hive_export"]["queried"] is True
+        assert diagnostics["live_hive_export"]["generation"] == 3
+        assert diagnostics["live_hive_export"]["usable"] is True
+        assert diagnostics["cache_after_refresh"]["source"] == "hive_export_rpc"
+        assert adapter.is_hive_member("02export") is True
+
+    def test_debug_refresh_uses_stale_datastore_fallback_when_live_export_fails(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter._store_snapshot(
+            adapter._validate_and_normalize_snapshot(_hint_snapshot(age_seconds=900, generation=1)),
+            "hive_export_rpc",
+        )
+        adapter.data_service = MagicMock()
+        stale_datastore = _hint_snapshot(age_seconds=2000, ttl_seconds=300, generation=4, peer_id="02stale")
+        adapter.data_service.list_datastore.return_value = {
+            "datastore": [{"string": json.dumps(stale_datastore)}]
+        }
+        mock_plugin.rpc.call.side_effect = Exception("timeout")
+
+        diagnostics = adapter.refresh_status_for_debug()
+
+        assert diagnostics["live_datastore"]["fresh"] is False
+        assert diagnostics["live_datastore"]["usable"] is False
+        assert diagnostics["live_datastore"]["stale_fallback_usable"] is True
+        assert diagnostics["live_hive_export"]["queried"] is True
+        assert diagnostics["live_hive_export"]["error"] == "timeout"
+        assert diagnostics["fallback"]["needed"] is True
+        assert diagnostics["fallback"]["used"] is True
+        assert diagnostics["fallback"]["used_source"] == "datastore_stale_fallback"
+        assert diagnostics["fallback"]["stale_fallback_used"] is True
+        assert diagnostics["cache_after_refresh"]["source"] == "datastore_stale_fallback"
+        assert adapter.is_fresh() is False
+        assert adapter.is_usable() is True
+        assert adapter.is_hive_member("02stale") is True
+
+    def test_debug_refresh_malformed_datastore_hints_falls_back_to_hive_export(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter._store_snapshot(
+            adapter._validate_and_normalize_snapshot(_hint_snapshot(age_seconds=900, generation=1)),
+            "datastore",
+        )
+        adapter.data_service = MagicMock()
+        malformed_datastore = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 300,
+            "generation": 5,
+            "hints": "not-a-map",
+        }
+        adapter.data_service.list_datastore.return_value = {
+            "datastore": [{"string": json.dumps(malformed_datastore)}]
+        }
+        fresh_export = _hint_snapshot(age_seconds=0, generation=6, peer_id="02export")
+        mock_plugin.rpc.call.return_value = fresh_export
+
+        diagnostics = adapter.refresh_status_for_debug()
+
+        assert diagnostics["live_datastore"]["available"] is True
+        assert diagnostics["live_datastore"]["valid"] is False
+        assert diagnostics["live_datastore"]["reason"] == "invalid_schema"
+        assert diagnostics["fallback"]["needed"] is True
+        assert diagnostics["fallback"]["reason"] == "datastore_invalid_schema"
+        assert diagnostics["fallback"]["used_source"] == "hive_export_rpc"
+        assert diagnostics["live_hive_export"]["usable"] is True
+        assert diagnostics["cache_after_refresh"]["source"] == "hive_export_rpc"
+        assert adapter.is_hive_member("02export") is True
 
 
 class TestTTL:
