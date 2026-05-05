@@ -82,3 +82,21 @@ def test_scheduled_fee_loop_uses_same_hive_refresh_helper():
     assert _calls_function(fee_loop, "_refresh_fee_cycle_hive_inputs"), (
         "scheduled and manual fee cycles should share the same hive refresh path"
     )
+
+
+def test_fee_hive_refresh_helper_refreshes_shared_runtime():
+    tree = _load_tree()
+    refresh_helper = _find_function(tree, "_refresh_fee_cycle_hive_inputs")
+    assert _contains_refresh_call(refresh_helper), (
+        "fee cycles should use the shared hive runtime refresh helper so hints "
+        "and router state stay aligned"
+    )
+
+
+def test_fee_debug_refreshes_shared_hive_runtime_before_reporting():
+    tree = _load_tree()
+    fee_debug = _find_function(tree, "revenue_fee_debug")
+    assert _contains_refresh_call(fee_debug), (
+        "revenue-fee-debug should refresh hive runtime before reporting per-channel "
+        "hive attribution so fresh datastore hints are not shown as absent"
+    )

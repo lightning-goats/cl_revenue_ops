@@ -11,6 +11,7 @@ lookups silently return 1.0 (neutral / no effect).
 """
 
 import json
+import threading
 import time
 
 # Hard-coded bias caps -- not configurable by design
@@ -47,6 +48,7 @@ class HiveHintAdapter:
     def __init__(self, plugin, ttl_override: int = 0):
         self._plugin = plugin
         self._ttl_override = ttl_override
+        self._lock = threading.RLock()
         self._snapshot = None
         self._snapshot_fetched_at = 0
         self._using_stale_fallback = False
@@ -116,10 +118,11 @@ class HiveHintAdapter:
             return None, info
 
     def _store_snapshot(self, snapshot: dict, source: str, *, stale_fallback: bool = False) -> None:
-        self._snapshot = snapshot
-        self._snapshot_fetched_at = int(time.time())
-        self._using_stale_fallback = bool(stale_fallback)
-        self._snapshot_source = source
+        with self._lock:
+            self._snapshot = snapshot
+            self._snapshot_fetched_at = int(time.time())
+            self._using_stale_fallback = bool(stale_fallback)
+            self._snapshot_source = source
 
     def poll(self):
         """Fetch a fresh hint snapshot. Prefers CLN datastore (fast local read),
@@ -190,10 +193,11 @@ class HiveHintAdapter:
         self._store_snapshot(candidate, raw_source or "unknown", stale_fallback=False)
 
     def _clear_snapshot(self) -> None:
-        self._snapshot = None
-        self._snapshot_fetched_at = 0
-        self._using_stale_fallback = False
-        self._snapshot_source = "none"
+        with self._lock:
+            self._snapshot = None
+            self._snapshot_fetched_at = 0
+            self._using_stale_fallback = False
+            self._snapshot_source = "none"
 
     @staticmethod
     def _error_indicates_hive_unavailable(error) -> bool:
@@ -253,7 +257,8 @@ class HiveHintAdapter:
         return 900
 
     def _effective_ttl(self) -> int:
-        return self._effective_ttl_for(self._snapshot)
+        with self._lock:
+            return self._effective_ttl_for(self._snapshot)
 
     def _snapshot_is_fresh(self, snapshot: dict | None) -> bool:
         if snapshot is None:
@@ -262,7 +267,8 @@ class HiveHintAdapter:
         return age <= self._effective_ttl_for(snapshot)
 
     def is_fresh(self) -> bool:
-        return self._snapshot_is_fresh(self._snapshot)
+        with self._lock:
+            return self._snapshot_is_fresh(self._snapshot)
 
     def _snapshot_is_recent_enough_for_fallback(self, snapshot: dict | None) -> bool:
         if snapshot is None:
@@ -275,18 +281,28 @@ class HiveHintAdapter:
         return age <= max_age
 
     def is_usable(self) -> bool:
-        return self.is_fresh() or self._using_stale_fallback
+        with self._lock:
+            return self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback
 
     # ------------------------------------------------------------------
     # Peer hint lookup
     # ------------------------------------------------------------------
 
     def _get_peer_hint(self, peer_id: str) -> dict:
-        if not self.is_usable():
-            return {}
-        hints = self._snapshot.get("hints", {})
-        hint = hints.get(peer_id, {})
-        return hint if isinstance(hint, dict) else {}
+        with self._lock:
+            if not (self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback):
+                return {}
+            hints = self._snapshot.get("hints", {}) if isinstance(self._snapshot, dict) else {}
+            hint = hints.get(peer_id, {})
+            return dict(hint) if isinstance(hint, dict) else {}
+
+    def _get_peer_hint_fresh(self, peer_id: str) -> dict:
+        with self._lock:
+            if not self._snapshot_is_fresh(self._snapshot):
+                return {}
+            hints = self._snapshot.get("hints", {}) if isinstance(self._snapshot, dict) else {}
+            hint = hints.get(peer_id, {})
+            return dict(hint) if isinstance(hint, dict) else {}
 
     @staticmethod
     def _normalize_str_list(values) -> list:
@@ -325,18 +341,34 @@ class HiveHintAdapter:
         return normalized
 
     def _get_section_entries(self, section_name: str, validator) -> list:
-        if not self.is_usable():
-            return []
-        section = self._snapshot.get(section_name, [])
-        if not isinstance(section, list):
-            return []
+        with self._lock:
+            if not (self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback):
+                return []
+            section = self._snapshot.get(section_name, []) if isinstance(self._snapshot, dict) else []
+            if not isinstance(section, list):
+                return []
 
-        entries = []
-        for raw in section:
-            entry = validator(raw)
-            if entry is not None:
-                entries.append(entry)
-        return entries
+            entries = []
+            for raw in section:
+                entry = validator(raw)
+                if entry is not None:
+                    entries.append(entry)
+            return entries
+
+    def _get_section_entries_fresh(self, section_name: str, validator) -> list:
+        with self._lock:
+            if not self._snapshot_is_fresh(self._snapshot):
+                return []
+            section = self._snapshot.get(section_name, []) if isinstance(self._snapshot, dict) else []
+            if not isinstance(section, list):
+                return []
+
+            entries = []
+            for raw in section:
+                entry = validator(raw)
+                if entry is not None:
+                    entries.append(entry)
+            return entries
 
     # ------------------------------------------------------------------
     # Membership
@@ -346,6 +378,32 @@ class HiveHintAdapter:
         """Return True if peer is a hive fleet member. False if unavailable/stale."""
         hint = self._get_peer_hint(peer_id)
         return bool(hint.get("member", False))
+
+    def get_membership_status(self, peer_id: str) -> dict:
+        """Return detailed membership/freshness state without changing adapter state."""
+        with self._lock:
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            generated_at = snapshot.get("generated_at") if snapshot else None
+            generated_at = int(generated_at) if isinstance(generated_at, (int, float)) else None
+            age = int(time.time()) - generated_at if generated_at is not None else None
+            fresh = self._snapshot_is_fresh(snapshot)
+            usable = fresh or self._using_stale_fallback
+            hints = snapshot.get("hints", {}) if snapshot else {}
+            hint = hints.get(peer_id, {}) if isinstance(hints, dict) else {}
+            known = usable and isinstance(hint, dict) and "member" in hint
+            return {
+                "peer_id": str(peer_id or ""),
+                "known": bool(known),
+                "member": bool(hint.get("member", False)) if known else False,
+                "fresh": bool(fresh),
+                "usable": bool(usable),
+                "stale_fallback": bool(self._using_stale_fallback),
+                "source": self._snapshot_source,
+                "generation": self._snapshot_generation(snapshot),
+                "generated_at": generated_at,
+                "age_seconds": age,
+                "effective_ttl_seconds": self._effective_ttl_for(snapshot),
+            }
 
     def get_corridor_role(self, peer_id: str) -> str:
         """Return validated corridor_role, or 'none' if unavailable."""
@@ -441,6 +499,14 @@ class HiveHintAdapter:
         bias = max(-MAX_REBALANCE_BIAS, min(MAX_REBALANCE_BIAS, bias))
         return 1.0 + bias
 
+    def get_peer_quality_score(self, peer_id: str) -> float:
+        """Return peer quality score in [0.0, 1.0], or 0.5 when unavailable."""
+        hint = self._get_peer_hint(peer_id)
+        val = hint.get("peer_quality_score")
+        if isinstance(val, (int, float)):
+            return max(0.0, min(1.0, float(val)))
+        return 0.5
+
     def get_centrality(self, peer_id: str) -> float:
         """Return external centrality for peer (0.0 if unavailable)."""
         hint = self._get_peer_hint(peer_id)
@@ -533,16 +599,17 @@ class HiveHintAdapter:
 
     def get_member_peer_ids(self) -> list:
         """Return hive member peer ids represented in the current hint snapshot."""
-        if not self.is_usable():
-            return []
-        hints = self._snapshot.get("hints", {})
-        if not isinstance(hints, dict):
-            return []
-        return [
-            str(peer_id)
-            for peer_id, hint in hints.items()
-            if peer_id and isinstance(hint, dict) and bool(hint.get("member", False))
-        ]
+        with self._lock:
+            if not (self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback):
+                return []
+            hints = self._snapshot.get("hints", {}) if isinstance(self._snapshot, dict) else {}
+            if not isinstance(hints, dict):
+                return []
+            return [
+                str(peer_id)
+                for peer_id, hint in hints.items()
+                if peer_id and isinstance(hint, dict) and bool(hint.get("member", False))
+            ]
 
     # ------------------------------------------------------------------
     # Coordination sections
@@ -701,6 +768,13 @@ class HiveHintAdapter:
             self._validate_route_segment_lease,
         )
 
+    def get_route_segment_leases_fresh(self) -> list[dict]:
+        """Return route-segment leases only from a fresh snapshot."""
+        return self._get_section_entries_fresh(
+            "route_segment_leases",
+            self._validate_route_segment_lease,
+        )
+
     def get_rebalance_recommendations(self) -> list[dict]:
         """Return validated rebalance recommendations or [] if unavailable/stale."""
         return self._get_section_entries(
@@ -708,9 +782,23 @@ class HiveHintAdapter:
             self._validate_rebalance_recommendation,
         )
 
+    def get_rebalance_recommendations_fresh(self) -> list[dict]:
+        """Return rebalance recommendations only from a fresh snapshot."""
+        return self._get_section_entries_fresh(
+            "rebalance_recommendations",
+            self._validate_rebalance_recommendation,
+        )
+
     def get_rebalance_campaigns(self) -> list[dict]:
         """Return validated rebalance campaigns or [] if unavailable/stale."""
         return self._get_section_entries(
+            "rebalance_campaigns",
+            self._validate_rebalance_campaign,
+        )
+
+    def get_rebalance_campaigns_fresh(self) -> list[dict]:
+        """Return rebalance campaigns only from a fresh snapshot."""
+        return self._get_section_entries_fresh(
             "rebalance_campaigns",
             self._validate_rebalance_campaign,
         )
@@ -835,9 +923,19 @@ class HiveHintAdapter:
         hint = self._get_peer_hint(peer_id)
         return bool(hint.get("closure_recommended", False))
 
+    def is_closure_recommended_fresh(self, peer_id: str) -> bool:
+        """Return closure recommendation only from a fresh snapshot."""
+        hint = self._get_peer_hint_fresh(peer_id)
+        return bool(hint.get("closure_recommended", False))
+
     def get_closure_reason(self, peer_id: str) -> str:
         """Return closure reason string, or '' if no recommendation."""
         hint = self._get_peer_hint(peer_id)
+        return str(hint.get("closure_reason", ""))
+
+    def get_closure_reason_fresh(self, peer_id: str) -> str:
+        """Return closure reason only from a fresh snapshot."""
+        hint = self._get_peer_hint_fresh(peer_id)
         return str(hint.get("closure_reason", ""))
 
     # ------------------------------------------------------------------
@@ -918,26 +1016,27 @@ class HiveHintAdapter:
         }
 
     def _cache_debug_view(self) -> dict:
-        cache = self._snapshot_debug_view(
-            self._snapshot,
-            self._snapshot_source,
-            {
-                "queried": False,
-                "available": self._snapshot is not None,
-                "transport": "adapter_cache",
-                "reason": "missing" if self._snapshot is None else "",
-            },
-        )
-        cache["fresh"] = self.is_fresh()
-        cache["usable"] = self.is_usable()
-        cache["stale_fallback"] = self._using_stale_fallback
-        cache["fetched_at"] = int(self._snapshot_fetched_at or 0) or None
-        cache["cache_age_seconds"] = (
-            int(time.time()) - int(self._snapshot_fetched_at)
-            if self._snapshot_fetched_at
-            else None
-        )
-        return cache
+        with self._lock:
+            cache = self._snapshot_debug_view(
+                self._snapshot,
+                self._snapshot_source,
+                {
+                    "queried": False,
+                    "available": self._snapshot is not None,
+                    "transport": "adapter_cache",
+                    "reason": "missing" if self._snapshot is None else "",
+                },
+            )
+            cache["fresh"] = self._snapshot_is_fresh(self._snapshot)
+            cache["usable"] = self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback
+            cache["stale_fallback"] = self._using_stale_fallback
+            cache["fetched_at"] = int(self._snapshot_fetched_at or 0) or None
+            cache["cache_age_seconds"] = (
+                int(time.time()) - int(self._snapshot_fetched_at)
+                if self._snapshot_fetched_at
+                else None
+            )
+            return cache
 
     @staticmethod
     def _fallback_reason_from_probe(prefix: str, probe: dict) -> str:
@@ -1067,40 +1166,41 @@ class HiveHintAdapter:
         return diagnostics
 
     def get_status(self) -> dict:
-        if self._snapshot is None:
+        with self._lock:
+            if self._snapshot is None:
+                return {
+                    "snapshot_fresh": False,
+                    "snapshot_usable": False,
+                    "stale_fallback": False,
+                    "snapshot_age_seconds": None,
+                    "snapshot_generated_at": None,
+                    "snapshot_fetched_at": None,
+                    "adapter_cache_age_seconds": None,
+                    "effective_ttl_seconds": self._effective_ttl_for(None),
+                    "snapshot_source": self._snapshot_source,
+                    "hints_count": 0,
+                }
+            age = int(time.time()) - int(self._snapshot.get("generated_at", 0))
+            cache_age = int(time.time()) - int(self._snapshot_fetched_at or 0) if self._snapshot_fetched_at else None
+            hints = self._snapshot.get("hints", {})
+            member_hints = [
+                hint
+                for hint in hints.values()
+                if isinstance(hint, dict) and bool(hint.get("member", False))
+            ]
             return {
-                "snapshot_fresh": False,
-                "snapshot_usable": False,
-                "stale_fallback": False,
-                "snapshot_age_seconds": None,
-                "snapshot_generated_at": None,
-                "snapshot_fetched_at": None,
-                "adapter_cache_age_seconds": None,
-                "effective_ttl_seconds": self._effective_ttl_for(None),
+                "snapshot_fresh": self._snapshot_is_fresh(self._snapshot),
+                "snapshot_usable": self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback,
+                "stale_fallback": self._using_stale_fallback,
+                "snapshot_age_seconds": age,
+                "snapshot_generated_at": int(self._snapshot.get("generated_at", 0) or 0),
+                "snapshot_fetched_at": int(self._snapshot_fetched_at or 0),
+                "adapter_cache_age_seconds": cache_age,
+                "effective_ttl_seconds": self._effective_ttl_for(self._snapshot),
                 "snapshot_source": self._snapshot_source,
-                "hints_count": 0,
+                "hints_count": len(hints),
+                "member_hints_count": len(member_hints),
+                "rebalance_recommendations_count": len(self._get_section_entries("rebalance_recommendations", self._validate_rebalance_recommendation)),
+                "rebalance_campaigns_count": len(self._get_section_entries("rebalance_campaigns", self._validate_rebalance_campaign)),
+                "route_segment_leases_count": len(self._get_section_entries("route_segment_leases", self._validate_route_segment_lease)),
             }
-        age = int(time.time()) - int(self._snapshot.get("generated_at", 0))
-        cache_age = int(time.time()) - int(self._snapshot_fetched_at or 0) if self._snapshot_fetched_at else None
-        hints = self._snapshot.get("hints", {})
-        member_hints = [
-            hint
-            for hint in hints.values()
-            if isinstance(hint, dict) and bool(hint.get("member", False))
-        ]
-        return {
-            "snapshot_fresh": self.is_fresh(),
-            "snapshot_usable": self.is_usable(),
-            "stale_fallback": self._using_stale_fallback,
-            "snapshot_age_seconds": age,
-            "snapshot_generated_at": int(self._snapshot.get("generated_at", 0) or 0),
-            "snapshot_fetched_at": int(self._snapshot_fetched_at or 0),
-            "adapter_cache_age_seconds": cache_age,
-            "effective_ttl_seconds": self._effective_ttl(),
-            "snapshot_source": self._snapshot_source,
-            "hints_count": len(hints),
-            "member_hints_count": len(member_hints),
-            "rebalance_recommendations_count": len(self.get_rebalance_recommendations()),
-            "rebalance_campaigns_count": len(self.get_rebalance_campaigns()),
-            "route_segment_leases_count": len(self.get_route_segment_leases()),
-        }

@@ -9,6 +9,7 @@ cfg.base_fee_msat path is used for every channel.
 
 import os
 import sys
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -74,6 +75,17 @@ class _FakeHints:
 
     def is_hive_member(self, peer_id):
         return peer_id in self._hive
+
+
+class _MembershipStatusHints:
+    def __init__(self, status):
+        self._status = dict(status)
+
+    def get_membership_status(self, peer_id):
+        return {**self._status, "peer_id": peer_id}
+
+    def _effective_ttl(self):
+        return int(self._status.get("effective_ttl_seconds", 900) or 900)
 
 
 def test_policy_off_uses_legacy_base_fee_msat(mock_plugin, mock_database):
@@ -276,3 +288,55 @@ def test_resolve_base_fee_msat_branches(mock_plugin, mock_database):
     fc_adp.hive_hints = None
     assert fc_adp._resolve_base_fee_msat(hive_peer, cfg_adp.snapshot()) == 999
     assert fc_adp._resolve_base_fee_msat(stranger, cfg_adp.snapshot()) == 999
+
+
+def test_adaptive_base_fee_preserves_cached_member_during_stale_cache(mock_plugin, mock_database):
+    from modules.config import Config
+    from modules.fee_controller import FeeController
+
+    hive_peer = "02" + "a" * 64
+    cfg = Config(
+        base_fee_msat=999,
+        base_fee_policy="adaptive",
+        base_fee_msat_intra_fleet=7,
+        base_fee_msat_non_hive=2500,
+    )
+    fc = FeeController(mock_plugin, cfg, mock_database)
+    fc.hive_hints = _MembershipStatusHints({
+        "known": False,
+        "member": False,
+        "fresh": False,
+        "usable": False,
+        "source": "datastore",
+        "effective_ttl_seconds": 900,
+    })
+    fc._hive_member_set_at[hive_peer] = int(time.time())
+
+    assert fc._classify_channel_role(hive_peer) == "intra_fleet"
+    assert fc._resolve_base_fee_msat(hive_peer, cfg.snapshot()) == 7
+
+
+def test_adaptive_base_fee_falls_back_to_legacy_when_hive_state_absent(mock_plugin, mock_database):
+    from modules.config import Config
+    from modules.fee_controller import FeeController
+
+    hive_peer = "02" + "a" * 64
+    cfg = Config(
+        base_fee_msat=999,
+        base_fee_policy="adaptive",
+        base_fee_msat_intra_fleet=7,
+        base_fee_msat_non_hive=2500,
+    )
+    fc = FeeController(mock_plugin, cfg, mock_database)
+    fc.hive_hints = _MembershipStatusHints({
+        "known": False,
+        "member": False,
+        "fresh": False,
+        "usable": False,
+        "source": "none",
+        "effective_ttl_seconds": 900,
+    })
+    fc._hive_member_set_at[hive_peer] = int(time.time())
+
+    assert fc._classify_channel_role(hive_peer) == "unknown"
+    assert fc._resolve_base_fee_msat(hive_peer, cfg.snapshot()) == 999

@@ -528,6 +528,25 @@ class EVRebalancer:
         except Exception:
             return 1.0
 
+    def _fresh_hive_entries(self, getter_name: str) -> List[Dict[str, Any]]:
+        """Return action-grade hive entries only when the snapshot is fresh."""
+        if self.hive_hints is None:
+            return []
+        freshness = getattr(self.hive_hints, "is_fresh", None)
+        if callable(freshness):
+            try:
+                if not freshness():
+                    return []
+            except Exception:
+                return []
+        fresh_getter = getattr(self.hive_hints, f"{getter_name}_fresh", None)
+        getter = fresh_getter if callable(fresh_getter) else getattr(self.hive_hints, getter_name, None)
+        if not callable(getter):
+            return []
+        try:
+            return [entry for entry in (getter() or []) if isinstance(entry, dict)]
+        except Exception:
+            return []
 
     @staticmethod
     def _normalize_coordination_value(value: Any) -> str:
@@ -713,7 +732,7 @@ class EVRebalancer:
         if self.hive_hints is not None:
             try:
                 if context["coordination_hint_type"] == "campaign":
-                    campaigns = list(self.hive_hints.get_rebalance_campaigns() or [])
+                    campaigns = self._fresh_hive_entries("get_rebalance_campaigns")
                     entry = next(
                         (
                             campaign for campaign in campaigns
@@ -730,7 +749,7 @@ class EVRebalancer:
                             {},
                         )
                 else:
-                    recommendations = list(self.hive_hints.get_rebalance_recommendations() or [])
+                    recommendations = self._fresh_hive_entries("get_rebalance_recommendations")
                     entry = next(
                         (
                             recommendation for recommendation in recommendations
