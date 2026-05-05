@@ -847,7 +847,10 @@ class CapacityPlanner:
             hive_closure_flagged = False
             if self.hive_hints is not None:
                 try:
-                    hive_closure_flagged = self.hive_hints.is_closure_recommended(prof.peer_id)
+                    checker = getattr(self.hive_hints, "is_closure_recommended_fresh", None)
+                    if not callable(checker):
+                        checker = getattr(self.hive_hints, "is_closure_recommended", None)
+                    hive_closure_flagged = bool(checker(prof.peer_id)) if callable(checker) else False
                 except Exception:
                     pass
 

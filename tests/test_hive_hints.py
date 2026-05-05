@@ -271,11 +271,15 @@ class TestPolling:
         snapshot = {
             "generated_at": int(time.time()) - 2000,
             "ttl_seconds": 900,
+            "rebalance_recommendations": [
+                {"recommendation_id": "stale-rec", "source_scid": "1x1x1", "sink_scid": "2x2x2"}
+            ],
             "hints": {
                 "02stale": {
                     "member": True,
                     "traffic_confidence": 0.5,
                     "corridor_role": "owner",
+                    "closure_recommended": True,
                 }
             },
         }
@@ -290,6 +294,12 @@ class TestPolling:
         assert adapter.is_fresh() is False
         assert adapter.is_usable() is True
         assert adapter.is_hive_member("02stale") is True
+        assert adapter.get_membership_status("02stale")["member"] is True
+        assert adapter.get_membership_status("02stale")["fresh"] is False
+        assert adapter.get_rebalance_recommendations()
+        assert adapter.get_rebalance_recommendations_fresh() == []
+        assert adapter.is_closure_recommended("02stale") is True
+        assert adapter.is_closure_recommended_fresh("02stale") is False
         status = adapter.get_status()
         assert status["snapshot_fresh"] is False
         assert status["snapshot_usable"] is True
@@ -1242,6 +1252,10 @@ class TestMemberLookup:
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
         adapter.poll()
         assert adapter.is_hive_member("02unknown") is False
+        status = adapter.get_membership_status("02unknown")
+        assert status["known"] is False
+        assert status["member"] is False
+        assert status["fresh"] is True
 
     def test_is_hive_member_false_when_stale(self, mock_plugin):
         stale = dict(VALID_SNAPSHOT)

@@ -90,6 +90,43 @@ class TestFeeHiveBias:
 
         assert multiplier > 1.5
 
+    def test_hive_fee_debug_exposes_bounded_hint_attribution(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        adapter = MagicMock()
+        adapter.get_status.return_value = {
+            "snapshot_fresh": True,
+            "snapshot_usable": True,
+            "snapshot_source": "datastore",
+            "snapshot_age_seconds": 12,
+            "effective_ttl_seconds": 900,
+        }
+        adapter.get_membership_status.return_value = {
+            "known": True,
+            "member": True,
+            "fresh": True,
+            "usable": True,
+            "source": "datastore",
+        }
+        adapter.get_fee_bias.return_value = 1.5
+        adapter.get_traffic_confidence.return_value = 0.9
+        adapter.get_peak_hours.return_value = []
+        adapter.get_centrality.return_value = 0.05
+        adapter.get_corridor_role.return_value = "owner"
+        adapter.get_fee_elasticity.return_value = 0.25
+        adapter.get_peer_quality_score.return_value = 0.8
+        adapter.get_fleet_fee_prior.return_value = 120
+        adapter.get_optimal_fee_estimate.return_value = 150
+        fc.hive_hints = adapter
+
+        debug = fc.get_hive_fee_hint_debug("02aabb")
+
+        assert debug["snapshot_fresh"] is True
+        assert debug["snapshot_source"] == "datastore"
+        assert debug["membership"]["member"] is True
+        assert debug["fee_bias"] == 1.1
+        assert debug["exploration_multiplier"] > 1.0
+        assert debug["peer_quality_score"] == 0.8
+
 
 class TestMemberFeePolicy:
     def test_hive_member_uses_advisory_dynamic_fee(self, mock_plugin, mock_config, mock_database):

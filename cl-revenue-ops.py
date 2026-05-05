@@ -2302,11 +2302,10 @@ def run_flow_analysis():
 
 def _refresh_fee_cycle_hive_inputs():
     """Refresh advisory hive inputs before any fee adjustment path."""
-    if hive_hints is not None:
-        try:
-            hive_hints.poll()
-        except Exception:
-            pass  # fail-open
+    try:
+        refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
+    except Exception:
+        pass  # fail-open
 
     if policy_manager is not None and hive_hints is not None:
         try:
@@ -2933,9 +2932,22 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     min_forwards = profile["min_forwards_for_signal"]
     market_boundary_configured = bool(getattr(cfg_snap, "fee_market_boundary_enabled", False))
 
+    hive_refresh_debug = {
+        "attempted": False,
+        "ok": False,
+    }
+    if hive_hints is not None or hive_router is not None:
+        hive_refresh_debug["attempted"] = True
+        try:
+            refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
+            hive_refresh_debug["ok"] = True
+        except Exception as e:
+            hive_refresh_debug["error"] = str(e)
+
     now = int(time.time())
     result = {
         "timestamp": now,
+        "hive_refresh": hive_refresh_debug,
         "config": {
             "fee_interval_seconds": config.fee_interval if config else 1800,
             "fee_profile": profile["name"],
@@ -3010,8 +3022,16 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             result["summary"]["waiting_time"] += 1
 
         chan_state = state_lookup.get(channel_id, {})
+        peer_id = str(chan_state.get("peer_id") or "")
+        hive_fee_debug = {}
+        if peer_id and hasattr(fee_controller, "get_hive_fee_hint_debug"):
+            try:
+                hive_fee_debug = fee_controller.get_hive_fee_hint_debug(peer_id)
+            except Exception as e:
+                hive_fee_debug = {"error": str(e)}
         result["channels"].append({
             "channel_id": channel_id[:12] + "..." if len(channel_id) > 12 else channel_id,
+            "peer_id": peer_id,
             "status": status,
             "skip_reason": skip_reason,
             "is_sleeping": bool(is_sleeping),
@@ -3034,6 +3054,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
                 "contextual_sample_used": bool(v2_state.get("last_contextual_sample_used", False)),
                 "contexts_tracked": len(ts_state.get("contextual_posteriors") or {}),
             },
+            "hive": hive_fee_debug,
         })
         result["summary"]["total"] += 1
 

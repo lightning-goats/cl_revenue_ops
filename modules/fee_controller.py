@@ -1821,6 +1821,96 @@ class FeeController:
         except Exception:
             return 1.0
 
+    def _hive_hint_effective_ttl(self) -> int:
+        if self.hive_hints is None:
+            return 900
+        try:
+            if hasattr(self.hive_hints, "_effective_ttl"):
+                return max(1, int(self.hive_hints._effective_ttl()))
+        except Exception:
+            pass
+        try:
+            status = self.hive_hints.get_status()
+            return max(1, int(status.get("effective_ttl_seconds", 900) or 900))
+        except Exception:
+            return 900
+
+    def _cached_hive_membership_active(self, peer_id: str) -> bool:
+        last_set = self._hive_member_set_at.get(peer_id)
+        if last_set is None:
+            return False
+        return int(time.time()) - int(last_set) <= self._hive_hint_effective_ttl() * 2
+
+    def _remember_hive_member(self, peer_id: str) -> bool:
+        previous_seen_at = self._hive_member_set_at.get(peer_id)
+        self._hive_member_set_at[peer_id] = int(time.time())
+        if previous_seen_at is None:
+            self._hive_member_advisory_peers.add(peer_id)
+        return previous_seen_at is None
+
+    def _clear_hive_member_cache(self, peer_id: str, *, release: bool) -> None:
+        if release and peer_id in self._hive_member_set_at:
+            self._hive_member_released_peers.add(peer_id)
+        self._hive_member_set_at.pop(peer_id, None)
+        self._hive_member_advisory_peers.discard(peer_id)
+
+    def _get_hive_membership_status(self, peer_id: str) -> Dict[str, Any]:
+        if self.hive_hints is None:
+            return {
+                "peer_id": str(peer_id or ""),
+                "known": False,
+                "member": False,
+                "fresh": False,
+                "usable": False,
+                "source": "none",
+            }
+        getter = getattr(self.hive_hints, "get_membership_status", None)
+        if callable(getter):
+            try:
+                status = getter(peer_id)
+                if isinstance(status, dict):
+                    return {
+                        "peer_id": str(status.get("peer_id") or peer_id or ""),
+                        "known": bool(status.get("known", False)),
+                        "member": bool(status.get("member", False)),
+                        "fresh": bool(status.get("fresh", False)),
+                        "usable": bool(status.get("usable", False)),
+                        "stale_fallback": bool(status.get("stale_fallback", False)),
+                        "source": str(status.get("source") or "unknown"),
+                        "generation": status.get("generation"),
+                        "age_seconds": status.get("age_seconds"),
+                        "effective_ttl_seconds": status.get("effective_ttl_seconds"),
+                    }
+            except Exception:
+                pass
+
+        usable = True
+        fresh = True
+        try:
+            if hasattr(self.hive_hints, "is_usable"):
+                usable = bool(self.hive_hints.is_usable())
+        except Exception:
+            usable = True
+        try:
+            if hasattr(self.hive_hints, "is_fresh"):
+                fresh = bool(self.hive_hints.is_fresh())
+        except Exception:
+            fresh = usable
+        member = False
+        if usable:
+            try:
+                member = bool(self.hive_hints.is_hive_member(peer_id))
+            except Exception:
+                member = False
+        return {
+            "peer_id": str(peer_id or ""),
+            "known": bool(usable),
+            "member": bool(member),
+            "fresh": bool(fresh),
+            "usable": bool(usable),
+            "source": "legacy_adapter",
+        }
+
     def _classify_channel_role(self, peer_id: str) -> str:
         """Return channel role for base_fee selection.
 
@@ -1835,11 +1925,17 @@ class FeeController:
             return "non_hive"
         if self.hive_hints is None:
             return "non_hive"
-        try:
-            if self.hive_hints.is_hive_member(peer_id):
+        status = self._get_hive_membership_status(peer_id)
+        if status.get("member"):
+            self._remember_hive_member(peer_id)
+            return "intra_fleet"
+        if not status.get("usable"):
+            if (
+                status.get("source") not in ("none", "legacy_adapter")
+                and self._cached_hive_membership_active(peer_id)
+            ):
                 return "intra_fleet"
-        except Exception:
-            pass
+            return "unknown"
         return "non_hive"
 
     def _resolve_base_fee_msat(self, peer_id: str, cfg: Optional['ConfigSnapshot'] = None) -> int:
@@ -1875,6 +1971,8 @@ class FeeController:
         role = self._classify_channel_role(peer_id)
         if role == "intra_fleet":
             return _cfg_int('base_fee_msat_intra_fleet', 0)
+        if role == "unknown":
+            return _cfg_int('base_fee_msat', 0)
         return _cfg_int('base_fee_msat_non_hive', 1000)
 
     def _get_hive_exploration_multiplier(self, peer_id: str) -> float:
@@ -1944,6 +2042,57 @@ class FeeController:
         except Exception:
             return 1.0
 
+    def get_hive_fee_hint_debug(self, peer_id: str) -> Dict[str, Any]:
+        """Return read-only fee hint attribution for operator debug surfaces."""
+        if self.hive_hints is None or not peer_id:
+            return {
+                "enabled": self.hive_hints is not None,
+                "peer_id": str(peer_id or ""),
+                "fee_bias": 1.0,
+                "temporal_multiplier": 1.0,
+                "exploration_multiplier": 1.0,
+                "membership": {"known": False, "member": False},
+            }
+
+        status: Dict[str, Any] = {}
+        try:
+            status = self.hive_hints.get_status()
+        except Exception:
+            status = {}
+        if not isinstance(status, dict):
+            status = {}
+
+        membership = self._get_hive_membership_status(peer_id)
+        debug: Dict[str, Any] = {
+            "enabled": True,
+            "peer_id": str(peer_id or ""),
+            "snapshot_fresh": bool(status.get("snapshot_fresh", False)),
+            "snapshot_usable": bool(status.get("snapshot_usable", False)),
+            "snapshot_source": str(status.get("snapshot_source") or ""),
+            "snapshot_age_seconds": status.get("snapshot_age_seconds"),
+            "effective_ttl_seconds": status.get("effective_ttl_seconds"),
+            "membership": membership,
+            "fee_bias": self._get_hive_fee_bias(peer_id),
+            "temporal_multiplier": self._get_temporal_fee_adjustment(peer_id),
+            "exploration_multiplier": self._get_hive_exploration_multiplier(peer_id),
+        }
+
+        for key, getter_name, default in (
+            ("corridor_role", "get_corridor_role", "none"),
+            ("traffic_confidence", "get_traffic_confidence", 0.0),
+            ("fee_elasticity", "get_fee_elasticity", 0.0),
+            ("peer_quality_score", "get_peer_quality_score", 0.5),
+            ("fleet_fee_prior_ppm", "get_fleet_fee_prior", None),
+            ("optimal_fee_estimate_ppm", "get_optimal_fee_estimate", 0),
+        ):
+            try:
+                getter = getattr(self.hive_hints, getter_name, None)
+                debug[key] = getter(peer_id) if callable(getter) else default
+            except Exception:
+                debug[key] = default
+
+        return debug
+
     def _get_network_fee_prior(self, peer_id: str, scid: str) -> dict | None:
         """Get informed prior from network gossip data for a channel.
 
@@ -1996,15 +2145,14 @@ class FeeController:
             # Hive quality signal: high-quality peers get tighter priors (faster convergence)
             if self.hive_hints:
                 try:
-                    hint = self.hive_hints._get_peer_hint(peer_id)
-                    if hint:
-                        quality = hint.get("peer_quality_score")
-                        if isinstance(quality, (int, float)) and quality > 0:
-                            quality = max(0.0, min(1.0, quality))
-                            # High quality (0.8+) → tighten std by up to 40%
-                            # Low quality (0.2-) → widen std by up to 30%
-                            quality_factor = 1.0 - (quality - 0.5) * 0.8  # 0.5→1.0, 1.0→0.6, 0.0→1.4
-                            prior_std = max(30, int(prior_std * quality_factor))
+                    quality_getter = getattr(self.hive_hints, "get_peer_quality_score", None)
+                    quality = quality_getter(peer_id) if callable(quality_getter) else 0.5
+                    if isinstance(quality, (int, float)) and quality > 0:
+                        quality = max(0.0, min(1.0, float(quality)))
+                        # High quality (0.8+) tightens std by up to 40%.
+                        # Low quality (0.2-) widens std by up to 30%.
+                        quality_factor = 1.0 - (quality - 0.5) * 0.8  # 0.5->1.0, 1.0->0.6, 0.0->1.4
+                        prior_std = max(30, int(prior_std * quality_factor))
                 except Exception:
                     pass
 
@@ -2442,28 +2590,25 @@ class FeeController:
         if self.hive_hints is None:
             return None
 
-        hints_usable = True
-        try:
-            if hasattr(self.hive_hints, "is_usable"):
-                hints_usable = bool(self.hive_hints.is_usable())
-        except Exception:
-            hints_usable = True
+        status = self._get_hive_membership_status(peer_id)
+        hints_usable = bool(status.get("usable", False))
 
-        try:
-            if self.hive_hints.is_hive_member(peer_id):
-                previous_seen_at = self._hive_member_set_at.get(peer_id)
-                self._hive_member_set_at[peer_id] = int(time.time())
-                if previous_seen_at is None:
-                    self._hive_member_advisory_peers.add(peer_id)
-                return None
-        except Exception:
-            pass
+        if status.get("member"):
+            self._remember_hive_member(peer_id)
+            return None
 
         if not hints_usable:
-            if peer_id in self._hive_member_set_at:
-                self._hive_member_released_peers.add(peer_id)
-            self._hive_member_set_at.pop(peer_id, None)
-            self._hive_member_advisory_peers.discard(peer_id)
+            # A previously observed snapshot can age just past TTL before the
+            # next successful poll. Keep membership sticky through the grace
+            # window for fee/base-fee continuity, but release immediately when
+            # the adapter explicitly reports no hive state or an older test
+            # double cannot distinguish cache staleness from hive absence.
+            if (
+                status.get("source") not in ("none", "legacy_adapter")
+                and self._cached_hive_membership_active(peer_id)
+            ):
+                return None
+            self._clear_hive_member_cache(peer_id, release=True)
             return None
 
         # Grace period: treat stale-but-usable membership as advisory for one
@@ -2477,8 +2622,7 @@ class FeeController:
             if int(time.time()) - last_set <= ttl * 2:
                 return None
             else:
-                del self._hive_member_set_at[peer_id]
-                self._hive_member_advisory_peers.discard(peer_id)
+                self._clear_hive_member_cache(peer_id, release=False)
 
         return None
 
@@ -3961,6 +4105,9 @@ class FeeController:
         market_boundary_downshift_info = {"applied": False}
         market_boundary_support_info = {"applied": False}
         market_boundary_window_bypass_info = {"applied": False}
+        hive_fee_bias = 1.0
+        temporal_adj = 1.0
+        exploration_multiplier = 1.0
 
         # Detect critical state
         is_congested = (state and state.get("state") == "congested")
@@ -5337,6 +5484,10 @@ class FeeController:
                     "corridor_role": corridor_role,
                     "context_observation_count": context_observation_count,
                     "contextual_sample_used": contextual_sample_used,
+                    "hive_fee_bias": hive_fee_bias,
+                    "hive_temporal_multiplier": temporal_adj,
+                    "hive_exploration_multiplier": exploration_multiplier,
+                    "hive_membership": self._get_hive_membership_status(peer_id),
                 },
                 reason_code=fee_reason_code,
             )
