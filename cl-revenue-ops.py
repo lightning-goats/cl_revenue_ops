@@ -2490,6 +2490,99 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     }
 
 
+def _hive_hints_status_for_debug(plugin: Plugin, max_segment_scores: int = 20) -> Dict[str, Any]:
+    """Return read-only hive hint freshness diagnostics for operator surfaces."""
+    hive_refresh_error = ""
+    hive_refresh_attempted = False
+    hive_refresh_diagnostics = None
+
+    if hive_hints:
+        debug_refresher = getattr(hive_hints, "refresh_status_for_debug", None)
+        if callable(debug_refresher):
+            try:
+                candidate_diagnostics = debug_refresher()
+                if isinstance(candidate_diagnostics, dict):
+                    hive_refresh_diagnostics = candidate_diagnostics
+            except Exception as e:
+                hive_refresh_error = str(e)
+                plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
+
+        if hive_refresh_diagnostics is None:
+            poller = getattr(hive_hints, "poll", None)
+            if callable(poller):
+                hive_refresh_attempted = True
+                try:
+                    poller()
+                except Exception as e:
+                    hive_refresh_error = str(e)
+                    plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
+
+        try:
+            hive_status = hive_hints.get_status()
+        except Exception as e:
+            hive_status = {
+                "snapshot_fresh": False,
+                "snapshot_usable": False,
+                "hints_count": 0,
+                "status_error": str(e),
+            }
+    else:
+        hive_status = {"snapshot_fresh": False, "snapshot_usable": False, "hints_count": 0}
+
+    if not isinstance(hive_status, dict):
+        hive_status = {"snapshot_fresh": False, "snapshot_usable": False, "hints_count": 0}
+
+    if isinstance(hive_refresh_diagnostics, dict):
+        hive_refresh_attempted = bool(hive_refresh_diagnostics.get("refresh_attempted", False))
+        hive_status["cache"] = dict(hive_refresh_diagnostics.get("cache", {}) or {})
+        hive_status["cache_after_refresh"] = dict(hive_refresh_diagnostics.get("cache_after_refresh", {}) or {})
+        hive_status["live_datastore"] = dict(hive_refresh_diagnostics.get("live_datastore", {}) or {})
+        hive_status["live_hive_export"] = dict(hive_refresh_diagnostics.get("live_hive_export", {}) or {})
+        hive_status["fallback"] = dict(hive_refresh_diagnostics.get("fallback", {}) or {})
+        hive_status["status_refresh_needed"] = bool(hive_refresh_diagnostics.get("refresh_needed", False))
+        hive_status["status_refresh_result"] = str(hive_refresh_diagnostics.get("refresh_result") or "")
+
+    hive_status["status_refresh_attempted"] = hive_refresh_attempted
+    hive_status["status_refresh_ok"] = (not hive_refresh_error) and (
+        bool(hive_refresh_diagnostics is not None) or hive_refresh_attempted
+    )
+    if hive_refresh_error:
+        hive_status["status_refresh_error"] = hive_refresh_error
+
+    segment_scores: List[Dict[str, Any]] = []
+    if hive_hints is not None:
+        getter = getattr(hive_hints, "get_segment_scores", None)
+        if callable(getter):
+            try:
+                raw_scores = getter() or []
+            except Exception:
+                raw_scores = []
+            for raw in raw_scores:
+                if isinstance(raw, dict):
+                    segment_scores.append(dict(raw))
+    segment_scores.sort(
+        key=lambda entry: (
+            -abs(float(entry.get("net_utility", 0.0) or 0.0))
+            * float(entry.get("confidence", 0.0) or 0.0),
+            -float(entry.get("confidence", 0.0) or 0.0),
+            str(entry.get("short_channel_id") or ""),
+            int(entry.get("direction", 0) or 0),
+        )
+    )
+    max_segment_scores = max(0, int(max_segment_scores or 0))
+    if max_segment_scores:
+        segment_scores = segment_scores[:max_segment_scores]
+    hive_status["segment_scores_count"] = len(segment_scores)
+    hive_status["segment_scores"] = segment_scores
+    return hive_status
+
+
+@plugin.method("revenue-hive-hints-status")
+def revenue_hive_hints_status(plugin: Plugin, max_segment_scores: int = 20) -> Dict[str, Any]:
+    """Diagnostic: cl-mycelium hint freshness, fallback, and signal coverage."""
+    return _hive_hints_status_for_debug(plugin, max_segment_scores=max_segment_scores)
+
+
 @plugin.method("revenue-rebalance-debug")
 def revenue_rebalance_debug(
     plugin: Plugin,

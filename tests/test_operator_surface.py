@@ -1028,9 +1028,9 @@ def test_readme_examples_describe_current_hive_surfaces():
     assert "decision explainability" in readme
     assert "revenue-config set enable_vegas_reflex false" not in readme
     assert "lightning-cli revenue-policy set" not in readme
-    assert "cl-hive" in readme
+    assert "cl-mycelium" in readme
     assert "hive-hints" in readme
-    assert "hive (fleet intelligence)" in readme
+    assert "mycelium/hive hint contract" in readme
     assert "revenue-hive-hints-status" in readme
 
 
