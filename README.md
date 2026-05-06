@@ -90,6 +90,10 @@ Core Lightning
 See [Core Lightning Compatibility](docs/CORE_LIGHTNING_COMPATIBILITY.md) for the
 Polar-tested version floor and smoke checklist.
 
+### License
+
+`cl-revenue-ops` is released under the BSD 3-Clause License.
+
 ### Start The Plugin
 
 ```bash

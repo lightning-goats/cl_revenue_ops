@@ -48,15 +48,18 @@ coverage.xml
 # Logs
 *.log
 
-# Generated experiment outputs
+# Publication boundary: local-only development artifacts.
 #
-# Keep curated summaries in docs/ or as intentional top-level results/*.md files.
-# Timestamped run directories should stay local unless force-added on purpose.
-results/fee-*/
-results/hive-hints-truth-*/
-results/module-loop-*/
-results/rebalancer-polar-mcp-*/
+# Keep raw run captures, internal implementation plans, reviewer bundles, and
+# scratch analysis local. Publish operator docs, compatibility docs, and tests
+# that protect production behavior.
+results/
+docs/plans/
+docs/superpowers/
+docs/local/
+docs/internal/
 artifacts/
+*.zip
 
 # unittest.mock spillover from accidental file-backed mocks
 MagicMock/
