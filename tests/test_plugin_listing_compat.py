@@ -97,10 +97,13 @@ def load_plugin_module():
 def test_plugin_listing_entrypoint_and_dependency_contract():
     plugin_path = ROOT / "cl-revenue-ops.py"
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert plugin_path.exists()
     assert plugin_path.stat().st_mode & stat.S_IXUSR
-    assert "pyln-client" in requirements
+    assert "Core Lightning `v24.08.1+`" in readme
+    assert "Core Lightning v24.08.1+" in requirements
+    assert "pyln-client>=24.8.1" in requirements
 
 
 def test_plugin_listing_rpc_and_safe_default_contract():
@@ -123,4 +126,3 @@ def test_plugin_listing_rpc_and_safe_default_contract():
     assert options["revenue-ops-fee-market-boundary-enabled"]["default"] == "false"
     assert "revenue-ops-dry-run" in options
     assert mod.plugin.init_functions
-

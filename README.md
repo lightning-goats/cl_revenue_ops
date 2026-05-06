@@ -83,7 +83,7 @@ Core Lightning
 
 ### Requirements
 
-- Core Lightning `v23.05+`
+- Core Lightning `v24.08.1+`
 - Python `3.10+`
 - bookkeeper plugin: recommended for cleaner P&L and cost accounting
 
