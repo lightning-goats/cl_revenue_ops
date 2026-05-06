@@ -21,7 +21,29 @@ the smoke checklist below.
 | --- | --- | --- |
 | `v24.08.1` | Not supported | `getroutes` and `askrene-listlayers` exist, but `askrene-create-layer` is missing. |
 | `v24.11.1` | Pass | askrene create/update/bias/remove layer lifecycle passes; plugin starts with `pyln-client==24.11.1`; `revenue-status`, `revenue-fee-debug`, `revenue-rebalance-debug`, and `revenue-hive-hints-status` respond. |
+| `v25.02.2` | Pass | askrene layer creation passes; plugin starts with documented dependencies; `revenue-status`, `revenue-rebalance-debug`, and fresh live `hive-export-hints` consumption respond. |
+| `v25.05` | Pass | askrene layer creation passes; plugin starts with documented dependencies; `revenue-status`, `revenue-rebalance-debug`, and fresh live `hive-export-hints` consumption respond. |
 | `v25.09.3` | Pass | askrene layer creation/removal passes; plugin starts after adding a Python runtime to the Polar image; `revenue-status` and `revenue-rebalance-debug` respond. |
+| `v25.12` | Pass | askrene layer creation passes; plugin starts after adding a Python runtime to the Polar image; `revenue-status`, `revenue-rebalance-debug`, and fresh live `hive-export-hints` consumption respond. |
+
+## Real-Channel Askrene Smoke
+
+A three-node `v25.12` Polar topology (`alice -> bob -> carol`) was also tested
+with real public channels. The smoke created an askrene layer, applied
+`askrene-update-channel` and `askrene-bias-channel` to real
+`short_channel_id_dir` values, and confirmed `getroutes` returned the expected
+two-hop path through the temporary layer.
+
+Observed path:
+
+```text
+132x1x0/0 -> 120x1x0/1
+```
+
+Some Polar CLN images do not include Python by default. For those images, install
+a Python runtime before applying the plugin dependency smoke. This does not
+change the Core Lightning compatibility result; it only affects the test image's
+ability to run Python plugins.
 
 ## Smoke Checklist
 
