@@ -17,6 +17,8 @@ Classifications:
 - ZOMBIE: Underwater + low volume, should consider closing
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple
 from enum import Enum

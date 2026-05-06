@@ -98,12 +98,18 @@ def test_plugin_listing_entrypoint_and_dependency_contract():
     plugin_path = ROOT / "cl-revenue-ops.py"
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    compatibility = (ROOT / "docs" / "CORE_LIGHTNING_COMPATIBILITY.md").read_text(
+        encoding="utf-8"
+    )
 
     assert plugin_path.exists()
     assert plugin_path.stat().st_mode & stat.S_IXUSR
-    assert "Core Lightning `v24.08.1+`" in readme
-    assert "Core Lightning v24.08.1+" in requirements
-    assert "pyln-client>=24.8.1" in requirements
+    assert "Core Lightning `v24.11.1+`" in readme
+    assert "Core Lightning v24.11.1+" in requirements
+    assert "pyln-client>=24.11.1" in requirements
+    assert "Minimum supported Core Lightning: `v24.11.1+`" in compatibility
+    assert "`v24.08.1` | Not supported" in compatibility
+    assert "askrene-create-layer" in compatibility
 
 
 def test_plugin_listing_rpc_and_safe_default_contract():

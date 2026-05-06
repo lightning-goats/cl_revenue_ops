@@ -51,6 +51,8 @@ Revenue Calculation:
 - Demand-adjusted via Kalman flow estimation
 """
 
+from __future__ import annotations
+
 import time
 import random
 import math
