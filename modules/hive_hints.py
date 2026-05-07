@@ -10,6 +10,8 @@ If hints are missing, stale, invalid, or both transports fail, all
 lookups silently return 1.0 (neutral / no effect).
 """
 
+from __future__ import annotations
+
 import json
 import threading
 import time

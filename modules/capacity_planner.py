@@ -5,6 +5,8 @@ This module identifies "Winner" channels for capital injection
 and "Loser" channels for capital redeployment (Close).
 """
 
+from __future__ import annotations
+
 import json
 import math
 import time

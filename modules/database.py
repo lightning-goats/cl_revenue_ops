@@ -12,6 +12,8 @@ Thread Safety:
 - Prevents race conditions during concurrent writes (e.g., Rebalancer + Fee Controller)
 """
 
+from __future__ import annotations
+
 import sqlite3
 import os
 import time
