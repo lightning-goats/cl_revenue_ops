@@ -77,6 +77,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
 PLUGIN_VERSION = "2.5.1"
+HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 
 # =============================================================================
@@ -2518,7 +2519,7 @@ def _hive_hints_status_for_debug(plugin: Plugin, max_segment_scores: int = 20) -
                     plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
 
         try:
-            hive_status = hive_hints.get_status()
+            hive_status = hive_hints.get_status(live_refresh=False)
         except Exception as e:
             hive_status = {
                 "snapshot_fresh": False,
@@ -2548,6 +2549,7 @@ def _hive_hints_status_for_debug(plugin: Plugin, max_segment_scores: int = 20) -
     )
     if hive_refresh_error:
         hive_status["status_refresh_error"] = hive_refresh_error
+    hive_status["diagnostics_version"] = HIVE_HINTS_DIAGNOSTICS_VERSION
 
     segment_scores: List[Dict[str, Any]] = []
     if hive_hints is not None:
@@ -2958,7 +2960,7 @@ def revenue_rebalance_debug(
                     hive_refresh_error = str(e)
                     plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
         try:
-            hive_status = hive_hints.get_status()
+            hive_status = hive_hints.get_status(live_refresh=False)
         except Exception as e:
             hive_status = {
                 "snapshot_fresh": False,
@@ -2985,6 +2987,7 @@ def revenue_rebalance_debug(
     )
     if hive_refresh_error:
         hive_status["status_refresh_error"] = hive_refresh_error
+    hive_status["diagnostics_version"] = HIVE_HINTS_DIAGNOSTICS_VERSION
     segment_scores = _filtered_segment_scores()
     hive_status["segment_scores_count"] = len(segment_scores)
     if not summary_only:

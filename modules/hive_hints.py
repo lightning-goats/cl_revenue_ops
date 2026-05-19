@@ -874,7 +874,7 @@ class HiveHintAdapter:
     VALID_SIZE_BUCKETS = {"small", "medium", "large"}
     VALID_OPEN_REASONS = {
         "underserved_corridor", "improve_coverage", "reduce_overlap",
-        "member_connectivity", "none",
+        "member_connectivity", "organism_high_risk_suppression", "none",
     }
 
     def get_channel_open_hint(self, peer_id: str) -> dict:
@@ -1167,7 +1167,7 @@ class HiveHintAdapter:
         diagnostics["cache_after_refresh"] = self._cache_debug_view()
         return diagnostics
 
-    def get_status(self) -> dict:
+    def _status_from_cache(self) -> dict:
         with self._lock:
             if self._snapshot is None:
                 return {
@@ -1206,3 +1206,69 @@ class HiveHintAdapter:
                 "rebalance_campaigns_count": len(self._get_section_entries("rebalance_campaigns", self._validate_rebalance_campaign)),
                 "route_segment_leases_count": len(self._get_section_entries("route_segment_leases", self._validate_route_segment_lease)),
             }
+
+    @staticmethod
+    def _debug_refresh_result_for_status(refresh_result: str) -> str:
+        return {
+            "refreshed_from_hive_export": "refreshed_from_export",
+            "using_stale_datastore_fallback": "stale_fallback",
+            "invalid_live_hive_export": "invalid_snapshot",
+            "refresh_failed_cache_retained": "no_usable_hints",
+        }.get(str(refresh_result or ""), str(refresh_result or ""))
+
+    def _merge_debug_refresh_status(self, status: dict, diagnostics: dict) -> None:
+        cache = diagnostics.get("cache", {}) if isinstance(diagnostics, dict) else {}
+        datastore = diagnostics.get("live_datastore", {}) if isinstance(diagnostics, dict) else {}
+        export = diagnostics.get("live_hive_export", {}) if isinstance(diagnostics, dict) else {}
+        fallback = diagnostics.get("fallback", {}) if isinstance(diagnostics, dict) else {}
+        if not isinstance(cache, dict):
+            cache = {}
+        if not isinstance(datastore, dict):
+            datastore = {}
+        if not isinstance(export, dict):
+            export = {}
+        if not isinstance(fallback, dict):
+            fallback = {}
+
+        fallback_reason = str(fallback.get("reason") or "")
+        if fallback.get("stale_fallback_used"):
+            fallback_reason = str(fallback.get("stale_fallback_reason") or fallback_reason)
+
+        status.update({
+            "cached_snapshot_age_seconds": cache.get("age_seconds"),
+            "cached_snapshot_effective_ttl": cache.get("effective_ttl_seconds"),
+            "cached_snapshot_usable": bool(cache.get("usable", False)),
+            "live_datastore_age_seconds": datastore.get("age_seconds"),
+            "live_datastore_ttl_seconds": datastore.get("ttl_seconds"),
+            "live_datastore_usable": bool(datastore.get("usable", False)),
+            "live_datastore_generation": datastore.get("generation"),
+            "live_export_age_seconds": export.get("age_seconds"),
+            "live_export_ttl_seconds": export.get("ttl_seconds"),
+            "live_export_usable": bool(export.get("usable", False)),
+            "live_export_generation": export.get("generation"),
+            "refresh_attempted": bool(diagnostics.get("refresh_attempted", False)),
+            "refresh_result": self._debug_refresh_result_for_status(
+                str(diagnostics.get("refresh_result") or "")
+            ),
+            "fallback_reason": fallback_reason,
+        })
+
+    def get_status(self, live_refresh: bool = True) -> dict:
+        diagnostics = None
+        if live_refresh:
+            try:
+                with self._lock:
+                    refresh_needed = not self._snapshot_is_fresh(self._snapshot)
+                if refresh_needed:
+                    diagnostics = self.refresh_status_for_debug()
+            except Exception as e:
+                diagnostics = {
+                    "refresh_attempted": True,
+                    "refresh_result": "status_refresh_error",
+                    "fallback": {"reason": str(e)},
+                }
+
+        status = self._status_from_cache()
+        if isinstance(diagnostics, dict):
+            self._merge_debug_refresh_status(status, diagnostics)
+        return status

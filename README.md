@@ -193,6 +193,12 @@ lightning-cli revenue-config set daily_budget_sats 10000
   - `drain_direction` remains askrene/diagnostic only; the fee controller intentionally does not apply it directly
 - `revenue-hive-hints-status` reports freshness and signal coverage for the currently cached cl-mycelium hint snapshot.
 
+## cl_revenue_ops standalone invariant
+
+`cl_revenue_ops` remains a fully independent local executor when cl-hive or cl-mycelium is absent. Hint integration is confined to `modules/hive_hints.py`; missing datastore entries, unknown `hive-export-hints`, stale snapshots, malformed payloads, and disabled hint adapters must degrade to neutral hint lookups rather than crashing or changing budgets.
+
+The read-only operator surfaces `revenue-status`, `revenue-fee-debug`, `revenue-rebalance-debug`, and `revenue-hive-hints-status` must keep returning JSON in standalone mode. Bad hints must not call fee, rebalance, planner, Boltz, or CLN mutation RPCs. Valid classic cl-hive hints and valid cl-mycelium M2-scoped hints may bias local fee/rebalance/planner behavior only through the existing bounded caps; they never override local budget, safety, or executor policy. M2 `all_hints` is not a production default for this plugin.
+
 ## More Detail
 
 - Minimal config example: [config/cl-revenue-ops.conf.minimal](config/cl-revenue-ops.conf.minimal)
