@@ -1,12 +1,27 @@
 # cl-revenue-ops
 
-`cl-revenue-ops` is the local execution layer for routing profit and liquidity management on Core Lightning. It watches channel economics, adjusts fees, and executes rebalancing while keeping the normal operator surface intentionally small.
+`cl_revenue_ops` is the independent local execution layer for Core Lightning routing economics. It owns fee control, rebalance decisioning/execution, planner/capex, profitability analysis, and budget enforcement. It watches channel economics, adjusts fees, and executes rebalancing while keeping the normal operator surface intentionally small.
+
+It can consume bounded cl-mycelium hints, but those hints are optional enhancements, not dependencies. `cl_revenue_ops` must run safely when cl-mycelium or cl-hive is absent.
+
+## Product Architecture
+
+```text
+cl-mycelium coordinates.
+cl_revenue_ops executes.
+Core Lightning owns node runtime.
+```
+
+`cl-mycelium` may produce bounded hints and read-only context. `cl_revenue_ops` remains the local executor: it decides what is safe, applies local budgets and policy, and uses Core Lightning RPCs for execution when operator controls allow it.
 
 ## What Operators Need To Know
 
-- This is the executor. It owns local fee execution and rebalance execution.
-- `cl-mycelium` is the fleet coordination organism. `cl-revenue-ops` consumes its hints, but all spending decisions remain local and bounded by this plugin's controls.
+- This is the executor. It owns local fee execution, rebalance execution, planner/capex decisions, profitability analysis, and budgets.
+- `cl-mycelium` is the fleet coordination organism. `cl_revenue_ops` consumes its hints, but all spending decisions remain local and bounded by this plugin's controls.
+- `cl_revenue_ops` runs safely without cl-mycelium or cl-hive. Missing, stale, malformed, or unavailable hints neutralize safely.
+- Hints may bias local decisions only within bounded caps; they never override local budget, safety, or executor policy.
 - Live rebalances execute through `RebalanceEngineV2` using native explicit-route execution; route discovery is pinned to the `v3`/askrene router path.
+- There is no Sling dependency.
 - The normal runtime controls are `paused`, `daily_budget_sats`, fee rails, fee market-boundary knobs, and planner execution caps.
 - The primary operator surfaces are `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug`.
 - The normal workflow is decision explainability first, knob tuning second.
@@ -19,7 +34,8 @@
 
 - Route selection is pinned to `rebalance_router=v3`, which uses askrene and cl-mycelium-aware path discovery through the stable hive route layers.
 - Live execution uses the explicit route priced by askrene and pays it with native Core Lightning RPCs.
-- Failed route segments are recorded as local observations and exported through the `["revenue", "segment-observations"]` datastore key for cl-mycelium-aware routing bias.
+- Failed route segments are recorded as local observations and exported through the `["revenue", "segment-observations"]` datastore key for read-only route evidence.
+- No Sling plugin is required or used by the current execution path.
 
 ## Profitability Analysis
 
@@ -45,7 +61,19 @@ Payload shape:
 - Per channel msat fields: `fees_earned_msat`, `sourced_fee_contribution_msat`, `total_contribution_msat`, `volume_routed_msat`, `sourced_volume_msat`, `open_cost_msat`, `rebalance_cost_msat`, `net_pnl_msat`
 - Per channel counters: `forward_count`, `sourced_forward_count`, `total_forward_count`
 
-`revenue-profitability` remains available as an RPC surface, but the datastore snapshot is the canonical cross-plugin contract and is the path `cl-mycelium` should prefer.
+`revenue-profitability` remains available as an RPC surface, but the datastore snapshot is the canonical cross-plugin contract and is the path `cl-mycelium` should prefer. See [docs/contracts/REVENUE_PROFITABILITY_SUMMARY_CONTRACT.md](docs/contracts/REVENUE_PROFITABILITY_SUMMARY_CONTRACT.md).
+
+## Produced Telemetry Contracts
+
+`cl_revenue_ops` publishes read-only telemetry for cl-mycelium and other consumers:
+
+| Datastore key | Contract | Notes |
+| --- | --- | --- |
+| `["revenue","profitability-summary"]` | [REVENUE_PROFITABILITY_SUMMARY_CONTRACT.md](docs/contracts/REVENUE_PROFITABILITY_SUMMARY_CONTRACT.md) | msat-native profitability and channel role telemetry. |
+| `["revenue","capex-summary"]` | [REVENUE_CAPEX_SUMMARY_CONTRACT.md](docs/contracts/REVENUE_CAPEX_SUMMARY_CONTRACT.md) | capital posture telemetry; cannot authorize spend. |
+| `["revenue","segment-observations"]` | [REVENUE_SEGMENT_OBSERVATIONS_CONTRACT.md](docs/contracts/REVENUE_SEGMENT_OBSERVATIONS_CONTRACT.md) | route segment evidence; stale/malformed observations produce no penalty or score change. |
+
+Consumers must treat stale, missing, or malformed payloads as unknown confidence, not zero value or an action command.
 
 ## Channel Opening Intelligence
 
@@ -179,10 +207,10 @@ lightning-cli revenue-config set daily_budget_sats 10000
 
 ## cl-mycelium Hints
 
-`cl_revenue_ops` consumes `cl-mycelium` fleet hints only through `modules/hive_hints.py` (`HiveHintAdapter`). The adapter name, `hive-*` RPC names, and `["hive", "hints"]` datastore key remain the stable compatibility contract.
+`cl_revenue_ops` consumes `cl-mycelium` fleet hints only through `modules/hive_hints.py` (`HiveHintAdapter`). The adapter name, `hive-*` RPC names, and `["hive", "hints"]` datastore key remain the stable compatibility contract documented in [docs/contracts/HIVE_HINTS_CONTRACT.md](docs/contracts/HIVE_HINTS_CONTRACT.md).
 
 - Transport order is datastore first: read CLN datastore key `["hive", "hints"]`, then fall back to `hive-export-hints` only if the datastore payload is missing, stale, or invalid.
-- Missing or malformed per-peer hint entries degrade to neutral local behavior; they do not bypass fee, rebalance, planner, or policy safety rails.
+- Missing, stale, malformed, or unavailable hints degrade to neutral local behavior; they do not bypass fee, rebalance, planner, budget, or policy safety rails.
 - Once per fee cycle, `cl_revenue_ops` polls the hint snapshot and refreshes the shared `HiveRouter` compatibility layer (`hive-fleet` layer detection, fleet balance cache, route cache clear) so inbound-fee estimation and Boltz topology scoring see live fleet state instead of a startup-only snapshot.
 - Rebalance candidates are classified before pricing as `hive_only`, `hybrid`, or `market_only`. `hive_only` uses the active cl-mycelium-aware route pricer with live `hive-*` and `revenue-*` askrene layers, `hybrid` compares that fleet-aware route against the configured market router, and `market_only` stays on the configured router only.
 - Coordination hints now seed candidate generation before the active pair cap is applied. `rebalance_recommendations` / `rebalance_campaigns` can materialize coordinated pairs from peer IDs, local SCIDs, or route segments, and may steer policy via `route_policy`, `allow_market_fallback`, `prefer_hive_on_tie`, and `priority_score`.
@@ -193,11 +221,25 @@ lightning-cli revenue-config set daily_budget_sats 10000
   - `drain_direction` remains askrene/diagnostic only; the fee controller intentionally does not apply it directly
 - `revenue-hive-hints-status` reports freshness and signal coverage for the currently cached cl-mycelium hint snapshot.
 
+### Hint Diagnostics
+
+`revenue-hive-hints-status` is the primary full freshness diagnostic. The current diagnostic surface includes `diagnostics_version=standalone-hints-v1` and reports cache status, `cache_after_refresh`, `live_datastore`, `live_hive_export`, fallback state, and segment score counts.
+
+`revenue-rebalance-debug.hive_hints` corroborates hint freshness. `revenue-fee-debug` is a lighter supporting surface for fee debugging, not the primary full freshness diagnostic.
+
 ## cl_revenue_ops standalone invariant
 
 `cl_revenue_ops` remains a fully independent local executor when cl-hive or cl-mycelium is absent. Hint integration is confined to `modules/hive_hints.py`; missing datastore entries, unknown `hive-export-hints`, stale snapshots, malformed payloads, and disabled hint adapters must degrade to neutral hint lookups rather than crashing or changing budgets.
 
 The read-only operator surfaces `revenue-status`, `revenue-fee-debug`, `revenue-rebalance-debug`, and `revenue-hive-hints-status` must keep returning JSON in standalone mode. Bad hints must not call fee, rebalance, planner, Boltz, or CLN mutation RPCs. Valid classic cl-hive hints and valid cl-mycelium M2-scoped hints may bias local fee/rebalance/planner behavior only through the existing bounded caps; they never override local budget, safety, or executor policy. M2 `all_hints` is not a production default for this plugin.
+
+## Public Contract Docs
+
+- Contract index: [docs/contracts/README.md](docs/contracts/README.md)
+- Cross-repo doc reference audit: [docs/audits/CROSS_REPO_DOC_REFERENCE_AUDIT.md](docs/audits/CROSS_REPO_DOC_REFERENCE_AUDIT.md)
+- Standalone independence audit: [docs/audits/2026-05-19-standalone-independence-audit.md](docs/audits/2026-05-19-standalone-independence-audit.md)
+- Hint freshness diagnostics audit: [docs/audits/HIVE_HINT_FRESHNESS_DIAGNOSTICS_AUDIT.md](docs/audits/HIVE_HINT_FRESHNESS_DIAGNOSTICS_AUDIT.md)
+- Cross-plugin contract audit: [docs/audits/CROSS_PLUGIN_CONTRACT_AUDIT.md](docs/audits/CROSS_PLUGIN_CONTRACT_AUDIT.md)
 
 ## More Detail
 

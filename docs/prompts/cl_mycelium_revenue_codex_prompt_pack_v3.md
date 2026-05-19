@@ -1,5 +1,7 @@
 # cl-mycelium / cl_revenue_ops Codex Prompt Pack v3
 
+> Note: this is an archived task prompt pack, not public product documentation. Local/private observation prompts in this file are historical implementation material and are not part of the public product README or contract surface.
+
 Use these prompts after reviewing the current `cl_revenue_ops-main.zip`.
 
 The central invariant:

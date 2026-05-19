@@ -15,9 +15,9 @@ Follow-up audit for the Task 1 standalone hint diagnostics surface. This checks 
 - Malformed datastore/export payloads return JSON diagnostics, clear or avoid unusable cache, and leave fee/rebalance hint lookups neutral.
 - Missing cl-hive or unknown `hive-export-hints` reports `hive_unavailable` through the status refresh result and leaves hints unusable.
 
-## Hermes Guidance
+## Read-Only Consumer Guidance
 
-Hermes should treat `revenue-hive-hints-status` as the primary hint freshness surface and require `diagnostics_version == "standalone-hints-v1"` before relying on the detailed cache/datastore/export/fallback fields. If the version is absent or different, Hermes should record the deployment as an older or unknown diagnostic surface rather than inferring freshness.
+Read-only collectors should treat `revenue-hive-hints-status` as the primary hint freshness surface and require `diagnostics_version == "standalone-hints-v1"` before relying on the detailed cache/datastore/export/fallback fields. If the version is absent or different, collectors should record the deployment as an older or unknown diagnostic surface rather than inferring freshness.
 
 `revenue-rebalance-debug.hive_hints` is suitable as a corroborating read-only surface. `revenue-fee-debug` reports only hive refresh success or failure for fee debugging and should not be treated as the primary full freshness surface.
 

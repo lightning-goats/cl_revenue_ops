@@ -8,7 +8,7 @@ Datastore key: `["revenue", "capex-summary"]`
 
 ## Consumer
 
-cl-hive / cl-mycelium and Hermes may consume this datastore payload as read-only capital posture telemetry. Consumers must not use it to spend directly.
+cl-hive / cl-mycelium and other read-only consumers may consume this datastore payload as capital posture telemetry. Consumers must not use it to spend directly.
 
 ## Generated At
 

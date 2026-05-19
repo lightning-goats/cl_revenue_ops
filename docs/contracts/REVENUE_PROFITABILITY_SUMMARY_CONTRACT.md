@@ -8,7 +8,7 @@ Datastore key: `["revenue", "profitability-summary"]`
 
 ## Consumer
 
-cl-hive / cl-mycelium and Hermes may consume this datastore payload as read-only economic telemetry. Consumers must not call cl_revenue_ops action RPCs to obtain it.
+cl-hive / cl-mycelium and other read-only consumers may consume this datastore payload as economic telemetry. Consumers must not call cl_revenue_ops action RPCs to obtain it.
 
 ## Generated At
 
