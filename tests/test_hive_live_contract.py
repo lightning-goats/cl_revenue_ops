@@ -179,16 +179,18 @@ def live_snapshot() -> dict:
 
 
 class TestLiveHiveContract:
-    def test_quality_and_traffic_only_peers_survive_export(self, live_snapshot):
+    def test_current_live_export_contract_is_accepted(self, live_snapshot):
         adapter = _build_adapter(live_snapshot)
         hints = adapter._snapshot["hints"]
 
-        assert hints[PEER_QUALITY]["peer_quality_score"] == 0.81
-        assert hints[PEER_QUALITY]["traffic_confidence"] == 0.3
-        assert hints[PEER_QUALITY]["member"] is False
-        assert hints[PEER_TRAFFIC]["traffic_confidence"] == 0.73
-        assert hints[PEER_TRAFFIC]["member"] is False
-        assert adapter.get_rebalance_bias(PEER_QUALITY) > 1.0
+        # The current cl-hive export only emits actionable hints: rebalance
+        # preferences and corridor fee assignments. Quality-only and
+        # traffic-only peers are intentionally omitted by the producer.
+        assert PEER_QUALITY not in hints
+        assert PEER_TRAFFIC not in hints
+        assert hints[PEER_REBAL]["rebalance_preference"] == "sink"
+        assert hints[PEER_PRIMARY]["corridor_role"] == "owner"
+        assert hints[PEER_SECONDARY]["corridor_role"] == "secondary"
 
     def test_dominant_rebalance_direction_flows_through(self, live_snapshot):
         adapter = _build_adapter(live_snapshot)
@@ -206,6 +208,8 @@ class TestLiveHiveContract:
         adapter = _build_adapter_from_datastore(live_snapshot)
         hints = adapter._snapshot["hints"]
 
-        assert hints[PEER_QUALITY]["peer_quality_score"] == 0.81
+        assert PEER_QUALITY not in hints
+        assert PEER_TRAFFIC not in hints
         assert hints[PEER_REBAL]["rebalance_preference"] == "sink"
-        assert adapter.get_fleet_fee_prior(PEER_SECONDARY) == 900
+        assert hints[PEER_PRIMARY]["corridor_role"] == "owner"
+        assert hints[PEER_SECONDARY]["corridor_role"] == "secondary"

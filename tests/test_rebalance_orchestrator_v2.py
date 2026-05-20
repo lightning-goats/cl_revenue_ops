@@ -49,6 +49,9 @@ def _make_engine(channels=None, capex_budgets=None):
     config.low_liquidity_threshold = 0.35
     config.high_liquidity_threshold = 0.65
     config.rebalance_max_amount = 2_000_000
+    # Auto-run rebalance execution requires a non-zero global spend budget;
+    # pair-level capex budgets alone are not sufficient.
+    config.daily_budget_sats = 500
 
     database = MagicMock()
     database.record_rebalance.return_value = 1

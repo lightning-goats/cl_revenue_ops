@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from pyln.testing.fixtures import *  # noqa: F401,F403
+import pytest
+
+pytest.importorskip("pyln.testing")
+from pyln.testing.fixtures import *  # noqa: F401,F403,E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
