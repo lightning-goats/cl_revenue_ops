@@ -34,9 +34,34 @@ Required fields for each peer hint are intentionally minimal. Missing optional f
 - Top-level: `ttl_seconds`, `schema_version`, `generation`, `peer_count`, `producer`, `compat_schema`, `m2_scope`, `route_segment_leases`, `rebalance_recommendations`, `rebalance_campaigns`, `segment_scores`, `segment_observations`.
 - Peer hint: `member`, `direct_channel_peer`, `corridor_role`, `competition_bias`, `traffic_confidence`, `rebalance_preference`, `peer_quality_score`, `external_centrality`, `reputation_score`, `peak_hours_utc`, `drain_direction`, `fee_elasticity`, `optimal_fee_estimate_ppm`, `fleet_fee_median`, `fleet_capacity_sats`, `fleet_available_sats`, `fleet_topology`, `fleet_hive_topology`, `closure_recommended`, `closure_reason`, `channel_open_hint`.
 
+## M2 Scope Enforcement
+
+`cl_revenue_ops` enforces M2 scope on the consumer side in `modules/hive_hints.py`; producers should still pre-scope payloads, but consumers must not rely on that. Supported scopes are:
+
+- `legacy_seed_only`: only peers listed in `legacy_seed_peer_ids`, `legacy_peer_ids`, `seed_peer_ids`, or peer hints marked `legacy_seed_peer` / `legacy_seed` may receive M2-sensitive influence.
+- `channel_peers`: only peer hints marked `direct_channel_peer=true` may receive M2-sensitive influence.
+- `channel_and_fleet_peers`: production default for M2 payloads; only `direct_channel_peer=true` or `member=true` peers may receive M2-sensitive influence.
+- `all_hints`: explicit lab-only broad mode; must not be the production default.
+
+For payloads carrying M2 markers such as `m2_scope`, `producer=cl-mycelium`, or M2-compatible schema metadata, missing or unknown `m2_scope` falls back to `channel_and_fleet_peers`. Legacy payloads without M2 markers remain compatible with legacy seed behavior.
+
+M2-sensitive peer influence includes fee bias, rebalance bias, membership when derived from M2 metadata, corridor/drain/quality/reputation/traffic/elasticity/optimal-fee fields, fleet fee and topology fields, channel open hints, and closure recommendations. M2-sensitive section influence includes `route_segment_leases`, `rebalance_recommendations`, `rebalance_campaigns`, and peer-specific `segment_scores`. Unknown optional fields are ignored.
+
+Production M2 section hints should carry explicit peer identifiers so the consumer can enforce scope without trusting producer-side filtering. Supported identifier fields include top-level `peer_id`, `peer_ids`, `source_peer_id`, `destination_peer_id`, `from_peer_id`, `to_peer_id`, `target_peer_id`, member/executor/observer peer id fields, and `fallback_executor_member_ids`. `route_segments` may also include `source_peer_id` and `destination_peer_id`; the adapter preserves those nested identifiers during validation and applies scope checks to them. M2-sensitive section entries without peer identifiers are neutralized, except route-level aggregate `segment_scores` that intentionally have no peer id.
+
+Adapter diagnostics expose `m2_scope`, `m2_scope_enforced_by_consumer`, `m2_scope_lab_only_all_hints`, `m2_out_of_scope_peer_count`, and `m2_scope_neutralized_field_count`.
+
 ## Stale Behavior
 
-Fresh hints may bias local fee and rebalance decisions within hard caps. Stale hints return neutral lookups unless the adapter explicitly marks a recent stale datastore payload as stale fallback after live export fails.
+Fresh hints may bias local fee and rebalance decisions within hard caps. Stale hints return neutral lookups unless the adapter explicitly marks a recent stale datastore payload as stale fallback after live export fails. Stale fallback is never used for ancient, malformed, or invalid snapshots.
+
+`cl_revenue_ops` exposes an adapter stale fallback policy:
+
+- `diagnostics_only`: stale fallback is reported but all behavior lookups return neutral.
+- `bounded_bias`: default; stale fallback may influence only capped fee bias and capped rebalance bias. Open candidates, closure recommendations, route leases, campaigns, rebalance recommendations, segment scores, and segment observations return neutral.
+- `full_legacy_fallback`: explicit compatibility mode for the previous broad stale fallback behavior. This mode is not the safe default.
+
+Adapter diagnostics expose `stale_fallback_active`, `stale_fallback_policy`, `stale_fallback_behavior_fields_allowed`, and `stale_fallback_behavior_fields_neutralized`.
 
 ## Malformed Behavior
 
@@ -80,6 +105,7 @@ The current compatibility contract is legacy-compatible hints v1. Producers may 
   "segment_scores": [
     {
       "short_channel_id": "123x1x0",
+      "peer_id": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "direction": 1,
       "amount_bucket_sats": 250000,
       "success_score": 0.8,

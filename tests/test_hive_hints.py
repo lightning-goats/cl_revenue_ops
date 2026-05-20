@@ -293,12 +293,16 @@ class TestPolling:
         assert adapter._snapshot == snapshot
         assert adapter.is_fresh() is False
         assert adapter.is_usable() is True
-        assert adapter.is_hive_member("02stale") is True
-        assert adapter.get_membership_status("02stale")["member"] is True
-        assert adapter.get_membership_status("02stale")["fresh"] is False
-        assert adapter.get_rebalance_recommendations()
+        assert adapter.get_fee_bias("02stale") > 1.0
+        assert adapter.get_rebalance_bias("02stale") == 1.0
+        assert adapter.is_hive_member("02stale") is False
+        membership = adapter.get_membership_status("02stale")
+        assert membership["known"] is False
+        assert membership["member"] is False
+        assert membership["fresh"] is False
+        assert adapter.get_rebalance_recommendations() == []
         assert adapter.get_rebalance_recommendations_fresh() == []
-        assert adapter.is_closure_recommended("02stale") is True
+        assert adapter.is_closure_recommended("02stale") is False
         assert adapter.is_closure_recommended_fresh("02stale") is False
         status = adapter.get_status()
         assert status["snapshot_fresh"] is False
@@ -408,7 +412,9 @@ class TestPolling:
         assert diagnostics["cache_after_refresh"]["source"] == "datastore_stale_fallback"
         assert adapter.is_fresh() is False
         assert adapter.is_usable() is True
-        assert adapter.is_hive_member("02stale") is True
+        assert adapter.is_hive_member("02stale") is False
+        assert adapter.get_fee_bias("02stale") > 1.0
+        assert adapter.get_rebalance_bias("02stale") == 1.0
 
     def test_debug_refresh_malformed_datastore_hints_falls_back_to_hive_export(self, mock_plugin):
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
@@ -945,6 +951,385 @@ class TestSafetyRails:
             assert adapter.get_rebalance_bias(peer_id) == 1.0
 
 
+
+class TestM2ScopeEnforcement:
+    def _adapter(self, mock_plugin, snapshot):
+        snap = dict(snapshot)
+        snap["generated_at"] = int(time.time())
+        mock_plugin.rpc.call.return_value = snap
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        return adapter
+
+    def _snapshot(self, scope, hints, **sections):
+        payload = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "producer": "cl-mycelium",
+            "compat_schema": "legacy-hints/v1",
+            "m2_scope": scope,
+            "hints": hints,
+        }
+        payload.update(sections)
+        return payload
+
+    def _behavior_hint(self, *, member=False, direct=False, open_pref="open"):
+        return {
+            "member": member,
+            "direct_channel_peer": direct,
+            "corridor_role": "owner",
+            "competition_bias": 1,
+            "traffic_confidence": 1.0,
+            "rebalance_preference": "sink",
+            "peer_quality_score": 1.0,
+            "reputation_score": 90,
+            "fee_elasticity": -0.3,
+            "optimal_fee_estimate_ppm": 77,
+            "closure_recommended": True,
+            "closure_reason": "m2-test",
+            "channel_open_hint": {
+                "open_preference": open_pref,
+                "topology_confidence": 0.9,
+                "suggested_size_bucket": "medium",
+                "reason": "underserved_corridor",
+            },
+        }
+
+    def test_channel_and_fleet_scope_neutralizes_non_channel_non_fleet_peer(self, mock_plugin):
+        peer_id = "02out"
+        adapter = self._adapter(
+            mock_plugin,
+            self._snapshot(
+                "channel_and_fleet_peers",
+                {peer_id: self._behavior_hint(member=False, direct=False)},
+                route_segment_leases=[{"lease_id": "lease-out", "source_peer_id": peer_id, "route_segments": []}],
+                rebalance_recommendations=[{"recommendation_id": "rec-out", "source_peer_id": peer_id, "destination_peer_id": "02dest"}],
+                rebalance_campaigns=[{"campaign_id": "camp-out", "status": "active", "peer_id": peer_id}],
+                segment_scores=[{
+                    "peer_id": peer_id,
+                    "short_channel_id": "123x1x0",
+                    "direction": 1,
+                    "amount_bucket_sats": 250_000,
+                    "success_score": 0.1,
+                    "failure_score": 0.9,
+                    "net_utility": -0.8,
+                    "confidence": 0.9,
+                    "observer_count": 1,
+                    "last_observed_at": int(time.time()),
+                }],
+            ),
+        )
+
+        assert adapter.get_fee_bias(peer_id) == 1.0
+        assert adapter.get_rebalance_bias(peer_id) == 1.0
+        assert adapter.get_channel_open_hint(peer_id) == {}
+        assert adapter.get_open_candidates() == []
+        assert adapter.is_closure_recommended(peer_id) is False
+        assert adapter.get_route_segment_leases() == []
+        assert adapter.get_rebalance_recommendations() == []
+        assert adapter.get_rebalance_campaigns() == []
+        assert adapter.get_segment_scores() == []
+        status = adapter.get_status(live_refresh=False)
+        assert status["m2_scope"] == "channel_and_fleet_peers"
+        assert status["m2_scope_enforced_by_consumer"] is True
+        assert status["m2_scope_lab_only_all_hints"] is False
+        assert status["m2_out_of_scope_peer_count"] == 1
+        assert status["m2_scope_neutralized_field_count"] > 0
+
+    def test_m2_section_hints_use_nested_and_list_peer_identifiers_for_scope(self, mock_plugin):
+        direct_peer = "02direct"
+        dest_peer = "02dest"
+        out_peer = "02out"
+        adapter = self._adapter(
+            mock_plugin,
+            self._snapshot(
+                "channel_peers",
+                {
+                    direct_peer: self._behavior_hint(member=False, direct=True),
+                    dest_peer: self._behavior_hint(member=False, direct=True),
+                    out_peer: self._behavior_hint(member=True, direct=False),
+                },
+                route_segment_leases=[
+                    {
+                        "lease_id": "lease-in",
+                        "route_segments": [
+                            {
+                                "source": "123x1x0",
+                                "destination": "124x1x0",
+                                "source_peer_id": direct_peer,
+                                "destination_peer_id": dest_peer,
+                            }
+                        ],
+                    },
+                    {
+                        "lease_id": "lease-out",
+                        "route_segments": [
+                            {
+                                "source": "125x1x0",
+                                "destination": "126x1x0",
+                                "source_peer_id": direct_peer,
+                                "destination_peer_id": out_peer,
+                            }
+                        ],
+                    },
+                ],
+                rebalance_recommendations=[
+                    {
+                        "recommendation_id": "rec-in",
+                        "route_segments": [
+                            {
+                                "source": "123x1x0",
+                                "destination": "124x1x0",
+                                "source_peer_id": direct_peer,
+                                "destination_peer_id": dest_peer,
+                            }
+                        ],
+                    },
+                    {
+                        "recommendation_id": "rec-out",
+                        "route_segments": [
+                            {
+                                "source": "125x1x0",
+                                "destination": "126x1x0",
+                                "source_peer_id": direct_peer,
+                                "destination_peer_id": out_peer,
+                            }
+                        ],
+                    },
+                ],
+                rebalance_campaigns=[
+                    {"campaign_id": "camp-in", "status": "active", "peer_ids": [direct_peer, dest_peer]},
+                    {"campaign_id": "camp-out", "status": "active", "peer_ids": [out_peer]},
+                ],
+            ),
+        )
+
+        leases = adapter.get_route_segment_leases()
+        assert [lease["lease_id"] for lease in leases] == ["lease-in"]
+        assert leases[0]["route_segments"][0]["source_peer_id"] == direct_peer
+        assert leases[0]["route_segments"][0]["destination_peer_id"] == dest_peer
+        assert [rec["recommendation_id"] for rec in adapter.get_rebalance_recommendations()] == ["rec-in"]
+        assert [camp["campaign_id"] for camp in adapter.get_rebalance_campaigns()] == ["camp-in"]
+
+    def test_channel_peers_scope_neutralizes_fleet_only_peer(self, mock_plugin):
+        fleet_peer = "02fleet"
+        direct_peer = "02direct"
+        adapter = self._adapter(
+            mock_plugin,
+            self._snapshot(
+                "channel_peers",
+                {
+                    fleet_peer: self._behavior_hint(member=True, direct=False),
+                    direct_peer: self._behavior_hint(member=False, direct=True),
+                },
+            ),
+        )
+
+        assert adapter.get_fee_bias(fleet_peer) == 1.0
+        assert adapter.get_rebalance_bias(fleet_peer) == 1.0
+        assert adapter.is_hive_member(fleet_peer) is False
+        assert adapter.get_channel_open_hint(fleet_peer) == {}
+        assert adapter.get_fee_bias(direct_peer) > 1.0
+        assert adapter.get_rebalance_bias(direct_peer) > 1.0
+        assert adapter.get_channel_open_hint(direct_peer)["open_preference"] == "open"
+
+    def test_legacy_seed_only_scope_allows_only_seed_peers(self, mock_plugin):
+        seed_peer = "02seed"
+        other_peer = "02other"
+        adapter = self._adapter(
+            mock_plugin,
+            self._snapshot(
+                "legacy_seed_only",
+                {
+                    seed_peer: self._behavior_hint(member=False, direct=False),
+                    other_peer: self._behavior_hint(member=True, direct=True),
+                },
+                legacy_seed_peer_ids=[seed_peer],
+            ),
+        )
+
+        assert adapter.get_fee_bias(seed_peer) > 1.0
+        assert adapter.get_rebalance_bias(seed_peer) > 1.0
+        assert adapter.get_fee_bias(other_peer) == 1.0
+        assert adapter.get_rebalance_bias(other_peer) == 1.0
+
+    def test_all_hints_scope_allows_explicit_broad_lab_behavior(self, mock_plugin):
+        peer_id = "02lab"
+        adapter = self._adapter(
+            mock_plugin,
+            self._snapshot("all_hints", {peer_id: self._behavior_hint(member=False, direct=False)}),
+        )
+
+        assert adapter.get_fee_bias(peer_id) > 1.0
+        assert adapter.get_rebalance_bias(peer_id) > 1.0
+        assert adapter.get_channel_open_hint(peer_id)["open_preference"] == "open"
+        status = adapter.get_status(live_refresh=False)
+        assert status["m2_scope"] == "all_hints"
+        assert status["m2_scope_lab_only_all_hints"] is True
+
+    def test_missing_or_unknown_m2_scope_uses_safe_consumer_default(self, mock_plugin):
+        peer_id = "02out"
+        missing_scope = self._snapshot("channel_and_fleet_peers", {peer_id: self._behavior_hint()})
+        missing_scope.pop("m2_scope")
+        adapter = self._adapter(mock_plugin, missing_scope)
+        assert adapter.get_fee_bias(peer_id) == 1.0
+        assert adapter.get_rebalance_bias(peer_id) == 1.0
+        assert adapter.get_status(live_refresh=False)["m2_scope"] == "channel_and_fleet_peers"
+
+        unknown_scope = self._snapshot("surprise_scope", {peer_id: self._behavior_hint()})
+        adapter = self._adapter(mock_plugin, unknown_scope)
+        assert adapter.get_fee_bias(peer_id) == 1.0
+        assert adapter.get_rebalance_bias(peer_id) == 1.0
+        assert adapter.get_status(live_refresh=False)["m2_scope"] == "channel_and_fleet_peers"
+
+
+class TestStaleFallbackPolicy:
+    def _stale_adapter(self, mock_plugin, *, policy="bounded_bias"):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0, stale_fallback_policy=policy)
+        adapter.data_service = MagicMock()
+        stale_snapshot = {
+            "generated_at": int(time.time()) - 2_000,
+            "ttl_seconds": 900,
+            "hints": {
+                "02stale": {
+                    "member": True,
+                    "direct_channel_peer": True,
+                    "corridor_role": "owner",
+                    "competition_bias": 1,
+                    "traffic_confidence": 1.0,
+                    "rebalance_preference": "sink",
+                    "peer_quality_score": 1.0,
+                    "closure_recommended": True,
+                    "channel_open_hint": {
+                        "open_preference": "open",
+                        "topology_confidence": 1.0,
+                    },
+                }
+            },
+            "rebalance_recommendations": [
+                {"recommendation_id": "stale-rec", "source_peer_id": "02stale", "destination_peer_id": "02dest"}
+            ],
+            "rebalance_campaigns": [
+                {"campaign_id": "stale-camp", "status": "active", "peer_id": "02stale"}
+            ],
+            "route_segment_leases": [
+                {"lease_id": "stale-lease", "source_peer_id": "02stale", "route_segments": []}
+            ],
+            "segment_scores": [
+                {
+                    "peer_id": "02stale",
+                    "short_channel_id": "123x1x0",
+                    "direction": 1,
+                    "amount_bucket_sats": 250_000,
+                    "success_score": 0.1,
+                    "failure_score": 0.9,
+                    "net_utility": -0.8,
+                    "confidence": 0.9,
+                    "observer_count": 1,
+                    "last_observed_at": int(time.time()) - 2_000,
+                }
+            ],
+        }
+        adapter.data_service.list_datastore.return_value = {"datastore": [{"string": json.dumps(stale_snapshot)}]}
+        mock_plugin.rpc.call.side_effect = Exception("hive-export-hints timeout")
+        adapter.poll()
+        return adapter
+
+    def test_diagnostics_only_policy_neutralizes_all_behavior(self, mock_plugin):
+        adapter = self._stale_adapter(mock_plugin, policy="diagnostics_only")
+
+        assert adapter.is_usable() is True
+        assert adapter.get_fee_bias("02stale") == 1.0
+        assert adapter.get_rebalance_bias("02stale") == 1.0
+        assert adapter.is_hive_member("02stale") is False
+        assert adapter.get_channel_open_hint("02stale") == {}
+        assert adapter.is_closure_recommended("02stale") is False
+        assert adapter.get_rebalance_recommendations() == []
+        assert adapter.get_rebalance_campaigns() == []
+        assert adapter.get_route_segment_leases() == []
+        assert adapter.get_segment_scores() == []
+        status = adapter.get_status(live_refresh=False)
+        assert status["stale_fallback_active"] is True
+        assert status["stale_fallback_policy"] == "diagnostics_only"
+        assert status["stale_fallback_behavior_fields_allowed"] == []
+
+    def test_bounded_bias_policy_allows_only_capped_fee_and_rebalance_bias(self, mock_plugin):
+        adapter = self._stale_adapter(mock_plugin, policy="bounded_bias")
+
+        assert 1.0 < adapter.get_fee_bias("02stale") <= 1.1
+        assert 1.0 < adapter.get_rebalance_bias("02stale") <= 1.15
+        assert adapter.is_hive_member("02stale") is False
+        assert adapter.get_open_candidates() == []
+        assert adapter.get_channel_open_hint("02stale") == {}
+        assert adapter.is_closure_recommended("02stale") is False
+        assert adapter.get_rebalance_recommendations() == []
+        assert adapter.get_rebalance_campaigns() == []
+        assert adapter.get_route_segment_leases() == []
+        assert adapter.get_segment_scores() == []
+        status = adapter.get_status(live_refresh=False)
+        assert status["stale_fallback_active"] is True
+        assert status["stale_fallback_policy"] == "bounded_bias"
+        assert status["stale_fallback_behavior_fields_allowed"] == ["fee_bias", "rebalance_bias"]
+        assert "channel_open_hint" in status["stale_fallback_behavior_fields_neutralized"]
+        assert "segment_scores" in status["stale_fallback_behavior_fields_neutralized"]
+
+    def test_full_legacy_fallback_policy_keeps_explicit_broad_behavior(self, mock_plugin):
+        adapter = self._stale_adapter(mock_plugin, policy="full_legacy_fallback")
+
+        assert adapter.is_hive_member("02stale") is True
+        assert adapter.get_channel_open_hint("02stale")["open_preference"] == "open"
+        assert adapter.is_closure_recommended("02stale") is True
+        assert adapter.get_rebalance_recommendations()[0]["recommendation_id"] == "stale-rec"
+        assert adapter.get_rebalance_campaigns()[0]["campaign_id"] == "stale-camp"
+        assert adapter.get_route_segment_leases()[0]["lease_id"] == "stale-lease"
+        assert adapter.get_segment_scores()[0]["short_channel_id"] == "123x1x0"
+        status = adapter.get_status(live_refresh=False)
+        assert status["stale_fallback_policy"] == "full_legacy_fallback"
+        assert status["stale_fallback_behavior_fields_allowed"] == ["all_legacy_behavior"]
+        assert status["stale_fallback_behavior_fields_neutralized"] == []
+
+    def test_fresh_snapshot_behavior_unchanged_under_bounded_bias_policy(self, mock_plugin):
+        peer_id = "02fresh"
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                peer_id: {
+                    "member": True,
+                    "direct_channel_peer": True,
+                    "traffic_confidence": 1.0,
+                    "corridor_role": "owner",
+                    "rebalance_preference": "sink",
+                    "peer_quality_score": 1.0,
+                    "closure_recommended": True,
+                    "channel_open_hint": {"open_preference": "open", "topology_confidence": 1.0},
+                }
+            },
+            "segment_scores": [
+                {
+                    "peer_id": peer_id,
+                    "short_channel_id": "123x1x0",
+                    "direction": 1,
+                    "amount_bucket_sats": 250_000,
+                    "success_score": 0.1,
+                    "failure_score": 0.9,
+                    "net_utility": -0.8,
+                    "confidence": 0.9,
+                    "observer_count": 1,
+                    "last_observed_at": int(time.time()),
+                }
+            ],
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+
+        assert adapter.is_hive_member(peer_id) is True
+        assert adapter.get_channel_open_hint(peer_id)["open_preference"] == "open"
+        assert adapter.is_closure_recommended(peer_id) is True
+        assert adapter.get_segment_scores()[0]["short_channel_id"] == "123x1x0"
+
+
 # ---------------------------------------------------------------------------
 # Channel-open hints
 # ---------------------------------------------------------------------------
@@ -954,6 +1339,7 @@ SNAPSHOT_WITH_OPEN_HINTS = {
     "ttl_seconds": 900,
     "hints": {
         "02open_peer": {
+            "direct_channel_peer": True,
             "traffic_confidence": 0.8,
             "channel_open_hint": {
                 "open_preference": "open",
@@ -963,6 +1349,7 @@ SNAPSHOT_WITH_OPEN_HINTS = {
             },
         },
         "02avoid_peer": {
+            "direct_channel_peer": True,
             "traffic_confidence": 0.9,
             "channel_open_hint": {
                 "open_preference": "avoid",
@@ -972,6 +1359,7 @@ SNAPSHOT_WITH_OPEN_HINTS = {
             },
         },
         "02neutral_peer": {
+            "direct_channel_peer": True,
             "traffic_confidence": 0.5,
             "channel_open_hint": {
                 "open_preference": "neutral",

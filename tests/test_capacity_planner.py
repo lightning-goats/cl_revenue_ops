@@ -2446,8 +2446,8 @@ class TestSafetyGuards:
         assert ok is False
         assert "exceeds max" in reason
 
-    def test_safety_guards_skips_reserve_for_close(self):
-        """Close actions don't require reserve check."""
+    def test_safety_guards_close_does_not_require_wallet_reserve(self):
+        """Close actions do not require wallet reserve, but still use unified budget when configured."""
         planner = self._make_planner(
             feerates_return={"perkb": {"opening": 10000}},  # 10 sat/vB
             listfunds_return={
@@ -2460,10 +2460,41 @@ class TestSafetyGuards:
         )
         cfg = self._make_cfg(max_fee_rate=50.0, min_reserve=500000)
 
-        # Close action should pass even with very low balance
         ok, reason = planner._check_safety_guards(cfg, "close", "peer1", amount_sats=0)
         assert ok is True
         assert "All guards passed" in reason
+
+    def test_safety_guards_close_budget_uses_reserved_close_fee_cap(self):
+        """Close guard should pre-check unified budget with the close-fee reserve cap."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 10000}},  # 10 sat/vB => 2000 sats close cost
+            recent_actions=[],
+        )
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 4500, "remaining_sats": 4500}
+        )
+        cfg = self._make_cfg(max_fee_rate=50.0)
+
+        ok, reason = planner._check_safety_guards(cfg, "close", "peer1", amount_sats=0)
+
+        assert ok is True
+        assert "All guards passed" in reason
+
+    def test_safety_guards_close_blocks_zero_unified_budget(self):
+        """A zero unified budget must block live planner close execution before the close RPC."""
+        planner = self._make_planner(
+            feerates_return={"perkb": {"opening": 10000}},
+            recent_actions=[],
+        )
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 0, "remaining_sats": 0}
+        )
+        cfg = self._make_cfg(max_fee_rate=50.0)
+
+        ok, reason = planner._check_safety_guards(cfg, "close", "peer1", amount_sats=0)
+
+        assert ok is False
+        assert "zero limit" in reason
 
     def test_safety_guards_reserve_blocks_open(self):
         """Open action fails when reserve is insufficient."""
@@ -3096,12 +3127,18 @@ def _make_close_cfg(
     planner_dry_run=False,
     planner_execute_closes=False,
     planner_max_closes_per_cycle=1,
+    planner_close_fee_reserve_multiplier=2.0,
+    planner_close_fee_cap_sats=0,
+    planner_close_feerange_enabled=False,
 ):
     """Create a mock config for close tests."""
     cfg = MagicMock()
     cfg.planner_dry_run = planner_dry_run
     cfg.planner_execute_closes = planner_execute_closes
     cfg.planner_max_closes_per_cycle = planner_max_closes_per_cycle
+    cfg.planner_close_fee_reserve_multiplier = planner_close_fee_reserve_multiplier
+    cfg.planner_close_fee_cap_sats = planner_close_fee_cap_sats
+    cfg.planner_close_feerange_enabled = planner_close_feerange_enabled
     return cfg
 
 
@@ -3165,6 +3202,101 @@ class TestDirectClose:
         planner.rebalancer.job_manager.has_active_job.assert_not_called()
         planner.rebalancer.job_manager.stop_job.assert_not_called()
         db.update_planner_action.assert_called_once_with(99, status="recommended")
+
+    def test_execute_close_blocks_zero_unified_budget_before_rpc(self):
+        """Direct close execution also enforces the unified budget pre-check."""
+        planner, db, pm = _make_close_planner(with_rebalancer=True)
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 0, "remaining_sats": 0}
+        )
+        cfg = _make_close_cfg(planner_execute_closes=True)
+
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "zombie")
+
+        assert result["status"] == "failed"
+        assert "Unified budget" in result["error"] or "zero limit" in result["error"]
+        planner.plugin.rpc.call.assert_not_called()
+        planner.rebalancer.job_manager.has_active_job.assert_not_called()
+        db.update_planner_action.assert_called_once_with(99, status="failed")
+
+    def test_execute_close_prechecks_reserved_fee_cap_not_point_estimate(self):
+        """Live close budget gate uses the conservative close-fee reservation cap."""
+        planner, db, pm = _make_close_planner(with_rebalancer=True)
+        planner._estimate_close_cost = MagicMock(return_value=2000)
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 3000, "remaining_sats": 3000}
+        )
+        cfg = _make_close_cfg(
+            planner_execute_closes=True,
+            planner_close_fee_reserve_multiplier=2.0,
+        )
+
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "zombie")
+
+        assert result["status"] == "failed"
+        assert "4000 sats" in result["error"]
+        planner.plugin.rpc.call.assert_not_called()
+        planner.rebalancer.job_manager.has_active_job.assert_not_called()
+        db.reserve_spend.assert_not_called()
+
+    def test_execute_close_passes_feerange_only_when_enabled(self):
+        """Planner close can cap CLN quick-close negotiation when explicitly configured."""
+        planner, db, pm = _make_close_planner()
+        planner._estimate_close_cost = MagicMock(return_value=2000)
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 10000, "remaining_sats": 10000}
+        )
+        cfg = _make_close_cfg(
+            planner_execute_closes=True,
+            planner_close_fee_reserve_multiplier=2.0,
+            planner_close_feerange_enabled=True,
+        )
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
+
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
+
+        assert result["status"] == "completed"
+        planner.plugin.rpc.call.assert_any_call(
+            "close",
+            {"id": "100x1x0", "feerange": ["slow", "20000perkb"]},
+        )
+
+    def test_execute_close_reserves_fee_cap_and_settles_actual_fee_when_reported(self):
+        """Close reservations use the cap; spend event reconciles to actual fee when returned."""
+        planner, db, pm = _make_close_planner()
+        planner._estimate_close_cost = MagicMock(return_value=2000)
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 10000, "remaining_sats": 10000}
+        )
+        cfg = _make_close_cfg(
+            planner_execute_closes=True,
+            planner_close_fee_reserve_multiplier=2.0,
+        )
+        planner.plugin.rpc.call.return_value = {"type": "mutual", "fee_sats": 1500}
+        db.reserve_spend.return_value = True
+
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
+
+        assert result["status"] == "completed"
+        assert result["estimated_close_cost_sats"] == 2000
+        assert result["reserved_close_fee_sats"] == 4000
+        assert result["actual_close_fee_sats"] == 1500
+        assert db.reserve_spend.call_args.kwargs["amount_sats"] == 4000
+        assert db.mark_spend_reservation_spent.call_args.kwargs["actual_spent_sats"] == 1500
+
+    def test_execute_close_allows_positive_unified_budget(self):
+        """A positive unified budget allows close execution after other close gates pass."""
+        planner, db, pm = _make_close_planner()
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 10000, "remaining_sats": 10000}
+        )
+        cfg = _make_close_cfg(planner_execute_closes=True)
+        planner.plugin.rpc.call.return_value = {"type": "mutual"}
+
+        result = planner._execute_close("100x1x0", "peer_abc", cfg, "ZOMBIE")
+
+        assert result["status"] == "completed"
+        planner.plugin.rpc.call.assert_any_call("close", {"id": "100x1x0"})
 
     def test_execute_close_calls_generic_rpc_close(self):
         """Successful close calls generic RPC close with channel_id."""
@@ -3687,6 +3819,34 @@ class TestExecuteCycle:
         ]
         assert available_sats_seen == [4_500_000, 4_500_000]
         assert fundchannel_attempts == [candidate_a["peer_id"], candidate_b["peer_id"]]
+
+    def test_execute_cycle_blocks_live_close_when_unified_budget_zero(self):
+        """Zero budget with live close execution enabled surfaces a skip and does not call close."""
+        scid = "200x300x0"
+        loser_prof = _mock_profitability(
+            scid=scid, marginal_roi_percent=-80.0, roi_percent=-90.0,
+            classification=ProfitabilityClass.ZOMBIE, days_open=120,
+        )
+        loser_prof.channel_role = "balanced"
+        loser_flow = _mock_flow(
+            daily_volume=100, flow_ratio=0.5, confidence=1.0,
+            kalman_regime_change=False,
+        )
+
+        planner, plugin, prof, flow, pm = _make_cycle_planner(
+            all_profitability={scid: loser_prof},
+            all_flow={scid: loser_flow},
+        )
+        planner.global_budget_limit_provider = MagicMock(
+            return_value={"effective_budget_sats": 0, "remaining_sats": 0}
+        )
+        cfg = _make_cycle_cfg(planner_max_closes_per_cycle=1, planner_execute_closes=True)
+
+        result = planner.execute_cycle(cfg)
+
+        assert result["closes"] == []
+        assert any("Close guard failed" in reason and "zero limit" in reason for reason in result["skipped_reasons"])
+        plugin.rpc.call.assert_not_called()
 
     def test_execute_cycle_closes_worst_loser(self):
         """Cycle directly closes worst loser when guards pass."""

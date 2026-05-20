@@ -429,11 +429,12 @@ class TestCoordinatedRebalanceReporting:
         assert outcome_calls[0]["status"] == "declined"
         assert outcome_calls[0]["reason"] == "local_budget_block"
 
-    def test_execute_rebalance_declines_when_intent_report_fails(
+    def test_execute_rebalance_continues_when_optional_intent_report_fails(
         self, mock_plugin, mock_database
     ):
         from modules.config import Config
         from modules.rebalancer import EVRebalancer, RebalanceReasonCode
+        from modules.rebalance_executor_v2 import ExecutionResult
 
         cfg = Config(dry_run=False)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
@@ -445,6 +446,12 @@ class TestCoordinatedRebalanceReporting:
         r._calculate_turnover_rate = MagicMock(return_value=0.05)
         r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
         r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
+            success=True,
+            fee_msat=2500,
+            fee_ppm=50,
+            route_type="native",
+        )
 
         mock_database.record_rebalance = MagicMock(return_value=325)
         mock_database.update_rebalance_result = MagicMock()
@@ -476,12 +483,11 @@ class TestCoordinatedRebalanceReporting:
 
         result = r.execute_rebalance(candidate, enforce_budget=True)
 
-        assert result["success"] is False
-        assert result["error"] == "local_execution_failed"
-        r.rebalance_engine_v2.execute_candidate.assert_not_called()
+        assert result["success"] is True
+        r.rebalance_engine_v2.execute_candidate.assert_called_once()
         assert len(outcome_calls) == 1
-        assert outcome_calls[0]["status"] == "declined"
-        assert outcome_calls[0]["reason"] == "local_execution_failed"
+        assert outcome_calls[0]["status"] == "succeeded"
+        assert outcome_calls[0]["details"]["intent_status"] == "report_failed"
 
 
 class TestLastHopFeeUnits:

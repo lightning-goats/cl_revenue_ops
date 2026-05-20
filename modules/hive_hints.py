@@ -21,6 +21,88 @@ MAX_FEE_BIAS = 0.10          # +/-10% max fee effect
 MAX_REBALANCE_BIAS = 0.15    # +/-15% max rebalance score effect
 MAX_CORRIDOR_UTILIZATION_BIAS = 0.10  # +/-10% max utilization effect
 
+VALID_M2_SCOPES = {
+    "legacy_seed_only",
+    "channel_peers",
+    "channel_and_fleet_peers",
+    "all_hints",
+}
+DEFAULT_M2_SCOPE = "channel_and_fleet_peers"
+VALID_STALE_FALLBACK_POLICIES = {
+    "diagnostics_only",
+    "bounded_bias",
+    "full_legacy_fallback",
+}
+DEFAULT_STALE_FALLBACK_POLICY = "bounded_bias"
+STALE_FALLBACK_BOUNDED_FIELDS = ("fee_bias", "rebalance_bias")
+STALE_FALLBACK_NEUTRALIZED_FIELDS = (
+    "membership",
+    "corridor_utilization_bias",
+    "channel_open_hint",
+    "closure_recommended",
+    "route_segment_leases",
+    "rebalance_recommendations",
+    "rebalance_campaigns",
+    "segment_scores",
+    "segment_observations",
+)
+M2_SENSITIVE_PEER_FIELDS = {
+    "fee_bias",
+    "rebalance_bias",
+    "membership",
+    "corridor_role",
+    "corridor_utilization_bias",
+    "peer_quality_score",
+    "traffic_confidence",
+    "drain_direction",
+    "competition_bias",
+    "fee_elasticity",
+    "optimal_fee_estimate_ppm",
+    "reputation_score",
+    "external_centrality",
+    "fleet_fee_prior",
+    "fleet_balance",
+    "fleet_topology",
+    "channel_open_hint",
+    "closure_recommended",
+    "closure_reason",
+}
+M2_SENSITIVE_SECTIONS = {
+    "route_segment_leases",
+    "rebalance_recommendations",
+    "rebalance_campaigns",
+    "segment_scores",
+}
+PEER_IDENTIFIER_FIELDS = (
+    "peer_id",
+    "peer_ids",
+    "member_id",
+    "member_ids",
+    "member_peer_ids",
+    "source_peer_id",
+    "source_member_id",
+    "from_peer_id",
+    "destination_peer_id",
+    "destination_member_id",
+    "dest_peer_id",
+    "to_peer_id",
+    "target_peer_id",
+    "owner_member_id",
+    "observer_member_id",
+    "observer_peer_id",
+    "primary_executor_member_id",
+    "executor_member_id",
+    "executor_member_ids",
+    "fallback_executor_member_ids",
+    "participant_peer_ids",
+    "candidate_peer_ids",
+)
+NESTED_PEER_IDENTIFIER_SECTIONS = (
+    "route_segments",
+    "segments",
+    "path_segments",
+)
+
 # Per-field contribution weights
 FEE_CORRIDOR_WEIGHT = 0.03   # corridor_role: +/-3%
 FEE_COMPETITION_WEIGHT = 0.02  # competition_bias: +/-2%
@@ -47,9 +129,10 @@ class HiveHintAdapter:
     STALE_FALLBACK_MIN_SECONDS = 6 * 3600
     STALE_FALLBACK_TTL_MULTIPLIER = 24
 
-    def __init__(self, plugin, ttl_override: int = 0):
+    def __init__(self, plugin, ttl_override: int = 0, stale_fallback_policy: str = DEFAULT_STALE_FALLBACK_POLICY):
         self._plugin = plugin
         self._ttl_override = ttl_override
+        self._stale_fallback_policy = self._normalize_stale_fallback_policy(stale_fallback_policy)
         self._lock = threading.RLock()
         self._snapshot = None
         self._snapshot_fetched_at = 0
@@ -287,24 +370,228 @@ class HiveHintAdapter:
             return self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback
 
     # ------------------------------------------------------------------
+    # Influence policy
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_stale_fallback_policy(policy: str) -> str:
+        normalized = str(policy or DEFAULT_STALE_FALLBACK_POLICY).strip().lower()
+        if normalized in VALID_STALE_FALLBACK_POLICIES:
+            return normalized
+        return DEFAULT_STALE_FALLBACK_POLICY
+
+    @staticmethod
+    def _snapshot_has_m2_marker(snapshot: dict | None) -> bool:
+        if not isinstance(snapshot, dict):
+            return False
+        if "m2_scope" in snapshot:
+            return True
+        producer = str(snapshot.get("producer") or "").lower()
+        compat = str(snapshot.get("compat_schema") or "").lower()
+        schema = str(snapshot.get("schema_version") or "").lower()
+        return "mycelium" in producer or "m2" in compat or "m2" in schema
+
+    def _normalized_m2_scope_for(self, snapshot: dict | None) -> str:
+        if not isinstance(snapshot, dict):
+            return DEFAULT_M2_SCOPE
+        raw = str(snapshot.get("m2_scope") or "").strip()
+        if raw in VALID_M2_SCOPES:
+            return raw
+        if self._snapshot_has_m2_marker(snapshot):
+            return DEFAULT_M2_SCOPE
+        return "legacy_seed_only"
+
+    @staticmethod
+    def _legacy_seed_peer_ids(snapshot: dict | None) -> set:
+        if not isinstance(snapshot, dict):
+            return set()
+        result = set()
+        for key in ("legacy_seed_peer_ids", "legacy_peer_ids", "seed_peer_ids"):
+            values = snapshot.get(key)
+            if isinstance(values, str):
+                if values.strip():
+                    result.add(values.strip())
+            elif isinstance(values, list):
+                for value in values:
+                    text = str(value or "").strip()
+                    if text:
+                        result.add(text)
+        hints = snapshot.get("hints", {})
+        if isinstance(hints, dict):
+            for peer_id, hint in hints.items():
+                if isinstance(hint, dict) and bool(
+                    hint.get("legacy_seed_peer") or hint.get("legacy_seed")
+                ):
+                    result.add(str(peer_id))
+        return result
+
+    def _peer_in_m2_scope(self, peer_id: str, hint: dict, snapshot: dict | None) -> bool:
+        if not self._snapshot_has_m2_marker(snapshot):
+            return True
+        scope = self._normalized_m2_scope_for(snapshot)
+        if scope == "all_hints":
+            return True
+        if scope == "channel_and_fleet_peers":
+            return bool(hint.get("direct_channel_peer", False) or hint.get("member", False))
+        if scope == "channel_peers":
+            return bool(hint.get("direct_channel_peer", False))
+        if scope == "legacy_seed_only":
+            return str(peer_id or "") in self._legacy_seed_peer_ids(snapshot)
+        return False
+
+    @staticmethod
+    def _entry_peer_ids(entry: dict) -> list:
+        peer_ids = []
+
+        def add_value(value) -> None:
+            if value is None:
+                return
+            if isinstance(value, list):
+                for item in value:
+                    add_value(item)
+                return
+            if isinstance(value, dict):
+                collect_from_mapping(value)
+                return
+            text = str(value or "").strip()
+            if text and text not in peer_ids:
+                peer_ids.append(text)
+
+        def collect_from_mapping(mapping: dict) -> None:
+            if not isinstance(mapping, dict):
+                return
+            for key in PEER_IDENTIFIER_FIELDS:
+                add_value(mapping.get(key))
+            for key in NESTED_PEER_IDENTIFIER_SECTIONS:
+                nested = mapping.get(key)
+                if isinstance(nested, list):
+                    for item in nested:
+                        if isinstance(item, dict):
+                            collect_from_mapping(item)
+
+        collect_from_mapping(entry)
+        return peer_ids
+
+    def _entry_in_m2_scope(self, entry: dict, snapshot: dict | None, section_name: str | None = None) -> bool:
+        if not self._snapshot_has_m2_marker(snapshot):
+            return True
+        if self._normalized_m2_scope_for(snapshot) == "all_hints":
+            return True
+        peer_ids = self._entry_peer_ids(entry)
+        if not peer_ids:
+            # Segment scores may be route-level aggregate evidence without a
+            # peer id. Peer-specific score entries are still scoped when the
+            # producer includes peer_id/source_peer_id/etc.
+            return section_name == "segment_scores"
+        hints = snapshot.get("hints", {}) if isinstance(snapshot, dict) else {}
+        if not isinstance(hints, dict):
+            return False
+        for peer_id in peer_ids:
+            hint = hints.get(peer_id, {})
+            if not isinstance(hint, dict) or not self._peer_in_m2_scope(peer_id, hint, snapshot):
+                return False
+        return True
+
+    def _behavior_field_allowed(self, field: str, snapshot: dict | None) -> bool:
+        if self._snapshot_is_fresh(snapshot):
+            return True
+        if not self._using_stale_fallback:
+            return False
+        policy = self._normalize_stale_fallback_policy(self._stale_fallback_policy)
+        if policy == "full_legacy_fallback":
+            return True
+        if policy == "bounded_bias":
+            return str(field or "") in STALE_FALLBACK_BOUNDED_FIELDS
+        return False
+
+    def _m2_scope_debug_for(self, snapshot: dict | None) -> dict:
+        scope = self._normalized_m2_scope_for(snapshot)
+        hints = snapshot.get("hints", {}) if isinstance(snapshot, dict) else {}
+        if not isinstance(hints, dict):
+            hints = {}
+        m2_active = self._snapshot_has_m2_marker(snapshot)
+        out_of_scope = []
+        neutralized_fields = 0
+        if m2_active and scope != "all_hints":
+            for peer_id, hint in hints.items():
+                hint = hint if isinstance(hint, dict) else {}
+                if self._peer_in_m2_scope(str(peer_id), hint, snapshot):
+                    continue
+                out_of_scope.append(str(peer_id))
+                neutralized_fields += sum(
+                    1 for key in M2_SENSITIVE_PEER_FIELDS if key in hint
+                )
+            for section_name in M2_SENSITIVE_SECTIONS:
+                section = snapshot.get(section_name, []) if isinstance(snapshot, dict) else []
+                if isinstance(section, list):
+                    for raw in section:
+                        if isinstance(raw, dict) and not self._entry_in_m2_scope(raw, snapshot, section_name):
+                            neutralized_fields += 1
+        return {
+            "m2_scope": scope,
+            "m2_scope_enforced_by_consumer": True,
+            "m2_scope_lab_only_all_hints": scope == "all_hints",
+            "m2_out_of_scope_peer_count": len(out_of_scope),
+            "m2_scope_neutralized_field_count": int(neutralized_fields),
+        }
+
+    def _stale_fallback_debug_for(self, active: bool | None = None) -> dict:
+        policy = self._normalize_stale_fallback_policy(self._stale_fallback_policy)
+        active = self._using_stale_fallback if active is None else bool(active)
+        if not active:
+            allowed = []
+            neutralized = []
+        elif policy == "full_legacy_fallback":
+            allowed = ["all_legacy_behavior"]
+            neutralized = []
+        elif policy == "bounded_bias":
+            allowed = list(STALE_FALLBACK_BOUNDED_FIELDS)
+            neutralized = list(STALE_FALLBACK_NEUTRALIZED_FIELDS)
+        else:
+            allowed = []
+            neutralized = list(STALE_FALLBACK_BOUNDED_FIELDS) + list(STALE_FALLBACK_NEUTRALIZED_FIELDS)
+        return {
+            "stale_fallback_active": active,
+            "stale_fallback_policy": policy,
+            "stale_fallback_behavior_fields_allowed": allowed,
+            "stale_fallback_behavior_fields_neutralized": neutralized,
+        }
+
+    # ------------------------------------------------------------------
     # Peer hint lookup
     # ------------------------------------------------------------------
 
-    def _get_peer_hint(self, peer_id: str) -> dict:
+    def _get_peer_hint(self, peer_id: str, behavior_field: str = "generic") -> dict:
         with self._lock:
-            if not (self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback):
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            if not self._behavior_field_allowed(behavior_field, snapshot):
                 return {}
-            hints = self._snapshot.get("hints", {}) if isinstance(self._snapshot, dict) else {}
-            hint = hints.get(peer_id, {})
-            return dict(hint) if isinstance(hint, dict) else {}
+            hints = snapshot.get("hints", {}) if snapshot else {}
+            hint = hints.get(peer_id, {}) if isinstance(hints, dict) else {}
+            if not isinstance(hint, dict):
+                return {}
+            if (
+                behavior_field in M2_SENSITIVE_PEER_FIELDS
+                and not self._peer_in_m2_scope(peer_id, hint, snapshot)
+            ):
+                return {}
+            return dict(hint)
 
-    def _get_peer_hint_fresh(self, peer_id: str) -> dict:
+    def _get_peer_hint_fresh(self, peer_id: str, behavior_field: str = "generic") -> dict:
         with self._lock:
-            if not self._snapshot_is_fresh(self._snapshot):
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            if not self._snapshot_is_fresh(snapshot):
                 return {}
-            hints = self._snapshot.get("hints", {}) if isinstance(self._snapshot, dict) else {}
-            hint = hints.get(peer_id, {})
-            return dict(hint) if isinstance(hint, dict) else {}
+            hints = snapshot.get("hints", {}) if snapshot else {}
+            hint = hints.get(peer_id, {}) if isinstance(hints, dict) else {}
+            if not isinstance(hint, dict):
+                return {}
+            if (
+                behavior_field in M2_SENSITIVE_PEER_FIELDS
+                and not self._peer_in_m2_scope(peer_id, hint, snapshot)
+            ):
+                return {}
+            return dict(hint)
 
     @staticmethod
     def _normalize_str_list(values) -> list:
@@ -339,37 +626,61 @@ class HiveHintAdapter:
             destination = str(value.get("destination", "")).strip()
             if not source or not destination:
                 return []
-            normalized.append({"source": source, "destination": destination})
+            segment = {"source": source, "destination": destination}
+            for key in PEER_IDENTIFIER_FIELDS:
+                peer_value = value.get(key)
+                if isinstance(peer_value, list):
+                    normalized_values = []
+                    for item in peer_value:
+                        text = str(item or "").strip()
+                        if text and text not in normalized_values:
+                            normalized_values.append(text)
+                    if normalized_values:
+                        segment[key] = normalized_values
+                else:
+                    text = str(peer_value or "").strip()
+                    if text:
+                        segment[key] = text
+            normalized.append(segment)
         return normalized
 
-    def _get_section_entries(self, section_name: str, validator) -> list:
+    def _get_section_entries(self, section_name: str, validator, behavior_field: str | None = None) -> list:
         with self._lock:
-            if not (self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback):
+            field = behavior_field or section_name
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            if not self._behavior_field_allowed(field, snapshot):
                 return []
-            section = self._snapshot.get(section_name, []) if isinstance(self._snapshot, dict) else []
+            section = snapshot.get(section_name, []) if snapshot else []
             if not isinstance(section, list):
                 return []
 
             entries = []
             for raw in section:
                 entry = validator(raw)
-                if entry is not None:
-                    entries.append(entry)
+                if entry is None:
+                    continue
+                if section_name in M2_SENSITIVE_SECTIONS and not self._entry_in_m2_scope(entry, snapshot, section_name):
+                    continue
+                entries.append(entry)
             return entries
 
-    def _get_section_entries_fresh(self, section_name: str, validator) -> list:
+    def _get_section_entries_fresh(self, section_name: str, validator, behavior_field: str | None = None) -> list:
         with self._lock:
-            if not self._snapshot_is_fresh(self._snapshot):
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            if not self._snapshot_is_fresh(snapshot):
                 return []
-            section = self._snapshot.get(section_name, []) if isinstance(self._snapshot, dict) else []
+            section = snapshot.get(section_name, []) if snapshot else []
             if not isinstance(section, list):
                 return []
 
             entries = []
             for raw in section:
                 entry = validator(raw)
-                if entry is not None:
-                    entries.append(entry)
+                if entry is None:
+                    continue
+                if section_name in M2_SENSITIVE_SECTIONS and not self._entry_in_m2_scope(entry, snapshot, section_name):
+                    continue
+                entries.append(entry)
             return entries
 
     # ------------------------------------------------------------------
@@ -378,7 +689,7 @@ class HiveHintAdapter:
 
     def is_hive_member(self, peer_id: str) -> bool:
         """Return True if peer is a hive fleet member. False if unavailable/stale."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "membership")
         return bool(hint.get("member", False))
 
     def get_membership_status(self, peer_id: str) -> dict:
@@ -390,8 +701,7 @@ class HiveHintAdapter:
             age = int(time.time()) - generated_at if generated_at is not None else None
             fresh = self._snapshot_is_fresh(snapshot)
             usable = fresh or self._using_stale_fallback
-            hints = snapshot.get("hints", {}) if snapshot else {}
-            hint = hints.get(peer_id, {}) if isinstance(hints, dict) else {}
+            hint = self._get_peer_hint(peer_id, "membership") if usable else {}
             known = usable and isinstance(hint, dict) and "member" in hint
             return {
                 "peer_id": str(peer_id or ""),
@@ -409,7 +719,7 @@ class HiveHintAdapter:
 
     def get_corridor_role(self, peer_id: str) -> str:
         """Return validated corridor_role, or 'none' if unavailable."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "corridor_role")
         role = hint.get("corridor_role")
         if role in self.VALID_CORRIDOR_ROLES:
             return role
@@ -417,7 +727,7 @@ class HiveHintAdapter:
 
     def get_corridor_utilization_bias(self, peer_id: str) -> float:
         """Return utilization multiplier from corridor role in [0.9, 1.1]. 1.0 if unavailable."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "corridor_utilization_bias")
         if not hint:
             return 1.0
 
@@ -443,7 +753,7 @@ class HiveHintAdapter:
 
     def get_fee_bias(self, peer_id: str) -> float:
         """Return multiplicative fee bias in [0.9, 1.1]. 1.0 if unavailable."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "fee_bias")
         if not hint:
             return 1.0
 
@@ -475,7 +785,7 @@ class HiveHintAdapter:
 
     def get_rebalance_bias(self, peer_id: str) -> float:
         """Return multiplicative rebalance score bias in [0.85, 1.15]. 1.0 if unavailable."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "rebalance_bias")
         if not hint:
             return 1.0
 
@@ -503,7 +813,7 @@ class HiveHintAdapter:
 
     def get_peer_quality_score(self, peer_id: str) -> float:
         """Return peer quality score in [0.0, 1.0], or 0.5 when unavailable."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "peer_quality_score")
         val = hint.get("peer_quality_score")
         if isinstance(val, (int, float)):
             return max(0.0, min(1.0, float(val)))
@@ -511,7 +821,7 @@ class HiveHintAdapter:
 
     def get_centrality(self, peer_id: str) -> float:
         """Return external centrality for peer (0.0 if unavailable)."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "external_centrality")
         val = hint.get("external_centrality")
         if isinstance(val, (int, float)):
             return max(0.0, min(1.0, float(val)))
@@ -519,7 +829,7 @@ class HiveHintAdapter:
 
     def get_reputation_score(self, peer_id: str) -> int:
         """Return fleet-aggregated reputation score (50 if unavailable)."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "reputation_score")
         val = hint.get("reputation_score")
         if isinstance(val, (int, float)):
             return max(0, min(100, int(val)))
@@ -527,7 +837,7 @@ class HiveHintAdapter:
 
     def get_traffic_confidence(self, peer_id: str) -> float:
         """Return traffic confidence score in [0.0, 1.0] (0.0 if unavailable)."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "traffic_confidence")
         val = hint.get("traffic_confidence")
         if isinstance(val, (int, float)):
             return max(0.0, min(1.0, float(val)))
@@ -535,7 +845,7 @@ class HiveHintAdapter:
 
     def get_peak_hours(self, peer_id: str) -> list:
         """Return peak traffic hours UTC (empty list if unavailable)."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "traffic_confidence")
         val = hint.get("peak_hours_utc")
         if isinstance(val, list):
             return [int(h) for h in val if isinstance(h, (int, float)) and 0 <= h <= 23]
@@ -548,7 +858,7 @@ class HiveHintAdapter:
         directional pressure is applied through cl-hive's askrene traffic
         layers to avoid double-counting the same signal.
         """
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "drain_direction")
         val = hint.get("drain_direction")
         if val in ("inbound_heavy", "outbound_heavy", "balanced"):
             return val
@@ -556,7 +866,7 @@ class HiveHintAdapter:
 
     def get_fee_elasticity(self, peer_id: str) -> float:
         """Return estimated price elasticity (0.0 if unavailable)."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "fee_elasticity")
         val = hint.get("fee_elasticity")
         if isinstance(val, (int, float)):
             return float(val)
@@ -564,7 +874,7 @@ class HiveHintAdapter:
 
     def get_optimal_fee_estimate(self, peer_id: str) -> int:
         """Return fleet-estimated optimal fee PPM (0 if unavailable)."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "optimal_fee_estimate_ppm")
         val = hint.get("optimal_fee_estimate_ppm")
         if isinstance(val, (int, float)) and val > 0:
             return int(val)
@@ -576,7 +886,7 @@ class HiveHintAdapter:
         Returns dict with capacity_sats, available_sats, topology — or empty dict.
         Eliminates the need for a separate hive-fleet-balances RPC.
         """
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "fleet_balance")
         cap = hint.get("fleet_capacity_sats")
         avail = hint.get("fleet_available_sats")
         if isinstance(cap, (int, float)) and isinstance(avail, (int, float)):
@@ -589,7 +899,7 @@ class HiveHintAdapter:
 
     def get_fleet_topology(self, peer_id: str) -> list:
         """Return validated topology entries advertised by a hive member hint."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "fleet_topology")
         merged = []
         for value in (
             *self._normalize_str_list(hint.get("fleet_hive_topology")),
@@ -602,15 +912,19 @@ class HiveHintAdapter:
     def get_member_peer_ids(self) -> list:
         """Return hive member peer ids represented in the current hint snapshot."""
         with self._lock:
-            if not (self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback):
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            if not self._behavior_field_allowed("membership", snapshot):
                 return []
-            hints = self._snapshot.get("hints", {}) if isinstance(self._snapshot, dict) else {}
+            hints = snapshot.get("hints", {}) if snapshot else {}
             if not isinstance(hints, dict):
                 return []
             return [
                 str(peer_id)
                 for peer_id, hint in hints.items()
-                if peer_id and isinstance(hint, dict) and bool(hint.get("member", False))
+                if peer_id
+                and isinstance(hint, dict)
+                and bool(hint.get("member", False))
+                and self._peer_in_m2_scope(str(peer_id), hint, snapshot)
             ]
 
     # ------------------------------------------------------------------
@@ -733,6 +1047,10 @@ class HiveHintAdapter:
                 "observer_count": int(raw.get("observer_count", 0)),
                 "last_observed_at": int(raw.get("last_observed_at", 0)),
             }
+            for key in ("peer_id", "source_peer_id", "destination_peer_id", "dest_peer_id", "to_peer_id", "target_peer_id"):
+                value = str(raw.get(key) or "").strip()
+                if value:
+                    score[key] = value
         except (TypeError, ValueError):
             return None
         if (
@@ -879,7 +1197,7 @@ class HiveHintAdapter:
 
     def get_channel_open_hint(self, peer_id: str) -> dict:
         """Return validated channel_open_hint for peer, or {} if unavailable/invalid."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "channel_open_hint")
         if not hint:
             return {}
         raw = hint.get("channel_open_hint")
@@ -922,22 +1240,22 @@ class HiveHintAdapter:
 
     def is_closure_recommended(self, peer_id: str) -> bool:
         """Return True if cl-hive reputation layer recommends closing this peer."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "closure_recommended")
         return bool(hint.get("closure_recommended", False))
 
     def is_closure_recommended_fresh(self, peer_id: str) -> bool:
         """Return closure recommendation only from a fresh snapshot."""
-        hint = self._get_peer_hint_fresh(peer_id)
+        hint = self._get_peer_hint_fresh(peer_id, "closure_recommended")
         return bool(hint.get("closure_recommended", False))
 
     def get_closure_reason(self, peer_id: str) -> str:
         """Return closure reason string, or '' if no recommendation."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "closure_reason")
         return str(hint.get("closure_reason", ""))
 
     def get_closure_reason_fresh(self, peer_id: str) -> str:
         """Return closure reason only from a fresh snapshot."""
-        hint = self._get_peer_hint_fresh(peer_id)
+        hint = self._get_peer_hint_fresh(peer_id, "closure_reason")
         return str(hint.get("closure_reason", ""))
 
     # ------------------------------------------------------------------
@@ -946,7 +1264,7 @@ class HiveHintAdapter:
 
     def get_fleet_fee_prior(self, peer_id: str) -> int | None:
         """Return fleet-observed fee median for a peer, or None."""
-        hint = self._get_peer_hint(peer_id)
+        hint = self._get_peer_hint(peer_id, "fleet_fee_prior")
         if not hint:
             return None
         fee = hint.get("fleet_fee_median")
@@ -998,7 +1316,7 @@ class HiveHintAdapter:
             reason = "fresh"
         else:
             reason = "stale"
-        return {
+        result = {
             "queried": bool(info.get("queried", False)),
             "source": source,
             "transport": info.get("transport"),
@@ -1016,6 +1334,9 @@ class HiveHintAdapter:
             "effective_ttl_seconds": ttl,
             "hints_count": len(hints) if isinstance(hints, dict) else 0,
         }
+        result.update(self._m2_scope_debug_for(candidate if candidate is not None else raw))
+        result.update(self._stale_fallback_debug_for(active=False))
+        return result
 
     def _cache_debug_view(self) -> dict:
         with self._lock:
@@ -1038,6 +1359,8 @@ class HiveHintAdapter:
                 if self._snapshot_fetched_at
                 else None
             )
+            cache.update(self._m2_scope_debug_for(self._snapshot))
+            cache.update(self._stale_fallback_debug_for())
             return cache
 
     @staticmethod
@@ -1181,6 +1504,8 @@ class HiveHintAdapter:
                     "effective_ttl_seconds": self._effective_ttl_for(None),
                     "snapshot_source": self._snapshot_source,
                     "hints_count": 0,
+                    **self._m2_scope_debug_for(None),
+                    **self._stale_fallback_debug_for(active=False),
                 }
             age = int(time.time()) - int(self._snapshot.get("generated_at", 0))
             cache_age = int(time.time()) - int(self._snapshot_fetched_at or 0) if self._snapshot_fetched_at else None
@@ -1190,7 +1515,7 @@ class HiveHintAdapter:
                 for hint in hints.values()
                 if isinstance(hint, dict) and bool(hint.get("member", False))
             ]
-            return {
+            status = {
                 "snapshot_fresh": self._snapshot_is_fresh(self._snapshot),
                 "snapshot_usable": self._snapshot_is_fresh(self._snapshot) or self._using_stale_fallback,
                 "stale_fallback": self._using_stale_fallback,
@@ -1206,6 +1531,9 @@ class HiveHintAdapter:
                 "rebalance_campaigns_count": len(self._get_section_entries("rebalance_campaigns", self._validate_rebalance_campaign)),
                 "route_segment_leases_count": len(self._get_section_entries("route_segment_leases", self._validate_route_segment_lease)),
             }
+            status.update(self._m2_scope_debug_for(self._snapshot))
+            status.update(self._stale_fallback_debug_for())
+            return status
 
     @staticmethod
     def _debug_refresh_result_for_status(refresh_result: str) -> str:

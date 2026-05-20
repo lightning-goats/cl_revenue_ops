@@ -243,6 +243,11 @@ def test_hive_hints_status_reports_usable_stale_fallback_after_live_export_failu
     assert status["live_hive_export"]["reason"] == "rpc_error"
     assert status["fallback"]["stale_fallback_used"] is True
     assert status["cache_after_refresh"]["usable"] is True
+    assert status["stale_fallback_active"] is True
+    assert status["stale_fallback_policy"] == "bounded_bias"
+    assert status["stale_fallback_behavior_fields_allowed"] == ["fee_bias", "rebalance_bias"]
+    assert "segment_scores" in status["stale_fallback_behavior_fields_neutralized"]
+    assert status["m2_scope_enforced_by_consumer"] is True
     _assert_no_action_rpc(adapter_rpc)
 
 

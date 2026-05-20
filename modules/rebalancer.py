@@ -2431,10 +2431,8 @@ class EVRebalancer:
                     intent_status = str(
                         (coordination_context or {}).get("intent_status") or ""
                     ).strip().lower()
-                    if intent_status != "accepted":
+                    if intent_status != "accepted" and intent_status not in {"report_failed", "invalid_response"}:
                         intent_failure_reason = "shared_conflict_changed"
-                        if intent_status in {"report_failed", "invalid_response"}:
-                            intent_failure_reason = "local_execution_failed"
                         self._report_coordination_outcome(
                             candidate,
                             coordination_context,
@@ -2448,12 +2446,13 @@ class EVRebalancer:
                             "message": f"Coordination intent rejected: {intent_status}",
                         }
                     else:
-                        self._report_coordination_outcome(
-                            candidate,
-                            coordination_context,
-                            status="started",
-                        )
-                        coordination_started = True
+                        if intent_status == "accepted":
+                            self._report_coordination_outcome(
+                                candidate,
+                                coordination_context,
+                                status="started",
+                            )
+                            coordination_started = True
                         try:
                             exec_result = self._execute_candidate_v2(candidate)
                             if exec_result.success:
@@ -2480,6 +2479,7 @@ class EVRebalancer:
                                     coordination_context,
                                     status="succeeded",
                                     details={
+                                        "intent_status": intent_status,
                                         "route_type": exec_result.route_type,
                                         "attempts": exec_result.attempts,
                                         "parts": exec_result.parts,
@@ -2516,6 +2516,7 @@ class EVRebalancer:
                                     status="failed",
                                     reason=stable_error,
                                     details={
+                                        "intent_status": intent_status,
                                         "executor_error": error_str,
                                         "route_type": exec_result.route_type,
                                         "attempts": exec_result.attempts,

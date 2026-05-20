@@ -1479,6 +1479,20 @@ class RebalanceEngine:
         their caller owns override semantics and accounting.
         """
         max_fee_sats = max(0, int(getattr(pair, "pair_budget_sats", 0) or 0))
+        cfg = self._config_snapshot()
+        effective_budget = self._get_global_budget_limit(cfg)
+        allow_zero_cost_with_zero_budget = bool(
+            getattr(cfg, "allow_zero_cost_auto_rebalance_when_budget_zero", False)
+        )
+        if effective_budget <= 0:
+            if max_fee_sats <= 0 and allow_zero_cost_with_zero_budget:
+                return False, None
+            return False, ExecutionResult(
+                success=False,
+                amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+                error="zero_budget_blocks_auto_rebalance",
+                route_type=self._executor_mode(),
+            )
         if max_fee_sats <= 0:
             return False, None
         if self.database is None or not callable(getattr(self.database, "reserve_budget", None)):
@@ -1489,14 +1503,12 @@ class RebalanceEngine:
                 route_type=self._executor_mode(),
             )
 
-        cfg = self._config_snapshot()
         now = int(time.time())
         window_hours = max(
             1,
             int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24),
         )
         since_ts = now - (window_hours * 3600)
-        effective_budget = self._get_global_budget_limit(cfg)
         external = self._get_external_liquidity_costs()
         ext_spent = int(external.get("spent_24h_sats", 0) or 0)
         ext_reserved = int(external.get("reserved_24h_sats", 0) or 0)

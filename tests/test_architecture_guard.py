@@ -158,3 +158,17 @@ class TestRebalanceDataServiceBoundary:
             raise AssertionError("RebalanceEngine call missing data_service=...")
 
         raise AssertionError("RebalanceEngine call not found in cl-revenue-ops.py")
+
+
+class TestNoSlingDependency:
+    """Sling must not be an active runtime dependency."""
+
+    def test_runtime_source_has_no_sling_references(self):
+        for path in _source_files():
+            source = Path(path).read_text(encoding="utf-8").lower()
+            assert "sling" not in source, f"runtime Sling reference found in {path}"
+
+    def test_dependency_files_have_no_sling_references(self):
+        for path in (ROOT / "requirements.txt", ROOT / "pyproject.toml"):
+            source = path.read_text(encoding="utf-8").lower()
+            assert "sling" not in source, f"dependency Sling reference found in {path}"

@@ -27,6 +27,9 @@ _LOSER_SEVERITY = {
     "STAGNANT": 1,
 }
 
+_CLOSE_TX_VBYTES = 200
+_DEFAULT_CLOSE_FEE_RESERVE_MULTIPLIER = 2.0
+
 # Strategy weights for score normalization (higher = more trusted signal)
 STRATEGY_WEIGHTS = {
     "winner": 1.0,
@@ -2214,10 +2217,114 @@ class CapacityPlanner:
         except Exception as e:
             return False, f"Cooldown check failed: {e}"
 
-    def _check_unified_budget(self, estimated_cost_sats: int) -> tuple:
+    @staticmethod
+    def _close_fee_reserve_multiplier(cfg) -> float:
+        raw = getattr(cfg, "planner_close_fee_reserve_multiplier", _DEFAULT_CLOSE_FEE_RESERVE_MULTIPLIER)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            return _DEFAULT_CLOSE_FEE_RESERVE_MULTIPLIER
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = _DEFAULT_CLOSE_FEE_RESERVE_MULTIPLIER
+        if math.isnan(value) or math.isinf(value):
+            value = _DEFAULT_CLOSE_FEE_RESERVE_MULTIPLIER
+        return max(1.0, value)
+
+    @staticmethod
+    def _configured_close_fee_cap_sats(cfg) -> int:
+        raw = getattr(cfg, "planner_close_fee_cap_sats", 0)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            return 0
+        try:
+            return max(0, int(raw or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _close_fee_plan(self, cfg) -> dict:
+        estimated = max(1, int(self._estimate_close_cost() or 0))
+        configured_cap = self._configured_close_fee_cap_sats(cfg)
+        if configured_cap > 0:
+            if configured_cap < estimated:
+                return {
+                    "ok": False,
+                    "estimated_cost_sats": estimated,
+                    "reserve_sats": configured_cap,
+                    "fee_cap_sats": configured_cap,
+                    "source": "fixed_cap",
+                    "error": (
+                        f"Configured close fee cap {configured_cap} sats is below "
+                        f"estimated close cost {estimated} sats"
+                    ),
+                }
+            reserve_sats = configured_cap
+            source = "fixed_cap"
+        else:
+            multiplier = self._close_fee_reserve_multiplier(cfg)
+            reserve_sats = max(estimated, int(math.ceil(estimated * multiplier)))
+            source = "multiplier"
+        return {
+            "ok": True,
+            "estimated_cost_sats": estimated,
+            "reserve_sats": reserve_sats,
+            "fee_cap_sats": reserve_sats,
+            "source": source,
+            "feerange": self._close_feerange(cfg, reserve_sats),
+        }
+
+    @staticmethod
+    def _close_feerange(cfg, fee_cap_sats: int) -> list | None:
+        raw_enabled = getattr(cfg, "planner_close_feerange_enabled", False)
+        if isinstance(raw_enabled, str):
+            enabled = raw_enabled.strip().lower() in ("true", "1", "yes")
+        else:
+            enabled = raw_enabled is True
+        if not enabled:
+            return None
+        try:
+            cap = int(fee_cap_sats or 0)
+        except (TypeError, ValueError):
+            return None
+        if cap <= 0:
+            return None
+        max_perkb = max(1, int(math.floor((cap * 1000) / _CLOSE_TX_VBYTES)))
+        return ["slow", f"{max_perkb}perkb"]
+
+    @staticmethod
+    def _extract_actual_close_fee_sats(result) -> int | None:
+        if not isinstance(result, dict):
+            return None
+        for key in ("actual_fee_sats", "close_fee_sats", "closing_fee_sats", "fee_sats"):
+            value = result.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)) and value >= 0:
+                return int(value)
+            if isinstance(value, str):
+                stripped = value.strip().lower().removesuffix("sat").strip()
+                if stripped.isdigit():
+                    return int(stripped)
+        for key in ("actual_fee_msat", "close_fee_msat", "closing_fee_msat", "fee_msat", "fees_msat"):
+            value = result.get(key)
+            parsed = parse_msat(value)
+            if parsed is not None and parsed >= 0:
+                return int(math.ceil(parsed / 1000.0))
+        return None
+
+    def _check_unified_budget(self, estimated_cost_sats: int, cfg=None) -> tuple:
         """Check unified liquidity budget has room for this operation."""
         provider = getattr(self, "global_budget_limit_provider", None)
         if not callable(provider):
+            raw_budget = getattr(cfg, "daily_budget_sats", None) if cfg is not None else None
+            if isinstance(raw_budget, (int, float)):
+                budget = max(0, int(raw_budget or 0))
+                if budget <= 0:
+                    return False, "Unified budget provider returned zero limit"
+                if int(estimated_cost_sats or 0) > budget:
+                    return False, (
+                        f"Unified budget: estimated cost {estimated_cost_sats} sats "
+                        f"exceeds remaining {budget} sats (budget: {budget})"
+                    )
+                return True, f"Unified budget OK: {budget} remaining of {budget}"
             return True, "No unified budget provider"
         try:
             budget_info = provider()
@@ -2263,7 +2370,17 @@ class CapacityPlanner:
             if not reserve_ok:
                 return False, reserve_reason
             # Unified budget gates the immediate on-chain spend for the open.
-            budget_ok, budget_reason = self._check_unified_budget(self._estimate_open_cost())
+            budget_ok, budget_reason = self._check_unified_budget(self._estimate_open_cost(), cfg)
+            if not budget_ok:
+                return False, budget_reason
+
+        if action_type == "close":
+            # Close fees are on-chain liquidity costs too; live closes must not
+            # bypass the same unified budget surface used by opens.
+            fee_plan = self._close_fee_plan(cfg)
+            if not fee_plan.get("ok", False):
+                return False, str(fee_plan.get("error") or "Close fee cap invalid")
+            budget_ok, budget_reason = self._check_unified_budget(int(fee_plan["reserve_sats"]), cfg)
             if not budget_ok:
                 return False, budget_reason
 
@@ -2813,6 +2930,10 @@ class CapacityPlanner:
         """Close a channel: record action, gate on dry_run/recommendation mode, stop rebalancer, call close RPC."""
         db = self.profitability.database if self.profitability else None
 
+        fee_plan = self._close_fee_plan(cfg)
+        estimated_cost = int(fee_plan.get("estimated_cost_sats", self._estimate_close_cost()) or 0)
+        reserved_close_fee_sats = int(fee_plan.get("reserve_sats", estimated_cost) or estimated_cost)
+
         # Record action
         action_id = None
         if db:
@@ -2821,7 +2942,7 @@ class CapacityPlanner:
                     action_type="close",
                     peer_id=peer_id,
                     channel_id=channel_id,
-                    estimated_cost_sats=self._estimate_close_cost(),
+                    estimated_cost_sats=estimated_cost,
                     reason=reason,
                 )
             except Exception as e:
@@ -2858,6 +2979,29 @@ class CapacityPlanner:
                 "peer_id": peer_id,
             }
 
+        if not fee_plan.get("ok", False):
+            budget_ok = False
+            budget_reason = str(fee_plan.get("error") or "Close fee cap invalid")
+        else:
+            budget_ok, budget_reason = self._check_unified_budget(reserved_close_fee_sats, cfg)
+        if not budget_ok:
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="failed")
+                except Exception:
+                    pass
+            self.plugin.log(
+                f"Planner close blocked by unified budget for {channel_id}: {budget_reason}",
+                level='warn',
+            )
+            return {
+                "action_id": action_id,
+                "status": "failed",
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "error": budget_reason,
+            }
+
         # Stop rebalancer jobs if any
         if self.rebalancer and hasattr(self.rebalancer, 'job_manager'):
             try:
@@ -2870,7 +3014,7 @@ class CapacityPlanner:
                 )
 
         try:
-            result = self._rpc_close(channel_id)
+            result = self._rpc_close(channel_id, feerange=fee_plan.get("feerange"))
 
             if db and action_id:
                 try:
@@ -2881,14 +3025,22 @@ class CapacityPlanner:
             # Record close cost in spend_events (matches open cost tracking pattern)
             if db:
                 try:
-                    close_cost = self._estimate_close_cost()
+                    actual_close_fee_sats = self._extract_actual_close_fee_sats(result)
+                    close_cost = actual_close_fee_sats if actual_close_fee_sats is not None else reserved_close_fee_sats
                     close_reservation_id = f"planner-close-{channel_id}-{int(time.time())}"
                     reserved = db.reserve_spend(
                         reservation_id=close_reservation_id,
-                        amount_sats=close_cost,
+                        amount_sats=reserved_close_fee_sats,
                         category="channel_close",
                         subcategory=reason if reason else "automated",
-                        metadata={"channel_id": channel_id, "peer_id": peer_id},
+                        metadata={
+                            "channel_id": channel_id,
+                            "peer_id": peer_id,
+                            "estimated_close_cost_sats": estimated_cost,
+                            "reserved_close_fee_sats": reserved_close_fee_sats,
+                            "close_fee_cap_source": fee_plan.get("source"),
+                            "actual_close_fee_source": "close_rpc" if actual_close_fee_sats is not None else "reserved_cap_fallback",
+                        },
                     )
                     if reserved:
                         db.mark_spend_reservation_spent(
@@ -2904,7 +3056,17 @@ class CapacityPlanner:
                 f"Channel closed: {channel_id} (peer: {peer_id[:16]}...)",
                 level='info',
             )
-            return {"action_id": action_id, "status": "completed", "result": result}
+            actual_close_fee_sats = self._extract_actual_close_fee_sats(result)
+            return {
+                "action_id": action_id,
+                "status": "completed",
+                "result": result,
+                "estimated_close_cost_sats": estimated_cost,
+                "reserved_close_fee_sats": reserved_close_fee_sats,
+                "actual_close_fee_sats": actual_close_fee_sats,
+                "close_fee_cap_source": fee_plan.get("source"),
+                "close_feerange": fee_plan.get("feerange"),
+            }
 
         except Exception as e:
             if db and action_id:
@@ -2918,5 +3080,8 @@ class CapacityPlanner:
             )
             return {"action_id": action_id, "status": "failed", "error": str(e)}
 
-    def _rpc_close(self, channel_id: str) -> Dict[str, Any]:
-        return self.data_service.close_channel(id=channel_id) if self.data_service else self.plugin.rpc.call("close", {"id": channel_id})
+    def _rpc_close(self, channel_id: str, feerange: list | None = None) -> Dict[str, Any]:
+        params = {"id": channel_id}
+        if feerange:
+            params["feerange"] = feerange
+        return self.data_service.close_channel(**params) if self.data_service else self.plugin.rpc.call("close", params)

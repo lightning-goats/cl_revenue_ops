@@ -3265,6 +3265,18 @@ class Database:
             WHERE status = 'active' AND reserved_at >= ?
             GROUP BY category
         """, (cutoff,)).fetchall()
+        event_counts = conn.execute("""
+            SELECT category, COUNT(*) AS total
+            FROM spend_events
+            WHERE timestamp >= ?
+            GROUP BY category
+        """, (cutoff,)).fetchall()
+        reservation_counts = conn.execute("""
+            SELECT category, COUNT(*) AS total
+            FROM spend_reservations
+            WHERE status = 'active' AND reserved_at >= ?
+            GROUP BY category
+        """, (cutoff,)).fetchall()
 
         spent_by_category = {str(r["category"]): int(r["total"] or 0) for r in by_cat_events}
         reserved_by_category = {str(r["category"]): int(r["total"] or 0) for r in by_cat_resv}
@@ -3275,6 +3287,8 @@ class Database:
             "reserved_24h_sats": int((reserved_row["total_reserved"] if reserved_row else 0) or 0),
             "spent_by_category": spent_by_category,
             "reserved_by_category": reserved_by_category,
+            "event_count_by_category": {str(r["category"]): int(r["total"] or 0) for r in event_counts},
+            "active_reservation_count_by_category": {str(r["category"]): int(r["total"] or 0) for r in reservation_counts},
         }
 
         if include_reservations:

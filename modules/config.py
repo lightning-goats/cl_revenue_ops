@@ -64,6 +64,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'fee_market_boundary_max_downshift_ratio': float,
     'fee_market_boundary_cache_seconds': int,
     'daily_budget_sats': int,
+    'allow_zero_cost_auto_rebalance_when_budget_zero': bool,
     'weekly_budget_sats': int,
     'hot_channel_protection_enabled': bool,
     'hot_channel_protection_override_peers': str,
@@ -158,6 +159,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_execute_closes': bool,
     'planner_max_opens_per_cycle': int,
     'planner_max_closes_per_cycle': int,
+    'planner_close_fee_reserve_multiplier': float,
+    'planner_close_fee_cap_sats': int,
+    'planner_close_feerange_enabled': bool,
     'planner_min_channel_sats': int,
     'planner_max_channel_sats': int,
     'planner_min_channel_age_days': int,
@@ -456,6 +460,7 @@ class Config:
     
     # Global Capital Controls
     daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period (fixed floor)
+    allow_zero_cost_auto_rebalance_when_budget_zero: bool = False
     weekly_budget_sats: int = 35000        # Max rebalancing fees per 7-day window (hard ceiling)
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
 
@@ -535,6 +540,9 @@ class Config:
     planner_execute_closes: bool = False
     planner_max_opens_per_cycle: int = 1
     planner_max_closes_per_cycle: int = 0
+    planner_close_fee_reserve_multiplier: float = 2.0
+    planner_close_fee_cap_sats: int = 0
+    planner_close_feerange_enabled: bool = False
     planner_min_channel_sats: int = 500000      # 500k sats
     planner_max_channel_sats: int = 10000000    # 10M sats
     planner_min_channel_age_days: int = 30
@@ -884,6 +892,7 @@ class ConfigSnapshot:
     
     # Global Capital Controls
     daily_budget_sats: int
+    allow_zero_cost_auto_rebalance_when_budget_zero: bool
     min_wallet_reserve: int
 
     # HTLC Congestion threshold
@@ -952,6 +961,9 @@ class ConfigSnapshot:
     planner_execute_closes: bool = False
     planner_max_opens_per_cycle: int = 1
     planner_max_closes_per_cycle: int = 0
+    planner_close_fee_reserve_multiplier: float = 2.0
+    planner_close_fee_cap_sats: int = 0
+    planner_close_feerange_enabled: bool = False
     planner_min_channel_sats: int = 500000
     planner_max_channel_sats: int = 10000000
     planner_min_channel_age_days: int = 30

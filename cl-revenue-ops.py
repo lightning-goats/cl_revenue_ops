@@ -712,6 +712,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-allow-zero-cost-auto-rebalance-when-budget-zero',
+    default='false',
+    description='Allow automatic zero-fee rebalances when daily_budget_sats is zero (default: false)'
+)
+
+plugin.add_option(
     name='revenue-ops-weekly-budget-sats',
     default='35000',
     description='Max rebalancing fees to spend in 7 days - hard ceiling over daily burst limit (default: 35000)'
@@ -1001,6 +1007,21 @@ plugin.add_option(
     name='revenue-ops-planner-max-closes-per-cycle',
     default='0',
     description='Maximum planner close executions per cycle when close execution is enabled (default: 0)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-close-fee-reserve-multiplier',
+    default='2.0',
+    description='Multiplier applied to estimated close fee for planner close budget reservation (default: 2.0)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-close-fee-cap-sats',
+    default='0',
+    description='Fixed planner close fee cap/reservation in sats; 0 uses reserve multiplier (default: 0)'
+)
+plugin.add_option(
+    name='revenue-ops-planner-close-feerange-enabled',
+    default='false',
+    description='Pass a CLN close feerange cap derived from the planner close fee reservation (default: false)'
 )
 plugin.add_option(
     name='revenue-ops-planner-min-channel-sats',
@@ -1537,6 +1558,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
+        allow_zero_cost_auto_rebalance_when_budget_zero=options.get(
+            'revenue-ops-allow-zero-cost-auto-rebalance-when-budget-zero', 'false'
+        ).lower() in ('true', '1', 'yes'),
         weekly_budget_sats=_safe_int('revenue-ops-weekly-budget-sats'),
         min_wallet_reserve=_safe_int('revenue-ops-min-wallet-reserve'),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true',
@@ -1557,6 +1581,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_execute_closes=options.get('revenue-ops-planner-execute-closes', 'false').lower() in ('true', '1', 'yes'),
         planner_max_opens_per_cycle=_safe_int('revenue-ops-planner-max-opens-per-cycle'),
         planner_max_closes_per_cycle=_safe_int('revenue-ops-planner-max-closes-per-cycle'),
+        planner_close_fee_reserve_multiplier=_safe_float('revenue-ops-planner-close-fee-reserve-multiplier'),
+        planner_close_fee_cap_sats=_safe_int('revenue-ops-planner-close-fee-cap-sats'),
+        planner_close_feerange_enabled=options.get('revenue-ops-planner-close-feerange-enabled', 'false').lower() in ('true', '1', 'yes'),
         planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
         planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
         planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
@@ -5896,10 +5923,8 @@ def _normalize_generic_ledger_for_total_cost_budget(generic_ledger: Dict[str, An
     """Exclude canonical open/close spend events from the generic ledger budget bucket."""
     normalized = dict(generic_ledger or {})
     spent_by_category = normalized.get("spent_by_category")
-    if not isinstance(spent_by_category, dict) or not spent_by_category:
-        normalized.setdefault("counted_spent_categories", {})
-        normalized.setdefault("excluded_spent_categories", {})
-        return normalized
+    if not isinstance(spent_by_category, dict):
+        spent_by_category = {}
 
     counted_spent_categories = {}
     excluded_spent_categories = {}
@@ -5914,7 +5939,41 @@ def _normalize_generic_ledger_for_total_cost_budget(generic_ledger: Dict[str, An
     normalized["spent_24h_sats"] = sum(counted_spent_categories.values())
     normalized["counted_spent_categories"] = counted_spent_categories
     normalized["excluded_spent_categories"] = excluded_spent_categories
+    normalized.setdefault("event_count_by_category", {})
+    normalized.setdefault("active_reservation_count_by_category", {})
     return normalized
+
+
+def _open_close_cost_visibility(generic_ledger: Dict[str, Any], open_cost_sats: int, closure_cost_sats: int) -> Dict[str, Any]:
+    excluded = generic_ledger.get("excluded_spent_categories", {}) if isinstance(generic_ledger, dict) else {}
+    reserved = generic_ledger.get("reserved_by_category", {}) if isinstance(generic_ledger, dict) else {}
+    event_counts = generic_ledger.get("event_count_by_category", {}) if isinstance(generic_ledger, dict) else {}
+    reservation_counts = generic_ledger.get("active_reservation_count_by_category", {}) if isinstance(generic_ledger, dict) else {}
+    if not isinstance(excluded, dict):
+        excluded = {}
+    if not isinstance(reserved, dict):
+        reserved = {}
+    if not isinstance(event_counts, dict):
+        event_counts = {}
+    if not isinstance(reservation_counts, dict):
+        reservation_counts = {}
+
+    pending_events = 0
+    if int(open_cost_sats or 0) <= 0 and int(excluded.get("channel_open", 0) or 0) > 0:
+        pending_events += max(1, int(event_counts.get("channel_open", 0) or 0))
+    if int(closure_cost_sats or 0) <= 0 and int(excluded.get("channel_close", 0) or 0) > 0:
+        pending_events += max(1, int(event_counts.get("channel_close", 0) or 0))
+    pending_events += max(0, int(reservation_counts.get("channel_open", 0) or 0))
+    pending_events += max(0, int(reservation_counts.get("channel_close", 0) or 0))
+
+    return {
+        "canonical_open_cost_available": int(open_cost_sats or 0) > 0,
+        "canonical_close_cost_available": int(closure_cost_sats or 0) > 0,
+        "pending_open_close_spend_events": pending_events,
+        "excluded_from_generic_totals_to_avoid_double_count": True,
+        "excluded_open_close_spend_sats": int(excluded.get("channel_open", 0) or 0) + int(excluded.get("channel_close", 0) or 0),
+        "reserved_open_close_sats": int(reserved.get("channel_open", 0) or 0) + int(reserved.get("channel_close", 0) or 0),
+    }
 
 
 def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, Any]:
@@ -5940,14 +5999,25 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     # Actual cost components (canonical data sources)
     rebalance = _rebalance_liquidity_cost_components(window_hours=wh)
     boltz = _boltz_liquidity_cost_components(window_hours=wh)
-    generic_ledger = database.get_spend_ledger_summary(window_hours=wh) if database else {
-        "spent_24h_sats": 0, "reserved_24h_sats": 0, "spent_by_category": {}, "reserved_by_category": {}
-    }
+    if database:
+        try:
+            generic_ledger = database.get_spend_ledger_summary(window_hours=wh, include_reservations=True)
+        except TypeError:
+            generic_ledger = database.get_spend_ledger_summary(window_hours=wh)
+    else:
+        generic_ledger = {
+            "spent_24h_sats": 0, "reserved_24h_sats": 0, "spent_by_category": {}, "reserved_by_category": {}
+        }
     generic_ledger = _normalize_generic_ledger_for_total_cost_budget(generic_ledger)
     revenue_msat = int(database.get_total_routing_revenue(since)) if database else 0
     revenue_sats = revenue_msat // 1000
     open_cost_sats = int(database.get_opening_costs_since(since)) if database else 0
     closure_cost_sats = int(database.get_closure_costs_since(since)) if database else 0
+    open_close_cost_visibility = _open_close_cost_visibility(
+        generic_ledger,
+        open_cost_sats,
+        closure_cost_sats,
+    )
 
     actual_by_category = {
         "rebalance": int(rebalance.get("spent_24h_sats", 0) or 0),
@@ -5985,6 +6055,7 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
         "net_profit_sats_after_costs": net_profit_sats,
         "actual_spent_by_category": actual_by_category,
         "reserved_by_category": reserved_by_category,
+        "open_close_cost_visibility": open_close_cost_visibility,
         "components": {
             "rebalance": rebalance,
             "boltz": boltz,

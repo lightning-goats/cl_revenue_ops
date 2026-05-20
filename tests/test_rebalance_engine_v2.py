@@ -2543,6 +2543,129 @@ def test_engine_execute_pair_records_pending_then_success_in_rebalance_history(
     assert ukwargs.get("actual_fee_msat") == 3_000
 
 
+def test_engine_auto_execute_pair_blocks_zero_budget_even_for_zero_cost_route(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.daily_budget_sats = 0
+    engine.config.allow_zero_cost_auto_rebalance_when_budget_zero = False
+    mock_database.record_rebalance.return_value = 66
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=0,
+        reason_code="ev_positive",
+        route=[],
+    )
+    executor = MagicMock()
+
+    result = engine._execute_pair(pair, executor, reserve_budget=True, account_costs=True)
+
+    assert result.success is False
+    assert result.error == "zero_budget_blocks_auto_rebalance"
+    executor.execute.assert_not_called()
+    mock_database.reserve_budget.assert_not_called()
+    mock_database.update_rebalance_result.assert_called_once()
+
+
+def test_engine_auto_execute_pair_blocks_zero_budget_for_positive_cost_route(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.daily_budget_sats = 0
+    engine.config.allow_zero_cost_auto_rebalance_when_budget_zero = False
+    mock_database.record_rebalance.return_value = 67
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=100,
+        reason_code="ev_positive",
+        route=[],
+    )
+    executor = MagicMock()
+
+    result = engine._execute_pair(pair, executor, reserve_budget=True, account_costs=True)
+
+    assert result.success is False
+    assert result.error == "zero_budget_blocks_auto_rebalance"
+    executor.execute.assert_not_called()
+    mock_database.reserve_budget.assert_not_called()
+
+
+def test_engine_auto_execute_pair_allows_zero_cost_route_when_budget_positive(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.daily_budget_sats = 5000
+    engine.config.allow_zero_cost_auto_rebalance_when_budget_zero = False
+    mock_database.record_rebalance.return_value = 68
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=0,
+        reason_code="ev_positive",
+        route=[],
+    )
+    executor = MagicMock()
+    executor.execute.return_value = ExecutionResult(success=True, amount_sats=50_000, fee_sats=0, fee_msat=0)
+
+    result = engine._execute_pair(pair, executor, reserve_budget=True, account_costs=True)
+
+    assert result.success is True
+    executor.execute.assert_called_once()
+    mock_database.reserve_budget.assert_not_called()
+
+
+def test_engine_auto_execute_pair_allows_zero_cost_route_with_explicit_zero_budget_override(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.daily_budget_sats = 0
+    engine.config.allow_zero_cost_auto_rebalance_when_budget_zero = True
+    mock_database.record_rebalance.return_value = 69
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=0,
+        reason_code="operator_allows_zero_cost",
+        route=[],
+    )
+    executor = MagicMock()
+    executor.execute.return_value = ExecutionResult(success=True, amount_sats=50_000, fee_sats=0, fee_msat=0)
+
+    result = engine._execute_pair(pair, executor, reserve_budget=True, account_costs=True)
+
+    assert result.success is True
+    executor.execute.assert_called_once()
+    mock_database.reserve_budget.assert_not_called()
+
+
 def test_engine_auto_execute_pair_accounts_costs_and_budget_reservation(
     mock_plugin, mock_database
 ):

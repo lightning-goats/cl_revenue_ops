@@ -195,9 +195,15 @@ def test_planner_cycle_limit_defaults_match_config():
     assert snapshot.planner_max_opens_per_cycle == 1
     assert snapshot.planner_max_closes_per_cycle == 0
     assert snapshot.planner_min_annual_roi_pct == 1.0
+    assert snapshot.planner_close_fee_reserve_multiplier == 2.0
+    assert snapshot.planner_close_fee_cap_sats == 0
+    assert snapshot.planner_close_feerange_enabled is False
     assert mod.plugin.options["revenue-ops-planner-max-opens-per-cycle"]["default"] == "1"
     assert mod.plugin.options["revenue-ops-planner-max-closes-per-cycle"]["default"] == "0"
     assert mod.plugin.options["revenue-ops-planner-min-annual-roi-pct"]["default"] == "1.0"
+    assert mod.plugin.options["revenue-ops-planner-close-fee-reserve-multiplier"]["default"] == "2.0"
+    assert mod.plugin.options["revenue-ops-planner-close-fee-cap-sats"]["default"] == "0"
+    assert mod.plugin.options["revenue-ops-planner-close-feerange-enabled"]["default"] == "false"
 
 
 def test_planner_execute_closes_option_is_parsed_during_init(monkeypatch):
@@ -224,6 +230,23 @@ def test_planner_cycle_limits_are_parsed_during_init(monkeypatch):
 
     assert cfg.planner_max_opens_per_cycle == 3
     assert cfg.planner_max_closes_per_cycle == 2
+
+
+def test_planner_close_fee_cap_options_are_parsed_during_init(monkeypatch):
+    mod = load_plugin_module()
+    cfg = _run_init_with_stubbed_dependencies(
+        mod,
+        monkeypatch,
+        {
+            "revenue-ops-planner-close-fee-reserve-multiplier": "2.5",
+            "revenue-ops-planner-close-fee-cap-sats": "9000",
+            "revenue-ops-planner-close-feerange-enabled": "true",
+        },
+    )
+
+    assert cfg.planner_close_fee_reserve_multiplier == 2.5
+    assert cfg.planner_close_fee_cap_sats == 9000
+    assert cfg.planner_close_feerange_enabled is True
 
 
 def test_planner_min_annual_roi_option_is_parsed_during_init(monkeypatch):
@@ -919,6 +942,15 @@ def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
             "channel_open": 20,
             "misc_ops": 3,
         },
+        "event_count_by_category": {
+            "channel_open": 1,
+            "channel_close": 1,
+            "misc_ops": 1,
+        },
+        "active_reservation_count_by_category": {
+            "channel_open": 1,
+            "misc_ops": 1,
+        },
     }
     mod.database.get_total_routing_revenue.return_value = 500
     mod.database.get_opening_costs_since.return_value = 100
@@ -952,6 +984,48 @@ def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
         "channel_open": 50,
         "channel_close": 15,
     }
+    assert result["open_close_cost_visibility"] == {
+        "canonical_open_cost_available": True,
+        "canonical_close_cost_available": True,
+        "pending_open_close_spend_events": 1,
+        "excluded_from_generic_totals_to_avoid_double_count": True,
+        "excluded_open_close_spend_sats": 65,
+        "reserved_open_close_sats": 20,
+    }
+
+
+def test_total_cost_budget_reports_pending_open_close_visibility_delay():
+    mod = load_plugin_module()
+    mod.config = SimpleNamespace(
+        reservation_timeout_hours=4,
+        daily_budget_sats=2000,
+    )
+    mod.database = MagicMock()
+    mod.database.get_spend_ledger_summary.return_value = {
+        "spent_24h_sats": 50,
+        "reserved_24h_sats": 0,
+        "spent_by_category": {"channel_close": 50},
+        "reserved_by_category": {},
+        "event_count_by_category": {"channel_close": 1},
+    }
+    mod.database.get_total_routing_revenue.return_value = 0
+    mod.database.get_opening_costs_since.return_value = 0
+    mod.database.get_closure_costs_since.return_value = 0
+    mod._rebalance_liquidity_cost_components = MagicMock(
+        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
+    )
+    mod._boltz_liquidity_cost_components = MagicMock(
+        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
+    )
+
+    result = mod._total_cost_budget_status(window_hours=24)
+
+    assert result["actual_spent_sats"] == 0
+    visibility = result["open_close_cost_visibility"]
+    assert visibility["canonical_close_cost_available"] is False
+    assert visibility["pending_open_close_spend_events"] == 1
+    assert visibility["excluded_open_close_spend_sats"] == 50
+    assert visibility["excluded_from_generic_totals_to_avoid_double_count"] is True
 
 
 def test_revenue_status_operator_controls_hide_internal_knob_dump():
