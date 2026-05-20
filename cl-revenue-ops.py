@@ -59,6 +59,10 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.7.0: Diagnostics, cross-plugin contracts, and safety hardening
+#   - Expands hive hint freshness diagnostics and standalone safety coverage
+#   - Documents cross-plugin datastore contracts for cl-mycelium/revenue artifacts
+#   - Hardens budget/execution boundaries and residual action RPC safety checks
 # v2.5.1: Fee market boundary deprecation
 #   - Makes fee market boundary settings no-op compatibility controls
 #   - Prevents remote peer fee policies from anchoring local fee floors/caps
@@ -76,7 +80,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.5.1"
+PLUGIN_VERSION = "2.7.0"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 

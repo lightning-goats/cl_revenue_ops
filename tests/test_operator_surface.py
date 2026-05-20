@@ -1108,11 +1108,11 @@ def test_readme_examples_describe_current_hive_surfaces():
     assert "revenue-hive-hints-status" in readme
 
 
-def test_claude_docs_describe_current_hive_hint_surface():
-    claude = Path("CLAUDE.md").read_text()
+def test_agent_docs_describe_current_hive_hint_surface():
+    agent_docs = Path("AGENTS.md").read_text()
 
-    assert "cl-hive" in claude
-    assert "hive-hints" in claude
+    assert "cl-mycelium" in agent_docs
+    assert "hints" in agent_docs
 
 
 def test_readme_states_planner_closes_are_recommendation_only_by_default():
