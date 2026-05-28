@@ -171,3 +171,10 @@ The residual hardening changes were verified with the required focused and broad
 - `pytest tests/test_hive_hints.py tests/test_fee_hive_bias.py tests/test_fee_setting_execution.py tests/test_planner_hive_hints.py tests/test_segment_observations.py tests/test_rebalance_coordination_overlay.py -q` -> 142 passed.
 - Optional reporting and open/close visibility targeted tests -> 39 passed.
 - Targeted operator-surface planner close fee cap tests -> 4 passed.
+
+
+### Metabolic Level 2c Documentation Addendum - 2026-05-28
+
+`metabolic_influence/v1` consumption does not add any action RPC. `revenue-hive-hints-status`, `revenue-fee-debug`, `revenue-rebalance-debug`, and `revenue-planner-candidates` may expose metabolic influence diagnostics, but they remain read-only/debug surfaces. Level 2c metabolic influence is bounded scoring input only and cannot call `revenue-rebalance-cycle`, `revenue-fee-cycle`, `revenue-planner-execute`, spend mutation RPCs, Boltz action RPCs, CLN pay/sendpay/keysend/withdraw, fundchannel, close, setconfig, or fee-setting RPCs.
+
+`cl_revenue_ops` remains budget and executor authority. Zero-budget and dry-run gates still apply, and Level 2c does not establish Level 3 value evidence.

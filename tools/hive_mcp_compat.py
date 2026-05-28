@@ -107,9 +107,10 @@ async def handle_revenue_hive_status(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    hive_status, revenue_status = await asyncio.gather(
+    hive_status, revenue_status, rebalance_debug = await asyncio.gather(
         node.call("hive-status"),
         node.call("revenue-status"),
+        node.call("revenue-rebalance-debug", {"summary_only": True, "include_hot_markers": False, "max_candidates": 0}),
         return_exceptions=True,
     )
 
@@ -123,6 +124,18 @@ async def handle_revenue_hive_status(args: Dict) -> Dict:
         result["revenue_status"] = {"error": str(revenue_status)}
     else:
         result["revenue_status"] = revenue_status
+
+    if isinstance(rebalance_debug, Exception):
+        result["revenue_hints"] = {"status": "error", "detail": str(rebalance_debug)}
+    elif isinstance(rebalance_debug, dict) and "error" in rebalance_debug:
+        result["revenue_hints"] = {"status": "error", "detail": str(rebalance_debug["error"])}
+    else:
+        hive_hints = rebalance_debug.get("hive_hints", {}) if isinstance(rebalance_debug, dict) else {}
+        result["revenue_hints"] = {
+            "status": "pass" if isinstance(hive_hints, dict) and hive_hints.get("snapshot_usable") else "warn",
+            "diagnostic": "revenue-rebalance-debug.hive_hints",
+            "hive_hints": hive_hints,
+        }
 
     hive_ok = isinstance(result["hive_status"], dict) and "error" not in result["hive_status"]
     revenue_ok = (
@@ -251,11 +264,12 @@ async def handle_revenue_ops_health(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     checks: Dict[str, Dict[str, Any]] = {}
-    dashboard, status, spend, boltz = await asyncio.gather(
+    dashboard, status, spend, boltz, rebalance_debug = await asyncio.gather(
         node.call("revenue-dashboard", {"window_days": 7}),
         node.call("revenue-status"),
         node.call("revenue-spend-ledger", {"window_hours": 24, "include_reservations": True}),
         node.call("revenue-boltz-wallet"),
+        node.call("revenue-rebalance-debug", {"summary_only": True, "include_hot_markers": False, "max_candidates": 0}),
         return_exceptions=True,
     )
 
@@ -325,6 +339,29 @@ async def handle_revenue_ops_health(args: Dict) -> Dict:
             "keys": sorted(boltz.keys())[:10],
         }
 
+    if isinstance(rebalance_debug, Exception):
+        checks["hive_hints"] = {"status": "error", "detail": str(rebalance_debug)}
+    elif isinstance(rebalance_debug, dict) and "error" in rebalance_debug:
+        checks["hive_hints"] = {"status": "error", "detail": rebalance_debug["error"]}
+    else:
+        hive_hints = rebalance_debug.get("hive_hints", {}) if isinstance(rebalance_debug, dict) else {}
+        if isinstance(hive_hints, dict):
+            checks["hive_hints"] = {
+                "status": "pass" if hive_hints.get("snapshot_usable") else "warn",
+                "diagnostic": "revenue-rebalance-debug.hive_hints",
+                "snapshot_fresh": hive_hints.get("snapshot_fresh"),
+                "snapshot_usable": hive_hints.get("snapshot_usable"),
+                "stale_fallback": hive_hints.get("stale_fallback"),
+                "snapshot_age_seconds": hive_hints.get("snapshot_age_seconds"),
+                "hints_count": hive_hints.get("hints_count"),
+                "member_hints_count": hive_hints.get("member_hints_count"),
+            }
+        else:
+            checks["hive_hints"] = {
+                "status": "warn",
+                "detail": "revenue-rebalance-debug returned without hive_hints diagnostic",
+            }
+
     statuses = [check["status"] for check in checks.values()]
     if statuses and all(status == "pass" for status in statuses):
         overall = "healthy"
@@ -340,7 +377,7 @@ async def handle_revenue_ops_health(args: Dict) -> Dict:
         "overall_health": overall,
         "checks": checks,
         "note": (
-            "Heavy diagnostics such as revenue-profitability and revenue-rebalance-debug are excluded from the heartbeat to avoid timeout-driven false negatives."
+            "Heavy diagnostics such as revenue-profitability are excluded from the heartbeat to avoid timeout-driven false negatives. revenue-rebalance-debug is called in summary_only mode to expose current hive_hints consumption status."
         ),
     }
 """,

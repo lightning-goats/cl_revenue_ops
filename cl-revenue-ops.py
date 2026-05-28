@@ -1063,6 +1063,11 @@ plugin.add_option(
     default='0',
     description='Override hint snapshot TTL in seconds; 0 = use snapshot value (default: 0)'
 )
+plugin.add_option(
+    name='revenue-ops-hive-hints-allow-all-hints-m2-scope',
+    default='false',
+    description='Allow lab-only all_hints M2 scope from hive hints (default: false)'
+)
 
 def _on_rebalance_router_change(plugin_: Plugin, option_name: str, new_value: Any) -> None:
     """Validate + log a runtime rebalance-router flip triggered by setconfig.
@@ -1597,6 +1602,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         ),
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
         hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
+        hive_hints_allow_all_hints_m2_scope=options.get(
+            'revenue-ops-hive-hints-allow-all-hints-m2-scope', 'false'
+        ).lower() in ('true', '1', 'yes'),
         rebalance_router='v3',
         askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'hive-fleet',
     )
@@ -1868,6 +1876,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hive_hints = HiveHintAdapter(
             safe_plugin,
             ttl_override=config.hive_hints_ttl_seconds,
+            allow_all_hints_m2_scope=config.hive_hints_allow_all_hints_m2_scope,
         )
         plugin.log("HiveHintAdapter initialized - fleet hint bias enabled")
     else:
@@ -3288,7 +3297,18 @@ def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
     candidates = database.get_planner_candidates(limit=limit)
-    return {"candidates": candidates, "count": len(candidates)}
+    metabolic_planner_influence = {}
+    try:
+        getter = getattr(capacity_planner, "get_metabolic_planner_influence_debug", None)
+        if callable(getter):
+            metabolic_planner_influence = getter()
+    except Exception:
+        metabolic_planner_influence = {"seen": False, "usable": False, "reason": "debug_error"}
+    return {
+        "candidates": candidates,
+        "count": len(candidates),
+        "metabolic_planner_influence": metabolic_planner_influence,
+    }
 
 
 @plugin.method("revenue-planner-execute")

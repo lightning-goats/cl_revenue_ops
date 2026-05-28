@@ -6,12 +6,14 @@ paths:
   reports_root: docs/reports
 nodes:
   lnnode:
-    t0: "REPLACE_ME"
+    # Inferred from the first observed plugin initialization after 2026-04-23 deploy activity.
+    t0: "2026-04-23T16:31:01Z"
     transport: ["ssh", "lnnode"]
     lightning_cli_prefix: "lightning-cli --lightning-dir=/data/lightningd"
     log_extract_command: "grep -aE 'FEE:|REBALANCE_FLOOR|competition_aware|INITIAL_FEE|Hive member|Traceback|TypeError|AttributeError|KeyError|Error|plugin-cl-revenue-ops.py|cl-revenue-ops.py|estimated_closure_cost|_estimate_close_cost|coordination_reserved_slots|rebalance_coordination|undercut explore' /data/lightningd/cln.log | tail -100000"
   hive-nexus-02:
-    t0: "REPLACE_ME"
+    # Inferred from the first observed plugin initialization after 2026-04-23 deploy activity.
+    t0: "2026-04-23T16:51:47Z"
     transport: ["docker", "exec", "cl-hive-node-hive-nexus-02", "sh", "-lc"]
     lightning_cli_prefix: "lightning-cli --lightning-dir=/data/lightning/bitcoin"
     log_extract_command: "grep -aE 'FEE:|REBALANCE_FLOOR|competition_aware|INITIAL_FEE|Hive member|Traceback|TypeError|AttributeError|KeyError|Error|plugin-cl-revenue-ops.py|cl-revenue-ops.py|estimated_closure_cost|_estimate_close_cost|coordination_reserved_slots|rebalance_coordination|undercut explore' /data/lightning/bitcoin/lightningd.log | tail -100000"

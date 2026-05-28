@@ -350,3 +350,16 @@ def test_cl_revenue_ops_contract_surfaces_run_without_hive_adapter():
     assert status["diagnostics_version"] == "standalone-hints-v1"
     assert status["snapshot_usable"] is False
     assert status["hints_count"] == 0
+
+
+def test_metabolic_influence_contract_is_documented_as_bounded_advisory_input():
+    metabolic = Path("docs/contracts/METABOLIC_INFLUENCE_CONTRACT.md").read_text()
+    hive = Path("docs/contracts/HIVE_HINTS_CONTRACT.md").read_text()
+
+    assert "metabolic-influence/v1" in metabolic
+    assert "[0.95, 1.05]" in metabolic
+    assert "[0.85, 1.15]" in metabolic
+    assert "[0.85, 1.10]" in metabolic
+    assert "never grants budget authority" in hive
+    assert "never authorizes execution" in hive
+    assert "metabolic_influence" in hive

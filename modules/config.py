@@ -171,6 +171,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Hive Hints
     'hive_hints_enabled': bool,
     'hive_hints_ttl_seconds': int,
+    'hive_hints_allow_all_hints_m2_scope': bool,
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': float,
     'capex_bootstrap_bps': int,
@@ -552,6 +553,7 @@ class Config:
     # Hive Hints integration
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
+    hive_hints_allow_all_hints_m2_scope: bool = False
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50       # Fraction of channel contribution for all capex
     capex_bootstrap_bps: int = 10               # Bootstrap: basis points of capacity per 30d

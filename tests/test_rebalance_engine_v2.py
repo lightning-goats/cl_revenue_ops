@@ -2936,3 +2936,34 @@ def test_engine_clears_persisted_pair_failure_after_success(
     mock_database.clear_pair_rebalance_failure.assert_called_once_with(
         "100x1x0", "200x1x0"
     )
+
+
+def test_metabolic_rebalance_bias_is_bounded_score_modifier(mock_plugin, mock_database):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    hive_hints = MagicMock()
+    hive_hints.get_metabolic_rebalance_bias.return_value = 1.50
+    hive_hints.get_metabolic_peer_effect.return_value = {
+        "usable": True,
+        "bias_capped": True,
+        "reason_codes": ["positive_net_usable_energy"],
+    }
+    engine._hive_hints = hive_hints
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02source",
+        dest_peer_id="02dest",
+        amount_sats=100_000,
+        pair_budget_sats=100,
+        score=10.0,
+    )
+
+    engine._apply_metabolic_rebalance_bias(pair)
+
+    assert pair.score == pytest.approx(11.5)
+    assert pair.metabolic_rebalance_bias == pytest.approx(1.15)
+    assert pair.metabolic_rebalance_influence["bias_capped"] is True
+    engine._update_pair_score_decomposition(pair, route_status="planned")
+    assert pair.score_decomposition["inputs"]["metabolic_rebalance_bias"] == pytest.approx(1.15)

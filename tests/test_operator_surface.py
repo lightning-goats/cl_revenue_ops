@@ -570,6 +570,18 @@ def test_hive_hint_plugin_options_are_registered():
 
     assert mod.plugin.options["revenue-ops-hive-hints-enabled"]["default"] == "true"
     assert mod.plugin.options["revenue-ops-hive-hints-ttl"]["default"] == "0"
+    assert mod.plugin.options["revenue-ops-hive-hints-allow-all-hints-m2-scope"]["default"] == "false"
+
+
+def test_hive_hint_all_hints_lab_scope_option_is_parsed_during_init(monkeypatch):
+    mod = load_plugin_module()
+    cfg = _run_init_with_stubbed_dependencies(
+        mod,
+        monkeypatch,
+        {"revenue-ops-hive-hints-allow-all-hints-m2-scope": "true"},
+    )
+
+    assert cfg.hive_hints_allow_all_hints_m2_scope is True
 
 
 def test_rebalance_tuning_plugin_options_are_dynamic():

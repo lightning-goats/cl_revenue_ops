@@ -120,6 +120,7 @@ class CapacityPlanner:
             "candidate_pool_size": len(db.get_planner_candidates()) if db else 0,
             "recent_actions": db.get_planner_actions(limit=5) if db else [],
             "hive_open_candidates": hive_open_count,
+            "metabolic_planner_influence": self.get_metabolic_planner_influence_debug(),
         }
 
     def generate_report(self) -> Dict[str, Any]:
@@ -2060,7 +2061,40 @@ class CapacityPlanner:
         except Exception:
             pass
 
+        try:
+            getter = getattr(self.hive_hints, "get_metabolic_open_bias", None)
+            if callable(getter):
+                multiplier *= max(0.85, min(1.10, float(getter(peer_id))))
+        except Exception:
+            pass
+
         return max(0.75, min(1.25, multiplier))
+
+    def get_metabolic_planner_influence_debug(self) -> Dict[str, Any]:
+        """Return read-only metabolic influence diagnostics for planner surfaces."""
+        if self.hive_hints is None:
+            return {
+                "seen": False,
+                "usable": False,
+                "reason": "no_hive_hint_adapter",
+            }
+        try:
+            status_getter = getattr(self.hive_hints, "get_metabolic_status", None)
+            status = status_getter() if callable(status_getter) else {}
+            if not isinstance(status, dict):
+                status = {}
+            if not status.get("present", False):
+                return {"seen": False, "usable": False, "reason": "missing"}
+            return {
+                "seen": True,
+                "usable": bool(status.get("usable", False)),
+                "m2_scope": status.get("m2_scope"),
+                "confidence": status.get("confidence", "unknown"),
+                "coverage": dict(status.get("coverage", {}) or {}),
+                "reason": status.get("reason") or (None if status.get("usable") else "unusable"),
+            }
+        except Exception as e:
+            return {"seen": False, "usable": False, "reason": f"error: {e}"}
 
     def _update_candidate_pool(self, candidates: List[Dict]):
         """Persist scored candidates to database."""

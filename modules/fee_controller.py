@@ -1818,7 +1818,11 @@ class FeeController:
         if self.hive_hints is None:
             return 1.0
         try:
-            bias = self.hive_hints.get_fee_bias(peer_id)
+            bias = float(self.hive_hints.get_fee_bias(peer_id))
+            metabolic_getter = getattr(self.hive_hints, "get_metabolic_fee_bias", None)
+            if callable(metabolic_getter):
+                metabolic_bias = max(0.95, min(1.05, float(metabolic_getter(peer_id))))
+                bias *= metabolic_bias
             return max(0.9, min(1.1, bias))
         except Exception:
             return 1.0
@@ -2065,6 +2069,34 @@ class FeeController:
             status = {}
 
         membership = self._get_hive_membership_status(peer_id)
+        metabolic_fee_influence: Dict[str, Any] = {
+            "seen": False,
+            "usable": False,
+            "bias": 1.0,
+            "bias_capped": False,
+            "reason_codes": [],
+        }
+        try:
+            status_metabolic = status.get("metabolic_influence") if isinstance(status, dict) else {}
+            peer_effect_getter = getattr(self.hive_hints, "get_metabolic_peer_effect", None)
+            bias_getter = getattr(self.hive_hints, "get_metabolic_fee_bias", None)
+            effect = peer_effect_getter(peer_id) if callable(peer_effect_getter) else {}
+            if not isinstance(effect, dict):
+                effect = {}
+            raw_bias = bias_getter(peer_id) if callable(bias_getter) else 1.0
+            bias = max(0.95, min(1.05, float(raw_bias)))
+            metabolic_fee_influence = {
+                "seen": bool(status_metabolic.get("present", False)) if isinstance(status_metabolic, dict) else bool(effect),
+                "usable": bool(effect.get("usable", False)),
+                "bias": bias,
+                "bias_capped": bool(effect.get("bias_capped", False)) or abs(float(raw_bias) - bias) > 1e-9,
+                "reason_codes": list(effect.get("reason_codes", []) or []),
+            }
+            if effect.get("reason"):
+                metabolic_fee_influence["reason"] = str(effect.get("reason"))
+        except Exception:
+            pass
+
         debug: Dict[str, Any] = {
             "enabled": True,
             "peer_id": str(peer_id or ""),
@@ -2077,6 +2109,7 @@ class FeeController:
             "fee_bias": self._get_hive_fee_bias(peer_id),
             "temporal_multiplier": self._get_temporal_fee_adjustment(peer_id),
             "exploration_multiplier": self._get_hive_exploration_multiplier(peer_id),
+            "metabolic_fee_influence": metabolic_fee_influence,
         }
 
         for key, getter_name, default in (

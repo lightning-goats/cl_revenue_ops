@@ -953,11 +953,15 @@ class TestSafetyRails:
 
 
 class TestM2ScopeEnforcement:
-    def _adapter(self, mock_plugin, snapshot):
+    def _adapter(self, mock_plugin, snapshot, *, allow_all_hints_m2_scope=False):
         snap = dict(snapshot)
         snap["generated_at"] = int(time.time())
         mock_plugin.rpc.call.return_value = snap
-        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter = HiveHintAdapter(
+            mock_plugin,
+            ttl_override=0,
+            allow_all_hints_m2_scope=allow_all_hints_m2_scope,
+        )
         adapter.poll()
         return adapter
 
@@ -993,6 +997,13 @@ class TestM2ScopeEnforcement:
                 "suggested_size_bucket": "medium",
                 "reason": "underserved_corridor",
             },
+            "metabolic_influence": {
+                "score_delta": 0.2,
+                "confidence_delta": 0.1,
+                "posture": "growth_ready",
+                "reason_codes": ["test_metabolism"],
+                "advisory_only": True,
+            },
         }
 
     def test_channel_and_fleet_scope_neutralizes_non_channel_non_fleet_peer(self, mock_plugin):
@@ -1023,6 +1034,7 @@ class TestM2ScopeEnforcement:
         assert adapter.get_fee_bias(peer_id) == 1.0
         assert adapter.get_rebalance_bias(peer_id) == 1.0
         assert adapter.get_channel_open_hint(peer_id) == {}
+        assert adapter.get_metabolic_influence(peer_id) == {}
         assert adapter.get_open_candidates() == []
         assert adapter.is_closure_recommended(peer_id) is False
         assert adapter.get_route_segment_leases() == []
@@ -1153,19 +1165,40 @@ class TestM2ScopeEnforcement:
         assert adapter.get_fee_bias(other_peer) == 1.0
         assert adapter.get_rebalance_bias(other_peer) == 1.0
 
-    def test_all_hints_scope_allows_explicit_broad_lab_behavior(self, mock_plugin):
+    def test_all_hints_scope_is_neutral_without_local_operator_enablement(self, mock_plugin):
         peer_id = "02lab"
         adapter = self._adapter(
             mock_plugin,
             self._snapshot("all_hints", {peer_id: self._behavior_hint(member=False, direct=False)}),
         )
 
+        assert adapter.get_fee_bias(peer_id) == 1.0
+        assert adapter.get_rebalance_bias(peer_id) == 1.0
+        assert adapter.get_channel_open_hint(peer_id) == {}
+        assert adapter.get_metabolic_influence(peer_id) == {}
+        status = adapter.get_status(live_refresh=False)
+        assert status["m2_scope"] == "channel_and_fleet_peers"
+        assert status["m2_requested_scope"] == "all_hints"
+        assert status["m2_scope_lab_only_all_hints"] is False
+        assert status["m2_scope_all_hints_operator_enabled"] is False
+
+    def test_all_hints_scope_allows_explicit_broad_lab_behavior(self, mock_plugin):
+        peer_id = "02lab"
+        adapter = self._adapter(
+            mock_plugin,
+            self._snapshot("all_hints", {peer_id: self._behavior_hint(member=False, direct=False)}),
+            allow_all_hints_m2_scope=True,
+        )
+
         assert adapter.get_fee_bias(peer_id) > 1.0
         assert adapter.get_rebalance_bias(peer_id) > 1.0
         assert adapter.get_channel_open_hint(peer_id)["open_preference"] == "open"
+        assert adapter.get_metabolic_influence(peer_id)["posture"] == "growth_ready"
         status = adapter.get_status(live_refresh=False)
         assert status["m2_scope"] == "all_hints"
+        assert status["m2_requested_scope"] == "all_hints"
         assert status["m2_scope_lab_only_all_hints"] is True
+        assert status["m2_scope_all_hints_operator_enabled"] is True
 
     def test_missing_or_unknown_m2_scope_uses_safe_consumer_default(self, mock_plugin):
         peer_id = "02out"
@@ -1203,6 +1236,12 @@ class TestStaleFallbackPolicy:
                     "channel_open_hint": {
                         "open_preference": "open",
                         "topology_confidence": 1.0,
+                    },
+                    "metabolic_influence": {
+                        "score_delta": 0.4,
+                        "confidence_delta": 0.2,
+                        "posture": "growth_ready",
+                        "advisory_only": True,
                     },
                 }
             },
@@ -1243,6 +1282,7 @@ class TestStaleFallbackPolicy:
         assert adapter.get_rebalance_bias("02stale") == 1.0
         assert adapter.is_hive_member("02stale") is False
         assert adapter.get_channel_open_hint("02stale") == {}
+        assert adapter.get_metabolic_influence("02stale") == {}
         assert adapter.is_closure_recommended("02stale") is False
         assert adapter.get_rebalance_recommendations() == []
         assert adapter.get_rebalance_campaigns() == []
@@ -1261,6 +1301,7 @@ class TestStaleFallbackPolicy:
         assert adapter.is_hive_member("02stale") is False
         assert adapter.get_open_candidates() == []
         assert adapter.get_channel_open_hint("02stale") == {}
+        assert adapter.get_metabolic_influence("02stale") == {}
         assert adapter.is_closure_recommended("02stale") is False
         assert adapter.get_rebalance_recommendations() == []
         assert adapter.get_rebalance_campaigns() == []
@@ -1271,6 +1312,7 @@ class TestStaleFallbackPolicy:
         assert status["stale_fallback_policy"] == "bounded_bias"
         assert status["stale_fallback_behavior_fields_allowed"] == ["fee_bias", "rebalance_bias"]
         assert "channel_open_hint" in status["stale_fallback_behavior_fields_neutralized"]
+        assert "metabolic_influence" in status["stale_fallback_behavior_fields_neutralized"]
         assert "segment_scores" in status["stale_fallback_behavior_fields_neutralized"]
 
     def test_full_legacy_fallback_policy_keeps_explicit_broad_behavior(self, mock_plugin):
