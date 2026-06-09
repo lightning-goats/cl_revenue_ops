@@ -819,6 +819,9 @@ class Database:
         # Fee Controller queries by out_channel + timestamp every 30min
         # This changes query complexity from O(N) to O(log N)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_out_channel_time ON forwards(out_channel, timestamp)")
+        # idx_forwards_out_time duplicated idx_forwards_out_channel_time on the
+        # hottest write table; drop it on existing databases.
+        conn.execute("DROP INDEX IF EXISTS idx_forwards_out_time")
         
         # Daily aggregated forwarding stats (Granular History)
         # Replacing the single 'lifetime_aggregates' counter with daily resolution
@@ -1273,7 +1276,6 @@ class Database:
 
                 # Helpful indexes for per-channel lookups (keeps queries fast as forwards grow)
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_in_time ON forwards(in_channel, timestamp)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_out_time ON forwards(out_channel, timestamp)")
 
                 conn.execute("COMMIT")
             except Exception:
@@ -1505,6 +1507,59 @@ class Database:
                 conn.execute("ROLLBACK")
             except Exception as rb_err:
                 self.plugin.log(f"ROLLBACK failed in update_channel_state: {rb_err}", level='error')
+            raise
+
+    def update_channel_states_batch(self, rows: List[Dict[str, Any]]) -> None:
+        """Upsert many channel states in a single transaction.
+
+        Each row is a dict of update_channel_state() keyword arguments.
+        Avoids taking the write lock once per channel during flow analysis.
+        """
+        if not rows:
+            return
+        conn = self._get_connection()
+        now = int(time.time())
+
+        params = [
+            (
+                row["channel_id"], row["peer_id"], row["state"],
+                row["flow_ratio"], row["sats_in"], row["sats_out"],
+                row["capacity"], now,
+                row.get("confidence", 1.0), row.get("velocity", 0.0),
+                row.get("flow_multiplier", 1.0), row.get("ema_decay", 0.8),
+                row.get("forward_count", 0),
+                row.get("kalman_flow_ratio", 0.0),
+                row.get("kalman_velocity", 0.0),
+                row.get("kalman_uncertainty", 0.1),
+            )
+            for row in rows
+        ]
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany("""
+                INSERT INTO channel_states
+                (channel_id, peer_id, state, flow_ratio, sats_in, sats_out, capacity, updated_at,
+                 confidence, velocity, flow_multiplier, ema_decay, forward_count,
+                 kalman_flow_ratio, kalman_velocity, kalman_uncertainty)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    peer_id=excluded.peer_id, state=excluded.state,
+                    flow_ratio=excluded.flow_ratio, sats_in=excluded.sats_in,
+                    sats_out=excluded.sats_out, capacity=excluded.capacity,
+                    updated_at=excluded.updated_at, confidence=excluded.confidence,
+                    velocity=excluded.velocity, flow_multiplier=excluded.flow_multiplier,
+                    ema_decay=excluded.ema_decay, forward_count=excluded.forward_count,
+                    kalman_flow_ratio=excluded.kalman_flow_ratio,
+                    kalman_velocity=excluded.kalman_velocity,
+                    kalman_uncertainty=excluded.kalman_uncertainty
+            """, params)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                self.plugin.log(f"ROLLBACK failed in update_channel_states_batch: {rb_err}", level='error')
             raise
 
     def get_channel_state(self, channel_id: str) -> Optional[Dict[str, Any]]:

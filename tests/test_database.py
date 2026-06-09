@@ -408,3 +408,66 @@ class TestDeadCapitalStages:
         states = db.get_all_kalman_states()
         assert len(states) == 1
         assert abs(states[0]["flow_ratio"] - 0.3) < 0.001
+
+
+class TestUpdateChannelStatesBatch:
+    """Real SQLite tests for the batched channel-state upsert."""
+
+    def _make_db(self, tmp_path):
+        db_path = os.path.join(tmp_path, "test_batch.db")
+        plugin = MagicMock()
+        db = Database(db_path, plugin)
+        db.initialize()
+        return db
+
+    def _row(self, channel_id, **overrides):
+        row = dict(
+            channel_id=channel_id, peer_id="peer_" + channel_id,
+            state="balanced", flow_ratio=0.5, sats_in=100, sats_out=200,
+            capacity=1_000_000, confidence=0.9, velocity=0.1,
+            flow_multiplier=1.2, ema_decay=0.7, forward_count=3,
+            kalman_flow_ratio=0.4, kalman_velocity=0.05,
+            kalman_uncertainty=0.2,
+        )
+        row.update(overrides)
+        return row
+
+    def test_empty_batch_is_noop(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.update_channel_states_batch([])
+        assert db.get_all_channel_states() == []
+
+    def test_batch_insert_matches_single_upsert(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.update_channel_states_batch([self._row("1x1x0"), self._row("2x2x0")])
+
+        state = db.get_channel_state("1x1x0")
+        assert state is not None
+        assert state["peer_id"] == "peer_1x1x0"
+        assert state["flow_ratio"] == 0.5
+        assert state["kalman_uncertainty"] == 0.2
+        assert len(db.get_all_channel_states()) == 2
+
+    def test_batch_updates_existing_rows(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.update_channel_state(
+            channel_id="1x1x0", peer_id="old_peer", state="source",
+            flow_ratio=0.1, sats_in=1, sats_out=2, capacity=500,
+        )
+        db.update_channel_states_batch([self._row("1x1x0", state="sink")])
+
+        state = db.get_channel_state("1x1x0")
+        assert state["state"] == "sink"
+        assert state["peer_id"] == "peer_1x1x0"
+        assert len(db.get_all_channel_states()) == 1
+
+    def test_batch_defaults_for_optional_fields(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.update_channel_states_batch([dict(
+            channel_id="3x3x0", peer_id="p3", state="balanced",
+            flow_ratio=0.5, sats_in=0, sats_out=0, capacity=100,
+        )])
+        state = db.get_channel_state("3x3x0")
+        assert state["confidence"] == 1.0
+        assert state["ema_decay"] == 0.8
+        assert state["kalman_uncertainty"] == 0.1

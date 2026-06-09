@@ -1154,7 +1154,13 @@ class FlowAnalyzer:
         raw_flow_data = self.database.get_continuous_net_flow_all(
             window_hours=self.config.flow_window_days * 24
         )
-        
+
+        # Prefetch all previous states in one query instead of one per channel.
+        prev_states = {
+            s.get("channel_id"): s for s in self.database.get_all_channel_states()
+        }
+        pending_state_rows = []
+
         # Analyze each channel
         for channel in channels:
             channel_id = channel.get("short_channel_id") or channel.get("channel_id")
@@ -1196,7 +1202,7 @@ class FlowAnalyzer:
             max_htlcs = channel.get("max_htlcs", 483)
 
             # Get previous flow state for velocity calculation
-            prev_state = self.database.get_channel_state(channel_id)
+            prev_state = prev_states.get(channel_id)
             prev_ratio = float(prev_state.get("flow_ratio", 0.0)) if prev_state else 0.0
             # BUG FIX: Ensure updated_at is an integer timestamp
             prev_ts_raw = prev_state.get("updated_at", 0) if prev_state else 0
@@ -1235,8 +1241,9 @@ class FlowAnalyzer:
 
             results[channel_id] = metrics
 
-            # Store in database (with v2.0 and v2.1 fields)
-            self.database.update_channel_state(
+            # Queue for a single batched upsert after the loop (with v2.0 and
+            # v2.1 fields) instead of taking the write lock per channel.
+            pending_state_rows.append(dict(
                 channel_id=channel_id,
                 peer_id=peer_id,
                 state=metrics.state.value,
@@ -1254,10 +1261,13 @@ class FlowAnalyzer:
                 kalman_flow_ratio=metrics.kalman_flow_ratio,
                 kalman_velocity=metrics.kalman_velocity,
                 kalman_uncertainty=metrics.kalman_uncertainty
-            )
+            ))
 
-            # Update temporal flow profile
-            self._update_temporal_profile(channel_id)
+        # Persist all channel states in one transaction, then update temporal
+        # profiles (profile writes UPDATE channel_states, so rows must exist).
+        self.database.update_channel_states_batch(pending_state_rows)
+        for row in pending_state_rows:
+            self._update_temporal_profile(row["channel_id"])
 
         # Reconcile: remove stale channel_states entries for closed channels.
         # _get_channels() only returns CHANNELD_NORMAL, so any channel_states
