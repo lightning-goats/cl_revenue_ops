@@ -4613,6 +4613,23 @@ def test_metabolic_open_bias_is_bounded_planner_scoring_input():
 
 
 
+def test_immune_open_bias_is_bounded_planner_scoring_input():
+    plugin = MagicMock()
+    profitability = MagicMock()
+    flow = MagicMock()
+    planner = CapacityPlanner(plugin, profitability, flow, config=MagicMock())
+    hive_hints = MagicMock()
+    hive_hints.get_corridor_utilization_bias.return_value = 1.0
+    hive_hints.get_reputation_score.return_value = 50
+    hive_hints.get_metabolic_open_bias.return_value = 1.0
+    hive_hints.get_immune_open_bias.return_value = 0.50
+    planner.hive_hints = hive_hints
+
+    multiplier = planner._get_hive_open_score_multiplier("02candidate")
+
+    assert multiplier == pytest.approx(0.85)
+
+
 def test_metabolic_open_bias_cannot_bypass_planner_disabled_gate():
     plugin = MagicMock()
     profitability = MagicMock()

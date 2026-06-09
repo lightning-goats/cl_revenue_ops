@@ -2068,6 +2068,13 @@ class CapacityPlanner:
         except Exception:
             pass
 
+        try:
+            getter = getattr(self.hive_hints, "get_immune_open_bias", None)
+            if callable(getter):
+                multiplier *= max(0.85, min(1.10, float(getter(peer_id))))
+        except Exception:
+            pass
+
         return max(0.75, min(1.25, multiplier))
 
     def get_metabolic_planner_influence_debug(self) -> Dict[str, Any]:

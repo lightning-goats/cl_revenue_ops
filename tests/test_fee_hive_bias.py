@@ -96,6 +96,26 @@ class TestFeeHiveBias:
 
         assert fc._get_hive_fee_bias("02aabb") == pytest.approx(1.1)
 
+    def test_immune_fee_bias_is_bounded_scoring_input(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        adapter = MagicMock()
+        adapter.get_fee_bias.return_value = 1.0
+        adapter.get_metabolic_fee_bias.return_value = 1.0
+        adapter.get_immune_fee_bias.return_value = 0.95
+        fc.hive_hints = adapter
+
+        assert fc._get_hive_fee_bias("02aabb") == pytest.approx(0.95)
+
+    def test_immune_fee_bias_cannot_escape_fee_hard_cap(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        adapter = MagicMock()
+        adapter.get_fee_bias.return_value = 0.9
+        adapter.get_metabolic_fee_bias.return_value = 1.0
+        adapter.get_immune_fee_bias.return_value = 0.95
+        fc.hive_hints = adapter
+
+        assert fc._get_hive_fee_bias("02aabb") == pytest.approx(0.9)
+
     def test_hive_exploration_multiplier_uses_fee_elasticity(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
         adapter = MagicMock()

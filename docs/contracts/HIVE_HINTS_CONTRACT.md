@@ -31,7 +31,8 @@ Required fields for each peer hint are intentionally minimal. Missing optional f
 
 ## Optional Fields
 
-- Top-level: `ttl_seconds`, `schema_version`, `generation`, `peer_count`, `producer`, `compat_schema`, `m2_scope`, `route_segment_leases`, `rebalance_recommendations`, `rebalance_campaigns`, `segment_scores`, `segment_observations`, `metabolic_influence`.
+- Top-level: `ttl_seconds`, `schema_version`, `generation`, `peer_count`, `producer`, `compat_schema`, `m2_scope`, `route_segment_leases`, `rebalance_recommendations`, `rebalance_campaigns`, `segment_scores`, `segment_observations`, `metabolic_influence`, `immune_influence`.
+- Legacy `cl-hive` exports emit `schema_version: 1`, `producer: "cl-hive"`, and `compat_schema: "legacy-hints/v1"` — values that carry no M2 markers, so consumers keep legacy scope semantics. M2-mode payloads use `producer: "cl-mycelium"` and explicit `m2_scope`.
 - Peer hint: `member`, `direct_channel_peer`, `corridor_role`, `competition_bias`, `traffic_confidence`, `rebalance_preference`, `peer_quality_score`, `external_centrality`, `reputation_score`, `peak_hours_utc`, `drain_direction`, `fee_elasticity`, `optimal_fee_estimate_ppm`, `fleet_fee_median`, `fleet_capacity_sats`, `fleet_available_sats`, `fleet_topology`, `fleet_hive_topology`, `closure_recommended`, `closure_reason`, `channel_open_hint`, legacy per-peer `metabolic_influence` metadata.
 
 ## M2 Scope Enforcement
@@ -60,6 +61,12 @@ The consumer requires a fresh outer hint snapshot and a fresh `metabolic_influen
 Allowed effects are capped score modifiers only: fee bias in `[0.95, 1.05]`, rebalance bias in `[0.85, 1.15]`, and planner/open bias in `[0.85, 1.10]`. Metabolic influence never grants budget authority, never authorizes execution, never bypasses ROI/cost/dry-run/policy gates, and never changes min/max fee rails.
 
 Terminology: cl-mycelium Level 2b produces default-off, scoped metabolic hint metadata. `cl_revenue_ops` Level 2c consumes fresh, scope-valid metadata only as bounded local scoring input. `cl_revenue_ops` remains budget and executor authority.
+
+## Immune Influence
+
+`immune_influence` is an optional Level 2c top-level section with `schema_version: immune-influence/v1`. It is default-off, advisory only, and scope-bound. It may expose bounded scoring deltas for in-scope peers when explicitly enabled, but it does not mutate legacy peer hint fields, budgets, M2 scope, peer suppression, or executor policy. `all_hints` is lab-only and must not be the production default.
+
+Consumers must treat missing, stale, malformed, unsupported, low-confidence, or out-of-scope immune influence as neutral. The section never grants close, spend, rebalance, open, fee, or budget authority; `cl_revenue_ops` remains budget and execution authority.
 
 ## Stale Behavior
 

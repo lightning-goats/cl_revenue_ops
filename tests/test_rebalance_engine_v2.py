@@ -2967,3 +2967,34 @@ def test_metabolic_rebalance_bias_is_bounded_score_modifier(mock_plugin, mock_da
     assert pair.metabolic_rebalance_influence["bias_capped"] is True
     engine._update_pair_score_decomposition(pair, route_status="planned")
     assert pair.score_decomposition["inputs"]["metabolic_rebalance_bias"] == pytest.approx(1.15)
+
+
+def test_immune_rebalance_bias_is_bounded_score_modifier(mock_plugin, mock_database):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    hive_hints = MagicMock()
+    hive_hints.get_immune_rebalance_bias.return_value = 0.50
+    hive_hints.get_immune_peer_effect.return_value = {
+        "usable": True,
+        "bias_capped": True,
+        "reason_codes": ["toxic_peer_detected"],
+    }
+    engine._hive_hints = hive_hints
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02source",
+        dest_peer_id="02dest",
+        amount_sats=100_000,
+        pair_budget_sats=100,
+        score=10.0,
+    )
+
+    engine._apply_immune_rebalance_bias(pair)
+
+    assert pair.score == pytest.approx(8.5)
+    assert pair.immune_rebalance_bias == pytest.approx(0.85)
+    assert pair.immune_rebalance_influence["bias_capped"] is True
+    engine._update_pair_score_decomposition(pair, route_status="planned")
+    assert pair.score_decomposition["inputs"]["immune_rebalance_bias"] == pytest.approx(0.85)

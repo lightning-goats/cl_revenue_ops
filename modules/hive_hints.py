@@ -21,6 +21,7 @@ MAX_FEE_BIAS = 0.10          # +/-10% max fee effect
 MAX_REBALANCE_BIAS = 0.15    # +/-15% max rebalance score effect
 MAX_CORRIDOR_UTILIZATION_BIAS = 0.10  # +/-10% max utilization effect
 METABOLIC_SCHEMA_VERSION = "metabolic-influence/v1"
+IMMUNE_SCHEMA_VERSION = "immune-influence/v1"
 METABOLIC_MIN_CONFIDENCE_SCORE = 0.50
 METABOLIC_FEE_BIAS_CAP = 0.05       # +/-5% max metabolic fee effect
 METABOLIC_REBALANCE_BIAS_CAP = 0.15 # +/-15% max metabolic rebalance score effect
@@ -34,6 +35,13 @@ METABOLIC_CONFIDENCE_SCORES = {
     "low": 0.35,
     "unknown": 0.0,
 }
+IMMUNE_MIN_CONFIDENCE_SCORE = 0.50
+IMMUNE_FEE_BIAS_CAP = 0.05
+IMMUNE_REBALANCE_BIAS_CAP = 0.15
+IMMUNE_OPEN_NEGATIVE_CAP = 0.15
+IMMUNE_OPEN_POSITIVE_CAP = 0.10
+IMMUNE_CLOSURE_WATCH_CAP = 0.15
+IMMUNE_CONFIDENCE_SCORES = dict(METABOLIC_CONFIDENCE_SCORES)
 
 VALID_M2_SCOPES = {
     "legacy_seed_only",
@@ -60,6 +68,7 @@ STALE_FALLBACK_NEUTRALIZED_FIELDS = (
     "segment_scores",
     "segment_observations",
     "metabolic_influence",
+    "immune_influence",
 )
 M2_SENSITIVE_PEER_FIELDS = {
     "fee_bias",
@@ -82,6 +91,7 @@ M2_SENSITIVE_PEER_FIELDS = {
     "closure_recommended",
     "closure_reason",
     "metabolic_influence",
+    "immune_influence",
 }
 M2_SENSITIVE_SECTIONS = {
     "route_segment_leases",
@@ -1379,6 +1389,214 @@ class HiveHintAdapter:
             return peer_id in self._legacy_seed_peer_ids(snapshot)
         return False
 
+
+    # ------------------------------------------------------------------
+    # Immune influence v1
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _immune_confidence_score(confidence) -> float:
+        key = str(confidence or "unknown").strip().lower()
+        return float(IMMUNE_CONFIDENCE_SCORES.get(key, 0.0))
+
+    def _immune_payload_status_for(self, snapshot: dict | None) -> dict:
+        raw = snapshot.get("immune_influence") if isinstance(snapshot, dict) else None
+        present = raw is not None
+        base = {
+            "present": bool(present),
+            "schema_version": None,
+            "fresh": False,
+            "usable": False,
+            "m2_scope": DEFAULT_M2_SCOPE,
+            "peer_effect_count": 0,
+            "out_of_scope_peer_effect_count": 0,
+            "neutralized_peer_effect_count": 0,
+            "confidence": "unknown",
+            "reason": "missing" if not present else "malformed",
+            "generated_at": None,
+            "age_seconds": None,
+            "ttl_seconds": None,
+            "enabled": False,
+        }
+        if raw is None:
+            return base
+        if not isinstance(raw, dict):
+            return base
+
+        schema = str(raw.get("schema_version") or "")
+        confidence = str(raw.get("confidence") or "unknown").strip().lower() or "unknown"
+        peer_effects_raw = raw.get("peer_effects")
+        peer_effects_malformed = peer_effects_raw is not None and not isinstance(peer_effects_raw, dict)
+        peer_effects = peer_effects_raw if isinstance(peer_effects_raw, dict) else {}
+        global_effects_raw = raw.get("global_effects")
+        global_effects_malformed = global_effects_raw is not None and not isinstance(global_effects_raw, dict)
+        generated_at = raw.get("generated_at")
+        generated_at = int(generated_at) if isinstance(generated_at, (int, float)) else None
+        ttl = self._metabolic_ttl_for(raw, snapshot)
+        age = int(time.time()) - generated_at if generated_at is not None else None
+        fresh = bool(generated_at is not None and ttl > 0 and age is not None and age <= ttl)
+        raw_scope = str(raw.get("m2_scope") or self._requested_m2_scope_for(snapshot) or DEFAULT_M2_SCOPE).strip()
+        scope = raw_scope if raw_scope in VALID_M2_SCOPES else DEFAULT_M2_SCOPE
+
+        out_of_scope = 0
+        for peer_id in peer_effects.keys():
+            if not self._metabolic_peer_in_scope(str(peer_id), snapshot, scope):
+                out_of_scope += 1
+
+        base.update({
+            "schema_version": schema or None,
+            "fresh": fresh,
+            "m2_scope": scope,
+            "peer_effect_count": len(peer_effects),
+            "out_of_scope_peer_effect_count": out_of_scope,
+            "confidence": confidence,
+            "generated_at": generated_at,
+            "age_seconds": age,
+            "ttl_seconds": ttl,
+            "enabled": bool(raw.get("enabled", True)),
+        })
+
+        reason = None
+        if schema != IMMUNE_SCHEMA_VERSION:
+            reason = "unsupported_schema"
+        elif peer_effects_malformed or global_effects_malformed:
+            reason = "malformed"
+        elif raw.get("enabled", True) is False:
+            reason = "disabled"
+        elif not self._snapshot_is_fresh(snapshot) or self._using_stale_fallback:
+            reason = "snapshot_stale_or_fallback"
+        elif not fresh:
+            reason = "stale"
+        elif scope == "all_hints" and not self._allow_all_hints_m2_scope:
+            reason = "all_hints_scope_not_enabled"
+        elif self._immune_confidence_score(confidence) < IMMUNE_MIN_CONFIDENCE_SCORE:
+            reason = "low_confidence"
+
+        usable = reason is None
+        base["usable"] = bool(usable)
+        base["reason"] = reason
+        base["neutralized_peer_effect_count"] = out_of_scope if usable else len(peer_effects)
+        return base
+
+    def get_immune_status(self) -> dict:
+        with self._lock:
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            return self._immune_payload_status_for(snapshot)
+
+    def _get_immune_peer_effect_with_reason(self, peer_id: str) -> tuple[dict, str | None]:
+        with self._lock:
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            status = self._immune_payload_status_for(snapshot)
+            if not status.get("usable"):
+                return {}, str(status.get("reason") or "unusable")
+            raw = snapshot.get("immune_influence", {}) if isinstance(snapshot, dict) else {}
+            peer_effects = raw.get("peer_effects") if isinstance(raw.get("peer_effects"), dict) else {}
+            peer_id = str(peer_id or "")
+            if not self._metabolic_peer_in_scope(peer_id, snapshot, str(status.get("m2_scope") or DEFAULT_M2_SCOPE)):
+                return {}, "out_of_scope"
+            effect = peer_effects.get(peer_id)
+            if not isinstance(effect, dict):
+                return {}, "missing_peer_effect"
+            return dict(effect), None
+
+    def get_immune_peer_effect(self, peer_id: str) -> dict:
+        effect, reason = self._get_immune_peer_effect_with_reason(peer_id)
+        if reason is not None:
+            return {
+                "peer_id": str(peer_id or ""),
+                "usable": False,
+                "reason": reason,
+                "fee_bias": 1.0,
+                "rebalance_bias": 1.0,
+                "open_bias": 1.0,
+                "closure_watch_bias": 1.0,
+                "reason_codes": [],
+            }
+        raw_fee = effect.get("fee_bias_delta")
+        raw_rebalance = effect.get("rebalance_priority_delta")
+        raw_open = effect.get("open_confidence_delta")
+        raw_close = effect.get("closure_watch_priority_delta")
+        fee_delta = self._clamp_float(raw_fee, -IMMUNE_FEE_BIAS_CAP, IMMUNE_FEE_BIAS_CAP)
+        rebalance_delta = self._clamp_float(raw_rebalance, -IMMUNE_REBALANCE_BIAS_CAP, IMMUNE_REBALANCE_BIAS_CAP)
+        open_delta = self._clamp_float(raw_open, -IMMUNE_OPEN_NEGATIVE_CAP, IMMUNE_OPEN_POSITIVE_CAP)
+        close_delta = self._clamp_float(raw_close, -IMMUNE_CLOSURE_WATCH_CAP, IMMUNE_CLOSURE_WATCH_CAP)
+        reason_codes = effect.get("reason_codes")
+        if not isinstance(reason_codes, list):
+            reason_codes = []
+        return {
+            "peer_id": str(peer_id or ""),
+            "usable": True,
+            "reason": None,
+            "immune_peer_posture": str(effect.get("immune_peer_posture") or "unknown"),
+            "pathology_class": str(effect.get("pathology_class") or "unknown"),
+            "fee_bias_delta": fee_delta,
+            "rebalance_priority_delta": rebalance_delta,
+            "open_confidence_delta": open_delta,
+            "closure_watch_priority_delta": close_delta,
+            "fee_bias": round(1.0 + fee_delta, 6),
+            "rebalance_bias": round(1.0 + rebalance_delta, 6),
+            "open_bias": round(1.0 + open_delta, 6),
+            "closure_watch_bias": round(1.0 + close_delta, 6),
+            "bias_capped": any(
+                isinstance(value, (int, float)) and not isinstance(value, bool) and abs(float(value) - capped) > 1e-9
+                for value, capped in (
+                    (raw_fee, fee_delta),
+                    (raw_rebalance, rebalance_delta),
+                    (raw_open, open_delta),
+                    (raw_close, close_delta),
+                )
+            ),
+            "reason_codes": [str(code) for code in reason_codes if str(code or "").strip()],
+        }
+
+    def get_immune_fee_bias(self, peer_id: str) -> float:
+        effect = self.get_immune_peer_effect(peer_id)
+        if not effect.get("usable"):
+            return 1.0
+        return max(0.95, min(1.05, float(effect.get("fee_bias", 1.0) or 1.0)))
+
+    def get_immune_rebalance_bias(self, source_peer_id: str, dest_peer_id: str) -> float:
+        deltas = []
+        for peer_id in (source_peer_id, dest_peer_id):
+            effect = self.get_immune_peer_effect(peer_id)
+            if effect.get("usable"):
+                deltas.append(float(effect.get("rebalance_priority_delta", 0.0) or 0.0))
+        if not deltas:
+            return 1.0
+        chosen = max(deltas, key=lambda value: abs(value))
+        return max(0.85, min(1.15, 1.0 + chosen))
+
+    def get_immune_open_bias(self, peer_id: str) -> float:
+        effect = self.get_immune_peer_effect(peer_id)
+        if not effect.get("usable"):
+            return 1.0
+        return max(0.85, min(1.10, float(effect.get("open_bias", 1.0) or 1.0)))
+
+    def get_immune_closure_watch_bias(self, peer_id: str) -> float:
+        effect = self.get_immune_peer_effect(peer_id)
+        if not effect.get("usable"):
+            return 1.0
+        return max(0.85, min(1.15, float(effect.get("closure_watch_bias", 1.0) or 1.0)))
+
+    def get_immune_action_constraints(self) -> dict:
+        with self._lock:
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            status = self._immune_payload_status_for(snapshot)
+            raw = snapshot.get("immune_influence", {}) if isinstance(snapshot, dict) else {}
+            global_effects = raw.get("global_effects") if isinstance(raw, dict) and isinstance(raw.get("global_effects"), dict) else {}
+            return {
+                "additional_permission": False,
+                "execution_authority": "cl_revenue_ops",
+                "budget_authority": "cl_revenue_ops",
+                "immune_influence_usable": bool(status.get("usable")),
+                "growth_allowed": bool(global_effects.get("growth_allowed", False)) if status.get("usable") else False,
+                "rebalance_allowed": str(global_effects.get("rebalance_allowed") or "unknown") if status.get("usable") else "unknown",
+                "exploration_allowed": bool(global_effects.get("exploration_allowed", False)) if status.get("usable") else False,
+                "peer_suppression_allowed": False,
+                "closure_execution_allowed": False,
+                "reason": status.get("reason"),
+            }
+
     def _metabolic_payload_status_for(self, snapshot: dict | None) -> dict:
         raw = snapshot.get("metabolic_influence") if isinstance(snapshot, dict) else None
         present = raw is not None
@@ -1833,6 +2051,7 @@ class HiveHintAdapter:
                     "snapshot_source": self._snapshot_source,
                     "hints_count": 0,
                     "metabolic_influence": self._metabolic_payload_status_for(None),
+                    "immune_influence": self._immune_payload_status_for(None),
                     **self._m2_scope_debug_for(None),
                     **self._stale_fallback_debug_for(active=False),
                 }
@@ -1860,6 +2079,7 @@ class HiveHintAdapter:
                 "rebalance_campaigns_count": len(self._get_section_entries("rebalance_campaigns", self._validate_rebalance_campaign)),
                 "route_segment_leases_count": len(self._get_section_entries("route_segment_leases", self._validate_route_segment_lease)),
                 "metabolic_influence": self._metabolic_payload_status_for(self._snapshot),
+                "immune_influence": self._immune_payload_status_for(self._snapshot),
             }
             status.update(self._m2_scope_debug_for(self._snapshot))
             status.update(self._stale_fallback_debug_for())

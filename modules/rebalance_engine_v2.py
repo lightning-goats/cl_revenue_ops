@@ -354,6 +354,10 @@ class RebalanceEngine:
                     float(getattr(pair, "metabolic_rebalance_bias", 1.0) or 1.0),
                     6,
                 ),
+                "immune_rebalance_bias": round(
+                    float(getattr(pair, "immune_rebalance_bias", 1.0) or 1.0),
+                    6,
+                ),
             },
         }
 
@@ -413,6 +417,13 @@ class RebalanceEngine:
             ),
             "metabolic_rebalance_influence": copy.deepcopy(
                 getattr(pair, "metabolic_rebalance_influence", {}) or {}
+            ),
+            "immune_rebalance_bias": round(
+                float(getattr(pair, "immune_rebalance_bias", 1.0) or 1.0),
+                6,
+            ),
+            "immune_rebalance_influence": copy.deepcopy(
+                getattr(pair, "immune_rebalance_influence", {}) or {}
             ),
             "reason_code": pair.reason_code,
             "route_policy": getattr(
@@ -534,6 +545,7 @@ class RebalanceEngine:
             "skipped": skipped,
             "executions": executions,
             "metabolic_rebalance_influence": self._metabolic_rebalance_debug_for_candidates(considered, selected),
+            "immune_rebalance_influence": self._immune_rebalance_debug_for_candidates(considered, selected),
         }
 
 
@@ -552,6 +564,34 @@ class RebalanceEngine:
         constraints = {}
         try:
             getter = getattr(self._hive_hints, "get_metabolic_action_constraints", None)
+            if callable(getter):
+                constraints = getter()
+        except Exception:
+            constraints = {}
+        return {
+            "seen": any(bool(item.get("seen", False)) for item in influences),
+            "usable": any(bool(item.get("usable", False)) for item in influences),
+            "candidate_bias_applied": any(float(item.get("bias", 1.0) or 1.0) != 1.0 for item in influences),
+            "bias_capped": any(bool(item.get("bias_capped", False)) for item in influences),
+            "constraints": constraints if isinstance(constraints, dict) else {},
+            "reason_codes": reason_codes,
+        }
+
+    def _immune_rebalance_debug_for_candidates(self, considered: List[PairCandidate], selected: List[PairCandidate]) -> Dict[str, Any]:
+        influences = []
+        for pair in list(considered or []) + list(selected or []):
+            influence = getattr(pair, "immune_rebalance_influence", {}) or {}
+            if isinstance(influence, dict) and influence:
+                influences.append(influence)
+        reason_codes = []
+        for influence in influences:
+            for code in influence.get("reason_codes", []) or []:
+                code = str(code or "")
+                if code and code not in reason_codes:
+                    reason_codes.append(code)
+        constraints = {}
+        try:
+            getter = getattr(self._hive_hints, "get_immune_action_constraints", None)
             if callable(getter):
                 constraints = getter()
         except Exception:
@@ -955,6 +995,7 @@ class RebalanceEngine:
             self._route_decision_for_pair(pair)
             self._apply_segment_score_bias(pair)
             self._apply_metabolic_rebalance_bias(pair)
+            self._apply_immune_rebalance_bias(pair)
             self._update_pair_score_decomposition(pair, route_status="planned")
         priority_rank = {
             RoutePriority.COORDINATED: 0,
@@ -1262,6 +1303,61 @@ class RebalanceEngine:
         except Exception:
             pair.metabolic_rebalance_bias = 1.0
             pair.metabolic_rebalance_influence = {
+                "seen": False,
+                "usable": False,
+                "bias": 1.0,
+                "bias_capped": False,
+                "reason_codes": [],
+                "reason": "error",
+            }
+
+    def _apply_immune_rebalance_bias(self, pair: PairCandidate) -> None:
+        """Apply fresh, scoped immune influence as a bounded score modifier."""
+        hive_hints = self._hive_hints
+        if hive_hints is None:
+            return
+        try:
+            getter = getattr(hive_hints, "get_immune_rebalance_bias", None)
+            if not callable(getter):
+                return
+            raw_bias = float(getter(pair.source_peer_id, pair.dest_peer_id))
+            bias = max(0.85, min(1.15, raw_bias))
+            pair.immune_rebalance_bias = bias
+            influence = {
+                "seen": False,
+                "usable": bias != 1.0,
+                "bias": bias,
+                "bias_capped": abs(raw_bias - bias) > 1e-9,
+                "reason_codes": [],
+            }
+            peer_getter = getattr(hive_hints, "get_immune_peer_effect", None)
+            if callable(peer_getter):
+                reason_codes = []
+                capped = influence["bias_capped"]
+                seen = False
+                usable = False
+                for peer_id in (pair.source_peer_id, pair.dest_peer_id):
+                    effect = peer_getter(peer_id)
+                    if not isinstance(effect, dict):
+                        continue
+                    seen = seen or bool(effect)
+                    usable = usable or bool(effect.get("usable", False))
+                    capped = capped or bool(effect.get("bias_capped", False))
+                    for code in effect.get("reason_codes", []) or []:
+                        code = str(code or "")
+                        if code and code not in reason_codes:
+                            reason_codes.append(code)
+                influence.update({
+                    "seen": seen,
+                    "usable": usable and bias != 1.0,
+                    "bias_capped": capped,
+                    "reason_codes": reason_codes,
+                })
+            pair.immune_rebalance_influence = influence
+            pair.score = float(getattr(pair, "score", 0.0) or 0.0) * bias
+        except Exception:
+            pair.immune_rebalance_bias = 1.0
+            pair.immune_rebalance_influence = {
                 "seen": False,
                 "usable": False,
                 "bias": 1.0,

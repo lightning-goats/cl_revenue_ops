@@ -1823,6 +1823,10 @@ class FeeController:
             if callable(metabolic_getter):
                 metabolic_bias = max(0.95, min(1.05, float(metabolic_getter(peer_id))))
                 bias *= metabolic_bias
+            immune_getter = getattr(self.hive_hints, "get_immune_fee_bias", None)
+            if callable(immune_getter):
+                immune_bias = max(0.95, min(1.05, float(immune_getter(peer_id))))
+                bias *= immune_bias
             return max(0.9, min(1.1, bias))
         except Exception:
             return 1.0
