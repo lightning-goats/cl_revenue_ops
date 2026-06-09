@@ -5555,8 +5555,50 @@ class FeeController:
         return None
 
     def _handle_policy_change(self, peer_id: str, policy: PeerPolicy) -> None:
-        """Handle policy changes (placeholder for future use)."""
-        pass
+        """Wake the peer's sleeping channels so the next fee cycle applies
+        the new policy.
+
+        Registered with PolicyManager at init; fires on revenue-policy
+        set and delete (delete notifies with the default policy).
+        """
+        try:
+            states = self.database.get_all_channel_states()
+        except Exception as e:
+            self.plugin.log(
+                f"POLICY_CHANGE: channel lookup failed for {peer_id[:12]}...: {e}",
+                level='warn'
+            )
+            return
+
+        channel_ids = [
+            s.get("channel_id") for s in states
+            if s.get("peer_id") == peer_id and s.get("channel_id")
+        ]
+        if not channel_ids:
+            return
+
+        woken = 0
+        with self._state_lock:
+            for channel_id in channel_ids:
+                cycle = self._cycle_states.get(channel_id)
+                if cycle is not None and cycle.is_sleeping:
+                    cycle.is_sleeping = False
+                    cycle.sleep_until = 0
+                    cycle.stable_cycles = 0
+                    self._save_cycle_state(channel_id, cycle)
+                    woken += 1
+                ts_state = self._channel_fee_states.get(channel_id)
+                if ts_state is not None and ts_state.is_sleeping:
+                    ts_state.is_sleeping = False
+                    ts_state.sleep_until = 0
+                    ts_state.stable_cycles = 0
+                    self._save_channel_fee_state(channel_id, ts_state)
+        if woken:
+            self.plugin.log(
+                f"POLICY_CHANGE: Woke {woken} channel(s) for {peer_id[:12]}... "
+                f"after policy change to strategy={policy.strategy.value}",
+                level='info'
+            )
 
     @staticmethod
     def _extract_local_htlc_bounds(

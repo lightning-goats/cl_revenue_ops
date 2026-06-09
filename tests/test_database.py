@@ -471,3 +471,67 @@ class TestUpdateChannelStatesBatch:
         assert state["confidence"] == 1.0
         assert state["ema_decay"] == 0.8
         assert state["kalman_uncertainty"] == 0.1
+
+
+class TestForwardDoubleDipPrevention:
+    """TODO #19: hook-path and hydration-path inserts of the same forward
+    must deduplicate under idx_forwards_unique regardless of order."""
+
+    def _make_db(self, tmp_path):
+        db_path = os.path.join(tmp_path, "test_double_dip.db")
+        plugin = MagicMock()
+        db = Database(db_path, plugin)
+        db.initialize()
+        return db
+
+    FWD = dict(
+        in_channel="111x1x0", out_channel="222x2x0",
+        in_msat=1_000_000, out_msat=999_000, fee_msat=1_000,
+        received_time=1_700_000_100, resolved_time=1_700_000_103,
+    )
+
+    def _count(self, db):
+        conn = db._get_connection()
+        return conn.execute("SELECT COUNT(*) FROM forwards").fetchone()[0]
+
+    def test_hook_then_hydration_no_duplicate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._make_db(tmp)
+            f = self.FWD
+            db.record_forward(
+                f["in_channel"], f["out_channel"], f["in_msat"], f["out_msat"],
+                f["fee_msat"], f["received_time"], f["resolved_time"], 3,
+            )
+            inserted = db.bulk_insert_forwards([dict(
+                f, resolution_time=3,
+            )])
+            assert inserted == 0
+            assert self._count(db) == 1
+
+    def test_hydration_then_hook_no_duplicate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._make_db(tmp)
+            f = self.FWD
+            assert db.bulk_insert_forwards([dict(f, resolution_time=3)]) == 1
+            db.record_forward(
+                f["in_channel"], f["out_channel"], f["in_msat"], f["out_msat"],
+                f["fee_msat"], f["received_time"], f["resolved_time"], 3,
+            )
+            assert self._count(db) == 1
+
+    def test_legacy_colon_scid_still_deduplicates(self):
+        """Hook path historically normalized ':' to 'x'; hydration uses
+        normalize_scid. Same forward in both spellings must not double-dip."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._make_db(tmp)
+            f = self.FWD
+            db.record_forward(
+                "111:1:0", "222:2:0", f["in_msat"], f["out_msat"],
+                f["fee_msat"], f["received_time"], f["resolved_time"], 3,
+            )
+            inserted = db.bulk_insert_forwards([dict(f, resolution_time=3)])
+            assert inserted == 0
+            assert self._count(db) == 1

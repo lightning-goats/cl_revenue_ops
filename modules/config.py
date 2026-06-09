@@ -139,8 +139,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'thompson_max_observations': int,
     'thompson_min_observations': int,
     # Routing Intelligence Integration
-    'routing_intelligence_enabled': bool,
-    'routing_intelligence_cache_seconds': int,
     # Fields present in CONFIG_FIELD_RANGES that need type registration
     'base_fee_msat': int,
     'fee_ppm_intra_fleet': int,
@@ -150,8 +148,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'target_flow': int,
     'source_threshold': float,
     'sink_threshold': float,
-    'enable_flow_asymmetry': bool,
-    'enable_peer_sync': bool,
     # Capacity Planner
     'planner_enabled': bool,
     'planner_interval': int,
@@ -226,7 +222,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'thompson_max_observations': (50, 500),
     'thompson_min_observations': (1, 20),
     # Routing Intelligence Integration
-    'routing_intelligence_cache_seconds': (60, 3600),  # 1 min to 1 hour
     # Additional range validations
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
@@ -505,8 +500,6 @@ class Config:
     vegas_decay_rate: float = 0.85         # Per-cycle decay (~30min half-life)
     
     # Deferred features
-    enable_flow_asymmetry: bool = False    # Rare liquidity premium
-    enable_peer_sync: bool = False         # Peer-level fee syncing
 
     # Issue #28: Revenue rate EMA smoothing
     # EMA formula: new_ema = alpha * current + (1 - alpha) * old_ema
@@ -531,8 +524,6 @@ class Config:
     # ==========================================================================
     # Routing Intelligence Integration
     # ==========================================================================
-    routing_intelligence_enabled: bool = False    # Opt-in feature (off by default)
-    routing_intelligence_cache_seconds: int = 300  # Cache TTL for routing intel
 
     # Capacity Planner
     planner_enabled: bool = False
@@ -919,8 +910,6 @@ class ConfigSnapshot:
     vegas_decay_rate: float
     
     # Deferred features
-    enable_flow_asymmetry: bool
-    enable_peer_sync: bool
 
     # RPC Hardening
     rpc_timeout_seconds: int
@@ -942,8 +931,6 @@ class ConfigSnapshot:
     thompson_max_observations: int
     thompson_min_observations: int
     # Routing Intelligence Integration
-    routing_intelligence_enabled: bool
-    routing_intelligence_cache_seconds: int
 
     # M-27: xpay/askrene parameters (were missing from snapshot)
     askrene_layer: str = 'xpay'

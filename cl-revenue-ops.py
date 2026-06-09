@@ -1719,12 +1719,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log(f"Warning: Could not load config overrides: {e}", level='warn')
 
     # =========================================================================
-    # FORWARDS TABLE HYDRATION (TODO #19: Double-Dip Fix)
+    # FORWARDS TABLE HYDRATION (#19: double-dip prevented)
     # =========================================================================
     # The forwards table is populated in real-time by forward_event hook.
     # Startup hydration backfills empty tables and bounded overlap gaps.
+    # Hook and hydration overlap is safe: both insert paths use
+    # INSERT OR IGNORE under idx_forwards_unique with the same SCID and
+    # timestamp normalization (see TestForwardDoubleDipPrevention).
     # The RPC fetch itself is still an unfiltered settled-forward listforwards
-    # call; the "bounded" part is the local insert window below.
+    # call; the local insert window below bounds what gets written.
     # =========================================================================
     try:
         last_forward_ts = database.get_latest_forward_timestamp()

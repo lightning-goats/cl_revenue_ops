@@ -31,7 +31,7 @@ Immune influence is optional, fresh-only, scope-checked, bounded, and neutral on
 
 Peer effects may include bounded `fee_bias_delta`, `rebalance_priority_delta`, `open_confidence_delta`, and `closure_watch_priority_delta`. These are scoring modifiers only. Under `channel_and_fleet_peers`, effects apply only to peers marked `direct_channel_peer=true` or `member=true` in the same hint snapshot.
 
-Note: the current cl-hive producer always emits `fee_bias_delta: 0.0` (neutral); nonzero fee bias is reserved for future producer versions. The consumer must still clamp and bound any nonzero value it receives.
+By design, immune influence carries no fee authority: the producer always emits `fee_bias_delta: 0.0`. Fee biasing belongs to metabolic influence and the local fee controller; immune effects are limited to rebalance priority, open confidence, and closure watch. The consumer must still clamp and bound any nonzero value it receives so a future schema revision cannot exceed documented bounds.
 
 ## Neutralization
 
