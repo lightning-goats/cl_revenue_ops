@@ -342,8 +342,20 @@ class HiveRouter:
             # not "short_channel_id".  The first hop's amount_msat is what
             # enters the route; the route-level amount_msat is what arrives
             # at the destination.  Fee = first_hop - destination_amount.
-            first_hop_amount = path[0].get("amount_msat", amount_msat)
-            dest_amount = route.get("amount_msat", amount_msat)
+            first_hop_amount = path[0].get("amount_msat")
+            dest_amount = route.get("amount_msat")
+            if first_hop_amount is None or dest_amount is None:
+                # Falling back to the requested amount makes the fee compute
+                # as 0, which silently flatters the route — keep the fallback
+                # for compatibility but make it observable.
+                self._log(
+                    "getroutes result missing amount_msat "
+                    f"(first_hop={first_hop_amount}, dest={dest_amount}); "
+                    "route fee may be underestimated",
+                    level="warn",
+                )
+                first_hop_amount = first_hop_amount if first_hop_amount is not None else amount_msat
+                dest_amount = dest_amount if dest_amount is not None else amount_msat
             total_fee_msat = max(0, first_hop_amount - dest_amount)
             fee_ppm = (total_fee_msat * 1_000_000) // dest_amount if dest_amount > 0 else 0
 

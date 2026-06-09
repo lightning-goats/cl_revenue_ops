@@ -2981,6 +2981,18 @@ class FeeController:
         peer_id: str,
         actual_fee_ppm: int = None
     ) -> ChannelFeeState:
+        """Locked wrapper: _channel_fee_states is shared across the fee loop
+        and hook threads; _state_lock is an RLock so re-entry from already
+        locked callers is safe."""
+        with self._state_lock:
+            return self._get_channel_fee_state_locked(channel_id, peer_id, actual_fee_ppm)
+
+    def _get_channel_fee_state_locked(
+        self,
+        channel_id: str,
+        peer_id: str,
+        actual_fee_ppm: int = None
+    ) -> ChannelFeeState:
         """
         Get fee state for a channel.
 
@@ -3053,7 +3065,8 @@ class FeeController:
 
     def _save_channel_fee_state(self, channel_id: str, state: ChannelFeeState) -> None:
         """Save channel fee state to cache and database."""
-        self._channel_fee_states[channel_id] = state
+        with self._state_lock:
+            self._channel_fee_states[channel_id] = state
 
         row_fields, v2_data = self._build_merged_fee_strategy_row(
             channel_id,
@@ -6593,32 +6606,35 @@ class FeeController:
         """
         if not channel_id or current_fee_ppm <= 0:
             return
-        fee_state = self._channel_fee_states.get(channel_id)
-        if not fee_state:
-            return
-        state = fee_state.thompson
-        if not isinstance(state, GaussianThompsonState):
-            return
+        # Called from the forward_event hook thread; the fee loop mutates the
+        # same Thompson state under _state_lock.
+        with self._state_lock:
+            fee_state = self._channel_fee_states.get(channel_id)
+            if not fee_state:
+                return
+            state = fee_state.thompson
+            if not isinstance(state, GaussianThompsonState):
+                return
 
-        implied_fee = int(current_fee_ppm * 0.8)
-        try:
-            prior_precision = 1.0 / max(state.MIN_STD ** 2, state.posterior_std ** 2)
+            implied_fee = int(current_fee_ppm * 0.8)
+            try:
+                prior_precision = 1.0 / max(state.MIN_STD ** 2, state.posterior_std ** 2)
 
-            # Base weight: 10% of a settled forward
-            # Amount boost: log scale, large forwards (>1M sats) get up to 3x
-            base_weight = 0.1
-            if amount_msat > 0:
-                amount_sats = amount_msat / 1000
-                # 1K sats → 1x, 100K sats → 2x, 1M+ sats → 3x
-                amount_boost = min(3.0, 1.0 + math.log10(max(1, amount_sats)) / 3.0)
-                base_weight *= amount_boost
+                # Base weight: 10% of a settled forward
+                # Amount boost: log scale, large forwards (>1M sats) get up to 3x
+                base_weight = 0.1
+                if amount_msat > 0:
+                    amount_sats = amount_msat / 1000
+                    # 1K sats → 1x, 100K sats → 2x, 1M+ sats → 3x
+                    amount_boost = min(3.0, 1.0 + math.log10(max(1, amount_sats)) / 3.0)
+                    base_weight *= amount_boost
 
-            obs_precision = prior_precision * base_weight
+                obs_precision = prior_precision * base_weight
 
-            total_precision = prior_precision + obs_precision
-            if total_precision > 0:
-                new_mean = (prior_precision * state.posterior_mean + obs_precision * implied_fee) / total_precision
-                state.posterior_mean = float(new_mean)
-                state.posterior_std = float(max(state.MIN_STD, (1.0 / total_precision) ** 0.5))
-        except Exception:
-            pass
+                total_precision = prior_precision + obs_precision
+                if total_precision > 0:
+                    new_mean = (prior_precision * state.posterior_mean + obs_precision * implied_fee) / total_precision
+                    state.posterior_mean = float(new_mean)
+                    state.posterior_std = float(max(state.MIN_STD, (1.0 / total_precision) ** 0.5))
+            except Exception:
+                pass

@@ -1999,7 +1999,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 # Keeps history tables from growing unbounded over months
                 # Use flow_window_days + 1 day buffer, minimum 8 days
                 if database:
-                    days_to_keep = max(8, config.flow_window_days + 1)
+                    cleanup_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                    days_to_keep = max(8, cleanup_snap.flow_window_days + 1)
                     database.cleanup_old_data(days_to_keep=days_to_keep)
 
                 # AUDIT FIX PM-5: Clean up expired time-limited policies
@@ -4973,11 +4974,14 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
     # Record failed forward as weak negative DTS signal (amount-weighted)
     if status == "failed" and in_channel and fee_controller is not None:
         try:
-            cfs = fee_controller._channel_fee_states.get(in_channel)
-            current_fee = cfs.last_fee_ppm if cfs else 0
-            if current_fee > 0:
-                failed_in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
-                fee_controller.record_failed_forward(in_channel, current_fee, amount_msat=failed_in_msat)
+            # _channel_fee_states is mutated by the fee loop under _state_lock;
+            # this hook runs on the pyln thread, so take the same lock.
+            with fee_controller._state_lock:
+                cfs = fee_controller._channel_fee_states.get(in_channel)
+                current_fee = cfs.last_fee_ppm if cfs else 0
+                if current_fee > 0:
+                    failed_in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
+                    fee_controller.record_failed_forward(in_channel, current_fee, amount_msat=failed_in_msat)
         except Exception:
             pass
 
