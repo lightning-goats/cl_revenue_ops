@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field
@@ -147,6 +148,15 @@ class RebalanceEngine:
 
         self._cycle_router: Optional[Any] = self._active_router()
         self._last_cycle_result: CycleResult = CycleResult()
+        # Single-flight execution guard. run_cycle() (background loop) and
+        # execute_candidate() (manual RPCs) mutate shared cycle state
+        # (_cycle_router, _last_cycle_result, _pair_failures, hive_router
+        # begin_cycle/end_cycle) and can otherwise pay for the same
+        # source->dest pair twice when they overlap. Contenders never block:
+        # run_cycle() skips with a 'cycle_already_running' audit marker and
+        # execute_candidate() fails fast with error='engine_busy' (same
+        # non-blocking pattern as the fee controller's state lock).
+        self._cycle_lock = threading.Lock()
 
     def _probe_askrene(self) -> bool:
         """One-shot probe: does this CLN instance have askrene loaded?"""
@@ -1065,6 +1075,10 @@ class RebalanceEngine:
                             pair.pair_budget_sats,
                             getattr(route_result, "probability_ppm", 0),
                         )
+                        # Persist the planner's effective ceiling so execution
+                        # and budget reservation honor the same budget that
+                        # accepted this route (no-op when the bonus is 0).
+                        pair.effective_budget_sats = int(effective_budget)
                         self._update_pair_score_decomposition(
                             pair,
                             probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),
@@ -1625,6 +1639,28 @@ class RebalanceEngine:
         bonus_fraction = clamped * bonus_rate
         return int(pair_budget_sats * (1.0 + bonus_fraction))
 
+    @staticmethod
+    def _pair_max_fee_sats(pair: PairCandidate) -> int:
+        """Return the fee ceiling execution must honor for this pair.
+
+        When the probability budget bonus accepted a route above the raw
+        pair budget, find_candidates stores the planner's effective budget
+        on the pair (``effective_budget_sats``). Execution and budget
+        reservation must use that same ceiling or _validate_route would
+        deterministically reject every bonus-band route. With the default
+        bonus of 0.0 the effective budget equals the raw pair budget and
+        behavior is unchanged.
+        """
+        base = int(getattr(pair, "pair_budget_sats", 0) or 0)
+        effective = getattr(pair, "effective_budget_sats", None)
+        if effective is None:
+            return base
+        try:
+            effective = int(effective)
+        except (TypeError, ValueError):
+            return base
+        return max(base, effective)
+
     def _config_snapshot(self) -> Any:
         return self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
 
@@ -1671,7 +1707,7 @@ class RebalanceEngine:
         Manual/explicit execute_candidate callers deliberately skip this path;
         their caller owns override semantics and accounting.
         """
-        max_fee_sats = max(0, int(getattr(pair, "pair_budget_sats", 0) or 0))
+        max_fee_sats = max(0, self._pair_max_fee_sats(pair))
         cfg = self._config_snapshot()
         effective_budget = self._get_global_budget_limit(cfg)
         allow_zero_cost_with_zero_budget = bool(
@@ -1779,7 +1815,7 @@ class RebalanceEngine:
             "amount_sats": pair.amount_sats,
             "source_channel_id": pair.source_channel_id,
             "dest_channel_id": pair.dest_channel_id,
-            "max_fee_sats": pair.pair_budget_sats,
+            "max_fee_sats": self._pair_max_fee_sats(pair),
             "observation_store": self._segment_observation_store,
             "observation_context": {
                 "short_channel_id": pair.dest_channel_id,
@@ -1981,11 +2017,24 @@ class RebalanceEngine:
         original_amount = int(getattr(pair, "amount_sats", 0) or 0)
         original_route = list(getattr(pair, "route", []) or [])
         original_route_cost = getattr(pair, "route_cost_sats", None)
+        original_budget = int(getattr(pair, "pair_budget_sats", 0) or 0)
+        original_effective_budget = getattr(pair, "effective_budget_sats", None)
         partial_attempts: List[Dict[str, Any]] = []
         total_attempts = max(1, int(getattr(prior_result, "attempts", 0) or 1))
 
         for amount_sats in self._native_partial_amounts(original_amount):
             pair.amount_sats = amount_sats
+            # Scale the fee budget proportionally to the retry amount so the
+            # partial fill keeps the original plan's fee-rate ceiling. Without
+            # this a 5k-sat fill could legally pay the full pair budget
+            # (e.g. 5,000 sats fee on 5,000 sats = 1,000,000 ppm).
+            scaled_budget = original_budget
+            if original_amount > 0 and original_budget > 0:
+                scaled_budget = max(
+                    1,
+                    -(-original_budget * amount_sats // original_amount),  # ceil
+                )
+            pair.pair_budget_sats = scaled_budget
             try:
                 route_result, route_label = self._route_pair(
                     pair=pair,
@@ -2014,9 +2063,10 @@ class RebalanceEngine:
 
             route_cost = int(getattr(route_result, "route_cost_sats", 0) or 0)
             effective_budget = self._probability_adjusted_budget(
-                int(getattr(pair, "pair_budget_sats", 0) or 0),
+                scaled_budget,
                 int(getattr(route_result, "probability_ppm", 0) or 0),
             )
+            pair.effective_budget_sats = int(effective_budget)
             if route_cost > effective_budget:
                 partial_attempts.append(
                     {
@@ -2085,6 +2135,12 @@ class RebalanceEngine:
         pair.amount_sats = original_amount
         pair.route = original_route
         pair.route_cost_sats = original_route_cost
+        pair.pair_budget_sats = original_budget
+        if original_effective_budget is None:
+            if hasattr(pair, "effective_budget_sats"):
+                del pair.effective_budget_sats
+        else:
+            pair.effective_budget_sats = original_effective_budget
         data = dict(getattr(prior_result, "failure_data", {}) or {})
         data["partial_fill"] = {
             "planned_amount_sats": original_amount,
@@ -2107,18 +2163,28 @@ class RebalanceEngine:
         *,
         reserve_budget: bool = False,
         account_costs: bool = False,
+        rebalance_id: Optional[int] = None,
     ) -> Optional[ExecutionResult]:
         """Execute a single pair in a worker thread.
 
         Native execution requires the route priced by the active router and
         executes that exact route.
+
+        ``rebalance_id``: when the caller (manual/diagnostic/execute_rebalance
+        paths in the rebalancer) already inserted its own rebalance_history
+        row, it passes that row id here and the engine updates it in place
+        instead of inserting a second 'pending' row. This keeps one history
+        row per rebalance so success-rate/fee stats are not double-counted.
         """
         # Stage 2D Defect 3 fix: the v2 engine used to leave ``rebalance_history``
         # empty on automatic cycles, which made ``revenue-status.rebalance_decision.
         # action == 'rebalance'`` reachable alongside ``recent_rebalances == []``.
         # Legacy ``execute_rebalance`` already records to the DB; we mirror that
         # behavior here so the summary and the history agree.
-        rebalance_id: Optional[int] = self._record_rebalance_pending(pair)
+        if rebalance_id is None:
+            rebalance_id = self._record_rebalance_pending(pair)
+        else:
+            rebalance_id = int(rebalance_id)
         reservation_id = (
             str(rebalance_id)
             if rebalance_id is not None
@@ -2436,8 +2502,43 @@ class RebalanceEngine:
             self._log(f"segment observation export failed: {exc}", level="debug")
             return False
 
-    def execute_candidate(self, candidate: Any) -> ExecutionResult:
-        """Price and execute one explicit candidate on the v2 stack."""
+    def execute_candidate(
+        self, candidate: Any, rebalance_id: Optional[int] = None
+    ) -> ExecutionResult:
+        """Price and execute one explicit candidate on the v2 stack.
+
+        Single-flight: shares the engine cycle lock with run_cycle(). The
+        acquire is non-blocking by design — if a cycle (or another explicit
+        execution) is in flight, this returns a failed ExecutionResult with
+        error='engine_busy' instead of waiting, so manual RPC callers get an
+        immediate, retriable answer rather than blocking behind a full
+        background cycle.
+
+        ``rebalance_id``: optional existing rebalance_history row id owned by
+        the caller; see _execute_pair.
+        """
+        if not self._cycle_lock.acquire(blocking=False):
+            self._log(
+                "engine_busy: another rebalance cycle/execution holds the "
+                "engine lock; rejecting explicit candidate",
+                level="info",
+            )
+            return ExecutionResult(
+                success=False,
+                error="engine_busy",
+                amount_sats=int(getattr(candidate, "amount_sats", 0) or 0),
+                route_type=self._executor_mode(),
+            )
+        try:
+            return self._execute_candidate_locked(
+                candidate, rebalance_id=rebalance_id
+            )
+        finally:
+            self._cycle_lock.release()
+
+    def _execute_candidate_locked(
+        self, candidate: Any, rebalance_id: Optional[int] = None
+    ) -> ExecutionResult:
         source_channel_id = str(getattr(candidate, "from_channel", "") or "")
         dest_channel_id = str(getattr(candidate, "to_channel", "") or "")
         source_peer_id = str(getattr(candidate, "from_peer_id", "") or "")
@@ -2523,14 +2624,42 @@ class RebalanceEngine:
             executor,
             reserve_budget=False,
             account_costs=False,
+            rebalance_id=rebalance_id,
         )
 
     def run_cycle(self) -> CycleResult:
         """Live execution: find candidates (already priced), execute concurrently.
 
+        Single-flight: if another cycle (or an explicit execute_candidate)
+        already holds the engine lock, returns immediately with an empty
+        CycleResult carrying a 'cycle_already_running' audit marker instead
+        of mutating shared cycle state or double-paying the same pairs.
+
         Filters out pairs in futility state before submitting to the executor,
         and records success/failure in the pair tracker for the next cycle.
         """
+        if not self._cycle_lock.acquire(blocking=False):
+            self._log(
+                "cycle_already_running: another rebalance cycle holds the "
+                "engine lock; skipping this cycle",
+                level="info",
+            )
+            return CycleResult(
+                audit_records=[
+                    SkipRecord(
+                        channel_id="",
+                        reason="cycle_already_running",
+                        value_class="none",
+                        detail="engine cycle lock held by another caller",
+                    )
+                ]
+            )
+        try:
+            return self._run_cycle_locked()
+        finally:
+            self._cycle_lock.release()
+
+    def _run_cycle_locked(self) -> CycleResult:
         try:
             self.reconcile_pending_settlements()
         except Exception as exc:

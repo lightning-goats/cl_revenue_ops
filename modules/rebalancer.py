@@ -340,11 +340,22 @@ class EVRebalancer:
         # Propagate to job_manager so _handle_job_* methods can call unreserve
         self.job_manager.hive_router = value
 
-    def _execute_candidate_v2(self, candidate: RebalanceCandidate):
-        """Execute one candidate through the shared v2 engine."""
+    def _execute_candidate_v2(
+        self,
+        candidate: RebalanceCandidate,
+        rebalance_id: Optional[int] = None,
+    ):
+        """Execute one candidate through the shared v2 engine.
+
+        ``rebalance_id``: the caller's existing rebalance_history row. The
+        engine updates that row in place instead of inserting its own
+        'pending' row, so each rebalance produces exactly one history row.
+        """
         if self.rebalance_engine_v2 is None:
             raise RuntimeError("no rebalance engine available")
-        return self.rebalance_engine_v2.execute_candidate(candidate)
+        return self.rebalance_engine_v2.execute_candidate(
+            candidate, rebalance_id=rebalance_id
+        )
 
     def _set_last_decision_summary(
         self,
@@ -2454,11 +2465,13 @@ class EVRebalancer:
                             )
                             coordination_started = True
                         try:
-                            exec_result = self._execute_candidate_v2(candidate)
+                            exec_result = self._execute_candidate_v2(
+                                candidate, rebalance_id=rebalance_id
+                            )
                             if exec_result.success:
                                 actual_fee_sats = self._record_successful_rebalance_fee(
                                     rebalance_id,
-                                    status='completed',
+                                    status='success',
                                     channel_id=candidate.to_channel,
                                     peer_id=candidate.to_peer_id,
                                     amount_sats=candidate.amount_sats,
@@ -2497,8 +2510,15 @@ class EVRebalancer:
                                         f"({exec_result.attempts} attempts, "
                                         f"type={exec_result.route_type})"
                                     ),
+                                    "payment_pending": bool(
+                                        getattr(exec_result, "payment_pending", False)
+                                    ),
                                 }
-                                if rebalance_id:
+                                # The engine shares our history row; when the
+                                # payment is parked as 'pending_settlement' for
+                                # the reconciliation sweep, do not clobber it
+                                # with 'failed'.
+                                if rebalance_id and not res["payment_pending"]:
                                     self.database.update_rebalance_result(
                                         rebalance_id, 'failed',
                                         error_message=error_str,
@@ -2548,11 +2568,13 @@ class EVRebalancer:
                             )
                 else:
                     try:
-                        exec_result = self._execute_candidate_v2(candidate)
+                        exec_result = self._execute_candidate_v2(
+                            candidate, rebalance_id=rebalance_id
+                        )
                         if exec_result.success:
                             actual_fee_sats = self._record_successful_rebalance_fee(
                                 rebalance_id,
-                                status='completed',
+                                status='success',
                                 channel_id=candidate.to_channel,
                                 peer_id=candidate.to_peer_id,
                                 amount_sats=candidate.amount_sats,
@@ -2579,8 +2601,14 @@ class EVRebalancer:
                                     f"({exec_result.attempts} attempts, "
                                     f"type={exec_result.route_type})"
                                 ),
+                                "payment_pending": bool(
+                                    getattr(exec_result, "payment_pending", False)
+                                ),
                             }
-                            if rebalance_id:
+                            # Engine shares our history row; keep its
+                            # 'pending_settlement' status intact for the
+                            # reconciliation sweep.
+                            if rebalance_id and not res["payment_pending"]:
                                 self.database.update_rebalance_result(
                                     rebalance_id, 'failed',
                                     error_message=error_str,
@@ -2663,7 +2691,7 @@ class EVRebalancer:
                     safety_block=False,
                     budget_blocked=False,
                 )
-                if rebalance_id:
+                if rebalance_id and not res.get("payment_pending"):
                     self.database.update_rebalance_result(
                         rebalance_id, 'failed', error_message=error
                     )
@@ -2807,7 +2835,9 @@ class EVRebalancer:
             )
 
             if self.rebalance_engine_v2:
-                exec_result = self._execute_candidate_v2(candidate)
+                exec_result = self._execute_candidate_v2(
+                    candidate, rebalance_id=rebalance_id
+                )
                 if exec_result.success:
                     self._record_successful_rebalance_fee(
                         rebalance_id,
@@ -2817,7 +2847,9 @@ class EVRebalancer:
                         amount_sats=shock_amount,
                         fee_msat=exec_result.fee_msat,
                     )
-                else:
+                elif not getattr(exec_result, "payment_pending", False):
+                    # Engine shares this history row; leave its
+                    # 'pending_settlement' status for the reconcile sweep.
                     self.database.update_rebalance_result(
                         rebalance_id, 'failed',
                         error_message=exec_result.error or "rebalance failed"
@@ -2922,7 +2954,7 @@ class EVRebalancer:
             self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no rebalance engine available")
             return {"success": False, "error": "no rebalance engine available"}
 
-        exec_result = self._execute_candidate_v2(cand)
+        exec_result = self._execute_candidate_v2(cand, rebalance_id=rebalance_id)
 
         if exec_result.success:
             fee_sats = self._record_successful_rebalance_fee(
@@ -2935,10 +2967,13 @@ class EVRebalancer:
             )
             result = {"success": True, "message": "completed", "actual_fee_sats": fee_sats}
         else:
-            self.database.update_rebalance_result(
-                rebalance_id, 'failed',
-                error_message=exec_result.error or ""
-            )
+            if not getattr(exec_result, "payment_pending", False):
+                # Engine shares this history row; keep 'pending_settlement'
+                # intact for the reconciliation sweep.
+                self.database.update_rebalance_result(
+                    rebalance_id, 'failed',
+                    error_message=exec_result.error or ""
+                )
             result = {"success": False, "error": exec_result.error or "rebalance failed"}
 
         # Include capital controls warning in result (unless force=True)
