@@ -1005,6 +1005,30 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-receivable-ratio-target',
+    default='0.30',
+    description='Node receivable/capacity ratio at which structural drain pressure reaches zero'
+)
+
+plugin.add_option(
+    name='revenue-ops-receivable-ratio-floor',
+    default='0.20',
+    description='Receivable/capacity ratio below which the node is considered inbound-starved'
+)
+
+plugin.add_option(
+    name='revenue-ops-boltz-structural-budget-sats',
+    default='0',
+    description='Daily swap-fee budget (sats) for scarcity-credited Boltz loop-outs (0 = disabled)'
+)
+
+plugin.add_option(
+    name='revenue-ops-drain-fee-discount-max',
+    default='0.0',
+    description='Max bounded fee discount on stagnant over-local channels (0.0 = disabled)'
+)
+
+plugin.add_option(
     name='revenue-ops-expansion-treasury-enabled',
     default='false',
     description='Enable expansion treasury mode (reverse-swap excess LN to on-chain for opens) (default: false)'
@@ -1580,6 +1604,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         boltz_auto_cycle_interval_minutes=_safe_int_opt('revenue-ops-boltz-auto-cycle-interval-minutes', '15'),
         boltz_auto_cycle_max_actions=_safe_int_opt('revenue-ops-boltz-auto-cycle-max-actions', '1'),
         boltz_auto_cycle_startup_delay_seconds=_safe_int_opt('revenue-ops-boltz-auto-cycle-startup-delay-seconds', '120'),
+        receivable_ratio_target=_safe_float_opt('revenue-ops-receivable-ratio-target', '0.30'),
+        receivable_ratio_floor=_safe_float_opt('revenue-ops-receivable-ratio-floor', '0.20'),
+        boltz_structural_budget_sats_per_day=_safe_int_opt('revenue-ops-boltz-structural-budget-sats', '0'),
+        drain_fee_discount_max=_safe_float_opt('revenue-ops-drain-fee-discount-max', '0.0'),
         expansion_treasury_enabled=options.get('revenue-ops-expansion-treasury-enabled', 'false').lower() == 'true',
         expansion_treasury_onchain_target_sats=_safe_int_opt('revenue-ops-expansion-treasury-onchain-target-sats', '5000000'),
         expansion_treasury_min_deficit_sats=_safe_int_opt('revenue-ops-expansion-treasury-min-deficit-sats', '250000'),

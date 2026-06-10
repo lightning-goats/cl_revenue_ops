@@ -78,6 +78,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'boltz_auto_cycle_interval_minutes': int,
     'boltz_auto_cycle_max_actions': int,
     'boltz_auto_cycle_startup_delay_seconds': int,
+    'receivable_ratio_target': float,
+    'receivable_ratio_floor': float,
+    'boltz_structural_budget_sats_per_day': int,
+    'drain_fee_discount_max': float,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -199,6 +203,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'boltz_auto_cycle_interval_minutes': (1, 1440),
     'boltz_auto_cycle_max_actions': (1, 10),
     'boltz_auto_cycle_startup_delay_seconds': (0, 3600),
+    'receivable_ratio_target': (0.0, 1.0),
+    'receivable_ratio_floor': (0.0, 1.0),
+    'boltz_structural_budget_sats_per_day': (0, 1_000_000),
+    'drain_fee_discount_max': (0.0, 0.5),
     'min_wallet_reserve': (0, 100000000),
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
@@ -322,6 +330,16 @@ class Config:
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
     boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
+    # Source-heavy drain: node-level receivable objective and envelopes.
+    # receivable_ratio = total receivable / total capacity across channels.
+    receivable_ratio_target: float = 0.30   # structural credit scales to 0 here
+    receivable_ratio_floor: float = 0.20    # below this the node is "starved"
+    # Daily cap (sats of swap fees) for loop-outs that only pass the profit
+    # guard via the structural credit. 0 = structural loop-outs disabled.
+    boltz_structural_budget_sats_per_day: int = 0
+    # Max bounded fee discount applied to stagnant over-local channels.
+    # 0.0 = disabled. 0.10 means fees may be biased down by at most 10%.
+    drain_fee_discount_max: float = 0.0
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
@@ -573,6 +591,24 @@ class Config:
                 "hive_equalization_low_pct must be less than "
                 "hive_equalization_high_pct"
             )
+        # Source-heavy drain fields: enforce ranges at construction time so a
+        # bad receivable objective or discount cap can never be instantiated.
+        for _key in (
+            'receivable_ratio_target',
+            'receivable_ratio_floor',
+            'boltz_structural_budget_sats_per_day',
+            'drain_fee_discount_max',
+        ):
+            _min_val, _max_val = CONFIG_FIELD_RANGES[_key]
+            _val = getattr(self, _key)
+            if not (_min_val <= _val <= _max_val):
+                raise ValueError(
+                    f"{_key} must be between {_min_val} and {_max_val}, got {_val}"
+                )
+        if self.receivable_ratio_floor > self.receivable_ratio_target:
+            raise ValueError(
+                "receivable_ratio_floor must not exceed receivable_ratio_target"
+            )
         profile = str(self.fee_profile or "active").lower()
         if profile not in STRING_ENUM_VALID_VALUES["fee_profile"]:
             raise ValueError(
@@ -644,6 +680,8 @@ class Config:
                 self.hive_equalization_low_pct = max(
                     0.0, self.hive_equalization_high_pct - 0.05
                 )
+        if self.receivable_ratio_floor > self.receivable_ratio_target:
+            self.receivable_ratio_floor = self.receivable_ratio_target
         return list(self._override_warnings)
 
     def _apply_override(self, key: str, value: str) -> None:
