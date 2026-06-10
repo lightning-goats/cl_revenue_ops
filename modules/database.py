@@ -3729,6 +3729,25 @@ class Database:
             self.plugin.log(f"Record spend event failed: {e}", level='error')
             return False
 
+    def get_category_spend_sats(self, category: str,
+                                subcategory: Optional[str] = None,
+                                since_timestamp: int = 0) -> int:
+        """Sum of spend_events sats for a category (optionally subcategory)."""
+        conn = self._get_connection()
+        if subcategory is None:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount_sats), 0) FROM spend_events "
+                "WHERE category = ? AND timestamp >= ?",
+                (str(category), int(since_timestamp)),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount_sats), 0) FROM spend_events "
+                "WHERE category = ? AND subcategory = ? AND timestamp >= ?",
+                (str(category), str(subcategory), int(since_timestamp)),
+            ).fetchone()
+        return int(row[0])
+
     def cleanup_stale_spend_reservations(self, max_age_seconds: int = 86400, category: Optional[str] = None) -> int:
         conn = self._get_connection()
         cutoff = int(time.time()) - max_age_seconds

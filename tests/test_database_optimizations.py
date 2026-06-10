@@ -613,3 +613,37 @@ class TestNodeRealizedFeePpm:
             (old,),
         )
         assert db.get_node_realized_fee_ppm(window_days=7) == 0
+
+
+class TestCategorySpendSats:
+    def _db(self, tmp_path):
+        from modules.database import Database
+        plugin = MagicMock()
+        db = Database(str(tmp_path / "spend.db"), plugin)
+        db.initialize()
+        return db
+
+    def test_sums_matching_category_and_subcategory(self, tmp_path):
+        db = self._db(tmp_path)
+        now = int(time.time())
+        db.record_spend_event(event_id="e1", amount_sats=100, category="boltz",
+                              subcategory="structural", timestamp=now - 100)
+        db.record_spend_event(event_id="e2", amount_sats=40, category="boltz",
+                              subcategory="structural", timestamp=now - 200)
+        db.record_spend_event(event_id="e3", amount_sats=999, category="boltz",
+                              subcategory="swap_fee", timestamp=now - 200)
+        db.record_spend_event(event_id="e4", amount_sats=999, category="boltz",
+                              subcategory="structural", timestamp=now - 2 * 86400)
+        got = db.get_category_spend_sats("boltz", subcategory="structural",
+                                         since_timestamp=now - 86400)
+        assert got == 140
+
+    def test_subcategory_none_sums_whole_category(self, tmp_path):
+        db = self._db(tmp_path)
+        now = int(time.time())
+        db.record_spend_event(event_id="e1", amount_sats=10, category="boltz",
+                              subcategory="swap_fee", timestamp=now - 100)
+        db.record_spend_event(event_id="e2", amount_sats=20, category="boltz",
+                              subcategory="structural", timestamp=now - 100)
+        assert db.get_category_spend_sats("boltz",
+                                          since_timestamp=now - 86400) == 30
