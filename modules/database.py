@@ -297,7 +297,14 @@ class Database:
         # Create new connection for this thread in a local variable so that
         # a PRAGMA failure does not leave a half-configured connection in
         # thread-local storage (connection leak prevention).
-        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        # check_same_thread=False so close_all_connections() can close
+        # connections owned by other (daemon) threads at shutdown — CPython
+        # otherwise enforces the thread check even on close(), which made the
+        # shutdown handler a silent no-op and prevented WAL truncation.
+        # SAFETY CONSTRAINT: each connection is still only USED (execute/etc.)
+        # by its owning thread via threading.local; cross-thread access is
+        # limited to close() during shutdown.
+        conn = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
         try:
             conn.row_factory = sqlite3.Row
 
@@ -2202,39 +2209,56 @@ class Database:
         base_cooldown = max(1, int(cooldown_seconds))
         normalized_kind = str(failure_kind or "other_retriable").strip() or "other_retriable"
 
-        existing = conn.execute(
-            """
-            SELECT failure_count
-            FROM pair_rebalance_failures
-            WHERE source_channel_id = ? AND dest_channel_id = ?
-            """,
-            (source_channel_id, dest_channel_id),
-        ).fetchone()
-        failure_count = int(existing["failure_count"]) + 1 if existing else 1
-        backoff_multiplier = min(max(failure_count, 1), 6)
-        cooldown_until = current_time + (base_cooldown * backoff_multiplier)
+        # Atomic increment: a SELECT-then-INSERT read-modify-write loses
+        # increments under concurrent writers (autocommit, no transaction).
+        # The increment and backoff math happen inside a single upsert, with
+        # the post-increment count driving the cooldown:
+        #   backoff_multiplier = min(max(failure_count, 1), 6)
+        # The follow-up SELECT runs inside the same BEGIN IMMEDIATE
+        # transaction so the returned row matches exactly this call's effect.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                INSERT INTO pair_rebalance_failures
+                    (source_channel_id, dest_channel_id, failure_kind,
+                     failure_count, last_failure_at, cooldown_until)
+                VALUES (?, ?, ?, 1, ?, ? + ?)
+                ON CONFLICT(source_channel_id, dest_channel_id) DO UPDATE SET
+                    failure_kind = excluded.failure_kind,
+                    failure_count = pair_rebalance_failures.failure_count + 1,
+                    last_failure_at = excluded.last_failure_at,
+                    cooldown_until = excluded.last_failure_at +
+                        (? * MIN(MAX(pair_rebalance_failures.failure_count + 1, 1), 6))
+                """,
+                (
+                    source_channel_id,
+                    dest_channel_id,
+                    normalized_kind,
+                    current_time,
+                    current_time,
+                    base_cooldown,
+                    base_cooldown,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT failure_count, cooldown_until
+                FROM pair_rebalance_failures
+                WHERE source_channel_id = ? AND dest_channel_id = ?
+                """,
+                (source_channel_id, dest_channel_id),
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
-        conn.execute(
-            """
-            INSERT INTO pair_rebalance_failures
-                (source_channel_id, dest_channel_id, failure_kind,
-                 failure_count, last_failure_at, cooldown_until)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_channel_id, dest_channel_id) DO UPDATE SET
-                failure_kind = excluded.failure_kind,
-                failure_count = excluded.failure_count,
-                last_failure_at = excluded.last_failure_at,
-                cooldown_until = excluded.cooldown_until
-            """,
-            (
-                source_channel_id,
-                dest_channel_id,
-                normalized_kind,
-                failure_count,
-                current_time,
-                cooldown_until,
-            ),
-        )
+        failure_count = int(row["failure_count"])
+        cooldown_until = int(row["cooldown_until"])
         return {
             "source_channel_id": source_channel_id,
             "dest_channel_id": dest_channel_id,
@@ -4397,17 +4421,35 @@ class Database:
         total_msat = int(row["total_msat"] or 0) if row else 0
         return base_to_sats_ceil(total_msat)
     
-    def get_channel_cost_history(self, channel_id: str) -> List[Dict[str, Any]]:
-        """Get detailed cost history for a channel."""
+    def get_channel_cost_history(
+        self,
+        channel_id: str,
+        since_timestamp: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get detailed cost history for a channel.
+
+        Args:
+            channel_id: The channel short ID (SCID)
+            since_timestamp: Optional unix timestamp; when provided, only rows
+                with timestamp >= since_timestamp are returned (uses the
+                idx_rebalance_costs_channel_time index). Default None keeps
+                the original full-history behavior.
+        """
         channel_id = normalize_scid(channel_id)
         aliases = _scid_aliases(channel_id)
         placeholders = _sql_placeholders(aliases)
         conn = self._get_connection()
+        params: List[Any] = list(aliases)
+        time_filter = ""
+        if since_timestamp is not None:
+            time_filter = "AND timestamp >= ?"
+            params.append(int(since_timestamp))
         rows = conn.execute(f"""
-            SELECT * FROM rebalance_costs 
+            SELECT * FROM rebalance_costs
             WHERE channel_id IN ({placeholders})
+            {time_filter}
             ORDER BY timestamp DESC
-        """, aliases).fetchall()
+        """, params).fetchall()
         return [dict(row) for row in rows]
     
     def get_channel_rebalance_success_rate(
@@ -5080,7 +5122,8 @@ class Database:
             "channel_states": 0,
             "channel_failures": 0,
             "channel_probes": 0,
-            "kalman_state": 0
+            "kalman_state": 0,
+            "pair_rebalance_failures": 0
         }
 
         try:
@@ -5114,6 +5157,18 @@ class Database:
                     (channel_id,)
                 )
                 deleted["kalman_state"] = cursor.rowcount
+
+                # Remove pair rebalance cooldown state involving the closed
+                # channel (keyed by source_channel_id/dest_channel_id).
+                try:
+                    cursor = conn.execute(
+                        "DELETE FROM pair_rebalance_failures "
+                        "WHERE source_channel_id = ? OR dest_channel_id = ?",
+                        (channel_id, channel_id)
+                    )
+                    deleted["pair_rebalance_failures"] = cursor.rowcount
+                except sqlite3.OperationalError:
+                    pass  # Table may not exist on older schemas
 
                 # L11 FIX: Clean up fee_strategy_state to prevent
                 # orphaned rows from accumulating on nodes with frequent channel turnover.
@@ -5533,6 +5588,31 @@ class Database:
             snapshot_cutoff = now - (365 * 86400)
             conn.execute("DELETE FROM financial_snapshots WHERE timestamp < ?", (snapshot_cutoff,))
 
+            # LEDGER CLEANUP: Prune terminal reservation rows and stale pair
+            # cooldowns older than 90 days. Conservative on purpose:
+            # - reservations are only removed once in a terminal state
+            #   (anything not 'active'): spent/released/expired/etc.
+            # - pair_rebalance_failures rows are only removed when BOTH the
+            #   cooldown expiry and the last update are older than the cutoff.
+            # Do NOT prune spend_events, rebalance_costs, or planner_actions —
+            # they are accounting sources of truth.
+            ledger_cutoff = now - (90 * 86400)
+            conn.execute(
+                "DELETE FROM budget_reservations "
+                "WHERE status != 'active' AND reserved_at < ?",
+                (ledger_cutoff,)
+            )
+            conn.execute(
+                "DELETE FROM spend_reservations "
+                "WHERE status != 'active' AND reserved_at < ?",
+                (ledger_cutoff,)
+            )
+            conn.execute(
+                "DELETE FROM pair_rebalance_failures "
+                "WHERE cooldown_until < ? AND last_failure_at < ?",
+                (ledger_cutoff, ledger_cutoff)
+            )
+
             conn.execute("COMMIT")
         except Exception as e:
             try:
@@ -5768,9 +5848,11 @@ class Database:
             conn.execute("ROLLBACK")
             raise
 
-        # Read back the version (outside transaction; reflects committed state)
-        row = conn.execute("SELECT MAX(version) as max_v FROM config_overrides").fetchone()
-        return row['max_v'] or 0
+        # Return the version computed inside the transaction. A re-read of
+        # MAX(version) outside the transaction could return a HIGHER version
+        # written by a concurrent caller after our commit, misattributing
+        # someone else's version to this write.
+        return new_version
 
     def get_all_config_overrides(self) -> Dict[str, str]:
         """Get all config overrides as a dictionary.
@@ -6109,18 +6191,31 @@ class Database:
         return cursor.rowcount > 0
 
     def delete_expired_policies(self, now: int) -> list:
-        """Delete expired policies. Returns list of deleted peer_ids."""
+        """Delete expired policies. Returns list of deleted peer_ids.
+
+        SELECT and DELETE run in one BEGIN IMMEDIATE transaction so the
+        returned peer_id list exactly matches the rows deleted (no other
+        writer can add/remove expired rows between the two statements).
+        """
         conn = self._get_connection()
-        expired_rows = conn.execute(
-            "SELECT peer_id FROM peer_policies WHERE expires_at IS NOT NULL AND expires_at < ?",
-            (now,)
-        ).fetchall()
-        if not expired_rows:
-            return []
-        conn.execute(
-            "DELETE FROM peer_policies WHERE expires_at IS NOT NULL AND expires_at < ?",
-            (now,)
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            expired_rows = conn.execute(
+                "SELECT peer_id FROM peer_policies WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now,)
+            ).fetchall()
+            if expired_rows:
+                conn.execute(
+                    "DELETE FROM peer_policies WHERE expires_at IS NOT NULL AND expires_at < ?",
+                    (now,)
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         return [row["peer_id"] for row in expired_rows]
 
     def upsert_policies_batch(self, rows: list) -> None:
