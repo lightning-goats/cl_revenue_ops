@@ -152,6 +152,9 @@ class GaussianThompsonState:
     MIN_STD = 10                    # Never let uncertainty go below 10 ppm
     ZERO_REVENUE_WEIGHT_FACTOR = 0.15  # Zero-revenue observations get 15% of time-weight
     SECONDARY_EXPLORE_BOOST = 1.25  # Slightly wider prior for secondary contexts
+    MAX_BIAS_NUDGES = 50            # Security: bounded out-of-band nudge memory
+    BIAS_DECAY_HOURS = 24.0         # Advisory nudges fade with a 1-day half-life
+    BIAS_MIN_WEIGHT = 1e-3          # Below this decayed weight a nudge is pruned
 
     # Prior parameters
     prior_mean_fee: int = 200       # Default prior mean: 200 ppm
@@ -185,6 +188,15 @@ class GaussianThompsonState:
     # {context_key: (mean, precision, count, last_update)}
     # Legacy serialized 3-tuples (mean, std, count) are still accepted on load.
     contextual_posteriors: Dict[str, Tuple[float, float, int, int]] = field(default_factory=dict)
+
+    # Durable out-of-band posterior nudges: (target_fee, weight, timestamp).
+    # _recompute_posterior rebuilds posterior_mean/std entirely from
+    # observations + the fixed prior, which used to silently erase in-place
+    # nudges (failed forwards, neighbor-median seeding, undercut/boundary
+    # bias) before the next sampling cycle could see them. Nudges recorded
+    # here are re-applied after every recompute, with time decay, so the
+    # advisory signal actually shifts the next cycle's sampled distribution.
+    posterior_bias: List[Tuple[float, float, int]] = field(default_factory=list)
 
     # Tracking
     last_sampled_fee: int = 0
@@ -651,7 +663,86 @@ class GaussianThompsonState:
                 # Don't increment count for cross-pollination
                 self.contextual_posteriors[adj_key] = (new_mean, new_precision, adj_count, adj_last)
 
+    def record_posterior_nudge(self, target_fee: float, weight: float) -> None:
+        """
+        Apply and durably record an out-of-band posterior nudge.
+
+        Out-of-band signals (failed forwards, neighbor-median seeding,
+        undercut/boundary bias) are not revenue observations, so they cannot
+        live in self.observations — but a plain in-place posterior_mean/std
+        mutation is erased by the next _recompute_posterior. This records
+        the nudge so it is re-applied (with time decay) after every
+        recompute, making the advisory signal survive update_posterior.
+
+        Args:
+            target_fee: Fee (ppm) to pull the posterior toward
+            weight: Nudge strength relative to current posterior precision
+                    (e.g. 0.1 = 10% of a settled forward's confidence)
+        """
+        try:
+            target_fee = float(target_fee)
+            weight = float(weight)
+        except (TypeError, ValueError):
+            return
+        if not (math.isfinite(target_fee) and math.isfinite(weight)):
+            return
+        if weight <= 0 or target_fee < 0:
+            return
+
+        self.posterior_bias.append((target_fee, weight, int(time.time())))
+        if len(self.posterior_bias) > self.MAX_BIAS_NUDGES:
+            self.posterior_bias = self.posterior_bias[-self.MAX_BIAS_NUDGES:]
+
+        # Immediate effect on the current posterior (same precision-weighted
+        # blend the call sites previously applied in place).
+        self._blend_posterior_toward(target_fee, weight)
+
+    def _blend_posterior_toward(self, target_fee: float, weight: float) -> None:
+        """Precision-weighted Gaussian blend of the posterior toward a target."""
+        prior_precision = 1.0 / max(self.MIN_STD ** 2, self.posterior_std ** 2)
+        obs_precision = prior_precision * weight
+        total_precision = prior_precision + obs_precision
+        if total_precision <= 0:
+            return
+        self.posterior_mean = float(
+            (prior_precision * self.posterior_mean + obs_precision * target_fee)
+            / total_precision
+        )
+        self.posterior_std = float(max(self.MIN_STD, (1.0 / total_precision) ** 0.5))
+
+    def _apply_posterior_bias(self) -> None:
+        """Re-apply recorded nudges after a posterior rebuild, with decay."""
+        if not self.posterior_bias:
+            return
+        now = int(time.time())
+        kept: List[Tuple[float, float, int]] = []
+        for entry in self.posterior_bias:
+            try:
+                target_fee = float(entry[0])
+                weight = float(entry[1])
+                ts = int(entry[2])
+            except (TypeError, ValueError, IndexError):
+                continue
+            age_hours = max(0.0, (now - ts) / 3600.0)
+            decayed = weight * math.pow(0.5, age_hours / self.BIAS_DECAY_HOURS)
+            if decayed < self.BIAS_MIN_WEIGHT:
+                continue  # Expired — prune
+            kept.append((target_fee, weight, ts))
+            self._blend_posterior_toward(target_fee, decayed)
+        self.posterior_bias = kept
+
     def _recompute_posterior(self) -> None:
+        """
+        Recompute posterior from observations, then re-apply durable nudges.
+
+        The core rebuild derives posterior_mean/std solely from
+        self.observations + the fixed prior; out-of-band nudges recorded via
+        record_posterior_nudge are layered back on top so they are not lost.
+        """
+        self._recompute_posterior_core()
+        self._apply_posterior_bias()
+
+    def _recompute_posterior_core(self) -> None:
         """
         Recompute posterior using Bayesian polynomial regression.
 
@@ -989,6 +1080,7 @@ class GaussianThompsonState:
             "_last_fee_min": self._last_fee_min,
             "_last_fee_max": self._last_fee_max,
             "contextual_posteriors": self.contextual_posteriors,
+            "posterior_bias": self.posterior_bias,
             "last_sampled_fee": self.last_sampled_fee,
             "last_sample_time": self.last_sample_time
         }
@@ -1064,6 +1156,22 @@ class GaussianThompsonState:
             state._prior_precision = [row[:] for row in _default_prec]
         state._last_fee_min = float(d.get("_last_fee_min", 0.0))
         state._last_fee_max = float(d.get("_last_fee_max", 0.0))
+
+        # Restore durable out-of-band nudges (validated; bounded)
+        raw_bias = d.get("posterior_bias", [])
+        restored_bias: List[Tuple[float, float, int]] = []
+        if isinstance(raw_bias, list):
+            for entry in raw_bias[-cls.MAX_BIAS_NUDGES:]:
+                try:
+                    target_fee = float(entry[0])
+                    weight = float(entry[1])
+                    ts = int(entry[2])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if (math.isfinite(target_fee) and math.isfinite(weight)
+                        and weight > 0 and target_fee >= 0):
+                    restored_bias.append((target_fee, weight, ts))
+        state.posterior_bias = restored_bias
 
         state.last_sampled_fee = d.get("last_sampled_fee", 0)
         state.last_sample_time = d.get("last_sample_time", 0)
@@ -3141,9 +3249,17 @@ class FeeController:
         if flow_state in ("sink", "dormant"):
             return None
 
-        # Strategy 1: Per-channel cost history
-        cost_history = self.database.get_channel_cost_history(channel_id)
+        # Strategy 1: Per-channel cost history.
+        # Push the window filter into SQL when the DB layer supports it;
+        # fall back to the legacy full-history signature otherwise.
         cutoff = int(time.time()) - (self.REBALANCE_FLOOR_WINDOW_DAYS * 86400)
+        try:
+            cost_history = self.database.get_channel_cost_history(
+                channel_id, since_timestamp=cutoff
+            )
+        except TypeError:
+            # Older database module without since_timestamp support
+            cost_history = self.database.get_channel_cost_history(channel_id)
         recent_costs = [c for c in cost_history if c.get('timestamp', 0) >= cutoff]
 
         if len(recent_costs) >= self.REBALANCE_FLOOR_MIN_SAMPLES:
@@ -4657,6 +4773,14 @@ class FeeController:
                     ts_state.last_fee_ppm = current_fee_ppm
                     ts_state.last_volume_sats = volume_since_sats
                     ts_state.last_update = now
+                    # Persisted is_sleeping/sleep_until/stable_cycles are sourced
+                    # from the cycle payload (_build_merged_fee_strategy_row), so
+                    # sleep entry must be mirrored onto the cycle state — every
+                    # wake path already updates both — or a restart would wake
+                    # every sleeping channel.
+                    cycle.is_sleeping = True
+                    cycle.sleep_until = ts_state.sleep_until
+                    cycle.stable_cycles = ts_state.stable_cycles
                     self._save_channel_fee_state(channel_id, ts_state)
                     # Reset cycle observation timer so post-sleep window
                     # doesn't span the entire sleep period
@@ -4820,14 +4944,9 @@ class FeeController:
                 if sparse_data_conservative and ts_state and ts_state.thompson:
                     ts = ts_state.thompson
                     if ts.posterior_std >= 100:  # Still very uncertain
-                        prior_prec = 1.0 / max(ts.MIN_STD ** 2, ts.posterior_std ** 2)
-                        obs_prec = prior_prec * 0.15  # 15% weight — weaker than forward
-                        total_prec = prior_prec + obs_prec
-                        if total_prec > 0:
-                            ts.posterior_mean = float(
-                                (prior_prec * ts.posterior_mean + obs_prec * neighbor_median) / total_prec
-                            )
-                            ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
+                        # Durable nudge (15% weight — weaker than a settled
+                        # forward); survives the next posterior recompute.
+                        ts.record_posterior_nudge(float(neighbor_median), 0.15)
             # Market-fee policy: price relative to neighbor_median based on the
             # configured mode. "undercut" (default) prices below the median to win
             # volume. "match" targets the median. "premium" prices above the median
@@ -4965,14 +5084,8 @@ class FeeController:
                     ):
                         ts = ts_state.thompson
                         if ts.posterior_mean > undercut_target and ts.posterior_std >= 50:
-                            prior_prec = 1.0 / max(ts.MIN_STD ** 2, ts.posterior_std ** 2)
-                            obs_prec = prior_prec * 0.10
-                            total_prec = prior_prec + obs_prec
-                            if total_prec > 0:
-                                ts.posterior_mean = float(
-                                    (prior_prec * ts.posterior_mean + obs_prec * undercut_target) / total_prec
-                                )
-                                ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
+                            # Durable nudge; survives the next posterior recompute.
+                            ts.record_posterior_nudge(float(undercut_target), 0.10)
 
             # Rebalance cost awareness: routing-value-scaled nudge toward cost recovery
             # Applied BEFORE bounding so the nudge actually reaches the blending step.
@@ -5066,14 +5179,8 @@ class FeeController:
                     if sparse_data_conservative and ts_state and ts_state.thompson:
                         ts = ts_state.thompson
                         if ts.posterior_mean > boundary_target_ppm and ts.posterior_std >= 50:
-                            prior_prec = 1.0 / max(ts.MIN_STD ** 2, ts.posterior_std ** 2)
-                            obs_prec = prior_prec * 0.15
-                            total_prec = prior_prec + obs_prec
-                            if total_prec > 0:
-                                ts.posterior_mean = float(
-                                    (prior_prec * ts.posterior_mean + obs_prec * boundary_target_ppm) / total_prec
-                                )
-                                ts.posterior_std = float(max(ts.MIN_STD, (1.0 / total_prec) ** 0.5))
+                            # Durable nudge; survives the next posterior recompute.
+                            ts.record_posterior_nudge(float(boundary_target_ppm), 0.15)
                 elif (
                     observed_market_flow
                     and current_fee_ppm <= boundary_target_ppm
@@ -5877,21 +5984,39 @@ class FeeController:
             if rpc_warnings:
                 result["warnings"] = rpc_warnings
 
+            # The fee is now LIVE on-chain (setchannel succeeded and the
+            # read-back was recorded). Mark success here: everything after
+            # this point is bookkeeping, and reporting a bookkeeping failure
+            # as success=False makes callers believe the fee was NOT changed,
+            # leaving last_broadcast_fee_ppm stale and the optimizer fighting
+            # its own already-applied change every cycle.
+            result["success"] = True
+            result["old_fee_ppm"] = old_fee_ppm
+            result["message"] = f"Fee set to {fee_ppm} PPM"
 
             # M-13: Removed per-channel sleep+verify+retry loop from hot path.
             # Fee verification is handled by the existing gossip refresh mechanism
             # in the next adjustment cycle, which detects and corrects reverted fees.
 
-            # Step 3: Record the change with explainability data
-            self.database.record_fee_change(
-                channel_id=resolved_channel_id,
-                peer_id=peer_id,
-                old_fee_ppm=old_fee_ppm,
-                new_fee_ppm=fee_ppm,
-                reason=reason,
-                manual=manual,
-                reason_code=reason_code,
-            )
+            # Step 3: Record the change with explainability data.
+            # Post-RPC bookkeeping failures are warnings, not failures.
+            try:
+                self.database.record_fee_change(
+                    channel_id=resolved_channel_id,
+                    peer_id=peer_id,
+                    old_fee_ppm=old_fee_ppm,
+                    new_fee_ppm=fee_ppm,
+                    reason=reason,
+                    manual=manual,
+                    reason_code=reason_code,
+                )
+            except Exception as e:
+                result.setdefault("warnings", {})["record_fee_change_failed"] = str(e)
+                self.plugin.log(
+                    f"Fee applied on-chain for {resolved_channel_id[:16]}... but "
+                    f"recording the change failed: {e}",
+                    level='warn'
+                )
 
             # Keep optimizer state coherent for manual/policy/gossip-refresh and
             # exploration-driven changes (algorithm-driven DTS samples update their
@@ -5936,11 +6061,7 @@ class FeeController:
                         self._save_channel_fee_state(resolved_channel_id, ts_state)
                     except Exception as e:
                         self.plugin.log(f"STATE_SYNC: Failed to update DTS state for {resolved_channel_id}: {e}", level="debug")
-            
-            result["success"] = True
-            result["old_fee_ppm"] = old_fee_ppm
-            result["message"] = f"Fee set to {fee_ppm} PPM"
-            
+
             self.plugin.log(
                 f"Set fee for {resolved_channel_id[:16]}...: {old_fee_ppm} -> {fee_ppm} PPM "
                 f"({reason})",
@@ -5948,12 +6069,27 @@ class FeeController:
             )
             
         except RpcError as e:
-            result["message"] = f"RPC error: {str(e)}"
-            self.plugin.log(f"Failed to set fee for {channel_id}: {e}", level='error')
+            if result.get("success"):
+                # Fee already applied on-chain; a later RPC hiccup is a warning.
+                result.setdefault("warnings", {})["post_broadcast_bookkeeping_failed"] = str(e)
+                self.plugin.log(
+                    f"Post-broadcast bookkeeping RPC error for {channel_id}: {e}",
+                    level='warn'
+                )
+            else:
+                result["message"] = f"RPC error: {str(e)}"
+                self.plugin.log(f"Failed to set fee for {channel_id}: {e}", level='error')
         except Exception as e:
-            result["message"] = f"Error: {str(e)}"
-            self.plugin.log(f"Error setting fee: {e}", level='error')
-        
+            if result.get("success"):
+                result.setdefault("warnings", {})["post_broadcast_bookkeeping_failed"] = str(e)
+                self.plugin.log(
+                    f"Post-broadcast bookkeeping error for {channel_id}: {e}",
+                    level='warn'
+                )
+            else:
+                result["message"] = f"Error: {str(e)}"
+                self.plugin.log(f"Error setting fee: {e}", level='error')
+
         return result
     
     def set_initial_fee(self, channel_id: str, peer_id: str) -> Optional[Dict[str, Any]]:
@@ -6618,8 +6754,6 @@ class FeeController:
 
             implied_fee = int(current_fee_ppm * 0.8)
             try:
-                prior_precision = 1.0 / max(state.MIN_STD ** 2, state.posterior_std ** 2)
-
                 # Base weight: 10% of a settled forward
                 # Amount boost: log scale, large forwards (>1M sats) get up to 3x
                 base_weight = 0.1
@@ -6629,12 +6763,9 @@ class FeeController:
                     amount_boost = min(3.0, 1.0 + math.log10(max(1, amount_sats)) / 3.0)
                     base_weight *= amount_boost
 
-                obs_precision = prior_precision * base_weight
-
-                total_precision = prior_precision + obs_precision
-                if total_precision > 0:
-                    new_mean = (prior_precision * state.posterior_mean + obs_precision * implied_fee) / total_precision
-                    state.posterior_mean = float(new_mean)
-                    state.posterior_std = float(max(state.MIN_STD, (1.0 / total_precision) ** 0.5))
+                # Durable nudge: survives _recompute_posterior, which rebuilds
+                # posterior_mean/std from observations + the fixed prior and
+                # would otherwise erase this signal before the next sample.
+                state.record_posterior_nudge(implied_fee, base_weight)
             except Exception:
                 pass

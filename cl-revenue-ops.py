@@ -4934,6 +4934,12 @@ def _refresh_dynamic_config():
                 plugin.log(f"Dynamic config refresh: planner_execute_closes = {new_val}")
 
 
+# Bounded wait for fee_controller._state_lock in the forward_event handler.
+# adjust_all_fees holds the lock for the whole fee cycle; pyln dispatches all
+# notifications on one thread, so we must never block here indefinitely.
+FORWARD_EVENT_LOCK_TIMEOUT_SECS = 2.0
+
+
 @plugin.subscribe("forward_event")
 def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     """
@@ -4974,14 +4980,28 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
     # Record failed forward as weak negative DTS signal (amount-weighted)
     if status == "failed" and in_channel and fee_controller is not None:
         try:
-            # _channel_fee_states is mutated by the fee loop under _state_lock;
-            # this hook runs on the pyln thread, so take the same lock.
-            with fee_controller._state_lock:
-                cfs = fee_controller._channel_fee_states.get(in_channel)
-                current_fee = cfs.last_fee_ppm if cfs else 0
-                if current_fee > 0:
-                    failed_in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
-                    fee_controller.record_failed_forward(in_channel, current_fee, amount_msat=failed_in_msat)
+            # _channel_fee_states is mutated by the fee loop under _state_lock,
+            # which adjust_all_fees holds across the ENTIRE fee cycle (including
+            # dozens of setchannel RPCs). pyln dispatches all notifications and
+            # RPC handlers on a single thread, so a blocking acquire here would
+            # freeze the whole plugin until the cycle ends. Use a bounded
+            # acquire and drop the nudge under contention — it is advisory
+            # negative feedback, so losing one is harmless.
+            if fee_controller._state_lock.acquire(timeout=FORWARD_EVENT_LOCK_TIMEOUT_SECS):
+                try:
+                    cfs = fee_controller._channel_fee_states.get(in_channel)
+                    current_fee = cfs.last_fee_ppm if cfs else 0
+                    if current_fee > 0:
+                        failed_in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
+                        fee_controller.record_failed_forward(in_channel, current_fee, amount_msat=failed_in_msat)
+                finally:
+                    fee_controller._state_lock.release()
+            else:
+                plugin.log(
+                    "forward_event: fee state lock busy (fee cycle in progress); "
+                    "skipping failed-forward nudge",
+                    level='debug'
+                )
         except Exception:
             pass
 
