@@ -29,6 +29,8 @@ Core Lightning owns node runtime.
 - `revenue-policy list|get|find|changes` are diagnostic surfaces. Write actions such as `set` and `delete` remain internal or debug workflows, not the normal operator path.
 - Planner closes are recommendation-only by default.
 - To allow live close RPCs, set `revenue-ops-planner-execute-closes=true` and `revenue-ops-planner-max-closes-per-cycle` to a positive value.
+- Source-heavy drain: `revenue-ops-receivable-ratio-target`/`-floor` define the node-level inbound objective shown in `revenue-status.receivable`. The circular rebalancer always keeps first claim on internal redistribution; only the residual it cannot place (`revenue-rebalance-debug.drain_demand`) may earn the Boltz structural credit, capped by `revenue-ops-boltz-structural-budget-sats` per day (default 0 = off). `revenue-ops-drain-fee-discount-max` optionally biases fees down on stagnant over-local channels (default 0.0 = off).
+- Rebalancing and Boltz swaps remain separate tools with separate budgets: rebalancing redistributes at routing-fee cost; loop-outs change the node's aggregate balance at swap+chain cost. Note: the structural envelope is enforced from recorded spend — a swap whose fee fails to record does not deplete it, so keep the envelope small relative to the unified daily budget.
 
 ## Rebalance Execution
 
