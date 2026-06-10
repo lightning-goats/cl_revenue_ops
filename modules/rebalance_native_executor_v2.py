@@ -207,7 +207,11 @@ class NativeRouteExecutor:
             return
         failure_data = dict(result.failure_data or {})
         failure_class = str(failure_data.get("failure_class") or "unknown")
-        confidence = 0.85 if result.excluded_channels else 0.55
+        # Observations are recorded only for entries in excluded_channels,
+        # which always carry channel attribution; failures without any
+        # attribution produce no excluded entries and nothing to export, so
+        # confidence is a constant here (the old 0.55 branch was unreachable).
+        confidence = 0.85
         context = observation_context or {}
         for entry in result.excluded_channels:
             scid, sep, direction_text = str(entry).partition("/")
