@@ -34,7 +34,7 @@ from .rebalance_router_v3 import RebalanceRouterV3, _configured_layer_names
 from .rebalance_state_v2 import StateSnapshot, build_state_snapshot
 from .segment_observations import SegmentObservationStore
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
-from .utils import base_to_sats_ceil
+from .utils import base_to_sats_ceil, parse_msat
 
 
 @dataclass
@@ -108,7 +108,7 @@ class RebalanceEngine:
             "fee_insufficient": 1800,            # 30 min (rare; usually persistent)
             "incorrect_cltv_expiry": 3600,       # 1 hour (CLN config alignment)
             "permanent_failure": 21600,          # 6 hours
-            "payment_pending_timeout": 600,      # 10 min
+            "payment_pending_timeout": 3600,     # 1 hour: HTLC may pend until CLTV expiry
             "local_execution_failed": 600,       # 10 min
             "other_retriable": 600,              # 10 min
         }
@@ -1752,6 +1752,12 @@ class RebalanceEngine:
         if not reserved_budget or self.database is None:
             return
         try:
+            if result is not None and getattr(result, "payment_pending", False):
+                # Payment unresolved: keep the reservation active so the
+                # budget stays held until the reconciliation sweep confirms
+                # settlement or failure. Releasing here would let the next
+                # cycle spend the same budget while the HTLC can still settle.
+                return
             if result is not None and result.success:
                 self.database.mark_budget_spent(
                     reservation_id,
@@ -1813,6 +1819,9 @@ class RebalanceEngine:
         if self._executor_mode() != "native":
             return first_result
         if getattr(first_result, "success", False):
+            return first_result
+        if getattr(first_result, "payment_pending", False):
+            # The first payment may still settle — never pay again on top.
             return first_result
 
         exclusions: List[str] = []
@@ -1954,6 +1963,9 @@ class RebalanceEngine:
     ) -> ExecutionResult:
         """Retry native execution at smaller amounts after a liquidity failure."""
         if self._executor_mode() != "native":
+            return prior_result
+        if getattr(prior_result, "payment_pending", False):
+            # The first payment may still settle — never pay again on top.
             return prior_result
         if not self._native_failure_allows_partial(prior_result):
             return prior_result
@@ -2251,6 +2263,17 @@ class RebalanceEngine:
                             ),
                             timestamp=int(time.time()),
                         )
+            elif getattr(result, "payment_pending", False):
+                # Park the row for the reconciliation sweep. No cost is
+                # recorded yet — that happens once listsendpays reports a
+                # terminal state for this payment_hash.
+                failure_data = getattr(result, "failure_data", {}) or {}
+                self.database.update_rebalance_result(
+                    rebalance_id,
+                    "pending_settlement",
+                    error_message=str(getattr(result, "error", "") or ""),
+                    payment_hash=str(failure_data.get("payment_hash", "") or ""),
+                )
             else:
                 self.database.update_rebalance_result(
                     rebalance_id,
@@ -2264,6 +2287,117 @@ class RebalanceEngine:
                 f"update_rebalance_result failed for id={rebalance_id}: {exc}",
                 level="debug",
             )
+
+    def reconcile_pending_settlements(self) -> int:
+        """Resolve rebalance payments that previously timed out unresolved.
+
+        Sweeps rebalance_history rows parked as 'pending_settlement' against
+        listsendpays. Settled payments get their fee recorded into
+        rebalance_costs (the budget source of truth) and the reservation
+        marked spent; failed payments release the reservation. Still-pending
+        payments are left for the next cycle. Returns the number of rows
+        resolved either way.
+        """
+        if self.database is None:
+            return 0
+        getter = getattr(self.database, "get_pending_settlement_rebalances", None)
+        if getter is None:
+            return 0
+        try:
+            rows = getter() or []
+        except Exception as exc:
+            self._log(f"pending settlement query failed: {exc}", level="warn")
+            return 0
+        resolved = 0
+        for row in rows:
+            try:
+                if self._reconcile_pending_row(row):
+                    resolved += 1
+            except Exception as exc:
+                self._log(
+                    f"pending settlement reconcile failed for id={row.get('id')}: {exc}",
+                    level="warn",
+                )
+        return resolved
+
+    def _reconcile_pending_row(self, row: Dict[str, Any]) -> bool:
+        rebalance_id = int(row.get("id") or 0)
+        payment_hash = str(row.get("payment_hash") or "")
+        if rebalance_id <= 0 or not payment_hash:
+            return False
+        response = self.plugin.rpc.call("listsendpays", {"payment_hash": payment_hash})
+        payments = response.get("payments", []) if isinstance(response, dict) else []
+        payments = [p for p in payments if isinstance(p, dict)]
+        statuses = {str(p.get("status") or "") for p in payments}
+
+        if "pending" in statuses:
+            return False
+
+        reservation_id = str(rebalance_id)
+        if "complete" in statuses:
+            settled = next(p for p in payments if str(p.get("status")) == "complete")
+            amount_msat = parse_msat(settled.get("amount_msat"))
+            sent_msat = parse_msat(settled.get("amount_sent_msat"))
+            fee_msat = max(0, sent_msat - amount_msat)
+            fee_sats = base_to_sats_ceil(fee_msat)
+            dest_channel = str(row.get("to_channel") or "")
+            self.database.update_rebalance_result(
+                rebalance_id,
+                "success",
+                actual_fee_sats=fee_sats,
+                actual_fee_msat=fee_msat,
+            )
+            if fee_msat > 0:
+                self.database.record_rebalance_cost(
+                    channel_id=dest_channel,
+                    peer_id=self._peer_id_for_channel(dest_channel),
+                    cost_sats=fee_sats,
+                    cost_msat=fee_msat,
+                    amount_sats=int(row.get("amount_sats") or 0),
+                    timestamp=int(time.time()),
+                )
+            self.database.mark_budget_spent(reservation_id, fee_sats)
+            self._record_pair_success(
+                str(row.get("from_channel") or ""), dest_channel
+            )
+            self._log(
+                f"late settlement confirmed for rebalance {rebalance_id}: "
+                f"fee {fee_sats} sats recorded",
+            )
+            return True
+
+        # No pending and no complete: the payment failed or never existed.
+        self.database.update_rebalance_result(
+            rebalance_id,
+            "failed",
+            error_message="payment_pending_resolved_failed",
+        )
+        self.database.release_budget_reservation(reservation_id)
+        try:
+            self.plugin.rpc.call(
+                "delpay", {"payment_hash": payment_hash, "status": "failed"}
+            )
+        except Exception:
+            pass
+        return True
+
+    def _peer_id_for_channel(self, channel_id: str) -> str:
+        """Best-effort SCID -> peer id lookup for cost attribution."""
+        try:
+            channels = self.plugin.rpc.listpeerchannels().get("channels", [])
+            for channel in channels:
+                if not isinstance(channel, dict):
+                    continue
+                scid = str(
+                    channel.get("short_channel_id")
+                    or channel.get("alias", {}).get("local", "")
+                    or ""
+                )
+                if scid == channel_id:
+                    return str(channel.get("peer_id") or "")
+        except Exception:
+            pass
+        return ""
 
     def _segment_observation_direction(self, peer_id: str) -> int:
         """Return the directional edge for inbound-to-local liquidity on dest channel."""
@@ -2397,6 +2531,10 @@ class RebalanceEngine:
         Filters out pairs in futility state before submitting to the executor,
         and records success/failure in the pair tracker for the next cycle.
         """
+        try:
+            self.reconcile_pending_settlements()
+        except Exception as exc:
+            self._log(f"pending settlement sweep failed: {exc}", level="warn")
         candidates = self.find_candidates()
         planned = self._last_cycle_result or CycleResult()
         result = CycleResult(

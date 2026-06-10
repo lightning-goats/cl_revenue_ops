@@ -29,9 +29,18 @@ class NativeRouteExecutor:
         if self.plugin:
             self.plugin.log(f"[NativeRebalanceExecutor] {msg}", level=level)
 
-    def _rpc_call(self, method: str, params: Any = None) -> Any:
+    def _rpc_call(self, method: str, params: Any = None, *, timeout: Optional[int] = None) -> Any:
         if params is None:
             params = {}
+        if timeout is not None:
+            # The ThreadSafeRpcProxy consumes a ``timeout=`` kwarg to extend
+            # its deadline past config.rpc_timeout_seconds. Plain pyln rpc
+            # objects don't accept it, so fall back on TypeError (raised at
+            # call time, before any RPC is issued).
+            try:
+                return self.plugin.rpc.call(method, params, timeout=timeout)
+            except TypeError:
+                return self.plugin.rpc.call(method, params)
         return self.plugin.rpc.call(method, params)
 
     def is_available(self) -> bool:
@@ -277,6 +286,37 @@ class NativeRouteExecutor:
             )
         return True, "", fee_msat
 
+    @staticmethod
+    def _is_proxy_timeout(exc: Exception) -> bool:
+        """Detect the main plugin's RPCTimeoutError without importing it."""
+        for klass in type(exc).__mro__:
+            if klass.__name__ == "RPCTimeoutError":
+                return True
+        return "rpc timeout" in str(exc).lower()
+
+    def _is_payment_unresolved(
+        self,
+        exc: Exception,
+        error_text: str,
+        details: Dict[str, Any],
+        payment_attempted: bool,
+    ) -> bool:
+        """True when the payment may still settle despite the exception.
+
+        CLN's waitsendpay code 200 means "timed out, payment still pending".
+        A proxy deadline on sendpay/waitsendpay leaves the HTLC state unknown.
+        Treating these as terminal failures would delete the invoice, release
+        the budget, and allow an immediate repeat payment while the first one
+        can still settle.
+        """
+        if not payment_attempted:
+            return False
+        if details.get("code") == 200:
+            return True
+        if self._is_proxy_timeout(exc):
+            return True
+        return "waitsendpay_status=pending" in error_text
+
     def _cleanup_failed_payment(self, payment_hash: str, label: str) -> None:
         if payment_hash:
             try:
@@ -323,6 +363,7 @@ class NativeRouteExecutor:
 
         label = f"rebal-native-{int(time.time() * 1000)}-{dest_channel_id}"
         payment_hash = ""
+        payment_attempted = False
         try:
             invoice = self._rpc_call(
                 "invoice",
@@ -351,6 +392,7 @@ class NativeRouteExecutor:
             if invoice.get("payment_secret"):
                 sendpay_params["payment_secret"] = invoice["payment_secret"]
 
+            payment_attempted = True
             self._rpc_call("sendpay", sendpay_params)
             paid = self._rpc_call(
                 "waitsendpay",
@@ -358,6 +400,7 @@ class NativeRouteExecutor:
                     "payment_hash": payment_hash,
                     "timeout": self.SENDPAY_TIMEOUT_SEC,
                 },
+                timeout=self.SENDPAY_TIMEOUT_SEC,
             )
             if isinstance(paid, dict) and paid.get("status") not in (None, "complete"):
                 raise RuntimeError(f"waitsendpay_status={paid.get('status')}")
@@ -383,6 +426,27 @@ class NativeRouteExecutor:
             return result
         except Exception as exc:
             error_text, details = self._error_details(exc)
+            if self._is_payment_unresolved(exc, error_text, details, payment_attempted):
+                # The HTLC may still settle. Do NOT delete the invoice or the
+                # payment, do NOT emit route exclusions, and surface the
+                # planned fee so the engine can keep the budget held until
+                # the reconciliation sweep resolves the payment.
+                result.payment_pending = True
+                result.error = f"payment_pending_timeout: {error_text}"
+                result.fee_msat = planned_fee_msat
+                result.fee_sats = base_to_sats_ceil(planned_fee_msat)
+                result.failure_data = {
+                    "failure_class": "pending",
+                    "payment_hash": payment_hash,
+                    "invoice_label": label,
+                    "route_summary": self._route_summary(route or []),
+                }
+                self._log(
+                    f"payment unresolved after timeout (hash={payment_hash}); "
+                    "holding for settlement reconciliation",
+                    level="warn",
+                )
+                return result
             failure_data = dict(details)
             failure_data["failure_class"] = self._failure_class(error_text)
             failure_data["route_summary"] = self._route_summary(route or [])

@@ -619,10 +619,18 @@ class Database:
                 status TEXT NOT NULL,  -- 'pending', 'success', 'failed'
                 rebalance_type TEXT NOT NULL DEFAULT 'normal',  -- 'normal', 'diagnostic'
                 error_message TEXT,
-                timestamp INTEGER NOT NULL
+                timestamp INTEGER NOT NULL,
+                payment_hash TEXT
             )
         """)
-        
+        # In-flight settlement tracking: payments that timed out unresolved
+        # are parked as status='pending_settlement' with their payment_hash
+        # so the engine's reconciliation sweep can settle them later.
+        try:
+            conn.execute("ALTER TABLE rebalance_history ADD COLUMN payment_hash TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # Real-time forwards tracking
         conn.execute("""
             CREATE TABLE IF NOT EXISTS forwards (
@@ -2020,7 +2028,8 @@ class Database:
                                 actual_profit_sats: Optional[int] = None,
                                 error_message: Optional[str] = None,
                                 post_local_ratio: Optional[float] = None,
-                                amount_sats: Optional[int] = None):
+                                amount_sats: Optional[int] = None,
+                                payment_hash: Optional[str] = None):
         """Update a rebalance record with the result.
 
         Phase 3.3: post_local_ratio captures the destination's local ratio
@@ -2049,10 +2058,32 @@ class Database:
             SET status = ?, actual_fee_sats = ?, actual_fee_msat = ?, actual_profit_sats = ?,
                 error_message = ?, timestamp = ?,
                 post_local_ratio = COALESCE(?, post_local_ratio),
-                amount_sats = COALESCE(?, amount_sats)
+                amount_sats = COALESCE(?, amount_sats),
+                payment_hash = COALESCE(?, payment_hash)
             WHERE id = ?
         """, (status, fee_sats, fee_msat, actual_profit_sats, error_message,
-              int(time.time()), anchor_ratio, actual_amount, rebalance_id))
+              int(time.time()), anchor_ratio, actual_amount,
+              str(payment_hash) if payment_hash else None, rebalance_id))
+
+    def get_pending_settlement_rebalances(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return rebalances parked as 'pending_settlement' awaiting reconciliation.
+
+        These are payments whose waitsendpay timed out without a terminal
+        state; the engine sweeps them each cycle against listsendpays.
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT id, from_channel, to_channel, amount_sats, payment_hash, timestamp
+            FROM rebalance_history
+            WHERE status = 'pending_settlement'
+                  AND payment_hash IS NOT NULL AND payment_hash != ''
+            ORDER BY timestamp ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_last_post_rebalance_state(
         self, channel_id: str
