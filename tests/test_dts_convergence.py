@@ -250,3 +250,113 @@ class TestDiscountPersistence:
         st.observations.append((300, 0.0, 0.01, now, "normal"))
         st.apply_dts_discount(gamma=0.9)
         assert st.observations[0][2] <= 0.01 + 1e-12
+
+
+# =============================================================================
+# Fix #2: sustained zero-revenue runs must push the fee DOWN
+# =============================================================================
+
+class TestZeroRevenueDirectionalProbing:
+
+    def _pretrain_at_500(self, rng):
+        st = GaussianThompsonState()
+        for _ in range(100):
+            FakeTime.advance(1.0)
+            st.update_posterior(
+                fee=500 + rng.randint(-30, 30),
+                revenue_rate=40.0 * max(0.0, rng.gauss(1.0, 0.2)),
+                hours=1.0,
+            )
+        return st
+
+    def test_zero_revenue_run_reaches_live_demand(self, fake_time):
+        """Audit defect 2 (EXP 2): channel converged at 500 ppm, market moves
+        so demand exists only below 200 ppm. Previously the fee NEVER dropped
+        below 200 in 2000 hourly cycles (it wandered UP to 1142). With
+        directional zero-revenue probing it must find the demand region."""
+        rng = random.Random(42)
+        random.seed(33)
+        st = self._pretrain_at_500(rng)
+        fee = 500
+        found_at = None
+        for i in range(500):
+            FakeTime.advance(1.0)
+            rr = 0.0 if fee >= 200 else 30.0
+            st.update_posterior(fee=fee, revenue_rate=rr, hours=1.0)
+            st.apply_dts_discount(gamma=0.992)  # sparse gamma (quiet channel)
+            s = st.sample_fee(FLOOR, CEIL)
+            br = blend_ratio(st.posterior_std)
+            delta = int(round((s - fee) * br))
+            if s != fee and delta == 0:
+                delta = 1 if s > fee else -1
+            cap = step_cap(fee)
+            fee = max(FLOOR, min(CEIL, fee + max(-cap, min(cap, delta))))
+            if fee < 200:
+                found_at = i
+                break
+        assert found_at is not None, (
+            "fee never dropped below 200 ppm in 500 zero-revenue cycles "
+            "(zero-revenue stall regression)"
+        )
+
+    def test_streak_counts_and_resets(self, fake_time):
+        st = GaussianThompsonState()
+        for _ in range(6):
+            FakeTime.advance(1.0)
+            st.update_posterior(fee=500, revenue_rate=0.0, hours=1.0)
+        assert st.zero_revenue_streak == 6
+        assert st.zero_run_start_fee == 500.0
+        FakeTime.advance(1.0)
+        st.update_posterior(fee=500, revenue_rate=12.0, hours=1.0)
+        assert st.zero_revenue_streak == 0
+        assert st.zero_run_start_fee == 0.0
+
+    def test_probes_injected_after_threshold_and_flagged(self, fake_time):
+        st = GaussianThompsonState()
+        n = GaussianThompsonState.ZERO_REVENUE_STREAK_THRESHOLD
+        for i in range(n + 2):
+            FakeTime.advance(1.0)
+            st.update_posterior(fee=500, revenue_rate=0.0, hours=1.0)
+        probes = [o for o in st.observations
+                  if len(o) >= 6 and o[5] == GaussianThompsonState.ZERO_PROBE_FLAG]
+        assert probes, "no directional pseudo-observations injected"
+        # Probe sits below the charged fee
+        assert all(p[0] < 500 for p in probes)
+        # No probes before the threshold was reached
+        assert len(probes) <= 3
+
+    def test_probing_stops_near_cumulative_floor(self, fake_time):
+        """Total downward injection influence is capped: once the posterior
+        has fallen below ZERO_PROBE_FLOOR_FRAC of the fee at run start, no
+        further probes are injected."""
+        st = GaussianThompsonState()
+        for _ in range(10):
+            FakeTime.advance(1.0)
+            st.update_posterior(fee=500, revenue_rate=0.0, hours=1.0)
+        # Force the posterior under the cumulative floor (0.3 * 500 = 150)
+        st.posterior_mean = 100.0
+        before = len([o for o in st.observations if len(o) >= 6])
+        FakeTime.advance(1.0)
+        st.update_posterior(fee=500, revenue_rate=0.0, hours=1.0)
+        after = len([o for o in st.observations if len(o) >= 6])
+        assert after == before, "probe injected below the cumulative floor"
+
+    def test_streak_round_trips_with_flagged_probes(self, fake_time):
+        import json
+        st = GaussianThompsonState()
+        for _ in range(6):
+            FakeTime.advance(1.0)
+            st.update_posterior(fee=400, revenue_rate=0.0, hours=1.0)
+        restored = GaussianThompsonState.from_dict(
+            json.loads(json.dumps(st.to_dict()))
+        )
+        assert restored.zero_revenue_streak == st.zero_revenue_streak
+        assert restored.zero_run_start_fee == st.zero_run_start_fee
+        probes = [o for o in restored.observations
+                  if len(o) >= 6 and o[5] == GaussianThompsonState.ZERO_PROBE_FLAG]
+        assert probes
+
+    def test_legacy_dict_defaults_streak_fields(self):
+        st = GaussianThompsonState.from_dict({"posterior_mean": 250.0})
+        assert st.zero_revenue_streak == 0
+        assert st.zero_run_start_fee == 0.0

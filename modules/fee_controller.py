@@ -151,6 +151,29 @@ class GaussianThompsonState:
     MIN_OBSERVATIONS = 5            # Minimum before trusting posterior
     MIN_STD = 10                    # Never let uncertainty go below 10 ppm
     ZERO_REVENUE_WEIGHT_FACTOR = 0.15  # Zero-revenue observations get 15% of time-weight
+
+    # Directional zero-revenue probing: plain zero-revenue observations only
+    # re-anchor the posterior on fees we already charged, so a channel parked
+    # above the demand region could stall (or random-walk UP) forever. After
+    # ZERO_REVENUE_STREAK_THRESHOLD consecutive zero-revenue windows we inject
+    # a flagged pseudo-observation at fee*ZERO_PROBE_STEP_FRAC each window,
+    # giving the posterior a downward gradient to follow. Injection stops once
+    # posterior_mean has fallen below ZERO_PROBE_FLOOR_FRAC of the fee at
+    # which the zero-run started (the state doesn't know the channel floor;
+    # downstream rails still clamp regardless).
+    ZERO_REVENUE_STREAK_THRESHOLD = 4   # Consecutive zero windows before probing
+    ZERO_PROBE_STEP_FRAC = 0.9          # Probe at 90% of the current fee
+    ZERO_PROBE_FLOOR_FRAC = 0.3         # Cap on cumulative downward influence
+    ZERO_PROBE_FLAG = "zero_probe"      # 6th tuple element marking injected probes
+    ZERO_REGIME_REL_STD = 0.15          # Min relative uncertainty when all revenue is zero
+    ZERO_REGIME_STREAK_OVERRIDE = 24    # After this many consecutive zero windows the
+                                        # market has moved: anchor only on the current
+                                        # run's observations (stale positive history at
+                                        # the old fee otherwise dominates for weeks)
+    ZERO_REGIME_ANCHOR_HALF_LIFE_HOURS = 24.0  # Recency half-life for the zero-regime
+                                               # anchor mean; the global 7-day half-life
+                                               # makes the anchor lag the whole run and
+                                               # stalls the downward walk
     SECONDARY_EXPLORE_BOOST = 1.25  # Slightly wider prior for secondary contexts
     MAX_BIAS_NUDGES = 50            # Security: bounded out-of-band nudge memory
     BIAS_DECAY_HOURS = 24.0         # Advisory nudges fade with a 1-day half-life
@@ -213,6 +236,11 @@ class GaussianThompsonState:
     # from the overall charged-fee history, so in a single-regime world the
     # offset vanishes instead of creating an inertia equilibrium.
     charged_fee_mean: float = 0.0
+
+    # Zero-revenue run tracking (see ZERO_REVENUE_STREAK_THRESHOLD above)
+    zero_revenue_streak: int = 0
+    zero_run_start_fee: float = 0.0
+    zero_run_start_ts: int = 0
 
     # Tracking
     last_sampled_fee: int = 0
@@ -498,13 +526,36 @@ class GaussianThompsonState:
             # 15% of time-weight — enough to drift the posterior, but positive
             # observations always dominate. See dts-stagnant-decay-design.md.
             weight = min(1.0, hours / 6.0) * self.ZERO_REVENUE_WEIGHT_FACTOR
+            if self.zero_revenue_streak == 0:
+                self.zero_run_start_fee = float(fee)
+                self.zero_run_start_ts = now
+            self.zero_revenue_streak += 1
         else:
             # Positive revenue: original formula (log-scaled revenue * time)
             weight = min(1.0, hours / 6.0) * min(1.0, math.log1p(revenue_rate) / math.log1p(1000))
             weight = max(0.01, weight)  # Minimum weight for positive observations
+            self.zero_revenue_streak = 0
+            self.zero_run_start_fee = 0.0
+            self.zero_run_start_ts = 0
 
         # Add observation with time bucket (5-tuple)
         self.observations.append((fee, revenue_rate, weight, now, time_bucket))
+
+        # Directional zero-revenue probing: after a sustained zero-revenue run
+        # inject a flagged pseudo-observation slightly BELOW the charged fee so
+        # the posterior gains a downward gradient instead of stalling on (or
+        # wandering above) fees that earn nothing. Bounded by the cumulative
+        # floor relative to the fee at run start; reversible (any revenue
+        # resets the streak and stops injection).
+        if (revenue_rate <= 0
+                and self.zero_revenue_streak >= self.ZERO_REVENUE_STREAK_THRESHOLD
+                and self.zero_run_start_fee > 0
+                and self.posterior_mean >= self.ZERO_PROBE_FLOOR_FRAC * self.zero_run_start_fee):
+            probe_fee = max(1, int(fee * self.ZERO_PROBE_STEP_FRAC))
+            if probe_fee < fee:
+                self.observations.append(
+                    (probe_fee, 0.0, weight, now, time_bucket, self.ZERO_PROBE_FLAG)
+                )
 
         # Prune old observations
         if len(self.observations) > self.MAX_OBSERVATIONS:
@@ -799,6 +850,7 @@ class GaussianThompsonState:
         # Collect weighted observations with time decay
         now = int(time.time())
         weighted_obs: List[Tuple[float, float, float]] = []  # (fee, revenue, weight)
+        weighted_ts: List[int] = []  # Parallel timestamps (zero-regime filtering)
         fee_min = float('inf')
         fee_max = float('-inf')
 
@@ -813,6 +865,7 @@ class GaussianThompsonState:
             if weight < 1e-6:
                 continue
             weighted_obs.append((float(fee), float(revenue_rate), weight))
+            weighted_ts.append(int(timestamp))
             fee_min = min(fee_min, float(fee))
             fee_max = max(fee_max, float(fee))
 
@@ -820,6 +873,64 @@ class GaussianThompsonState:
         total_w = sum(w for _, _, w in weighted_obs)
         if total_w > 0:
             self.charged_fee_mean = sum(f * w for f, _, w in weighted_obs) / total_w
+
+        # Zero-revenue regime: when every surviving observation earned nothing
+        # (or a sustained zero-run says the market has moved), the revenue
+        # curve is unidentifiable — both the quadratic fit and the "best
+        # observed fee" fallback degenerate into a random walk over fees we
+        # already charged (audit: a dead channel wandered UP from 500 to
+        # 1142 ppm). Anchor the posterior on the weighted mean of charged and
+        # probed fees instead, so the downward zero-revenue probes (see
+        # update_posterior) can actually walk the posterior toward live
+        # demand, and disable polynomial sampling until revenue returns.
+        zero_mass = sum(rev * w for _, rev, w in weighted_obs) <= 1e-9
+        streak_override = (
+            self.zero_revenue_streak >= self.ZERO_REGIME_STREAK_OVERRIDE
+            and self.zero_run_start_ts > 0
+        )
+        if total_w > 0 and (zero_mass or streak_override):
+            # Recency-emphasised anchor weights: the global 7-day half-life
+            # would make the anchor lag the entire run's fee history and
+            # stall the descent toward live demand.
+            anchor_all = [
+                (
+                    f,
+                    w * math.pow(
+                        0.5,
+                        max(0.0, (now - ts) / 3600.0)
+                        / self.ZERO_REGIME_ANCHOR_HALF_LIFE_HOURS,
+                    ),
+                    ts,
+                )
+                for (f, _, w), ts in zip(weighted_obs, weighted_ts)
+            ]
+            if streak_override:
+                # Stale positive history from before the run started would
+                # anchor the mean at the dead fee for weeks; use only the
+                # current run's (all zero-revenue) observations.
+                pairs = [
+                    (f, w) for f, w, ts in anchor_all
+                    if ts >= self.zero_run_start_ts
+                ]
+            else:
+                pairs = []
+            if not pairs:
+                pairs = [(f, w) for f, w, _ in anchor_all]
+            pair_w = sum(w for _, w in pairs)
+            if pair_w > 0:
+                anchor_mean = sum(f * w for f, w in pairs) / pair_w
+                fees = [f for f, _ in pairs]
+                spread_std = (max(fees) - min(fees)) / 4.0 if len(fees) > 1 else 0.0
+                max_std = math.sqrt(1.0 / self.MIN_PRECISION)
+                self.posterior_mean = anchor_mean
+                self.posterior_std = max(
+                    float(self.MIN_STD),
+                    min(max_std, max(spread_std, self.ZERO_REGIME_REL_STD * anchor_mean)),
+                )
+                # Degenerate range => _sample_from_polynomial_posterior returns None
+                self._last_fee_min = 0.0
+                self._last_fee_max = 0.0
+                return
 
         if len(weighted_obs) < 3:
             # Need at least 3 points for a 3-parameter polynomial fit
@@ -1166,6 +1277,9 @@ class GaussianThompsonState:
             "contextual_posteriors": self.contextual_posteriors,
             "posterior_bias": self.posterior_bias,
             "charged_fee_mean": self.charged_fee_mean,
+            "zero_revenue_streak": self.zero_revenue_streak,
+            "zero_run_start_fee": self.zero_run_start_fee,
+            "zero_run_start_ts": self.zero_run_start_ts,
             "last_sampled_fee": self.last_sampled_fee,
             "last_sample_time": self.last_sample_time
         }
@@ -1265,6 +1379,22 @@ class GaussianThompsonState:
             state.charged_fee_mean = 0.0
         if not math.isfinite(state.charged_fee_mean) or state.charged_fee_mean < 0:
             state.charged_fee_mean = 0.0
+
+        # Zero-revenue run tracking (legacy dicts: no active run)
+        try:
+            state.zero_revenue_streak = max(0, int(d.get("zero_revenue_streak", 0)))
+        except (TypeError, ValueError):
+            state.zero_revenue_streak = 0
+        try:
+            state.zero_run_start_fee = float(d.get("zero_run_start_fee", 0.0))
+        except (TypeError, ValueError):
+            state.zero_run_start_fee = 0.0
+        if not math.isfinite(state.zero_run_start_fee) or state.zero_run_start_fee < 0:
+            state.zero_run_start_fee = 0.0
+        try:
+            state.zero_run_start_ts = max(0, int(d.get("zero_run_start_ts", 0)))
+        except (TypeError, ValueError):
+            state.zero_run_start_ts = 0
 
         state.last_sampled_fee = d.get("last_sampled_fee", 0)
         state.last_sample_time = d.get("last_sample_time", 0)
