@@ -8,8 +8,10 @@ policies.
 
 from __future__ import annotations
 
+import itertools
 import threading
-from contextlib import contextmanager
+import time
+from contextlib import ExitStack, contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from .rebalance_route_policy import RouteDecision, RoutePolicy
@@ -46,7 +48,21 @@ def _translate_getroutes_hop(hop: Dict[str, Any]) -> Dict[str, Any]:
 class RebalanceHiveRouter:
     """Price full-path hive routes for active-engine rebalancing."""
 
-    _exclude_counter = 0
+    # Monotonic counter for throwaway layer names. itertools.count so that
+    # concurrent workers can never mint duplicate names (next() is atomic
+    # under the GIL); names also carry a time component so a restarted
+    # plugin cannot collide with a layer leaked by a previous run.
+    _exclude_counter = itertools.count(1)
+    # Process-lifetime base layer that disables our outgoing half of every
+    # local channel. Source pinning composes this with a tiny per-source
+    # re-enable layer: askrene applies getroutes layers in order and later
+    # layers override earlier ones per field (verified in askrene.c
+    # apply_layers + gossmap.c gossmap_local_updatechan), so
+    # [.., LOCAL_DISABLE_LAYER, source-enable] yields the same effective
+    # graph as the legacy "disable all but source" per-pair layer at a
+    # fraction of the RPC cost. Stable name: a stale copy from a previous
+    # plugin run is detected on create failure and rebuilt clean.
+    LOCAL_DISABLE_LAYER = "rebalance-local-disable"
     ROUTE_LAYER_NAMES = {
         "revenue-local",
         "hive-observed-liquidity",
@@ -78,6 +94,11 @@ class RebalanceHiveRouter:
         # RPC worker thread) can't tear down the background pricing cycle's
         # layers, and vice versa.
         self._thread_state = threading.local()
+        # Base disable-all layer state is shared across threads (that is the
+        # point of the layer) and guarded by a lock for reconciliation.
+        self._local_disable_lock = threading.Lock()
+        self._local_disable_ready = False
+        self._local_disable_entries: set = set()
 
     def _cycle_active(self) -> bool:
         return bool(getattr(self._thread_state, "active", False))
@@ -99,10 +120,19 @@ class RebalanceHiveRouter:
         self.end_cycle()
         self._thread_state.active = True
 
+    def _cycle_enable_dict(self) -> Dict[str, str]:
+        layers = getattr(self._thread_state, "enable_layers", None)
+        if layers is None:
+            layers = {}
+            self._thread_state.enable_layers = layers
+        return layers
+
     def end_cycle(self) -> None:
         layers = self._cycle_layers_dict()
-        to_remove = list(layers.values())
+        enable_layers = self._cycle_enable_dict()
+        to_remove = list(layers.values()) + list(enable_layers.values())
         layers.clear()
+        enable_layers.clear()
         self._thread_state.active = False
         for layer_name in to_remove:
             try:
@@ -160,6 +190,15 @@ class RebalanceHiveRouter:
             self.plugin.rpc.call(
                 "askrene-update-channel",
                 {"layer": layer, "short_channel_id_dir": scid_dir, "enabled": False},
+            )
+
+    def _enable_channel(self, layer: str, scid_dir: str) -> None:
+        if self.data_service is not None:
+            self.data_service.askrene_update_channel(layer, scid_dir, enabled=True)
+        else:
+            self.plugin.rpc.call(
+                "askrene-update-channel",
+                {"layer": layer, "short_channel_id_dir": scid_dir, "enabled": True},
             )
 
     def _disable_node(self, layer: str, node: str) -> None:
@@ -267,6 +306,90 @@ class RebalanceHiveRouter:
             excludes.append(f"{scid}/{_channel_direction(self.our_node_id, peer_id)}")
         return excludes
 
+    def _layer_name(self, kind: str) -> str:
+        return f"rebalance-{kind}-{int(time.time())}-{next(type(self)._exclude_counter)}"
+
+    def _local_outgoing_scidds(self, channels: Dict[str, Any]) -> Dict[str, str]:
+        """Map scid -> 'scid/dir' for our outgoing half of every local channel."""
+        out: Dict[str, str] = {}
+        for ch in channels.get("channels", []):
+            scid = str(ch.get("short_channel_id") or "").replace(":", "x")
+            peer_id = str(ch.get("peer_id") or "")
+            if not scid or not peer_id:
+                continue
+            out[scid] = f"{scid}/{_channel_direction(self.our_node_id, peer_id)}"
+        return out
+
+    def _ensure_local_disable_layer(self, scidds: List[str]) -> str:
+        """Create or incrementally reconcile the disable-all base layer.
+
+        Entries are only ever added (a closed channel's stale entry is
+        harmless — the channel is gone from gossip), so reconciliation after
+        the first build is normally zero RPCs.
+        """
+        with self._local_disable_lock:
+            if not self._local_disable_ready:
+                try:
+                    self._create_layer(self.LOCAL_DISABLE_LAYER)
+                except Exception:
+                    # A stale layer with this name exists (previous plugin
+                    # run; lightningd kept running). Rebuild it clean so its
+                    # contents are exactly the current channel set.
+                    self._remove_layer(self.LOCAL_DISABLE_LAYER)
+                    self._create_layer(self.LOCAL_DISABLE_LAYER)
+                self._local_disable_entries = set()
+                self._local_disable_ready = True
+            for scidd in scidds:
+                if scidd not in self._local_disable_entries:
+                    self._disable_channel(self.LOCAL_DISABLE_LAYER, scidd)
+                    self._local_disable_entries.add(scidd)
+        return self.LOCAL_DISABLE_LAYER
+
+    def _invalidate_local_disable_layer(self) -> None:
+        with self._local_disable_lock:
+            self._local_disable_ready = False
+            self._local_disable_entries = set()
+
+    def _build_enable_layer(self, source_scidd: str) -> str:
+        layer_name = self._layer_name("source-enable")
+        try:
+            self._create_layer(layer_name)
+            self._enable_channel(layer_name, source_scidd)
+        except Exception:
+            try:
+                self._remove_layer(layer_name)
+            except Exception:
+                pass
+            raise
+        return layer_name
+
+    @contextmanager
+    def _source_enable_layer(self, source_scidd: str) -> Iterator[str]:
+        """Tiny layer re-enabling the selected source on top of the base layer."""
+        if self._cycle_active():
+            cache = self._cycle_enable_dict()
+            cached = cache.get(source_scidd)
+            if cached is not None:
+                yield cached
+                return
+            layer_name = self._build_enable_layer(source_scidd)
+            cache[source_scidd] = layer_name
+            yield layer_name
+            return
+
+        layer_name = self._build_enable_layer(source_scidd)
+        try:
+            yield layer_name
+        finally:
+            try:
+                self._remove_layer(layer_name)
+            except Exception:
+                pass
+
+    def _drop_cycle_enable_layer(self, source_scidd: str) -> None:
+        if self._cycle_active():
+            self._cycle_enable_dict().pop(source_scidd, None)
+
     @staticmethod
     def _is_node_exclude(entry: str) -> bool:
         return "/" not in entry and "x" not in entry and ":" not in entry
@@ -276,8 +399,7 @@ class RebalanceHiveRouter:
         return str(entry or "").strip().replace(":", "x")
 
     def _build_exclude_layer(self, normalized_excludes: List[str]) -> str:
-        type(self)._exclude_counter += 1
-        layer_name = f"rebalance-exclude-{type(self)._exclude_counter}"
+        layer_name = self._layer_name("exclude")
         try:
             self._create_layer(layer_name)
             for entry in normalized_excludes:
@@ -352,11 +474,64 @@ class RebalanceHiveRouter:
             return RouteResult(success=False, error="fleet_invalid_amount")
 
         layers = self._current_layers()
-        merged_excludes = list(dict.fromkeys((exclude or []) + self._fleet_local_excludes(selected_source_scid)))
+        retry_excludes = [
+            n for n in (self._normalize_exclude_entry(e) for e in (exclude or [])) if n
+        ]
         max_fee_msat = max(required_amount_msat // 100, int(getattr(pair, "pair_budget_sats", 0) or 0) * 1000)
 
+        # Source pinning: compose [.., disable-all-local, enable-source]
+        # instead of building a per-source layer that disables N-1 channels.
+        # Falls back to the legacy merged-exclude layer when setup fails.
+        source_scidd: Optional[str] = None
+        local_scidds: List[str] = []
         try:
-            with self._exclude_layer(merged_excludes) as exclude_layer:
+            scidd_map = self._local_outgoing_scidds(self._get_peer_channels())
+            source_scidd = scidd_map.get(selected_source_scid)
+            local_scidds = list(scidd_map.values())
+        except Exception:
+            pass
+
+        try:
+            with ExitStack() as stack:
+                pinned_layers: Optional[List[str]] = None
+                if source_scidd:
+                    try:
+                        base_layer = self._ensure_local_disable_layer(local_scidds)
+                        enable_layer = stack.enter_context(
+                            self._source_enable_layer(source_scidd)
+                        )
+                        pinned_layers = [base_layer, enable_layer]
+                    except Exception as setup_exc:
+                        self._log(
+                            f"pinned-source layer setup failed, using legacy "
+                            f"excludes: {setup_exc}",
+                            level="warn",
+                        )
+                        pinned_layers = None
+
+                if pinned_layers is None:
+                    merged_excludes = list(
+                        dict.fromkeys(
+                            retry_excludes
+                            + self._fleet_local_excludes(selected_source_scid)
+                        )
+                    )
+                    exclude_layer = stack.enter_context(
+                        self._exclude_layer(merged_excludes)
+                    )
+                    active_layers = list(layers)
+                else:
+                    # Failure-retry excludes go LAST so an erring source
+                    # channel can override its own re-enable.
+                    exclude_layer = (
+                        stack.enter_context(self._exclude_layer(retry_excludes))
+                        if retry_excludes
+                        else None
+                    )
+                    active_layers = list(layers) + pinned_layers
+                if exclude_layer is not None:
+                    active_layers.append(exclude_layer)
+
                 route_kwargs = {
                     "source": self.our_node_id,
                     "destination": pair.dest_peer_id,
@@ -364,17 +539,24 @@ class RebalanceHiveRouter:
                     "maxfee_msat": max_fee_msat,
                     "final_cltv": required_cltv,
                     "maxparts": 1,
+                    "layers": active_layers,
                 }
-                active_layers = list(layers)
-                if exclude_layer is not None:
-                    active_layers.append(exclude_layer)
-                route_kwargs["layers"] = active_layers
                 try:
                     result = self._get_routes(**route_kwargs)
                 except Exception as e:
                     if not self._is_unknown_layer_error(e):
                         raise
+                    # Some layer rotated/vanished underneath us: refresh the
+                    # hive layer set and rebuild our own layers, retry once.
                     refreshed_layers = self._current_layers()
+                    if pinned_layers is not None and source_scidd:
+                        self._invalidate_local_disable_layer()
+                        self._drop_cycle_enable_layer(source_scidd)
+                        base_layer = self._ensure_local_disable_layer(local_scidds)
+                        enable_layer = stack.enter_context(
+                            self._source_enable_layer(source_scidd)
+                        )
+                        refreshed_layers += [base_layer, enable_layer]
                     if exclude_layer is not None:
                         refreshed_layers.append(exclude_layer)
                     if refreshed_layers == active_layers:

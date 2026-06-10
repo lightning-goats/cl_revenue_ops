@@ -109,7 +109,8 @@ def test_hive_router_uses_all_live_hive_and_revenue_layers():
     result = router.price_pair(_pair(), _route_decision(RoutePolicy.HIVE_ONLY))
 
     assert result.success is True
-    assert data_service.get_routes.call_args.kwargs["layers"] == [
+    layers = data_service.get_routes.call_args.kwargs["layers"]
+    assert layers[:7] == [
         "auto.localchans",
         "hive-fleet",
         "hive-reputation",
@@ -118,6 +119,9 @@ def test_hive_router_uses_all_live_hive_and_revenue_layers():
         "revenue-local",
         "auto.no_mpp_support",
     ]
+    # Source pinning composes on top of the gossip/hive layers.
+    assert layers[7] == "rebalance-local-disable"
+    assert layers[8].startswith("rebalance-source-enable-")
 
 
 def test_hive_router_reprices_prefix_amounts_from_live_forwarding_policies():
@@ -279,12 +283,17 @@ def test_hive_router_excludes_expansion_test_layers_from_live_routes():
     result = router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
 
     assert result.success is True
-    assert data_service.get_routes.call_args.kwargs["layers"] == [
+    layers = data_service.get_routes.call_args.kwargs["layers"]
+    assert layers[:4] == [
         "auto.localchans",
         "hive-fleet",
         "revenue-local",
         "auto.no_mpp_support",
     ]
+    # Expansion-test layers stay excluded; only the pinning layers follow.
+    assert layers[4] == "rebalance-local-disable"
+    assert layers[5].startswith("rebalance-source-enable-")
+    assert len(layers) == 6
 
 
 def test_hive_router_rejects_non_hive_intermediate_for_hive_only():
@@ -498,7 +507,14 @@ def _two_source_channel_fixture(data_service: MagicMock) -> None:
     }
 
 
-def test_hive_router_reuses_exclude_layer_within_cycle():
+def _update_channel_calls(data_service):
+    return [
+        (call.args[0], call.args[1], call.kwargs.get("enabled"))
+        for call in data_service.askrene_update_channel.call_args_list
+    ]
+
+
+def test_hive_router_reuses_pinned_layers_within_cycle():
     from modules.rebalance_hive_router import RebalanceHiveRouter
 
     plugin = MagicMock()
@@ -520,15 +536,192 @@ def test_hive_router_reuses_exclude_layer_within_cycle():
     finally:
         router.end_cycle()
 
-    # Two price_pair calls with the same exclude set share one created layer.
-    assert data_service.askrene_create_layer.call_count == 1
-    # Disables happen once (on layer creation), not per price_pair call.
-    assert data_service.askrene_update_channel.call_count == 1
-    # end_cycle tears the shared layer down exactly once.
+    # One base disable-all layer + one source-enable layer, shared by both calls.
+    assert data_service.askrene_create_layer.call_count == 2
+    # 2 local channels disabled once + 1 source re-enable; nothing per extra call.
+    updates = _update_channel_calls(data_service)
+    assert len(updates) == 3
+    assert sum(1 for _, _, enabled in updates if enabled is False) == 2
+    assert sum(1 for _, _, enabled in updates if enabled is True) == 1
+    # end_cycle removes only the per-source enable layer; the base layer persists.
     assert data_service.askrene_remove_layer.call_count == 1
+    removed = data_service.askrene_remove_layer.call_args.args[0]
+    assert removed != RebalanceHiveRouter.LOCAL_DISABLE_LAYER
 
 
-def test_hive_router_without_cycle_tears_down_each_call():
+def test_hive_router_base_layer_survives_across_cycles():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    _two_source_channel_fixture(data_service)
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    for _ in range(2):
+        router.begin_cycle()
+        try:
+            router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+        finally:
+            router.end_cycle()
+
+    # The disable-all base layer is built once; the second cycle only
+    # creates its per-source enable layer (steady-state cost ~2 RPCs/pair).
+    creates = [c.args[0] for c in data_service.askrene_create_layer.call_args_list]
+    assert creates.count(RebalanceHiveRouter.LOCAL_DISABLE_LAYER) == 1
+    assert len(creates) == 3  # base + one enable layer per cycle
+    disables = [u for u in _update_channel_calls(data_service) if u[2] is False]
+    assert len(disables) == 2  # both local channels, disabled exactly once ever
+
+
+def test_hive_router_base_layer_reconciles_new_channels():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    _two_source_channel_fixture(data_service)
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+
+    # A third local channel appears (channel open) between calls.
+    base_side_effect = data_service.get_peer_channels.side_effect
+
+    def with_new_channel(peer_id=None):
+        result = base_side_effect(peer_id=peer_id)
+        if peer_id is None:
+            result = {"channels": list(result["channels"]) + [{
+                "short_channel_id": "500x1x0",
+                "peer_id": "02" + "d" * 64,
+                "state": "CHANNELD_NORMAL",
+            }]}
+        return result
+
+    data_service.get_peer_channels.side_effect = with_new_channel
+
+    router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+
+    disables = [u for u in _update_channel_calls(data_service) if u[2] is False]
+    # 2 originals + exactly 1 incremental disable for the new channel — no rebuild.
+    assert len(disables) == 3
+    assert any(u[1].startswith("500x1x0/") for u in disables)
+    creates = [c.args[0] for c in data_service.askrene_create_layer.call_args_list]
+    assert creates.count(RebalanceHiveRouter.LOCAL_DISABLE_LAYER) == 1
+
+
+def test_hive_router_pinned_layer_order_in_getroutes():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    _two_source_channel_fixture(data_service)
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    router.price_pair(
+        _pair(),
+        _route_decision(RoutePolicy.HYBRID),
+        exclude=["150x1x0/1"],
+    )
+
+    layers = data_service.get_routes.call_args.kwargs["layers"]
+    base_idx = layers.index(RebalanceHiveRouter.LOCAL_DISABLE_LAYER)
+    # Gossip/hive layers first, then disable-all, then the source re-enable,
+    # with the failure-retry exclude layer last so it can override the enable.
+    assert layers.index("auto.localchans") < base_idx
+    assert layers.index("hive-fleet") < base_idx
+    enable_idx = base_idx + 1
+    assert layers[enable_idx].startswith("rebalance-source-enable-")
+    assert layers[-1].startswith("rebalance-exclude-")
+    assert layers[-1] != layers[enable_idx]
+    # The enable layer re-enables exactly the selected source half.
+    enables = [u for u in _update_channel_calls(data_service) if u[2] is True]
+    assert len(enables) == 1
+    assert enables[0][1].startswith("100x1x0/")
+
+
+def test_hive_router_recreates_stale_base_layer_from_prior_run():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    _two_source_channel_fixture(data_service)
+    # First create fails: a stale layer with the same name exists (plugin
+    # restarted, lightningd did not). The router must remove and recreate.
+    data_service.askrene_create_layer.side_effect = [
+        RuntimeError("layer already exists"),
+        None,  # recreate of base
+        None,  # enable layer
+    ]
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    result = router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+
+    assert result.success is True
+    removed = [c.args[0] for c in data_service.askrene_remove_layer.call_args_list]
+    assert RebalanceHiveRouter.LOCAL_DISABLE_LAYER in removed
+
+
+def test_hive_router_falls_back_to_legacy_excludes_when_pinning_fails():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    plugin = MagicMock()
+    data_service = MagicMock()
+    _two_source_channel_fixture(data_service)
+
+    # Base-layer construction fails hard (create + recreate both fail).
+    def create_layer(name):
+        if name == RebalanceHiveRouter.LOCAL_DISABLE_LAYER:
+            raise RuntimeError("askrene hiccup")
+        return None
+
+    data_service.askrene_create_layer.side_effect = create_layer
+
+    router = RebalanceHiveRouter(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+    result = router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
+
+    # Legacy path: one merged exclude layer disabling the non-source channel.
+    assert result.success is True
+    disables = [u for u in _update_channel_calls(data_service) if u[2] is False]
+    assert any(u[1].startswith("400x1x0/") for u in disables)
+    enables = [u for u in _update_channel_calls(data_service) if u[2] is True]
+    assert enables == []
+
+
+def test_hive_router_without_cycle_tears_down_enable_layer_each_call():
     from modules.rebalance_hive_router import RebalanceHiveRouter
 
     plugin = MagicMock()
@@ -546,8 +739,13 @@ def test_hive_router_without_cycle_tears_down_each_call():
     router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
     router.price_pair(_pair(), _route_decision(RoutePolicy.HYBRID))
 
-    assert data_service.askrene_create_layer.call_count == 2
+    # base created once + one enable layer per call; only enables removed.
+    creates = [c.args[0] for c in data_service.askrene_create_layer.call_args_list]
+    assert creates.count(RebalanceHiveRouter.LOCAL_DISABLE_LAYER) == 1
+    assert len(creates) == 3
     assert data_service.askrene_remove_layer.call_count == 2
+    removed = [c.args[0] for c in data_service.askrene_remove_layer.call_args_list]
+    assert RebalanceHiveRouter.LOCAL_DISABLE_LAYER not in removed
 
 
 def test_hive_router_get_routes_passes_timeout():
