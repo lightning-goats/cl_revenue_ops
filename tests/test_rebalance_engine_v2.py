@@ -3490,3 +3490,67 @@ def test_overlay_claimed_source_removed_from_drain_demand(
     assert drain is not None
     assert [e.channel_id for e in drain.entries] == ["500x1x0"]
     assert drain.total_excess_sats == 100_000
+
+
+# -----------------------------------------------------------------------------
+# Market pricing keeps observed-liquidity failure evidence while still
+# excluding hive bias layers.
+# -----------------------------------------------------------------------------
+
+
+def test_market_price_pair_includes_observed_liquidity_without_hive_layers(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    router = MagicMock()
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "1" * 64,
+        dest_peer_id="02" + "2" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=100,
+    )
+
+    RebalanceEngine._market_price_pair(
+        router, pair, None, market_only_layers=True
+    )
+
+    kwargs = router.price_pair.call_args.kwargs
+    # No hive bias layers...
+    assert kwargs["layer_names_override"] == []
+    # ...but observed liquidity stays on: it is OUR failure evidence
+    # (avoid segments we just failed on), not a hive preference.
+    assert kwargs["include_observed_liquidity"] is True
+
+
+def test_engine_threads_pair_fee_cap_into_coordination_overlay(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PlanResult
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.pair_fee_cap_ppm = 1_000
+    engine.config.hive_equalization_enabled = False
+    engine._audit = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=0,
+            total_remaining_budget_sats=0,
+        )
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls, patch(
+        "modules.rebalance_engine_v2.build_coordination_overlay"
+    ) as overlay_builder:
+        planner = planner_cls.return_value
+        planner.max_pairs = 5
+        planner.plan.return_value = PlanResult(selected=[], skipped=[])
+        overlay_builder.return_value = PlanResult(selected=[], skipped=[])
+
+        engine.find_candidates()
+
+    assert overlay_builder.call_args.kwargs["pair_fee_cap_ppm"] == 1_000

@@ -420,7 +420,9 @@ def test_engine_hybrid_market_leg_uses_layerless_market_fallback():
     assert pair.route == market_route
     kwargs = engine.router_v3.price_pair.call_args.kwargs
     assert kwargs["layer_names_override"] == []
-    assert kwargs["include_observed_liquidity"] is False
+    # Observed liquidity stays on for market pricing: it is our own
+    # failure evidence, not a hive bias layer.
+    assert kwargs["include_observed_liquidity"] is True
 
 
 def test_engine_orders_pairs_by_route_priority():

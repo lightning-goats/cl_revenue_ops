@@ -1022,6 +1022,7 @@ class RebalanceEngine:
             target_band_low=target_band_low,
             target_band_high=target_band_high,
             max_chunk_sats=max_chunk_sats,
+            pair_fee_cap_ppm=pair_fee_cap_ppm,
         )
         plan.skipped.extend(overlay.skipped)
         planner_max_pairs = getattr(planner, "max_pairs", 10)
@@ -1527,10 +1528,14 @@ class RebalanceEngine:
             "exclude": exclude,
         }
         if market_only_layers:
+            # Exclude hive bias layers, but keep the observed-liquidity
+            # layer: it carries OUR OWN failure evidence (avoid segments we
+            # just failed on), not hive preference, and dropping it lets
+            # market pricing re-propose routes through known-bad segments.
             kwargs.update(
                 {
                     "layer_names_override": [],
-                    "include_observed_liquidity": False,
+                    "include_observed_liquidity": True,
                 }
             )
         try:

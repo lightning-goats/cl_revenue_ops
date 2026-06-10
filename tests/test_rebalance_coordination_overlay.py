@@ -691,3 +691,100 @@ def test_negative_reserved_clamped_to_zero():
     )
     # Negative clamps to 0; no change vs the default.
     assert len(selected) == 1
+
+
+# -----------------------------------------------------------------------------
+# Budget parity: coordination pairs get the same pair_fee_cap_ppm floor the
+# planner gives its pairs.
+# -----------------------------------------------------------------------------
+
+def test_overlay_pair_budget_gets_fee_cap_floor_like_planner_pairs():
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-floor",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot,
+        hive_hints=hints,
+        our_node_id="02ours",
+        pair_fee_cap_ppm=1_000,
+    )
+
+    assert len(candidates) == 1
+    # max(sink budget 40, ceil(120_000 * 1000 / 1e6) = 120) = 120
+    assert candidates[0].pair_budget_sats == 120
+
+
+def test_overlay_pair_budget_unchanged_when_fee_cap_disabled():
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-nofloor",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].pair_budget_sats == 40
+
+
+def test_overlay_keeps_larger_sink_budget_over_fee_cap_floor():
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    snapshot = build_state_snapshot(
+        [
+            {
+                "channel_id": "100x1x0",
+                "peer_id": "02" + "1" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 900_000,
+            },
+            {
+                "channel_id": "200x1x0",
+                "peer_id": "02" + "2" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 100_000,
+            },
+        ],
+        {"channel_budgets": {"200x1x0": {"budget_sats": 5_000}}},
+    )
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-bigbudget",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot,
+        hive_hints=hints,
+        our_node_id="02ours",
+        pair_fee_cap_ppm=1_000,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].pair_budget_sats == 5_000

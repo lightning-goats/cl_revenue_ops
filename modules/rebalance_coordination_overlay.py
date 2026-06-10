@@ -194,6 +194,7 @@ def _build_pair_from_entry(
     target_band_low: float,
     target_band_high: float,
     max_chunk_sats: int,
+    pair_fee_cap_ppm: int = 0,
 ) -> tuple[Optional[PairCandidate], Optional[SkipRecord]]:
     source_scid = str(entry.get("source_scid") or "").strip()
     sink_scid = str(entry.get("sink_scid") or "").strip()
@@ -293,15 +294,24 @@ def _build_pair_from_entry(
             detail=f"hint_id={hint_id} amount_not_viable",
         )
 
+    # Destination authorizes spend. Source budget represents its own refill
+    # authority, not the fee envelope for draining it. Same
+    # pair_fee_cap_ppm-on-amount floor as planner pairs so a small bootstrap
+    # destination budget can still pay enough routing fee to find a path.
+    pair_budget = sink.remaining_budget_sats
+    if pair_fee_cap_ppm > 0 and amount_sats > 0:
+        fee_cap_from_amount = (
+            amount_sats * pair_fee_cap_ppm + 999_999
+        ) // 1_000_000
+        pair_budget = max(pair_budget, fee_cap_from_amount)
+
     pair = PairCandidate(
         source_channel_id=source.channel_id,
         dest_channel_id=sink.channel_id,
         source_peer_id=source.peer_id,
         dest_peer_id=sink.peer_id,
         amount_sats=amount_sats,
-        # Destination authorizes spend. Source budget represents its own refill
-        # authority, not the fee envelope for draining it.
-        pair_budget_sats=sink.remaining_budget_sats,
+        pair_budget_sats=pair_budget,
         source_capacity_sats=source.capacity_sats,
         dest_capacity_sats=sink.capacity_sats,
         source_value_class=source.value_class,
@@ -390,6 +400,7 @@ def build_coordination_overlay(
     target_band_low: float = 0.35,
     target_band_high: float = 0.65,
     max_chunk_sats: int = 2_000_000,
+    pair_fee_cap_ppm: int = 0,
 ) -> PlanResult:
     result = PlanResult()
     if hive_hints is None:
@@ -406,6 +417,7 @@ def build_coordination_overlay(
             target_band_low=target_band_low,
             target_band_high=target_band_high,
             max_chunk_sats=max_chunk_sats,
+            pair_fee_cap_ppm=pair_fee_cap_ppm,
         )
         if skip is not None:
             result.skipped.append(skip)
@@ -435,6 +447,7 @@ def build_coordination_pairs(
     target_band_low: float = 0.35,
     target_band_high: float = 0.65,
     max_chunk_sats: int = 2_000_000,
+    pair_fee_cap_ppm: int = 0,
 ) -> List[PairCandidate]:
     return build_coordination_overlay(
         snapshot,
@@ -443,6 +456,7 @@ def build_coordination_pairs(
         target_band_low=target_band_low,
         target_band_high=target_band_high,
         max_chunk_sats=max_chunk_sats,
+        pair_fee_cap_ppm=pair_fee_cap_ppm,
     ).selected
 
 
