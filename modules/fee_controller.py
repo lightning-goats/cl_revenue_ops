@@ -2130,6 +2130,18 @@ class FeeController:
     EXPLORATION_SPARSE_HEADROOM_RATIO = 0.50
 
     # ==========================================================================
+    # Audit F5 (2026-06): initial-fee prior seeding of the PERSISTENT state
+    # ==========================================================================
+    # std for the fleet fee prior. NOT the old hardcoded 50: the fleet prior
+    # is an unweighted corridor median, informative but too coarse to justify
+    # near-converged confidence on a channel with zero local observations.
+    FLEET_PRIOR_STD_PPM = 80
+    # Weight of the one durable posterior nudge recorded toward the chosen
+    # prior so the sample-time bias machinery carries the signal through the
+    # early fee cycles (until real observations accumulate).
+    INITIAL_PRIOR_NUDGE_WEIGHT = 0.3
+
+    # ==========================================================================
     # Issue #20: Flow-Based Ceiling Reduction
     # ==========================================================================
     ZERO_FLOW_DAYS_MODERATE = 3
@@ -7073,10 +7085,10 @@ class FeeController:
                 try:
                     fleet_fee = self.hive_hints.get_fleet_fee_prior(peer_id)
                     if fleet_fee and fleet_fee > 0:
-                        fleet_prior = {"mean": fleet_fee, "std": 50}
+                        fleet_prior = {"mean": fleet_fee, "std": self.FLEET_PRIOR_STD_PPM}
                         self.plugin.log(
                             f"INITIAL_FEE: {scid[:16]}... using fleet prior "
-                            f"(mean={fleet_fee}, std=50)",
+                            f"(mean={fleet_fee}, std={self.FLEET_PRIOR_STD_PPM})",
                             level='debug'
                         )
                 except Exception:
@@ -7095,6 +7107,33 @@ class FeeController:
                         f"INITIAL_FEE: {scid[:16]}... using network prior "
                         f"(mean={network_prior['mean']}, std={network_prior['std']})",
                         level='debug'
+                    )
+
+                # Audit F5: the prior used to live ONLY in the throwaway
+                # state above — the channel's PERSISTENT thompson state
+                # still started at the default prior (200/100), so the
+                # first regular fee cycle sampled from the default and
+                # walked the fee away from the best available evidence
+                # (up to ~460 ppm/cycle). Seed the real state so the
+                # evidence persists, and record one durable nudge toward
+                # the prior so the sample-time bias machinery carries the
+                # signal through early cycles. (Default path: untouched.)
+                try:
+                    with self._state_lock:
+                        fee_state = self._get_channel_fee_state_locked(scid, peer_id)
+                        if isinstance(fee_state.thompson, GaussianThompsonState):
+                            fee_state.thompson.prior_mean_fee = prior["mean"]
+                            fee_state.thompson.prior_std_fee = prior["std"]
+                            fee_state.thompson.record_posterior_nudge(
+                                float(prior["mean"]),
+                                self.INITIAL_PRIOR_NUDGE_WEIGHT,
+                            )
+                            self._save_channel_fee_state(scid, fee_state)
+                except Exception as seed_err:
+                    self.plugin.log(
+                        f"INITIAL_FEE: failed to seed persistent prior for "
+                        f"{scid[:16]}...: {seed_err}",
+                        level='warn'
                     )
 
             initial_fee = ts.sample_fee(cfg.min_fee_ppm, cfg.max_fee_ppm)
