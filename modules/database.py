@@ -327,6 +327,17 @@ class Database:
             # Enable incremental auto-vacuum so PRAGMA incremental_vacuum works.
             # Only takes effect on a fresh (empty) database; harmless no-op otherwise.
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
+            # Performance pragmas (best-effort; failures must not break the
+            # connection since these are pure optimizations):
+            # - cache_size=-16000: ~16MB page cache (negative = KiB units)
+            # - mmap_size=128MB: memory-mapped I/O for read-heavy workloads
+            # - temp_store=MEMORY: keep temp B-trees (GROUP BY/ORDER BY) in RAM
+            try:
+                conn.execute("PRAGMA cache_size=-16000;")
+                conn.execute("PRAGMA mmap_size=134217728;")
+                conn.execute("PRAGMA temp_store=MEMORY;")
+            except Exception as e:
+                self.plugin.log(f"Database: performance PRAGMAs not applied: {e}", level='debug')
         except Exception:
             conn.close()
             raise
@@ -819,10 +830,21 @@ class Database:
 
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
+        # Timestamp-only index for the hourly audit-log cleanup DELETE,
+        # which otherwise scans the whole fee_changes table.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_time ON fee_changes(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_time ON forwards(timestamp)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_forwards_channels ON forwards(in_channel, out_channel)")
+        # idx_forwards_channels was a strict prefix of idx_forwards_unique
+        # (in_channel, out_channel, ...); drop it on existing databases to
+        # shrink the hottest write table's index overhead.
+        conn.execute("DROP INDEX IF EXISTS idx_forwards_channels")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_channel ON rebalance_costs(channel_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_channel_time ON rebalance_costs(channel_id, timestamp)")
+        # Covering index for timestamp-only SUM(cost_sats) predicates
+        # (_reserve_budget_atomic daily/weekly checks inside BEGIN IMMEDIATE,
+        # get_total_rebalance_fees, get_budget_status, get_daily_rebalance_spend).
+        # rebalance_costs is never pruned, so these were full table scans.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_time ON rebalance_costs(timestamp, cost_sats)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_states_peer ON channel_states(peer_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connection_history_peer_time ON peer_connection_history(peer_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_time ON mempool_fee_history(timestamp)")
@@ -1626,6 +1648,31 @@ class Database:
         )
         conn.commit()
 
+    def save_temporal_profiles_batch(self, rows: List[Dict[str, Any]]) -> int:
+        """Save temporal profile JSON for many channels in a single transaction.
+
+        Each row is a dict: {"channel_id": str, "profile_json": str}, matching
+        what save_temporal_profile() writes. Returns len(rows).
+        """
+        if not rows:
+            return 0
+        conn = self._get_connection()
+        params = [(row["profile_json"], row["channel_id"]) for row in rows]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany(
+                "UPDATE channel_states SET temporal_profile_json = ? WHERE channel_id = ?",
+                params,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                self.plugin.log(f"ROLLBACK failed in save_temporal_profiles_batch: {rb_err}", level='error')
+            raise
+        return len(rows)
+
     def load_temporal_profile(self, channel_id: str) -> Optional[str]:
         """Load temporal profile JSON for a channel. Returns None if absent."""
         conn = self._get_connection()
@@ -1641,6 +1688,82 @@ class Database:
         """Get per-hour flow histogram for a channel."""
         conn = self._get_connection()
         return _hourly_forward_histogram_sql(conn, channel_id, window_days)
+
+    def get_hourly_forward_histograms_all(self, window_days: int = 7) -> Dict[str, List]:
+        """Compute per-hour flow histograms for ALL channels in one pass.
+
+        Batched equivalent of get_hourly_forward_histogram(): returns
+        {channel_id: [24 x {"out_sats", "in_sats", "count"}]} with each
+        element shaped exactly like the single-channel helper's output
+        (per-day averages over days with data, integer division).
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        since = now - window_days * 86400
+
+        # Days-with-data per channel (either direction), mirroring
+        # COUNT(DISTINCT timestamp / 86400) in _hourly_forward_histogram_sql.
+        # UNION (not ALL) dedupes (channel, day) pairs across directions.
+        day_rows = conn.execute("""
+            SELECT channel_id, COUNT(*) AS day_count
+            FROM (
+                SELECT in_channel AS channel_id, timestamp / 86400 AS day
+                FROM forwards WHERE timestamp >= ?
+                UNION
+                SELECT out_channel AS channel_id, timestamp / 86400 AS day
+                FROM forwards WHERE timestamp >= ?
+            )
+            GROUP BY channel_id
+        """, (since, since)).fetchall()
+        days_by_channel = {row[0]: max(1, int(row[1] or 1)) for row in day_rows}
+
+        rows = conn.execute("""
+            SELECT
+                channel_id,
+                hour_utc,
+                SUM(out_sats) AS total_out,
+                SUM(in_sats) AS total_in,
+                SUM(cnt) AS total_count
+            FROM (
+                SELECT
+                    in_channel AS channel_id,
+                    CAST(((timestamp % 86400) / 3600) AS INTEGER) AS hour_utc,
+                    0 AS out_sats,
+                    SUM(in_msat) / 1000 AS in_sats,
+                    COUNT(*) AS cnt
+                FROM forwards
+                WHERE timestamp >= ?
+                GROUP BY in_channel, hour_utc
+
+                UNION ALL
+
+                SELECT
+                    out_channel AS channel_id,
+                    CAST(((timestamp % 86400) / 3600) AS INTEGER) AS hour_utc,
+                    SUM(out_msat) / 1000 AS out_sats,
+                    0 AS in_sats,
+                    COUNT(*) AS cnt
+                FROM forwards
+                WHERE timestamp >= ?
+                GROUP BY out_channel, hour_utc
+            )
+            GROUP BY channel_id, hour_utc
+            ORDER BY channel_id, hour_utc
+        """, (since, since)).fetchall()
+
+        result: Dict[str, List] = {}
+        for row in rows:
+            cid = row[0]
+            histogram = result.get(cid)
+            if histogram is None:
+                histogram = [{"out_sats": 0, "in_sats": 0, "count": 0} for _ in range(24)]
+                result[cid] = histogram
+            h = int(row[1]) % 24
+            days_with_data = days_by_channel.get(cid, 1)
+            histogram[h]["out_sats"] = int(row[2] or 0) // days_with_data
+            histogram[h]["in_sats"] = int(row[3] or 0) // days_with_data
+            histogram[h]["count"] = int(row[4] or 0) // days_with_data
+        return result
 
     # =========================================================================
     # Kalman Filter State Methods (v2.1)
@@ -1700,6 +1823,76 @@ class Database:
             "per_hour",
             state.get("observation_count", 0),
         ))
+
+    def save_kalman_states_batch(self, rows: List[Dict[str, Any]]) -> int:
+        """Save Kalman filter state for many channels in a single transaction.
+
+        Each row is a dict of save_kalman_state() keyword arguments:
+        {"channel_id": str, "state": Dict[str, Any]}.
+
+        Rows containing NaN/Inf values are skipped (same protection as the
+        single-row method). Returns len(rows); rolls back on error.
+        """
+        if not rows:
+            return 0
+
+        float_fields = [
+            ("flow_ratio", 0.0), ("flow_velocity", 0.0),
+            ("variance_ratio", 0.1), ("variance_velocity", 0.1),
+            ("covariance", 0.0), ("innovation_variance", 0.01),
+            ("last_innovation", 0.0),
+        ]
+        params = []
+        for row in rows:
+            channel_id = row["channel_id"]
+            state = row["state"]
+            values = []
+            poisoned = False
+            for key, default in float_fields:
+                v = state.get(key, default)
+                if isinstance(v, float) and not math.isfinite(v):
+                    self.plugin.log(
+                        f"Kalman NaN/Inf in {key} for {channel_id}, skipping persist",
+                        level='warn'
+                    )
+                    poisoned = True
+                    break
+                values.append(v)
+            if poisoned:
+                continue
+            params.append((
+                channel_id,
+                values[0],  # flow_ratio
+                values[1],  # flow_velocity
+                values[2],  # variance_ratio
+                values[3],  # variance_velocity
+                values[4],  # covariance
+                state.get("last_update", 0),
+                values[5],  # innovation_variance
+                values[6],  # last_innovation
+                "per_hour",
+                state.get("observation_count", 0),
+            ))
+
+        if params:
+            conn = self._get_connection()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.executemany("""
+                    INSERT OR REPLACE INTO kalman_state
+                    (channel_id, flow_ratio, flow_velocity, variance_ratio, variance_velocity,
+                     covariance, last_update, innovation_variance, last_innovation, velocity_unit,
+                     observation_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, params)
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception as rb_err:
+                    self.plugin.log(f"ROLLBACK failed in save_kalman_states_batch: {rb_err}", level='error')
+                raise
+        return len(rows)
 
     def get_all_kalman_states(self) -> List[Dict[str, Any]]:
         """Get Kalman filter states for all channels."""
@@ -1906,12 +2099,76 @@ class Database:
               last_broadcast_fee_ppm, last_state, is_sleeping, sleep_until, stable_cycles,
               forward_count_since_update, last_volume_sats, v2_state_json))
     
+    def update_fee_strategy_states_batch(self, rows: List[Dict[str, Any]]) -> int:
+        """Upsert fee strategy state for many channels in a single transaction.
+
+        Each row is a dict of update_fee_strategy_state() keyword arguments
+        (same names and defaults). Returns len(rows); rolls back on error.
+        """
+        if not rows:
+            return 0
+        conn = self._get_connection()
+        now = int(time.time())
+
+        params = []
+        for row in rows:
+            last_update = row.get("last_update")
+            ts = last_update if last_update is not None else now
+            params.append((
+                row["channel_id"],
+                row["last_revenue_rate"],
+                row["last_fee_ppm"],
+                row["trend_direction"],
+                row.get("step_ppm", 50),
+                row.get("consecutive_same_direction", 0),
+                ts,
+                row.get("last_broadcast_fee_ppm", 0),
+                row.get("last_state", 'unknown'),
+                row.get("is_sleeping", 0),
+                row.get("sleep_until", 0),
+                row.get("stable_cycles", 0),
+                row.get("forward_count_since_update", 0),
+                row.get("last_volume_sats", 0),
+                row.get("v2_state_json", '{}'),
+            ))
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany("""
+                INSERT OR REPLACE INTO fee_strategy_state
+                (channel_id, last_revenue_rate, last_fee_ppm, trend_direction,
+                 step_ppm, consecutive_same_direction, last_update,
+                 last_broadcast_fee_ppm, last_state, is_sleeping, sleep_until, stable_cycles,
+                 forward_count_since_update, last_volume_sats, v2_state_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, params)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                self.plugin.log(f"ROLLBACK failed in update_fee_strategy_states_batch: {rb_err}", level='error')
+            raise
+        return len(rows)
+
     def get_all_fee_strategy_states(self) -> List[Dict[str, Any]]:
         """Get fee strategy state for all channels."""
         conn = self._get_connection()
         rows = conn.execute("SELECT * FROM fee_strategy_state").fetchall()
         return [dict(row) for row in rows]
-    
+
+    def get_all_fee_strategy_channel_ids(self) -> List[str]:
+        """Get just the channel_ids present in fee_strategy_state.
+
+        Cheap alternative to get_all_fee_strategy_states() for callers that
+        only need the id list — avoids deserializing every v2_state_json blob
+        (20-40KB per channel).
+        """
+        conn = self._get_connection()
+        rows = conn.execute("SELECT channel_id FROM fee_strategy_state").fetchall()
+        return [row[0] for row in rows]
+
+
     def reset_fee_strategy_state(self, channel_id: str):
         """
         Reset the fee strategy state for a channel.
@@ -2163,6 +2420,24 @@ class Database:
         if row and row['last_time']:
             return row['last_time']
         return None
+
+    def get_last_rebalance_times(self) -> Dict[str, int]:
+        """Get last successful rebalance timestamps for all destination channels.
+
+        Batched equivalent of get_last_rebalance_time() without a reason_code
+        filter: one GROUP BY instead of a query per channel.
+
+        Returns:
+            Dict mapping to_channel -> MAX(timestamp) of successful rebalances.
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT to_channel, MAX(timestamp) AS last_time
+            FROM rebalance_history
+            WHERE status = 'success'
+            GROUP BY to_channel
+        """).fetchall()
+        return {row[0]: int(row[1]) for row in rows if row[1] is not None}
 
     def get_pair_rebalance_cooldown(
         self,
@@ -2751,6 +3026,165 @@ class Database:
             'revenue_sats': base_to_sats_ceil(revenue_msat),
             'forward_count': direct_pnl['forward_count']
         }
+
+    def get_all_channels_full_pnl(self, window_days: int) -> Dict[str, Dict]:
+        """
+        Get complete P&L breakdowns for ALL channels in a few GROUP BY passes.
+
+        Batched equivalent of calling get_channel_full_pnl() per channel:
+        the returned value dicts are shaped EXACTLY like that method's return
+        (same windows, msat conversions, and scid-alias normalization).
+
+        Channels appear in the result if they have any activity in the window
+        (forwards, rolled-up daily stats, or rebalance costs).
+
+        Returns:
+            Dict[channel_id] -> full P&L dict (see get_channel_full_pnl).
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        since = now - (window_days * 86400)
+        since_day = (since // 86400) * 86400
+        # DB-1: exclude current partial day from daily stats (see get_channel_pnl)
+        today_start = (now // 86400) * 86400
+
+        # GROUP BY key normalization: REPLACE(col, ':', 'x') is exactly
+        # normalize_scid(), which collapses the same alias set that
+        # _scid_aliases() expands per channel in the single-channel queries.
+        per_channel: Dict[str, Dict[str, int]] = {}
+
+        def _entry(cid: str) -> Dict[str, int]:
+            return per_channel.setdefault(cid, {
+                "revenue_msat": 0,
+                "forward_count": 0,
+                "cost_msat": 0,
+                "sourced_volume_msat": 0,
+                "sourced_fee_msat": 0,
+                "sourced_forward_count": 0,
+            })
+
+        # Direct revenue (as exit channel): live forwards + completed daily rollups
+        exit_rows = conn.execute("""
+            SELECT channel_id,
+                   COALESCE(SUM(fee_msat), 0) AS revenue_msat,
+                   COALESCE(SUM(cnt), 0) AS forward_count
+            FROM (
+                SELECT REPLACE(out_channel, ':', 'x') AS channel_id,
+                       SUM(fee_msat) AS fee_msat,
+                       COUNT(*) AS cnt
+                FROM forwards
+                WHERE timestamp >= ?
+                GROUP BY REPLACE(out_channel, ':', 'x')
+                UNION ALL
+                SELECT REPLACE(channel_id, ':', 'x') AS channel_id,
+                       SUM(total_fee_msat) AS fee_msat,
+                       SUM(forward_count) AS cnt
+                FROM daily_forwarding_stats
+                WHERE date >= ? AND date < ?
+                GROUP BY REPLACE(channel_id, ':', 'x')
+            )
+            GROUP BY channel_id
+        """, (since, since_day, today_start)).fetchall()
+        for r in exit_rows:
+            cid = normalize_scid(r["channel_id"])
+            if not cid:
+                continue
+            data = _entry(cid)
+            data["revenue_msat"] += int(r["revenue_msat"] or 0)
+            data["forward_count"] += int(r["forward_count"] or 0)
+
+        # Inbound contribution (as entry channel)
+        inbound_rows = conn.execute("""
+            SELECT channel_id,
+                   COALESCE(SUM(in_msat), 0) AS sourced_volume_msat,
+                   COALESCE(SUM(fee_msat), 0) AS sourced_fee_msat,
+                   COALESCE(SUM(cnt), 0) AS sourced_forward_count
+            FROM (
+                SELECT REPLACE(in_channel, ':', 'x') AS channel_id,
+                       SUM(in_msat) AS in_msat,
+                       SUM(fee_msat) AS fee_msat,
+                       COUNT(*) AS cnt
+                FROM forwards
+                WHERE timestamp >= ?
+                GROUP BY REPLACE(in_channel, ':', 'x')
+                UNION ALL
+                SELECT REPLACE(channel_id, ':', 'x') AS channel_id,
+                       SUM(total_in_msat) AS in_msat,
+                       SUM(total_fee_msat) AS fee_msat,
+                       SUM(forward_count) AS cnt
+                FROM daily_forwarding_stats_inbound
+                WHERE date >= ? AND date < ?
+                GROUP BY REPLACE(channel_id, ':', 'x')
+            )
+            GROUP BY channel_id
+        """, (since, since_day, today_start)).fetchall()
+        for r in inbound_rows:
+            cid = normalize_scid(r["channel_id"])
+            if not cid:
+                continue
+            data = _entry(cid)
+            data["sourced_volume_msat"] += int(r["sourced_volume_msat"] or 0)
+            data["sourced_fee_msat"] += int(r["sourced_fee_msat"] or 0)
+            data["sourced_forward_count"] += int(r["sourced_forward_count"] or 0)
+
+        # Rebalance costs (C6: rebalance_costs is the unpruned source of truth)
+        try:
+            cost_rows = conn.execute("""
+                SELECT REPLACE(channel_id, ':', 'x') AS channel_id,
+                       COALESCE(SUM(COALESCE(cost_msat, cost_sats * 1000)), 0) AS cost_msat
+                FROM rebalance_costs
+                WHERE timestamp >= ?
+                GROUP BY REPLACE(channel_id, ':', 'x')
+            """, (since,)).fetchall()
+        except sqlite3.OperationalError:
+            cost_rows = conn.execute("""
+                SELECT REPLACE(channel_id, ':', 'x') AS channel_id,
+                       COALESCE(SUM(cost_sats * 1000), 0) AS cost_msat
+                FROM rebalance_costs
+                WHERE timestamp >= ?
+                GROUP BY REPLACE(channel_id, ':', 'x')
+            """, (since,)).fetchall()
+        for r in cost_rows:
+            cid = normalize_scid(r["channel_id"])
+            if not cid:
+                continue
+            _entry(cid)["cost_msat"] += int(r["cost_msat"] or 0)
+
+        # Assemble dicts shaped exactly like get_channel_full_pnl()
+        result: Dict[str, Dict] = {}
+        for cid, data in per_channel.items():
+            revenue_msat = data["revenue_msat"]
+            sourced_fee_msat = data["sourced_fee_msat"]
+            total_contribution_msat = max(revenue_msat, sourced_fee_msat)
+            rebalance_cost_msat = data["cost_msat"]
+            rebalance_cost_sats = base_to_sats_ceil(rebalance_cost_msat)
+            net_pnl_msat = total_contribution_msat - rebalance_cost_msat
+            result[cid] = {
+                'channel_id': cid,
+                'window_days': window_days,
+                # Direct metrics (as exit channel) — msat native
+                'direct_revenue_msat': revenue_msat,
+                'direct_forward_count': data["forward_count"],
+                # Inbound contribution metrics (as entry channel) — msat native
+                'sourced_volume_msat': data["sourced_volume_msat"],
+                'sourced_fee_contribution_msat': sourced_fee_msat,
+                'sourced_forward_count': data["sourced_forward_count"],
+                # Combined metrics — msat native
+                'total_contribution_msat': total_contribution_msat,
+                'rebalance_cost_msat': rebalance_cost_msat,
+                'rebalance_cost_sats': rebalance_cost_sats,
+                'net_pnl_msat': net_pnl_msat,
+                # Sats conversions for reporting (ceiling for fees)
+                'direct_revenue_sats': base_to_sats_ceil(revenue_msat),
+                'total_contribution_sats': base_to_sats_ceil(total_contribution_msat),
+                'net_pnl_sats': base_delta_to_sats_toward_zero(net_pnl_msat),
+                'sourced_fee_contribution_sats': base_to_sats_ceil(sourced_fee_msat),
+                'sourced_volume_sats': base_to_sats_floor(data["sourced_volume_msat"]),
+                # Legacy fields for backward compatibility
+                'revenue_sats': base_to_sats_ceil(revenue_msat),
+                'forward_count': data["forward_count"],
+            }
+        return result
 
     def get_last_forward_time_any_direction(self, channel_id: str) -> Optional[int]:
         """
@@ -4059,6 +4493,83 @@ class Database:
 
         # Log duplicate detection for observability
         if cursor.rowcount == 0:
+            self.plugin.log(
+                f"Forward duplicate detected (already recorded): "
+                f"{in_channel[:12]}... -> {out_channel[:12]}... "
+                f"(received={received_time}, resolved={resolved_time})",
+                level='debug'
+            )
+
+    def record_forward_and_reputation(self, forward: Dict[str, Any],
+                                      peer_id: str, success: bool) -> None:
+        """Record a forward and update peer reputation in ONE transaction.
+
+        Per-forward hot path: combines record_forward(**forward) and the
+        update_peer_reputation(peer_id, success) upsert under a single
+        BEGIN IMMEDIATE/COMMIT, halving write transactions per forward.
+
+        Args:
+            forward: dict of record_forward() arguments — in_channel,
+                out_channel, in_msat, out_msat, fee_msat, plus optional
+                received_time, resolved_time, resolution_time.
+            peer_id: The peer's node ID (reputation upsert target)
+            success: True if forward settled, False if failed
+        """
+        # --- Same derivation logic as record_forward() (canonical path) ---
+        in_channel = (forward.get("in_channel") or "").replace(":", "x")
+        out_channel = (forward.get("out_channel") or "").replace(":", "x")
+        in_msat = int(forward.get("in_msat") or 0)
+        out_msat = int(forward.get("out_msat") or 0)
+        fee_msat = int(forward.get("fee_msat") or 0)
+        received_time = int(forward.get("received_time") or 0)
+        resolved_time = int(forward.get("resolved_time") or 0)
+        resolution_time = float(forward.get("resolution_time") or 0)
+
+        ts = received_time or int(time.time())
+        rt = resolved_time
+        if rt <= 0 and resolution_time > 0:
+            rt = ts + int(resolution_time)
+
+        conn = self._get_connection()
+        now = int(time.time())
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO forwards
+                (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (in_channel, out_channel, in_msat, out_msat, fee_msat,
+                  resolution_time, ts, rt))
+            duplicate = (cursor.rowcount == 0)
+
+            # Same upsert SQL as update_peer_reputation()
+            if success:
+                conn.execute("""
+                    INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
+                    VALUES (?, 1, 0, ?)
+                    ON CONFLICT(peer_id) DO UPDATE SET
+                        success_count = success_count + 1,
+                        last_update = excluded.last_update
+                """, (peer_id, now))
+            else:
+                conn.execute("""
+                    INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
+                    VALUES (?, 0, 1, ?)
+                    ON CONFLICT(peer_id) DO UPDATE SET
+                        failure_count = failure_count + 1,
+                        last_update = excluded.last_update
+                """, (peer_id, now))
+
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                self.plugin.log(f"ROLLBACK failed in record_forward_and_reputation: {rb_err}", level='error')
+            raise
+
+        if duplicate:
             self.plugin.log(
                 f"Forward duplicate detected (already recorded): "
                 f"{in_channel[:12]}... -> {out_channel[:12]}... "
