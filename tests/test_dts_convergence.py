@@ -360,3 +360,84 @@ class TestZeroRevenueDirectionalProbing:
         st = GaussianThompsonState.from_dict({"posterior_mean": 250.0})
         assert st.zero_revenue_streak == 0
         assert st.zero_run_start_fee == 0.0
+
+
+# =============================================================================
+# Fix #3: durable nudges must reach BOTH sample paths and never add confidence
+# =============================================================================
+
+class TestNudgesReachSampling:
+
+    def _established_state(self):
+        """Healthy polynomial + contextual state around 300 ppm."""
+        rng = random.Random(13)
+        st = GaussianThompsonState()
+        ctx = "balanced:normal:P"
+        for _ in range(60):
+            FakeTime.advance(1.0)
+            f = 300 + rng.randint(-100, 100)
+            rr = revenue_rate(f, rng=rng)
+            st.update_posterior(fee=f, revenue_rate=rr, hours=1.0)
+            st.update_contextual(ctx, fee=f, revenue_rate=rr)
+        return st, ctx
+
+    @staticmethod
+    def _mean_sample(state, ctx, contextual, n=2000):
+        random.seed(99)
+        tot = 0
+        for _ in range(n):
+            tot += (state.sample_fee_contextual(ctx, FLOOR, CEIL) if contextual
+                    else state.sample_fee(FLOOR, CEIL))
+        return tot / n
+
+    def test_nudges_never_increase_confidence(self, fake_time):
+        """Audit defect 3: each nudge multiplied posterior precision by
+        (1+w); 50 stored nudges crushed std 40 -> 10, so failed-forward
+        storms made the controller MORE confident and sped up the blend."""
+        st, _ = self._established_state()
+        std_before = st.posterior_std
+        for _ in range(50):
+            st.record_posterior_nudge(100.0, 0.2)
+        assert st.posterior_std >= std_before - 1e-9, (
+            f"nudges still crush uncertainty: std {std_before:.2f} -> "
+            f"{st.posterior_std:.2f}"
+        )
+
+    def test_nudges_shift_sampled_fee_on_both_paths(self, fake_time):
+        """Audit EXP 5b: 20 nudges toward 100 on an established state shifted
+        the contextual sampled mean by ~0 and the polynomial mean by ~50%.
+        Both paths must now move by at least 30% of the nudge distance."""
+        import copy
+        st, ctx = self._established_state()
+        base = copy.deepcopy(st)
+        nudged = copy.deepcopy(st)
+        for _ in range(20):
+            nudged.record_posterior_nudge(100.0, 0.2)
+
+        for contextual in (False, True):
+            pre = self._mean_sample(copy.deepcopy(base), ctx, contextual)
+            post = self._mean_sample(copy.deepcopy(nudged), ctx, contextual)
+            distance = pre - 100.0
+            assert distance > 50, "test setup: posterior should sit well above 100"
+            shift = pre - post
+            assert shift >= 0.30 * distance, (
+                f"nudges bypassed by {'contextual' if contextual else 'polynomial'} "
+                f"path: mean sample {pre:.0f} -> {post:.0f} "
+                f"(needed >= {0.30 * distance:.0f} of {distance:.0f})"
+            )
+
+    def test_nudge_durability_assertions_still_hold(self, fake_time):
+        """Mean effect persists across recompute + serialization (the existing
+        durability guarantees from test_fee_controller_pending_fixes)."""
+        import copy
+        import json
+        st, _ = self._established_state()
+        control = copy.deepcopy(st)
+        st.record_posterior_nudge(100.0, 0.3)
+        assert st.posterior_mean < control.posterior_mean
+
+        restored = GaussianThompsonState.from_dict(json.loads(json.dumps(st.to_dict())))
+        FakeTime.advance(1.0)
+        restored.update_posterior(fee=300, revenue_rate=20.0, hours=1.0)
+        control.update_posterior(fee=300, revenue_rate=20.0, hours=1.0)
+        assert restored.posterior_mean < control.posterior_mean - 1.0

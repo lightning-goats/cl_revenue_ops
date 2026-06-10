@@ -362,15 +362,24 @@ class GaussianThompsonState:
             # Use prior with extra exploration (clamped to MIN_STD like normal path)
             explore_std = max(self.MIN_STD, self.prior_std_fee * 1.1)
             sampled = random.gauss(self.prior_mean_fee, explore_std)
+            # The prior ignores posterior_mean, so advisory nudges (e.g.
+            # neighbor-median seeding on young channels) must be applied here
+            sampled += self._posterior_bias_shift(sampled)
         else:
             # Try polynomial posterior sampling; fall back to Gaussian
             sampled = self._sample_from_polynomial_posterior(floor, ceiling)
             if sampled is not None:
+                # Polynomial draws come from the regression coefficients and
+                # ignore posterior_mean entirely — apply the durable nudge
+                # shift here so advisory signals reach the sampled fee
+                sampled += self._posterior_bias_shift(sampled)
                 sampled_fee = int(max(floor, min(ceiling, sampled)))
                 self.last_sampled_fee = sampled_fee
                 self.last_sample_time = int(time.time())
                 return sampled_fee
-            # Fallback: sample from Gaussian posterior
+            # Fallback: sample from Gaussian posterior. No extra bias shift:
+            # posterior_mean already carries the nudges via
+            # _apply_posterior_bias after every recompute.
             modulated_std = max(self.MIN_STD, self.posterior_std)
             sampled = random.gauss(self.posterior_mean, modulated_std)
 
@@ -789,17 +798,53 @@ class GaussianThompsonState:
         self._blend_posterior_toward(target_fee, weight)
 
     def _blend_posterior_toward(self, target_fee: float, weight: float) -> None:
-        """Precision-weighted Gaussian blend of the posterior toward a target."""
-        prior_precision = 1.0 / max(self.MIN_STD ** 2, self.posterior_std ** 2)
-        obs_precision = prior_precision * weight
-        total_precision = prior_precision + obs_precision
-        if total_precision <= 0:
+        """
+        Mean-only blend of the posterior toward a target.
+
+        Moves posterior_mean by the same fraction the old precision-weighted
+        blend implied (weight/(1+weight) of the distance), but deliberately
+        leaves posterior_std untouched: nudges are advisory signals, not
+        revenue evidence, so they must never ADD confidence. The previous
+        implementation multiplied precision by (1+weight) per nudge — 50
+        stored nudges crushed std 40 -> 10, and since posterior_std drives
+        the downstream blend ratio, failed-forward storms made the
+        controller MORE confident and faster.
+        """
+        if weight <= 0:
             return
+        frac = weight / (1.0 + weight)
         self.posterior_mean = float(
-            (prior_precision * self.posterior_mean + obs_precision * target_fee)
-            / total_precision
+            self.posterior_mean + (target_fee - self.posterior_mean) * frac
         )
-        self.posterior_std = float(max(self.MIN_STD, (1.0 / total_precision) ** 0.5))
+
+    def _posterior_bias_shift(self, base: float) -> float:
+        """
+        Additive shift the active (time-decayed) nudges imply for a sample.
+
+        The polynomial sampler draws from the regression coefficients and the
+        contextual sampler builds on it — neither reads posterior_mean, so
+        nudges recorded against the Gaussian posterior never reached the fee
+        that was actually sampled. This computes the equivalent mean-shift
+        (the same weight/(1+weight) blend per nudge, applied sequentially)
+        so sample paths can add it to their drawn value before rail clamps.
+        """
+        if not self.posterior_bias:
+            return 0.0
+        now = int(time.time())
+        shifted = float(base)
+        for entry in self.posterior_bias:
+            try:
+                target_fee = float(entry[0])
+                weight = float(entry[1])
+                ts = int(entry[2])
+            except (TypeError, ValueError, IndexError):
+                continue
+            age_hours = max(0.0, (now - ts) / 3600.0)
+            decayed = weight * math.pow(0.5, age_hours / self.BIAS_DECAY_HOURS)
+            if decayed < self.BIAS_MIN_WEIGHT:
+                continue
+            shifted += (target_fee - shifted) * (decayed / (1.0 + decayed))
+        return shifted - float(base)
 
     def _apply_posterior_bias(self) -> None:
         """Re-apply recorded nudges after a posterior rebuild, with decay."""
