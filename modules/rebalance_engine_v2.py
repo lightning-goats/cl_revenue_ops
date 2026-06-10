@@ -19,6 +19,7 @@ from .rebalance_coordination_overlay import (
     build_coordination_overlay,
     merge_coordination_pairs,
     pair_segment_bias_multiplier,
+    suppress_leased_pairs,
 )
 from .rebalance_execution import ExecutionResult
 from .rebalance_native_executor_v2 import NativeRouteExecutor
@@ -28,6 +29,7 @@ from .rebalance_route_policy import (
     RouteDecision,
     RoutePolicy,
     RoutePriority,
+    _entries,
     decide_route_policy,
 )
 from .rebalance_router_v2 import RouteResult
@@ -1051,6 +1053,43 @@ class RebalanceEngine:
                 ]
             plan.selected = hive_equalization.selected
             plan.skipped.extend(hive_equalization.skipped)
+
+        # Fleet leases are fleet-wide de-confliction and must bind every
+        # selection path. build_coordination_overlay already suppresses its
+        # own pairs; planner and equalization pairs are checked here against
+        # the same leases.
+        if plan.selected and self._hive_hints is not None:
+            lease_result = suppress_leased_pairs(
+                plan.selected,
+                leases=_entries(self._hive_hints, "get_route_segment_leases"),
+                our_node_id=self._get_our_id() or "",
+                reason="fleet_lease_held",
+            )
+            plan.selected = lease_result.selected
+            plan.skipped.extend(lease_result.skipped)
+
+        # Net the planner's residual drain demand against the final merged
+        # selection. Overlay/equalization pairs drain sources the planner-
+        # phase pairing reported as unplaceable; leaving those entries in
+        # drain_demand would let the Boltz structural loop-out double-drain
+        # the same channel. Removal (rather than reducing excess_sats) is
+        # simpler and self-corrects next cycle. drain_demand.paired_count and
+        # over_local_count intentionally keep their planner-phase semantics
+        # (sources paired by the planner / source-eligible over-local count).
+        drain_demand = getattr(plan, "drain_demand", None)
+        if drain_demand is not None and plan.selected:
+            claimed_sources = {pair.source_channel_id for pair in plan.selected}
+            kept_entries = [
+                entry
+                for entry in drain_demand.entries
+                if entry.channel_id not in claimed_sources
+            ]
+            if len(kept_entries) != len(drain_demand.entries):
+                drain_demand.entries = kept_entries
+                drain_demand.total_excess_sats = sum(
+                    entry.excess_sats for entry in kept_entries
+                )
+
         for pair in plan.selected:
             self._route_decision_for_pair(pair)
             self._apply_segment_score_bias(pair)

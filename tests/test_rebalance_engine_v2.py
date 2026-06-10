@@ -3220,3 +3220,273 @@ def test_low_merit_coordination_final_score_below_high_merit_planner_pair(
     )
 
     assert plan_decomp["final_score"] > coord_decomp["final_score"]
+
+
+# -----------------------------------------------------------------------------
+# Fleet leases bind every selection path (planner + equalization), not just
+# the coordination overlay.
+# -----------------------------------------------------------------------------
+
+
+def test_fleet_lease_suppresses_matching_planner_pair(mock_plugin, mock_database):
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.config import Config
+    from modules.rebalance_types_v2 import PairCandidate, PlanResult
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "u" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._hive_hints = _OverlayHints(
+        leases=[
+            {
+                "lease_id": "lease-planner",
+                "owner_member_id": "02other",
+                "route_segments": ["300x1x0>400x1x0"],
+            }
+        ]
+    )
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=2,
+            total_remaining_budget_sats=20_000,
+        )
+    )
+
+    planner_pair = PairCandidate(
+        source_channel_id="300x1x0",
+        dest_channel_id="400x1x0",
+        source_peer_id="03" + "3" * 64,
+        dest_peer_id="03" + "4" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        score=1.0,
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner = planner_cls.return_value
+        planner.max_pairs = 5
+        planner.plan.return_value = PlanResult(selected=[planner_pair], skipped=[])
+
+        selected = engine.find_candidates()
+
+    assert selected == []
+    plan = engine._last_cycle_result.plan
+    lease_skips = [s for s in plan.skipped if s.reason == "fleet_lease_held"]
+    assert len(lease_skips) == 1
+    assert "lease-planner" in (lease_skips[0].detail or "")
+    engine.router_v3.price_pair.assert_not_called()
+
+
+def test_fleet_lease_owned_by_us_does_not_suppress_planner_pair(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.config import Config
+    from modules.rebalance_types_v2 import PairCandidate, PlanResult
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    our_id = "03" + "u" * 64
+    mock_plugin.rpc.getinfo.return_value = {"id": our_id}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=1,
+        route=[{"channel": "300x1x0"}],
+        probability_ppm=0,
+        error="",
+    )
+    engine._audit = MagicMock()
+    engine._hive_hints = _OverlayHints(
+        leases=[
+            {
+                "lease_id": "lease-ours",
+                "owner_member_id": our_id,
+                "route_segments": ["300x1x0>400x1x0"],
+            }
+        ]
+    )
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=2,
+            total_remaining_budget_sats=20_000,
+        )
+    )
+
+    planner_pair = PairCandidate(
+        source_channel_id="300x1x0",
+        dest_channel_id="400x1x0",
+        source_peer_id="03" + "3" * 64,
+        dest_peer_id="03" + "4" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        score=1.0,
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner = planner_cls.return_value
+        planner.max_pairs = 5
+        planner.plan.return_value = PlanResult(selected=[planner_pair], skipped=[])
+
+        selected = engine.find_candidates()
+
+    assert len(selected) == 1
+
+
+# -----------------------------------------------------------------------------
+# Drain demand must be net of overlay/equalization claims so Boltz cannot
+# double-drain a source the merged selection already drains.
+# -----------------------------------------------------------------------------
+
+
+def test_equalization_claimed_source_removed_from_drain_demand(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_state_v2 import build_state_snapshot
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._hive_router = MagicMock(name="hive_router")
+    engine._hive_router.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=0,
+        route=[{"channel": "fleet"}],
+        probability_ppm=0,
+        error="",
+    )
+    engine._audit = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=build_state_snapshot(
+            [
+                {
+                    "channel_id": "100x1x0",
+                    "peer_id": "02" + "1" * 64,
+                    "capacity_sats": 1_000_000,
+                    "local_sats": 900_000,
+                    "is_hive_member": True,
+                },
+                {
+                    "channel_id": "200x1x0",
+                    "peer_id": "02" + "2" * 64,
+                    "capacity_sats": 1_000_000,
+                    "local_sats": 100_000,
+                    "is_hive_member": True,
+                },
+            ],
+            {},
+        )
+    )
+
+    selected = engine.find_candidates()
+
+    assert len(selected) == 1
+    assert selected[0].reason_code == "hive_equalization"
+    drain = engine.get_drain_demand()
+    assert drain is not None
+    assert all(e.channel_id != "100x1x0" for e in drain.entries)
+    assert drain.total_excess_sats == sum(e.excess_sats for e in drain.entries)
+
+
+def test_overlay_claimed_source_removed_from_drain_demand(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.config import Config
+    from modules.rebalance_route_policy import (
+        RouteDecision,
+        RoutePolicy,
+        RoutePriority,
+    )
+    from modules.rebalance_types_v2 import (
+        DrainDemand,
+        DrainDemandEntry,
+        PairCandidate,
+        PlanResult,
+    )
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "u" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=1,
+        route=[{"channel": "100x1x0"}],
+        probability_ppm=0,
+        error="",
+    )
+    engine._audit = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=2,
+            total_remaining_budget_sats=20_000,
+        )
+    )
+
+    coordination_pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        score=1.0,
+        reason_code="coordinated_rebalance",
+        coordination_hint_type="recommendation",
+        coordination_hint_id="rec-1",
+        route_decision=RouteDecision(
+            policy=RoutePolicy.MARKET_ONLY,
+            priority=RoutePriority.COORDINATED,
+            reason="coordinated_rebalance",
+        ),
+    )
+    drain_demand = DrainDemand(
+        entries=[
+            DrainDemandEntry(
+                channel_id="100x1x0",
+                peer_id="03" + "b" * 64,
+                excess_sats=250_000,
+                drain_score=0.7,
+            ),
+            DrainDemandEntry(
+                channel_id="500x1x0",
+                peer_id="03" + "e" * 64,
+                excess_sats=100_000,
+                drain_score=0.4,
+            ),
+        ],
+        total_excess_sats=350_000,
+        over_local_count=2,
+        paired_count=0,
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls, patch(
+        "modules.rebalance_engine_v2.build_coordination_overlay"
+    ) as overlay_builder:
+        planner = planner_cls.return_value
+        planner.max_pairs = 5
+        planner.plan.return_value = PlanResult(
+            selected=[], skipped=[], drain_demand=drain_demand
+        )
+        overlay_builder.return_value = PlanResult(
+            selected=[coordination_pair], skipped=[]
+        )
+
+        selected = engine.find_candidates()
+
+    assert len(selected) == 1
+    drain = engine.get_drain_demand()
+    assert drain is not None
+    assert [e.channel_id for e in drain.entries] == ["500x1x0"]
+    assert drain.total_excess_sats == 100_000

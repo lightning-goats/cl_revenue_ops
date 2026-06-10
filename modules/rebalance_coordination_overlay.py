@@ -343,6 +343,7 @@ def suppress_leased_pairs(
     *,
     leases: Iterable[dict],
     our_node_id: str,
+    reason: str = "lease_conflict",
 ) -> PlanResult:
     result = PlanResult()
     normalized_our_id = str(our_node_id or "").strip()
@@ -371,7 +372,7 @@ def suppress_leased_pairs(
         result.skipped.append(
             SkipRecord(
                 channel_id=pair.dest_channel_id,
-                reason="lease_conflict",
+                reason=reason,
                 value_class="valuable",
                 remaining_budget_sats=pair.pair_budget_sats,
                 detail=f"lease_id={conflict.get('lease_id')}",
