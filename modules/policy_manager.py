@@ -1086,14 +1086,27 @@ class PolicyManager:
                             applied += 1
                 elif corridor_role == "owner":
                     # Corridor owners: DYNAMIC + protected
-                    if not (current.tags and "corridor_owner" in current.tags):
-                        self.set_policy(
-                            peer_id,
-                            strategy=FeeStrategy.DYNAMIC.value,
-                            rebalance_mode=RebalanceMode.ENABLED.value,
-                            tags=["corridor_owner", "auto_corridor"],
-                        )
-                        applied += 1
+                    current_tags = set(current.tags or [])
+                    if "corridor_owner" in current_tags:
+                        continue
+                    # get_policy returns a default (updated_at=0) when no
+                    # policy is stored; only a stored policy can be operator-owned.
+                    has_stored_policy = int(current.updated_at or 0) > 0
+                    if has_stored_policy and "auto_corridor" not in current_tags:
+                        # A stored policy this automation didn't create is
+                        # operator-owned. set_policy replaces tags and modes,
+                        # so writing here would wipe protect/no_close tags and
+                        # re-enable fees/rebalancing the operator disabled.
+                        # Corridor role comes from hive hints (external input)
+                        # and must never override local policy.
+                        continue
+                    self.set_policy(
+                        peer_id,
+                        strategy=FeeStrategy.DYNAMIC.value,
+                        rebalance_mode=RebalanceMode.ENABLED.value,
+                        tags=["corridor_owner", "auto_corridor"],
+                    )
+                    applied += 1
 
         except Exception as e:
             self.plugin.log(f"PolicyManager: Corridor policy error: {e}", level='warn')

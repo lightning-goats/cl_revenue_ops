@@ -280,6 +280,93 @@ class TestCorridorAutoPolicies:
         mock_database.delete_policy.assert_called_once_with(peer_id)
         mock_database.set_policy.assert_not_called()
 
+    def _corridor_pm(self, mock_database, mock_plugin, peer_id):
+        pm = PolicyManager(mock_database, mock_plugin)
+        pm.hive_hints = MagicMock()
+        pm.hive_hints.is_hive_member.return_value = False
+        pm.hive_hints.get_corridor_role.return_value = "owner"
+        pm.data_service = MagicMock()
+        pm.data_service.get_peer_channels.return_value = {
+            "channels": [{"peer_id": peer_id, "state": "CHANNELD_NORMAL"}]
+        }
+        return pm
+
+    def test_corridor_owner_applied_to_peer_without_policy(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        peer_id = sample_peer_ids[0]
+        pm = self._corridor_pm(mock_database, mock_plugin, peer_id)
+
+        applied = pm.apply_corridor_policies()
+
+        assert applied == 1
+        policy = pm.get_policy(peer_id)
+        assert "corridor_owner" in policy.tags
+        assert "auto_corridor" in policy.tags
+
+    def test_corridor_owner_never_clobbers_operator_policy(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """Hint-driven automation must not overwrite policies it didn't create.
+
+        Operator protections (protect/no_close tags, static strategy,
+        disabled rebalancing) were being wiped every fee cycle because
+        set_policy replaces tags and the only guard was the literal
+        'manual' tag, which no operator surface adds.
+        """
+        peer_id = sample_peer_ids[0]
+        pm = self._corridor_pm(mock_database, mock_plugin, peer_id)
+        pm.set_policy(
+            peer_id,
+            strategy="static",
+            fee_ppm_target=250,
+            rebalance_mode="disabled",
+            tags=["protect", "no_close"],
+        )
+        mock_database.set_policy.reset_mock()
+
+        applied = pm.apply_corridor_policies()
+
+        assert applied == 0
+        policy = pm.get_policy(peer_id)
+        assert policy.tags == ["protect", "no_close"]
+        assert policy.strategy == FeeStrategy.STATIC
+        assert policy.rebalance_mode == RebalanceMode.DISABLED
+        assert policy.fee_ppm_target == 250
+        mock_database.set_policy.assert_not_called()
+
+    def test_corridor_owner_refreshes_its_own_auto_policy(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """Policies previously created by this automation may be updated."""
+        peer_id = sample_peer_ids[0]
+        pm = self._corridor_pm(mock_database, mock_plugin, peer_id)
+        pm.set_policy(peer_id, strategy="dynamic", tags=["auto_corridor"])
+        mock_database.set_policy.reset_mock()
+
+        applied = pm.apply_corridor_policies()
+
+        assert applied == 1
+        policy = pm.get_policy(peer_id)
+        assert "corridor_owner" in policy.tags
+
+    def test_corridor_owner_existing_corridor_policy_untouched(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        peer_id = sample_peer_ids[0]
+        pm = self._corridor_pm(mock_database, mock_plugin, peer_id)
+        pm.set_policy(
+            peer_id,
+            strategy="dynamic",
+            tags=["corridor_owner", "auto_corridor"],
+        )
+        mock_database.set_policy.reset_mock()
+
+        applied = pm.apply_corridor_policies()
+
+        assert applied == 0
+        mock_database.set_policy.assert_not_called()
+
 
 class TestRateLimiting:
     """Test policy change rate limiting."""
