@@ -39,3 +39,56 @@ def test_plugin_options_registered():
         "revenue-ops-drain-fee-discount-max",
     ):
         assert name in mod.plugin.options, name
+
+
+def _channels_info(entries):
+    """entries: list of (spendable_sats, receivable_sats)."""
+    return {
+        f"{i}x1x0": {
+            "peer_id": "02" + ("%02d" % i) * 33,
+            "spendable_msat": s * 1000,
+            "receivable_msat": r * 1000,
+            "capacity": s + r,
+        }
+        for i, (s, r) in enumerate(entries, start=100)
+    }
+
+
+def _scarcity_module(entries):
+    mod = load_plugin_module()
+    mod.plugin.log = MagicMock()
+    mod.fee_controller = MagicMock()
+    mod.fee_controller._get_channels_info.return_value = _channels_info(entries)
+    from modules.config import Config
+    mod.config = Config()
+    return mod
+
+
+def test_receivable_status_starved_node():
+    # 97% local everywhere => receivable_ratio 0.03, fully starved
+    mod = _scarcity_module([(970_000, 30_000)] * 4)
+    status = mod._node_receivable_status()
+    assert status["receivable_ratio"] == pytest.approx(0.03, abs=0.001)
+    assert status["scarcity"] == pytest.approx(1.0)  # clamped at floor
+
+
+def test_receivable_status_healthy_node():
+    mod = _scarcity_module([(500_000, 500_000)] * 4)
+    status = mod._node_receivable_status()
+    assert status["receivable_ratio"] == pytest.approx(0.5, abs=0.001)
+    assert status["scarcity"] == 0.0
+
+
+def test_receivable_status_scales_between_floor_and_target():
+    # ratio 0.25 sits halfway between floor 0.20 and target 0.30
+    mod = _scarcity_module([(750_000, 250_000)] * 4)
+    status = mod._node_receivable_status()
+    assert status["scarcity"] == pytest.approx(0.5, abs=0.01)
+
+
+def test_receivable_status_safe_on_error():
+    mod = _scarcity_module([])
+    mod.fee_controller._get_channels_info.side_effect = RuntimeError("boom")
+    status = mod._node_receivable_status()
+    assert status == {"receivable_ratio": None, "scarcity": 0.0,
+                      "total_capacity_sats": 0, "total_receivable_sats": 0}

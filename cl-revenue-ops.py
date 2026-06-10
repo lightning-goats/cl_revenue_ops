@@ -2618,6 +2618,7 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
                 "budget_blocked": False,
             }
         ),
+        "receivable": _node_receivable_status(),
         "channel_states": channel_states,
         "recent_fee_changes": fee_history,
         "recent_rebalances": rebalance_history,
@@ -6220,6 +6221,47 @@ def _open_close_cost_visibility(generic_ledger: Dict[str, Any], open_cost_sats: 
         "excluded_open_close_spend_sats": int(excluded.get("channel_open", 0) or 0) + int(excluded.get("channel_close", 0) or 0),
         "reserved_open_close_sats": int(reserved.get("channel_open", 0) or 0) + int(reserved.get("channel_close", 0) or 0),
     }
+
+
+def _node_receivable_status() -> Dict[str, Any]:
+    """Node-level inbound-capacity objective.
+
+    scarcity is 0.0 at/above receivable_ratio_target, 1.0 at/below
+    receivable_ratio_floor, linear in between. Errors neutralize to
+    scarcity 0.0 so a telemetry failure can never enable spending.
+    """
+    safe = {"receivable_ratio": None, "scarcity": 0.0,
+            "total_capacity_sats": 0, "total_receivable_sats": 0}
+    if fee_controller is None or config is None:
+        return safe
+    try:
+        channels = fee_controller._get_channels_info()
+        total_cap = 0
+        total_recv = 0
+        for ch in channels.values():
+            spend = parse_msat(ch.get("spendable_msat", 0)) // 1000
+            recv = parse_msat(ch.get("receivable_msat", 0)) // 1000
+            total_cap += spend + recv
+            total_recv += recv
+        if total_cap <= 0:
+            return safe
+        ratio = total_recv / total_cap
+        floor = float(getattr(config, "receivable_ratio_floor", 0.20))
+        target = float(getattr(config, "receivable_ratio_target", 0.30))
+        if ratio >= target:
+            scarcity = 0.0
+        elif ratio <= floor:
+            scarcity = 1.0
+        else:
+            scarcity = (target - ratio) / max(1e-9, target - floor)
+        return {
+            "receivable_ratio": round(ratio, 4),
+            "scarcity": round(scarcity, 4),
+            "total_capacity_sats": total_cap,
+            "total_receivable_sats": total_recv,
+        }
+    except Exception:
+        return safe
 
 
 # Memoization for _total_cost_budget_status: the status is advisory (budgets are
