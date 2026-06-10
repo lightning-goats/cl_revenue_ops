@@ -6533,6 +6533,14 @@ def _build_boltz_balance_plan(
             if rebal_success.get("total", 0) >= 3 and rebal_success.get("success_rate", 1.0) == 0.0:
                 rebalance_impossible = True
 
+        # Hive hints: rebalance preference and peer quality (via bounded bias)
+        hive_rebal_bias = 1.0
+        if hive_hints is not None:
+            try:
+                hive_rebal_bias = hive_hints.get_rebalance_bias(peer_id)
+            except Exception:
+                pass
+
         # Predicted depletion hours from Kalman velocity
         predicted_depletion_hours = None
         kalman_velocity = float(state_row.get('kalman_velocity', 0.0) or 0.0)
