@@ -34,6 +34,11 @@ TTL_MEDIUM = 30        # 30 seconds
 class DataService:
     """Unified data access layer with tiered RPC caching."""
 
+    # Maximum entries in the TTL cache. Keys (per-peer listchannels,
+    # listnodes, full listpeerchannels payloads, ...) are unbounded over the
+    # process lifetime without a cap; oldest entries are evicted first.
+    _CACHE_MAX_ENTRIES = 256
+
     def __init__(self, plugin):
         """
         Args:
@@ -51,17 +56,37 @@ class DataService:
     # ------------------------------------------------------------------
 
     def _get_cached(self, key: str, ttl: int = TTL_MEDIUM) -> Optional[Any]:
-        """Return cached value if fresh, None otherwise."""
+        """Return cached value if fresh, None otherwise.
+
+        Stale entries are deleted on read so expired payloads (which can be
+        large, e.g. full listpeerchannels results) don't linger for the
+        process lifetime.
+        """
         with self._lock:
             entry = self._cache.get(key)
-            if entry and (time.time() - entry["ts"]) < ttl:
+            if entry is None:
+                return None
+            if (time.time() - entry["ts"]) < ttl:
                 return entry["value"]
+            # Expired — evict so memory is reclaimed immediately
+            del self._cache[key]
         return None
 
     def _set_cached(self, key: str, value: Any) -> None:
-        """Store value in cache with current timestamp."""
+        """Store value in cache with current timestamp.
+
+        Enforces _CACHE_MAX_ENTRIES by evicting the oldest entries (by
+        timestamp) when the cap is exceeded, keeping the cache bounded.
+        """
         with self._lock:
             self._cache[key] = {"value": value, "ts": time.time()}
+            if len(self._cache) > self._CACHE_MAX_ENTRIES:
+                excess = len(self._cache) - self._CACHE_MAX_ENTRIES
+                oldest = sorted(
+                    self._cache.items(), key=lambda kv: kv[1]["ts"]
+                )[:excess]
+                for stale_key, _ in oldest:
+                    del self._cache[stale_key]
 
     def invalidate(self, key: str = None) -> None:
         """Invalidate a specific key or all non-forever cache entries."""

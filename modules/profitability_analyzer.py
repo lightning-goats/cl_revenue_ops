@@ -568,13 +568,25 @@ class ChannelProfitabilityAnalyzer:
             # Batch fetch all revenue data with a single RPC call
             all_revenue_data = self._get_all_revenue_data()
 
+            # PERF: prefetch per-run batch data once instead of N per-channel
+            # queries inside analyze_channel (30d P&L + fee strategy states).
+            # Both helpers return None when batch data is unavailable, in
+            # which case analyze_channel falls back to per-channel queries.
+            all_pnl_30d = self._get_all_full_pnl_batch(30)
+            all_fee_states = self._get_all_fee_states()
+
             for channel_id, channel_info in channels.items():
                 # Pass precalculated revenue to avoid per-channel RPC calls
                 precalculated_revenue = all_revenue_data.get(channel_id)
                 profitability = self.analyze_channel(
                     channel_id, channel_info,
                     precalculated_revenue=precalculated_revenue,
-                    bkpr_cache=bkpr_cache
+                    bkpr_cache=bkpr_cache,
+                    precalculated_pnl_30d=(
+                        all_pnl_30d.get(channel_id)
+                        if all_pnl_30d is not None else None
+                    ),
+                    fee_states=all_fee_states
                 )
                 if profitability:
                     results[channel_id] = profitability
@@ -656,16 +668,24 @@ class ChannelProfitabilityAnalyzer:
     def analyze_channel(self, channel_id: str,
                        channel_info: Optional[Dict] = None,
                        precalculated_revenue: Optional[ChannelRevenue] = None,
-                       bkpr_cache: Optional['BookkeeperCache'] = None) -> Optional[ChannelProfitability]:
+                       bkpr_cache: Optional['BookkeeperCache'] = None,
+                       precalculated_pnl_30d: Optional[Dict[str, Any]] = None,
+                       fee_states: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[ChannelProfitability]:
         """
         Analyze profitability for a single channel.
-        
+
         Args:
             channel_id: Channel to analyze
             channel_info: Optional channel info (fetched if not provided)
             precalculated_revenue: Optional pre-fetched revenue data to avoid
                                    per-channel RPC calls when batch processing
-            
+            precalculated_pnl_30d: Optional pre-fetched 30-day full P&L dict
+                                   (same shape as Database.get_channel_full_pnl)
+                                   to avoid per-channel DB queries when batching
+            fee_states: Optional pre-fetched fee strategy states keyed by
+                        channel_id (from get_all_fee_strategy_states); when
+                        None, _classify_channel queries per channel
+
         Returns:
             ChannelProfitability object or None if analysis fails
         """
@@ -735,7 +755,11 @@ class ChannelProfitabilityAnalyzer:
             last_routed = self._get_last_routing_time(channel_id)
 
             # 30-day trailing P&L for marginal ROI
-            pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days=30)
+            # PERF: use the prefetched batch row when available; fall back to
+            # the per-channel query (identical shape) otherwise.
+            pnl_30d = precalculated_pnl_30d
+            if pnl_30d is None:
+                pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days=30)
             contribution_30d_msat = pnl_30d.get('total_contribution_msat', 0)
             rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
             rebalance_cost_30d_msat = int(
@@ -752,6 +776,7 @@ class ChannelProfitabilityAnalyzer:
                 channel_id=channel_id,
                 peer_id=peer_id,
                 forward_count=revenue.total_forward_count,
+                fee_states=fee_states,
             )
 
             profitability = ChannelProfitability(
@@ -1408,10 +1433,17 @@ class ChannelProfitabilityAnalyzer:
             # Get all active channels
             channels = self._get_all_channels()
 
+            # PERF: one batch query instead of one per channel; per-channel
+            # fallback preserves behavior when the batch method is unavailable
+            # or a channel is missing from the batch result.
+            all_pnl = self._get_all_full_pnl_batch(window_days)
+
             for channel_id, info in channels.items():
                 try:
                     # Get FULL P&L including inbound contribution
-                    pnl = self.database.get_channel_full_pnl(channel_id, window_days)
+                    pnl = all_pnl.get(channel_id) if all_pnl is not None else None
+                    if pnl is None:
+                        pnl = self.database.get_channel_full_pnl(channel_id, window_days)
 
                     # Total activity = exit forwards + sourced forwards
                     total_activity = pnl.get('direct_forward_count', 0) + pnl.get('sourced_forward_count', 0)
@@ -1489,15 +1521,25 @@ class ChannelProfitabilityAnalyzer:
             # Get all active channels
             channels = self._get_all_channels()
 
+            # PERF: two batch queries (30d + 7d windows) instead of two per
+            # channel; per-channel fallback preserves behavior when the batch
+            # method is unavailable or a channel is missing from the result.
+            all_pnl_30d = self._get_all_full_pnl_batch(window_days)
+            all_pnl_7d = self._get_all_full_pnl_batch(7)
+
             for channel_id, info in channels.items():
                 try:
                     peer_id = info.get('peer_id', '')
 
                     # Get 30-day P&L
-                    pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days)
+                    pnl_30d = all_pnl_30d.get(channel_id) if all_pnl_30d is not None else None
+                    if pnl_30d is None:
+                        pnl_30d = self.database.get_channel_full_pnl(channel_id, window_days)
 
                     # Get 7-day P&L for soft bleeder detection
-                    pnl_7d = self.database.get_channel_full_pnl(channel_id, 7)
+                    pnl_7d = all_pnl_7d.get(channel_id) if all_pnl_7d is not None else None
+                    if pnl_7d is None:
+                        pnl_7d = self.database.get_channel_full_pnl(channel_id, 7)
 
                     # Extract metrics
                     rebalance_cost_30d = pnl_30d.get('rebalance_cost_sats', 0)
@@ -1819,10 +1861,30 @@ class ChannelProfitabilityAnalyzer:
         """
         # Rebalance costs from database (records all rebalance attempts)
         rebalance_costs = self.database.get_channel_rebalance_costs(channel_id)
-        
-        # Determine open cost
+
+        # Determine open cost.
+        # PERF: fetch the full channel_costs row once — it provides both the
+        # cached open cost and opened_at, letting the refresh write at the end
+        # of this method be skipped when nothing changed (previously an
+        # unconditional INSERT OR REPLACE per channel per analysis pass).
+        db_cost_row: Optional[Dict[str, Any]] = None
+        db_cost_row_known = False
+        row_fn = getattr(self.database, "get_channel_cost", None)
+        if callable(row_fn):
+            try:
+                row = row_fn(channel_id)
+                if row is None or isinstance(row, dict):
+                    db_cost_row = row
+                    db_cost_row_known = True
+            except Exception:
+                pass
+
         open_cost = None
-        db_open_cost = self.database.get_channel_open_cost(channel_id)
+        if db_cost_row_known:
+            db_open_cost = db_cost_row.get("open_cost_sats") if db_cost_row else None
+        else:
+            # Fallback (e.g. database layer without get_channel_cost)
+            db_open_cost = self.database.get_channel_open_cost(channel_id)
 
         if opener == 'remote':
             # Remote opener pays the fees -> Cost to us is 0
@@ -1894,13 +1956,26 @@ class ChannelProfitabilityAnalyzer:
                 )
 
         # Ensure opened_at timestamp is correct for budget windowing.
-        # Previous bug stored opened_at=now for all channels on first run;
-        # re-write with the actual open_timestamp on every analysis pass.
+        # Previous bug stored opened_at=now for all channels on first run.
+        # PERF: skip the INSERT OR REPLACE when the stored row already matches
+        # (cost, opened_at, peer, capacity) — in steady state this removes one
+        # write transaction per channel per analysis pass (~10k writes/day at
+        # 100 channels). Falls back to the unconditional write when the full
+        # row could not be read (db_cost_row_known is False).
         if open_timestamp is not None and open_cost is not None:
-            self.database.record_channel_open_cost(
-                channel_id, peer_id, open_cost, capacity_sats,
-                timestamp=open_timestamp
+            row_matches = (
+                db_cost_row_known
+                and db_cost_row is not None
+                and db_cost_row.get("open_cost_sats") == open_cost
+                and db_cost_row.get("opened_at") == open_timestamp
+                and db_cost_row.get("peer_id") == peer_id
+                and db_cost_row.get("capacity_sats") == capacity_sats
             )
+            if not row_matches:
+                self.database.record_channel_open_cost(
+                    channel_id, peer_id, open_cost, capacity_sats,
+                    timestamp=open_timestamp
+                )
 
         # Success-rate-adjusted effective cost
         # Estimate 30-day costs from success_data (avg_cost_ppm * avg_amount * successes),
@@ -2315,13 +2390,71 @@ class ChannelProfitabilityAnalyzer:
             return self.database.get_last_forward_time_any_direction(channel_id)
         except Exception:
             return None
-    
+
+    def _get_all_full_pnl_batch(self, window_days: int) -> Optional[Dict[str, Dict[str, Any]]]:
+        """
+        Batch-fetch full P&L for all channels when the DB layer offers it.
+
+        Uses Database.get_all_channels_full_pnl(window_days) which returns
+        Dict[channel_id, dict] with rows shaped exactly like
+        get_channel_full_pnl's return value.
+
+        Returns:
+            Dict mapping channel_id to full-P&L dict, or None when the batch
+            method is unavailable (or returned an unexpected shape) so callers
+            fall back to per-channel get_channel_full_pnl queries.
+        """
+        batch_fn = getattr(self.database, "get_all_channels_full_pnl", None)
+        if not callable(batch_fn):
+            return None
+        try:
+            result = batch_fn(window_days)
+        except Exception as e:
+            self.plugin.log(
+                f"Batch full-P&L fetch failed ({e}); falling back to "
+                f"per-channel queries", level='debug'
+            )
+            return None
+        # Shape guard: mocks or partial implementations may return non-dicts
+        return result if isinstance(result, dict) else None
+
+    def _get_all_fee_states(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """
+        Prefetch all fee strategy states in one query for classification.
+
+        Returns:
+            Dict keyed by the row's channel_id (exact-match semantics, same
+            as get_fee_strategy_state's WHERE clause), or None when the data
+            is unavailable so _classify_channel falls back to per-channel
+            queries.
+        """
+        try:
+            rows = self.database.get_all_fee_strategy_states()
+        except Exception:
+            return None
+        if not isinstance(rows, list):
+            return None
+        states: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            if isinstance(row, dict) and row.get('channel_id'):
+                states[row['channel_id']] = row
+        return states
+
+
     def _classify_channel(self, roi: float, net_profit: int,
                          last_routed: Optional[int], days_open: int,
                          channel_id: Optional[str] = None,
                          peer_id: Optional[str] = None,
-                         forward_count: int = 0) -> ProfitabilityClass:
-        """Classify a channel based on profitability metrics."""
+                         forward_count: int = 0,
+                         fee_states: Optional[Dict[str, Dict[str, Any]]] = None) -> ProfitabilityClass:
+        """Classify a channel based on profitability metrics.
+
+        Args:
+            fee_states: Optional prefetched fee strategy states keyed by
+                channel_id. When provided, avoids a per-channel DB query; a
+                missing key behaves like the per-channel default state (no
+                threshold widening).
+        """
         
         # Check for inactivity
         if last_routed:
@@ -2371,7 +2504,13 @@ class ChannelProfitabilityAnalyzer:
         underwater_thresh = self.UNDERWATER_ROI_THRESHOLD
         if channel_id:
             try:
-                fee_state = self.database.get_fee_strategy_state(channel_id)
+                if fee_states is not None:
+                    # PERF: prefetched batch — missing key means no stored
+                    # state, equivalent to the per-channel default (variance
+                    # defaults to 10000, so no widening occurs either way).
+                    fee_state = fee_states.get(channel_id)
+                else:
+                    fee_state = self.database.get_fee_strategy_state(channel_id)
                 if fee_state:
                     v2_json = fee_state.get('v2_state_json', '{}') or '{}'
                     v2_data = json.loads(v2_json) if isinstance(v2_json, str) else v2_json

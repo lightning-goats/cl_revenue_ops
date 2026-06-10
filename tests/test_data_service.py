@@ -88,6 +88,56 @@ class TestCacheInfrastructure:
         assert errors == []
 
 
+class TestCacheEviction:
+    """Stale-entry deletion and bounded cache size."""
+
+    def test_stale_entry_deleted_on_read(self):
+        """An expired entry is removed from the cache dict, not just skipped."""
+        from modules.data_service import DataService
+        ds = DataService(_make_mock_plugin())
+        ds._set_cached("stale_key", {"big": "payload"})
+        ds._cache["stale_key"]["ts"] -= 60
+        assert ds._get_cached("stale_key", ttl=30) is None
+        assert "stale_key" not in ds._cache
+
+    def test_fresh_entry_not_deleted_on_read(self):
+        from modules.data_service import DataService
+        ds = DataService(_make_mock_plugin())
+        ds._set_cached("fresh_key", "v")
+        assert ds._get_cached("fresh_key", ttl=30) == "v"
+        assert "fresh_key" in ds._cache
+
+    def test_cache_size_cap_enforced(self):
+        """Cache never grows beyond _CACHE_MAX_ENTRIES."""
+        from modules.data_service import DataService
+        ds = DataService(_make_mock_plugin())
+        for i in range(ds._CACHE_MAX_ENTRIES + 44):
+            ds._set_cached(f"key_{i}", i)
+        assert len(ds._cache) == ds._CACHE_MAX_ENTRIES
+
+    def test_oldest_entries_evicted_first(self):
+        """Eviction removes oldest-by-timestamp entries, keeps newest."""
+        from modules.data_service import DataService
+        ds = DataService(_make_mock_plugin())
+        total = ds._CACHE_MAX_ENTRIES + 44
+        for i in range(total):
+            ds._set_cached(f"key_{i}", i)
+        # Newest survives, oldest evicted
+        assert f"key_{total - 1}" in ds._cache
+        assert "key_0" not in ds._cache
+        assert ds._get_cached(f"key_{total - 1}", ttl=300) == total - 1
+
+    def test_overwriting_same_key_does_not_evict(self):
+        """Repeated writes to one key never trigger eviction of others."""
+        from modules.data_service import DataService
+        ds = DataService(_make_mock_plugin())
+        ds._set_cached("other", "x")
+        for i in range(ds._CACHE_MAX_ENTRIES * 2):
+            ds._set_cached("hot_key", i)
+        assert ds._get_cached("other", ttl=300) == "x"
+        assert len(ds._cache) == 2
+
+
 class TestForeverTier:
     """Forever-cached values: node_id, network, alias, configs."""
 
