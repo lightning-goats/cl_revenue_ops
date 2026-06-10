@@ -1851,6 +1851,11 @@ class ChannelCycleState:
     forward_count_since_update: int = 0  # Number of forwards since last fee change
     last_volume_sats: int = 0  # Volume during last period
 
+    # P1: congestion episode tracker. True while the channel is inside a
+    # congestion episode; the first congested cycle (False -> True edge) may
+    # take one undamped step to the congestion cap, later cycles are damped.
+    congestion_active: bool = False
+
     # Gossip refresh tracking
     last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
 
@@ -2138,6 +2143,25 @@ class FeeController:
     # realized cost data for the per-ppm estimate to be meaningful.
     REBALANCE_FLOOR_MIN_SAMPLES = 4
     REBALANCE_FLOOR_WINDOW_DAYS = 30
+
+    # ==========================================================================
+    # P1 fix (2026-06-10): bounded, damped congestion response
+    # ==========================================================================
+    # The old congestion branch jumped straight to the global ceiling (50 ->
+    # 5000 ppm in one cycle), bypassed blend/delta damping via the decision-
+    # category change, and skipped the posterior update entirely. The
+    # emergency target is now capped per cycle at
+    #   min(ceiling, max(current * CONGESTION_FEE_MAX_MULTIPLIER,
+    #                    current + CONGESTION_FEE_MIN_HEADROOM_PPM))
+    # Only the FIRST cycle of a congestion episode (cycle.congestion_active
+    # edge) may take an undamped step to that cap; subsequent congested
+    # cycles ride the normal blend/delta-cap path with a raised congestion
+    # floor (current * CONGESTION_FLOOR_MULTIPLIER). Invariants: the per-
+    # cycle congestion step is bounded, and the window's observation always
+    # reaches the posterior before the congestion target is applied.
+    CONGESTION_FEE_MAX_MULTIPLIER = 2.0
+    CONGESTION_FEE_MIN_HEADROOM_PPM = 250
+    CONGESTION_FLOOR_MULTIPLIER = 1.5
 
     # ==========================================================================
     # P8 fix (2026-06-10): Vegas spike wake-up for sleeping channels
@@ -3473,6 +3497,7 @@ class FeeController:
             "last_state": state.last_state,
             "forward_count_since_update": state.forward_count_since_update,
             "last_volume_sats": state.last_volume_sats,
+            "congestion_active": bool(state.congestion_active),
             "last_gossip_refresh": state.last_gossip_refresh,
             "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
         }
@@ -5257,11 +5282,91 @@ class FeeController:
         volatility_reset = False
 
         # Priority 1: Congestion (Emergency High Fee)
+        # P1 fix (2026-06-10): bounded + damped, observation always recorded.
+        # See CONGESTION_FEE_* constants for the invariants.
+        if not is_congested and cycle.congestion_active:
+            # Episode over — re-arm the one-shot fast step for the next one.
+            cycle.congestion_active = False
+
         if is_congested:
-            new_fee_ppm = ceiling_ppm
             decision_reason = "CONGESTION"
-            new_direction = cycle.trend_direction
-            step_ppm = cycle.step_ppm
+
+            # (c) ALWAYS feed this window's observation into the posterior
+            # before applying the congestion target. Congested windows are the
+            # busiest channels at their most informative moments; the old
+            # branch skipped update_posterior entirely, starving DTS exactly
+            # where the revenue curve matters most. The raw (not demand-
+            # normalized) rate is recorded: congestion IS the demand signal.
+            ts_state = self._get_channel_fee_state(
+                channel_id, peer_id, actual_fee_ppm=raw_chain_fee
+            )
+            if raw_chain_fee > 0:  # P7: 0-fee windows carry no curve info
+                _, congestion_time_bucket, _ = self._get_context_with_values(
+                    channel_id, peer_id, outbound_ratio, flow_state=flow_state
+                )
+                ts_state.thompson.update_posterior(
+                    fee=raw_chain_fee,
+                    revenue_rate=current_revenue_rate,
+                    hours=hours_elapsed,
+                    time_bucket=congestion_time_bucket,
+                )
+
+            # (a) Emergency target capped per cycle — a strong fast response
+            # without the old 50 -> 5000 ceiling cliff.
+            congestion_cap_ppm = min(
+                ceiling_ppm,
+                max(
+                    int(current_fee_ppm * self.CONGESTION_FEE_MAX_MULTIPLIER),
+                    current_fee_ppm + self.CONGESTION_FEE_MIN_HEADROOM_PPM,
+                ),
+            )
+
+            first_trip = not cycle.congestion_active
+            cycle.congestion_active = True
+
+            if first_trip:
+                # One undamped step up to the cap when congestion FIRST trips.
+                new_fee_ppm = max(floor_ppm, min(ceiling_ppm, congestion_cap_ppm))
+                bounded_target_ppm = new_fee_ppm
+                applied_target_ppm = new_fee_ppm
+            else:
+                # (b) Damped follow-up through the normal blend/delta-cap
+                # path. The congestion floor keeps the response strong while
+                # the blend and per-cycle delta cap bound each move.
+                congestion_floor_ppm = max(
+                    floor_ppm,
+                    min(
+                        int(current_fee_ppm * self.CONGESTION_FLOOR_MULTIPLIER),
+                        congestion_cap_ppm,
+                    ),
+                )
+                floor_ppm = congestion_floor_ppm
+                if floor_ppm >= ceiling_ppm:
+                    ceiling_ppm = floor_ppm + 10
+                bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, congestion_cap_ppm))
+                blended_target_ppm, blend_info = self._blend_fee_target(
+                    current_fee_ppm=current_fee_ppm,
+                    bounded_target_ppm=bounded_target_ppm,
+                    woke_from_sleep=woke_from_sleep,
+                    sparse_data_conservative=False,
+                    posterior_std=ts_state.thompson.posterior_std,
+                    cfg=cfg,
+                )
+                target_blend_ratio = blend_info["blend_ratio"]
+                new_fee_ppm, damping_info = self._apply_damped_fee_target(
+                    current_fee_ppm=current_fee_ppm,
+                    target_fee_ppm=blended_target_ppm,
+                    woke_from_sleep=woke_from_sleep,
+                    cfg=cfg,
+                )
+                applied_target_ppm = new_fee_ppm
+                delta_cap_reason = damping_info["cap_reason"]
+                delta_cap_ppm = damping_info["max_delta_ppm"]
+                delta_cap_applied = damping_info["cap_applied"]
+
+            new_direction = 1 if new_fee_ppm > current_fee_ppm else (-1 if new_fee_ppm < current_fee_ppm else 0)
+            step_ppm = abs(new_fee_ppm - current_fee_ppm)
+            original_step_ppm = step_ppm
             volatility_reset = False
             rate_change = 0.0
             previous_rate = cycle.last_revenue_rate
@@ -6153,7 +6258,7 @@ class FeeController:
             f"{marginal_roi_info}"
         )
         if decision_reason == "CONGESTION":
-            reason = f"CONGESTION: ceiling override active, {common_reason_suffix}"
+            reason = f"CONGESTION: bounded emergency override active, {common_reason_suffix}"
         elif decision_reason in (
             "LOW_FEE_EXPLORATION",
             "LOW_FEE_EXPLORATION_SUCCESS",
@@ -7153,6 +7258,7 @@ class FeeController:
             last_state=cycle_data.get("last_state", "balanced"),
             forward_count_since_update=cycle_data.get("forward_count_since_update", 0),
             last_volume_sats=cycle_data.get("last_volume_sats", 0),
+            congestion_active=bool(cycle_data.get("congestion_active", False)),
             last_gossip_refresh=cycle_data.get("last_gossip_refresh", 0),
             dynamic_htlcmin_baseline_msat=cycle_data.get("dynamic_htlcmin_baseline_msat"),
         )

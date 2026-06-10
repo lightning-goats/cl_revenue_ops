@@ -497,3 +497,155 @@ class TestVegasSpikeWake:
 
         # 10x spike -> intensity 1.0 -> armed crossing must have fired
         fc.wake_all_sleeping_channels.assert_called_once()
+
+
+# =============================================================================
+# P1: bounded, damped congestion response that still feeds the posterior
+# =============================================================================
+
+class TestCongestionDamping:
+
+    def _congested_state(self):
+        return {"state": "congested", "forward_count": 50,
+                "kalman_flow_ratio": 0.5, "kalman_velocity": 0.0}
+
+    def test_first_trip_step_bounded_by_cap(self, mock_plugin, mock_database):
+        """First congested cycle: one fast step to min(ceiling,
+        max(2x current, current+250)) — NOT the 50->5000 ceiling cliff."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, self._congested_state(),
+            _channel_info(100), cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.reason_code == FeeReasonCode.CONGESTION.value
+        # cap = min(5000, max(200, 350)) = 350
+        assert result.new_fee_ppm == 350
+        assert result.new_fee_ppm < cfg.max_fee_ppm
+
+    def test_congestion_records_posterior_observation(self, mock_plugin, mock_database):
+        """The congested window's observation must reach the posterior."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=100)
+        before = len(ts_state.thompson.observations)
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, self._congested_state(),
+            _channel_info(100), cfg=cfg,
+        )
+
+        assert result is not None
+        after = len(ts_state.thompson.observations)
+        assert after == before + 1, "congestion cycle must add an observation"
+        assert ts_state.thompson.observations[-1][0] == 100, \
+            "observation must be attributed to the true chain fee"
+
+    def test_zero_fee_congestion_skips_observation_but_still_prices(self, mock_plugin, mock_database):
+        """P7 guard holds inside the congestion branch too."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 0}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=0)
+        before = len(ts_state.thompson.observations)
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, self._congested_state(),
+            _channel_info(0), cfg=cfg,
+        )
+
+        assert result is not None
+        assert len(ts_state.thompson.observations) == before
+        assert result.new_fee_ppm > 0
+
+    def test_second_congested_cycle_is_damped(self, mock_plugin, mock_database):
+        """While the episode persists, follow-up moves ride the normal
+        blend/delta-cap path (with the congestion floor)."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=100)
+        ts_state.thompson.update_posterior = lambda *a, **k: None  # determinism
+        ts_state.thompson.posterior_std = 250.0  # blend ratio 0.20
+
+        r1 = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, self._congested_state(),
+            _channel_info(100), cfg=cfg,
+        )
+        assert r1.new_fee_ppm == 350  # undamped first step
+
+        _open_window(fc)
+        ts_state.thompson.posterior_std = 250.0
+        r2 = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, self._congested_state(),
+            _channel_info(chain["fee"]), cfg=cfg,
+        )
+
+        assert r2 is not None
+        assert r2.reason_code == FeeReasonCode.CONGESTION.value
+        # cap = min(5000, max(700, 600)) = 700; blended = 350 + 0.2*(700-350)
+        assert r2.new_fee_ppm == 420
+        # bounded by the normal per-cycle delta cap from 350
+        assert r2.new_fee_ppm <= 350 + max(100, int(350 * 0.5) + 1)
+
+    def test_recovery_after_congestion_uses_normal_blend(self, mock_plugin, mock_database):
+        """Once congestion clears, the next cycle is a normal DTS+PID move
+        (no category cliff) and the episode flag re-arms."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = _prepare_dts_stubs(fc, chain_fee=100, sampled_fee=5000)
+
+        r1 = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, self._congested_state(),
+            _channel_info(100), cfg=cfg,
+        )
+        assert r1.new_fee_ppm == 350
+        assert fc._cycle_states[CHANNEL_ID].congestion_active is True
+
+        _open_window(fc)
+        ts_state.thompson.posterior_std = 250.0
+        r2 = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(chain["fee"]), cfg=cfg,
+        )
+
+        assert r2 is not None
+        assert r2.reason.startswith("DTS+PID:")
+        # Normal path: blended + delta-capped, never a jump to the 5000 sample
+        step_cap = max(100, int(350 * 0.5) + 1)
+        assert r2.new_fee_ppm <= 350 + step_cap
+        assert fc._cycle_states[CHANNEL_ID].congestion_active is False
+
+    def test_congestion_active_round_trips_persistence(self, mock_plugin, mock_database):
+        """congestion_active must survive the fee strategy row round trip."""
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+
+        cycle = ChannelCycleState(congestion_active=True, last_update=1000)
+        captured = {}
+        mock_database.update_fee_strategy_state.side_effect = (
+            lambda **kw: captured.update(kw)
+        )
+        fc._save_cycle_state(CHANNEL_ID, cycle)
+        assert captured, "row must be persisted"
+
+        # Reload through a fresh controller fed the persisted row
+        fc2, _ = _make_fc(mock_plugin, MagicMock())
+        fc2.database.get_fee_strategy_state.return_value = {
+            "channel_id": CHANNEL_ID,
+            "v2_state_json": captured["v2_state_json"],
+            "last_update": captured["last_update"],
+            "is_sleeping": 0,
+        }
+        reloaded = fc2._get_cycle_state(CHANNEL_ID)
+        assert reloaded.congestion_active is True

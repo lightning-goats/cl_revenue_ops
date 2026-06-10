@@ -2254,7 +2254,12 @@ class TestDTSPIDStabilityCaps:
 
         assert result is None
 
-    def test_congestion_bypasses_normal_damping(self, mock_plugin, mock_database):
+    def test_congestion_first_trip_takes_bounded_fast_step(self, mock_plugin, mock_database):
+        """P1 (2026-06-10): congestion no longer jumps to the global ceiling.
+
+        The first congested cycle takes one undamped step bounded by
+        min(ceiling, max(2x current, current + 250)).
+        """
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         cfg.min_fee_ppm = 75
         cfg.max_fee_ppm = 2500
@@ -2271,7 +2276,9 @@ class TestDTSPIDStabilityCaps:
         )
 
         assert result is not None
-        assert result.new_fee_ppm == cfg.max_fee_ppm
+        # cap = min(2500, max(2*75, 75+250)) = 325 — fast, but no 75->2500 cliff
+        assert result.new_fee_ppm == 325
+        assert result.new_fee_ppm < cfg.max_fee_ppm
 
     def test_balanced_channel_uses_blended_target_before_apply(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
