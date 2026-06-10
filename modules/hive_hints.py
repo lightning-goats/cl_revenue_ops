@@ -13,6 +13,7 @@ lookups silently return 1.0 (neutral / no effect).
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 
@@ -154,6 +155,13 @@ class HiveHintAdapter:
     VALID_CORRIDOR_ROLES = {"owner", "secondary", "contested", "none"}
     STALE_FALLBACK_MIN_SECONDS = 6 * 3600
     STALE_FALLBACK_TTL_MULTIPLIER = 24
+    # Hardening: the snapshot is producer-controlled (and the CLN datastore it
+    # rides in is locally writable). A future-dated generated_at or an absurd
+    # ttl_seconds must not pin a snapshot as "fresh" indefinitely.
+    HINT_CLOCK_SKEW_SECONDS = 300
+    HINT_MAX_TTL_SECONDS = 86400
+    # Total bitcoin supply in sats — an upper sanity bound for any fleet value.
+    MAX_FLEET_CAPACITY_SATS = 21_000_000 * 100_000_000
 
     def __init__(
         self,
@@ -369,10 +377,18 @@ class HiveHintAdapter:
 
     def _effective_ttl_for(self, snapshot: dict | None) -> int:
         if self._ttl_override > 0:
-            return self._ttl_override
+            return min(self._ttl_override, self.HINT_MAX_TTL_SECONDS)
         if snapshot and isinstance(snapshot.get("ttl_seconds"), (int, float)):
-            return int(snapshot["ttl_seconds"])
+            ttl = int(snapshot["ttl_seconds"])
+            # Clamp untrusted ttl into a sane window so a huge value cannot
+            # keep a stale snapshot alive forever.
+            return max(0, min(ttl, self.HINT_MAX_TTL_SECONDS))
         return 900
+
+    def _age_is_fresh(self, age: int, ttl: int) -> bool:
+        """A snapshot is fresh only within [-clock_skew, ttl]. A far-future
+        generated_at (negative age beyond skew) is rejected, not trusted."""
+        return -self.HINT_CLOCK_SKEW_SECONDS <= age <= ttl
 
     def _effective_ttl(self) -> int:
         with self._lock:
@@ -382,7 +398,7 @@ class HiveHintAdapter:
         if snapshot is None:
             return False
         age = int(time.time()) - int(snapshot.get("generated_at", 0))
-        return age <= self._effective_ttl_for(snapshot)
+        return self._age_is_fresh(age, self._effective_ttl_for(snapshot))
 
     def is_fresh(self) -> bool:
         with self._lock:
@@ -392,6 +408,9 @@ class HiveHintAdapter:
         if snapshot is None:
             return False
         age = int(time.time()) - int(snapshot.get("generated_at", 0))
+        if age < -self.HINT_CLOCK_SKEW_SECONDS:
+            # Far-future timestamp: refuse to treat as a usable fallback.
+            return False
         max_age = max(
             self.STALE_FALLBACK_MIN_SECONDS,
             self._effective_ttl_for(snapshot) * self.STALE_FALLBACK_TTL_MULTIPLIER,
@@ -976,7 +995,19 @@ class HiveHintAdapter:
         hint = self._get_peer_hint(peer_id, "fleet_balance")
         cap = hint.get("fleet_capacity_sats")
         avail = hint.get("fleet_available_sats")
-        if isinstance(cap, (int, float)) and isinstance(avail, (int, float)):
+        # Untrusted values: reject non-numeric, NaN/Inf, negative, absurdly
+        # large, or available>capacity rather than feeding them into rebalance
+        # sizing. An empty dict makes the caller fall back to its own data.
+        if (
+            isinstance(cap, (int, float))
+            and isinstance(avail, (int, float))
+            and not isinstance(cap, bool)
+            and not isinstance(avail, bool)
+            and math.isfinite(cap)
+            and math.isfinite(avail)
+            and 0 <= cap <= self.MAX_FLEET_CAPACITY_SATS
+            and 0 <= avail <= cap
+        ):
             return {
                 "capacity_sats": int(cap),
                 "available_sats": int(avail),
@@ -1307,10 +1338,18 @@ class HiveHintAdapter:
 
     def get_open_candidates(self) -> list:
         """Return list of (peer_id, hint_dict) for peers with open_preference='open'."""
-        if not self.is_fresh():
-            return []
+        # Capture one consistent snapshot under the lock: poll() can replace or
+        # clear self._snapshot between a freshness check and iteration.
+        with self._lock:
+            snapshot = self._snapshot
+            if not self._snapshot_is_fresh(snapshot):
+                return []
+            hints = snapshot.get("hints", {})
+            hint_items = list(hints.items()) if isinstance(hints, dict) else []
         results = []
-        for peer_id, hint in self._snapshot.get("hints", {}).items():
+        for peer_id, hint in hint_items:
+            if not isinstance(hint, dict):
+                continue
             coh = hint.get("channel_open_hint")
             if not isinstance(coh, dict):
                 continue
@@ -1356,7 +1395,12 @@ class HiveHintAdapter:
             return default
         if not isinstance(value, (int, float)):
             return default
-        return max(low, min(high, float(value)))
+        value = float(value)
+        # Reject NaN/Inf: a non-finite delta must neutralize to the default,
+        # not clamp to a boundary or propagate into fee/rebalance math.
+        if not math.isfinite(value):
+            return default
+        return max(low, min(high, value))
 
     @staticmethod
     def _metabolic_confidence_score(confidence) -> float:
@@ -1434,7 +1478,8 @@ class HiveHintAdapter:
         generated_at = int(generated_at) if isinstance(generated_at, (int, float)) else None
         ttl = self._metabolic_ttl_for(raw, snapshot)
         age = int(time.time()) - generated_at if generated_at is not None else None
-        fresh = bool(generated_at is not None and ttl > 0 and age is not None and age <= ttl)
+        fresh = bool(generated_at is not None and ttl > 0 and age is not None
+                     and -self.HINT_CLOCK_SKEW_SECONDS <= age <= ttl)
         raw_scope = str(raw.get("m2_scope") or self._requested_m2_scope_for(snapshot) or DEFAULT_M2_SCOPE).strip()
         scope = raw_scope if raw_scope in VALID_M2_SCOPES else DEFAULT_M2_SCOPE
 
@@ -1634,7 +1679,8 @@ class HiveHintAdapter:
         generated_at = int(generated_at) if isinstance(generated_at, (int, float)) else None
         ttl = self._metabolic_ttl_for(raw, snapshot)
         age = int(time.time()) - generated_at if generated_at is not None else None
-        fresh = bool(generated_at is not None and ttl > 0 and age is not None and age <= ttl)
+        fresh = bool(generated_at is not None and ttl > 0 and age is not None
+                     and -self.HINT_CLOCK_SKEW_SECONDS <= age <= ttl)
         raw_scope = str(raw.get("m2_scope") or self._requested_m2_scope_for(snapshot) or DEFAULT_M2_SCOPE).strip()
         scope = raw_scope if raw_scope in VALID_M2_SCOPES else DEFAULT_M2_SCOPE
 
@@ -1850,7 +1896,7 @@ class HiveHintAdapter:
         hints = raw.get("hints") if isinstance(raw, dict) else None
         candidate = self._validate_and_normalize_snapshot(raw)
         valid = candidate is not None
-        fresh = bool(valid and age is not None and age <= ttl)
+        fresh = bool(valid and age is not None and -self.HINT_CLOCK_SKEW_SECONDS <= age <= ttl)
         stale_fallback_usable = bool(valid and self._snapshot_is_recent_enough_for_fallback(candidate))
         if not available:
             reason = str(info.get("reason") or "missing")
