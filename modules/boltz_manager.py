@@ -824,8 +824,20 @@ class BoltzCliManager:
             self.plugin.log(f"BOLTZ: unified budget provider failed: {e}", level="warn")
         return {"budget_sats": max(0, int(self.cfg.daily_budget_sats)), "source": "boltz_cfg_fallback"}
 
-    def get_boltz_cost_components(self, window_hours: int = 24) -> Dict[str, Any]:
-        """Boltz-only spend component summary (no external costs, no unified budget math)."""
+    def get_boltz_cost_components(
+        self,
+        window_hours: int = 24,
+        global_budget_cap_sats: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Boltz-only spend component summary (no external costs, no unified budget math).
+
+        IMPORTANT: this method must never call self.global_budget_limit_provider.
+        The unified budget status itself aggregates Boltz costs through this
+        method, so calling the provider here mutually recurses (each level
+        spawning boltzcli subprocesses) until RecursionError. Callers that
+        want the reserved estimate capped at the unified budget pass the cap
+        explicitly via global_budget_cap_sats instead.
+        """
         swaps_json = self._listswaps_json(manual_only=True)
         swaps = self._extract_swap_list(swaps_json)
         swaps = self._augment_with_swap_journal(swaps, limit_hint=50)
@@ -874,14 +886,10 @@ class BoltzCliManager:
         # Use the tighter of Boltz-specific and global (unified) budget.
         boltz_budget = max(0, int(getattr(self.cfg, "daily_budget_sats", 0) or 0))
         cap_budget = boltz_budget
-        if callable(getattr(self, "global_budget_limit_provider", None)):
-            try:
-                gb = self.global_budget_limit_provider()
-                global_budget = max(0, int(gb.get("effective_budget_sats", 0) or 0))
-                if global_budget > 0:
-                    cap_budget = min(cap_budget, global_budget) if cap_budget > 0 else global_budget
-            except Exception:
-                pass
+        if global_budget_cap_sats is not None:
+            global_budget = max(0, self._parse_int(global_budget_cap_sats, 0))
+            if global_budget > 0:
+                cap_budget = min(cap_budget, global_budget) if cap_budget > 0 else global_budget
         if cap_budget > 0:
             max_reservable = max(0, cap_budget - boltz_spent)
             reserved = min(reserved, max_reservable)
@@ -1220,7 +1228,11 @@ class BoltzCliManager:
     def get_budget_status(self) -> Dict[str, Any]:
         budget_info = self._get_global_budget_limit()
         budget = max(0, self._parse_int(budget_info.get("budget_sats"), self.cfg.daily_budget_sats))
-        local = self.get_boltz_cost_components(window_hours=24)
+        try:
+            local = self.get_boltz_cost_components(window_hours=24, global_budget_cap_sats=budget)
+        except TypeError:
+            # Test doubles may stub get_boltz_cost_components with the old signature.
+            local = self.get_boltz_cost_components(window_hours=24)
         boltz_spent = max(0, self._parse_int(local.get("spent_24h_sats"), 0))
         counted = list(local.get("counted_details", [])) if isinstance(local.get("counted_details"), list) else []
         unknown_ts = max(0, self._parse_int(local.get("skipped_without_timestamp"), 0))

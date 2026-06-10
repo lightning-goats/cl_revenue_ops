@@ -150,7 +150,7 @@ class TestBoltzAutoCycleScheduler:
             "status": "executed",
             "executed_count": 1,
         })
-        mod.revenue_boltz_balance_cycle = MagicMock(return_value={
+        mod._execute_boltz_balance_cycle = MagicMock(return_value={
             "status": "executed",
             "executed_count": 1,
         })
@@ -161,7 +161,14 @@ class TestBoltzAutoCycleScheduler:
         assert result["selection_reason"] == "onchain_reserve_healthy_use_balance_mode"
         assert result["reserve_deficit_sats"] == 0
         assert result["trigger"] == "scheduler"
-        mod.revenue_boltz_balance_cycle.assert_called_once()
+        mod._execute_boltz_balance_cycle.assert_called_once()
+        # The auto-cycle must reuse the plan it already built for mode
+        # selection instead of letting the executor rebuild it.
+        assert (
+            mod._execute_boltz_balance_cycle.call_args.kwargs["precomputed_plan"]
+            is mod._build_boltz_balance_plan.return_value
+        )
+        mod._build_boltz_balance_plan.assert_called_once()
         mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
 
     def test_auto_cycle_surfaces_treasury_plan_error_without_falling_back(self):

@@ -1140,3 +1140,26 @@ def test_readme_describes_boltz_treasury_first_boundary():
     assert "standing on-chain reserve" in readme
     assert "treasury mode first" in readme
     assert "balance cycle" in readme
+
+
+def test_revenue_profitability_defaults_to_cached_analysis():
+    mod = load_plugin_module()
+    mod.profitability_analyzer = MagicMock()
+    mod.profitability_analyzer.analyze_all_channels.return_value = {}
+
+    result = mod.revenue_profitability(mod.plugin)
+
+    assert "error" not in result
+    # Default must NOT force a full re-analysis on the dispatch thread.
+    mod.profitability_analyzer.analyze_all_channels.assert_called_once_with(force=False)
+
+
+def test_revenue_profitability_refresh_forces_reanalysis():
+    mod = load_plugin_module()
+    mod.profitability_analyzer = MagicMock()
+    mod.profitability_analyzer.analyze_all_channels.return_value = {}
+
+    result = mod.revenue_profitability(mod.plugin, refresh=True)
+
+    assert "error" not in result
+    mod.profitability_analyzer.analyze_all_channels.assert_called_once_with(force=True)

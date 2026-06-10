@@ -192,6 +192,64 @@ def _compute_forward_hydration_start(
     overlap_start = last_forward_ts - 86400
     return max(overlap_start, hydration_floor)
 
+
+_HYDRATION_PAGE_LIMIT = 1000
+_HYDRATION_MAX_PAGES = 10_000  # Hard stop: 10M forwards, prevents runaway paging
+
+
+def _hydration_fetch_settled_forwards(start_time: int) -> List[Dict[str, Any]]:
+    """Fetch settled forwards newer than start_time for startup hydration.
+
+    Prefers a paged listforwards(index="created", start=..., limit=N) loop so
+    the node's entire settled-forward history is never materialized in a
+    single RPC response. Any error (older CLN without index paging, mocked or
+    unexpected response shapes, RPC failures) falls back to the legacy full
+    settled fetch. The unique-index dedup in bulk_insert_forwards remains the
+    correctness backstop on both paths.
+    """
+    start_time = int(start_time)
+    try:
+        collected: List[Dict[str, Any]] = []
+        next_start = 0
+        for _ in range(_HYDRATION_MAX_PAGES):
+            page = safe_plugin.rpc.listforwards(
+                status="settled",
+                index="created",
+                start=next_start,
+                limit=_HYDRATION_PAGE_LIMIT,
+            )
+            forwards = page["forwards"]
+            if not isinstance(forwards, list):
+                raise TypeError("listforwards returned non-list forwards")
+            for fwd in forwards:
+                if int(fwd.get("received_time", 0) or 0) > start_time:
+                    collected.append(fwd)
+            if len(forwards) < _HYDRATION_PAGE_LIMIT:
+                return collected
+            # Advance past the last created_index. Missing field means this
+            # CLN doesn't support index paging — KeyError triggers fallback.
+            advanced = int(forwards[-1]["created_index"]) + 1
+            if advanced <= next_start:
+                raise ValueError("listforwards paging did not advance")
+            next_start = advanced
+        raise RuntimeError("listforwards paging exceeded max page count")
+    except Exception as e:
+        plugin.log(
+            f"Paged listforwards hydration unavailable ({e}); "
+            f"falling back to full settled fetch",
+            level='debug'
+        )
+
+    try:
+        result = data_service.get_forwards(status="settled")
+    except Exception as e:
+        plugin.log(f"Warning: listforwards RPC failed during hydration: {e}. "
+                   f"Flow analysis will use existing database data only.", level='warn')
+        return []
+    forwards = result.get("forwards", []) or []
+    return [f for f in forwards if int(f.get("received_time", 0) or 0) > start_time]
+
+
 # Initialize the plugin
 plugin = Plugin()
 
@@ -436,9 +494,10 @@ _boltz_auto_cycle_state: Dict[str, Any] = {
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
 # Cache is cleared periodically to prevent stale mappings from corrupting reputation
-_scid_to_peer_cache: Dict[str, str] = {}
+_scid_to_peer_cache: Dict[str, Optional[str]] = {}  # None = negatively-cached unknown SCID
 _scid_cache_last_cleared: float = 0.0
 _SCID_CACHE_TTL_SECONDS: int = 3600  # Clear cache every hour
+_SCID_NEGATIVE_CACHE_MAX_ENTRIES: int = 512  # Bound on negatively-cached unknown SCIDs
 _scid_cache_lock = threading.Lock()
 _scid_cache_fetch_lock = threading.Lock()  # M-2: Serializes cache-miss RPC calls
 
@@ -1331,13 +1390,15 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
 
                 selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=balance_plan)
                 if selection.get("mode") == "balance":
-                    result = revenue_boltz_balance_cycle(
-                        plugin=plugin,
+                    # Reuse the plan built above for mode selection — rebuilding
+                    # it would repeat every per-candidate boltzcli quote call.
+                    result = _execute_boltz_balance_cycle(
                         dry_run=False,
                         max_actions=max_actions,
                         allow_concurrent_swaps=False,
                         loop_in_currency='auto',
                         loop_out_currency='auto',
+                        precomputed_plan=balance_plan,
                     )
                 else:
                     reason = selection.get("reason", "no_eligible_boltz_actions")
@@ -1735,8 +1796,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Hook and hydration overlap is safe: both insert paths use
     # INSERT OR IGNORE under idx_forwards_unique with the same SCID and
     # timestamp normalization (see TestForwardDoubleDipPrevention).
-    # The RPC fetch itself is still an unfiltered settled-forward listforwards
-    # call; the local insert window below bounds what gets written.
+    # The RPC fetch prefers a paged listforwards(index="created") loop with a
+    # full-fetch fallback; the local insert window below bounds what gets written.
     # =========================================================================
     try:
         last_forward_ts = database.get_latest_forward_timestamp()
@@ -1770,11 +1831,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             )
 
         if start_time is not None:
-            # Fetch from RPC - this is the ONLY listforwards call we make.
-            # CLN's listforwards `start` param expects a created_index (sequential
-            # counter), NOT a Unix timestamp. Passing a timestamp silently returns
-            # zero results on nodes with a small forward history, so we use the
-            # full settled-forward fetch and bound only the local insert window.
+            # Fetch from RPC via _hydration_fetch_settled_forwards: paged
+            # listforwards(index="created") when supported, full settled fetch
+            # otherwise. The received_time filter bounds the insert window in
+            # both cases (`start` pages by created_index, not by timestamp).
             #
             # Empty-table warm starts already use the helper's exact window.
             # Apply the extra-day overlap floor only when we have a non-empty
@@ -1783,28 +1843,20 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 max_hydration_days = max(config.flow_window_days + 1, 15)
                 hydration_floor = now - (max_hydration_days * 86400)
                 start_time = max(start_time, hydration_floor)
-            try:
-                result = data_service.get_forwards(status="settled")
-            except Exception as e:
-                plugin.log(f"Warning: listforwards RPC failed during hydration: {e}. "
-                           f"Flow analysis will use existing database data only.", level='warn')
-                result = {"forwards": []}
             forwards_to_insert = []
-
-            for fwd in result.get("forwards", []):
+            for fwd in _hydration_fetch_settled_forwards(start_time):
                 received_time = int(fwd.get("received_time", 0) or 0)
-                if received_time > start_time:
-                    resolved_time = int(fwd.get("resolved_time", 0) or 0)
-                    forwards_to_insert.append({
-                        'in_channel': fwd.get("in_channel", ""),
-                        'out_channel': fwd.get("out_channel", ""),
-                        'in_msat': _parse_msat(fwd.get("in_msat", fwd.get("in_msatoshi", 0))),
-                        'out_msat': _parse_msat(fwd.get("out_msat", fwd.get("out_msatoshi", 0))),
-                        'fee_msat': _parse_msat(fwd.get("fee_msat", fwd.get("fee_msatoshi", 0))),
-                        'resolution_time': max(0, resolved_time - received_time) if resolved_time > 0 else 0,
-                        'received_time': received_time,
-                        'resolved_time': resolved_time
-                    })
+                resolved_time = int(fwd.get("resolved_time", 0) or 0)
+                forwards_to_insert.append({
+                    'in_channel': fwd.get("in_channel", ""),
+                    'out_channel': fwd.get("out_channel", ""),
+                    'in_msat': _parse_msat(fwd.get("in_msat", fwd.get("in_msatoshi", 0))),
+                    'out_msat': _parse_msat(fwd.get("out_msat", fwd.get("out_msatoshi", 0))),
+                    'fee_msat': _parse_msat(fwd.get("fee_msat", fwd.get("fee_msatoshi", 0))),
+                    'resolution_time': max(0, resolved_time - received_time) if resolved_time > 0 else 0,
+                    'received_time': received_time,
+                    'resolved_time': resolved_time
+                })
 
             if forwards_to_insert:
                 inserted = database.bulk_insert_forwards(forwards_to_insert)
@@ -3457,18 +3509,21 @@ def revenue_rebalance(plugin: Plugin,
 
 
 @plugin.method("revenue-profitability")
-def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[str, Any]:
+def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None, refresh: bool = False) -> Dict[str, Any]:
     """
     Get channel profitability analysis.
-    
+
     Shows each channel's:
     - Total costs (opening + rebalancing)
     - Total revenue (routing fees)
     - Net profit/loss
     - ROI percentage
     - Profitability classification (profitable, break_even, underwater, zombie)
-    
-    Usage: lightning-cli revenue-profitability [channel_id]
+
+    Usage: lightning-cli revenue-profitability [channel_id] [refresh]
+
+    refresh=true forces a full re-analysis on the dispatch thread; the default
+    serves the analyzer's cached results (refreshed periodically in background).
     """
     if profitability_analyzer is None:
         return {"error": "Plugin not fully initialized"}
@@ -3535,8 +3590,9 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None) -> D
             else:
                 return {"channel_id": channel_id, "error": "No data available"}
         else:
-            # Analyze all channels
-            all_results = profitability_analyzer.analyze_all_channels(force=True)
+            # Analyze all channels. Default uses cached results; refresh=true
+            # forces a full re-analysis (expensive — blocks the dispatch thread).
+            all_results = profitability_analyzer.analyze_all_channels(force=bool(refresh))
 
             # Group by profitability class
             summary = {
@@ -4793,6 +4849,10 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
     Uses a cache to avoid repeated RPC calls. Cache is refreshed if the
     SCID is not found (channel might be new).
 
+    Unknown SCIDs are negatively cached (value None) so a burst of forwards
+    referencing a closed/foreign channel doesn't rebuild the SCID map on every
+    event. Negative entries are bounded and flushed by the hourly cache clear.
+
     Args:
         scid: Short channel ID (e.g., "123x456x0")
 
@@ -4831,10 +4891,20 @@ def _resolve_scid_to_peer(scid: str) -> Optional[str]:
                 if channel_scid and peer_id:
                     new_cache[normalize_scid(channel_scid)] = peer_id
 
+            resolved = new_cache.get(scid_norm)
             with _scid_cache_lock:
                 _scid_to_peer_cache.update(new_cache)
+                if resolved is None:
+                    # Negative cache: remember the miss so the next forward on
+                    # this unknown SCID doesn't rebuild the map again. Bounded
+                    # to keep hostile/garbage SCIDs from growing the dict; the
+                    # hourly clear above flushes entries (e.g. newly confirmed
+                    # channels) naturally.
+                    negative_count = sum(1 for v in _scid_to_peer_cache.values() if v is None)
+                    if negative_count < _SCID_NEGATIVE_CACHE_MAX_ENTRIES:
+                        _scid_to_peer_cache[scid_norm] = None
 
-            return new_cache.get(scid_norm)
+            return resolved
         except Exception as e:
             plugin.log(f"Error resolving SCID {scid} to peer: {e}", level='warn')
             return None
@@ -5015,17 +5085,23 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
     status = forward_event.get("status")
     in_channel = normalize_scid(forward_event.get("in_channel")) if forward_event.get("in_channel") else None
 
+    # Per-forward write coalescing: when the database exposes the combined
+    # single-transaction method, settled forwards record the forward row AND
+    # the reputation upsert in one transaction instead of two autocommit writes.
+    record_combined = getattr(database, "record_forward_and_reputation", None)
+
     # Track peer reputation for all forward outcomes
-    if in_channel:
-        peer_id = _resolve_scid_to_peer(in_channel)
-        if peer_id:
-            if status == "settled":
+    peer_id = _resolve_scid_to_peer(in_channel) if in_channel else None
+    if peer_id:
+        if status == "settled":
+            if not callable(record_combined):
                 database.update_peer_reputation(peer_id, is_success=True)
-            elif status == "failed":
-                # Only penalize in_channel peer on downstream failure, NOT
-                # local_failed (which means OUR node rejected the forward,
-                # e.g. insufficient outbound balance — the sender did nothing wrong).
-                database.update_peer_reputation(peer_id, is_success=False)
+            # else: deferred to the combined settled-forward write below
+        elif status == "failed":
+            # Only penalize in_channel peer on downstream failure, NOT
+            # local_failed (which means OUR node rejected the forward,
+            # e.g. insufficient outbound balance — the sender did nothing wrong).
+            database.update_peer_reputation(peer_id, is_success=False)
 
     # Record failed forward as weak negative DTS signal (amount-weighted)
     if status == "failed" and in_channel and fee_controller is not None:
@@ -5070,16 +5146,32 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
         resolved_time = int(forward_event.get("resolved_time", 0) or 0)
         resolution_duration = max(0, resolved_time - received_time) if resolved_time > 0 else 0
 
-        database.record_forward(
-            in_channel or "",
-            out_channel or "",
-            in_msat,
-            out_msat,
-            fee_msat,
-            received_time,
-            resolved_time,
-            resolution_duration,
-        )
+        if callable(record_combined) and peer_id:
+            record_combined(
+                {
+                    "in_channel": in_channel or "",
+                    "out_channel": out_channel or "",
+                    "in_msat": in_msat,
+                    "out_msat": out_msat,
+                    "fee_msat": fee_msat,
+                    "received_time": received_time,
+                    "resolved_time": resolved_time,
+                    "resolution_time": resolution_duration,
+                },
+                peer_id,
+                True,
+            )
+        else:
+            database.record_forward(
+                in_channel or "",
+                out_channel or "",
+                in_msat,
+                out_msat,
+                fee_msat,
+                received_time,
+                resolved_time,
+                resolution_duration,
+            )
 
 
 @plugin.subscribe("connect")
@@ -6006,7 +6098,25 @@ def _boltz_liquidity_cost_components(window_hours: int = 24) -> Dict[str, Any]:
     try:
         if not hasattr(boltz_manager, "get_boltz_cost_components"):
             return {"source": "boltz", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
-        comps = boltz_manager.get_boltz_cost_components(window_hours=window_hours)
+        # Pass the unified budget cap explicitly instead of letting the Boltz
+        # manager call back into the global budget provider (which evaluates
+        # this very function — mutual recursion). In fixed mode the effective
+        # unified budget equals the configured daily budget.
+        global_cap_sats = None
+        try:
+            if config is not None:
+                cfg = config.snapshot() if hasattr(config, "snapshot") else config
+                global_cap_sats = max(0, int(getattr(cfg, "daily_budget_sats", 0) or 0))
+        except Exception:
+            global_cap_sats = None
+        try:
+            comps = boltz_manager.get_boltz_cost_components(
+                window_hours=window_hours,
+                global_budget_cap_sats=global_cap_sats,
+            )
+        except TypeError:
+            # Older/stubbed managers without the explicit-cap parameter.
+            comps = boltz_manager.get_boltz_cost_components(window_hours=window_hours)
         return {
             "source": "boltz",
             "available": True,
@@ -6084,14 +6194,61 @@ def _open_close_cost_visibility(generic_ledger: Dict[str, Any], open_cost_sats: 
     }
 
 
+# Memoization for _total_cost_budget_status: the status is advisory (budgets are
+# enforced atomically at reservation time) but expensive to compute (boltzcli
+# subprocess + ~6 aggregate queries). One rebalance/boltz cycle evaluates it
+# 4-8 times through the provider wiring, so a short TTL collapses those calls.
+_TOTAL_COST_BUDGET_MEMO_TTL_SECONDS = 30.0
+_total_cost_budget_memo: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+_total_cost_budget_memo_lock = threading.Lock()
+# Reentrancy guard (defense in depth): the unified status aggregates component
+# providers that may, through misconfigured wiring, call back into the status.
+_total_cost_budget_reentry = threading.local()
+
+
 def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, Any]:
-    """Unified budget status across rebalances, Boltz swaps, and on-chain liquidity ops."""
+    """Unified budget status across rebalances, Boltz swaps, and on-chain liquidity ops.
+
+    Memoized per window_hours with a short TTL; guarded against re-entrant
+    evaluation from cost-component providers (returns the last cached value or
+    a minimal safe result instead of recursing).
+    """
     if config is None or database is None:
         return {"error": "Plugin not initialized"}
 
-    cfg = config.snapshot() if hasattr(config, "snapshot") else config
     wh = int(window_hours or 24)
     wh = max(1, min(168, wh))
+
+    # Fast path: fresh memoized value for this window.
+    with _total_cost_budget_memo_lock:
+        entry = _total_cost_budget_memo.get(wh)
+        if entry is not None and (time.monotonic() - entry[0]) < _TOTAL_COST_BUDGET_MEMO_TTL_SECONDS:
+            return dict(entry[1])
+
+    # Re-entrancy guard: never recurse into a full recomputation. Prefer the
+    # last known value for this window (even if stale); otherwise return a
+    # minimal error result that all consumers already handle conservatively.
+    if getattr(_total_cost_budget_reentry, "active", False):
+        with _total_cost_budget_memo_lock:
+            entry = _total_cost_budget_memo.get(wh)
+            if entry is not None:
+                return dict(entry[1])
+        return {"error": "reentrant total-cost budget evaluation", "window_hours": wh}
+
+    _total_cost_budget_reentry.active = True
+    try:
+        result = _compute_total_cost_budget_status(wh)
+    finally:
+        _total_cost_budget_reentry.active = False
+
+    if isinstance(result, dict) and "error" not in result:
+        with _total_cost_budget_memo_lock:
+            _total_cost_budget_memo[wh] = (time.monotonic(), dict(result))
+    return result
+
+
+def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
+    cfg = config.snapshot() if hasattr(config, "snapshot") else config
     now = int(time.time())
     since = now - (wh * 3600)
 
@@ -6501,6 +6658,7 @@ def _build_boltz_balance_plan(
     loop_out_currency: str = "LBTC",
     loop_in_currency: str = "LBTC",
     planner_coordination: Optional[Dict[str, Any]] = None,
+    pending_swap_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     if fee_controller is None or database is None:
         return {"error": "Plugin not initialized"}
@@ -6538,7 +6696,9 @@ def _build_boltz_balance_plan(
     state_rows = {str(r.get("channel_id")): r for r in database.get_all_channel_states()}
 
     budget_status = bm.budget()
-    pending_swaps = _boltz_pending_swap_count()
+    # Reuse the caller's pending-swap count when provided (it is a boltzcli
+    # subprocess call) — e.g. the balance cycle checks it before plan build.
+    pending_swaps = int(pending_swap_count) if pending_swap_count is not None else _boltz_pending_swap_count()
 
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
@@ -6597,27 +6757,6 @@ def _build_boltz_balance_plan(
         posterior_mean = float((dts_summary or {}).get("posterior_mean", 0) or 0)
         posterior_std = float((dts_summary or {}).get("posterior_std", 200) or 200)
 
-        # Rebalance feasibility: if native rebalancer can't rebalance this channel, Boltz is the only option
-        rebal_success = None
-        rebalance_impossible = False
-        if database is not None:
-            try:
-                rebal_success = database.get_channel_rebalance_success_rate(channel_id, window_days=7)
-            except Exception:
-                pass
-        if rebal_success is not None:
-            # 3+ attempts with 0% success in last 7 days = rebalancer can't do it
-            if rebal_success.get("total", 0) >= 3 and rebal_success.get("success_rate", 1.0) == 0.0:
-                rebalance_impossible = True
-
-        # Hive hints: rebalance preference and peer quality (via bounded bias)
-        hive_rebal_bias = 1.0
-        if hive_hints is not None:
-            try:
-                hive_rebal_bias = hive_hints.get_rebalance_bias(peer_id)
-            except Exception:
-                pass
-
         # Predicted depletion hours from Kalman velocity
         predicted_depletion_hours = None
         kalman_velocity = float(state_row.get('kalman_velocity', 0.0) or 0.0)
@@ -6671,6 +6810,30 @@ def _build_boltz_balance_plan(
             severity = max(0.0, (local_pct - eff_high_trigger_pct) / max(100.0 - eff_high_trigger_pct, 1.0))
         else:
             continue
+
+        # --- Post-trigger enrichment (deliberately AFTER direction selection so
+        # balanced channels never pay these per-channel DB/hint lookups) ---
+
+        # Rebalance feasibility: if native rebalancer can't rebalance this channel, Boltz is the only option
+        rebal_success = None
+        rebalance_impossible = False
+        if database is not None:
+            try:
+                rebal_success = database.get_channel_rebalance_success_rate(channel_id, window_days=7)
+            except Exception:
+                pass
+        if rebal_success is not None:
+            # 3+ attempts with 0% success in last 7 days = rebalancer can't do it
+            if rebal_success.get("total", 0) >= 3 and rebal_success.get("success_rate", 1.0) == 0.0:
+                rebalance_impossible = True
+
+        # Hive hints: rebalance preference and peer quality (via bounded bias)
+        hive_rebal_bias = 1.0
+        if hive_hints is not None:
+            try:
+                hive_rebal_bias = hive_hints.get_rebalance_bias(peer_id)
+            except Exception:
+                pass
 
         allowed, policy_reason = _boltz_direction_allowed_by_policy(peer_id, direction)
         if not allowed:
@@ -6971,9 +7134,8 @@ def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False) -> Dic
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-balance-cycle")
-def revenue_boltz_balance_cycle(
-    plugin: Plugin,
+def _execute_boltz_balance_cycle(
+    *,
     dry_run: bool = True,
     max_actions: int = 1,
     low_trigger_pct: float = 40.0,
@@ -6992,41 +7154,59 @@ def revenue_boltz_balance_cycle(
     allow_concurrent_swaps: bool = False,
     loop_in_currency: str = "LBTC",
     loop_out_currency: str = "LBTC",
+    precomputed_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Execute a profit-constrained Boltz balance cycle (loop-in/loop-out) with budget + cooldown guards."""
-    try:
-        plan = _build_boltz_balance_plan(
-            low_trigger_pct=low_trigger_pct,
-            low_target_pct=low_target_pct,
-            high_trigger_pct=high_trigger_pct,
-            high_target_pct=high_target_pct,
-            min_amount_sats=min_amount_sats,
-            max_amount_sats=max_amount_sats,
-            max_candidates=max(max(5, int(max_actions) * 5), 20),
-            only_peer_id=only_peer_id,
-            only_channel_id=only_channel_id,
-            require_profitable=require_profitable,
-            min_marginal_roi=min_marginal_roi,
-            profit_margin_factor=profit_margin_factor,
-            expected_horizon_days=expected_horizon_days,
-            loop_in_currency=loop_in_currency,
-            loop_out_currency=loop_out_currency,
-        )
-    except Exception as e:
-        return {"error": str(e)}
+    """Internal Boltz balance cycle executor.
+
+    precomputed_plan lets internal callers (the auto-cycle scheduler) reuse a
+    balance plan they already built instead of rebuilding the identical plan
+    (each build issues per-candidate boltzcli quote subprocesses). It is NOT an
+    RPC argument — the revenue-boltz-balance-cycle method never exposes it.
+    """
+    # Pending-swap short-circuit BEFORE building any plan: a pending swap blocks
+    # the whole cycle anyway, so don't pay for quotes/profitability first.
+    pending_swaps: Optional[int] = None
+    if isinstance(precomputed_plan, dict) and "pending_swap_count" in precomputed_plan:
+        pending_swaps = int(precomputed_plan.get("pending_swap_count", 0) or 0)
+    if not allow_concurrent_swaps:
+        if pending_swaps is None:
+            pending_swaps = _boltz_pending_swap_count()
+        if pending_swaps > 0:
+            return {
+                "status": "blocked",
+                "reason": f"{pending_swaps} pending Boltz swap(s) detected",
+                "plan": precomputed_plan,
+                "executed": [],
+                "skipped": [],
+            }
+
+    if isinstance(precomputed_plan, dict):
+        plan = precomputed_plan
+    else:
+        try:
+            plan = _build_boltz_balance_plan(
+                low_trigger_pct=low_trigger_pct,
+                low_target_pct=low_target_pct,
+                high_trigger_pct=high_trigger_pct,
+                high_target_pct=high_target_pct,
+                min_amount_sats=min_amount_sats,
+                max_amount_sats=max_amount_sats,
+                max_candidates=max(max(5, int(max_actions) * 5), 20),
+                only_peer_id=only_peer_id,
+                only_channel_id=only_channel_id,
+                require_profitable=require_profitable,
+                min_marginal_roi=min_marginal_roi,
+                profit_margin_factor=profit_margin_factor,
+                expected_horizon_days=expected_horizon_days,
+                loop_in_currency=loop_in_currency,
+                loop_out_currency=loop_out_currency,
+                pending_swap_count=pending_swaps,
+            )
+        except Exception as e:
+            return {"error": str(e)}
 
     if "error" in plan:
         return plan
-
-    pending_swaps = int(plan.get("pending_swap_count", 0) or 0)
-    if pending_swaps > 0 and not allow_concurrent_swaps:
-        return {
-            "status": "blocked",
-            "reason": f"{pending_swaps} pending Boltz swap(s) detected",
-            "plan": plan,
-            "executed": [],
-            "skipped": [],
-        }
 
     recommendations = list(plan.get("recommendations", []))
     budget = plan.get("budget", {}) if isinstance(plan.get("budget"), dict) else {}
@@ -7196,6 +7376,51 @@ def revenue_boltz_balance_cycle(
             "dynamic channel protection tuning raises loop-in trigger/target, amount cap, and cadence for fast-draining high-profit channels",
         ],
     }
+
+
+@plugin.method("revenue-boltz-balance-cycle")
+def revenue_boltz_balance_cycle(
+    plugin: Plugin,
+    dry_run: bool = True,
+    max_actions: int = 1,
+    low_trigger_pct: float = 40.0,
+    low_target_pct: float = 55.0,
+    high_trigger_pct: float = 80.0,
+    high_target_pct: float = 60.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_000_000,
+    only_peer_id: str = None,
+    only_channel_id: str = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    cooldown_hours: float = 4.0,
+    allow_concurrent_swaps: bool = False,
+    loop_in_currency: str = "LBTC",
+    loop_out_currency: str = "LBTC",
+) -> Dict[str, Any]:
+    """Execute a profit-constrained Boltz balance cycle (loop-in/loop-out) with budget + cooldown guards."""
+    return _execute_boltz_balance_cycle(
+        dry_run=dry_run,
+        max_actions=max_actions,
+        low_trigger_pct=low_trigger_pct,
+        low_target_pct=low_target_pct,
+        high_trigger_pct=high_trigger_pct,
+        high_target_pct=high_target_pct,
+        min_amount_sats=min_amount_sats,
+        max_amount_sats=max_amount_sats,
+        only_peer_id=only_peer_id,
+        only_channel_id=only_channel_id,
+        require_profitable=require_profitable,
+        min_marginal_roi=min_marginal_roi,
+        profit_margin_factor=profit_margin_factor,
+        expected_horizon_days=expected_horizon_days,
+        cooldown_hours=cooldown_hours,
+        allow_concurrent_swaps=allow_concurrent_swaps,
+        loop_in_currency=loop_in_currency,
+        loop_out_currency=loop_out_currency,
+    )
 
 
 @plugin.method("revenue-boltz-expansion-treasury-status")
