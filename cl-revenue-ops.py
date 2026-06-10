@@ -7757,6 +7757,14 @@ def revenue_boltz_expansion_treasury_cycle(
         if not econ.get('passes_profit_guard', False):
             skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'profit_guard_failed', 'recommendation': rec})
             continue
+        if econ.get('structural'):
+            # Credit-dependent (structural) passes are balance-cycle only: the
+            # treasury executor has no structural-envelope accounting, so a
+            # swap justified solely by the inbound-scarcity credit must not
+            # fund the treasury. Candidates that clear the guard on their own
+            # economics have structural=False and proceed unchanged.
+            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'structural_credit_requires_balance_cycle', 'recommendation': rec})
+            continue
         if est_fee > remaining_budget:
             skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'insufficient_remaining_budget', 'estimated_fee_sats': est_fee, 'remaining_budget_sats': remaining_budget, 'recommendation': rec})
             continue

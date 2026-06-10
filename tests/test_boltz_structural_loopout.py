@@ -544,6 +544,37 @@ def test_non_structural_candidate_ignores_envelope():
     assert bm.loop_out.call_args.kwargs["structural"] is False
 
 
+def _treasury_cycle_module(structural=True):
+    mod, bm = _cycle_module(envelope=1000, spent=0)
+    plan = _cycle_plan(structural=structural)
+    plan["status"] = "ok"
+    plan["treasury"] = {"deficit_sats": 900_000, "preferred_currency": "BTC"}
+    mod._build_boltz_expansion_treasury_plan = MagicMock(return_value=plan)
+    return mod, bm
+
+
+def test_treasury_cycle_skips_structural_candidates():
+    """The expansion-treasury executor has no structural-envelope accounting,
+    so a candidate that only passes the profit guard via the scarcity credit
+    must not fund the treasury — it is skipped (pre-credit behavior)."""
+    mod, bm = _treasury_cycle_module(structural=True)
+
+    result = mod.revenue_boltz_expansion_treasury_cycle(mod.plugin, dry_run=False)
+
+    assert result["executed"] == []
+    assert result["skipped"][0]["reason"] == "structural_credit_requires_balance_cycle"
+    bm.loop_out.assert_not_called()
+
+
+def test_treasury_cycle_executes_non_structural_candidates():
+    mod, bm = _treasury_cycle_module(structural=False)
+
+    result = mod.revenue_boltz_expansion_treasury_cycle(mod.plugin, dry_run=False)
+
+    assert len(result["executed"]) == 1
+    bm.loop_out.assert_called_once()
+
+
 def test_gate_fails_closed_on_spend_query_error():
     """Unknown 24h spend => assume the envelope is exhausted."""
     mod, bm = _cycle_module(envelope=1000)
