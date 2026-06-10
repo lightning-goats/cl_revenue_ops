@@ -649,3 +649,170 @@ class TestCongestionDamping:
         }
         reloaded = fc2._get_cycle_state(CHANNEL_ID)
         assert reloaded.congestion_active is True
+
+
+# =============================================================================
+# P2: gossip-gate dead band — pending target persistence + convergence
+# =============================================================================
+
+class TestGossipGatePendingTarget:
+
+    def _run_cycle(self, fc, cfg, chain, ts_state):
+        """One fee cycle with the observation window forced open."""
+        _open_window(fc)
+        ts_state.thompson.posterior_std = 250.0  # keep blend ratio at 0.20
+        return fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(chain["fee"]), cfg=cfg,
+        )
+
+    def _make_sim(self, mock_plugin, mock_database, start_fee=50, target=500):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_volume_since.return_value = 0  # zero revenue: no sleep
+        mock_database.get_fee_strategy_state.return_value = {
+            **mock_database.get_fee_strategy_state.return_value,
+            "last_fee_ppm": start_fee,
+            "last_broadcast_fee_ppm": start_fee,
+            "last_revenue_rate": 0.0,
+            # Same decision category as the cycles under test so the
+            # category-change broadcast override stays out of the way.
+            "last_state": "dts_pid (init)",
+        }
+        chain = {"fee": start_fee}
+        broadcasts = _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(fc, chain_fee=start_fee, sampled_fee=target)
+        return fc, cfg, chain, broadcasts, ts_state
+
+    def test_suppressed_target_persisted_as_pending(self, mock_plugin, mock_database):
+        """A gate-suppressed cycle must store the would-be fee as pending."""
+        fc, cfg, chain, broadcasts, ts_state = self._make_sim(
+            mock_plugin, mock_database, start_fee=406, target=500,
+        )
+
+        result = self._run_cycle(fc, cfg, chain, ts_state)
+
+        # blended = 406 + 0.2*(500-406) = 425; delta 19 < 5% of 406 (20.3)
+        assert result is None, "move inside the gossip band must be suppressed"
+        assert broadcasts == []
+        assert fc._cycle_states[CHANNEL_ID].pending_target_ppm == 425
+
+    def test_pending_round_trips_persistence(self, mock_plugin, mock_database):
+        """pending_target_ppm must survive the fee strategy row round trip."""
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+
+        cycle = ChannelCycleState(pending_target_ppm=425, last_update=1000)
+        captured = {}
+        mock_database.update_fee_strategy_state.side_effect = (
+            lambda **kw: captured.update(kw)
+        )
+        fc._save_cycle_state(CHANNEL_ID, cycle)
+
+        fc2, _ = _make_fc(mock_plugin, MagicMock())
+        fc2.database.get_fee_strategy_state.return_value = {
+            "channel_id": CHANNEL_ID,
+            "v2_state_json": captured["v2_state_json"],
+            "last_update": captured["last_update"],
+            "is_sleeping": 0,
+        }
+        reloaded = fc2._get_cycle_state(CHANNEL_ID)
+        assert reloaded.pending_target_ppm == 425
+
+    def test_poisoned_pending_is_sanitized(self, mock_plugin, mock_database):
+        """Garbage or out-of-range persisted pending values load as safe ints."""
+        import json
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_fee_strategy_state.return_value = {
+            "channel_id": CHANNEL_ID,
+            "v2_state_json": json.dumps({
+                "cycle_state": {"pending_target_ppm": "not-a-number"},
+            }),
+            "last_update": 0,
+            "is_sleeping": 0,
+        }
+        assert fc._get_cycle_state(CHANNEL_ID).pending_target_ppm == 0
+
+        fc2, _ = _make_fc(mock_plugin, MagicMock())
+        fc2.database.get_fee_strategy_state.return_value = {
+            "channel_id": CHANNEL_ID,
+            "v2_state_json": json.dumps({
+                "cycle_state": {"pending_target_ppm": 99_999_999},
+            }),
+            "last_update": 0,
+            "is_sleeping": 0,
+        }
+        assert fc2._get_cycle_state(CHANNEL_ID).pending_target_ppm == FeeController.ABS_MAX_FEE_PPM
+
+    def test_broadcast_clears_pending(self, mock_plugin, mock_database):
+        """Once a broadcast goes out, the pending escalation is consumed."""
+        fc, cfg, chain, broadcasts, ts_state = self._make_sim(
+            mock_plugin, mock_database, start_fee=406, target=500,
+        )
+
+        r1 = self._run_cycle(fc, cfg, chain, ts_state)  # suppressed, pending=425
+        assert r1 is None
+        r2 = self._run_cycle(fc, cfg, chain, ts_state)  # anchored: 425->440, broadcast
+        assert r2 is not None
+        assert broadcasts == [r2.new_fee_ppm]
+        assert fc._cycle_states[CHANNEL_ID].pending_target_ppm == 0
+
+    def test_stale_wrong_direction_pending_is_dropped(self, mock_plugin, mock_database):
+        """A pending value on the wrong side of the new target must be
+        cleared, never dragging the fee away from the posterior."""
+        fc, cfg, chain, broadcasts, ts_state = self._make_sim(
+            mock_plugin, mock_database, start_fee=300, target=200,
+        )
+        # Stale high pending (e.g. left over from a congestion episode)
+        cycle = fc._get_cycle_state(CHANNEL_ID, actual_fee_ppm=300)
+        cycle.pending_target_ppm = 600
+
+        result = self._run_cycle(fc, cfg, chain, ts_state)
+
+        # Move must be DOWN toward 200, anchor 600 must not be used
+        assert result is not None
+        assert result.new_fee_ppm < 300
+
+    def test_dead_band_escape_converges_within_6pct(self, mock_plugin, mock_database):
+        """AUDIT VERIFICATION SIM: from fee 50, posterior target 500, blend
+        0.20, the broadcast fee must escape the old 25% absorbing band and
+        reach within 6% of 500 in bounded cycles, with broadcasts settling
+        (no oscillation)."""
+        fc, cfg, chain, broadcasts, ts_state = self._make_sim(
+            mock_plugin, mock_database, start_fee=50, target=500,
+        )
+
+        broadcast_history = []  # (cycle_index, fee)
+        for i in range(40):
+            before = len(broadcasts)
+            self._run_cycle(fc, cfg, chain, ts_state)
+            if len(broadcasts) > before:
+                broadcast_history.append((i, broadcasts[-1]))
+
+        assert broadcast_history, "sim must broadcast at least once"
+        final_fee = broadcast_history[-1][1]
+
+        # Old behavior: converged to ~418 and stalled 16-19% under optimal.
+        # Required: within 6% of the 500 ppm posterior target.
+        assert final_fee >= 470, (
+            f"broadcast fee stalled at {final_fee} ppm — still inside the "
+            f"old gossip dead band (history: {broadcast_history})"
+        )
+        assert final_fee <= 500
+
+        # No oscillation: broadcasts are non-decreasing and settle.
+        fees = [f for _, f in broadcast_history]
+        assert fees == sorted(fees), f"broadcasts oscillated: {fees}"
+        last_broadcast_cycle = broadcast_history[-1][0]
+        assert last_broadcast_cycle <= 32, (
+            f"broadcasts had not settled by cycle 32 (last at {last_broadcast_cycle})"
+        )
+
+    def test_gate_still_suppresses_within_band(self, mock_plugin, mock_database):
+        """Gossip hygiene preserved: a single sub-5% move still does not
+        broadcast on its first cycle."""
+        fc, cfg, chain, broadcasts, ts_state = self._make_sim(
+            mock_plugin, mock_database, start_fee=480, target=500,
+        )
+        result = self._run_cycle(fc, cfg, chain, ts_state)
+        assert result is None
+        assert broadcasts == []

@@ -1856,6 +1856,12 @@ class ChannelCycleState:
     # take one undamped step to the congestion cap, later cycles are damped.
     congestion_active: bool = False
 
+    # P2: target suppressed by the gossip gate / alpha guard (0 = none).
+    # The next cycle blends FROM this value instead of the chain fee so
+    # sub-threshold deltas accumulate instead of being discarded — the 5%
+    # gate becomes a rate limiter rather than a permanent dead band.
+    pending_target_ppm: int = 0
+
     # Gossip refresh tracking
     last_gossip_refresh: int = 0  # Timestamp of last forced gossip refresh
 
@@ -2143,6 +2149,18 @@ class FeeController:
     # realized cost data for the per-ppm estimate to be meaningful.
     REBALANCE_FLOOR_MIN_SAMPLES = 4
     REBALANCE_FLOOR_WINDOW_DAYS = 30
+
+    # ==========================================================================
+    # P2 fix (2026-06-10): gossip gate suppression ratio + pending target
+    # ==========================================================================
+    # Fee changes within this fraction of the last broadcast fee are not
+    # gossiped (network hygiene). The suppressed target is persisted as
+    # cycle.pending_target_ppm and the next blend starts FROM it, so
+    # sub-threshold deltas accumulate across cycles. Without that, the gate
+    # was an absorbing band: steady-state mispricing of ratio/blend (25% at
+    # blend 0.20, 8.3% at 0.60). Invariant: the gate limits broadcast RATE,
+    # never the eventual price level.
+    GOSSIP_GATE_SUPPRESSION_RATIO = 0.05
 
     # ==========================================================================
     # P1 fix (2026-06-10): bounded, damped congestion response
@@ -3498,6 +3516,7 @@ class FeeController:
             "forward_count_since_update": state.forward_count_since_update,
             "last_volume_sats": state.last_volume_sats,
             "congestion_active": bool(state.congestion_active),
+            "pending_target_ppm": int(state.pending_target_ppm or 0),
             "last_gossip_refresh": state.last_gossip_refresh,
             "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
         }
@@ -5992,8 +6011,40 @@ class FeeController:
             if observation_count < GaussianThompsonState.MIN_OBSERVATIONS:
                 blend_posterior_std = max(blend_posterior_std, 200.0)
 
+            # =============================================================
+            # P2 fix (2026-06-10): pending-target blend anchor
+            # =============================================================
+            # When the gossip gate or alpha guard suppressed last cycle's
+            # target, blend FROM that pending target instead of the chain
+            # fee so sub-5% deltas accumulate instead of re-deriving the
+            # same suppressed value forever (the old absorbing dead band).
+            # The anchor is honored only while it lies between the current
+            # fee and the new bounded target (same direction of travel);
+            # a stale or wrong-direction pending value is cleared, and the
+            # pending escalation is dropped once the new raw target falls
+            # back inside the gossip band.
+            blend_anchor_ppm = current_fee_ppm
+            pending_target_ppm = int(cycle.pending_target_ppm or 0)
+            if pending_target_ppm > 0:
+                gate_ref_ppm = int(cycle.last_broadcast_fee_ppm or 0)
+                back_in_band = (
+                    gate_ref_ppm > 0
+                    and abs(bounded_target_ppm - gate_ref_ppm)
+                    <= gate_ref_ppm * self.GOSSIP_GATE_SUPPRESSION_RATIO
+                )
+                anchor_candidate = max(floor_ppm, min(ceiling_ppm, pending_target_ppm))
+                anchor_on_path = (
+                    min(current_fee_ppm, bounded_target_ppm)
+                    <= anchor_candidate
+                    <= max(current_fee_ppm, bounded_target_ppm)
+                )
+                if back_in_band or not anchor_on_path:
+                    cycle.pending_target_ppm = 0
+                else:
+                    blend_anchor_ppm = anchor_candidate
+
             blended_target_ppm, blend_info = self._blend_fee_target(
-                current_fee_ppm=current_fee_ppm,
+                current_fee_ppm=blend_anchor_ppm,
                 bounded_target_ppm=bounded_target_ppm,
                 woke_from_sleep=woke_from_sleep,
                 sparse_data_conservative=sparse_data_conservative,
@@ -6130,6 +6181,13 @@ class FeeController:
             # volume/revenue.  Not resetting last_update causes the same
             # observations to be re-ingested on every subsequent cycle that
             # also falls below the Alpha Guard threshold.
+            #
+            # P2: persist the suppressed target so the sub-threshold move
+            # accumulates — the next blend anchors from it instead of
+            # re-deriving (and re-discarding) the same delta every cycle.
+            cycle.pending_target_ppm = (
+                int(new_fee_ppm) if int(new_fee_ppm) != int(current_fee_ppm) else 0
+            )
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = current_fee_ppm
             cycle.last_update = now
@@ -6154,7 +6212,7 @@ class FeeController:
         # Reduce network noise by only broadcasting significant changes.
         # =====================================================================
         delta_broadcast = abs(new_fee_ppm - cycle.last_broadcast_fee_ppm)
-        threshold = cycle.last_broadcast_fee_ppm * 0.05
+        threshold = cycle.last_broadcast_fee_ppm * self.GOSSIP_GATE_SUPPRESSION_RATIO
         
         # Override: Always broadcast if entering/exiting critical states
         # or if we have never broadcasted before.
@@ -6171,6 +6229,13 @@ class FeeController:
                              (not target_found and cycle.last_state == "CONGESTION")
 
         if not significant_change and not channel_policy_change:
+            # P2: persist the suppressed target BEFORE any branch below so the
+            # gate becomes a rate limiter, not an absorbing band — the next
+            # cycle's blend anchors from this value and deltas accumulate.
+            cycle.pending_target_ppm = (
+                int(new_fee_ppm) if int(new_fee_ppm) != int(current_fee_ppm) else 0
+            )
+
             # =========================================================================
             # GOSSIP REFRESH CHECK
             # Broadcast staleness uses last_broadcast_at, so observation-cursor
@@ -6284,6 +6349,7 @@ class FeeController:
         
         # IDEMPOTENCY GUARD: Skip RPC if target is physically set
         if new_fee_ppm == raw_chain_fee and not channel_policy_change:
+            cycle.pending_target_ppm = 0  # P2: target reached, nothing pending
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = raw_chain_fee
             cycle.last_broadcast_fee_ppm = new_fee_ppm
@@ -6340,6 +6406,7 @@ class FeeController:
             new_fee_ppm = result.get("fee_ppm", new_fee_ppm)
 
             # Update state with new broadcast fee and refresh timer
+            cycle.pending_target_ppm = 0  # P2: pending escalation broadcast
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = current_fee_ppm
             cycle.last_broadcast_fee_ppm = new_fee_ppm
@@ -7243,6 +7310,14 @@ class FeeController:
         db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
         cycle_data = self._extract_cycle_state_payload(db_state, v2_data)
 
+        # P2: sanitize the persisted pending target (poisoned-datastore
+        # hardening: non-numeric -> 0, clamp to [0, ABS_MAX_FEE_PPM]).
+        try:
+            pending_target_ppm = int(cycle_data.get("pending_target_ppm", 0) or 0)
+        except (TypeError, ValueError):
+            pending_target_ppm = 0
+        pending_target_ppm = max(0, min(pending_target_ppm, self.ABS_MAX_FEE_PPM))
+
         cycle = ChannelCycleState(
             last_revenue_rate=cycle_data.get("last_revenue_rate", 0.0),
             last_fee_ppm=cycle_data.get("last_fee_ppm", 0),
@@ -7259,6 +7334,7 @@ class FeeController:
             forward_count_since_update=cycle_data.get("forward_count_since_update", 0),
             last_volume_sats=cycle_data.get("last_volume_sats", 0),
             congestion_active=bool(cycle_data.get("congestion_active", False)),
+            pending_target_ppm=pending_target_ppm,
             last_gossip_refresh=cycle_data.get("last_gossip_refresh", 0),
             dynamic_htlcmin_baseline_msat=cycle_data.get("dynamic_htlcmin_baseline_msat"),
         )
