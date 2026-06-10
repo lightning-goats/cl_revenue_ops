@@ -670,6 +670,18 @@ class FlowAnalyzer:
         # I-9: Flag to skip DB persistence in analyze_channel() during bulk analysis
         self._analyze_all_running: bool = False
 
+        # Result cache for analyze_all_channels (mirrors profitability analyzer).
+        # Capital-efficiency consumers (capacity planner, capex budget,
+        # rebalancer) re-run analyze_all_channels several times per cycle;
+        # without a cache each run repeats the full RPC fetch + bulk DB reads
+        # + per-channel Kalman updates + state writes.
+        # TS-7: Cache reads without lock are safe under CPython GIL (dict reads
+        # are atomic). Writes are protected by _analysis_lock.
+        self._flow_cache: Dict[str, FlowMetrics] = {}
+        self._flow_cache_timestamp: int = 0
+        self._flow_cache_ttl: int = 300  # seconds (configurable attribute)
+        self._analysis_lock = threading.Lock()  # Prevent analysis stampede
+
         # One-time purge v2: clear Kalman states missing observation_count.
         # Without observation gating, filters declared "converged" after 1-2 cycles
         # while flow_ratio was still near 0.0, overriding correct EMA classifications.
@@ -729,6 +741,34 @@ class FlowAnalyzer:
         except Exception as e:
             self.plugin.log(f"KALMAN: Failed to save filter state for {channel_id[:12]}...: {e}", level="warn")
 
+    def _flush_kalman_saves(self, rows: List[Dict[str, Any]]) -> None:
+        """Persist queued Kalman states, preferring a single batched write.
+
+        Each row dict carries the exact kwargs of save_kalman_state
+        ({"channel_id": ..., "state": ...}). Falls back to per-channel saves
+        when the batch DB method is unavailable.
+        """
+        if not rows:
+            return
+        batch_save = getattr(self.database, "save_kalman_states_batch", None)
+        if callable(batch_save):
+            try:
+                batch_save(rows)
+                return
+            except Exception as e:
+                self.plugin.log(
+                    f"KALMAN: batch save failed ({e}), falling back to "
+                    f"per-channel saves", level="warn"
+                )
+        for row in rows:
+            try:
+                self.database.save_kalman_state(row["channel_id"], row["state"])
+            except Exception as e:
+                self.plugin.log(
+                    f"KALMAN: Failed to save filter state for "
+                    f"{row['channel_id'][:12]}...: {e}", level="warn"
+                )
+
     def _calculate_kalman_volatility(self, daily_buckets: List[Dict[str, int]]) -> float:
         """
         Calculate volatility measure for Kalman process noise adaptation.
@@ -771,7 +811,8 @@ class FlowAnalyzer:
         observed_ratio: float,
         confidence: float,
         daily_buckets: List[Dict[str, int]],
-        has_observation: bool = True
+        has_observation: bool = True,
+        pending_kalman_saves: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[float, float, float, bool, int]:
         """
         Apply Kalman filter to get smoothed flow ratio estimate.
@@ -783,6 +824,9 @@ class FlowAnalyzer:
             daily_buckets: Daily flow data for volatility calculation
             has_observation: If False, run predict-only (no update).
                 Prevents feeding a fake 0.0 observation when no flow data exists.
+            pending_kalman_saves: When provided (bulk analysis), the updated
+                state is queued here for a single batched DB write instead of
+                an immediate per-channel autocommit write.
 
         Returns:
             (kalman_ratio, kalman_velocity, uncertainty, regime_change, observation_count)
@@ -840,8 +884,15 @@ class FlowAnalyzer:
                 level='debug'
             )
 
-        # Save state
-        self._save_kalman_filter(channel_id, kf)
+        # Save state. Predict-only runs are saved too: the predict step still
+        # changes covariance (uncertainty growth) and last_update, both of
+        # which must survive restarts for dt accounting to stay correct.
+        if pending_kalman_saves is not None:
+            pending_kalman_saves.append(
+                {"channel_id": channel_id, "state": kf.state.to_dict()}
+            )
+        else:
+            self._save_kalman_filter(channel_id, kf)
 
         return (
             kf.state.flow_ratio,
@@ -886,6 +937,7 @@ class FlowAnalyzer:
         channel_daily: List[Dict[str, int]],
         raw_entries: List,
         last_forward_ts: int,
+        pending_kalman_saves: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Apply Kalman filter and reclassify channel state based on the result.
 
@@ -922,6 +974,7 @@ class FlowAnalyzer:
                 confidence=kalman_confidence,
                 daily_buckets=channel_daily,
                 has_observation=has_observation,
+                pending_kalman_saves=pending_kalman_saves,
             )
         metrics.kalman_flow_ratio = kalman_ratio
         metrics.kalman_velocity = kalman_velocity
@@ -1119,21 +1172,57 @@ class FlowAnalyzer:
         # Security: enforce bounds
         return max(min_decay, min(max_decay, decay))
 
-    def analyze_all_channels(self) -> Dict[str, FlowMetrics]:
+    def analyze_all_channels(self, force: bool = False) -> Dict[str, FlowMetrics]:
         """
         Analyze flow for all channels.
-        
-        This is the main entry point, called periodically by the timer.
-        
+
+        This is the main entry point, called periodically by the timer and
+        re-invoked by capital-efficiency consumers several times per cycle.
+        A TTL result cache (default 300s) serves those repeat callers without
+        re-running the full RPC fetch + Kalman update + DB write pipeline.
+
+        CRITICAL: Kalman state updates and DB writes only happen on a genuine
+        refresh, never on cache hits — re-running the filter on the same data
+        would double-consume observations and shrink uncertainty artificially.
+
+        The hourly flow-analysis loop always gets a genuine refresh because
+        the cache TTL is far shorter than the loop interval.
+
+        Args:
+            force: If True, bypass the cache TTL and always run fresh analysis.
+
         Returns:
             Dict mapping channel_id to FlowMetrics
         """
-        self._analyze_all_running = True
+        # Serve cached results while fresh (prevents redundant re-analysis).
+        if not force and self._flow_cache:
+            cache_age = int(time.time()) - self._flow_cache_timestamp
+            if cache_age <= self._flow_cache_ttl:
+                return self._flow_cache
 
+        # Non-blocking stampede lock: if another thread is already analyzing,
+        # return the existing cache instead of duplicating work.
+        if not self._analysis_lock.acquire(blocking=False):
+            return self._flow_cache
+
+        # Update timestamp immediately so concurrent callers checking the TTL
+        # while we work are served from cache.
+        old_timestamp = self._flow_cache_timestamp
+        self._flow_cache_timestamp = int(time.time())
+
+        self._analyze_all_running = True
         try:
-            return self._analyze_all_channels_impl()
+            results = self._analyze_all_channels_impl()
+            self._flow_cache = results
+            return results
+        except Exception:
+            # Restore old timestamp so the next call retries promptly instead
+            # of treating the failed run as a fresh cache.
+            self._flow_cache_timestamp = old_timestamp
+            raise
         finally:
             self._analyze_all_running = False
+            self._analysis_lock.release()
 
     def _analyze_all_channels_impl(self) -> Dict[str, 'FlowMetrics']:
         results = {}
@@ -1150,9 +1239,12 @@ class FlowAnalyzer:
         # Get flow data from local forwards table (daily buckets for EMA calculation).
         flow_data_daily = self._get_daily_flow_from_db()
 
-        # Raw per-forward data for Kalman observation (bypasses EMA smoothing)
+        # Raw per-forward data for Kalman observation (bypasses EMA smoothing).
+        # Only the most recent 24 hours are consumed downstream
+        # (_compute_raw_kalman_observation filters to <=86400s), so fetch a
+        # 24h window instead of materializing the full flow_window_days span.
         raw_flow_data = self.database.get_continuous_net_flow_all(
-            window_hours=self.config.flow_window_days * 24
+            window_hours=24
         )
 
         # Prefetch all previous states in one query instead of one per channel.
@@ -1160,6 +1252,9 @@ class FlowAnalyzer:
             s.get("channel_id"): s for s in self.database.get_all_channel_states()
         }
         pending_state_rows = []
+        # Kalman states queued here are flushed in one batched write after the
+        # loop instead of one autocommit INSERT OR REPLACE per channel.
+        pending_kalman_rows: List[Dict[str, Any]] = []
 
         # Analyze each channel
         for channel in channels:
@@ -1237,6 +1332,7 @@ class FlowAnalyzer:
                 channel_daily=channel_daily,
                 raw_entries=raw_flow_data.get(channel_id, []),
                 last_forward_ts=last_forward_ts,
+                pending_kalman_saves=pending_kalman_rows,
             )
 
             results[channel_id] = metrics
@@ -1263,11 +1359,16 @@ class FlowAnalyzer:
                 kalman_uncertainty=metrics.kalman_uncertainty
             ))
 
+        # Flush queued Kalman states in one batched write (falls back to
+        # per-channel saves when the batch DB method is unavailable).
+        self._flush_kalman_saves(pending_kalman_rows)
+
         # Persist all channel states in one transaction, then update temporal
         # profiles (profile writes UPDATE channel_states, so rows must exist).
         self.database.update_channel_states_batch(pending_state_rows)
-        for row in pending_state_rows:
-            self._update_temporal_profile(row["channel_id"])
+        self._update_temporal_profiles_bulk(
+            [row["channel_id"] for row in pending_state_rows]
+        )
 
         # Reconcile: remove stale channel_states entries for closed channels.
         # _get_channels() only returns CHANNELD_NORMAL, so any channel_states
@@ -1295,17 +1396,112 @@ class FlowAnalyzer:
 
         return results
 
-    def _update_temporal_profile(self, channel_id: str) -> None:
+    def _update_temporal_profiles_bulk(self, channel_ids: List[str]) -> None:
+        """Update temporal profiles for many channels with batched DB access.
+
+        Optimizations over calling _update_temporal_profile() per channel:
+        - Fee strategy states prefetched once (get_all_fee_strategy_states)
+        - Hourly histograms fetched in one bulk query when the DB provides
+          get_hourly_forward_histograms_all (per-channel fallback otherwise)
+        - Profile writes flushed via save_temporal_profiles_batch when
+          available (per-channel save_temporal_profile fallback otherwise)
+        """
+        if not channel_ids:
+            return
+
+        # Prefetch all fee strategy states once instead of one query/channel.
+        fee_states: Dict[str, Dict[str, Any]] = {}
+        try:
+            fee_states = {
+                s.get("channel_id"): s
+                for s in self.database.get_all_fee_strategy_states()
+            }
+        except Exception:
+            fee_states = {}
+
+        # Bulk histogram fetch when the DB method exists.
+        histograms_all = None
+        get_all_hist = getattr(
+            self.database, "get_hourly_forward_histograms_all", None
+        )
+        if callable(get_all_hist):
+            try:
+                histograms_all = get_all_hist(window_days=7)
+            except Exception:
+                histograms_all = None
+        if not isinstance(histograms_all, dict):
+            histograms_all = None
+
+        pending_profile_rows: List[Dict[str, Any]] = []
+        for channel_id in channel_ids:
+            if histograms_all is not None:
+                # Channels absent from the bulk result had no forwards in the
+                # window — equivalent to the zero histogram the single-channel
+                # helper returns.
+                histogram = histograms_all.get(channel_id) or [
+                    {"out_sats": 0, "in_sats": 0, "count": 0} for _ in range(24)
+                ]
+            else:
+                histogram = None  # per-channel fetch inside the helper
+            row = self._update_temporal_profile(
+                channel_id,
+                histogram=histogram,
+                fee_state=fee_states.get(channel_id, {}),
+                defer_save=True,
+            )
+            if row is not None:
+                pending_profile_rows.append(row)
+
+        if not pending_profile_rows:
+            return
+
+        batch_save = getattr(self.database, "save_temporal_profiles_batch", None)
+        if callable(batch_save):
+            try:
+                batch_save(pending_profile_rows)
+                return
+            except Exception as e:
+                self.plugin.log(
+                    f"Temporal profile batch save failed ({e}), falling back "
+                    f"to per-channel saves", level="debug"
+                )
+        for row in pending_profile_rows:
+            try:
+                self.database.save_temporal_profile(
+                    row["channel_id"], row["profile_json"]
+                )
+            except Exception as e:
+                self.plugin.log(
+                    f"Temporal profile save failed for {row['channel_id']}: {e}",
+                    level="debug"
+                )
+
+    def _update_temporal_profile(
+        self,
+        channel_id: str,
+        histogram: Optional[list] = None,
+        fee_state: Optional[Dict[str, Any]] = None,
+        defer_save: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """Update the temporal flow profile for a channel.
 
         Computes hourly histogram from forwards table, EMA-blends with
         existing profile, and persists to database.
+
+        Args:
+            histogram: Prefetched hourly histogram (bulk path); fetched
+                per-channel when None.
+            fee_state: Prefetched fee strategy state (bulk path); fetched
+                per-channel when None.
+            defer_save: When True, skip the DB write and return a row dict
+                ({"channel_id", "profile_json"}) for batched persistence.
         """
         try:
             import json
 
-            # Get hourly histogram from forwards
-            histogram = self.database.get_hourly_forward_histogram(channel_id, window_days=7)
+            # Get hourly histogram from forwards (unless prefetched)
+            if histogram is None:
+                histogram = self.database.get_hourly_forward_histogram(channel_id, window_days=7)
 
             # Average daily forwards across the histogram window for graduation check
             avg_daily_forwards = sum(h.get("count", 0) for h in histogram)
@@ -1319,7 +1515,8 @@ class FlowAnalyzer:
 
             # Read dominant bucket from fee controller state if available
             try:
-                fee_state = self.database.get_fee_strategy_state(channel_id)
+                if fee_state is None:
+                    fee_state = self.database.get_fee_strategy_state(channel_id)
                 if fee_state and fee_state.get("v2_state_json"):
                     v2 = json.loads(fee_state["v2_state_json"]) if isinstance(fee_state["v2_state_json"], str) else fee_state.get("v2_state_json", {})
                     size_buckets = v2.get("size_buckets", {})
@@ -1338,11 +1535,16 @@ class FlowAnalyzer:
             # Update with EMA blending
             updated = update_temporal_profile(existing, histogram, avg_daily_forwards)
 
+            updated_json = json.dumps(updated.to_dict())
+            if defer_save:
+                return {"channel_id": channel_id, "profile_json": updated_json}
+
             # Persist
-            self.database.save_temporal_profile(channel_id, json.dumps(updated.to_dict()))
+            self.database.save_temporal_profile(channel_id, updated_json)
 
         except Exception as e:
             self.plugin.log(f"Temporal profile update failed for {channel_id}: {e}", level='debug')
+        return None
 
     def analyze_channel(self, channel_id: str) -> Optional[FlowMetrics]:
         """
@@ -1425,8 +1627,9 @@ class FlowAnalyzer:
             capacity=capacity,
             our_balance=our_balance,
             channel_daily=channel_daily,
+            # Only the most recent 24h is consumed by the Kalman observation
             raw_entries=self.database.get_continuous_net_flow_channel(
-                channel_id, window_hours=self.config.flow_window_days * 24
+                channel_id, window_hours=24
             ),
             last_forward_ts=last_forward_ts,
         )
