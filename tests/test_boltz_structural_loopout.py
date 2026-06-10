@@ -207,3 +207,155 @@ def test_scarcity_one_at_exact_floor():
     status = mod._node_receivable_status()
     assert status["receivable_ratio"] == pytest.approx(0.20, abs=1e-6)
     assert status["scarcity"] == pytest.approx(1.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Task 8: Boltz loop-outs earn a scarcity-scaled structural inbound credit
+# ---------------------------------------------------------------------------
+
+from tests.test_boltz_balance_plan_bias import _make_planner_module
+
+
+def _make_prof_mock():
+    """Minimal profitability object that survives require_profitable=True
+    filters but contributes zero historical revenue (daily_contrib == 0),
+    so only the structural credit can move the profit guard."""
+    prof = MagicMock()
+    prof.marginal_roi = 1.0
+    prof.marginal_roi_percent = 1.0
+    prof.net_profit_sats = 0
+    prof.roi_percent = 0.0
+    prof.is_operationally_profitable = False
+    prof.days_open = 30
+    prof.revenue.total_contribution_sats = 0
+    return prof
+
+
+def _structural_module(scarcity, realized_ppm=500, structural_budget=1000):
+    mod = _make_planner_module(hive_hints=None)
+    from modules.config import Config
+    mod.config = Config(boltz_structural_budget_sats_per_day=structural_budget)
+    mod._node_receivable_status = lambda: {
+        "receivable_ratio": 0.05, "scarcity": scarcity,
+        "total_capacity_sats": 10_000_000, "total_receivable_sats": 500_000,
+    }
+    mod.database.get_node_realized_fee_ppm.return_value = realized_ppm
+    # Profitability data so require_profitable=True does not skip the channel.
+    pa = MagicMock()
+    pa.analyze_all_channels.return_value = None
+    pa.get_profitability.return_value = _make_prof_mock()
+    mod.profitability_analyzer = pa
+    # 97% local => loop_out direction (high trigger default 80%)
+    mod.fee_controller._get_channels_info.return_value = {
+        "100x1x0": {
+            "peer_id": "02" + "b" * 64,
+            "capacity": 10_000_000,
+            "spendable_msat": 9_700_000_000,
+            "receivable_msat": 300_000_000,
+        }
+    }
+    return mod
+
+
+def test_starved_node_loopout_earns_structural_credit():
+    """Fully starved node: the structural credit alone (750 sats vs 120 sats
+    threshold) carries the loop-out past the profit guard."""
+    mod = _structural_module(scarcity=1.0)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    recs = plan["recommendations"]
+    assert len(recs) == 1
+    econ = recs[0]["economics"]
+    assert econ["structural_uplift_sats"] > 0
+    assert econ["passes_profit_guard"] is True
+    assert econ["structural"] is True
+
+
+def test_healthy_node_gets_zero_credit_and_unchanged_guard():
+    """Healthy node (scarcity 0): credit must be exactly zero and the guard
+    must behave exactly as before — the dead channel still fails it."""
+    mod = _structural_module(scarcity=0.0)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    for rec in plan["recommendations"]:
+        econ = rec["economics"]
+        assert econ["structural_uplift_sats"] == 0
+        assert econ["structural"] is False
+        assert econ["passes_profit_guard"] is False
+
+
+def test_structural_budget_zero_disables_credit_entirely():
+    """Envelope disabled (budget 0): even a fully starved node earns no credit."""
+    mod = _structural_module(scarcity=1.0, structural_budget=0)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    for rec in plan["recommendations"]:
+        econ = rec["economics"]
+        assert econ["structural_uplift_sats"] == 0
+        assert econ["structural"] is False
+
+
+def test_credit_scales_with_scarcity():
+    full = _structural_module(scarcity=1.0)
+    half = _structural_module(scarcity=0.5)
+
+    full_plan = full._build_boltz_balance_plan(require_profitable=True)
+    half_plan = half._build_boltz_balance_plan(require_profitable=True)
+
+    full_credit = full_plan["recommendations"][0]["economics"]["structural_uplift_sats"]
+    half_credit = half_plan["recommendations"][0]["economics"]["structural_uplift_sats"]
+    assert full_credit > 0 and half_credit > 0
+    assert full_credit == pytest.approx(2 * half_credit, rel=0.05)
+
+
+def test_realized_ppm_zero_disables_credit():
+    """No realized earn rate (new node, no forwards): credit must be zero."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=0)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    for rec in plan["recommendations"]:
+        assert rec["economics"]["structural_uplift_sats"] == 0
+
+
+def test_db_and_status_called_once_not_per_candidate():
+    """Receivable status and realized fee rate are hoisted out of the channel
+    loop: one evaluation per plan build, regardless of candidate count."""
+    mod = _structural_module(scarcity=1.0)
+    status_calls = {"n": 0}
+    base_status = mod._node_receivable_status
+
+    def counting_status():
+        status_calls["n"] += 1
+        return base_status()
+
+    mod._node_receivable_status = counting_status
+    # TWO loop-out candidates, both at 97% local.
+    mod.fee_controller._get_channels_info.return_value = {
+        "100x1x0": {
+            "peer_id": "02" + "b" * 64,
+            "capacity": 10_000_000,
+            "spendable_msat": 9_700_000_000,
+            "receivable_msat": 300_000_000,
+        },
+        "101x1x0": {
+            "peer_id": "02" + "c" * 64,
+            "capacity": 10_000_000,
+            "spendable_msat": 9_700_000_000,
+            "receivable_msat": 300_000_000,
+        },
+    }
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    assert len(plan["recommendations"]) == 2
+    assert mod.database.get_node_realized_fee_ppm.call_count == 1
+    assert status_calls["n"] == 1

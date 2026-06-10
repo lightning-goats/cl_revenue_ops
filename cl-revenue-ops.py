@@ -6787,6 +6787,24 @@ def _build_boltz_balance_plan(
     # subprocess call) — e.g. the balance cycle checks it before plan build.
     pending_swaps = int(pending_swap_count) if pending_swap_count is not None else _boltz_pending_swap_count()
 
+    # Structural inbound-credit inputs, hoisted to ONE evaluation per plan
+    # build (the candidate loop runs for up to ~50-100 channels and must not
+    # re-query node receivable status or the realized fee rate per channel).
+    # Both default to neutral (0) on error or when the envelope is disabled.
+    structural_budget_sats = int(getattr(config, "boltz_structural_budget_sats_per_day", 0) or 0)
+    structural_scarcity = 0.0
+    structural_realized_ppm = 0
+    if structural_budget_sats > 0:
+        try:
+            structural_scarcity = float(_node_receivable_status().get("scarcity", 0.0) or 0.0)
+        except Exception:
+            structural_scarcity = 0.0
+        if structural_scarcity > 0.0:
+            try:
+                structural_realized_ppm = int(database.get_node_realized_fee_ppm(window_days=7) or 0)
+            except Exception:
+                structural_realized_ppm = 0
+
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
@@ -7000,6 +7018,30 @@ def _build_boltz_balance_plan(
         if effective_profit_margin != float(profit_margin_factor):
             required_profit_threshold_sats = int(round(estimated_fee_sats * effective_profit_margin))
 
+        # Structural inbound credit: a receivable-starved node values the
+        # inbound capacity a loop-out creates, priced at the node's realized
+        # earn rate. Zero when the node is healthy or the structural
+        # envelope is disabled — the per-channel guard is then unchanged.
+        # NOTE: this is deliberately a Boltz-only concept. The circular
+        # rebalancer must never use it: rebalancing conserves the aggregate
+        # ratio, so inbound scarcity is not actionable there.
+        structural_uplift_sats = 0
+        if (
+            direction == "loop_out"
+            and structural_budget_sats > 0
+            and structural_scarcity > 0.0
+            and structural_realized_ppm > 0
+        ):
+            # Mirror the conservative DTS-uplift volume model:
+            # assume half the freed inbound turns over per horizon.
+            projected_volume = amount_sats * 0.5 * structural_scarcity
+            structural_uplift_sats = int(
+                projected_volume * structural_realized_ppm / 1_000_000
+                * float(expected_horizon_days)
+            )
+        passes_without_credit = expected_gross_uplift_sats >= required_profit_threshold_sats
+        expected_gross_uplift_sats += structural_uplift_sats
+
         passes_profit_guard = (expected_gross_uplift_sats >= required_profit_threshold_sats) if require_profitable else True
         expected_net_sats = expected_gross_uplift_sats - estimated_fee_sats
 
@@ -7078,6 +7120,12 @@ def _build_boltz_balance_plan(
                 "risk_adjusted_net_sats": risk_adjusted_net_sats,
                 "profit_margin_factor": effective_profit_margin,
                 "passes_profit_guard": bool(passes_profit_guard),
+                "structural_uplift_sats": structural_uplift_sats,
+                "structural": bool(
+                    passes_profit_guard
+                    and structural_uplift_sats > 0
+                    and not passes_without_credit
+                ),
                 "rebalance_impossible": rebalance_impossible,
                 "loop_in_non_pinnable": direction == "loop_in",
             },
