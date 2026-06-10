@@ -14,7 +14,12 @@ from .rebalance_route_policy import (
     _pair_segments,
     decide_route_policy,
 )
-from .rebalance_state_v2 import ChannelState, StateSnapshot
+from .rebalance_state_v2 import (
+    ChannelState,
+    StateSnapshot,
+    _drain_score,
+    _refill_urgency,
+)
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
 
 
@@ -259,6 +264,20 @@ def _build_pair_from_entry(
 
     source_excess = _channel_excess_sats(source, target_band_high)
     sink_need = _channel_need_sats(sink, target_band_low)
+    # Score in planner units (roughly [0.1, 1.5]) so coordination pairs are
+    # comparable with planner pairs in final ordering and so the engine's
+    # hold-margin EV gate is meaningful. The ratios mirror rebalance_state_v2's
+    # _drain_score/_refill_urgency shapes (excess over band headroom, deficit
+    # over the band floor, each in [0, 1]); the bounded priority multiplier
+    # preserves producer ranking without letting a raw sats-scale score
+    # dominate everything.
+    excess_ratio = _drain_score(source.local_ratio, target_band_high)
+    need_ratio = _refill_urgency(sink.local_ratio, target_band_low)
+    base_score = max(0.0, min(2.0, need_ratio + excess_ratio))
+    priority = _priority_score(entry)
+    normalized_score = base_score * (
+        1.0 + min(priority, MAX_HINT_PRIORITY_SCORE) / 100.0 * 0.15
+    )
     hinted_amount = _entry_amount_sats(entry)
     amount_sats = min(
         max_chunk_sats,
@@ -289,20 +308,22 @@ def _build_pair_from_entry(
         dest_value_class=sink.value_class,
         source_budget_source=source.budget_source,
         dest_budget_source=sink.budget_source,
-        score=(source_excess + sink_need) / 2.0,
+        score=normalized_score,
         source_local_ratio=source.local_ratio,
         dest_local_ratio=sink.local_ratio,
         reason_code="coordinated_rebalance",
         coordination_hint_type=hint_type,
         coordination_hint_id=hint_id,
-        coordination_rank_bonus=_priority_score(entry),
+        coordination_rank_bonus=priority,
     )
     pair.route_decision = decide_route_policy(
         pair,
         reason_code=pair.reason_code,
         hive_hints=hive_hints,
     )
-    pair.score *= pair_segment_bias_multiplier(pair, hive_hints, our_node_id)
+    # Segment utility bias is intentionally NOT applied here: the engine
+    # applies _apply_segment_score_bias uniformly to every selected pair, and
+    # multiplying it here too would double-apply it to coordination pairs.
     return pair, None
 
 
@@ -463,6 +484,8 @@ def merge_coordination_pairs(
             for existing in selected:
                 if _pair_key(existing) != key:
                     continue
+                # Planner, overlay, and equalization scores all share planner
+                # units, so taking the max is a like-for-like comparison.
                 existing.score = max(existing.score, pair.score)
                 if existing.route_decision is None:
                     existing.route_decision = pair.route_decision

@@ -32,7 +32,12 @@ from .rebalance_route_policy import (
 )
 from .rebalance_router_v2 import RouteResult
 from .rebalance_router_v3 import RebalanceRouterV3, _configured_layer_names
-from .rebalance_state_v2 import StateSnapshot, build_state_snapshot
+from .rebalance_state_v2 import (
+    StateSnapshot,
+    _drain_score,
+    _refill_urgency,
+    build_state_snapshot,
+)
 from .segment_observations import SegmentObservationStore
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
 from .utils import base_to_sats_ceil, parse_msat
@@ -905,6 +910,18 @@ class RebalanceEngine:
                 amount_sats = min(source_excess, dest_need, max_chunk_sats)
                 if amount_sats <= 0:
                     continue
+                # Score in planner units so equalization pairs are comparable
+                # with planner and coordination pairs in final ordering and
+                # the hold-margin gate. Mirrors the coordination overlay's
+                # normalization (_drain_score/_refill_urgency shapes).
+                equalization_score = max(
+                    0.0,
+                    min(
+                        2.0,
+                        _drain_score(source.local_ratio, high_pct)
+                        + _refill_urgency(dest.local_ratio, low_pct),
+                    ),
+                )
                 candidate_pairs.append(
                     PairCandidate(
                         source_channel_id=source.channel_id,
@@ -919,7 +936,7 @@ class RebalanceEngine:
                         dest_value_class=dest.value_class,
                         source_budget_source=source.budget_source,
                         dest_budget_source=dest.budget_source,
-                        score=float(source_excess + dest_need),
+                        score=equalization_score,
                         source_local_ratio=source.local_ratio,
                         dest_local_ratio=dest.local_ratio,
                         reason_code="hive_equalization",

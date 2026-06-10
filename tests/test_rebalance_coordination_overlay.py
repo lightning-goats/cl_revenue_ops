@@ -214,19 +214,17 @@ def test_overlay_keeps_pair_when_overlapping_lease_is_ours():
     assert len(result.selected) == 1
 
 
-def test_overlay_applies_segment_score_bias_to_coordinated_pair():
-    from modules.rebalance_coordination_overlay import build_coordination_pairs
+def test_overlay_score_is_normalized_to_planner_units():
+    """Overlay scores are band-normalized ratios in planner units, not raw
+    sats. _make_snapshot: drain (0.9-0.65)/0.35 + urgency (0.35-0.1)/0.35
+    = ~1.4286 base, priority 90 -> x(1 + 0.90 * 0.15)."""
+    import pytest
 
-    class SegmentAwareHiveHints(FakeHiveHints):
-        def get_segment_score(self, short_channel_id, direction, amount_sats=None):
-            if short_channel_id == "100x1x0" and direction == 0:
-                return {"net_utility": 0.8, "confidence": 0.8}
-            if short_channel_id == "200x1x0" and direction == 1:
-                return {"net_utility": 0.8, "confidence": 0.8}
-            return {}
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+    from modules.rebalance_state_v2 import _drain_score, _refill_urgency
 
     snapshot = _make_snapshot()
-    hints = SegmentAwareHiveHints(
+    hints = FakeHiveHints(
         recommendations=[
             {
                 "recommendation_id": "rec-1",
@@ -241,13 +239,130 @@ def test_overlay_applies_segment_score_bias_to_coordinated_pair():
     )
 
     candidates = build_coordination_pairs(
-        snapshot,
-        hive_hints=hints,
-        our_node_id="01" + "0" * 64,
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    expected_base = _drain_score(0.9, 0.65) + _refill_urgency(0.1, 0.35)
+    assert len(candidates) == 1
+    assert candidates[0].score == pytest.approx(expected_base * 1.135, rel=1e-4)
+    # Comparable with planner units (roughly [0.1, 1.5], never sats-scale).
+    assert candidates[0].score < 2.3
+
+
+def test_overlay_score_priority_multiplier_is_bounded():
+    """An absurd producer priority_score clamps to 100 -> max x1.15."""
+    import pytest
+
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+    from modules.rebalance_state_v2 import _drain_score, _refill_urgency
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-1",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+                "priority_score": 1_000_000.0,
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    expected_base = _drain_score(0.9, 0.65) + _refill_urgency(0.1, 0.35)
+    assert len(candidates) == 1
+    assert candidates[0].score == pytest.approx(expected_base * 1.15, rel=1e-4)
+
+
+def test_overlay_does_not_apply_segment_bias_itself():
+    """Segment utility bias is applied once, by the engine, to ALL selected
+    pairs. The overlay must not pre-multiply it (double application)."""
+    import pytest
+
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    class SegmentAwareHiveHints(FakeHiveHints):
+        def get_segment_score(self, short_channel_id, direction, amount_sats=None):
+            if short_channel_id == "100x1x0" and direction == 0:
+                return {"net_utility": 0.8, "confidence": 0.8}
+            if short_channel_id == "200x1x0" and direction == 1:
+                return {"net_utility": 0.8, "confidence": 0.8}
+            return {}
+
+    recommendations = [
+        {
+            "recommendation_id": "rec-1",
+            "source_scid": "100x1x0",
+            "sink_scid": "200x1x0",
+            "amount_sats": 120_000,
+            "route_policy": "hive_only",
+            "priority_score": 90.0,
+            "allow_market_fallback": False,
+        }
+    ]
+    our_node_id = "01" + "0" * 64
+
+    biased = build_coordination_pairs(
+        _make_snapshot(),
+        hive_hints=SegmentAwareHiveHints(recommendations=recommendations),
+        our_node_id=our_node_id,
+    )
+    unbiased = build_coordination_pairs(
+        _make_snapshot(),
+        hive_hints=FakeHiveHints(recommendations=recommendations),
+        our_node_id=our_node_id,
+    )
+
+    assert len(biased) == 1 and len(unbiased) == 1
+    assert biased[0].score == pytest.approx(unbiased[0].score)
+
+
+def test_low_merit_coordination_score_comparable_with_planner_scores():
+    """A mildly imbalanced coordination pair scores below a high-merit
+    planner pair (planner scores live in roughly [0.1, 1.5])."""
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    snapshot = build_state_snapshot(
+        [
+            {
+                "channel_id": "100x1x0",
+                "peer_id": "02" + "1" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 700_000,  # barely over band: excess_ratio 0.05
+                "is_hive_member": True,
+            },
+            {
+                "channel_id": "200x1x0",
+                "peer_id": "02" + "2" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 300_000,  # barely under band: need_ratio 0.05
+                "is_hive_member": True,
+            },
+        ],
+        {"channel_budgets": {"200x1x0": {"budget_sats": 40}}},
+    )
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-low",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 40_000,
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot, hive_hints=hints, our_node_id="02ours"
     )
 
     assert len(candidates) == 1
-    assert candidates[0].score > 250_000
+    high_merit_planner_score = 1.2
+    assert 0.0 < candidates[0].score < high_merit_planner_score
 
 
 # -----------------------------------------------------------------------------

@@ -2998,3 +2998,225 @@ def test_immune_rebalance_bias_is_bounded_score_modifier(mock_plugin, mock_datab
     assert pair.immune_rebalance_influence["bias_capped"] is True
     engine._update_pair_score_decomposition(pair, route_status="planned")
     assert pair.score_decomposition["inputs"]["immune_rebalance_bias"] == pytest.approx(0.85)
+
+
+# -----------------------------------------------------------------------------
+# Score-unit normalization: coordination/equalization scores live in planner
+# units so the hold-margin EV gate and final ordering are meaningful.
+# -----------------------------------------------------------------------------
+
+
+class _OverlayHints:
+    """Minimal hive-hints double for overlay-driven engine tests."""
+
+    def __init__(self, recommendations=None, campaigns=None, leases=None):
+        self._recommendations = list(recommendations or [])
+        self._campaigns = list(campaigns or [])
+        self._leases = list(leases or [])
+
+    def is_fresh(self):
+        return True
+
+    def is_hive_member(self, peer_id):
+        return False
+
+    def get_rebalance_recommendations(self):
+        return list(self._recommendations)
+
+    def get_rebalance_campaigns(self):
+        return list(self._campaigns)
+
+    def get_route_segment_leases(self):
+        return list(self._leases)
+
+    def get_segment_score(self, short_channel_id, direction, amount_sats=None):
+        return {}
+
+
+def _overlay_snapshot():
+    from modules.rebalance_state_v2 import build_state_snapshot
+
+    return build_state_snapshot(
+        [
+            {
+                "channel_id": "100x1x0",
+                "peer_id": "02" + "1" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 900_000,
+            },
+            {
+                "channel_id": "200x1x0",
+                "peer_id": "02" + "2" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 100_000,
+            },
+        ],
+        {"channel_budgets": {"200x1x0": {"budget_sats": 10_000}}},
+    )
+
+
+def test_hive_equalization_score_is_normalized_to_planner_units(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_state_v2 import build_state_snapshot
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._hive_router = MagicMock(name="hive_router")
+    engine._hive_router.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=0,
+        route=[{"channel": "fleet"}],
+        probability_ppm=0,
+        error="",
+    )
+    engine._audit = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=build_state_snapshot(
+            [
+                {
+                    "channel_id": "100x1x0",
+                    "peer_id": "02" + "1" * 64,
+                    "capacity_sats": 1_000_000,
+                    "local_sats": 900_000,
+                    "is_hive_member": True,
+                },
+                {
+                    "channel_id": "200x1x0",
+                    "peer_id": "02" + "2" * 64,
+                    "capacity_sats": 1_000_000,
+                    "local_sats": 100_000,
+                    "is_hive_member": True,
+                },
+            ],
+            {},
+        )
+    )
+
+    selected = engine.find_candidates()
+
+    from modules.rebalance_state_v2 import _drain_score, _refill_urgency
+
+    assert len(selected) == 1
+    assert selected[0].reason_code == "hive_equalization"
+    # drain (0.9-0.65)/0.35 + urgency (0.35-0.1)/0.35 = ~1.4286
+    expected = _drain_score(0.9, 0.65) + _refill_urgency(0.1, 0.35)
+    assert selected[0].score == pytest.approx(expected, rel=1e-4)
+    assert selected[0].score < 2.0
+
+
+def test_coordination_pair_with_negative_ev_is_rejected_by_hold_margin(
+    mock_plugin, mock_database
+):
+    """Pre-normalization, sats-scale coordination scores (e.g. 250k) made
+    p*score dwarf every penalty so the hold-margin gate could never reject
+    a coordination pair. Normalized scores make the gate real."""
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    # Route prices at nearly the entire pair budget: expected_fee ~= 1.0 and
+    # capital_risk ~= 1.0, so final_score is negative unless score is huge.
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=9_999,
+        route=[{"channel": "100x1x0"}],
+        probability_ppm=0,
+        error="",
+    )
+    engine._audit = MagicMock()
+    engine._hive_hints = _OverlayHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-negative-ev",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+                "route_policy": "market_only",
+                "priority_score": 90.0,
+            }
+        ]
+    )
+    engine._build_snapshot = MagicMock(return_value=_overlay_snapshot())
+
+    selected = engine.find_candidates()
+
+    assert selected == []
+    skip_reasons = {
+        call.kwargs.get("reason")
+        for call in engine._audit.log_skip.call_args_list
+    }
+    assert "below_hold_margin" in skip_reasons
+
+
+def test_coordination_pair_with_positive_ev_survives_hold_margin(
+    mock_plugin, mock_database
+):
+    """Sanity inverse: a cheap route keeps the coordination pair selected."""
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=5,
+        route=[{"channel": "100x1x0"}],
+        probability_ppm=0,
+        error="",
+    )
+    engine._audit = MagicMock()
+    engine._hive_hints = _OverlayHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-positive-ev",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+                "route_policy": "market_only",
+                "priority_score": 90.0,
+            }
+        ]
+    )
+    engine._build_snapshot = MagicMock(return_value=_overlay_snapshot())
+
+    selected = engine.find_candidates()
+
+    assert len(selected) >= 1
+    assert any(p.coordination_hint_id == "rec-positive-ev" for p in selected)
+
+
+def test_low_merit_coordination_final_score_below_high_merit_planner_pair(
+    mock_plugin, mock_database
+):
+    """With shared units, final_score comparisons across pair origins are
+    meaningful: a low-merit coordination pair no longer trivially outranks
+    a high-merit planner pair."""
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    coordination_pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "1" * 64,
+        dest_peer_id="02" + "2" * 64,
+        amount_sats=40_000,
+        pair_budget_sats=1_000,
+        score=0.1,  # normalized low-merit coordination score
+        reason_code="coordinated_rebalance",
+        coordination_hint_id="rec-low",
+    )
+    planner_pair = PairCandidate(
+        source_channel_id="300x1x0",
+        dest_channel_id="400x1x0",
+        source_peer_id="02" + "3" * 64,
+        dest_peer_id="02" + "4" * 64,
+        amount_sats=40_000,
+        pair_budget_sats=1_000,
+        score=1.2,  # high-merit planner score
+    )
+
+    coord_decomp = engine._build_score_decomposition(
+        coordination_pair, route_cost_sats=10, route_status="priced"
+    )
+    plan_decomp = engine._build_score_decomposition(
+        planner_pair, route_cost_sats=10, route_status="priced"
+    )
+
+    assert plan_decomp["final_score"] > coord_decomp["final_score"]
