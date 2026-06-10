@@ -500,6 +500,16 @@ class RebalanceEngine:
                 buckets["source_inside_band"] += 1
         return buckets
 
+    def get_drain_demand(self):
+        """Residual over-local demand from the last planning pass, or None.
+
+        Consumed by the Boltz structural loop-out path. Read-only snapshot;
+        the planner regenerates it every cycle.
+        """
+        last = self._last_cycle_result
+        plan = getattr(last, "plan", None) if last is not None else None
+        return getattr(plan, "drain_demand", None)
+
     def get_last_cycle_debug(self, max_candidates: int = 10) -> Dict[str, Any]:
         result = self._last_cycle_result or CycleResult()
         limit = max(0, int(max_candidates or 0))

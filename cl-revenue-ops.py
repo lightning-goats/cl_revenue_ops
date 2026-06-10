@@ -3137,6 +3137,23 @@ def revenue_rebalance_debug(
             )
         except Exception as e:
             result["last_cycle"] = {"error": str(e)}
+
+    drain = None
+    engine = getattr(rebalancer, "rebalance_engine_v2", None) if rebalancer else None
+    demand = engine.get_drain_demand() if engine is not None and hasattr(engine, "get_drain_demand") else None
+    if demand is not None:
+        drain = {
+            "total_excess_sats": demand.total_excess_sats,
+            "over_local_count": demand.over_local_count,
+            "paired_count": demand.paired_count,
+            "top_entries": [
+                {"channel_id": e.channel_id, "excess_sats": e.excess_sats,
+                 "drain_score": e.drain_score, "value_class": e.value_class}
+                for e in demand.entries[:10]
+            ],
+        }
+    result["drain_demand"] = drain
+
     return result
 
 
