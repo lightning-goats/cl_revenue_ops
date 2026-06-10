@@ -452,13 +452,13 @@ class TestRebalanceCostFloor:
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
-        # Mock cost history with enough samples
+        # Mock cost history with enough samples (>= REBALANCE_FLOOR_MIN_SAMPLES)
         mock_database.get_channel_cost_history.return_value = [
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400},
             {"cost_sats": 120, "amount_sats": 1_200_000, "timestamp": int(time.time()) - 86400 * 2},
             {"cost_sats": 80, "amount_sats": 800_000, "timestamp": int(time.time()) - 86400 * 3},
+            {"cost_sats": 90, "amount_sats": 900_000, "timestamp": int(time.time()) - 86400 * 4},
         ]
-        mock_database.get_channel_rebalance_success_rate.return_value = None
 
         # SOURCE and ROUTER both rebalance — both get the cost-recovery floor
         # (Phase B.2, 2026-04-23: widened from SOURCE-only).
@@ -488,20 +488,20 @@ class TestRebalanceCostFloor:
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400},
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 2},
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 3},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 4},
         ]
-        mock_database.get_channel_rebalance_success_rate.return_value = None
 
         result = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
 
-        # Cost is 100ppm, with 20% margin = 120ppm (success_rate=1.0 default)
+        # Cost is 100ppm, with 20% margin = 120ppm
         expected = int(100 * fc.REBALANCE_FLOOR_MARGIN)  # 120
         assert result == expected
 
     def test_rebalance_floor_requires_min_samples(self, mock_database, mock_plugin):
         """Rebalance floor should return None if insufficient samples.
 
-        Phase B.2 (2026-04-23): min_samples was lowered from 3 to 2, so
-        1 sample is now the below-threshold case.
+        P3 fix (2026-06-10): min_samples raised from 2 to 4 so single-
+        rebalance noise cannot set a hard price floor.
         """
         from modules.fee_controller import FeeController
         from modules.config import Config
@@ -512,9 +512,11 @@ class TestRebalanceCostFloor:
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
-        # Only 1 sample — below the new min of 2.
+        # 3 samples — below the new min of 4.
         mock_database.get_channel_cost_history.return_value = [
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 2},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": int(time.time()) - 86400 * 3},
         ]
         # Also no peer history available
         mock_database.get_historical_inbound_fee_ppm.return_value = None
@@ -566,6 +568,7 @@ class TestRebalanceCostFloor:
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": old_timestamp},
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": old_timestamp - 86400},
             {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": old_timestamp - 86400 * 2},
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": old_timestamp - 86400 * 3},
         ]
         mock_database.get_historical_inbound_fee_ppm.return_value = None
 
@@ -597,12 +600,18 @@ class TestRebalanceCostFloor:
 
 
 # =============================================================================
-# Success-Rate-Adjusted Cost Floor Tests (Change 9)
+# Realized-Cost Floor Tests (P3 fix, 2026-06-10)
 # =============================================================================
 
 
-class TestSuccessRateAdjustedFloor:
-    """Verify fee floor adjusts by rebalance success rate."""
+class TestRealizedCostFloorNoSuccessRateDivision:
+    """P3: the floor must reflect realized cost x margin only.
+
+    Failed rebalance attempts pay nothing, so dividing the realized
+    successful-rebalance cost by the success rate double-charged failure
+    (up to 12x at the old 10% clamp). The success rate must no longer
+    influence the floor.
+    """
 
     def _make_fc(self, mock_plugin, mock_database):
         from modules.fee_controller import FeeController
@@ -611,7 +620,7 @@ class TestSuccessRateAdjustedFloor:
         config = MagicMock(spec=Config)
         return FeeController(mock_plugin, config, mock_database)
 
-    def _cost_history(self, cost_ppm=100, n=3):
+    def _cost_history(self, cost_ppm=100, n=5):
         """Return n cost records that average to cost_ppm per 1M sats."""
         now = int(time.time())
         return [
@@ -619,8 +628,8 @@ class TestSuccessRateAdjustedFloor:
             for i in range(n)
         ]
 
-    def test_success_rate_doubles_floor_at_50pct(self, mock_database, mock_plugin):
-        """50% success rate should ~double the floor vs 100% success rate."""
+    def test_success_rate_does_not_change_floor(self, mock_database, mock_plugin):
+        """Floor is identical at 100% and 50% success rates."""
         fc = self._make_fc(mock_plugin, mock_database)
 
         channel_id = "123x456x0"
@@ -628,74 +637,36 @@ class TestSuccessRateAdjustedFloor:
 
         mock_database.get_channel_cost_history.return_value = self._cost_history(100, 5)
 
-        # 100% success rate
         mock_database.get_channel_rebalance_success_rate.return_value = {
             'total': 10, 'successes': 10, 'failures': 0,
             'success_rate': 1.0, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
         }
         floor_100 = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
 
-        # 50% success rate
         mock_database.get_channel_rebalance_success_rate.return_value = {
             'total': 10, 'successes': 5, 'failures': 5,
             'success_rate': 0.5, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
         }
         floor_50 = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
 
-        # 50% rate should produce ~2x floor
-        assert floor_50 > floor_100
-        assert abs(floor_50 - 2 * floor_100) <= 1  # Allow rounding
+        assert floor_100 == floor_50 == int(100 * fc.REBALANCE_FLOOR_MARGIN)
 
-    def test_success_rate_floor_minimum_10pct(self, mock_database, mock_plugin):
-        """Success rate should be floored at 10% to prevent 10x+ explosion."""
+    def test_terrible_success_rate_cannot_explode_floor(self, mock_database, mock_plugin):
+        """5% success rate must NOT multiply the floor (old behavior: 12x)."""
         fc = self._make_fc(mock_plugin, mock_database)
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
 
         mock_database.get_channel_cost_history.return_value = self._cost_history(100, 5)
-
-        # 5% success rate (below 10% floor)
         mock_database.get_channel_rebalance_success_rate.return_value = {
             'total': 100, 'successes': 5, 'failures': 95,
             'success_rate': 0.05, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
         }
-        floor_low = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
-
-        # 10% success rate (at floor)
-        mock_database.get_channel_rebalance_success_rate.return_value = {
-            'total': 100, 'successes': 10, 'failures': 90,
-            'success_rate': 0.10, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
-        }
-        floor_at_minimum = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
-
-        # Both should produce the same floor (clamped at 10%)
-        assert floor_low == floor_at_minimum
-        # 100ppm / 0.10 * 1.20 = 1200ppm
-        assert floor_low == 1200
-
-    def test_success_rate_insufficient_samples(self, mock_database, mock_plugin):
-        """Success rate = 1.0 should be used when < min_samples.
-
-        Phase B.2 (2026-04-23): min_samples was lowered from 3 to 2, so
-        the below-threshold case is now 1 rebalance.
-        """
-        fc = self._make_fc(mock_plugin, mock_database)
-
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-
-        mock_database.get_channel_cost_history.return_value = self._cost_history(100, 5)
-
-        # Only 1 rebalance (below min_samples=2)
-        mock_database.get_channel_rebalance_success_rate.return_value = {
-            'total': 1, 'successes': 0, 'failures': 1,
-            'success_rate': 0.0, 'avg_cost_ppm': 100, 'avg_amount_sats': 1_000_000,
-        }
         floor = fc._get_rebalance_cost_floor(channel_id, peer_id, "source")
 
-        # Should use success_rate=1.0, so floor = 100 * 1.20 = 120
-        assert floor == 120
+        # 100ppm * 1.20 = 120ppm, NOT 1200ppm
+        assert floor == int(100 * fc.REBALANCE_FLOOR_MARGIN)
 
     def test_success_rate_no_data_uses_default(self, mock_database, mock_plugin):
         """No rebalance success data should default to success_rate=1.0."""

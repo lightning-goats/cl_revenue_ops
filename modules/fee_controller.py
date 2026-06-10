@@ -2131,11 +2131,12 @@ class FeeController:
     # Issue #32: Rebalance Cost-Aware Fee Floor
     # ==========================================================================
     REBALANCE_FLOOR_MARGIN = 1.20
-    # Phase B.2 (2026-04-23): lowered from 3. Short lab windows and newly-
-    # opened production channels rarely accumulate 3 rebalances before the
-    # posterior stabilizes; 2 samples are enough to start recovering cost
-    # and the 20% margin absorbs sample noise.
-    REBALANCE_FLOOR_MIN_SAMPLES = 2
+    # P3 fix (2026-06-10): raised from 2 back to 4. With only 2 samples the
+    # cost floor was dominated by single-rebalance noise, and (combined with
+    # the now-removed success-rate division) could overcharge by up to 12x.
+    # Invariant: the rebalance floor only activates once there is enough
+    # realized cost data for the per-ppm estimate to be meaningful.
+    REBALANCE_FLOOR_MIN_SAMPLES = 4
     REBALANCE_FLOOR_WINDOW_DAYS = 30
 
     # Phase B.3 (2026-04-23): variance-gated undercut. When DTS posterior
@@ -3793,21 +3794,16 @@ class FeeController:
             if total_volume > 0:
                 cost_ppm = (total_cost * 1_000_000) // total_volume
 
-                # Adjust for success rate — effective cost = cost / success_rate
-                # If 50% of rebalances fail, effective replenishment cost is 2x recorded.
-                success_data = self.database.get_channel_rebalance_success_rate(
-                    channel_id, self.REBALANCE_FLOOR_WINDOW_DAYS
-                )
-                success_rate = 1.0
-                if success_data and success_data['total'] >= self.REBALANCE_FLOOR_MIN_SAMPLES:
-                    success_rate = max(success_data['success_rate'], 0.10)  # Floor at 10% to prevent explosion
-
-                effective_cost_ppm = int(cost_ppm / success_rate)
-                floor_ppm = int(effective_cost_ppm * self.REBALANCE_FLOOR_MARGIN)
+                # P3 fix (2026-06-10): no success-rate division. Failed
+                # rebalance attempts pay nothing, so cost_ppm (realized cost
+                # over successfully moved volume) already IS the effective
+                # replenishment cost. Dividing by the success rate (floored
+                # at 10%) double-charged failure and overcharged up to 12x.
+                # Invariant: the floor reflects realized cost x margin only.
+                floor_ppm = int(cost_ppm * self.REBALANCE_FLOOR_MARGIN)
 
                 self.plugin.log(
                     f"REBALANCE_FLOOR: {channel_id[:12]}... raw_cost={cost_ppm}ppm "
-                    f"success_rate={success_rate:.0%} effective={effective_cost_ppm}ppm "
                     f"* {self.REBALANCE_FLOOR_MARGIN:.0%} = {floor_ppm}ppm "
                     f"({len(recent_costs)} samples)",
                     level='debug'
@@ -5222,9 +5218,25 @@ class FeeController:
         floor_ppm = base_floor_ppm
         ceiling_ppm = base_ceiling_ppm
 
-        # Security: Ensure floor never exceeds ceiling
+        # Floor/ceiling inversion guard.
+        # P3 fix (2026-06-10): prefer the ceiling. The old behavior
+        # (ceiling = floor + 10) let the rebalance/vegas floor override the
+        # zero-flow discovery ceiling, locking stagnant channels at exactly
+        # the price that had already produced zero flow. Invariant:
+        # floor < ceiling always, and the discovery ceiling wins over cost
+        # floors unless min_fee_ppm itself forces the floor higher.
         if floor_ppm >= ceiling_ppm:
-            ceiling_ppm = floor_ppm + 10
+            overridden_floor_ppm = max(cfg.min_fee_ppm, ceiling_ppm - 10)
+            self.plugin.log(
+                f"FLOOR_INVERSION: {channel_id[:12]}... rebalance/vegas floor "
+                f"{floor_ppm}ppm overridden by discovery ceiling {ceiling_ppm}ppm; "
+                f"floor lowered to {overridden_floor_ppm}ppm",
+                level='debug'
+            )
+            floor_ppm = overridden_floor_ppm
+            if floor_ppm >= ceiling_ppm:
+                # min_fee_ppm dominates a tiny ceiling; keep floor < ceiling.
+                ceiling_ppm = floor_ppm + 10
         
         # Target Decision Block (Fee Priority Chain)
         # Priority: Congestion > bounded low-fee exploration > DTS+PID
