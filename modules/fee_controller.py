@@ -2140,6 +2140,20 @@ class FeeController:
     REBALANCE_FLOOR_WINDOW_DAYS = 30
 
     # ==========================================================================
+    # P8 fix (2026-06-10): Vegas spike wake-up for sleeping channels
+    # ==========================================================================
+    # The sleep early-return precedes the Vegas floor computation, so sleeping
+    # channels could ride out up to a full sleep period (~1h) with unraised
+    # floors during a mempool spike. When Vegas intensity crosses
+    # VEGAS_WAKE_INTENSITY_THRESHOLD the controller wakes all sleeping
+    # channels once per crossing (edge-triggered via _vegas_wake_armed) and
+    # re-arms only after intensity decays below VEGAS_WAKE_REARM_INTENSITY.
+    # Invariant: a sustained spike triggers exactly one fleet-wide wake, not
+    # one per cycle.
+    VEGAS_WAKE_INTENSITY_THRESHOLD = 0.5
+    VEGAS_WAKE_REARM_INTENSITY = 0.3
+
+    # ==========================================================================
     # F2 fix (2026-06-10): total hive hint authority over price
     # ==========================================================================
     # _get_hive_fee_bias clamps its own output to [0.9, 1.1], but the temporal
@@ -2238,6 +2252,9 @@ class FeeController:
 
         # Vegas Reflex state (global, not per-channel)
         self._vegas_state = VegasReflexState(decay_rate=config.vegas_decay_rate)
+        # P8: edge trigger for the spike wake-up (armed = next threshold
+        # crossing wakes sleeping channels; re-armed after decay).
+        self._vegas_wake_armed: bool = True
 
         # AskRene topology cache (for depletion checks)
         self._askrene_cache: Dict[str, int] = {}
@@ -4075,6 +4092,33 @@ class FeeController:
 
         return woken
 
+    def _maybe_wake_for_vegas_spike(self) -> bool:
+        """Wake all sleeping channels once per Vegas intensity crossing (P8).
+
+        Edge-triggered: fires when intensity crosses
+        VEGAS_WAKE_INTENSITY_THRESHOLD while armed, then stays quiet until
+        intensity decays below VEGAS_WAKE_REARM_INTENSITY. This keeps the
+        response to a sustained spike to a single fleet-wide wake instead of
+        re-waking (and re-pricing) every cycle.
+
+        Returns:
+            True if a wake was triggered this call.
+        """
+        intensity = float(self._vegas_state.intensity)
+        if self._vegas_wake_armed and intensity >= self.VEGAS_WAKE_INTENSITY_THRESHOLD:
+            self._vegas_wake_armed = False
+            woken = self.wake_all_sleeping_channels()
+            self.plugin.log(
+                f"VEGAS WAKE: intensity={intensity:.2f} crossed "
+                f"{self.VEGAS_WAKE_INTENSITY_THRESHOLD:.2f}; woke {woken} sleeping "
+                f"channels so spike floors apply immediately",
+                level='info'
+            )
+            return True
+        if not self._vegas_wake_armed and intensity < self.VEGAS_WAKE_REARM_INTENSITY:
+            self._vegas_wake_armed = True
+        return False
+
     def adjust_all_fees(self) -> List[FeeAdjustment]:
         """
         Adjust fees for all channels using DTS+PID optimization.
@@ -4181,6 +4225,9 @@ class FeeController:
                     f"multiplier={self._vegas_state.get_floor_multiplier():.2f}x",
                     level='info'
                 )
+            # P8: mempool spikes must reach sleeping channels too — their
+            # sleep early-return runs before the Vegas floor computation.
+            self._maybe_wake_for_vegas_spike()
         
         # PERF: defer fee-strategy row persistence for the whole cycle and
         # flush once at the end (single batch write instead of ~2 full-row

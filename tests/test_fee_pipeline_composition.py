@@ -425,3 +425,75 @@ class TestWindowWaitShortCircuit:
 
         assert result is not None
         assert len(floor_calls) >= 1
+
+
+# =============================================================================
+# P8: Vegas spikes wake sleeping channels (edge-triggered)
+# =============================================================================
+
+class TestVegasSpikeWake:
+
+    def _fc(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        fc.wake_all_sleeping_channels = MagicMock(return_value=3)
+        return fc
+
+    def test_crossing_threshold_wakes_once(self, mock_plugin, mock_database):
+        fc = self._fc(mock_plugin, mock_database)
+        fc._vegas_state.intensity = 0.8  # mocked vegas spike
+
+        assert fc._maybe_wake_for_vegas_spike() is True
+        assert fc.wake_all_sleeping_channels.call_count == 1
+
+        # Sustained spike: no second wake while above re-arm level
+        assert fc._maybe_wake_for_vegas_spike() is False
+        fc._vegas_state.intensity = 0.55
+        assert fc._maybe_wake_for_vegas_spike() is False
+        assert fc.wake_all_sleeping_channels.call_count == 1
+
+    def test_rearms_below_decay_threshold_then_fires_again(self, mock_plugin, mock_database):
+        fc = self._fc(mock_plugin, mock_database)
+        fc._vegas_state.intensity = 0.9
+        assert fc._maybe_wake_for_vegas_spike() is True
+
+        # Decay between thresholds: still disarmed
+        fc._vegas_state.intensity = 0.4
+        assert fc._maybe_wake_for_vegas_spike() is False
+
+        # Below re-arm threshold: re-arm (no wake yet)
+        fc._vegas_state.intensity = 0.2
+        assert fc._maybe_wake_for_vegas_spike() is False
+
+        # New spike: fires again
+        fc._vegas_state.intensity = 0.6
+        assert fc._maybe_wake_for_vegas_spike() is True
+        assert fc.wake_all_sleeping_channels.call_count == 2
+
+    def test_below_threshold_never_wakes(self, mock_plugin, mock_database):
+        fc = self._fc(mock_plugin, mock_database)
+        for intensity in (0.0, 0.1, 0.3, 0.49):
+            fc._vegas_state.intensity = intensity
+            assert fc._maybe_wake_for_vegas_spike() is False
+        fc.wake_all_sleeping_channels.assert_not_called()
+
+    def test_named_constants(self):
+        assert FeeController.VEGAS_WAKE_INTENSITY_THRESHOLD == 0.5
+        assert FeeController.VEGAS_WAKE_REARM_INTENSITY == 0.3
+
+    def test_cycle_invokes_wake_check_after_vegas_update(self, mock_plugin, mock_database):
+        """adjust_all_fees wires the spike check into the Vegas update path."""
+        fc, cfg = _make_fc(mock_plugin, mock_database, enable_vegas_reflex=True)
+        # One state so the cycle survives the empty-states early return;
+        # empty channels info means no actual repricing happens.
+        mock_database.get_all_channel_states.return_value = [
+            {"channel_id": CHANNEL_ID, "peer_id": PEER_ID, "state": "balanced"},
+        ]
+        mock_database.get_mempool_ma.return_value = 10.0
+        fc._get_dynamic_chain_costs = lambda: {"sat_per_vbyte": 100.0}  # 10x spike
+        fc._get_channels_info = lambda: {}
+        fc.wake_all_sleeping_channels = MagicMock(return_value=0)
+
+        fc.adjust_all_fees()
+
+        # 10x spike -> intensity 1.0 -> armed crossing must have fired
+        fc.wake_all_sleeping_channels.assert_called_once()
