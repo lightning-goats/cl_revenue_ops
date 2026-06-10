@@ -172,6 +172,12 @@ class HiveHintAdapter:
     VALID_CORRIDOR_ROLES = {"owner", "secondary", "contested", "none"}
     STALE_FALLBACK_MIN_SECONDS = 6 * 3600
     STALE_FALLBACK_TTL_MULTIPLIER = 24
+    # Hard ceiling on how old a stale snapshot may be before bounded-bias fields
+    # stop serving.  Without this, a producer-legal ttl_seconds=86400 makes the
+    # fallback window 24×86400 = 24 days.  48 h is a generous operational window
+    # (covers a weekend coordinator outage) while still bounding the risk of
+    # acting on very stale routing intelligence.
+    STALE_FALLBACK_MAX_SECONDS = 48 * 3600
     # Hardening: the snapshot is producer-controlled (and the CLN datastore it
     # rides in is locally writable). A future-dated generated_at or an absurd
     # ttl_seconds must not pin a snapshot as "fresh" indefinitely.
@@ -460,9 +466,15 @@ class HiveHintAdapter:
         if age < -self.HINT_CLOCK_SKEW_SECONDS:
             # Far-future timestamp: refuse to treat as a usable fallback.
             return False
+        # Cap: max(6 h, min(24×TTL, 48 h)) so a producer-legal ttl=86400 gives
+        # a 48 h window rather than 24 days.  STALE_FALLBACK_MAX_SECONDS is the
+        # absolute hard ceiling regardless of TTL.
         max_age = max(
             self.STALE_FALLBACK_MIN_SECONDS,
-            self._effective_ttl_for(snapshot) * self.STALE_FALLBACK_TTL_MULTIPLIER,
+            min(
+                self._effective_ttl_for(snapshot) * self.STALE_FALLBACK_TTL_MULTIPLIER,
+                self.STALE_FALLBACK_MAX_SECONDS,
+            ),
         )
         return age <= max_age
 
@@ -606,6 +618,12 @@ class HiveHintAdapter:
         if self._snapshot_is_fresh(snapshot):
             return True
         if not self._using_stale_fallback:
+            return False
+        # Re-evaluate recency at read time: the _using_stale_fallback flag is set
+        # at poll() time, but polls may keep erroring for days.  If the stored
+        # snapshot has since aged past the fallback window, stop serving bounded
+        # fields even while the flag is still True.
+        if not self._snapshot_is_recent_enough_for_fallback(snapshot):
             return False
         policy = self._normalize_stale_fallback_policy(self._stale_fallback_policy)
         if policy == "full_legacy_fallback":
@@ -806,14 +824,37 @@ class HiveHintAdapter:
         return bool(hint.get("member", False))
 
     def get_membership_status(self, peer_id: str) -> dict:
-        """Return detailed membership/freshness state without changing adapter state."""
+        """Return detailed membership/freshness state without changing adapter state.
+
+        Design note — membership coherence during stale fallback:
+        Under the "bounded_bias" policy, "membership" is in
+        STALE_FALLBACK_NEUTRALIZED_FIELDS: the snapshot's fee_bias is still
+        served but the member flag is suppressed.  Reporting usable=False here
+        (instead of usable=True, member=False) ensures that fee_controller's
+        _classify_channel_role falls into the grace-cache path
+        (_cached_hive_membership_active) rather than reclassifying confirmed
+        members as "non_hive" and charging stranger base fees while their
+        fee_bias from the same snapshot is still active.  No changes to
+        fee_controller are required.
+
+        The "full_legacy_fallback" policy is unaffected: _behavior_field_allowed
+        returns True for "membership" there, so hint lookup succeeds and usable
+        stays True.
+        """
         with self._lock:
             snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
             generated_at = self._finite_number(snapshot.get("generated_at")) if snapshot else None
             generated_at = int(generated_at) if generated_at is not None else None
             age = int(time.time()) - generated_at if generated_at is not None else None
             fresh = self._snapshot_is_fresh(snapshot)
-            usable = fresh or self._using_stale_fallback
+            # Under bounded_bias stale fallback, _behavior_field_allowed returns
+            # False for "membership" (it is in STALE_FALLBACK_NEUTRALIZED_FIELDS).
+            # Report usable=False so consumers engage their local grace caches
+            # rather than seeing usable=True with member=False — which would flip
+            # confirmed fleet members to stranger base fees mid-outage while the
+            # same snapshot's fee_bias is still trusted.
+            membership_allowed = self._behavior_field_allowed("membership", snapshot)
+            usable = fresh or (self._using_stale_fallback and membership_allowed)
             hint = self._get_peer_hint(peer_id, "membership") if usable else {}
             known = usable and isinstance(hint, dict) and "member" in hint
             return {
@@ -1654,6 +1695,10 @@ class HiveHintAdapter:
         }
 
     def get_immune_fee_bias(self, peer_id: str) -> float:
+        # Forward-compat note: cl-hive currently emits fee_bias_delta=0.0
+        # unconditionally (the producer has no fee authority by design), so this
+        # path always returns 1.0 in practice.  It is wired up for completeness
+        # and will become active if the producer gains fee-advisory capability.
         effect = self.get_immune_peer_effect(peer_id)
         if not effect.get("usable"):
             return 1.0
@@ -1859,6 +1904,10 @@ class HiveHintAdapter:
         }
 
     def get_metabolic_fee_bias(self, peer_id: str) -> float:
+        # Forward-compat note: cl-hive currently emits fee_bias_delta=0.0
+        # unconditionally (the producer has no fee authority by design), so this
+        # path always returns 1.0 in practice.  It is wired up for completeness
+        # and will become active if the producer gains fee-advisory capability.
         effect = self.get_metabolic_peer_effect(peer_id)
         if not effect.get("usable"):
             return 1.0

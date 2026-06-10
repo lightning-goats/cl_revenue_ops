@@ -1371,6 +1371,131 @@ class TestStaleFallbackPolicy:
         assert adapter.is_closure_recommended(peer_id) is True
         assert adapter.get_segment_scores()[0]["short_channel_id"] == "123x1x0"
 
+    # -----------------------------------------------------------------------
+    # Issue #1: fallback age re-checked at read time / 48 h hard ceiling
+    # -----------------------------------------------------------------------
+
+    def _aged_out_stale_adapter(self, mock_plugin, *, age_seconds, ttl_seconds=900, policy="bounded_bias"):
+        """Return an adapter with _using_stale_fallback=True but a snapshot
+        whose generated_at has aged past the fallback window, to simulate polls
+        continuously failing while the stored snapshot slowly ages out."""
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0, stale_fallback_policy=policy)
+        adapter.data_service = MagicMock()
+        snapshot = {
+            "generated_at": int(time.time()) - age_seconds,
+            "ttl_seconds": ttl_seconds,
+            "hints": {
+                "02peer": {
+                    "member": True,
+                    "direct_channel_peer": True,
+                    "corridor_role": "owner",
+                    "competition_bias": 1,
+                    "traffic_confidence": 1.0,
+                    "rebalance_preference": "sink",
+                    "peer_quality_score": 1.0,
+                }
+            },
+        }
+        # Force the snapshot in as a stale fallback by bypassing poll logic.
+        # This mirrors what happens when: (a) the snapshot was valid recently,
+        # (b) _store_snapshot set _using_stale_fallback=True, and
+        # (c) subsequent polls kept erroring without clearing the snapshot.
+        adapter._snapshot = snapshot
+        adapter._snapshot_fetched_at = int(time.time()) - age_seconds
+        adapter._using_stale_fallback = True
+        adapter._snapshot_source = "datastore_stale_fallback"
+        return adapter
+
+    def test_aged_out_stale_fallback_serves_neutral_fee_bias(self, mock_plugin):
+        """A snapshot older than the fallback cap must serve fee_bias=1.0 even
+        while _using_stale_fallback is still True."""
+        # 49 h >> 48 h hard ceiling — should be expired
+        adapter = self._aged_out_stale_adapter(mock_plugin, age_seconds=49 * 3600)
+        assert adapter._using_stale_fallback is True
+        assert adapter.get_fee_bias("02peer") == 1.0
+        assert adapter.get_rebalance_bias("02peer") == 1.0
+
+    def test_within_cap_stale_fallback_still_serves_bounded_fields(self, mock_plugin):
+        """A snapshot within the 48 h cap must still serve bounded bias fields."""
+        # 6000 s < 6 h minimum window — use min window of 6 h; 5999 < 21600 → within cap
+        adapter = self._aged_out_stale_adapter(mock_plugin, age_seconds=5999)
+        assert adapter._using_stale_fallback is True
+        assert adapter.get_fee_bias("02peer") > 1.0, "fee_bias should be active within the fallback window"
+
+    def test_ttl_86400_snapshot_stops_serving_after_48h_not_24_days(self, mock_plugin):
+        """With ttl_seconds=86400, the fallback window must be 48 h (hard ceiling),
+        not 24 × 86400 = 24 days."""
+        # 3 days >> 48 h — should be expired
+        adapter_expired = self._aged_out_stale_adapter(
+            mock_plugin, age_seconds=3 * 24 * 3600, ttl_seconds=86400
+        )
+        assert adapter_expired.get_fee_bias("02peer") == 1.0, (
+            "fee_bias must be neutral after 3 days even with ttl=86400 (48 h ceiling)"
+        )
+        # 24 h < 48 h — should still serve
+        adapter_active = self._aged_out_stale_adapter(
+            mock_plugin, age_seconds=24 * 3600, ttl_seconds=86400
+        )
+        assert adapter_active.get_fee_bias("02peer") > 1.0, (
+            "fee_bias should still be active at 24 h with ttl=86400 (within 48 h ceiling)"
+        )
+
+    def test_fallback_max_seconds_constant_is_48h(self, mock_plugin):
+        """STALE_FALLBACK_MAX_SECONDS must equal 48 h (172800 s)."""
+        from modules.hive_hints import HiveHintAdapter as H
+        assert H.STALE_FALLBACK_MAX_SECONDS == 48 * 3600
+
+    # -----------------------------------------------------------------------
+    # Issue #2: membership coherence during stale fallback
+    # -----------------------------------------------------------------------
+
+    def test_membership_status_usable_false_during_bounded_bias_stale_fallback(self, mock_plugin):
+        """Under bounded_bias stale fallback, get_membership_status must report
+        usable=False so fee_controller's grace cache engages rather than
+        reclassifying confirmed members as non_hive."""
+        adapter = self._stale_adapter(mock_plugin, policy="bounded_bias")
+        assert adapter._using_stale_fallback is True
+
+        # fee_bias is still active (bounded field)
+        fee_bias = adapter.get_fee_bias("02stale")
+        assert fee_bias > 1.0, "fee_bias should be active under bounded_bias fallback"
+
+        # membership usable=False — coherence: caller's grace cache engages
+        status = adapter.get_membership_status("02stale")
+        assert status["usable"] is False, (
+            "membership usable must be False under bounded_bias stale fallback "
+            "to keep fee_controller's grace cache active"
+        )
+        assert status["member"] is False
+        assert status["stale_fallback"] is True
+
+    def test_membership_status_usable_true_during_full_legacy_fallback(self, mock_plugin):
+        """Under full_legacy_fallback, membership IS in the allowed set, so
+        get_membership_status must report usable=True with member from snapshot."""
+        adapter = self._stale_adapter(mock_plugin, policy="full_legacy_fallback")
+        assert adapter._using_stale_fallback is True
+
+        status = adapter.get_membership_status("02stale")
+        assert status["usable"] is True, (
+            "membership usable must be True under full_legacy_fallback"
+        )
+        assert status["member"] is True
+        assert status["stale_fallback"] is True
+
+    def test_membership_usable_false_does_not_affect_is_hive_member(self, mock_plugin):
+        """is_hive_member (used by direct callers) is already False under
+        bounded_bias because _get_peer_hint returns {} for neutralized fields.
+        Confirm no regression."""
+        adapter = self._stale_adapter(mock_plugin, policy="bounded_bias")
+        assert adapter.is_hive_member("02stale") is False
+
+    def test_membership_status_usable_false_diagnostics_only(self, mock_plugin):
+        """Under diagnostics_only, membership is also neutralized — usable=False."""
+        adapter = self._stale_adapter(mock_plugin, policy="diagnostics_only")
+        status = adapter.get_membership_status("02stale")
+        assert status["usable"] is False
+        assert status["member"] is False
+
 
 # ---------------------------------------------------------------------------
 # Channel-open hints
