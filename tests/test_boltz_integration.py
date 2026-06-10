@@ -544,3 +544,102 @@ class TestExternalPayFallback:
     def test_norm_currency_unknown_passthrough(self):
         """Unknown currencies should be uppercased and returned as-is."""
         assert BoltzCliManager._norm_currency("eth", "BTC") == "ETH"
+
+
+class TestPayeeDirectPeerExclusion:
+    """External-pay routing must channel-exclude (not node-exclude) a payee
+    that is one of our direct peers, so routes can still terminate there."""
+
+    PREFERRED = "02" + "a" * 64
+    PAYEE = "02" + "b" * 64
+    OTHER = "02" + "c" * 64
+
+    def _channels(self):
+        return [
+            {"peer_id": self.PREFERRED, "short_channel_id": "100x1x0", "state": "CHANNELD_NORMAL"},
+            {"peer_id": self.PAYEE, "short_channel_id": "300x3x0", "state": "CHANNELD_NORMAL"},
+            {"peer_id": self.OTHER, "short_channel_id": "400x4x0", "state": "CHANNELD_NORMAL"},
+        ]
+
+    def _make_paying_manager(self, payee, payee_channels):
+        mgr = _make_manager()
+        mgr.data_service = None
+
+        def fake_call(method, params=None):
+            if method == "decode":
+                return {"amount_msat": 100_000_000, "payee": payee}
+            if method == "pay":
+                return {"status": "complete"}
+            if method == "listpeerchannels":
+                return {"channels": self._channels()}
+            return {}
+
+        mgr.rpc.call.side_effect = fake_call
+        # _resolve_peer_channel_ids uses rpc.listpeerchannels(peer_id)
+        mgr.rpc.listpeerchannels = MagicMock(return_value={"channels": payee_channels})
+        return mgr
+
+    def test_direct_peer_payee_excluded_by_channel_not_node(self):
+        mgr = self._make_paying_manager(
+            self.PAYEE,
+            [{"peer_id": self.PAYEE, "short_channel_id": "300x3x0", "state": "CHANNELD_NORMAL"}],
+        )
+
+        result = mgr._pay_invoice_via_first_hop(
+            "lnbc1invoice",
+            preferred_peer_id=self.PREFERRED,
+            preferred_channel_id="100x1x0",
+            retry_for=1,
+            expected_amount_sats=100_000,
+        )
+
+        exclude = result["exclude"]
+        assert self.PAYEE not in exclude, "payee node must never be excluded"
+        # Direct payee channels are excluded at channel level (both directions)
+        assert "300x3x0/0" in exclude
+        assert "300x3x0/1" in exclude
+        # No duplicate entries from the safeguard
+        assert exclude.count("300x3x0/0") == 1
+        assert exclude.count("300x3x0/1") == 1
+        assert any("direct payee channel" in w for w in result["warnings"])
+        assert result["status"] == "submitted"
+
+    def test_non_peer_payee_adds_no_exclusions(self):
+        mgr = self._make_paying_manager(self.PAYEE, [])
+
+        result = mgr._pay_invoice_via_first_hop(
+            "lnbc1invoice",
+            preferred_peer_id=self.PREFERRED,
+            preferred_channel_id="100x1x0",
+            retry_for=1,
+            expected_amount_sats=100_000,
+        )
+
+        assert self.PAYEE not in result["exclude"]
+        assert not any("direct payee channel" in w for w in result["warnings"])
+        assert result["status"] == "submitted"
+
+    def test_payee_is_preferred_peer_skips_channel_resolution(self):
+        mgr = self._make_paying_manager(self.PREFERRED, [])
+
+        result = mgr._pay_invoice_via_first_hop(
+            "lnbc1invoice",
+            preferred_peer_id=self.PREFERRED,
+            preferred_channel_id="100x1x0",
+            retry_for=1,
+            expected_amount_sats=100_000,
+        )
+
+        mgr.rpc.listpeerchannels.assert_not_called()
+        assert not any("direct payee channel" in w for w in result["warnings"])
+        assert result["status"] == "submitted"
+
+
+class TestBoltzAutoCycleDefaultDisabled:
+    def test_auto_cycle_disabled_by_default(self):
+        """Enabling the Boltz CLI must not silently activate the 15-minute
+        automated swap cycle; the auto-cycle is opt-in."""
+        from modules.config import Config
+
+        cfg = Config()
+        assert cfg.boltz_auto_cycle_enabled is False

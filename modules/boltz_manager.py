@@ -71,7 +71,9 @@ class BoltzCliManager:
         """Check if the capex tactical budget allows a swap.
 
         Pure treasury swaps (channel_id=None) are gated by tactical budget.
-        Channel-targeted swaps bypass the tactical gate (they use channel budget).
+        Channel-targeted swaps are not gated by the tactical budget; they are
+        gated by the channel's own capex budget via check_channel_capex_budget
+        (swap paths must call both).
         Without an engine, the gate is not applied (backward compat).
 
         Returns:
@@ -80,7 +82,8 @@ class BoltzCliManager:
         if not self._capex_engine:
             return {"allowed": True, "reason": None}
 
-        # Channel-targeted swaps bypass tactical gate
+        # Channel-targeted swaps use the per-channel capex budget gate instead
+        # (see check_channel_capex_budget, applied by loop_in/loop_out).
         if channel_id is not None:
             return {"allowed": True, "reason": None}
 
@@ -95,6 +98,74 @@ class BoltzCliManager:
                 ),
             }
         return {"allowed": True, "reason": None}
+
+    def check_channel_capex_budget(self, estimated_fee_sats: int, channel_id=None) -> dict:
+        """Gate a channel-targeted swap on the channel's remaining capex budget.
+
+        Conservative by design: if the capex engine has no allocation for the
+        channel (unknown channel, or allocations never computed), the remaining
+        budget is 0 and the swap is rejected. Without an engine, or for pure
+        treasury swaps (channel_id=None), the gate is not applied.
+
+        Returns:
+            {"allowed": bool, "reason": str or None, ...}
+        """
+        if not self._capex_engine or channel_id is None:
+            return {"allowed": True, "reason": None}
+
+        scid = str(channel_id).replace(':', 'x')
+        try:
+            budget = self._capex_engine.get_channel_budget(scid)
+            remaining = max(0, int(getattr(budget, "budget_sats", 0) or 0))
+            tier = str(getattr(budget, "tier", "unknown"))
+        except Exception as e:
+            # Fail closed: a swap spends real fees; do not spend against an
+            # unreadable budget.
+            try:
+                self.plugin.log(
+                    f"BOLTZ: channel capex budget lookup failed for {scid}: {e}; rejecting swap",
+                    level="warn",
+                )
+            except Exception:
+                pass
+            return {
+                "allowed": False,
+                "reason": f"Channel capex budget lookup failed for {scid}: {e}",
+                "channel_id": scid,
+            }
+
+        fee = max(0, int(estimated_fee_sats or 0))
+        if fee > remaining:
+            reason = (
+                f"Channel capex budget: estimated fee {fee} sats exceeds remaining "
+                f"channel budget {remaining} sats for {scid} (tier={tier})"
+            )
+            try:
+                self.plugin.log(f"BOLTZ: {reason}", level="info")
+            except Exception:
+                pass
+            return {
+                "allowed": False,
+                "reason": reason,
+                "channel_id": scid,
+                "remaining_budget_sats": remaining,
+                "tier": tier,
+            }
+        try:
+            self.plugin.log(
+                f"BOLTZ: channel capex gate passed for {scid}: fee {fee} sats <= "
+                f"remaining budget {remaining} sats (tier={tier})",
+                level="debug",
+            )
+        except Exception:
+            pass
+        return {
+            "allowed": True,
+            "reason": None,
+            "channel_id": scid,
+            "remaining_budget_sats": remaining,
+            "tier": tier,
+        }
 
     def compute_cost_attribution(self, cost_sats: int, channel_id=None) -> dict:
         """Compute cost attribution for a Boltz swap.
@@ -497,21 +568,28 @@ class BoltzCliManager:
         exclude, warnings = self._build_first_hop_excludes(preferred_peer_id, preferred_channel_id)
         payee_pubkey = self._decodepay_payee_pubkey(decode)
         if payee_pubkey:
+            # Never node-exclude the destination: the exclude list must only
+            # contain channel-scoped "scid/dir" entries, but guard against a
+            # payee pubkey slipping in so the route can still terminate there.
             if payee_pubkey in exclude:
-                # Do not node-exclude the destination; if it is a direct peer, exclude only our direct edge(s)
-                # so the route can still terminate at the payee via the preferred first hop.
                 exclude = [e for e in exclude if e != payee_pubkey]
                 warnings.append("removed payee pubkey from exclude set to permit route termination")
-                if payee_pubkey != preferred_peer_id:
-                    try:
-                        direct_scids = self._resolve_peer_channel_ids(payee_pubkey)
-                    except Exception:
-                        direct_scids = []
-                    if direct_scids:
-                        for scid in direct_scids:
-                            exclude.append(f"{scid}/0")
-                            exclude.append(f"{scid}/1")
-                        warnings.append(f"excluded {len(direct_scids)} direct payee channel(s) instead of payee node")
+            if payee_pubkey != preferred_peer_id:
+                # If the payee is a direct peer, exclude only our direct
+                # edge(s) to it (channel-level), so the payment is forced
+                # through the preferred first hop but can still terminate at
+                # the payee via a multi-hop route.
+                try:
+                    direct_scids = self._resolve_peer_channel_ids(payee_pubkey)
+                except Exception:
+                    direct_scids = []
+                if direct_scids:
+                    for scid in direct_scids:
+                        for direction in ("0", "1"):
+                            entry = f"{scid}/{direction}"
+                            if entry not in exclude:
+                                exclude.append(entry)
+                    warnings.append(f"payee is a direct peer; excluded {len(direct_scids)} direct payee channel(s) instead of payee node")
         pay_params: Dict[str, Any] = {"bolt11": invoice}
         if exclude:
             pay_params["exclude"] = exclude
@@ -1036,6 +1114,11 @@ class BoltzCliManager:
         self._save_ignored_external_swaps(ignores)
         return {"status": "success", "action": "add", "swap_id": sid, "ignore": rec, "swap": sw}
 
+    # Sources that correspond to actually executing a swap (creation paths).
+    # Only these deplete the capex "boltz" spend category; status probes and
+    # journal lookups must not double-spend the budget.
+    _SPEND_RECORD_SOURCES = frozenset({"loop_in", "loop_out", "loop_out_external_create", "chainswap"})
+
     def _record_swap_result(self, payload: Any, *, source: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         # B1 FIX: Serialize load-modify-save to prevent lost updates from concurrent threads
         with self._journal_lock:
@@ -1063,9 +1146,38 @@ class BoltzCliManager:
             # Compute capex cost attribution
             fee = self._estimate_swap_fee_sats(s)
             trigger_ch = (metadata or {}).get("trigger_channel_id")
+            if not trigger_ch:
+                # loop_out paths report the target channel via requested_channel_ids
+                req_chs = (metadata or {}).get("requested_channel_ids")
+                if isinstance(req_chs, list) and len(req_chs) == 1 and req_chs[0]:
+                    trigger_ch = str(req_chs[0])
             attribution = self.compute_cost_attribution(fee, channel_id=trigger_ch)
             rec["capex_attribution"] = attribution
             by_id[sid] = rec
+            # Deplete the capex "boltz" spend category for executed swaps so
+            # the tactical budget actually decreases as swap fees are spent.
+            if (
+                self._capex_engine is not None
+                and source in self._SPEND_RECORD_SOURCES
+                and fee > 0
+                and not self._is_error_swap(s)
+            ):
+                try:
+                    self._capex_engine.record_boltz_spend(
+                        swap_id=sid,
+                        fee_sats=fee,
+                        channel_id=trigger_ch,
+                        source=f"boltz_manager:{source}",
+                        metadata={"attribution": attribution},
+                    )
+                except Exception as e:
+                    try:
+                        self.plugin.log(
+                            f"BOLTZ: failed to record capex spend event for swap {sid}: {e}",
+                            level="warn",
+                        )
+                    except Exception:
+                        pass
         if by_id:
             merged = list(by_id.values())
             merged.sort(key=lambda x: int(x.get("recorded_at") or 0))
@@ -1234,6 +1346,19 @@ class BoltzCliManager:
                     "budget": budget_check.get("budget"),
                 }
 
+            # Channel-targeted swaps draw on the channel's own capex budget.
+            channel_check = self.check_channel_capex_budget(
+                estimated_fee_sats=budget_check.get("estimated_fee_sats", 0),
+                channel_id=channel_id,
+            )
+            if not channel_check["allowed"]:
+                return {
+                    "status": "rejected",
+                    "reason": channel_check["reason"],
+                    "budget": budget_check.get("budget"),
+                    "channel_budget_check": channel_check,
+                }
+
             warnings: List[str] = []
             if channel_id or peer_id:
                 warnings.append(
@@ -1297,6 +1422,19 @@ class BoltzCliManager:
                 "status": "rejected",
                 "reason": tactical_check["reason"],
                 "budget": budget_check.get("budget"),
+            }
+
+        # Channel-targeted swaps draw on the channel's own capex budget.
+        channel_check = self.check_channel_capex_budget(
+            estimated_fee_sats=budget_check.get("estimated_fee_sats", 0),
+            channel_id=channel_id,
+        )
+        if not channel_check["allowed"]:
+            return {
+                "status": "rejected",
+                "reason": channel_check["reason"],
+                "budget": budget_check.get("budget"),
+                "channel_budget_check": channel_check,
             }
 
         target_channel_id = (str(channel_id).replace(':', 'x') if channel_id else None)
@@ -1453,8 +1591,9 @@ class BoltzCliManager:
             if chan_ids and self._contains_chanids_cln_error(result):
                 self._reverse_chanids_supported = False
                 warnings.append("CLN boltz backend rejected chanIds in JSON result; retried reverse swap without channel pinning")
-                # Re-check budget before creating second swap (first swap may have consumed fees)
-                retry_budget = self._enforce_budget_for_quote(quote)
+                # Re-check budget before creating second swap (first swap may have consumed fees).
+                # Pass the nested quote (not the wrapper) so the fee estimate is not double-counted.
+                retry_budget = self._enforce_budget_for_quote(quote.get("quote", {}))
                 if not retry_budget["allowed"]:
                     warnings.append(f"Budget exhausted after chanId rejection: {retry_budget.get('reason')}")
                 else:
@@ -1478,8 +1617,8 @@ class BoltzCliManager:
                             if self._contains_chanids_cln_error(probe):
                                 self._reverse_chanids_supported = False
                                 warnings.append("CLN boltz backend rejected chanIds asynchronously; retried reverse swap without channel pinning")
-                                # Re-check budget before creating second swap
-                                retry_budget = self._enforce_budget_for_quote(quote)
+                                # Re-check budget before creating second swap (nested quote, not wrapper)
+                                retry_budget = self._enforce_budget_for_quote(quote.get("quote", {}))
                                 if not retry_budget["allowed"]:
                                     warnings.append(f"Budget exhausted after async chanId rejection: {retry_budget.get('reason')}")
                                 else:
@@ -1496,8 +1635,8 @@ class BoltzCliManager:
                 # CLN backends may reject chanIds even though boltzcli accepts the flag.
                 self._reverse_chanids_supported = False
                 warnings.append("CLN boltz backend rejected chanIds; retried reverse swap without channel pinning")
-                # Re-check budget before creating second swap
-                retry_budget = self._enforce_budget_for_quote(quote)
+                # Re-check budget before creating second swap (nested quote, not wrapper)
+                retry_budget = self._enforce_budget_for_quote(quote.get("quote", {}))
                 if not retry_budget["allowed"]:
                     warnings.append(f"Budget exhausted after chanId exception: {retry_budget.get('reason')}")
                 else:

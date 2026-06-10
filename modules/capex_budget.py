@@ -299,6 +299,45 @@ class CapexBudgetEngine:
         tactical_share = cost_sats - channel_share
         return {"channel": channel_share, "tactical": tactical_share}
 
+    def record_boltz_spend(
+        self,
+        swap_id: str,
+        fee_sats: int,
+        channel_id: Optional[str] = None,
+        source: Optional[str] = None,
+        metadata: Optional[Dict] = None,
+    ) -> bool:
+        """Record an executed Boltz swap fee in the generic spend ledger.
+
+        Writes a category="boltz" spend event so that
+        _apply_category_spend_remaining depletes the tactical budget (and,
+        when channel_id is set, per-channel capex via spend_events).
+        Keyed by swap id, so repeated journal updates for the same swap are
+        idempotent (INSERT OR REPLACE in the database layer).
+        """
+        sid = str(swap_id or "").strip()
+        if not sid:
+            return False
+        try:
+            fee = int(fee_sats)
+        except (TypeError, ValueError):
+            return False
+        if fee <= 0:
+            return False
+        try:
+            return bool(self._database.record_spend_event(
+                event_id=f"boltz:{sid}",
+                category="boltz",
+                amount_sats=fee,
+                subcategory="swap_fee",
+                reference_id=sid,
+                channel_id=str(channel_id).replace(':', 'x') if channel_id else None,
+                source=source or "boltz_manager",
+                metadata=metadata,
+            ))
+        except Exception:
+            return False
+
     # --- Internal methods ---
 
     def _compute_channel_budget(

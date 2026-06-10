@@ -11,7 +11,7 @@ import json
 import math
 import time
 from statistics import median
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from pyln.client import Plugin
 from .config import ChainCostDefaults
 from .demand_flow import DemandFlowClassifier
@@ -757,6 +757,8 @@ class CapacityPlanner:
                 prof,
                 channel_efficiency,
                 dead_capital_stages,
+                flow_metrics=flow_metrics,
+                route_pair_channels=route_pair_channels,
             )
             if dead_capital_loser is not None:
                 losers.append(dead_capital_loser)
@@ -780,65 +782,11 @@ class CapacityPlanner:
                 except Exception:
                     pass
 
-            # Kalman confidence gate -- skip closure if data unreliable
-            if flow_metrics:
-                confidence = getattr(flow_metrics, 'confidence', 1.0)
-                # Guard against non-numeric (e.g. MagicMock) or None
-                if not isinstance(confidence, (int, float)):
-                    confidence = 1.0
-                confidence = confidence or 1.0
-                if confidence < 0.5:
-                    continue  # Don't recommend closure with unreliable data
-
-            # Channel role protection -- INBOUND_GATEWAYs source volume for all
-            # outbound channels; closing one has outsized negative impact.
-            channel_role = getattr(prof, 'channel_role', None)
-            is_inbound_gateway = False
-            try:
-                if channel_role is not None:
-                    if isinstance(channel_role, ChannelRole):
-                        is_inbound_gateway = channel_role == ChannelRole.INBOUND_GATEWAY
-                    elif hasattr(channel_role, 'value'):
-                        is_inbound_gateway = channel_role.value in ('INBOUND_GATEWAY', 'inbound_gateway')
-                    else:
-                        is_inbound_gateway = str(channel_role) in ('INBOUND_GATEWAY', 'inbound_gateway')
-            except Exception:
-                pass
-
-            # Protect inbound gateways — they source traffic for the fleet
-            if is_inbound_gateway and prof.marginal_roi_percent >= -30.0:
-                continue  # Protect inbound gateways (tighter threshold)
-
-            # Protect channels that source significant fee contribution
-            # regardless of their own ROI — they enable other channels' revenue.
-            # Uses all-time sourced contribution from ChannelRevenue (not 30d window)
-            # because channels with a history of sourcing are worth protecting even
-            # if recent volume is lower. Avoids modifying ChannelProfitability dataclass.
-            sourced_fee_sats = getattr(prof.revenue, 'sourced_fee_contribution_sats', 0)
-            try:
-                sourced_fee_sats = int(sourced_fee_sats)
-            except (TypeError, ValueError):
-                sourced_fee_sats = 0
-            if sourced_fee_sats > 100 and prof.marginal_roi_percent > -50.0:
-                continue  # Protect significant inbound sources
-
-            # Route-pair protection: channels on proven revenue routes have network value
-            # beyond their individual ROI.  Closing one kills the paired channel's revenue.
-            # Hive corridor channels on revenue routes get extra protection.
-            is_on_revenue_route = scid_display in route_pair_channels
-            is_hive_corridor = False
-            if self.hive_hints is not None:
-                try:
-                    corridor_role = self.hive_hints.get_corridor_role(prof.peer_id)
-                    is_hive_corridor = corridor_role in {"owner", "secondary", "contested"}
-                except Exception:
-                    pass
-            if is_on_revenue_route:
-                # Hive corridor channels on revenue routes: protect until -50% ROI
-                # Regular revenue route channels: protect until -30% ROI
-                route_close_threshold = -50.0 if is_hive_corridor else -30.0
-                if prof.marginal_roi_percent > route_close_threshold:
-                    continue  # Protect revenue route channels
+            # Protective closure gates (Kalman confidence, inbound gateway,
+            # sourced-fee contribution, route-pair). Shared with the
+            # dead-capital staging pipeline via _close_protection_reason.
+            if self._close_protection_reason(scid_display, prof, flow_metrics, route_pair_channels):
+                continue
 
             # Hard bleeder bypass -- skip defibrillation gate
             bleeder_info = bleeders.get(scid)
@@ -975,16 +923,114 @@ class CapacityPlanner:
 
         return losers
 
+    def _close_protection_reason(
+        self,
+        scid_display: str,
+        prof,
+        flow_metrics,
+        route_pair_channels,
+    ) -> Optional[str]:
+        """Return why a channel must not be recommended for closure, or None.
+
+        Single source of truth for the protective closure gates used by both
+        the regular loser pipeline and the dead-capital staging pipeline:
+        - Kalman confidence gate (unreliable flow data)
+        - Inbound-gateway ROI protection
+        - Sourced-fee-contribution protection
+        - Route-pair (revenue route) protection
+        """
+        from .profitability_analyzer import ChannelRole
+
+        # Hive member protection -- never recommend closing fleet channels
+        if self.hive_hints is not None:
+            try:
+                if self.hive_hints.is_hive_member(prof.peer_id):
+                    return "HIVE_MEMBER"
+            except Exception:
+                pass
+
+        # Kalman confidence gate -- skip closure if data unreliable
+        if flow_metrics:
+            confidence = getattr(flow_metrics, 'confidence', 1.0)
+            # Guard against non-numeric (e.g. MagicMock) or None
+            if not isinstance(confidence, (int, float)):
+                confidence = 1.0
+            confidence = confidence or 1.0
+            if confidence < 0.5:
+                return "KALMAN_LOW_CONFIDENCE"  # Don't recommend closure with unreliable data
+
+        # Channel role protection -- INBOUND_GATEWAYs source volume for all
+        # outbound channels; closing one has outsized negative impact.
+        channel_role = getattr(prof, 'channel_role', None)
+        is_inbound_gateway = False
+        try:
+            if channel_role is not None:
+                if isinstance(channel_role, ChannelRole):
+                    is_inbound_gateway = channel_role == ChannelRole.INBOUND_GATEWAY
+                elif hasattr(channel_role, 'value'):
+                    is_inbound_gateway = channel_role.value in ('INBOUND_GATEWAY', 'inbound_gateway')
+                else:
+                    is_inbound_gateway = str(channel_role) in ('INBOUND_GATEWAY', 'inbound_gateway')
+        except Exception:
+            pass
+
+        # Protect inbound gateways — they source traffic for the fleet
+        if is_inbound_gateway and prof.marginal_roi_percent >= -30.0:
+            return "INBOUND_GATEWAY"  # Protect inbound gateways (tighter threshold)
+
+        # Protect channels that source significant fee contribution
+        # regardless of their own ROI — they enable other channels' revenue.
+        # Uses all-time sourced contribution from ChannelRevenue (not 30d window)
+        # because channels with a history of sourcing are worth protecting even
+        # if recent volume is lower. Avoids modifying ChannelProfitability dataclass.
+        sourced_fee_sats = getattr(getattr(prof, 'revenue', None), 'sourced_fee_contribution_sats', 0)
+        try:
+            sourced_fee_sats = int(sourced_fee_sats)
+        except (TypeError, ValueError):
+            sourced_fee_sats = 0
+        if sourced_fee_sats > 100 and prof.marginal_roi_percent > -50.0:
+            return "SOURCED_FEE_CONTRIBUTION"  # Protect significant inbound sources
+
+        # Route-pair protection: channels on proven revenue routes have network value
+        # beyond their individual ROI.  Closing one kills the paired channel's revenue.
+        # Hive corridor channels on revenue routes get extra protection.
+        is_on_revenue_route = scid_display in (route_pair_channels or set())
+        is_hive_corridor = False
+        if self.hive_hints is not None:
+            try:
+                corridor_role = self.hive_hints.get_corridor_role(prof.peer_id)
+                is_hive_corridor = corridor_role in {"owner", "secondary", "contested"}
+            except Exception:
+                pass
+        if is_on_revenue_route:
+            # Hive corridor channels on revenue routes: protect until -50% ROI
+            # Regular revenue route channels: protect until -30% ROI
+            route_close_threshold = -50.0 if is_hive_corridor else -30.0
+            if prof.marginal_roi_percent > route_close_threshold:
+                return "REVENUE_ROUTE"  # Protect revenue route channels
+
+        return None
+
     def _build_dead_capital_loser(
         self,
         scid: str,
         prof,
         channel_efficiency,
         dead_capital_stages: Dict[str, Dict[str, Any]],
+        flow_metrics=None,
+        route_pair_channels=None,
     ) -> Dict[str, Any] | None:
         """Return staged dead-capital action when the analyzer flags a channel."""
         if channel_efficiency is None or not getattr(channel_efficiency, "is_dead_capital", False):
             return None
+
+        # Protective closure gates apply to dead-capital staging too: a
+        # historically valuable channel that merely went quiet must not be
+        # staged into CLOSE on timeouts alone. FEE_REDUCE/DEFIBRILLATE stages
+        # remain allowed for protected channels.
+        close_protection = self._close_protection_reason(
+            scid, prof, flow_metrics, route_pair_channels or set()
+        )
 
         db = self.profitability.database if self.profitability else None
         now = int(time.time())
@@ -999,6 +1045,7 @@ class CapacityPlanner:
         entered_at = int(stage_row.get("entered_at", 0) or 0)
         persist_stage = None
 
+        close_blocked = False
         if stage == "none":
             action = "FEE_REDUCE"
             stage = "fee_reduction"
@@ -1012,15 +1059,40 @@ class CapacityPlanner:
         elif stage == "fee_reduction":
             action = "FEE_REDUCE"
         elif stage == "defibrillation" and entered_at and now - entered_at >= stage_timeout:
-            action = "CLOSE"
-            stage = "close"
-            entered_at = now
-            persist_stage = stage
+            if close_protection:
+                # Protections forbid CLOSE staging: hold at defibrillation
+                # instead of advancing (and re-evaluate next cycle).
+                action = "DEFIBRILLATE"
+                close_blocked = True
+            else:
+                action = "CLOSE"
+                stage = "close"
+                entered_at = now
+                persist_stage = stage
         elif stage == "defibrillation":
             action = "DEFIBRILLATE"
         else:
-            action = "CLOSE"
-            stage = "close"
+            if close_protection:
+                # A previously persisted close stage is demoted back to
+                # defibrillation while the channel is protected.
+                action = "DEFIBRILLATE"
+                stage = "defibrillation"
+                entered_at = now
+                persist_stage = stage
+                close_blocked = True
+            else:
+                action = "CLOSE"
+                stage = "close"
+
+        if close_blocked:
+            try:
+                self.plugin.log(
+                    f"DEAD CAPITAL: close staging blocked for {scid} "
+                    f"(protection: {close_protection}); holding at DEFIBRILLATE",
+                    level="info",
+                )
+            except Exception:
+                pass
 
         if persist_stage is not None and db is not None:
             try:
@@ -1057,6 +1129,7 @@ class CapacityPlanner:
             "is_fire_sale": False,
             "marginal_profit_30d_sats": getattr(prof, "marginal_profit_30d_sats", 0),
             "dead_capital_stage": stage,
+            "close_protection": close_protection if close_blocked else None,
         }
 
     def _generate_recommendations(self, winners: List[Dict], losers: List[Dict]) -> List[str]:
