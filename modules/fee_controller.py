@@ -2140,6 +2140,18 @@ class FeeController:
     REBALANCE_FLOOR_WINDOW_DAYS = 30
 
     # ==========================================================================
+    # F2 fix (2026-06-10): total hive hint authority over price
+    # ==========================================================================
+    # _get_hive_fee_bias clamps its own output to [0.9, 1.1], but the temporal
+    # traffic multiplier (x0.97-1.05, separately clamped) used to multiply
+    # AFTER that clamp — a composite of up to +15.5% if metabolic/immune hints
+    # ever go live. The two hints are now composed and the COMPOSITE is
+    # clamped before a single multiplication. Invariant: all hive-derived
+    # hints together can never move the target by more than +/-10%.
+    HIVE_HINT_TOTAL_BIAS_MIN = 0.9
+    HIVE_HINT_TOTAL_BIAS_MAX = 1.1
+
+    # ==========================================================================
     # P5 fix (2026-06-10): Kalman demand divisor bounds
     # ==========================================================================
     # The demand factor DIVIDES revenue observations before they reach the DTS
@@ -4874,6 +4886,7 @@ class FeeController:
         market_boundary_window_bypass_info = {"applied": False}
         hive_fee_bias = 1.0
         temporal_adj = 1.0
+        composite_hint_bias = 1.0
         exploration_multiplier = 1.0
 
         # Detect critical state
@@ -5548,10 +5561,18 @@ class FeeController:
             )
             raw_dts_target_ppm = int(dts_fee)
             post_pid_target_ppm = int(dts_fee * pid_multiplier)
-            # Hive hint bias: small bounded nudge before hard clamp
+            # Hive hint bias x temporal multiplier: composed and clamped ONCE
+            # (F2 fix, see HIVE_HINT_TOTAL_BIAS_*). The temporal multiplier
+            # used to apply after the hive clamp, letting the composite exceed
+            # the documented +/-10% hint authority. Single multiplication site.
             hive_fee_bias = self._get_hive_fee_bias(peer_id)
-            if hive_fee_bias != 1.0:
-                post_pid_target_ppm = int(post_pid_target_ppm * hive_fee_bias)
+            temporal_adj = self._get_temporal_fee_adjustment(peer_id)
+            composite_hint_bias = max(
+                self.HIVE_HINT_TOTAL_BIAS_MIN,
+                min(self.HIVE_HINT_TOTAL_BIAS_MAX, hive_fee_bias * temporal_adj),
+            )
+            if composite_hint_bias != 1.0:
+                post_pid_target_ppm = int(post_pid_target_ppm * composite_hint_bias)
             # Drain pressure: bounded discount for stagnant over-local channels
             # ("sell what you're long"). Bias only — min_fee_ppm rails still
             # clamp downstream. Off by default (drain_fee_discount_max=0.0).
@@ -5573,10 +5594,8 @@ class FeeController:
                     f"(multiplier={drain_multiplier:.3f})",
                     level='debug'
                 )
-            # Temporal fee adjustment from traffic patterns
-            temporal_adj = self._get_temporal_fee_adjustment(peer_id)
-            if temporal_adj != 1.0:
-                post_pid_target_ppm = int(post_pid_target_ppm * temporal_adj)
+            # Temporal fee adjustment is composed with the hive bias above
+            # (F2): it must share the single +/-10% hint clamp, not stack.
             # Neighbor fee context: soft attraction toward market median
             # Only pull DOWN toward market, never up — being cheaper is fine.
             neighbor_median = self._get_neighbor_fee_median(peer_id, cfg=cfg)
@@ -6308,6 +6327,7 @@ class FeeController:
                     "contextual_sample_used": contextual_sample_used,
                     "hive_fee_bias": hive_fee_bias,
                     "hive_temporal_multiplier": temporal_adj,
+                    "hive_composite_hint_bias": composite_hint_bias,
                     "hive_exploration_multiplier": exploration_multiplier,
                     "hive_membership": self._get_hive_membership_status(peer_id),
                 },
