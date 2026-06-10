@@ -81,7 +81,9 @@ def base_to_sats_ceil(base: int) -> int:
 def base_to_sats_floor(base: int) -> int:
     """Convert base units to sats, rounding DOWN.
 
-    Use for: capacity, balance, revenue reporting — never overstate.
+    Use for: capacity and balances — never overstate what is spendable.
+    Revenue reporting uses base_to_sats_ceil so sub-sat earnings stay
+    visible instead of truncating to zero.
     """
     return base // BASE_UNITS_PER_SAT
 

@@ -923,8 +923,8 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-boltz-auto-cycle-enabled',
-    default='true',
-    description='Enable in-plugin periodic profit-gated Boltz balance cycles (default: true)'
+    default='false',
+    description='Enable in-plugin periodic profit-gated Boltz balance cycles (default: false; automated spending must be opted into explicitly)'
 )
 
 plugin.add_option(
@@ -1222,7 +1222,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
         return result
 
     cfg = config.snapshot() if config else None
-    enabled = bool(getattr(cfg, 'boltz_auto_cycle_enabled', True)) if cfg else True
+    enabled = bool(getattr(cfg, 'boltz_auto_cycle_enabled', False)) if cfg else False
     _boltz_auto_cycle_mark_state(enabled=enabled)
     if not enabled and not force:
         result = {
@@ -1438,10 +1438,19 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # M-7/C-1/L-26: Cleanup runs via atexit (safe outside signal handler context)
     def _shutdown_cleanup():
         """Perform cleanup after shutdown_event is set. Runs via atexit."""
+        # The plugin can also exit via stdin EOF (pyln run() returning), in
+        # which case the SIGTERM handler never ran: signal the daemon loops
+        # before tearing down their resources.
+        try:
+            shutdown_event.set()
+        except Exception:
+            pass
         if safe_plugin and hasattr(safe_plugin, 'rpc'):
             try:
-                safe_plugin.rpc._executor.shutdown(wait=True)
-                safe_plugin.rpc._async_executor.shutdown(wait=True)
+                # cancel_futures drops queued-but-unstarted RPC work so exit
+                # only waits on in-flight calls, which the proxy timeouts bound.
+                safe_plugin.rpc._executor.shutdown(wait=True, cancel_futures=True)
+                safe_plugin.rpc._async_executor.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 pass
 
@@ -1506,7 +1515,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hot_channel_protection_max_chunk_multiplier=_safe_float_opt('revenue-ops-hot-channel-protection-max-chunk-multiplier', '4.0'),
         hot_channel_protection_min_cooldown_hours=_safe_float_opt('revenue-ops-hot-channel-protection-min-cooldown-hours', '1.0'),
         hot_channel_protection_max_rebalance_fee_ppm=_safe_int_opt('revenue-ops-hot-channel-protection-max-rebalance-fee-ppm', '2000'),
-        boltz_auto_cycle_enabled=options.get('revenue-ops-boltz-auto-cycle-enabled', 'true').lower() == 'true',
+        boltz_auto_cycle_enabled=options.get('revenue-ops-boltz-auto-cycle-enabled', 'false').lower() == 'true',
         boltz_auto_cycle_interval_minutes=_safe_int_opt('revenue-ops-boltz-auto-cycle-interval-minutes', '15'),
         boltz_auto_cycle_max_actions=_safe_int_opt('revenue-ops-boltz-auto-cycle-max-actions', '1'),
         boltz_auto_cycle_startup_delay_seconds=_safe_int_opt('revenue-ops-boltz-auto-cycle-startup-delay-seconds', '120'),
@@ -2096,7 +2105,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log("Boltz auto-cycle loop disabled: Boltz CLI integration not enabled", level='debug')
             return
 
-        _boltz_auto_cycle_mark_state(enabled=bool(getattr(config, 'boltz_auto_cycle_enabled', True)), thread_started=True)
+        _boltz_auto_cycle_mark_state(enabled=bool(getattr(config, 'boltz_auto_cycle_enabled', False)), thread_started=True)
 
         startup_delay = max(0, int(getattr(config, 'boltz_auto_cycle_startup_delay_seconds', 120) or 0))
         if startup_delay > 0:
@@ -2107,7 +2116,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 return
 
         while not shutdown_event.is_set():
-            enabled = bool(getattr(config, 'boltz_auto_cycle_enabled', True))
+            enabled = bool(getattr(config, 'boltz_auto_cycle_enabled', False))
             _boltz_auto_cycle_mark_state(enabled=enabled)
 
             if enabled:
@@ -3650,18 +3659,45 @@ def revenue_history(plugin: Plugin) -> Dict[str, Any]:
         return {"status": "error", "error": str(e)}
 
 
+def _policy_write_override(kwargs: Dict[str, Any]) -> bool:
+    """True when an internal/admin caller explicitly unlocks policy writes.
+
+    The deprecated ignore/unignore aliases must honor the same gate as
+    'revenue-policy set/delete' — otherwise the operator-write lockdown is
+    trivially circumvented through the aliases.
+    """
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    return _truthy(kwargs.get("internal")) or _truthy(kwargs.get("admin"))
+
+
 @plugin.method("revenue-ignore")
-def revenue_ignore(plugin: Plugin, peer_id: str, reason: str = "manual") -> Dict[str, Any]:
+def revenue_ignore(plugin: Plugin, peer_id: str, reason: str = "manual", **kwargs) -> Dict[str, Any]:
     """
     DEPRECATED: Use 'revenue-policy set <peer_id> strategy=passive rebalance=disabled' instead.
-    
+
     Stop cl-revenue-ops from managing this peer (fees or rebalancing).
-    
+
     Usage: lightning-cli revenue-ignore peer_id [reason]
     """
     if policy_manager is None:
         return {"error": "Plugin not initialized"}
-    
+
+    if not _policy_write_override(kwargs):
+        return {
+            "error": (
+                "revenue-ignore is deprecated for normal operator use. "
+                "Use revenue-policy list/get/find/changes for diagnostics."
+            )
+        }
+    if not re.match(r'^[0-9a-fA-F]{66}$', str(peer_id or "")):
+        return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
+
     plugin.log(
         f"DEPRECATED: revenue-ignore is deprecated. Use 'revenue-policy set {peer_id} "
         f"strategy=passive rebalance=disabled' instead.",
@@ -3689,17 +3725,27 @@ def revenue_ignore(plugin: Plugin, peer_id: str, reason: str = "manual") -> Dict
 
 
 @plugin.method("revenue-unignore")
-def revenue_unignore(plugin: Plugin, peer_id: str) -> Dict[str, Any]:
+def revenue_unignore(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
     """
     DEPRECATED: Use 'revenue-policy delete <peer_id>' instead.
-    
+
     Resume cl-revenue-ops management for this peer.
-    
+
     Usage: lightning-cli revenue-unignore peer_id
     """
     if policy_manager is None:
         return {"error": "Plugin not initialized"}
-    
+
+    if not _policy_write_override(kwargs):
+        return {
+            "error": (
+                "revenue-unignore is deprecated for normal operator use. "
+                "Use revenue-policy list/get/find/changes for diagnostics."
+            )
+        }
+    if not re.match(r'^[0-9a-fA-F]{66}$', str(peer_id or "")):
+        return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
+
     plugin.log(
         f"DEPRECATED: revenue-unignore is deprecated. Use 'revenue-policy delete {peer_id}' instead.",
         level='warn'
@@ -4899,7 +4945,11 @@ def _refresh_dynamic_config():
     populated at init. This function bridges the gap.
     """
     try:
-        all_configs = plugin.rpc.listconfigs()
+        # Use the timeout-protected proxy: this runs on the boltz/planner
+        # background threads, where a hung lightningd response would
+        # otherwise stall the loop indefinitely.
+        rpc = safe_plugin.rpc if safe_plugin is not None else plugin.rpc
+        all_configs = rpc.listconfigs()
         configs = all_configs.get("configs", {})
     except Exception:
         return
@@ -5628,6 +5678,12 @@ def revenue_spend_ledger(
         return {"error": str(e)}
 
 
+# Serializes the unified-budget check with the reservation insert below.
+# Without it two concurrent reserve calls can both pass the remaining-budget
+# check and jointly exceed it (TOCTOU).
+_spend_reserve_lock = threading.Lock()
+
+
 @plugin.method("revenue-spend-reserve")
 def revenue_spend_reserve(
     plugin: Plugin,
@@ -5646,33 +5702,34 @@ def revenue_spend_reserve(
         amount_sats = int(amount_sats)
         if amount_sats <= 0:
             return {"error": "amount_sats must be > 0"}
-        budget = _total_cost_budget_status()
-        if "error" in budget:
-            return budget
-        remaining = int(budget.get("remaining_sats", 0) or 0)
-        if amount_sats > remaining:
-            return {
-                "status": "rejected",
-                "reason": "insufficient_unified_budget",
-                "requested_sats": amount_sats,
-                "remaining_sats": remaining,
-                "budget": budget,
-            }
-        metadata = None
-        if metadata_json:
-            try:
-                metadata = json.loads(metadata_json)
-            except Exception:
-                metadata = {"raw": metadata_json}
-        ok = database.reserve_spend(
-            reservation_id=str(reservation_id),
-            amount_sats=amount_sats,
-            category=str(category),
-            subcategory=subcategory,
-            reference_id=reference_id,
-            channel_id=channel_id,
-            metadata=metadata,
-        )
+        with _spend_reserve_lock:
+            budget = _total_cost_budget_status()
+            if "error" in budget:
+                return budget
+            remaining = int(budget.get("remaining_sats", 0) or 0)
+            if amount_sats > remaining:
+                return {
+                    "status": "rejected",
+                    "reason": "insufficient_unified_budget",
+                    "requested_sats": amount_sats,
+                    "remaining_sats": remaining,
+                    "budget": budget,
+                }
+            metadata = None
+            if metadata_json:
+                try:
+                    metadata = json.loads(metadata_json)
+                except Exception:
+                    metadata = {"raw": metadata_json}
+            ok = database.reserve_spend(
+                reservation_id=str(reservation_id),
+                amount_sats=amount_sats,
+                category=str(category),
+                subcategory=subcategory,
+                reference_id=reference_id,
+                channel_id=channel_id,
+                metadata=metadata,
+            )
         if not ok:
             return {"status": "error", "error": "Failed to reserve spend"}
         return {
@@ -6891,7 +6948,7 @@ def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
     state.update({
         "boltz_enabled": bool(boltz_manager and getattr(boltz_manager, 'enabled', False)),
         "config": {
-            "boltz_auto_cycle_enabled": bool(getattr(config, 'boltz_auto_cycle_enabled', True)) if config else None,
+            "boltz_auto_cycle_enabled": bool(getattr(config, 'boltz_auto_cycle_enabled', False)) if config else None,
             "boltz_auto_cycle_interval_minutes": int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15)) if config else None,
             "boltz_auto_cycle_max_actions": int(getattr(config, 'boltz_auto_cycle_max_actions', 1)) if config else None,
             "boltz_auto_cycle_startup_delay_seconds": int(getattr(config, 'boltz_auto_cycle_startup_delay_seconds', 120)) if config else None,

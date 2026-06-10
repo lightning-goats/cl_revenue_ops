@@ -78,7 +78,25 @@ class RebalanceRouter:
             value = value.rstrip("msat")
         return int(value)
 
-    def _get_final_hop_policy(self, dest_peer_id: str) -> Optional[Dict[str, int]]:
+    @staticmethod
+    def _channel_matches_scid(ch: Dict[str, Any], dest_channel_id: Optional[str]) -> bool:
+        """True when the listpeerchannels entry is the requested channel.
+
+        With parallel channels to the same peer, reading the first channel's
+        policy over- or under-pays the final hop; the route must be priced
+        against the specific dest channel.
+        """
+        if not dest_channel_id:
+            return True
+        scid = str(ch.get("short_channel_id") or "")
+        if scid == dest_channel_id:
+            return True
+        alias = ch.get("alias") or {}
+        return str(alias.get("local") or "") == dest_channel_id
+
+    def _get_final_hop_policy(
+        self, dest_peer_id: str, dest_channel_id: Optional[str] = None
+    ) -> Optional[Dict[str, int]]:
         """Get the actual inbound policy the dest peer charges us.
 
         Priority 1: listpeerchannels updates.remote.fee_proportional_millionths
@@ -93,6 +111,8 @@ class RebalanceRouter:
                 result = self.plugin.rpc.listpeerchannels(peer_id=dest_peer_id)
             for ch in result.get("channels", []):
                 if ch.get("peer_id") != dest_peer_id:
+                    continue
+                if not self._channel_matches_scid(ch, dest_channel_id):
                     continue
                 updates = ch.get("updates")
                 if updates is None:
@@ -277,7 +297,9 @@ class RebalanceRouter:
             pass
         return {"fee_ppm": 0, "fee_base_msat": 0, "cltv_delta": 18}
 
-    def _get_dest_channel_cltv(self, dest_peer_id: str) -> int:
+    def _get_dest_channel_cltv(
+        self, dest_peer_id: str, dest_channel_id: Optional[str] = None
+    ) -> int:
         """Get the dest peer's cltv_expiry_delta for the final hop."""
         try:
             if self.data_service is not None:
@@ -285,6 +307,8 @@ class RebalanceRouter:
             else:
                 result = self.plugin.rpc.listpeerchannels(peer_id=dest_peer_id)
             for ch in result.get("channels", []):
+                if not self._channel_matches_scid(ch, dest_channel_id):
+                    continue
                 updates = ch.get("updates") or {}
                 remote = updates.get("remote") or {}
                 cltv = remote.get("cltv_expiry_delta")
@@ -356,7 +380,7 @@ class RebalanceRouter:
         # Step 1: Get actual final-hop fee. Include both base and proportional
         # policy; omitting the base fee causes low-amount routes to fail with
         # WIRE_FEE_INSUFFICIENT at the preceding hop.
-        final_hop_policy = self._get_final_hop_policy(dest_peer_id)
+        final_hop_policy = self._get_final_hop_policy(dest_peer_id, dest_channel_id)
         if final_hop_policy is None:
             return RouteResult(
                 success=False,
@@ -370,7 +394,7 @@ class RebalanceRouter:
             final_hop_fee_ppm,
             final_hop_fee_base_msat,
         )
-        dest_cltv = self._get_dest_channel_cltv(dest_peer_id)
+        dest_cltv = self._get_dest_channel_cltv(dest_peer_id, dest_channel_id)
         invoice_final_cltv = self._get_invoice_final_cltv()
         required_final_cltv = dest_cltv + invoice_final_cltv
 

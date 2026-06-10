@@ -603,6 +603,10 @@ class PolicyManager:
                 raise ValueError(f"fee_ppm_target must be a non-negative integer, got {new_fee_ppm}")
             if new_fee_ppm > 100000:
                 raise ValueError(f"fee_ppm_target cannot exceed 100000 PPM")
+        if new_strategy == FeeStrategy.STATIC and new_fee_ppm is None:
+            # Without a target the fee controller silently falls through to
+            # dynamic management — the opposite of what 'static' promises.
+            raise ValueError("strategy=static requires fee_ppm_target")
 
         # Validate tags
         new_tags = tags if tags is not None else existing.tags

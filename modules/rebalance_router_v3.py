@@ -13,6 +13,7 @@ Research basis: docs/superpowers/specs/2026-04-10-askrene-router-v3-research.md
 
 from __future__ import annotations
 
+import itertools
 import math
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -175,7 +176,9 @@ class RebalanceRouterV3:
             output. Typically ``plugin.log``.
     """
 
-    _exclude_counter: int = 0  # monotonic counter for exclude layer names
+    # Monotonic counter for exclude layer names. itertools.count so that
+    # concurrent workers can never mint duplicate names.
+    _exclude_counter = itertools.count(1)
 
     def __init__(
         self,
@@ -270,7 +273,9 @@ class RebalanceRouterV3:
         Returns a RouteResult matching the v2 router's shape so the engine
         and executor can consume either router's output transparently.
         """
-        final_hop_policy = self._v2_helpers._get_final_hop_policy(dest_peer_id)
+        final_hop_policy = self._v2_helpers._get_final_hop_policy(
+            dest_peer_id, dest_channel_id
+        )
         if final_hop_policy is None:
             return RouteResult(
                 success=False,
@@ -278,7 +283,7 @@ class RebalanceRouterV3:
             )
         final_hop_fee_ppm = int(final_hop_policy["fee_ppm"])
         final_hop_fee_base_msat = int(final_hop_policy.get("fee_base_msat", 0) or 0)
-        dest_cltv = self._v2_helpers._get_dest_channel_cltv(dest_peer_id)
+        dest_cltv = self._v2_helpers._get_dest_channel_cltv(dest_peer_id, dest_channel_id)
         invoice_final_cltv = self._v2_helpers._get_invoice_final_cltv()
         required_final_cltv = dest_cltv + invoice_final_cltv
         final_hop_fee_sats = self._v2_helpers._compute_final_hop_fee_sats(
@@ -506,11 +511,12 @@ class RebalanceRouterV3:
             yield None
             return
 
-        RebalanceRouterV3._exclude_counter += 1
+        # next() on itertools.count is atomic under the GIL; a plain class
+        # attribute increment is not, and two execution workers minting the
+        # same layer name leads to one removing the other's live layer.
+        counter = next(RebalanceRouterV3._exclude_counter)
         import time as _time
-        layer_name = (
-            f"rebalance-exclude-{int(_time.time())}-{RebalanceRouterV3._exclude_counter}"
-        )
+        layer_name = f"rebalance-exclude-{int(_time.time())}-{counter}"
 
         try:
             if self.data_service is not None:

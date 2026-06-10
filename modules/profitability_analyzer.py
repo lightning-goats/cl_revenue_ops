@@ -1272,8 +1272,10 @@ class ChannelProfitabilityAnalyzer:
         # Get aggregate stats from database (includes closed channels)
         stats = self.database.get_lifetime_stats()
 
-        # Convert revenue from msat to sats
-        lifetime_revenue_sats = base_to_sats_floor(stats["total_revenue_msat"])
+        # Convert revenue from msat to sats. Ceiling matches every other
+        # revenue report in this module so sub-sat earnings stay visible
+        # and lifetime/windowed figures agree.
+        lifetime_revenue_sats = base_to_sats_ceil(stats["total_revenue_msat"])
 
         # Get costs (including closure and swap costs)
         lifetime_opening_costs_sats = stats["total_opening_cost_sats"]
