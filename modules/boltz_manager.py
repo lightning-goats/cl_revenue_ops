@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from .utils import parse_msat
+
 
 class BoltzCliError(RuntimeError):
     """Raised when boltzcli execution fails."""
@@ -449,14 +451,48 @@ class BoltzCliManager:
             out["scan_error"] = str(e2)
             return out
 
+    @staticmethod
+    def _decodepay_amount_msat(decode: Any) -> Optional[int]:
+        """Extract the invoice amount in msat from CLN decode output."""
+        if not isinstance(decode, dict):
+            return None
+        for key in ("amount_msat", "msatoshi", "amount"):
+            value = decode.get(key)
+            if value is None:
+                continue
+            try:
+                amount = parse_msat(value)
+            except Exception:
+                continue
+            if amount > 0:
+                return amount
+        return None
+
     def _pay_invoice_via_first_hop(self, invoice: str, *, preferred_peer_id: str, preferred_channel_id: Optional[str] = None,
-                                   retry_for: int = 120) -> Dict[str, Any]:
+                                   retry_for: int = 120,
+                                   expected_amount_sats: Optional[int] = None) -> Dict[str, Any]:
         if not invoice or not str(invoice).lower().startswith("ln"):
             raise BoltzCliError("Invalid bolt11 invoice for external reverse swap payment")
         try:
             decode = self.data_service.decode(invoice) if self.data_service else self.rpc.call("decode", {"string": invoice})
         except Exception as e:
             raise BoltzCliError(f"decode failed for external reverse swap invoice: {e}")
+
+        # The invoice is produced by boltzd / the Boltz API — an external
+        # service. Never pay a principal we did not ask for.
+        if expected_amount_sats is not None:
+            invoice_msat = self._decodepay_amount_msat(decode)
+            expected_msat = int(expected_amount_sats) * 1000
+            if invoice_msat is None:
+                raise BoltzCliError(
+                    "external reverse swap invoice has no decodable amount; "
+                    f"refusing to pay (expected {expected_amount_sats} sats)"
+                )
+            if invoice_msat > expected_msat:
+                raise BoltzCliError(
+                    "external reverse swap invoice amount exceeds the requested "
+                    f"swap amount: invoice {invoice_msat} msat > expected {expected_msat} msat"
+                )
 
         exclude, warnings = self._build_first_hop_excludes(preferred_peer_id, preferred_channel_id)
         payee_pubkey = self._decodepay_payee_pubkey(decode)
@@ -1327,6 +1363,7 @@ class BoltzCliManager:
                 preferred_peer_id=resolved_peer,
                 preferred_channel_id=resolved_channel,
                 retry_for=120,
+                expected_amount_sats=amount_sats,
             )
             primary = self._primary_swap_entry(result)
             created_id = str((primary or {}).get("id") or "").strip()
