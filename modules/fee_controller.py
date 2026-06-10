@@ -2139,6 +2139,19 @@ class FeeController:
     REBALANCE_FLOOR_MIN_SAMPLES = 4
     REBALANCE_FLOOR_WINDOW_DAYS = 30
 
+    # ==========================================================================
+    # P5 fix (2026-06-10): Kalman demand divisor bounds
+    # ==========================================================================
+    # The demand factor DIVIDES revenue observations before they reach the DTS
+    # posterior, while the PID multiplier MULTIPLIES the sampled fee. The old
+    # [0.25, 4.0] range gave the divisor a 16x spread that systematically
+    # depressed the posterior on proven-demand channels, directly opposing the
+    # PID's balance correction. Invariant: demand normalization may at most
+    # halve or double an observation (4x spread), keeping it subordinate to
+    # the PID and to the posterior's own variance handling.
+    KALMAN_DEMAND_FACTOR_MIN = 0.5
+    KALMAN_DEMAND_FACTOR_MAX = 2.0
+
     # Phase B.3 (2026-04-23): variance-gated undercut. When DTS posterior
     # variance is above this threshold the channel is still exploring;
     # clamping DTS's sampled target down to the undercut anchor locks in
@@ -5426,11 +5439,16 @@ class FeeController:
             except Exception as e:
                 self.plugin.log(f"Kalman demand fallback: {e}", level='debug')
 
-            # Scale expected demand into a bounded factor
+            # Scale expected demand into a bounded factor.
+            # P5: clamped to [0.5, 2.0] — see KALMAN_DEMAND_FACTOR_* for why
+            # this divisor must stay subordinate to the PID multiplier.
             if expected_demand < 0.05:
                 demand_factor = 1.0  # Too low, avoid amplifying noise
             else:
-                demand_factor = max(0.25, min(4.0, expected_demand / 0.5))
+                demand_factor = max(
+                    self.KALMAN_DEMAND_FACTOR_MIN,
+                    min(self.KALMAN_DEMAND_FACTOR_MAX, expected_demand / 0.5),
+                )
 
             adjusted_revenue_rate = current_revenue_rate / demand_factor
 

@@ -211,3 +211,52 @@ class TestFloorCeilingInversion:
 
         assert result is not None
         assert result.algorithm_values["bounded_target_ppm"] >= 100
+
+# =============================================================================
+# P5: Kalman demand divisor clamp
+# =============================================================================
+
+class TestKalmanDemandFactorClamp:
+
+    def _captured_observation(self, mock_plugin, mock_database, kalman_flow_ratio):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=400)
+
+        captured = {}
+
+        def spy_update(fee, revenue_rate, hours=1.0, time_bucket="normal"):
+            captured["fee"] = fee
+            captured["revenue_rate"] = revenue_rate
+
+        ts_state.thompson.update_posterior = spy_update
+
+        state = {
+            "state": "balanced",
+            "forward_count": 10,
+            "kalman_flow_ratio": kalman_flow_ratio,
+            "kalman_velocity": 0.0,
+        }
+        fc._adjust_channel_fee(CHANNEL_ID, PEER_ID, state, _channel_info(150), cfg=cfg)
+        return captured
+
+    def test_high_demand_divisor_clamped_to_2x(self, mock_plugin, mock_database):
+        """expected_demand=8.0 used to divide by 4.0; must now divide by 2.0."""
+        captured = self._captured_observation(mock_plugin, mock_database, kalman_flow_ratio=8.0)
+        # raw rate: 50_000 sats * 150ppm / 1e6 = 7.5 sats over ~2h = ~3.75/hr
+        assert captured["revenue_rate"] == pytest.approx(3.75 / 2.0, rel=0.02)
+
+    def test_low_demand_multiplier_clamped_to_half(self, mock_plugin, mock_database):
+        """expected_demand=0.1 used to divide by 0.25 (4x boost); now 0.5 (2x)."""
+        captured = self._captured_observation(mock_plugin, mock_database, kalman_flow_ratio=0.1)
+        assert captured["revenue_rate"] == pytest.approx(3.75 / 0.5, rel=0.02)
+
+    def test_neutral_demand_unchanged(self, mock_plugin, mock_database):
+        """Sub-noise demand keeps factor at 1.0."""
+        captured = self._captured_observation(mock_plugin, mock_database, kalman_flow_ratio=0.01)
+        assert captured["revenue_rate"] == pytest.approx(3.75, rel=0.02)
+
+    def test_clamp_constants(self):
+        assert FeeController.KALMAN_DEMAND_FACTOR_MIN == 0.5
+        assert FeeController.KALMAN_DEMAND_FACTOR_MAX == 2.0
