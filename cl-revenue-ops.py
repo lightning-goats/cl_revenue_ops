@@ -6769,6 +6769,21 @@ def _build_boltz_balance_plan(
     planner_funding_deficit = int(planner_coord.get("funding_deficit_sats", 0) or 0)
     rebalancer_exhausted = bool(planner_coord.get("rebalancer_exhausted", False))
 
+    # Channels the circular rebalancer reported as unplaceable this cycle.
+    # Snapshot from the last rebalance cycle: a channel drained since then
+    # simply won't pass the loop-out trigger below (live balances re-read),
+    # so staleness is self-correcting.
+    drain_demand_scids: set = set()
+    try:
+        engine = getattr(rebalancer, "rebalance_engine_v2", None) if rebalancer else None
+        demand = engine.get_drain_demand() if engine is not None and hasattr(engine, "get_drain_demand") else None
+        if demand is not None:
+            drain_demand_scids = {
+                str(e.channel_id).replace(":", "x") for e in demand.entries
+            }
+    except Exception:
+        drain_demand_scids = set()
+
     # Route-pair awareness: protect inbound legs of top revenue routes from loop-out drain
     route_pair_in_channels = set()
     try:
@@ -7091,7 +7106,8 @@ def _build_boltz_balance_plan(
                 hive_topo = hive_router.score_channel_for_hive(
                     peer_id, direction, liquidity_ratio=local_pct / 100.0
                 )
-            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * rebalance_bonus * planner_bonus * route_bonus * hive_bonus * hive_topo
+            drain_bonus = 1.5 if scid_display in drain_demand_scids else 1.0
+            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * rebalance_bonus * planner_bonus * route_bonus * hive_bonus * hive_topo * drain_bonus
 
         candidate = {
             "channel_id": channel_id,
@@ -7159,6 +7175,7 @@ def _build_boltz_balance_plan(
                 "broadcast_fee_ppm": broadcast_fee_ppm,
                 "rebalance_impossible": rebalance_impossible,
                 "predicted_depletion_hours": round(predicted_depletion_hours, 1) if predicted_depletion_hours is not None else None,
+                "in_drain_demand": scid_display in drain_demand_scids,
             }
         }
         candidates.append(candidate)

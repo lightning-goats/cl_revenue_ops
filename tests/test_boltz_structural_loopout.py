@@ -587,3 +587,108 @@ def test_gate_fails_closed_on_spend_query_error():
     assert result["executed"] == []
     assert result["skipped"][0]["reason"] == "structural_envelope_exhausted"
     bm.loop_out.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 10: drain-demand residual from rebalancer prioritises channels first
+# ---------------------------------------------------------------------------
+
+def _drain_module():
+    """Two 97%-local channels; neither has structural data (budget=0 keeps it
+    neutral so structural credit does not interfere with ordering)."""
+    mod = _make_planner_module(hive_hints=None)
+    from modules.config import Config
+    mod.config = Config(boltz_structural_budget_sats_per_day=0)
+    mod._node_receivable_status = lambda: {
+        "receivable_ratio": 0.03, "scarcity": 0.0,
+        "total_capacity_sats": 20_000_000, "total_receivable_sats": 600_000,
+    }
+    pa = MagicMock()
+    pa.analyze_all_channels.return_value = None
+    pa.get_profitability.return_value = _make_prof_mock()
+    mod.profitability_analyzer = pa
+    # Two identical 97%-local channels; different peer ids so they are independent.
+    mod.fee_controller._get_channels_info.return_value = {
+        "100x1x0": {
+            "peer_id": "02" + "a" * 64,
+            "capacity": 10_000_000,
+            "spendable_msat": 9_700_000_000,
+            "receivable_msat": 300_000_000,
+        },
+        "200x2x0": {
+            "peer_id": "02" + "c" * 64,
+            "capacity": 10_000_000,
+            "spendable_msat": 9_700_000_000,
+            "receivable_msat": 300_000_000,
+        },
+    }
+    return mod
+
+
+def test_drain_demand_channels_rank_first():
+    """Channel in drain-demand must sort to position 0 (drain_bonus=1.5 lifts
+    its multi_goal_value above the identical non-demand channel)."""
+    mod = _drain_module()
+    mod.rebalancer = MagicMock()
+    demand = MagicMock()
+    entry = MagicMock()
+    entry.channel_id = "200x2x0"
+    demand.entries = [entry]
+    mod.rebalancer.rebalance_engine_v2.get_drain_demand.return_value = demand
+
+    plan = mod._build_boltz_balance_plan(require_profitable=False)
+
+    assert "error" not in plan
+    recs = plan["recommendations"]
+    assert len(recs) == 2
+    assert recs[0]["channel_id"] == "200x2x0", (
+        f"Expected demand channel first, got {recs[0]['channel_id']}"
+    )
+    assert recs[0]["score"]["in_drain_demand"] is True
+    assert recs[1]["score"]["in_drain_demand"] is False
+
+
+def test_drain_demand_colon_scids_normalized():
+    """entry.channel_id in colon form (200:2:0) must match the x-form scid_display."""
+    mod = _drain_module()
+    mod.rebalancer = MagicMock()
+    demand = MagicMock()
+    entry = MagicMock()
+    entry.channel_id = "200:2:0"   # colon form
+    demand.entries = [entry]
+    mod.rebalancer.rebalance_engine_v2.get_drain_demand.return_value = demand
+
+    plan = mod._build_boltz_balance_plan(require_profitable=False)
+
+    assert "error" not in plan
+    recs = plan["recommendations"]
+    assert recs[0]["channel_id"] == "200x2x0"
+    assert recs[0]["score"]["in_drain_demand"] is True
+
+
+def test_missing_engine_neutralizes():
+    """mod.rebalancer = None must not crash the plan; all in_drain_demand False."""
+    mod = _drain_module()
+    mod.rebalancer = None
+
+    plan = mod._build_boltz_balance_plan(require_profitable=False)
+
+    assert "error" not in plan
+    for rec in plan["recommendations"]:
+        assert rec["score"]["in_drain_demand"] is False
+
+
+def test_drain_demand_fetched_once():
+    """get_drain_demand must be called exactly once per plan build, even when
+    there are multiple loop-out candidates."""
+    mod = _drain_module()
+    mod.rebalancer = MagicMock()
+    demand = MagicMock()
+    demand.entries = []
+    mod.rebalancer.rebalance_engine_v2.get_drain_demand.return_value = demand
+
+    plan = mod._build_boltz_balance_plan(require_profitable=False)
+
+    assert "error" not in plan
+    assert len(plan["recommendations"]) == 2
+    mod.rebalancer.rebalance_engine_v2.get_drain_demand.assert_called_once()
