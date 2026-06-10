@@ -1956,6 +1956,25 @@ class FeeController:
         except Exception:
             return 1.0
 
+    @staticmethod
+    def _drain_fee_multiplier(*, local_ratio: float, forward_count: int,
+                              high_threshold: float, discount_max: float) -> float:
+        """Bounded discount for stagnant over-local channels.
+
+        Returns 1.0 (no-op) unless the channel is above the high-liquidity
+        threshold, had zero forwards in the observation window, and the
+        operator enabled a non-zero discount_max. Discount scales linearly
+        with the excess above the threshold and is clamped to discount_max.
+        Rails (min_fee_ppm) still apply downstream — this is a bias, not
+        an override.
+        """
+        if discount_max <= 0.0 or forward_count > 0:
+            return 1.0
+        if local_ratio <= high_threshold or high_threshold >= 1.0:
+            return 1.0
+        excess = (local_ratio - high_threshold) / (1.0 - high_threshold)
+        return 1.0 - min(float(discount_max), float(discount_max) * excess)
+
     def _hive_hint_effective_ttl(self) -> int:
         if self.hive_hints is None:
             return 900
@@ -5141,6 +5160,25 @@ class FeeController:
             hive_fee_bias = self._get_hive_fee_bias(peer_id)
             if hive_fee_bias != 1.0:
                 post_pid_target_ppm = int(post_pid_target_ppm * hive_fee_bias)
+            # Drain pressure: bounded discount for stagnant over-local channels
+            # ("sell what you're long"). Bias only — min_fee_ppm rails still
+            # clamp downstream. Off by default (drain_fee_discount_max=0.0).
+            drain_multiplier = self._drain_fee_multiplier(
+                local_ratio=outbound_ratio,
+                forward_count=forward_count,
+                high_threshold=float(getattr(cfg, "high_liquidity_threshold", 0.8)),
+                discount_max=float(getattr(cfg, "drain_fee_discount_max", 0.0)),
+            )
+            if drain_multiplier != 1.0:
+                pre_drain_target_ppm = post_pid_target_ppm
+                post_pid_target_ppm = int(post_pid_target_ppm * drain_multiplier)
+                self.plugin.log(
+                    f"DRAIN_DISCOUNT: {channel_id[:12]}... stagnant over-local "
+                    f"(outbound_ratio={outbound_ratio:.2f}), target "
+                    f"{pre_drain_target_ppm}->{post_pid_target_ppm}ppm "
+                    f"(multiplier={drain_multiplier:.3f})",
+                    level='debug'
+                )
             # Temporal fee adjustment from traffic patterns
             temporal_adj = self._get_temporal_fee_adjustment(peer_id)
             if temporal_adj != 1.0:
