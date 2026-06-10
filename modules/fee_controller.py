@@ -188,6 +188,13 @@ class GaussianThompsonState:
     CTX_CONFIDENCE_COUNT = 10.0     # Half-saturation obs count for ctx confidence
     CTX_PRECISION_DECAY = 0.98      # Per-update ctx precision decay (re-learnable)
 
+    # Hive exploration multiplier bounds. scale_variance() used to mutate only
+    # posterior_std, which neither sample path reads, so the multiplier never
+    # reached the fees actually sampled; it is now stored and consumed by the
+    # samplers themselves (scaling the polynomial/Gaussian draw noise).
+    EXPLORATION_BOOST_MIN = 0.75
+    EXPLORATION_BOOST_MAX = 2.0
+
     # Prior parameters
     prior_mean_fee: int = 200       # Default prior mean: 200 ppm
     prior_std_fee: int = 100        # Default prior uncertainty: 100 ppm
@@ -241,6 +248,11 @@ class GaussianThompsonState:
     zero_revenue_streak: int = 0
     zero_run_start_fee: float = 0.0
     zero_run_start_ts: int = 0
+
+    # One-shot exploration multiplier armed by scale_variance() and consumed
+    # by the next sample_fee/sample_fee_contextual call (the pipeline re-arms
+    # it every cycle when the hive requests exploration)
+    exploration_boost: float = 1.0
 
     # Tracking
     last_sampled_fee: int = 0
@@ -331,18 +343,57 @@ class GaussianThompsonState:
         return int(max(floor_ppm, min(ceiling_ppm, round(optimal_fee))))
 
     def scale_variance(self, factor: float) -> None:
-        """Scale posterior variance to encourage exploration.
+        """Arm an exploration multiplier for the next sample.
 
-        Widens (factor > 1) or narrows (factor < 1) the posterior
-        standard deviation.  Capped at prior_std to prevent runaway
-        exploration beyond the original prior uncertainty.
+        Stores the (bounded) factor in exploration_boost, which the sample
+        paths consume by scaling their draw noise — the previous behaviour
+        of only mutating posterior_std was dead code for sampling, because
+        neither the polynomial nor the contextual path reads posterior_std.
+
+        posterior_std is still widened for backward compatibility (it feeds
+        the downstream blend ratio), but capped at the MIN_PRECISION max
+        std rather than prior_std_fee: the old cap NARROWED the posterior
+        whenever std already exceeded the prior, i.e. it no-op'd or
+        backfired exactly when exploration was wanted.
         """
+        try:
+            factor = float(factor)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(factor) or factor <= 0:
+            return
+        factor = max(self.EXPLORATION_BOOST_MIN,
+                     min(self.EXPLORATION_BOOST_MAX, factor))
+        self.exploration_boost = factor
+        max_std = math.sqrt(1.0 / self.MIN_PRECISION)
         self.posterior_std = min(
-            float(self.prior_std_fee),
+            max_std,
             max(float(self.MIN_STD), self.posterior_std * factor)
         )
 
-    def sample_fee(self, floor: int, ceiling: int) -> int:
+    def _resolve_exploration_boost(self, exploration_multiplier: Optional[float]) -> float:
+        """
+        Resolve the effective exploration multiplier for a sample.
+
+        An explicit argument wins (without consuming the stored boost);
+        otherwise the one-shot boost armed by scale_variance is consumed.
+        Always bounded to [EXPLORATION_BOOST_MIN, EXPLORATION_BOOST_MAX].
+        """
+        if exploration_multiplier is None:
+            boost = self.exploration_boost
+            self.exploration_boost = 1.0  # One-shot: re-armed each cycle
+        else:
+            try:
+                boost = float(exploration_multiplier)
+            except (TypeError, ValueError):
+                boost = 1.0
+            if not math.isfinite(boost) or boost <= 0:
+                boost = 1.0
+        return max(self.EXPLORATION_BOOST_MIN,
+                   min(self.EXPLORATION_BOOST_MAX, boost))
+
+    def sample_fee(self, floor: int, ceiling: int,
+                   exploration_multiplier: Optional[float] = None) -> int:
         """
         Sample a fee from the posterior distribution.
 
@@ -353,21 +404,28 @@ class GaussianThompsonState:
         Args:
             floor: Minimum allowed fee (ppm)
             ceiling: Maximum allowed fee (ppm)
+            exploration_multiplier: Optional explicit draw-noise multiplier;
+                when omitted, the one-shot boost armed by scale_variance()
+                is consumed instead
 
         Returns:
             Sampled fee in ppm, clamped to [floor, ceiling]
         """
+        boost = self._resolve_exploration_boost(exploration_multiplier)
+
         # If not enough observations, explore more widely
         if len(self.observations) < self.MIN_OBSERVATIONS:
             # Use prior with extra exploration (clamped to MIN_STD like normal path)
-            explore_std = max(self.MIN_STD, self.prior_std_fee * 1.1)
+            explore_std = max(self.MIN_STD, self.prior_std_fee * 1.1) * boost
             sampled = random.gauss(self.prior_mean_fee, explore_std)
             # The prior ignores posterior_mean, so advisory nudges (e.g.
             # neighbor-median seeding on young channels) must be applied here
             sampled += self._posterior_bias_shift(sampled)
         else:
             # Try polynomial posterior sampling; fall back to Gaussian
-            sampled = self._sample_from_polynomial_posterior(floor, ceiling)
+            sampled = self._sample_from_polynomial_posterior(
+                floor, ceiling, noise_scale=boost
+            )
             if sampled is not None:
                 # Polynomial draws come from the regression coefficients and
                 # ignore posterior_mean entirely — apply the durable nudge
@@ -380,7 +438,7 @@ class GaussianThompsonState:
             # Fallback: sample from Gaussian posterior. No extra bias shift:
             # posterior_mean already carries the nudges via
             # _apply_posterior_bias after every recompute.
-            modulated_std = max(self.MIN_STD, self.posterior_std)
+            modulated_std = max(self.MIN_STD, self.posterior_std) * boost
             sampled = random.gauss(self.posterior_mean, modulated_std)
 
         # Clamp to bounds
@@ -390,7 +448,8 @@ class GaussianThompsonState:
 
         return sampled_fee
 
-    def sample_fee_contextual(self, context_key: str, floor: int, ceiling: int) -> int:
+    def sample_fee_contextual(self, context_key: str, floor: int, ceiling: int,
+                              exploration_multiplier: Optional[float] = None) -> int:
         """
         Sample fee from the global posterior with a bounded contextual offset.
 
@@ -407,12 +466,21 @@ class GaussianThompsonState:
             context_key: Context identifier (e.g., "low:normal:P")
             floor: Minimum allowed fee
             ceiling: Maximum allowed fee
+            exploration_multiplier: Optional explicit draw-noise multiplier
+                (otherwise the one-shot scale_variance boost is consumed)
 
         Returns:
             Sampled fee in ppm
         """
-        # Base draw from the global (polynomial-first) posterior
-        base = self.sample_fee(floor, ceiling)
+        # Base draw from the global (polynomial-first) posterior; the
+        # exploration boost rides on this draw's noise. The kwarg is only
+        # forwarded when explicitly given so callers that stub sample_fee
+        # with a (floor, ceiling) signature keep working.
+        if exploration_multiplier is None:
+            base = self.sample_fee(floor, ceiling)
+        else:
+            base = self.sample_fee(floor, ceiling,
+                                   exploration_multiplier=exploration_multiplier)
 
         ctx = self.contextual_posteriors.get(context_key)
         if not ctx:
@@ -449,13 +517,17 @@ class GaussianThompsonState:
         return sampled_fee
 
     def _sample_from_polynomial_posterior(
-        self, floor: int, ceiling: int
+        self, floor: int, ceiling: int, noise_scale: float = 1.0
     ) -> Optional[float]:
         """
         Sample optimal fee from the polynomial posterior.
 
         Draws beta ~ N(mu, Sigma) from the Bayesian posterior over [a, b, c],
         then finds the optimal fee from the sampled quadratic.
+
+        Args:
+            noise_scale: Multiplier on the stochastic part of the draw
+                (exploration boost); 1.0 = plain Thompson sample.
 
         Returns sampled fee (float) or None to signal fallback to Gaussian.
         """
@@ -476,13 +548,13 @@ class GaussianThompsonState:
         if L is None:
             # Fallback: diagonal approximation
             diag = [max(1e-6, Sigma[i][i]) for i in range(3)]
-            z = [random.gauss(0, 1) for _ in range(3)]
+            z = [random.gauss(0, 1) * noise_scale for _ in range(3)]
             beta_sampled = [
                 self.posterior_coeffs[i] + z[i] * math.sqrt(diag[i])
                 for i in range(3)
             ]
         else:
-            z = [random.gauss(0, 1) for _ in range(3)]
+            z = [random.gauss(0, 1) * noise_scale for _ in range(3)]
             Lz = self._mat3_vec_mul(L, z)
             beta_sampled = [self.posterior_coeffs[i] + Lz[i] for i in range(3)]
 
@@ -1325,6 +1397,7 @@ class GaussianThompsonState:
             "zero_revenue_streak": self.zero_revenue_streak,
             "zero_run_start_fee": self.zero_run_start_fee,
             "zero_run_start_ts": self.zero_run_start_ts,
+            "exploration_boost": self.exploration_boost,
             "last_sampled_fee": self.last_sampled_fee,
             "last_sample_time": self.last_sample_time
         }
@@ -1440,6 +1513,18 @@ class GaussianThompsonState:
             state.zero_run_start_ts = max(0, int(d.get("zero_run_start_ts", 0)))
         except (TypeError, ValueError):
             state.zero_run_start_ts = 0
+
+        # One-shot exploration boost (legacy dicts: neutral 1.0)
+        try:
+            state.exploration_boost = float(d.get("exploration_boost", 1.0))
+        except (TypeError, ValueError):
+            state.exploration_boost = 1.0
+        if not math.isfinite(state.exploration_boost):
+            state.exploration_boost = 1.0
+        state.exploration_boost = max(
+            cls.EXPLORATION_BOOST_MIN,
+            min(cls.EXPLORATION_BOOST_MAX, state.exploration_boost),
+        )
 
         state.last_sampled_fee = d.get("last_sampled_fee", 0)
         state.last_sample_time = d.get("last_sample_time", 0)
